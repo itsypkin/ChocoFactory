@@ -1,0 +1,11 @@
+[package]
+name = "chokofactoryd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "chokofactoryd"
+path = "src/main.rs"
+
+[dependencies]
+chokofactory-core = { path = "../chokofactory-core" }
