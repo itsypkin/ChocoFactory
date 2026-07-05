@@ -1,0 +1,6 @@
+[package]
+name = "chokofactory-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
