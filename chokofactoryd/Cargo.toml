@@ -3,9 +3,17 @@ name = "chokofactoryd"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "chokofactoryd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "chokofactoryd"
 path = "src/main.rs"
 
 [dependencies]
-chokofactory-core = { path = "../chokofactory-core" }
+chokofactory-core = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
