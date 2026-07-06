@@ -3,13 +3,14 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{FromRow, SqlitePool};
+use uuid::Uuid;
 
 const COLUMNS: &str = "id, task_run_id, seq, event_type, payload, created_at";
 
 #[derive(FromRow)]
 struct EventRow {
-    id: i64,
-    task_run_id: i64,
+    id: String,
+    task_run_id: String,
     seq: i64,
     event_type: String,
     payload: Json<Value>,
@@ -36,17 +37,19 @@ impl From<EventRow> for Event {
 /// `task_run_id` (§4.2). The log is append-only: there is no update.
 pub async fn append(
     pool: &SqlitePool,
-    task_run_id: i64,
+    task_run_id: &str,
     event_type: EventType,
     payload: Value,
 ) -> Result<Event, sqlx::Error> {
+    let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, EventRow>(&format!(
-        "INSERT INTO events (task_run_id, seq, event_type, payload, created_at)
-         SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?
+        "INSERT INTO events (id, task_run_id, seq, event_type, payload, created_at)
+         SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?
          FROM events WHERE task_run_id = ?
          RETURNING {COLUMNS}"
     ))
+    .bind(id)
     .bind(task_run_id)
     .bind(event_type.to_string())
     .bind(Json(payload))
@@ -57,7 +60,7 @@ pub async fn append(
     Ok(row.into())
 }
 
-pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Event>, sqlx::Error> {
+pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Event>, sqlx::Error> {
     let row = sqlx::query_as::<_, EventRow>(&format!("SELECT {COLUMNS} FROM events WHERE id = ?"))
         .bind(id)
         .fetch_optional(pool)
@@ -67,7 +70,7 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Event>, sqlx::Erro
 
 pub async fn list_for_task_run(
     pool: &SqlitePool,
-    task_run_id: i64,
+    task_run_id: &str,
 ) -> Result<Vec<Event>, sqlx::Error> {
     let rows = sqlx::query_as::<_, EventRow>(&format!(
         "SELECT {COLUMNS} FROM events WHERE task_run_id = ? ORDER BY seq"
@@ -98,12 +101,12 @@ mod tests {
     use chrono::Duration;
     use serde_json::json;
 
-    async fn seed_task_run(pool: &SqlitePool) -> i64 {
+    async fn seed_task_run(pool: &SqlitePool) -> String {
         let project_id = projects::create(pool, "demo").await.unwrap().id;
         let task_id = tasks::create(
             pool,
             tasks::NewTask {
-                project_id,
+                project_id: &project_id,
                 parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
@@ -116,7 +119,7 @@ mod tests {
         task_runs::create(
             pool,
             task_runs::NewTaskRun {
-                task_id,
+                task_id: &task_id,
                 stage: "chatting",
                 role: "chat",
                 cli_adapter: "claude",
@@ -135,7 +138,7 @@ mod tests {
 
         let e1 = append(
             &pool,
-            task_run_id,
+            &task_run_id,
             EventType::AssistantMessage,
             json!({"text": "hi"}),
         )
@@ -143,7 +146,7 @@ mod tests {
         .unwrap();
         let e2 = append(
             &pool,
-            task_run_id,
+            &task_run_id,
             EventType::ToolCall,
             json!({"tool": "bash"}),
         )
@@ -152,11 +155,12 @@ mod tests {
 
         assert_eq!(e1.seq, 1);
         assert_eq!(e2.seq, 2);
+        assert!(!e1.id.is_empty());
 
-        let fetched = get(&pool, e1.id).await.unwrap().unwrap();
+        let fetched = get(&pool, &e1.id).await.unwrap().unwrap();
         assert_eq!(fetched.event_type, EventType::AssistantMessage);
 
-        let all = list_for_task_run(&pool, task_run_id).await.unwrap();
+        let all = list_for_task_run(&pool, &task_run_id).await.unwrap();
         assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
     }
 
@@ -166,10 +170,10 @@ mod tests {
         let run_a = seed_task_run(&pool).await;
         let run_b = seed_task_run(&pool).await;
 
-        let a1 = append(&pool, run_a, EventType::Thinking, json!({}))
+        let a1 = append(&pool, &run_a, EventType::Thinking, json!({}))
             .await
             .unwrap();
-        let b1 = append(&pool, run_b, EventType::Thinking, json!({}))
+        let b1 = append(&pool, &run_b, EventType::Thinking, json!({}))
             .await
             .unwrap();
 
@@ -181,7 +185,7 @@ mod tests {
     async fn delete_older_than_prunes_only_stale_events() {
         let pool = connect_in_memory().await.unwrap();
         let task_run_id = seed_task_run(&pool).await;
-        append(&pool, task_run_id, EventType::Error, json!({}))
+        append(&pool, &task_run_id, EventType::Error, json!({}))
             .await
             .unwrap();
 
@@ -189,7 +193,7 @@ mod tests {
         let removed = delete_older_than(&pool, cutoff_in_future).await.unwrap();
         assert_eq!(removed, 1);
         assert!(
-            list_for_task_run(&pool, task_run_id)
+            list_for_task_run(&pool, &task_run_id)
                 .await
                 .unwrap()
                 .is_empty()

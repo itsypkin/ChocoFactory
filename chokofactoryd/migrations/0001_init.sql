@@ -1,13 +1,13 @@
 CREATE TABLE projects (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 
 CREATE TABLE tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    project_id INTEGER NOT NULL REFERENCES projects (id),
-    parent_task_id INTEGER REFERENCES tasks (id),
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects (id),
+    parent_task_id TEXT REFERENCES tasks (id),
     workflow_def TEXT NOT NULL,
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',
@@ -21,8 +21,8 @@ CREATE INDEX idx_tasks_parent_task_id ON tasks (parent_task_id);
 CREATE INDEX idx_tasks_status ON tasks (status);
 
 CREATE TABLE task_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id INTEGER NOT NULL REFERENCES tasks (id),
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks (id),
     stage TEXT NOT NULL,
     role TEXT NOT NULL,
     cli_adapter TEXT NOT NULL,
@@ -37,8 +37,8 @@ CREATE INDEX idx_task_runs_task_id ON task_runs (task_id);
 CREATE INDEX idx_task_runs_status ON task_runs (status);
 
 CREATE TABLE events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_run_id INTEGER NOT NULL REFERENCES task_runs (id),
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs (id),
     seq INTEGER NOT NULL,
     event_type TEXT NOT NULL,
     payload TEXT NOT NULL,
@@ -50,7 +50,7 @@ CREATE INDEX idx_events_task_run_id ON events (task_run_id);
 CREATE INDEX idx_events_created_at ON events (created_at);
 
 CREATE TABLE workflow_state (
-    task_id INTEGER PRIMARY KEY REFERENCES tasks (id),
+    task_id TEXT PRIMARY KEY REFERENCES tasks (id),
     current_stage TEXT NOT NULL,
     loop_counters TEXT NOT NULL DEFAULT '{}',
     stage_history TEXT NOT NULL DEFAULT '[]',

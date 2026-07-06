@@ -8,7 +8,10 @@ use serde_json::Value;
 /// A grouping label for related tasks. Holds no repo/path itself (design §3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
-    pub id: i64,
+    /// UUID (v4), stored as text. Kept as a plain `String` rather than a
+    /// `Uuid` type so the generation scheme (e.g. a shorter id) can change
+    /// later without touching every struct that carries an id.
+    pub id: String,
     pub name: String,
     pub created_at: DateTime<Utc>,
 }
@@ -16,10 +19,10 @@ pub struct Project {
 /// One unit of work, driven by a workflow definition (design §3, §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
-    pub id: i64,
-    pub project_id: i64,
+    pub id: String,
+    pub project_id: String,
     /// Set when this task was spawned via delegation from another task (§6.2).
-    pub parent_task_id: Option<i64>,
+    pub parent_task_id: Option<String>,
     pub workflow_def: String,
     pub title: String,
     /// Free-form for now (e.g. "open", "closed") — the full set of values
@@ -76,8 +79,8 @@ impl FromStr for TaskRunStatus {
 /// One row per underlying agent subprocess session a task has had (§3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRun {
-    pub id: i64,
-    pub task_id: i64,
+    pub id: String,
+    pub task_id: String,
     pub stage: String,
     pub role: String,
     pub cli_adapter: String,
@@ -143,8 +146,8 @@ impl FromStr for EventType {
 /// Append-only normalized event log row (§3, §4.2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
-    pub id: i64,
-    pub task_run_id: i64,
+    pub id: String,
+    pub task_run_id: String,
     pub seq: i64,
     pub event_type: EventType,
     pub payload: Value,
@@ -154,7 +157,7 @@ pub struct Event {
 /// Generic workflow-engine bookkeeping for a task, one row per task (§3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowState {
-    pub task_id: i64,
+    pub task_id: String,
     pub current_stage: String,
     /// JSON object mapping stage name -> loop count (§5.3).
     pub loop_counters: Value,
@@ -164,4 +167,67 @@ pub struct WorkflowState {
     /// whichever stage kind is currently active.
     pub payload: Value,
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_run_status_round_trips_through_display_and_from_str() {
+        for status in [
+            TaskRunStatus::Active,
+            TaskRunStatus::Idle,
+            TaskRunStatus::Exited,
+        ] {
+            assert_eq!(status.to_string().parse::<TaskRunStatus>().unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn task_run_status_from_str_rejects_unknown_value() {
+        let err = "bogus".parse::<TaskRunStatus>().unwrap_err();
+        assert_eq!(err.0, "bogus");
+        assert_eq!(err.to_string(), "invalid task run status: bogus");
+    }
+
+    #[test]
+    fn event_type_round_trips_through_display_and_from_str() {
+        for event_type in [
+            EventType::AssistantMessage,
+            EventType::ToolCall,
+            EventType::ToolResult,
+            EventType::Thinking,
+            EventType::Error,
+            EventType::SessionMeta,
+        ] {
+            assert_eq!(
+                event_type.to_string().parse::<EventType>().unwrap(),
+                event_type
+            );
+        }
+    }
+
+    #[test]
+    fn event_type_from_str_rejects_unknown_value() {
+        let err = "bogus".parse::<EventType>().unwrap_err();
+        assert_eq!(err.0, "bogus");
+        assert_eq!(err.to_string(), "invalid event type: bogus");
+    }
+
+    #[test]
+    fn task_run_status_serializes_to_snake_case_json() {
+        assert_eq!(
+            serde_json::to_string(&TaskRunStatus::Idle).unwrap(),
+            "\"idle\""
+        );
+    }
+
+    #[test]
+    fn event_type_serializes_to_snake_case_json() {
+        assert_eq!(
+            serde_json::to_string(&EventType::ToolResult).unwrap(),
+            "\"tool_result\""
+        );
+    }
 }

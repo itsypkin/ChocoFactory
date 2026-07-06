@@ -1,10 +1,11 @@
 use chokofactory_core::models::Project;
 use chrono::Utc;
 use sqlx::{FromRow, SqlitePool};
+use uuid::Uuid;
 
 #[derive(FromRow)]
 struct ProjectRow {
-    id: i64,
+    id: String,
     name: String,
     created_at: chrono::DateTime<Utc>,
 }
@@ -20,10 +21,12 @@ impl From<ProjectRow> for Project {
 }
 
 pub async fn create(pool: &SqlitePool, name: &str) -> Result<Project, sqlx::Error> {
+    let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, ProjectRow>(
-        "INSERT INTO projects (name, created_at) VALUES (?, ?) RETURNING id, name, created_at",
+        "INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?) RETURNING id, name, created_at",
     )
+    .bind(id)
     .bind(name)
     .bind(now)
     .fetch_one(pool)
@@ -31,7 +34,7 @@ pub async fn create(pool: &SqlitePool, name: &str) -> Result<Project, sqlx::Erro
     Ok(row.into())
 }
 
-pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Project>, sqlx::Error> {
+pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Project>, sqlx::Error> {
     let row =
         sqlx::query_as::<_, ProjectRow>("SELECT id, name, created_at FROM projects WHERE id = ?")
             .bind(id)
@@ -50,7 +53,7 @@ pub async fn list(pool: &SqlitePool) -> Result<Vec<Project>, sqlx::Error> {
 
 pub async fn rename(
     pool: &SqlitePool,
-    id: i64,
+    id: &str,
     name: &str,
 ) -> Result<Option<Project>, sqlx::Error> {
     let row = sqlx::query_as::<_, ProjectRow>(
@@ -63,7 +66,7 @@ pub async fn rename(
     Ok(row.map(Into::into))
 }
 
-pub async fn delete(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM projects WHERE id = ?")
         .bind(id)
         .execute(pool)
@@ -82,25 +85,29 @@ mod tests {
 
         let created = create(&pool, "demo").await.unwrap();
         assert_eq!(created.name, "demo");
+        assert!(!created.id.is_empty());
 
-        let fetched = get(&pool, created.id).await.unwrap().unwrap();
+        let fetched = get(&pool, &created.id).await.unwrap().unwrap();
         assert_eq!(fetched, created);
 
-        let renamed = rename(&pool, created.id, "renamed").await.unwrap().unwrap();
+        let renamed = rename(&pool, &created.id, "renamed")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(renamed.name, "renamed");
 
         let all = list(&pool).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].name, "renamed");
 
-        assert!(delete(&pool, created.id).await.unwrap());
-        assert!(get(&pool, created.id).await.unwrap().is_none());
-        assert!(!delete(&pool, created.id).await.unwrap());
+        assert!(delete(&pool, &created.id).await.unwrap());
+        assert!(get(&pool, &created.id).await.unwrap().is_none());
+        assert!(!delete(&pool, &created.id).await.unwrap());
     }
 
     #[tokio::test]
     async fn get_missing_returns_none() {
         let pool = connect_in_memory().await.unwrap();
-        assert!(get(&pool, 999).await.unwrap().is_none());
+        assert!(get(&pool, "does-not-exist").await.unwrap().is_none());
     }
 }

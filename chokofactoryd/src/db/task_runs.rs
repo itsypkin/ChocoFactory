@@ -1,14 +1,15 @@
 use chokofactory_core::models::{TaskRun, TaskRunStatus};
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, SqlitePool};
+use uuid::Uuid;
 
 const COLUMNS: &str =
     "id, task_id, stage, role, cli_adapter, model, session_id, status, started_at, ended_at";
 
 #[derive(FromRow)]
 struct TaskRunRow {
-    id: i64,
-    task_id: i64,
+    id: String,
+    task_id: String,
     stage: String,
     role: String,
     cli_adapter: String,
@@ -40,7 +41,7 @@ impl From<TaskRunRow> for TaskRun {
 }
 
 pub struct NewTaskRun<'a> {
-    pub task_id: i64,
+    pub task_id: &'a str,
     pub stage: &'a str,
     pub role: &'a str,
     pub cli_adapter: &'a str,
@@ -48,12 +49,14 @@ pub struct NewTaskRun<'a> {
 }
 
 pub async fn create(pool: &SqlitePool, new: NewTaskRun<'_>) -> Result<TaskRun, sqlx::Error> {
+    let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRunRow>(&format!(
-        "INSERT INTO task_runs (task_id, stage, role, cli_adapter, model, status, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO task_runs (id, task_id, stage, role, cli_adapter, model, status, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING {COLUMNS}"
     ))
+    .bind(id)
     .bind(new.task_id)
     .bind(new.stage)
     .bind(new.role)
@@ -66,7 +69,7 @@ pub async fn create(pool: &SqlitePool, new: NewTaskRun<'_>) -> Result<TaskRun, s
     Ok(row.into())
 }
 
-pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<TaskRun>, sqlx::Error> {
+pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<TaskRun>, sqlx::Error> {
     let row =
         sqlx::query_as::<_, TaskRunRow>(&format!("SELECT {COLUMNS} FROM task_runs WHERE id = ?"))
             .bind(id)
@@ -75,7 +78,7 @@ pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<TaskRun>, sqlx::Er
     Ok(row.map(Into::into))
 }
 
-pub async fn list_for_task(pool: &SqlitePool, task_id: i64) -> Result<Vec<TaskRun>, sqlx::Error> {
+pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<TaskRun>, sqlx::Error> {
     let rows = sqlx::query_as::<_, TaskRunRow>(&format!(
         "SELECT {COLUMNS} FROM task_runs WHERE task_id = ? ORDER BY id"
     ))
@@ -88,7 +91,7 @@ pub async fn list_for_task(pool: &SqlitePool, task_id: i64) -> Result<Vec<TaskRu
 /// Persists the CLI's `session_id` for later resume (§4.1).
 pub async fn set_session_id(
     pool: &SqlitePool,
-    id: i64,
+    id: &str,
     session_id: &str,
 ) -> Result<Option<TaskRun>, sqlx::Error> {
     let row = sqlx::query_as::<_, TaskRunRow>(&format!(
@@ -103,7 +106,7 @@ pub async fn set_session_id(
 
 pub async fn update_status(
     pool: &SqlitePool,
-    id: i64,
+    id: &str,
     status: TaskRunStatus,
     ended_at: Option<DateTime<Utc>>,
 ) -> Result<Option<TaskRun>, sqlx::Error> {
@@ -118,7 +121,7 @@ pub async fn update_status(
     Ok(row.map(Into::into))
 }
 
-pub async fn delete(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
+pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM task_runs WHERE id = ?")
         .bind(id)
         .execute(pool)
@@ -132,12 +135,12 @@ mod tests {
     use crate::db::{connect_in_memory, projects, tasks};
     use serde_json::json;
 
-    async fn seed_task(pool: &SqlitePool) -> i64 {
+    async fn seed_task(pool: &SqlitePool) -> String {
         let project_id = projects::create(pool, "demo").await.unwrap().id;
         tasks::create(
             pool,
             tasks::NewTask {
-                project_id,
+                project_id: &project_id,
                 parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
@@ -157,7 +160,7 @@ mod tests {
         let created = create(
             &pool,
             NewTaskRun {
-                task_id,
+                task_id: &task_id,
                 stage: "chatting",
                 role: "chat",
                 cli_adapter: "claude",
@@ -168,31 +171,32 @@ mod tests {
         .unwrap();
         assert_eq!(created.status, TaskRunStatus::Active);
         assert!(created.session_id.is_none());
+        assert!(!created.id.is_empty());
 
-        let with_session = set_session_id(&pool, created.id, "sess-123")
+        let with_session = set_session_id(&pool, &created.id, "sess-123")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(with_session.session_id.as_deref(), Some("sess-123"));
 
-        let idle = update_status(&pool, created.id, TaskRunStatus::Idle, None)
+        let idle = update_status(&pool, &created.id, TaskRunStatus::Idle, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(idle.status, TaskRunStatus::Idle);
 
         let now = Utc::now();
-        let exited = update_status(&pool, created.id, TaskRunStatus::Exited, Some(now))
+        let exited = update_status(&pool, &created.id, TaskRunStatus::Exited, Some(now))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(exited.status, TaskRunStatus::Exited);
         assert_eq!(exited.ended_at, Some(now));
 
-        let runs = list_for_task(&pool, task_id).await.unwrap();
+        let runs = list_for_task(&pool, &task_id).await.unwrap();
         assert_eq!(runs.len(), 1);
 
-        assert!(delete(&pool, created.id).await.unwrap());
-        assert!(get(&pool, created.id).await.unwrap().is_none());
+        assert!(delete(&pool, &created.id).await.unwrap());
+        assert!(get(&pool, &created.id).await.unwrap().is_none());
     }
 }
