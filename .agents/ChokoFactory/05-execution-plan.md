@@ -2,15 +2,14 @@
 
 Dependency-graph analysis of the open GitHub issues (`itsypkin/ChocoFactory`),
 grouped into waves of work that can proceed in parallel. Derived from each
-issue's `Depends on:` line as of 2026-07-06. #1 and #2 are already closed.
+issue's `Depends on:` line as of 2026-07-06. #1, #2, and #3 are already closed.
 
 ## Dependency graph (open issues)
 
 | Issue | Title | Depends on |
 |---|---|---|
-| #3 | P1-3: Agent adapter abstraction + Claude adapter | #1 (closed) |
-| #4 | P1-4: Session lifecycle manager | #2, #3 |
-| #5 | P1-5: Event capture + retention job | #2, #3 |
+| #4 | P1-4: Session lifecycle manager | #2 (closed), #3 (closed) |
+| #5 | P1-5: Event capture + retention job | #2 (closed), #3 (closed) |
 | #6 | P1-6: Workflow definition loader | #1 (closed) |
 | #7 | P1-7: Workflow engine core (Phase-1 stage kinds) | #2, #4, #6 |
 | #8 | P1-8: Built-in chat workflow | #7 |
@@ -32,25 +31,24 @@ Each wave can be worked on concurrently once the previous wave completes.
 
 | Wave | Issues | Unblocked by |
 |---|---|---|
-| 1 | #3, #6, #16 | #1/#2 (already closed) — ready to start now |
-| 2 | #4, #5 | #3 |
-| 3 | #7 | #4 and #6 |
-| 4 | #8, #12, #13, #15 | #7 |
-| 5 | #9, #17, #14 | #8 (for #9, #17); #12+#13 (for #14) |
-| 6 | #10, #11, #18 | #9 (for #10, #11); #12/#13/#14/#15/#16/#17 (for #18) |
-| 7 | #19 | #10 and #18 |
+| 1 | #4, #5, #6, #16 | #1/#2/#3 (already closed) — ready to start now |
+| 2 | #7 | #4 and #6 |
+| 3 | #8, #12, #13, #15 | #7 |
+| 4 | #9, #17, #14 | #8 (for #9, #17); #12+#13 (for #14) |
+| 5 | #10, #11, #18 | #9 (for #10, #11); #12/#13/#14/#15/#16/#17 (for #18) |
+| 6 | #19 | #10 and #18 |
 
 ## Observations
 
 - **#7 (Workflow engine core) is the critical bottleneck.** Nearly all of
-  Phase 2 and half of Phase 1 fan out from it; nothing in wave 4 onward can
+  Phase 2 and half of Phase 1 fan out from it; nothing in wave 3 onward can
   start until it lands.
 - **#16 (Worktree manager) is independently startable today** — it only
   depends on #2 (closed) despite not being consumed until #18, much later.
-  Good filler task for a spare contributor while the wave-1/2/3 chain is
+  Good filler task for a spare contributor while the wave-1/2 chain is
   in progress.
 - **Critical path** (longest chain, bounds minimum total time regardless of
-  parallelism): #3 → #4 → #7 → #8 → (#9/#17 or #12/#13/#14) → (#10 or #18)
-  → #19 — roughly 7 sequential steps.
-- With 3 available workstreams, #3, #6, and #16 can be picked up
+  parallelism): #4 → #7 → #8 → (#9/#17 or #12/#13/#14) → (#10 or #18)
+  → #19 — roughly 6 sequential steps.
+- With 4 available workstreams, #4, #5, #6, and #16 can be picked up
   simultaneously right now.
