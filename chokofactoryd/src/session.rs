@@ -305,10 +305,14 @@ async fn drain_session(
             event = handle.recv() => {
                 match event {
                     Some(event) => {
-                        if let AgentEvent::SessionMeta { session_id } = &event {
-                            let _ = task_runs::set_session_id(pool, task_run_id, session_id).await;
+                        if let AgentEvent::SessionMeta { session_id } = &event
+                            && let Err(err) = task_runs::set_session_id(pool, task_run_id, session_id).await
+                        {
+                            eprintln!("session {task_run_id}: failed to persist session_id: {err}");
                         }
-                        let _ = events::append(pool, task_run_id, event.event_type(), event.payload()).await;
+                        if let Err(err) = events::append(pool, task_run_id, event.event_type(), event.payload()).await {
+                            eprintln!("session {task_run_id}: failed to append event: {err}");
+                        }
                         // Any drained output counts as activity, not just
                         // inbound `Send`s — broader than §4.1's "no input"
                         // wording, but it's what keeps a mid-turn session
@@ -324,7 +328,9 @@ async fn drain_session(
             cmd = cmd_rx.recv(), if cmd_open => {
                 match cmd {
                     Some(Command::Send(text)) => {
-                        let _ = handle.send(&text);
+                        if let Err(err) = handle.send(&text) {
+                            eprintln!("session {task_run_id}: failed to deliver message, process already gone: {err}");
+                        }
                         *last_activity.lock().await = Utc::now();
                     }
                     Some(Command::Close) => {
@@ -346,8 +352,24 @@ async fn drain_session(
             }
         }
     }
-    let _ = handle.wait().await;
-    let _ = task_runs::update_status(pool, task_run_id, TaskRunStatus::Idle, None).await;
+    // A clean exit (reaper-driven close, or a one-shot agent_turn stage
+    // finishing on its own) goes to `idle`, ready to resume. A crash,
+    // auth failure, or signal kill goes to `exited` instead — otherwise
+    // a deterministic failure would just get resumed into the same
+    // crash forever, never reaching a terminal state.
+    let exit_status = handle.wait().await;
+    let clean_exit = matches!(&exit_status, Ok(status) if status.success());
+    if let Err(err) = &exit_status {
+        eprintln!("session {task_run_id}: failed to reap subprocess: {err}");
+    }
+    let (final_status, ended_at) = if clean_exit {
+        (TaskRunStatus::Idle, None)
+    } else {
+        (TaskRunStatus::Exited, Some(Utc::now()))
+    };
+    if let Err(err) = task_runs::update_status(pool, task_run_id, final_status, ended_at).await {
+        eprintln!("session {task_run_id}: failed to update status after drain: {err}");
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +455,27 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         panic!("timed out waiting for status {expected:?}");
+    }
+
+    #[tokio::test]
+    async fn a_crashed_subprocess_is_recorded_as_exited_not_idle() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
+            "fake_claude_crash.py",
+        )));
+        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+
+        // A non-zero exit should land the run in `exited`, not the
+        // `idle` (resumable) state a clean reaper-driven close gets.
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Exited).await;
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert!(run.ended_at.is_some());
     }
 
     #[tokio::test]
