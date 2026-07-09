@@ -121,6 +121,36 @@ pub async fn update_status(
     Ok(row.map(Into::into))
 }
 
+/// Daemon-restart recovery (§4.3): any run left `active` in the DB when
+/// the daemon starts is dead — its process is gone. A run with a
+/// persisted `session_id` is flipped to `idle`, ready to `resume` on the
+/// next message. A run that crashed before its first `SessionMeta` ever
+/// arrived has no `session_id` to resume from, so it's flipped straight
+/// to `exited` instead — landing it in `idle` would strand it in a state
+/// `send_message` can never recover from. Call once at startup before
+/// any `SessionManager` use.
+pub async fn recover_stale_active_runs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let idled =
+        sqlx::query("UPDATE task_runs SET status = ? WHERE status = ? AND session_id IS NOT NULL")
+            .bind(TaskRunStatus::Idle.to_string())
+            .bind(TaskRunStatus::Active.to_string())
+            .execute(pool)
+            .await?
+            .rows_affected();
+
+    let exited = sqlx::query(
+        "UPDATE task_runs SET status = ?, ended_at = ? WHERE status = ? AND session_id IS NULL",
+    )
+    .bind(TaskRunStatus::Exited.to_string())
+    .bind(Utc::now())
+    .bind(TaskRunStatus::Active.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(idled + exited)
+}
+
 pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM task_runs WHERE id = ?")
         .bind(id)
@@ -198,5 +228,79 @@ mod tests {
 
         assert!(delete(&pool, &created.id).await.unwrap());
         assert!(get(&pool, &created.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recover_stale_active_runs_flips_active_to_idle_and_leaves_others_alone() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+        let new_run = || NewTaskRun {
+            task_id: &task_id,
+            stage: "chatting",
+            role: "chat",
+            cli_adapter: "claude",
+            model: "sonnet",
+        };
+
+        let active = create(&pool, new_run()).await.unwrap();
+        set_session_id(&pool, &active.id, "sess-active")
+            .await
+            .unwrap();
+        let already_idle = create(&pool, new_run()).await.unwrap();
+        update_status(&pool, &already_idle.id, TaskRunStatus::Idle, None)
+            .await
+            .unwrap();
+        let exited = create(&pool, new_run()).await.unwrap();
+        update_status(&pool, &exited.id, TaskRunStatus::Exited, Some(Utc::now()))
+            .await
+            .unwrap();
+
+        let recovered = recover_stale_active_runs(&pool).await.unwrap();
+        assert_eq!(recovered, 1);
+
+        assert_eq!(
+            get(&pool, &active.id).await.unwrap().unwrap().status,
+            TaskRunStatus::Idle
+        );
+        assert_eq!(
+            get(&pool, &already_idle.id).await.unwrap().unwrap().status,
+            TaskRunStatus::Idle
+        );
+        assert_eq!(
+            get(&pool, &exited.id).await.unwrap().unwrap().status,
+            TaskRunStatus::Exited
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_stale_active_runs_exits_runs_that_never_got_a_session_id() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+
+        // Simulates a daemon crash before the CLI's first SessionMeta
+        // event ever arrived: still `active`, session_id is still NULL.
+        let crashed_before_session = create(
+            &pool,
+            NewTaskRun {
+                task_id: &task_id,
+                stage: "chatting",
+                role: "chat",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap();
+        assert!(crashed_before_session.session_id.is_none());
+
+        let recovered = recover_stale_active_runs(&pool).await.unwrap();
+        assert_eq!(recovered, 1);
+
+        let run = get(&pool, &crashed_before_session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, TaskRunStatus::Exited);
+        assert!(run.ended_at.is_some());
     }
 }
