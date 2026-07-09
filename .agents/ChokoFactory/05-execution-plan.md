@@ -2,18 +2,18 @@
 
 Dependency-graph analysis of the open GitHub issues (`itsypkin/ChocoFactory`),
 grouped into waves of work that can proceed in parallel. Derived from each
-issue's `Depends on:` line as of 2026-07-06. #1, #2, and #3 are already closed.
+issue's `Depends on:` line as of 2026-07-09. #1, #2, #3, and #5 are already
+closed.
 
 ## Dependency graph (open issues)
 
 | Issue | Title | Depends on |
 |---|---|---|
 | #4 | P1-4: Session lifecycle manager | #2 (closed), #3 (closed) |
-| #5 | P1-5: Event capture + retention job | #2 (closed), #3 (closed) |
 | #6 | P1-6: Workflow definition loader | #1 (closed) |
 | #7 | P1-7: Workflow engine core (Phase-1 stage kinds) | #2, #4, #6 |
 | #8 | P1-8: Built-in chat workflow | #7 |
-| #9 | P1-9: HTTP/WS API layer | #2, #4, #5, #8 |
+| #9 | P1-9: HTTP/WS API layer | #2, #4, #5 (closed), #8 |
 | #10 | P1-10: choco CLI | #9 |
 | #11 | P1-11: Web UI — navigation, live chat, event timeline | #9 |
 | #12 | P2-1: shell stage kind | #7 |
@@ -31,7 +31,7 @@ Each wave can be worked on concurrently once the previous wave completes.
 
 | Wave | Issues | Unblocked by |
 |---|---|---|
-| 1 | #4, #5, #6, #16 | #1/#2/#3 (already closed) — ready to start now |
+| 1 | #4, #6, #16 | #1/#2/#3 (already closed) — ready to start now (#5, also in this wave, is already done) |
 | 2 | #7 | #4 and #6 |
 | 3 | #8, #12, #13, #15 | #7 |
 | 4 | #9, #17, #14 | #8 (for #9, #17); #12+#13 (for #14) |
@@ -50,5 +50,8 @@ Each wave can be worked on concurrently once the previous wave completes.
 - **Critical path** (longest chain, bounds minimum total time regardless of
   parallelism): #4 → #7 → #8 → (#9/#17 or #12/#13/#14) → (#10 or #18)
   → #19 — roughly 6 sequential steps.
-- With 4 available workstreams, #4, #5, #6, and #16 can be picked up
-  simultaneously right now.
+- **#5 (Event capture) closed** without waiting on #4 (Session lifecycle),
+  confirming they were correctly independent, parallel wave-1 work — #4
+  simply took longer.
+- With 3 remaining workstreams, #4, #6, and #16 can be picked up
+  simultaneously right now (#5 is already done).
