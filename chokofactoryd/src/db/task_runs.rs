@@ -122,16 +122,33 @@ pub async fn update_status(
 }
 
 /// Daemon-restart recovery (§4.3): any run left `active` in the DB when
-/// the daemon starts is dead — its process is gone — so it's flipped to
-/// `idle` using its already-persisted `session_id`, ready to `resume` on
-/// the next message. Call once at startup before any `SessionManager` use.
+/// the daemon starts is dead — its process is gone. A run with a
+/// persisted `session_id` is flipped to `idle`, ready to `resume` on the
+/// next message. A run that crashed before its first `SessionMeta` ever
+/// arrived has no `session_id` to resume from, so it's flipped straight
+/// to `exited` instead — landing it in `idle` would strand it in a state
+/// `send_message` can never recover from. Call once at startup before
+/// any `SessionManager` use.
 pub async fn recover_stale_active_runs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("UPDATE task_runs SET status = ? WHERE status = ?")
-        .bind(TaskRunStatus::Idle.to_string())
-        .bind(TaskRunStatus::Active.to_string())
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
+    let idled =
+        sqlx::query("UPDATE task_runs SET status = ? WHERE status = ? AND session_id IS NOT NULL")
+            .bind(TaskRunStatus::Idle.to_string())
+            .bind(TaskRunStatus::Active.to_string())
+            .execute(pool)
+            .await?
+            .rows_affected();
+
+    let exited = sqlx::query(
+        "UPDATE task_runs SET status = ?, ended_at = ? WHERE status = ? AND session_id IS NULL",
+    )
+    .bind(TaskRunStatus::Exited.to_string())
+    .bind(Utc::now())
+    .bind(TaskRunStatus::Active.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(idled + exited)
 }
 
 pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
@@ -226,6 +243,9 @@ mod tests {
         };
 
         let active = create(&pool, new_run()).await.unwrap();
+        set_session_id(&pool, &active.id, "sess-active")
+            .await
+            .unwrap();
         let already_idle = create(&pool, new_run()).await.unwrap();
         update_status(&pool, &already_idle.id, TaskRunStatus::Idle, None)
             .await
@@ -250,5 +270,37 @@ mod tests {
             get(&pool, &exited.id).await.unwrap().unwrap().status,
             TaskRunStatus::Exited
         );
+    }
+
+    #[tokio::test]
+    async fn recover_stale_active_runs_exits_runs_that_never_got_a_session_id() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+
+        // Simulates a daemon crash before the CLI's first SessionMeta
+        // event ever arrived: still `active`, session_id is still NULL.
+        let crashed_before_session = create(
+            &pool,
+            NewTaskRun {
+                task_id: &task_id,
+                stage: "chatting",
+                role: "chat",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap();
+        assert!(crashed_before_session.session_id.is_none());
+
+        let recovered = recover_stale_active_runs(&pool).await.unwrap();
+        assert_eq!(recovered, 1);
+
+        let run = get(&pool, &crashed_before_session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, TaskRunStatus::Exited);
+        assert!(run.ended_at.is_some());
     }
 }

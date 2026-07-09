@@ -216,7 +216,15 @@ impl SessionManager {
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            drain_session(&manager.pool, &task_run_id, handle, cmd_rx, last_activity).await;
+            drain_session(
+                &manager.pool,
+                &task_run_id,
+                handle,
+                cmd_rx,
+                last_activity,
+                manager.idle_timeout,
+            )
+            .await;
             manager.sessions.lock().await.remove(&task_run_id);
         });
     }
@@ -247,15 +255,27 @@ impl SessionManager {
     }
 
     async fn reap_idle_sessions(&self) {
+        // Snapshot the live senders/activity handles and release the map
+        // lock before awaiting each one, so a reap pass doesn't serialize
+        // `start`/`send_message` behind however long that takes.
+        let snapshot: Vec<_> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .values()
+                .filter_map(|slot| match slot {
+                    SessionSlot::Live(session) => {
+                        Some((session.cmd_tx.clone(), Arc::clone(&session.last_activity)))
+                    }
+                    SessionSlot::Establishing => None,
+                })
+                .collect()
+        };
+
         let now = Utc::now();
-        let sessions = self.sessions.lock().await;
-        for slot in sessions.values() {
-            let SessionSlot::Live(session) = slot else {
-                continue;
-            };
-            let last_activity = *session.last_activity.lock().await;
+        for (cmd_tx, last_activity) in snapshot {
+            let last_activity = *last_activity.lock().await;
             if now - last_activity >= self.idle_timeout {
-                let _ = session.cmd_tx.send(Command::Close);
+                let _ = cmd_tx.send(Command::Close);
             }
         }
     }
@@ -273,6 +293,7 @@ async fn drain_session(
     mut handle: AgentHandle,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     last_activity: Arc<Mutex<DateTime<Utc>>>,
+    idle_timeout: chrono::Duration,
 ) {
     // Once `cmd_rx` closes, `recv()` resolves to `None` immediately on
     // every poll — stop selecting on it (rather than matching `None`
@@ -288,6 +309,13 @@ async fn drain_session(
                             let _ = task_runs::set_session_id(pool, task_run_id, session_id).await;
                         }
                         let _ = events::append(pool, task_run_id, event.event_type(), event.payload()).await;
+                        // Any drained output counts as activity, not just
+                        // inbound `Send`s — broader than §4.1's "no input"
+                        // wording, but it's what keeps a mid-turn session
+                        // from being reaped out from under itself. A
+                        // runaway agent that only ever emits and never
+                        // finishes its turn is §5.3's loop-guard's job to
+                        // catch, not the idle reaper's.
                         *last_activity.lock().await = Utc::now();
                     }
                     None => break,
@@ -300,7 +328,16 @@ async fn drain_session(
                         *last_activity.lock().await = Utc::now();
                     }
                     Some(Command::Close) => {
-                        handle.close_stdin();
+                        // Re-check freshness at the moment this is
+                        // actually processed, not when the reaper decided
+                        // it: a `Send` (and its last_activity bump) can
+                        // land in the queue behind this Close before it's
+                        // dequeued, and closing anyway would silently
+                        // drop that message once stdin is gone.
+                        let stale = Utc::now() - *last_activity.lock().await >= idle_timeout;
+                        if stale {
+                            handle.close_stdin();
+                        }
                     }
                     None => {
                         cmd_open = false;
@@ -468,6 +505,43 @@ mod tests {
 
         let stored = wait_until_events_len(&pool, &task_run_id, 2).await;
         assert_eq!(stored[1].payload["text"], "echo:hello again");
+    }
+
+    #[tokio::test]
+    async fn a_send_queued_behind_a_stale_reaper_close_is_not_dropped() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        // A real timeout, so last_activity looks fresh once the queued
+        // Close below is actually dequeued and re-checked.
+        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+        wait_until_events_len(&pool, &task_run_id, 2).await;
+
+        // Simulate the reaper enqueueing a Close based on a stale read of
+        // last_activity, taken before the send_message below bumps it -
+        // reproduces the ordering from the review finding without
+        // depending on real scheduler timing.
+        {
+            let sessions = manager.sessions.lock().await;
+            let Some(SessionSlot::Live(session)) = sessions.get(&task_run_id) else {
+                panic!("session should be live");
+            };
+            session.cmd_tx.send(Command::Close).unwrap();
+        }
+
+        manager
+            .send_message(&task_run_id, "again", &role_config())
+            .await
+            .unwrap();
+
+        let stored = wait_until_events_len(&pool, &task_run_id, 3).await;
+        assert_eq!(stored[2].payload["text"], "echo:again");
     }
 
     #[tokio::test]
