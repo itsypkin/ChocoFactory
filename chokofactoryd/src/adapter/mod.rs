@@ -162,6 +162,15 @@ impl AgentHandle {
             .map_err(|_| AdapterError::ProcessExited)
     }
 
+    /// Closes the subprocess's stdin, signaling end-of-input so the CLI
+    /// finishes its current turn and exits on its own (§4.1 step 2 — idle
+    /// teardown). Does not kill the process; keep draining `recv` until it
+    /// returns `None`, then `wait` to reap it.
+    pub fn close_stdin(&mut self) {
+        let (dummy_tx, _dummy_rx) = mpsc::unbounded_channel();
+        self.stdin_tx = dummy_tx;
+    }
+
     /// Waits for the underlying process to exit, reaping it.
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await

@@ -121,6 +121,19 @@ pub async fn update_status(
     Ok(row.map(Into::into))
 }
 
+/// Daemon-restart recovery (§4.3): any run left `active` in the DB when
+/// the daemon starts is dead — its process is gone — so it's flipped to
+/// `idle` using its already-persisted `session_id`, ready to `resume` on
+/// the next message. Call once at startup before any `SessionManager` use.
+pub async fn recover_stale_active_runs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("UPDATE task_runs SET status = ? WHERE status = ?")
+        .bind(TaskRunStatus::Idle.to_string())
+        .bind(TaskRunStatus::Active.to_string())
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM task_runs WHERE id = ?")
         .bind(id)
@@ -198,5 +211,44 @@ mod tests {
 
         assert!(delete(&pool, &created.id).await.unwrap());
         assert!(get(&pool, &created.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recover_stale_active_runs_flips_active_to_idle_and_leaves_others_alone() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+        let new_run = || NewTaskRun {
+            task_id: &task_id,
+            stage: "chatting",
+            role: "chat",
+            cli_adapter: "claude",
+            model: "sonnet",
+        };
+
+        let active = create(&pool, new_run()).await.unwrap();
+        let already_idle = create(&pool, new_run()).await.unwrap();
+        update_status(&pool, &already_idle.id, TaskRunStatus::Idle, None)
+            .await
+            .unwrap();
+        let exited = create(&pool, new_run()).await.unwrap();
+        update_status(&pool, &exited.id, TaskRunStatus::Exited, Some(Utc::now()))
+            .await
+            .unwrap();
+
+        let recovered = recover_stale_active_runs(&pool).await.unwrap();
+        assert_eq!(recovered, 1);
+
+        assert_eq!(
+            get(&pool, &active.id).await.unwrap().unwrap().status,
+            TaskRunStatus::Idle
+        );
+        assert_eq!(
+            get(&pool, &already_idle.id).await.unwrap().unwrap().status,
+            TaskRunStatus::Idle
+        );
+        assert_eq!(
+            get(&pool, &exited.id).await.unwrap().unwrap().status,
+            TaskRunStatus::Exited
+        );
     }
 }
