@@ -20,7 +20,16 @@ pub struct SessionManager {
     pool: SqlitePool,
     adapter: Arc<dyn AgentAdapter>,
     idle_timeout: chrono::Duration,
-    sessions: Mutex<HashMap<String, ActiveSession>>,
+    sessions: Mutex<HashMap<String, SessionSlot>>,
+}
+
+/// A `sessions` map entry: reserved while a process is being spawned or
+/// resumed (so a concurrent caller can't also try to establish one for
+/// the same `task_run_id`), then promoted to `Live` once the drain task
+/// is actually running.
+enum SessionSlot {
+    Establishing,
+    Live(ActiveSession),
 }
 
 struct ActiveSession {
@@ -37,6 +46,9 @@ enum Command {
 pub enum SessionError {
     UnknownTaskRun,
     NotResumable(TaskRunStatus),
+    /// Another call is already spawning or resuming a process for this
+    /// `task_run_id`. The caller can retry once that settles.
+    AlreadyStarting,
     Adapter(AdapterError),
     Db(sqlx::Error),
 }
@@ -47,6 +59,12 @@ impl fmt::Display for SessionError {
             SessionError::UnknownTaskRun => write!(f, "no such task run"),
             SessionError::NotResumable(status) => {
                 write!(f, "task run is {status} and has no session to resume")
+            }
+            SessionError::AlreadyStarting => {
+                write!(
+                    f,
+                    "a session for this task run is already being established"
+                )
             }
             SessionError::Adapter(err) => write!(f, "{err}"),
             SessionError::Db(err) => write!(f, "{err}"),
@@ -94,10 +112,15 @@ impl SessionManager {
         prompt: &str,
         cfg: &RoleConfig,
     ) -> Result<(), SessionError> {
-        let handle = self
-            .adapter
-            .start(prompt, cfg)
-            .map_err(SessionError::Adapter)?;
+        self.reserve(task_run_id).await?;
+
+        let handle = match self.adapter.start(prompt, cfg) {
+            Ok(handle) => handle,
+            Err(err) => {
+                self.sessions.lock().await.remove(task_run_id);
+                return Err(SessionError::Adapter(err));
+            }
+        };
         self.spawn_drain(task_run_id.to_string(), handle).await;
         Ok(())
     }
@@ -114,13 +137,17 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         {
             let sessions = self.sessions.lock().await;
-            if let Some(session) = sessions.get(task_run_id) {
-                *session.last_activity.lock().await = Utc::now();
-                session
-                    .cmd_tx
-                    .send(Command::Send(text.to_string()))
-                    .map_err(|_| SessionError::UnknownTaskRun)?;
-                return Ok(());
+            match sessions.get(task_run_id) {
+                Some(SessionSlot::Live(session)) => {
+                    *session.last_activity.lock().await = Utc::now();
+                    session
+                        .cmd_tx
+                        .send(Command::Send(text.to_string()))
+                        .map_err(|_| SessionError::UnknownTaskRun)?;
+                    return Ok(());
+                }
+                Some(SessionSlot::Establishing) => return Err(SessionError::AlreadyStarting),
+                None => {}
             }
         }
 
@@ -128,34 +155,63 @@ impl SessionManager {
             .await
             .map_err(SessionError::Db)?
             .ok_or(SessionError::UnknownTaskRun)?;
-        let Some(session_id) = task_run.session_id.as_deref() else {
+        let Some(session_id) = task_run.session_id.clone() else {
             return Err(SessionError::NotResumable(task_run.status));
         };
         if task_run.status == TaskRunStatus::Exited {
             return Err(SessionError::NotResumable(task_run.status));
         }
 
-        let handle = self
-            .adapter
-            .resume(session_id, text, cfg)
-            .map_err(SessionError::Adapter)?;
-        task_runs::update_status(&self.pool, task_run_id, TaskRunStatus::Active, None)
-            .await
-            .map_err(SessionError::Db)?;
+        // Re-checked atomically here (rather than trusting the read
+        // above): two concurrent calls for the same not-yet-live
+        // task_run_id can both reach this point, but only one of them
+        // wins the reservation. The loser reports AlreadyStarting instead
+        // of also resuming, which would otherwise spawn a duplicate
+        // process and corrupt this map (§ review on PR #28).
+        self.reserve(task_run_id).await?;
+
+        let handle = match self.adapter.resume(&session_id, text, cfg) {
+            Ok(handle) => handle,
+            Err(err) => {
+                self.sessions.lock().await.remove(task_run_id);
+                return Err(SessionError::Adapter(err));
+            }
+        };
+        if let Err(err) =
+            task_runs::update_status(&self.pool, task_run_id, TaskRunStatus::Active, None).await
+        {
+            self.sessions.lock().await.remove(task_run_id);
+            return Err(SessionError::Db(err));
+        }
         self.spawn_drain(task_run_id.to_string(), handle).await;
         Ok(())
     }
 
+    /// Atomically claims `task_run_id`'s map slot for a caller about to
+    /// spawn or resume a process, failing if another caller already holds
+    /// it (whether `Establishing` or already `Live`).
+    async fn reserve(&self, task_run_id: &str) -> Result<(), SessionError> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(task_run_id) {
+            return Err(SessionError::AlreadyStarting);
+        }
+        sessions.insert(task_run_id.to_string(), SessionSlot::Establishing);
+        Ok(())
+    }
+
+    /// Promotes `task_run_id`'s reserved slot to `Live` and spawns the
+    /// task that drains `handle`. Only the caller that won `reserve`
+    /// reaches this, so the `insert` here can't race another spawn.
     async fn spawn_drain(self: &Arc<Self>, task_run_id: String, handle: AgentHandle) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let last_activity = Arc::new(Mutex::new(Utc::now()));
 
         self.sessions.lock().await.insert(
             task_run_id.clone(),
-            ActiveSession {
+            SessionSlot::Live(ActiveSession {
                 cmd_tx,
                 last_activity: Arc::clone(&last_activity),
-            },
+            }),
         );
 
         let manager = Arc::clone(self);
@@ -193,7 +249,10 @@ impl SessionManager {
     async fn reap_idle_sessions(&self) {
         let now = Utc::now();
         let sessions = self.sessions.lock().await;
-        for session in sessions.values() {
+        for slot in sessions.values() {
+            let SessionSlot::Live(session) = slot else {
+                continue;
+            };
             let last_activity = *session.last_activity.lock().await;
             if now - last_activity >= self.idle_timeout {
                 let _ = session.cmd_tx.send(Command::Close);
@@ -215,6 +274,11 @@ async fn drain_session(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     last_activity: Arc<Mutex<DateTime<Utc>>>,
 ) {
+    // Once `cmd_rx` closes, `recv()` resolves to `None` immediately on
+    // every poll — stop selecting on it (rather than matching `None`
+    // inside the loop) so a closed channel can't spin the select! in a
+    // tight busy-loop while we wait out the remaining `handle.recv()`s.
+    let mut cmd_open = true;
     loop {
         tokio::select! {
             event = handle.recv() => {
@@ -229,14 +293,17 @@ async fn drain_session(
                     None => break,
                 }
             }
-            cmd = cmd_rx.recv() => {
+            cmd = cmd_rx.recv(), if cmd_open => {
                 match cmd {
                     Some(Command::Send(text)) => {
                         let _ = handle.send(&text);
                         *last_activity.lock().await = Utc::now();
                     }
-                    Some(Command::Close) | None => {
+                    Some(Command::Close) => {
                         handle.close_stdin();
+                    }
+                    None => {
+                        cmd_open = false;
                     }
                 }
             }
@@ -426,6 +493,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_message_rejects_a_concurrent_establish_for_the_same_task_run() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        task_runs::set_session_id(&pool, &task_run_id, "fixed-session-id")
+            .await
+            .unwrap();
+        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None)
+            .await
+            .unwrap();
+
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+
+        // Simulate another in-flight call that already claimed the slot
+        // between send_message's optimistic map check and its DB read.
+        manager.reserve(&task_run_id).await.unwrap();
+
+        let err = manager
+            .send_message(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::AlreadyStarting));
+    }
+
+    #[tokio::test]
+    async fn send_message_resumes_a_session_the_reaper_previously_idled() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        // Zero timeout: the reaper closes the session on its first pass.
+        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::zero());
+
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+        wait_until_events_len(&pool, &task_run_id, 2).await;
+
+        manager
+            .run_idle_reaper_loop(
+                &IdleReaperConfig {
+                    interval: StdDuration::from_millis(1),
+                },
+                Some(1),
+            )
+            .await;
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+
+        manager
+            .send_message(&task_run_id, "again", &role_config())
+            .await
+            .unwrap();
+
+        // The resumed process is a fresh subprocess too, so it emits its
+        // own SessionMeta (event 3) before the AssistantMessage (event 4).
+        let stored = wait_until_events_len(&pool, &task_run_id, 4).await;
+        assert_eq!(stored[3].payload["text"], "echo:again");
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, TaskRunStatus::Active);
+    }
+
+    #[tokio::test]
     async fn idle_reaper_closes_sessions_past_the_idle_timeout() {
         let pool = connect_in_memory().await.unwrap();
         let task_run_id = seed_task_run(&pool).await;
@@ -450,5 +581,35 @@ mod tests {
             .await;
 
         wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_leaves_sessions_within_the_idle_timeout_active() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+        wait_until_events_len(&pool, &task_run_id, 2).await;
+
+        manager
+            .run_idle_reaper_loop(
+                &IdleReaperConfig {
+                    interval: StdDuration::from_millis(1),
+                },
+                Some(1),
+            )
+            .await;
+
+        // Give an incorrect teardown a moment to land before asserting
+        // the run is still active.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, TaskRunStatus::Active);
     }
 }
