@@ -272,3 +272,4 @@ Milestones: [Phase 1 — Chat MVP](https://github.com/itsypkin/ChocoFactory/mile
 | P2-6  | [#17](https://github.com/itsypkin/ChocoFactory/issues/17) |
 | P2-7  | [#18](https://github.com/itsypkin/ChocoFactory/issues/18) |
 | P2-8  | [#19](https://github.com/itsypkin/ChocoFactory/issues/19) |
+| X-1   | [#32](https://github.com/itsypkin/ChocoFactory/issues/32) |
