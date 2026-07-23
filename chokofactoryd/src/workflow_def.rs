@@ -108,6 +108,12 @@ impl WorkflowDefinition {
                 });
             }
 
+            if matches!(stage.kind, StageKind::Terminal) && !stage.on.is_empty() {
+                return Err(WorkflowDefError::TerminalStageHasTransitions {
+                    stage: stage_name.clone(),
+                });
+            }
+
             for target in stage.on.values() {
                 if !self.stages.contains_key(target) {
                     return Err(WorkflowDefError::UnknownStageTarget {
@@ -544,6 +550,9 @@ pub enum WorkflowDefError {
         pattern: String,
         reason: String,
     },
+    TerminalStageHasTransitions {
+        stage: String,
+    },
 }
 
 impl fmt::Display for WorkflowDefError {
@@ -611,6 +620,10 @@ impl fmt::Display for WorkflowDefError {
             } => write!(
                 f,
                 "stage '{stage}' has an invalid poll outcome pattern '{pattern}': {reason}"
+            ),
+            WorkflowDefError::TerminalStageHasTransitions { stage } => write!(
+                f,
+                "stage '{stage}' is a terminal stage but declares 'on:' transitions, which can never run"
             ),
         }
     }
@@ -815,7 +828,7 @@ stages:
 name: broken
 stages:
   only:
-    kind: terminal
+    kind: human_gate
     on: { done: nowhere }
 "#;
         let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
@@ -1097,6 +1110,66 @@ stages:
         assert!(matches!(
             err,
             WorkflowDefError::InvalidFileReference { field, .. } if field == "prompt_file"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_role_system_prompt_file_path_that_escapes_the_definition_dir() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+    system_prompt_file: "../../../../etc/passwd"
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidFileReference { field, .. } if field == "system_prompt_file"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_script_file_path_that_escapes_the_definition_dir() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  run:
+    kind: shell
+    script_file: "../../../../etc/passwd"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidFileReference { field, .. } if field == "script_file"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_terminal_stage_with_on_transitions() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  done:
+    kind: terminal
+    on: { resumed: done }
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::TerminalStageHasTransitions { stage } if stage == "done"
         ));
     }
 
