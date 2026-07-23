@@ -215,6 +215,37 @@ from Phase 1.
 - Design ref: §6.2
 - Depends on: P1-10, P2-7
 
+## Additive — not gated by phase
+
+### X-1. ACP adapter spike
+
+Prototype an `AcpAdapter` implementing the existing `AgentAdapter` trait
+(§4) against the Agent Client Protocol instead of parsing a CLI's native
+stream directly. Use the official `claude-code-acp` bridge as the first
+target. Scope:
+
+1. Spawn/speak to the bridge over JSON-RPC (`session/new`, `session/prompt`),
+   and translate `session/update` notifications into `AgentEvent`s (§4.2,
+   §4.5) — reuse the same enum `ClaudeAdapter` already targets, so this
+   is a drop-in alternative, not a new event shape.
+2. Validate `session/load`/`session/resume` actually satisfies §4.1's
+   idle→resume cycle (close, persist session id, reopen on next message)
+   the same way `--resume <id>` does today.
+3. Note operational overhead (Node dependency, extra process hop) versus
+   the current direct-subprocess approach.
+4. Write up a go/no-go recommendation: adopt `AcpAdapter` as the primary
+   Claude transport, keep both behind a config flag, or drop it and stay
+   with direct `stream-json` parsing.
+
+Implementing full production support (replacing/complementing
+`ClaudeAdapter`, adding Codex/Gemini via the same `AcpAdapter`) is a
+follow-up task scoped after this spike's findings — not pre-planned here
+since it's conditional on the go/no-go call.
+
+- Design ref: §4.5
+- Depends on: P1-3 (needs the shipped `AgentAdapter` trait/`AgentEvent`
+  enum to prototype against)
+
 ## GitHub issue mapping
 
 Milestones: [Phase 1 — Chat MVP](https://github.com/itsypkin/ChocoFactory/milestone/1),
@@ -241,3 +272,4 @@ Milestones: [Phase 1 — Chat MVP](https://github.com/itsypkin/ChocoFactory/mile
 | P2-6  | [#17](https://github.com/itsypkin/ChocoFactory/issues/17) |
 | P2-7  | [#18](https://github.com/itsypkin/ChocoFactory/issues/18) |
 | P2-8  | [#19](https://github.com/itsypkin/ChocoFactory/issues/19) |
+| X-1   | [#32](https://github.com/itsypkin/ChocoFactory/issues/32) |
