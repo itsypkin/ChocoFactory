@@ -131,7 +131,7 @@ impl WorkflowDefinition {
                     });
                 }
                 if !self.stages.contains_key(&guard.then) {
-                    return Err(WorkflowDefError::UnknownStageTarget {
+                    return Err(WorkflowDefError::UnknownLoopGuardTarget {
                         stage: stage_name.clone(),
                         target: guard.then.clone(),
                     });
@@ -271,9 +271,49 @@ pub struct LoopGuard {
 #[derive(Debug, Deserialize)]
 struct RawDefinition {
     name: String,
-    #[serde(default)]
-    roles: HashMap<String, RawRole>,
+    #[serde(default, deserialize_with = "deserialize_map_rejecting_duplicate_keys")]
+    roles: IndexMap<String, RawRole>,
+    #[serde(deserialize_with = "deserialize_map_rejecting_duplicate_keys")]
     stages: IndexMap<String, RawStage>,
+}
+
+/// `serde_yaml`'s map deserialization (like most `Deserialize` map impls)
+/// just inserts each key as it's read, so a YAML mapping with a repeated
+/// key — a copy-pasted stage/role name — silently keeps only the last
+/// entry instead of erroring. That's exactly the kind of authoring typo
+/// this loader exists to catch at load time, so entries are read one at a
+/// time here and a repeat key is rejected instead of silently overwriting.
+fn deserialize_map_rejecting_duplicate_keys<'de, D, T>(
+    deserializer: D,
+) -> Result<IndexMap<String, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Visitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
+        type Value = IndexMap<String, T>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map with unique keys")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut result = IndexMap::new();
+            while let Some((key, value)) = map.next_entry::<String, T>()? {
+                if result.insert(key.clone(), value).is_some() {
+                    return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    deserializer.deserialize_map(Visitor(std::marker::PhantomData))
 }
 
 #[derive(Debug, Deserialize)]
@@ -516,6 +556,10 @@ pub enum WorkflowDefError {
         stage: String,
         outcome: String,
     },
+    UnknownLoopGuardTarget {
+        stage: String,
+        target: String,
+    },
     NoReachableSink,
     MissingReferencedFile {
         owner: String,
@@ -571,6 +615,10 @@ impl fmt::Display for WorkflowDefError {
             WorkflowDefError::UnknownLoopGuardOutcome { stage, outcome } => write!(
                 f,
                 "stage '{stage}' has a loop_guard on outcome '{outcome}', which is not in its 'on:' map"
+            ),
+            WorkflowDefError::UnknownLoopGuardTarget { stage, target } => write!(
+                f,
+                "stage '{stage}' has a loop_guard 'then' target of unknown stage '{target}'"
             ),
             WorkflowDefError::NoReachableSink => write!(
                 f,
@@ -913,6 +961,25 @@ stages:
     }
 
     #[test]
+    fn rejects_a_loop_guard_then_target_of_an_unknown_stage() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  a:
+    kind: human_gate
+    on: { resumed: a }
+    loop_guard: { on: resumed, max: 3, then: nowhere }
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::UnknownLoopGuardTarget { stage, target }
+                if stage == "a" && target == "nowhere"
+        ));
+    }
+
+    #[test]
     fn rejects_a_missing_prompt_file() {
         let dir = TempDir::new();
         let yaml = r#"
@@ -1004,6 +1071,46 @@ stages:
         let yaml = "name: empty\nstages: {}\n";
         let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
         assert!(matches!(err, WorkflowDefError::NoStages));
+    }
+
+    #[test]
+    fn rejects_a_definition_with_a_duplicate_stage_key() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  done:
+    kind: terminal
+  done:
+    kind: human_gate
+    on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(err, WorkflowDefError::Yaml(_)));
+        assert!(err.to_string().contains("duplicate key"));
+    }
+
+    #[test]
+    fn rejects_a_definition_with_a_duplicate_role_key() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+  chat:
+    cli: codex
+    model: opus
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(err, WorkflowDefError::Yaml(_)));
+        assert!(err.to_string().contains("duplicate key"));
     }
 
     #[test]
