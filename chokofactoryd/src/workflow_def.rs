@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use indexmap::IndexMap;
+use regex::Regex;
 use serde::Deserialize;
 
 /// A parsed, validated workflow definition. `stages` preserves the YAML
@@ -130,6 +131,32 @@ impl WorkflowDefinition {
                     });
                 }
             }
+
+            if let StageKind::Poll {
+                timeout, outcomes, ..
+            } = &stage.kind
+            {
+                for outcome in outcomes {
+                    if !stage.on.contains_key(&outcome.then) {
+                        return Err(WorkflowDefError::UnknownPollOutcome {
+                            stage: stage_name.clone(),
+                            outcome: outcome.then.clone(),
+                        });
+                    }
+                    if let Err(reason) = Regex::new(&outcome.pattern) {
+                        return Err(WorkflowDefError::InvalidPollPattern {
+                            stage: stage_name.clone(),
+                            pattern: outcome.pattern.clone(),
+                            reason: reason.to_string(),
+                        });
+                    }
+                }
+                if timeout.is_some() && !stage.on.contains_key("timeout") {
+                    return Err(WorkflowDefError::MissingTimeoutOutcome {
+                        stage: stage_name.clone(),
+                    });
+                }
+            }
         }
 
         if !self.sink_reachable_from_start() {
@@ -228,7 +255,7 @@ pub struct PollOutcome {
     pub then: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LoopGuard {
     pub on: String,
     pub max: u32,
@@ -308,26 +335,6 @@ impl<'de> Deserialize<'de> for Capture {
                 "unsupported capture kind '{other}' (expected 'json')"
             ))),
         }
-    }
-}
-
-impl<'de> Deserialize<'de> for LoopGuard {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            on: String,
-            max: u32,
-            then: String,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        Ok(LoopGuard {
-            on: raw.on,
-            max: raw.max,
-            then: raw.then,
-        })
     }
 }
 
@@ -414,6 +421,7 @@ impl RawStage {
     }
 }
 
+#[derive(Clone, Copy)]
 enum RefOwner<'a> {
     Role(&'a str),
     Stage(&'a str),
@@ -423,19 +431,41 @@ enum RefOwner<'a> {
 /// exist on disk — a typo'd prompt/script path is exactly the kind of
 /// malformed definition this loader should catch at load time rather than
 /// leaving to fail deep inside a running task.
+///
+/// Rejects absolute paths and `..` components up front: without this, a
+/// `prompt_file`/`system_prompt_file`/`script_file` value could walk
+/// straight out of the definition's directory (e.g. `/etc/passwd` or
+/// `../../../../etc/passwd`), contradicting "resolved relative to the
+/// definition dir" and letting the daemon read/execute arbitrary files a
+/// workflow author (or generator) points it at.
 fn resolve_file(
     base_dir: &Path,
     relative: &str,
     owner: RefOwner<'_>,
     field: &'static str,
 ) -> Result<PathBuf, WorkflowDefError> {
-    let resolved = base_dir.join(relative);
+    let owner_label = || match owner {
+        RefOwner::Role(name) => format!("role '{name}'"),
+        RefOwner::Stage(name) => format!("stage '{name}'"),
+    };
+
+    let rel_path = Path::new(relative);
+    let escapes = rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if escapes {
+        return Err(WorkflowDefError::InvalidFileReference {
+            owner: owner_label(),
+            field,
+            value: relative.to_string(),
+        });
+    }
+
+    let resolved = base_dir.join(rel_path);
     if !resolved.is_file() {
         return Err(WorkflowDefError::MissingReferencedFile {
-            owner: match owner {
-                RefOwner::Role(name) => format!("role '{name}'"),
-                RefOwner::Stage(name) => format!("stage '{name}'"),
-            },
+            owner: owner_label(),
             field,
             path: resolved,
         });
@@ -447,15 +477,20 @@ fn resolve_file(
 /// (`30s`, `5m`, `1h`) — deliberately not pulling in a duration-parsing
 /// crate for a three-suffix format this small.
 fn parse_duration(s: &str) -> Result<Duration, String> {
-    let (digits, unit) = s.split_at(s.len().saturating_sub(1));
+    let mut chars = s.chars();
+    let unit = chars.next_back().ok_or_else(|| s.to_string())?;
+    let digits = chars.as_str();
     let amount: u64 = digits.parse().map_err(|_| s.to_string())?;
-    let multiplier = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
+    let multiplier: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
         _ => return Err(s.to_string()),
     };
-    Ok(Duration::from_secs(amount * multiplier))
+    let secs = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| s.to_string())?;
+    Ok(Duration::from_secs(secs))
 }
 
 #[derive(Debug)]
@@ -481,6 +516,11 @@ pub enum WorkflowDefError {
         field: &'static str,
         path: PathBuf,
     },
+    InvalidFileReference {
+        owner: String,
+        field: &'static str,
+        value: String,
+    },
     AmbiguousShellCommand {
         stage: String,
     },
@@ -491,6 +531,18 @@ pub enum WorkflowDefError {
         stage: String,
         field: &'static str,
         value: String,
+    },
+    UnknownPollOutcome {
+        stage: String,
+        outcome: String,
+    },
+    MissingTimeoutOutcome {
+        stage: String,
+    },
+    InvalidPollPattern {
+        stage: String,
+        pattern: String,
+        reason: String,
     },
 }
 
@@ -520,6 +572,14 @@ impl fmt::Display for WorkflowDefError {
                 "{owner} references {field} '{}', which does not exist",
                 path.display()
             ),
+            WorkflowDefError::InvalidFileReference {
+                owner,
+                field,
+                value,
+            } => write!(
+                f,
+                "{owner} references {field} '{value}', which is an absolute path or escapes the workflow definition's directory"
+            ),
             WorkflowDefError::AmbiguousShellCommand { stage } => write!(
                 f,
                 "stage '{stage}' sets both 'command' and 'script_file'; only one is allowed"
@@ -535,6 +595,22 @@ impl fmt::Display for WorkflowDefError {
             } => write!(
                 f,
                 "stage '{stage}' has an invalid {field} '{value}' (expected e.g. '30s', '5m', '1h')"
+            ),
+            WorkflowDefError::UnknownPollOutcome { stage, outcome } => write!(
+                f,
+                "stage '{stage}' has a poll outcome '{outcome}', which is not in its 'on:' map"
+            ),
+            WorkflowDefError::MissingTimeoutOutcome { stage } => write!(
+                f,
+                "stage '{stage}' sets a poll 'timeout' but has no 'timeout' key in its 'on:' map"
+            ),
+            WorkflowDefError::InvalidPollPattern {
+                stage,
+                pattern,
+                reason,
+            } => write!(
+                f,
+                "stage '{stage}' has an invalid poll outcome pattern '{pattern}': {reason}"
             ),
         }
     }
@@ -932,5 +1008,170 @@ stages:
         let dir = TempDir::new();
         let err = WorkflowDefinition::load(&dir.path.join("nope.yaml")).unwrap_err();
         assert!(matches!(err, WorkflowDefError::Io(_)));
+    }
+
+    #[test]
+    fn rejects_a_duration_with_a_non_ascii_unit_instead_of_panicking() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  waiting:
+    kind: poll
+    command: "true"
+    interval: "10°"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidDuration { stage, field, .. }
+                if stage == "waiting" && field == "interval"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_duration_that_would_overflow_instead_of_panicking() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  waiting:
+    kind: poll
+    command: "true"
+    interval: "9999999999999999h"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidDuration { stage, field, .. }
+                if stage == "waiting" && field == "interval"
+        ));
+    }
+
+    #[test]
+    fn rejects_an_absolute_prompt_file_path() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    prompt_file: /etc/passwd
+    on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidFileReference { field, .. } if field == "prompt_file"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_prompt_file_path_that_escapes_the_definition_dir() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    prompt_file: "../../../../etc/passwd"
+    on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidFileReference { field, .. } if field == "prompt_file"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_poll_outcome_not_present_in_the_on_map() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  waiting:
+    kind: poll
+    command: "true"
+    interval: 30s
+    outcomes:
+      - match: "^SUCCESS$"
+        then: succeeded
+    on: { success: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::UnknownPollOutcome { stage, outcome }
+                if stage == "waiting" && outcome == "succeeded"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_poll_timeout_with_no_timeout_key_in_on_map() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  waiting:
+    kind: poll
+    command: "true"
+    interval: 30s
+    timeout: 5m
+    outcomes:
+      - match: "^SUCCESS$"
+        then: success
+    on: { success: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::MissingTimeoutOutcome { stage } if stage == "waiting"
+        ));
+    }
+
+    #[test]
+    fn rejects_an_invalid_poll_pattern_regex() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  waiting:
+    kind: poll
+    command: "true"
+    interval: 30s
+    outcomes:
+      - match: "("
+        then: success
+    on: { success: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidPollPattern { stage, pattern, .. }
+                if stage == "waiting" && pattern == "("
+        ));
     }
 }
