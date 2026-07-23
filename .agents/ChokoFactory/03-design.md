@@ -173,6 +173,43 @@ Scheduled job (daily) deletes `events` rows older than 1 year (Q16).
 Runs off `events.created_at`; doesn't touch `tasks`/`task_runs` rows
 themselves, so task history/metadata outlives its detailed transcript.
 
+### 4.5 ACP as a candidate adapter transport (under evaluation)
+
+`ClaudeAdapter` (shipped, §8 P1-3) talks to `claude --print
+--output-format=stream-json` directly and hand-parses its native event
+stream. As of mid-2026, the **Agent Client Protocol** (ACP) — a JSON-RPC
+2.0 standard originated by Zed and co-maintained with JetBrains, now with
+a registry and adoption across Claude Code, Codex CLI, Gemini CLI, and
+GitHub Copilot CLI — offers a standardized alternative to this
+CLI-by-CLI parsing:
+
+- `session/new` / `session/load` / `session/resume` map onto §4.1's
+  active/idle/resume model as protocol-native operations rather than
+  per-CLI flag conventions (`--resume <id>` today).
+- `session/update` notification variants map close to 1:1 onto the
+  existing `AgentEvent` enum (§4.2): `ContentChunk` → `AssistantMessage`,
+  `ToolCallUpdate` → `ToolCall`/`ToolResult`, `ThinkingUpdate` →
+  `Thinking`. Adopting ACP would change what produces these events, not
+  the event shape itself or anything downstream (workflow engine, event
+  store, UI stay untouched).
+- `session/request_permission` gives a protocol-native tool-approval
+  hook — not needed for anything in scope today, but relevant if a
+  future stage kind wants mid-turn human approval.
+- The practical win is on the abstraction goal stated in §2/§4 itself:
+  one `AcpAdapter` implementation could replace N bespoke per-CLI stream
+  parsers, since Claude Code, Codex CLI, and Gemini CLI all now have ACP
+  support.
+
+Open questions before committing to this as more than an experiment:
+Claude Code's ACP support is a Node-based bridge package
+(`claude-code-acp`, built on the Claude Agent SDK) rather than the
+`claude` binary itself, adding a runtime dependency and a hop the direct
+`stream-json` approach doesn't have; Codex CLI's ACP support is
+described as a community bridge rather than first-party; and the
+protocol is roughly a year old and still evolving. `AgentAdapter` (§4)
+already isolates this behind a trait, so evaluating ACP is additive —
+see §8 for the spike task — not a rewrite of anything shipped.
+
 ## 5. Workflow Engine
 
 Per your steer: rather than hardcoding Type 1 and Type 3 as bespoke Rust
@@ -447,6 +484,9 @@ script would.
   substring/regex matches against command output plus an `on_timeout` —
   no boolean/arithmetic expression language, no access to arbitrary task
   state beyond `{{ stages.*.* }}` templating (§5.1).
+- **Switching the adapter transport to ACP** (§4.5) — evaluated as a
+  spike (§8), not committed. `ClaudeAdapter`'s direct `stream-json`
+  parsing stays as-is unless the spike's findings justify the change.
 
 ## 8. Phasing
 
@@ -463,3 +503,7 @@ script would.
   based commands, worktree manager.
 - **Phase 3+ (not planned yet)**: Type 2 (design doc), notifications,
   anything else in §7.
+- **ACP adapter spike** (§4.5): not gated on either phase — can run
+  alongside Phase 2 since it only needs P1-3's `AgentAdapter` trait/
+  `AgentEvent` shape to prototype against, and its outcome doesn't block
+  anything else shipped or planned.
