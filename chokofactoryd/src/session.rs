@@ -321,6 +321,16 @@ async fn drain_session(
             // event/exit first, so `last_activity`/the loop's own `break`
             // reflect the process's real state before `Close` is ever
             // considered.
+            //
+            // Trade-off accepted: a continuously-emitting turn (events
+            // always ready on every poll) could in principle delay
+            // `cmd_rx` — a `Send` or the reaper's `Close` — indefinitely,
+            // since the event branch always wins ties. This doesn't lose
+            // or corrupt anything (no missed `Close`, no wrong
+            // `end_reason`), only adds latency, and requires output with
+            // no gaps at all between chunks — not how these CLI adapters
+            // actually behave in practice — so it's judged acceptable
+            // over reintroducing the mislabeling race above.
             biased;
             event = handle.recv() => {
                 match event {

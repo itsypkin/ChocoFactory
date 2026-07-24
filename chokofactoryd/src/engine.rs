@@ -145,10 +145,24 @@ impl WorkflowEngine {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
 
-        let start = definition.start_stage();
-        workflow_state::create(&self.pool, task_id, start).await?;
-        self.enter_stage(task_id, definition, start, initial_input)
-            .await
+        let result: Result<(), EngineError> = async {
+            let start = definition.start_stage();
+            workflow_state::create(&self.pool, task_id, start).await?;
+            self.enter_stage(task_id, definition, start, initial_input)
+                .await
+        }
+        .await;
+        // Any error here means either nothing was written yet (nothing
+        // left to protect) or `workflow_state` was already durably
+        // committed before `enter_stage` ran (a fresh lock on a future
+        // call reads that same committed state correctly either way) — so
+        // it's always safe to evict rather than leaking this task's entry
+        // in `task_locks` after any failure, not just a successful
+        // terminal close (§ review on PR #35).
+        if result.is_err() {
+            self.task_locks.lock().await.remove(task_id);
+        }
+        result
     }
 
     /// Applies `outcome` against the task's current stage — looking it up
@@ -168,61 +182,72 @@ impl WorkflowEngine {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
 
-        let state = workflow_state::get(&self.pool, task_id)
-            .await?
-            .ok_or(EngineError::NoWorkflowState)?;
-        let from_stage = state.current_stage.clone();
-        let stage_def = definition
-            .stages
-            .get(&from_stage)
-            .ok_or_else(|| EngineError::UnknownStage(from_stage.clone()))?;
+        let result: Result<(), EngineError> =
+            async {
+                let state = workflow_state::get(&self.pool, task_id)
+                    .await?
+                    .ok_or(EngineError::NoWorkflowState)?;
+                let from_stage = state.current_stage.clone();
+                let stage_def = definition
+                    .stages
+                    .get(&from_stage)
+                    .ok_or_else(|| EngineError::UnknownStage(from_stage.clone()))?;
 
-        if matches!(stage_def.kind, StageKind::Terminal) {
-            return Err(EngineError::TerminalStageHasNoTransitions(from_stage));
-        }
+                if matches!(stage_def.kind, StageKind::Terminal) {
+                    return Err(EngineError::TerminalStageHasNoTransitions(from_stage));
+                }
 
-        let mut next_stage =
-            stage_def
-                .on
-                .get(outcome)
-                .cloned()
-                .ok_or_else(|| EngineError::UnknownOutcome {
-                    stage: from_stage.clone(),
-                    outcome: outcome.to_string(),
+                let mut next_stage = stage_def.on.get(outcome).cloned().ok_or_else(|| {
+                    EngineError::UnknownOutcome {
+                        stage: from_stage.clone(),
+                        outcome: outcome.to_string(),
+                    }
                 })?;
 
-        let mut loop_counters = state.loop_counters;
-        if let Some(guard) = &stage_def.loop_guard
-            && guard.on == outcome
-        {
-            let count = bump_loop_counter(&mut loop_counters, &from_stage);
-            if count > u64::from(guard.max) {
-                next_stage = guard.then.clone();
-                reset_loop_count(&mut loop_counters, &from_stage);
+                let mut loop_counters = state.loop_counters;
+                if let Some(guard) = &stage_def.loop_guard
+                    && guard.on == outcome
+                {
+                    let count = bump_loop_counter(&mut loop_counters, &from_stage);
+                    if count > u64::from(guard.max) {
+                        next_stage = guard.then.clone();
+                        reset_loop_count(&mut loop_counters, &from_stage);
+                    }
+                }
+                note_stage_entry(&mut loop_counters, definition, &next_stage, &from_stage);
+
+                let mut stage_history = match state.stage_history {
+                    Value::Array(entries) => entries,
+                    _ => Vec::new(),
+                };
+                stage_history.push(json!(from_stage));
+
+                workflow_state::update(
+                    &self.pool,
+                    task_id,
+                    workflow_state::WorkflowStateUpdate {
+                        current_stage: next_stage.clone(),
+                        loop_counters,
+                        stage_history: Value::Array(stage_history),
+                        payload: state.payload,
+                    },
+                )
+                .await?;
+
+                self.enter_stage(task_id, definition, &next_stage, None)
+                    .await
             }
+            .await;
+        // Same rationale as `start_task`'s eviction above: every error
+        // branch here either precedes any write (nothing to protect) or
+        // follows `workflow_state::update` already having durably
+        // committed (a fresh lock next time reads that same state
+        // correctly), so evicting unconditionally on failure is safe
+        // (§ review on PR #35).
+        if result.is_err() {
+            self.task_locks.lock().await.remove(task_id);
         }
-        note_stage_entry(&mut loop_counters, definition, &next_stage, &from_stage);
-
-        let mut stage_history = match state.stage_history {
-            Value::Array(entries) => entries,
-            _ => Vec::new(),
-        };
-        stage_history.push(json!(from_stage));
-
-        workflow_state::update(
-            &self.pool,
-            task_id,
-            workflow_state::WorkflowStateUpdate {
-                current_stage: next_stage.clone(),
-                loop_counters,
-                stage_history: Value::Array(stage_history),
-                payload: state.payload,
-            },
-        )
-        .await?;
-
-        self.enter_stage(task_id, definition, &next_stage, None)
-            .await
+        result
     }
 
     /// Dispatches the behavior for whichever kind `stage_name` is (§5.2).
@@ -676,6 +701,58 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
 
         engine.advance(&task_id, &def, "resumed").await.unwrap();
+
+        let locks = engine.task_locks.lock().await;
+        assert!(!locks.contains_key(&task_id));
+    }
+
+    #[tokio::test]
+    async fn advance_evicts_its_task_lock_even_when_it_errors() {
+        // Regression test for the review on PR #35: `task_locks` used to
+        // be evicted only on a successful terminal close, so an ordinary
+        // caller error (unknown outcome, unknown role, missing prompt
+        // file, etc.) left the entry leaked forever. Evicting on *any*
+        // error is safe here since it either precedes any write or
+        // follows one that already durably committed.
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine
+            .advance(&task_id, &def, "nonexistent")
+            .await
+            .unwrap_err();
+
+        let locks = engine.task_locks.lock().await;
+        assert!(!locks.contains_key(&task_id));
+    }
+
+    #[tokio::test]
+    async fn start_task_evicts_its_task_lock_when_entering_the_stage_fails() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: chat
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        // No prompt_file on the stage and no initial_input supplied here
+        // -> MissingAgentTurnInput, an enter_stage failure after
+        // workflow_state::create already committed.
+        engine.start_task(&task_id, &def, None).await.unwrap_err();
 
         let locks = engine.task_locks.lock().await;
         assert!(!locks.contains_key(&task_id));
