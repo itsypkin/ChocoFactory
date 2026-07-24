@@ -131,6 +131,15 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         initial_input: Option<&str>,
     ) -> Result<(), EngineError> {
+        // Takes the same per-task lock `advance()` uses (§ review on PR
+        // #35): nothing can call `advance()` before this creates
+        // `workflow_state` below, but holding it anyway removes the need
+        // to reason about that ordering as a standing invariant — e.g. a
+        // retry that calls `start_task` again while an earlier attempt is
+        // still mid-`enter_stage` can't race a concurrent `advance()`.
+        let lock = self.lock_for_task(task_id).await;
+        let _guard = lock.lock().await;
+
         let start = definition.start_stage();
         workflow_state::create(&self.pool, task_id, start).await?;
         self.enter_stage(task_id, definition, start, initial_input)
@@ -244,6 +253,11 @@ impl WorkflowEngine {
             StageKind::HumanGate => Ok(()),
             StageKind::Terminal => {
                 tasks::update_status(&self.pool, task_id, "closed").await?;
+                // A terminal task can never be `advance()`d or `start_task`'d
+                // again, so its lock entry would otherwise sit in
+                // `task_locks` forever — evict it now rather than growing
+                // that map for the life of the daemon (§ review on PR #35).
+                self.task_locks.lock().await.remove(task_id);
                 Ok(())
             }
             StageKind::Shell { .. } | StageKind::Poll { .. } => {
@@ -318,11 +332,22 @@ impl WorkflowEngine {
             // else in this module ever transitions it), wedging the task
             // since workflow_state was already committed to this stage by
             // the caller before enter_stage ran (§ review on PR #35).
+            //
+            // This still leaves the *task* itself — as opposed to this
+            // task_run — with no queryable "stuck" signal beyond this
+            // eprintln! and `end_reason: "start_failed"` on the task_run:
+            // nothing here marks `workflow_state`/`tasks` in a way an
+            // operator or API layer could discover without already knowing
+            // to look. Acknowledged gap for Phase 1; surfacing it (e.g. a
+            // task status or a query joining `tasks` to a stalled
+            // `task_run`) is expected to land with the API layer (P1-9) or
+            // a dedicated follow-up, not silently absorbed here.
             if let Err(update_err) = task_runs::update_status(
                 &self.pool,
                 &task_run.id,
                 TaskRunStatus::Exited,
                 Some(Utc::now()),
+                Some("start_failed"),
             )
             .await
             {
@@ -610,6 +635,24 @@ stages:
 
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "closed");
+    }
+
+    #[tokio::test]
+    async fn entering_a_terminal_stage_evicts_its_task_lock() {
+        // A terminal task can never be advance()d or start_task'd again,
+        // so its task_locks entry should be reclaimed rather than sitting
+        // in the map for the rest of the daemon's life (§ review on PR
+        // #35).
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+
+        let locks = engine.task_locks.lock().await;
+        assert!(!locks.contains_key(&task_id));
     }
 
     #[tokio::test]
@@ -918,12 +961,15 @@ stages:
         )
         .await
         .unwrap();
-        task_runs::update_status(&pool, &task_run.id, TaskRunStatus::Idle, None)
-            .await
-            .unwrap();
-        task_runs::set_end_reason(&pool, &task_run.id, "reaped")
-            .await
-            .unwrap();
+        task_runs::update_status(
+            &pool,
+            &task_run.id,
+            TaskRunStatus::Idle,
+            None,
+            Some("reaped"),
+        )
+        .await
+        .unwrap();
 
         let engine = engine_with_adapter(pool.clone(), "unused");
         engine.spawn_turn_watcher(task_id.clone(), Arc::clone(&def), task_run.id.clone());

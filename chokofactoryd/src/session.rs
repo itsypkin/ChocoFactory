@@ -178,7 +178,8 @@ impl SessionManager {
             }
         };
         if let Err(err) =
-            task_runs::update_status(&self.pool, task_run_id, TaskRunStatus::Active, None).await
+            task_runs::update_status(&self.pool, task_run_id, TaskRunStatus::Active, None, None)
+                .await
         {
             self.sessions.lock().await.remove(task_run_id);
             return Err(SessionError::Db(err));
@@ -374,14 +375,17 @@ async fn drain_session(
     } else {
         (TaskRunStatus::Exited, Some(Utc::now()))
     };
-    if let Err(err) = task_runs::update_status(pool, task_run_id, final_status, ended_at).await {
-        eprintln!("session {task_run_id}: failed to update status after drain: {err}");
-    }
-    if clean_exit
-        && reaped
-        && let Err(err) = task_runs::set_end_reason(pool, task_run_id, "reaped").await
+    // `status` and `end_reason` are set in the one statement below rather
+    // than two: a watcher elsewhere (engine.rs's turn-completion watcher)
+    // polls this row from a separate task and must never be able to
+    // observe `status == Idle` while `end_reason` still holds a stale (or
+    // absent) value from before this exit — that's exactly the gap that
+    // would resurrect the ambiguity `end_reason` exists to close.
+    let end_reason = (clean_exit && reaped).then_some("reaped");
+    if let Err(err) =
+        task_runs::update_status(pool, task_run_id, final_status, ended_at, end_reason).await
     {
-        eprintln!("session {task_run_id}: failed to record reaped end reason: {err}");
+        eprintln!("session {task_run_id}: failed to update status after drain: {err}");
     }
 }
 
@@ -542,7 +546,7 @@ mod tests {
         task_runs::set_session_id(&pool, &task_run_id, "fixed-session-id")
             .await
             .unwrap();
-        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None)
+        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None, None)
             .await
             .unwrap();
 
@@ -604,9 +608,15 @@ mod tests {
     async fn send_message_rejects_an_exited_task_run() {
         let pool = connect_in_memory().await.unwrap();
         let task_run_id = seed_task_run(&pool).await;
-        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Exited, Some(Utc::now()))
-            .await
-            .unwrap();
+        task_runs::update_status(
+            &pool,
+            &task_run_id,
+            TaskRunStatus::Exited,
+            Some(Utc::now()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
@@ -629,7 +639,7 @@ mod tests {
         task_runs::set_session_id(&pool, &task_run_id, "fixed-session-id")
             .await
             .unwrap();
-        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None)
+        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None, None)
             .await
             .unwrap();
 

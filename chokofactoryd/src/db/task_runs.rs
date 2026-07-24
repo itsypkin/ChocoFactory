@@ -106,35 +106,30 @@ pub async fn set_session_id(
     Ok(row.map(Into::into))
 }
 
-/// Records why `status` reached its current value, for cases where the
-/// status alone can't tell two paths apart (e.g. the idle reaper's clean
-/// exit vs. a turn actually finishing — both land on `Idle`).
-pub async fn set_end_reason(
-    pool: &SqlitePool,
-    id: &str,
-    end_reason: &str,
-) -> Result<Option<TaskRun>, sqlx::Error> {
-    let row = sqlx::query_as::<_, TaskRunRow>(&format!(
-        "UPDATE task_runs SET end_reason = ? WHERE id = ? RETURNING {COLUMNS}"
-    ))
-    .bind(end_reason)
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(Into::into))
-}
-
+/// Updates `status` and `end_reason` together in a single statement.
+/// `end_reason` records why `status` reached its current value, for cases
+/// where `status` alone can't tell two paths apart (e.g. the idle reaper's
+/// clean exit vs. a turn actually finishing — both land on `Idle`). Setting
+/// both fields in one `UPDATE` matters, not just for tidiness: a watcher
+/// polling this row from another task must never be able to observe the
+/// new `status` with the *previous* `end_reason` still attached, which a
+/// pair of separate statements would allow in the gap between them.
+/// Callers not setting a specific reason should pass `None`, clearing any
+/// stale value left over from an earlier transition (e.g. a resumed run
+/// going back to `Active` sheds whatever `end_reason` its last `Idle` had).
 pub async fn update_status(
     pool: &SqlitePool,
     id: &str,
     status: TaskRunStatus,
     ended_at: Option<DateTime<Utc>>,
+    end_reason: Option<&str>,
 ) -> Result<Option<TaskRun>, sqlx::Error> {
     let row = sqlx::query_as::<_, TaskRunRow>(&format!(
-        "UPDATE task_runs SET status = ?, ended_at = ? WHERE id = ? RETURNING {COLUMNS}"
+        "UPDATE task_runs SET status = ?, ended_at = ?, end_reason = ? WHERE id = ? RETURNING {COLUMNS}"
     ))
     .bind(status.to_string())
     .bind(ended_at)
+    .bind(end_reason)
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -229,14 +224,14 @@ mod tests {
             .unwrap();
         assert_eq!(with_session.session_id.as_deref(), Some("sess-123"));
 
-        let idle = update_status(&pool, &created.id, TaskRunStatus::Idle, None)
+        let idle = update_status(&pool, &created.id, TaskRunStatus::Idle, None, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(idle.status, TaskRunStatus::Idle);
 
         let now = Utc::now();
-        let exited = update_status(&pool, &created.id, TaskRunStatus::Exited, Some(now))
+        let exited = update_status(&pool, &created.id, TaskRunStatus::Exited, Some(now), None)
             .await
             .unwrap()
             .unwrap();
@@ -267,13 +262,19 @@ mod tests {
             .await
             .unwrap();
         let already_idle = create(&pool, new_run()).await.unwrap();
-        update_status(&pool, &already_idle.id, TaskRunStatus::Idle, None)
+        update_status(&pool, &already_idle.id, TaskRunStatus::Idle, None, None)
             .await
             .unwrap();
         let exited = create(&pool, new_run()).await.unwrap();
-        update_status(&pool, &exited.id, TaskRunStatus::Exited, Some(Utc::now()))
-            .await
-            .unwrap();
+        update_status(
+            &pool,
+            &exited.id,
+            TaskRunStatus::Exited,
+            Some(Utc::now()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let recovered = recover_stale_active_runs(&pool).await.unwrap();
         assert_eq!(recovered, 1);
