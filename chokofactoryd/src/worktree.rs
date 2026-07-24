@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use tokio::process::Command;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Manages the git worktree lifecycle for coding-style tasks (design §5.5,
 /// Q7): a working copy is created on first entry into a stage that needs
@@ -12,23 +15,40 @@ use tokio::process::Command;
 #[derive(Debug)]
 pub enum WorktreeError {
     Spawn(std::io::Error),
-    NotAGitRepo(PathBuf),
+    NotAGitRepo {
+        path: PathBuf,
+        source: Box<WorktreeError>,
+    },
     NoParentDir(PathBuf),
-    GitFailed { args: Vec<String>, stderr: String },
+    /// `kind` names which identifier was rejected ("project" or "task_id").
+    InvalidIdentifier {
+        kind: &'static str,
+        value: String,
+    },
+    GitFailed {
+        args: Vec<String>,
+        stderr: String,
+    },
 }
 
 impl fmt::Display for WorktreeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WorktreeError::Spawn(err) => write!(f, "failed to spawn git: {err}"),
-            WorktreeError::NotAGitRepo(path) => {
-                write!(f, "not a git repository: {}", path.display())
+            WorktreeError::NotAGitRepo { path, source } => {
+                write!(f, "not a git repository: {} ({source})", path.display())
             }
             WorktreeError::NoParentDir(path) => write!(
                 f,
                 "repo path has no parent directory to place a worktree next to: {}",
                 path.display()
             ),
+            WorktreeError::InvalidIdentifier { kind, value } => {
+                write!(
+                    f,
+                    "invalid {kind} {value:?}: must be non-empty, at most {MAX_IDENTIFIER_LEN} bytes, and must not contain '/', '\\', or be \".\"/\"..\""
+                )
+            }
             WorktreeError::GitFailed { args, stderr } => {
                 write!(f, "git {} failed: {}", args.join(" "), stderr.trim())
             }
@@ -38,9 +58,101 @@ impl fmt::Display for WorktreeError {
 
 impl std::error::Error for WorktreeError {}
 
+/// Per-`(project, task_id)` locks serializing `ensure`/`remove` so
+/// concurrent calls for the same task don't race on the `path.exists()`
+/// check followed by a non-atomic git operation. Mirrors the per-key-lock
+/// convention in `session.rs`'s `Mutex<HashMap<String, SessionSlot>>`.
+/// Entries are removed once nobody else is waiting on them, so this map
+/// doesn't grow unbounded over the daemon's lifetime.
+static LOCKS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn lock_key(project: &str, task_id: &str) -> String {
+    // NUL can't appear in either part (rejected by `validate_identifier`),
+    // so this can't collide two different (project, task_id) pairs.
+    format!("{project}\0{task_id}")
+}
+
+fn acquire_lock(key: &str) -> Arc<AsyncMutex<()>> {
+    let mut locks = LOCKS.lock().unwrap();
+    locks
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
+/// Drops the map entry for `key` if `lock` is the last reference to it
+/// (i.e. the map's own clone plus ours, and nobody else concurrently
+/// waiting) — otherwise a still-waiting caller would create a fresh,
+/// disconnected lock instead of joining the existing queue.
+fn release_lock(key: &str, lock: &Arc<AsyncMutex<()>>) {
+    let mut locks = LOCKS.lock().unwrap();
+    if Arc::strong_count(lock) <= 2 {
+        locks.remove(key);
+    }
+}
+
+/// Holds the per-`(project, task_id)` lock for the duration of an
+/// `ensure`/`remove` call. An RAII guard (rather than a manual
+/// lock/unlock pair) so the `LOCKS` entry is still released via `Drop`
+/// even if the calling future is cancelled mid-await (e.g. wrapped in a
+/// `tokio::time::timeout` by a future caller) — otherwise that entry
+/// would leak for the rest of the process's lifetime.
+struct KeyLock {
+    key: String,
+    lock: Arc<AsyncMutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl KeyLock {
+    async fn acquire(project: &str, task_id: &str) -> Self {
+        let key = lock_key(project, task_id);
+        let lock = acquire_lock(&key);
+        let guard = Arc::clone(&lock).lock_owned().await;
+        Self {
+            key,
+            lock,
+            guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for KeyLock {
+    fn drop(&mut self) {
+        // Release the mutex itself first so `release_lock`'s strong-count
+        // check reflects only the map's clone and `self.lock`, not also
+        // the owned guard's internal clone.
+        self.guard.take();
+        release_lock(&self.key, &self.lock);
+    }
+}
+
+/// Comfortably under typical filesystem filename limits (~255 bytes) even
+/// after both `project`/`task_id` are combined with the `-wt-`/`task/`
+/// affixes in `worktree_path`/`branch_name`.
+const MAX_IDENTIFIER_LEN: usize = 200;
+
+fn validate_identifier(kind: &'static str, value: &str) -> Result<(), WorktreeError> {
+    let is_valid = !value.is_empty()
+        && value.len() <= MAX_IDENTIFIER_LEN
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\', '\0']);
+    if is_valid {
+        Ok(())
+    } else {
+        Err(WorktreeError::InvalidIdentifier {
+            kind,
+            value: value.to_string(),
+        })
+    }
+}
+
 /// The sibling directory a task's worktree lives in, per design §5.5:
 /// `../<project>-wt-<task_id>` relative to `repo`.
 pub fn worktree_path(repo: &Path, project: &str, task_id: &str) -> Result<PathBuf, WorktreeError> {
+    validate_identifier("project", project)?;
+    validate_identifier("task_id", task_id)?;
     let parent = repo
         .parent()
         .ok_or_else(|| WorktreeError::NoParentDir(repo.to_path_buf()))?;
@@ -52,14 +164,33 @@ pub fn branch_name(task_id: &str) -> String {
     format!("task/{task_id}")
 }
 
+async fn branch_exists(repo: &Path, branch: &str) -> bool {
+    run_git(
+        repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .is_ok()
+}
+
 /// Creates the task's worktree if it doesn't already exist (idempotent, so
 /// re-entering the triggering stage — e.g. after a daemon restart — is
 /// safe). Returns the worktree's path either way.
 pub async fn ensure(repo: &Path, project: &str, task_id: &str) -> Result<PathBuf, WorktreeError> {
     ensure_git_repo(repo).await?;
     let path = worktree_path(repo, project, task_id)?;
+    let _lock = KeyLock::acquire(project, task_id).await;
+    ensure_locked(repo, task_id, &path).await
+}
+
+async fn ensure_locked(repo: &Path, task_id: &str, path: &Path) -> Result<PathBuf, WorktreeError> {
     if path.exists() {
-        return Ok(path);
+        return Ok(path.to_path_buf());
     }
 
     // Clear any stale registration left behind if a previous worktree dir
@@ -70,23 +201,28 @@ pub async fn ensure(repo: &Path, project: &str, task_id: &str) -> Result<PathBuf
 
     let branch = branch_name(task_id);
     let path_str = path.to_string_lossy().into_owned();
-    match run_git(repo, &["worktree", "add", &path_str, "-b", &branch]).await {
-        Ok(()) => Ok(path),
-        // The branch may already exist from a prior attempt whose worktree
-        // dir was since removed by hand; reuse it instead of failing.
-        Err(WorktreeError::GitFailed { stderr, .. }) if stderr.contains("already exists") => {
-            run_git(repo, &["worktree", "add", &path_str, &branch]).await?;
-            Ok(path)
-        }
-        Err(err) => Err(err),
+    // Check whether the branch survived (e.g. from a prior attempt whose
+    // worktree dir was since removed by hand) directly, rather than
+    // parsing git's (locale-dependent, ambiguous) stderr text.
+    if branch_exists(repo, &branch).await {
+        run_git(repo, &["worktree", "add", &path_str, &branch]).await?;
+    } else {
+        run_git(repo, &["worktree", "add", &path_str, "-b", &branch]).await?;
     }
+    Ok(path.to_path_buf())
 }
 
 /// Removes the task's worktree, discarding any uncommitted changes in it.
 /// A no-op if it's already gone (idempotent — task cancellation may race
 /// with a stage that already removed it on reaching `done`).
 pub async fn remove(repo: &Path, project: &str, task_id: &str) -> Result<(), WorktreeError> {
+    ensure_git_repo(repo).await?;
     let path = worktree_path(repo, project, task_id)?;
+    let _lock = KeyLock::acquire(project, task_id).await;
+    remove_locked(repo, &path).await
+}
+
+async fn remove_locked(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
     if !path.exists() {
         return Ok(());
     }
@@ -97,7 +233,10 @@ pub async fn remove(repo: &Path, project: &str, task_id: &str) -> Result<(), Wor
 async fn ensure_git_repo(repo: &Path) -> Result<(), WorktreeError> {
     run_git(repo, &["rev-parse", "--git-dir"])
         .await
-        .map_err(|_| WorktreeError::NotAGitRepo(repo.to_path_buf()))
+        .map_err(|err| WorktreeError::NotAGitRepo {
+            path: repo.to_path_buf(),
+            source: Box::new(err),
+        })
 }
 
 async fn run_git(repo: &Path, args: &[&str]) -> Result<(), WorktreeError> {
@@ -177,6 +316,39 @@ mod tests {
     }
 
     #[test]
+    fn worktree_path_rejects_path_traversal_in_project() {
+        let repo = Path::new("/home/user/myrepo");
+        let err = worktree_path(repo, "../../etc", "task-123").unwrap_err();
+        assert!(matches!(
+            err,
+            WorktreeError::InvalidIdentifier {
+                kind: "project",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn worktree_path_rejects_slash_in_task_id() {
+        let repo = Path::new("/home/user/myrepo");
+        let err = worktree_path(repo, "myproject", "task/../../evil").unwrap_err();
+        assert!(matches!(
+            err,
+            WorktreeError::InvalidIdentifier {
+                kind: "task_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn worktree_path_rejects_empty_identifiers() {
+        let repo = Path::new("/home/user/myrepo");
+        assert!(worktree_path(repo, "", "task-123").is_err());
+        assert!(worktree_path(repo, "myproject", "").is_err());
+    }
+
+    #[test]
     fn branch_name_uses_task_prefix() {
         assert_eq!(branch_name("task-123"), "task/task-123");
     }
@@ -223,6 +395,97 @@ mod tests {
         assert!(path.join("README.md").exists());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_calls_for_same_task_do_not_race() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+        let repo = Arc::new(repo);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let repo = Arc::clone(&repo);
+            handles.push(tokio::spawn(async move {
+                ensure(&repo, "myrepo", "task-1").await
+            }));
+        }
+
+        let mut paths = Vec::new();
+        for handle in handles {
+            paths.push(handle.await.unwrap().unwrap());
+        }
+        assert!(paths.iter().all(|p| *p == paths[0]));
+        assert!(paths[0].join("README.md").exists());
+
+        std::fs::remove_dir_all(root.as_path()).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_for_different_task_ids_does_not_interfere() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+        let repo = Arc::new(repo);
+
+        let (a, b) = tokio::join!(
+            ensure(&repo, "myrepo", "task-a"),
+            ensure(&repo, "myrepo", "task-b"),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a, b);
+        assert!(a.join("README.md").exists());
+        assert!(b.join("README.md").exists());
+
+        std::fs::remove_dir_all(root.as_path()).ok();
+    }
+
+    #[tokio::test]
+    async fn lock_map_entry_is_removed_after_calls_settle() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+
+        // Unique key so this assertion can't be affected by other tests'
+        // entries in the process-wide `LOCKS` map running concurrently.
+        ensure(&repo, "lockmap-test-project", "lockmap-test-task")
+            .await
+            .unwrap();
+        remove(&repo, "lockmap-test-project", "lockmap-test-task")
+            .await
+            .unwrap();
+
+        let key = lock_key("lockmap-test-project", "lockmap-test-task");
+        assert!(!LOCKS.lock().unwrap().contains_key(&key));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensure_and_remove_do_not_race() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+        ensure(&repo, "myrepo", "task-1").await.unwrap();
+        let repo = Arc::new(repo);
+
+        let mut handles = Vec::new();
+        for i in 0..6 {
+            let repo = Arc::clone(&repo);
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    ensure(&repo, "myrepo", "task-1").await.map(|_| ())
+                } else {
+                    remove(&repo, "myrepo", "task-1").await
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        std::fs::remove_dir_all(root.as_path()).ok();
     }
 
     #[tokio::test]
@@ -275,7 +538,13 @@ mod tests {
         let err = ensure(&not_a_repo, "myproject", "task-1")
             .await
             .unwrap_err();
-        assert!(matches!(err, WorktreeError::NotAGitRepo(_)));
+        // The underlying git error should be preserved, not discarded.
+        match &err {
+            WorktreeError::NotAGitRepo { source, .. } => {
+                assert!(matches!(source.as_ref(), WorktreeError::GitFailed { .. }));
+            }
+            other => panic!("expected NotAGitRepo, got {other:?}"),
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }
