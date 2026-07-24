@@ -14,6 +14,7 @@
 //! outcome since it was last entered from a *different* prior stage (the
 //! reset condition in §5.3) — see `bump_loop_counter`/`note_stage_entry`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
@@ -21,8 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chokofactory_core::models::TaskRunStatus;
+use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
+use tokio::sync::Mutex;
 
 use crate::adapter::RoleConfig;
 use crate::db::{task_runs, tasks, workflow_state};
@@ -37,6 +40,12 @@ const TURN_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 pub struct WorkflowEngine {
     pool: SqlitePool,
     session_manager: Arc<SessionManager>,
+    /// Serializes `advance()` calls per task (§ review on PR #35): without
+    /// this, two callers racing to advance the same task's `workflow_state`
+    /// (e.g. the turn-completion watcher and a future human_gate message
+    /// relay, P1-9) could both read the same row and then both write,
+    /// silently clobbering one call's `stage_history`/`loop_counters`.
+    task_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 #[derive(Debug)]
@@ -96,7 +105,19 @@ impl WorkflowEngine {
         Arc::new(Self {
             pool,
             session_manager,
+            task_locks: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Returns (creating if needed) the lock guarding `task_id`'s
+    /// `workflow_state` read-modify-write in `advance()`.
+    async fn lock_for_task(&self, task_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.task_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(task_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     /// Creates `task_id`'s `workflow_state` row at `definition`'s entry
@@ -130,6 +151,9 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         outcome: &str,
     ) -> Result<(), EngineError> {
+        let lock = self.lock_for_task(task_id).await;
+        let _guard = lock.lock().await;
+
         let state = workflow_state::get(&self.pool, task_id)
             .await?
             .ok_or(EngineError::NoWorkflowState)?;
@@ -284,10 +308,31 @@ impl WorkflowEngine {
         )
         .await?;
 
-        self.session_manager
+        if let Err(err) = self
+            .session_manager
             .start(&task_run.id, &prompt, &role_config)
             .await
-            .map_err(EngineError::Session)?;
+        {
+            // The task_run row was just created `Active` above; without
+            // this, a spawn failure here leaves it Active forever (nothing
+            // else in this module ever transitions it), wedging the task
+            // since workflow_state was already committed to this stage by
+            // the caller before enter_stage ran (§ review on PR #35).
+            if let Err(update_err) = task_runs::update_status(
+                &self.pool,
+                &task_run.id,
+                TaskRunStatus::Exited,
+                Some(Utc::now()),
+            )
+            .await
+            {
+                eprintln!(
+                    "workflow engine: failed to mark task run {} exited after a failed session start: {update_err}",
+                    task_run.id
+                );
+            }
+            return Err(EngineError::Session(err));
+        }
 
         // A stage with an empty `on:` map (chat, §5.4) never concludes —
         // it just keeps accepting further live messages into the same
@@ -313,6 +358,21 @@ impl WorkflowEngine {
         tokio::spawn(async move {
             loop {
                 match task_runs::get(&engine.pool, &task_run_id).await {
+                    // `Idle` is also what the idle reaper leaves behind
+                    // when it force-closes a stalled turn's stdin
+                    // (session.rs's `drain_session`) — indistinguishable
+                    // from a turn finishing on its own by `status` alone,
+                    // so `end_reason` is what actually decides whether
+                    // this was a real completion.
+                    Ok(Some(run))
+                        if run.status == TaskRunStatus::Idle
+                            && run.end_reason.as_deref() == Some("reaped") =>
+                    {
+                        eprintln!(
+                            "workflow engine: task run {task_run_id} (task {task_id}) was force-closed by the idle reaper before completing its turn; not auto-advancing"
+                        );
+                        return;
+                    }
                     Ok(Some(run)) if run.status == TaskRunStatus::Idle => break,
                     Ok(Some(run)) if run.status == TaskRunStatus::Exited => {
                         eprintln!(
@@ -321,7 +381,18 @@ impl WorkflowEngine {
                         return;
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => return,
+                    Ok(None) => {
+                        eprintln!(
+                            "workflow engine: task run {task_run_id} (task {task_id}) disappeared while watching for turn completion; not auto-advancing"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "workflow engine: failed to poll task run {task_run_id} (task {task_id}) while watching for turn completion: {err}; not auto-advancing"
+                        );
+                        return;
+                    }
                 }
                 tokio::time::sleep(TURN_WATCH_INTERVAL).await;
             }
@@ -818,6 +889,83 @@ stages:
         wait_until_stage(&pool, &task_id, "finished").await;
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "closed");
+    }
+
+    #[tokio::test]
+    async fn a_turn_reaped_by_the_idle_timeout_does_not_auto_advance() {
+        // Regression test for the ambiguity the review on PR #35 flagged:
+        // both a completed turn and a reaper-force-closed turn land the
+        // task_run on `Idle`, so the watcher must consult `end_reason`
+        // rather than treating every `Idle` as "done". The task_run is
+        // seeded directly as already `Idle`/`reaped` so the watcher's
+        // very first poll observes the condition deterministically,
+        // rather than racing a real subprocess to get there first.
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        workflow_state::create(&pool, &task_id, "gate")
+            .await
+            .unwrap();
+        let task_run = task_runs::create(
+            &pool,
+            task_runs::NewTaskRun {
+                task_id: &task_id,
+                stage: "gate",
+                role: "chat",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap();
+        task_runs::update_status(&pool, &task_run.id, TaskRunStatus::Idle, None)
+            .await
+            .unwrap();
+        task_runs::set_end_reason(&pool, &task_run.id, "reaped")
+            .await
+            .unwrap();
+
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.spawn_turn_watcher(task_id.clone(), Arc::clone(&def), task_run.id.clone());
+
+        tokio::time::sleep(StdDuration::from_millis(150)).await;
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "gate");
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_start_marks_the_task_run_exited_instead_of_wedging_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("coder-turn.md"), "do the thing").unwrap();
+        let yaml = r#"
+name: coding-task
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        // A binary that can't be spawned at all, so session_manager.start()
+        // fails synchronously rather than the process merely crashing
+        // after launch.
+        let engine = engine_with_adapter(pool.clone(), "/no/such/binary-3f6c9a");
+
+        engine.start_task(&task_id, &def, None).await.unwrap_err();
+
+        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, TaskRunStatus::Exited);
+        assert!(runs[0].ended_at.is_some());
     }
 
     #[tokio::test]

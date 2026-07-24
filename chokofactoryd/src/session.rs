@@ -300,6 +300,12 @@ async fn drain_session(
     // inside the loop) so a closed channel can't spin the select! in a
     // tight busy-loop while we wait out the remaining `handle.recv()`s.
     let mut cmd_open = true;
+    // Set only when this session's stdin was actually force-closed by the
+    // idle reaper (not merely requested — see the staleness re-check
+    // below). Distinguishes a reaper-driven clean exit from a turn that
+    // genuinely finished on its own, which look identical from `status`
+    // alone (§ review on PR #35).
+    let mut reaped = false;
     loop {
         tokio::select! {
             event = handle.recv() => {
@@ -343,6 +349,7 @@ async fn drain_session(
                         let stale = Utc::now() - *last_activity.lock().await >= idle_timeout;
                         if stale {
                             handle.close_stdin();
+                            reaped = true;
                         }
                     }
                     None => {
@@ -369,6 +376,12 @@ async fn drain_session(
     };
     if let Err(err) = task_runs::update_status(pool, task_run_id, final_status, ended_at).await {
         eprintln!("session {task_run_id}: failed to update status after drain: {err}");
+    }
+    if clean_exit
+        && reaped
+        && let Err(err) = task_runs::set_end_reason(pool, task_run_id, "reaped").await
+    {
+        eprintln!("session {task_run_id}: failed to record reaped end reason: {err}");
     }
 }
 
@@ -698,6 +711,33 @@ mod tests {
             .await;
 
         wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+
+        // Regression test for the review on PR #35: a reaper-driven clean
+        // exit must be distinguishable from a turn that finished on its
+        // own, since both land on `Idle` — `end_reason` is what the
+        // workflow engine's completion watcher relies on to tell them
+        // apart.
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason.as_deref(), Some("reaped"));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_finishes_on_its_own_has_no_end_reason() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
+            "fake_claude_oneshot.py",
+        )));
+        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, None);
     }
 
     #[tokio::test]

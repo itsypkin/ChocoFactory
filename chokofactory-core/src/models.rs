@@ -87,6 +87,11 @@ pub struct TaskRun {
     pub model: String,
     pub session_id: Option<String>,
     pub status: TaskRunStatus,
+    /// Why `status` reached its current value, when `status` alone is
+    /// ambiguous — e.g. `Some("reaped")` when a clean exit into `Idle` was
+    /// actually the idle reaper force-closing stdin, not the turn
+    /// finishing on its own. `None` for every other transition.
+    pub end_reason: Option<String>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
 }
