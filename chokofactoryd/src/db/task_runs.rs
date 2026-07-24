@@ -1,4 +1,4 @@
-use chokofactory_core::models::{TaskRun, TaskRunStatus};
+use chokofactory_core::models::{TaskRun, TaskRunEndReason, TaskRunStatus};
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
@@ -35,7 +35,11 @@ impl From<TaskRunRow> for TaskRun {
                 .status
                 .parse()
                 .expect("task_runs.status holds a value written by this module"),
-            end_reason: row.end_reason,
+            end_reason: row.end_reason.map(|reason| {
+                reason
+                    .parse()
+                    .expect("task_runs.end_reason holds a value written by this module")
+            }),
             started_at: row.started_at,
             ended_at: row.ended_at,
         }
@@ -122,14 +126,14 @@ pub async fn update_status(
     id: &str,
     status: TaskRunStatus,
     ended_at: Option<DateTime<Utc>>,
-    end_reason: Option<&str>,
+    end_reason: Option<TaskRunEndReason>,
 ) -> Result<Option<TaskRun>, sqlx::Error> {
     let row = sqlx::query_as::<_, TaskRunRow>(&format!(
         "UPDATE task_runs SET status = ?, ended_at = ?, end_reason = ? WHERE id = ? RETURNING {COLUMNS}"
     ))
     .bind(status.to_string())
     .bind(ended_at)
-    .bind(end_reason)
+    .bind(end_reason.map(|reason| reason.to_string()))
     .bind(id)
     .fetch_optional(pool)
     .await?;

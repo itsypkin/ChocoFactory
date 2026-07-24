@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chokofactory_core::models::TaskRunStatus;
+use chokofactory_core::models::{TaskRunEndReason, TaskRunStatus};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, mpsc};
@@ -309,6 +309,19 @@ async fn drain_session(
     let mut reaped = false;
     loop {
         tokio::select! {
+            // Biased so a pending `handle.recv()` result is always
+            // observed before an already-queued `Close` is acted on: with
+            // the default randomized selection, a turn that finishes (or
+            // emits its final event) right as a stale-triggered `Close` is
+            // sitting in `cmd_rx` could have that `Close` processed first,
+            // re-check freshness against a `last_activity` that hasn't
+            // been bumped yet, wrongly call it stale, and mark a turn that
+            // was already finishing on its own as `reaped` (§ review on PR
+            // #35). Preferring `handle.recv()` drains any already-ready
+            // event/exit first, so `last_activity`/the loop's own `break`
+            // reflect the process's real state before `Close` is ever
+            // considered.
+            biased;
             event = handle.recv() => {
                 match event {
                     Some(event) => {
@@ -381,7 +394,7 @@ async fn drain_session(
     // observe `status == Idle` while `end_reason` still holds a stale (or
     // absent) value from before this exit — that's exactly the gap that
     // would resurrect the ambiguity `end_reason` exists to close.
-    let end_reason = (clean_exit && reaped).then_some("reaped");
+    let end_reason = (clean_exit && reaped).then_some(TaskRunEndReason::Reaped);
     if let Err(err) =
         task_runs::update_status(pool, task_run_id, final_status, ended_at, end_reason).await
     {
@@ -728,7 +741,7 @@ mod tests {
         // workflow engine's completion watcher relies on to tell them
         // apart.
         let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
-        assert_eq!(run.end_reason.as_deref(), Some("reaped"));
+        assert_eq!(run.end_reason, Some(TaskRunEndReason::Reaped));
     }
 
     #[tokio::test]

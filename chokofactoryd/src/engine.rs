@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chokofactory_core::models::TaskRunStatus;
+use chokofactory_core::models::{TaskRunEndReason, TaskRunStatus};
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -56,6 +56,7 @@ pub enum EngineError {
     UnknownOutcome { stage: String, outcome: String },
     TerminalStageHasNoTransitions(String),
     MissingAgentTurnInput(String),
+    UnknownRole { stage: String, role: String },
     UnsupportedStageKind(String),
     Session(SessionError),
     Db(sqlx::Error),
@@ -80,6 +81,10 @@ impl fmt::Display for EngineError {
             EngineError::MissingAgentTurnInput(stage) => write!(
                 f,
                 "stage '{stage}' is an agent_turn with no prompt_file and no input was supplied"
+            ),
+            EngineError::UnknownRole { stage, role } => write!(
+                f,
+                "stage '{stage}' is an agent_turn with unknown role '{role}'"
             ),
             EngineError::UnsupportedStageKind(stage) => write!(
                 f,
@@ -252,7 +257,19 @@ impl WorkflowEngine {
             // `advance(task_id, definition, "resumed")` once it arrives.
             StageKind::HumanGate => Ok(()),
             StageKind::Terminal => {
-                tasks::update_status(&self.pool, task_id, "closed").await?;
+                // Best-effort, not `?`: `workflow_state` is already
+                // committed to this terminal stage by the caller (`advance`/
+                // `start_task`) before this runs, so a transient failure
+                // here can't be un-done by returning early — it would only
+                // additionally skip the lock eviction below and leak that
+                // entry forever, since a terminal stage's own guard makes
+                // this exact branch unreachable a second time for this task
+                // (§ review on PR #35).
+                if let Err(err) = tasks::update_status(&self.pool, task_id, "closed").await {
+                    eprintln!(
+                        "workflow engine: failed to mark task {task_id} closed after entering a terminal stage: {err}"
+                    );
+                }
                 // A terminal task can never be `advance()`d or `start_task`'d
                 // again, so its lock entry would otherwise sit in
                 // `task_locks` forever — evict it now rather than growing
@@ -277,10 +294,19 @@ impl WorkflowEngine {
         prompt_file: Option<&std::path::Path>,
         input: Option<&str>,
     ) -> Result<(), EngineError> {
+        // `WorkflowDefinition::parse`/`load` reject an agent_turn stage
+        // with an unknown role, but `roles`/`stages` are `pub` fields with
+        // no private-construction guard — a definition built by hand
+        // (struct literal) rather than through those constructors could
+        // reach here unvalidated, so this stays a reported error rather
+        // than an `.expect()` (§ review on PR #35).
         let role_def = definition
             .roles
             .get(role)
-            .expect("workflow_def validation rejects agent_turn stages with unknown roles");
+            .ok_or_else(|| EngineError::UnknownRole {
+                stage: stage_name.to_string(),
+                role: role.to_string(),
+            })?;
 
         let prompt = match prompt_file {
             Some(path) => fs::read_to_string(path).map_err(EngineError::Io)?,
@@ -347,7 +373,7 @@ impl WorkflowEngine {
                 &task_run.id,
                 TaskRunStatus::Exited,
                 Some(Utc::now()),
-                Some("start_failed"),
+                Some(TaskRunEndReason::StartFailed),
             )
             .await
             {
@@ -391,7 +417,7 @@ impl WorkflowEngine {
                     // this was a real completion.
                     Ok(Some(run))
                         if run.status == TaskRunStatus::Idle
-                            && run.end_reason.as_deref() == Some("reaped") =>
+                            && run.end_reason == Some(TaskRunEndReason::Reaped) =>
                     {
                         eprintln!(
                             "workflow engine: task run {task_run_id} (task {task_id}) was force-closed by the idle reaper before completing its turn; not auto-advancing"
@@ -653,6 +679,43 @@ stages:
 
         let locks = engine.task_locks.lock().await;
         assert!(!locks.contains_key(&task_id));
+    }
+
+    /// Regression test for the review on PR #35: `task_locks` exists
+    /// specifically to serialize `advance()` so racing callers can't
+    /// clobber each other's `workflow_state` read-modify-write. Fires more
+    /// concurrent "resumed" calls than the loop_guard's `max` (3) allows,
+    /// on real OS threads (`flavor = "multi_thread"`, not just interleaved
+    /// `.await` points within one thread) — without the lock, two callers
+    /// could both read `count: 0` and both write `count: 1`, losing an
+    /// increment and never escalating past the guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_advance_calls_on_the_same_task_do_not_lose_updates() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = self_loop_guard_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let engine = Arc::clone(&engine);
+            let def = Arc::clone(&def);
+            let task_id = task_id.clone();
+            handles.push(tokio::spawn(async move {
+                engine.advance(&task_id, &def, "resumed").await
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        // 4 real transitions through "resumed" against a guard allowing 3:
+        // if any pair of concurrent calls lost an update, the count would
+        // fall short and the task would still be looping on "a" instead of
+        // having escalated to "done".
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "done");
     }
 
     #[tokio::test]
@@ -935,6 +998,61 @@ stages:
     }
 
     #[tokio::test]
+    async fn a_crashed_single_shot_turn_does_not_auto_advance() {
+        // Drives an actually-crashing subprocess (exit code 1, not a
+        // hand-seeded row) through the real spawn_turn_watcher path, to
+        // confirm the `Exited` branch's "log and don't advance" behavior
+        // holds end to end, not just when unit-tested against seeded state
+        // (§ review on PR #35).
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("coder-turn.md"), "do the thing").unwrap();
+        let yaml = r#"
+name: coding-task
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude_crash.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        for _ in 0..200 {
+            if task_runs::get(&pool, &runs[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                == TaskRunStatus::Exited
+            {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+
+        // Give the watcher a moment it would need if it had incorrectly
+        // decided to auto-advance, then confirm it didn't.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "coding");
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "open");
+    }
+
+    #[tokio::test]
     async fn a_turn_reaped_by_the_idle_timeout_does_not_auto_advance() {
         // Regression test for the ambiguity the review on PR #35 flagged:
         // both a completed turn and a reaper-force-closed turn land the
@@ -966,7 +1084,7 @@ stages:
             &task_run.id,
             TaskRunStatus::Idle,
             None,
-            Some("reaped"),
+            Some(TaskRunEndReason::Reaped),
         )
         .await
         .unwrap();
