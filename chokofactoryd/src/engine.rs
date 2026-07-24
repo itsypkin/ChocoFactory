@@ -125,6 +125,31 @@ impl WorkflowEngine {
         )
     }
 
+    /// Removes `task_id`'s entry from `task_locks`, but only if `lock` is
+    /// the sole outstanding reference to it.
+    ///
+    /// Unconditional removal is unsound with 3+ overlapping callers: if
+    /// another caller (B) already cloned this same `Arc` from the map
+    /// before this call started evicting, removing the map entry now
+    /// doesn't affect B — B still holds/awaits the *same* `Arc` — but a
+    /// brand-new caller (C) arriving after the removal gets handed a
+    /// freshly-inserted, unrelated `Arc`, and now B and C can run their
+    /// `workflow_state` read-modify-writes concurrently on two different
+    /// mutexes, exactly the lost-update race `task_locks` exists to
+    /// prevent (§ review on PR #35). Checking `strong_count` while still
+    /// holding `task_locks`'s own guard (so no one can clone the `Arc` out
+    /// from under this check) tells us whether such a B exists: the
+    /// baseline is 2 — this call's local `lock` binding, plus the map's
+    /// own stored clone — so anything higher means another caller is
+    /// still referencing it and eviction must be skipped, leaving that
+    /// caller (and whoever joins after it) to eventually evict instead.
+    async fn evict_task_lock_if_unshared(&self, task_id: &str, lock: &Arc<Mutex<()>>) {
+        let mut locks = self.task_locks.lock().await;
+        if Arc::strong_count(lock) <= 2 {
+            locks.remove(task_id);
+        }
+    }
+
     /// Creates `task_id`'s `workflow_state` row at `definition`'s entry
     /// stage (§5.1: the first stage declared) and enters it.
     /// `initial_input` is the human-typed message a chat-style task was
@@ -145,22 +170,26 @@ impl WorkflowEngine {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
 
+        let start = definition.start_stage();
         let result: Result<(), EngineError> = async {
-            let start = definition.start_stage();
             workflow_state::create(&self.pool, task_id, start).await?;
             self.enter_stage(task_id, definition, start, initial_input)
                 .await
         }
         .await;
-        // Any error here means either nothing was written yet (nothing
-        // left to protect) or `workflow_state` was already durably
-        // committed before `enter_stage` ran (a fresh lock on a future
-        // call reads that same committed state correctly either way) — so
-        // it's always safe to evict rather than leaking this task's entry
-        // in `task_locks` after any failure, not just a successful
-        // terminal close (§ review on PR #35).
-        if result.is_err() {
-            self.task_locks.lock().await.remove(task_id);
+        // Evict on any error (either nothing was written yet, or
+        // `workflow_state` already durably committed before `enter_stage`
+        // ran — a fresh lock next time reads that same state correctly
+        // either way) or once the entry stage is itself terminal (no
+        // future call for this task will ever come). `lock_for_task`
+        // guards against a still-referenced `Arc` actually being removed
+        // (§ review on PR #35).
+        let entry_stage_is_terminal = definition
+            .stages
+            .get(start)
+            .is_some_and(|stage_def| matches!(stage_def.kind, StageKind::Terminal));
+        if result.is_err() || entry_stage_is_terminal {
+            self.evict_task_lock_if_unshared(task_id, &lock).await;
         }
         result
     }
@@ -182,7 +211,9 @@ impl WorkflowEngine {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
 
-        let result: Result<(), EngineError> =
+        // The stage entered on success, so the caller below can tell
+        // whether it just became terminal without a second query.
+        let result: Result<String, EngineError> =
             async {
                 let state = workflow_state::get(&self.pool, task_id)
                     .await?
@@ -235,19 +266,29 @@ impl WorkflowEngine {
                 .await?;
 
                 self.enter_stage(task_id, definition, &next_stage, None)
-                    .await
+                    .await?;
+                Ok(next_stage)
             }
             .await;
         // Same rationale as `start_task`'s eviction above: every error
         // branch here either precedes any write (nothing to protect) or
         // follows `workflow_state::update` already having durably
         // committed (a fresh lock next time reads that same state
-        // correctly), so evicting unconditionally on failure is safe
+        // correctly), so it's safe to evict on failure; likewise once the
+        // stage just entered is terminal, no future call for this task
+        // will ever come. `evict_task_lock_if_unshared` guards against
+        // removing an `Arc` some other overlapping caller still holds
         // (§ review on PR #35).
-        if result.is_err() {
-            self.task_locks.lock().await.remove(task_id);
+        let entered_terminal_stage = result.as_ref().is_ok_and(|stage| {
+            definition
+                .stages
+                .get(stage)
+                .is_some_and(|stage_def| matches!(stage_def.kind, StageKind::Terminal))
+        });
+        if result.is_err() || entered_terminal_stage {
+            self.evict_task_lock_if_unshared(task_id, &lock).await;
         }
-        result
+        result.map(|_| ())
     }
 
     /// Dispatches the behavior for whichever kind `stage_name` is (§5.2).
@@ -282,24 +323,21 @@ impl WorkflowEngine {
             // `advance(task_id, definition, "resumed")` once it arrives.
             StageKind::HumanGate => Ok(()),
             StageKind::Terminal => {
-                // Best-effort, not `?`: `workflow_state` is already
-                // committed to this terminal stage by the caller (`advance`/
-                // `start_task`) before this runs, so a transient failure
-                // here can't be un-done by returning early — it would only
-                // additionally skip the lock eviction below and leak that
-                // entry forever, since a terminal stage's own guard makes
-                // this exact branch unreachable a second time for this task
-                // (§ review on PR #35).
+                // Best-effort, not `?`: propagating this would skip the
+                // caller's (`advance`/`start_task`) lock-eviction check for
+                // a terminal stage, and `workflow_state` is already
+                // committed to this stage regardless, so a transient
+                // failure here can't be un-done by returning early anyway
+                // (§ review on PR #35). Lock eviction itself happens in
+                // the caller, which knows the stage just entered and can
+                // safely check whether any other overlapping caller still
+                // references it (`evict_task_lock_if_unshared`) — this
+                // function has no access to that `Arc`.
                 if let Err(err) = tasks::update_status(&self.pool, task_id, "closed").await {
                     eprintln!(
                         "workflow engine: failed to mark task {task_id} closed after entering a terminal stage: {err}"
                     );
                 }
-                // A terminal task can never be `advance()`d or `start_task`'d
-                // again, so its lock entry would otherwise sit in
-                // `task_locks` forever — evict it now rather than growing
-                // that map for the life of the daemon (§ review on PR #35).
-                self.task_locks.lock().await.remove(task_id);
                 Ok(())
             }
             StageKind::Shell { .. } | StageKind::Poll { .. } => {
@@ -758,6 +796,41 @@ stages:
         assert!(!locks.contains_key(&task_id));
     }
 
+    /// Regression test for the review on PR #35: eviction used to remove
+    /// a task's `task_locks` entry unconditionally, even while another
+    /// overlapping caller still held a clone of the same `Arc<Mutex<()>>`
+    /// (e.g. blocked waiting on it). A brand-new caller arriving after
+    /// that eviction would then get a fresh, unrelated lock — letting it
+    /// run concurrently with the still-in-flight holder of the old one,
+    /// exactly the lost-update race `task_locks` exists to prevent. A
+    /// real 3-way `tokio::spawn` race reproducing this would be
+    /// timing-dependent and potentially flaky, so this drives
+    /// `evict_task_lock_if_unshared` directly instead: deterministic, and
+    /// it's the exact primitive responsible for correctness here.
+    #[tokio::test]
+    async fn evict_task_lock_if_unshared_skips_eviction_while_another_caller_holds_a_clone() {
+        let pool = connect_in_memory().await.unwrap();
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        let task_id = "task-under-test";
+
+        let lock = engine.lock_for_task(task_id).await;
+        // Simulates a second overlapping caller that already fetched the
+        // same Arc from the map before this eviction attempt runs.
+        let other_callers_clone = engine.lock_for_task(task_id).await;
+
+        engine.evict_task_lock_if_unshared(task_id, &lock).await;
+        assert!(
+            engine.task_locks.lock().await.contains_key(task_id),
+            "must not evict while another caller still references the lock"
+        );
+
+        // Once the other caller's reference is gone, this is the sole
+        // remaining holder, and eviction proceeds.
+        drop(other_callers_clone);
+        engine.evict_task_lock_if_unshared(task_id, &lock).await;
+        assert!(!engine.task_locks.lock().await.contains_key(task_id));
+    }
+
     /// Regression test for the review on PR #35: `task_locks` exists
     /// specifically to serialize `advance()` so racing callers can't
     /// clobber each other's `workflow_state` read-modify-write. Fires more
@@ -793,6 +866,61 @@ stages:
         // having escalated to "done".
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "done");
+    }
+
+    /// Regression test for the review on PR #35's eviction-race finding:
+    /// mixes real concurrent `advance()` calls that succeed with ones that
+    /// error (an outcome absent from every stage's `on:` map), on real OS
+    /// threads, to prove `evict_task_lock_if_unshared`'s guard holds under
+    /// actual scheduling nondeterminism — not just in the deterministic
+    /// single-threaded reproduction of the primitive above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_advance_calls_mixing_errors_and_successes_do_not_lose_updates() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = self_loop_guard_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let engine = Arc::clone(&engine);
+            let def = Arc::clone(&def);
+            let task_id = task_id.clone();
+            handles.push(tokio::spawn(async move {
+                engine.advance(&task_id, &def, "resumed").await
+            }));
+        }
+        for _ in 0..4 {
+            let engine = Arc::clone(&engine);
+            let def = Arc::clone(&def);
+            let task_id = task_id.clone();
+            handles.push(tokio::spawn(async move {
+                engine.advance(&task_id, &def, "bogus-outcome").await
+            }));
+        }
+
+        let (mut ok_count, mut err_count) = (0, 0);
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(()) => ok_count += 1,
+                Err(_) => err_count += 1,
+            }
+        }
+
+        // "bogus-outcome" is never in any stage's `on:` map, so it always
+        // errors regardless of interleaving (UnknownOutcome on "a",
+        // TerminalStageHasNoTransitions once escalated to "done") — these
+        // counts are deterministic even though the interleaving isn't.
+        assert_eq!(ok_count, 4);
+        assert_eq!(err_count, 4);
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "done");
+
+        // The task is terminal and every caller has finished: nothing
+        // should still be holding this lock, erroring or not.
+        assert!(!engine.task_locks.lock().await.contains_key(&task_id));
     }
 
     #[tokio::test]
