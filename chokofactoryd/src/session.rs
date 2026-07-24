@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chokofactory_core::models::TaskRunStatus;
+use chokofactory_core::models::{TaskRunEndReason, TaskRunStatus};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, mpsc};
@@ -178,7 +178,8 @@ impl SessionManager {
             }
         };
         if let Err(err) =
-            task_runs::update_status(&self.pool, task_run_id, TaskRunStatus::Active, None).await
+            task_runs::update_status(&self.pool, task_run_id, TaskRunStatus::Active, None, None)
+                .await
         {
             self.sessions.lock().await.remove(task_run_id);
             return Err(SessionError::Db(err));
@@ -300,8 +301,37 @@ async fn drain_session(
     // inside the loop) so a closed channel can't spin the select! in a
     // tight busy-loop while we wait out the remaining `handle.recv()`s.
     let mut cmd_open = true;
+    // Set only when this session's stdin was actually force-closed by the
+    // idle reaper (not merely requested — see the staleness re-check
+    // below). Distinguishes a reaper-driven clean exit from a turn that
+    // genuinely finished on its own, which look identical from `status`
+    // alone (§ review on PR #35).
+    let mut reaped = false;
     loop {
         tokio::select! {
+            // Biased so a pending `handle.recv()` result is always
+            // observed before an already-queued `Close` is acted on: with
+            // the default randomized selection, a turn that finishes (or
+            // emits its final event) right as a stale-triggered `Close` is
+            // sitting in `cmd_rx` could have that `Close` processed first,
+            // re-check freshness against a `last_activity` that hasn't
+            // been bumped yet, wrongly call it stale, and mark a turn that
+            // was already finishing on its own as `reaped` (§ review on PR
+            // #35). Preferring `handle.recv()` drains any already-ready
+            // event/exit first, so `last_activity`/the loop's own `break`
+            // reflect the process's real state before `Close` is ever
+            // considered.
+            //
+            // Trade-off accepted: a continuously-emitting turn (events
+            // always ready on every poll) could in principle delay
+            // `cmd_rx` — a `Send` or the reaper's `Close` — indefinitely,
+            // since the event branch always wins ties. This doesn't lose
+            // or corrupt anything (no missed `Close`, no wrong
+            // `end_reason`), only adds latency, and requires output with
+            // no gaps at all between chunks — not how these CLI adapters
+            // actually behave in practice — so it's judged acceptable
+            // over reintroducing the mislabeling race above.
+            biased;
             event = handle.recv() => {
                 match event {
                     Some(event) => {
@@ -343,6 +373,7 @@ async fn drain_session(
                         let stale = Utc::now() - *last_activity.lock().await >= idle_timeout;
                         if stale {
                             handle.close_stdin();
+                            reaped = true;
                         }
                     }
                     None => {
@@ -367,7 +398,16 @@ async fn drain_session(
     } else {
         (TaskRunStatus::Exited, Some(Utc::now()))
     };
-    if let Err(err) = task_runs::update_status(pool, task_run_id, final_status, ended_at).await {
+    // `status` and `end_reason` are set in the one statement below rather
+    // than two: a watcher elsewhere (engine.rs's turn-completion watcher)
+    // polls this row from a separate task and must never be able to
+    // observe `status == Idle` while `end_reason` still holds a stale (or
+    // absent) value from before this exit — that's exactly the gap that
+    // would resurrect the ambiguity `end_reason` exists to close.
+    let end_reason = (clean_exit && reaped).then_some(TaskRunEndReason::Reaped);
+    if let Err(err) =
+        task_runs::update_status(pool, task_run_id, final_status, ended_at, end_reason).await
+    {
         eprintln!("session {task_run_id}: failed to update status after drain: {err}");
     }
 }
@@ -529,7 +569,7 @@ mod tests {
         task_runs::set_session_id(&pool, &task_run_id, "fixed-session-id")
             .await
             .unwrap();
-        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None)
+        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None, None)
             .await
             .unwrap();
 
@@ -591,9 +631,15 @@ mod tests {
     async fn send_message_rejects_an_exited_task_run() {
         let pool = connect_in_memory().await.unwrap();
         let task_run_id = seed_task_run(&pool).await;
-        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Exited, Some(Utc::now()))
-            .await
-            .unwrap();
+        task_runs::update_status(
+            &pool,
+            &task_run_id,
+            TaskRunStatus::Exited,
+            Some(Utc::now()),
+            None,
+        )
+        .await
+        .unwrap();
 
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
@@ -616,7 +662,7 @@ mod tests {
         task_runs::set_session_id(&pool, &task_run_id, "fixed-session-id")
             .await
             .unwrap();
-        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None)
+        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None, None)
             .await
             .unwrap();
 
@@ -698,6 +744,33 @@ mod tests {
             .await;
 
         wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+
+        // Regression test for the review on PR #35: a reaper-driven clean
+        // exit must be distinguishable from a turn that finished on its
+        // own, since both land on `Idle` — `end_reason` is what the
+        // workflow engine's completion watcher relies on to tell them
+        // apart.
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(TaskRunEndReason::Reaped));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_finishes_on_its_own_has_no_end_reason() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
+            "fake_claude_oneshot.py",
+        )));
+        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, None);
     }
 
     #[tokio::test]

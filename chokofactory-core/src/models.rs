@@ -76,6 +76,54 @@ impl FromStr for TaskRunStatus {
     }
 }
 
+/// Why a `TaskRun`'s `status` reached its current value, when `status`
+/// alone is ambiguous — e.g. `Reaped` when a clean exit into `Idle` was
+/// actually the idle reaper force-closing stdin, not the turn finishing on
+/// its own. A proper enum (rather than bare string literals scattered
+/// across `engine.rs`/`session.rs`) so a typo in one call site is a compile
+/// error instead of a silently-broken comparison elsewhere (§ review on PR
+/// #35).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRunEndReason {
+    /// The idle reaper force-closed stdin on a session past `idle_timeout`.
+    Reaped,
+    /// `SessionManager::start` failed to spawn the adapter process at all.
+    StartFailed,
+}
+
+impl fmt::Display for TaskRunEndReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TaskRunEndReason::Reaped => "reaped",
+            TaskRunEndReason::StartFailed => "start_failed",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseTaskRunEndReasonError(pub String);
+
+impl fmt::Display for ParseTaskRunEndReasonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid task run end reason: {}", self.0)
+    }
+}
+
+impl std::error::Error for ParseTaskRunEndReasonError {}
+
+impl FromStr for TaskRunEndReason {
+    type Err = ParseTaskRunEndReasonError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "reaped" => Ok(TaskRunEndReason::Reaped),
+            "start_failed" => Ok(TaskRunEndReason::StartFailed),
+            other => Err(ParseTaskRunEndReasonError(other.to_string())),
+        }
+    }
+}
+
 /// One row per underlying agent subprocess session a task has had (§3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRun {
@@ -87,6 +135,7 @@ pub struct TaskRun {
     pub model: String,
     pub session_id: Option<String>,
     pub status: TaskRunStatus,
+    pub end_reason: Option<TaskRunEndReason>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
 }
@@ -189,6 +238,23 @@ mod tests {
         let err = "bogus".parse::<TaskRunStatus>().unwrap_err();
         assert_eq!(err.0, "bogus");
         assert_eq!(err.to_string(), "invalid task run status: bogus");
+    }
+
+    #[test]
+    fn task_run_end_reason_round_trips_through_display_and_from_str() {
+        for reason in [TaskRunEndReason::Reaped, TaskRunEndReason::StartFailed] {
+            assert_eq!(
+                reason.to_string().parse::<TaskRunEndReason>().unwrap(),
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn task_run_end_reason_from_str_rejects_unknown_value() {
+        let err = "bogus".parse::<TaskRunEndReason>().unwrap_err();
+        assert_eq!(err.0, "bogus");
+        assert_eq!(err.to_string(), "invalid task run end reason: bogus");
     }
 
     #[test]
