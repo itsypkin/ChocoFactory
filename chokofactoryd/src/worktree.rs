@@ -58,19 +58,25 @@ impl fmt::Display for WorktreeError {
 
 impl std::error::Error for WorktreeError {}
 
-/// Per-`(project, task_id)` locks serializing `ensure`/`remove` so
-/// concurrent calls for the same task don't race on the `path.exists()`
-/// check followed by a non-atomic git operation. Mirrors the per-key-lock
+/// Per-worktree-path locks serializing `ensure`/`remove` so concurrent
+/// calls for the same task don't race on the `path.exists()` check
+/// followed by a non-atomic git operation. Mirrors the per-key-lock
 /// convention in `session.rs`'s `Mutex<HashMap<String, SessionSlot>>`.
 /// Entries are removed once nobody else is waiting on them, so this map
 /// doesn't grow unbounded over the daemon's lifetime.
+///
+/// Keyed by the resolved worktree path rather than the raw `(project,
+/// task_id)` pair: `worktree_path` joins them with a plain `-wt-`
+/// separator, which isn't collision-free (e.g. `("foo", "bar-wt-baz")`
+/// and `("foo-wt-bar", "baz")` both resolve to `foo-wt-bar-wt-baz`).
+/// Keying on the path guarantees two pairs that resolve to the same
+/// directory always share the same lock, since that directory — not the
+/// identifier pair — is the actual contended resource.
 static LOCKS: LazyLock<StdMutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-fn lock_key(project: &str, task_id: &str) -> String {
-    // NUL can't appear in either part (rejected by `validate_identifier`),
-    // so this can't collide two different (project, task_id) pairs.
-    format!("{project}\0{task_id}")
+fn lock_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn acquire_lock(key: &str) -> Arc<AsyncMutex<()>> {
@@ -92,12 +98,13 @@ fn release_lock(key: &str, lock: &Arc<AsyncMutex<()>>) {
     }
 }
 
-/// Holds the per-`(project, task_id)` lock for the duration of an
+/// Holds the per-worktree-path lock for the duration of an
 /// `ensure`/`remove` call. An RAII guard (rather than a manual
-/// lock/unlock pair) so the `LOCKS` entry is still released via `Drop`
-/// even if the calling future is cancelled mid-await (e.g. wrapped in a
-/// `tokio::time::timeout` by a future caller) — otherwise that entry
-/// would leak for the rest of the process's lifetime.
+/// lock/unlock pair) so the `LOCKS` entry is reliably released via
+/// `Drop` on every exit path — normal return, an error via `?`, or the
+/// calling future being dropped mid-await (e.g. under a
+/// `tokio::time::timeout`) — without which a cancelled caller could
+/// otherwise leak that entry for the rest of the process's lifetime.
 struct KeyLock {
     key: String,
     lock: Arc<AsyncMutex<()>>,
@@ -105,8 +112,8 @@ struct KeyLock {
 }
 
 impl KeyLock {
-    async fn acquire(project: &str, task_id: &str) -> Self {
-        let key = lock_key(project, task_id);
+    async fn acquire(path: &Path) -> Self {
+        let key = lock_key(path);
         let lock = acquire_lock(&key);
         let guard = Arc::clone(&lock).lock_owned().await;
         Self {
@@ -184,7 +191,7 @@ async fn branch_exists(repo: &Path, branch: &str) -> bool {
 pub async fn ensure(repo: &Path, project: &str, task_id: &str) -> Result<PathBuf, WorktreeError> {
     ensure_git_repo(repo).await?;
     let path = worktree_path(repo, project, task_id)?;
-    let _lock = KeyLock::acquire(project, task_id).await;
+    let _lock = KeyLock::acquire(&path).await;
     ensure_locked(repo, task_id, &path).await
 }
 
@@ -204,10 +211,15 @@ async fn ensure_locked(repo: &Path, task_id: &str, path: &Path) -> Result<PathBu
     // Check whether the branch survived (e.g. from a prior attempt whose
     // worktree dir was since removed by hand) directly, rather than
     // parsing git's (locale-dependent, ambiguous) stderr text.
+    //
+    // `--` ends option parsing before the positional path/branch args,
+    // so a `project`/`task_id` starting with `-` (combined with a
+    // relative `repo` whose worktree path ends up with no leading `/`)
+    // can't be misparsed by git as a flag.
     if branch_exists(repo, &branch).await {
-        run_git(repo, &["worktree", "add", &path_str, &branch]).await?;
+        run_git(repo, &["worktree", "add", "--", &path_str, &branch]).await?;
     } else {
-        run_git(repo, &["worktree", "add", &path_str, "-b", &branch]).await?;
+        run_git(repo, &["worktree", "add", "-b", &branch, "--", &path_str]).await?;
     }
     Ok(path.to_path_buf())
 }
@@ -218,7 +230,7 @@ async fn ensure_locked(repo: &Path, task_id: &str, path: &Path) -> Result<PathBu
 pub async fn remove(repo: &Path, project: &str, task_id: &str) -> Result<(), WorktreeError> {
     ensure_git_repo(repo).await?;
     let path = worktree_path(repo, project, task_id)?;
-    let _lock = KeyLock::acquire(project, task_id).await;
+    let _lock = KeyLock::acquire(&path).await;
     remove_locked(repo, &path).await
 }
 
@@ -227,7 +239,7 @@ async fn remove_locked(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
         return Ok(());
     }
     let path_str = path.to_string_lossy().into_owned();
-    run_git(repo, &["worktree", "remove", &path_str, "--force"]).await
+    run_git(repo, &["worktree", "remove", "--force", "--", &path_str]).await
 }
 
 async fn ensure_git_repo(repo: &Path) -> Result<(), WorktreeError> {
@@ -449,17 +461,31 @@ mod tests {
 
         // Unique key so this assertion can't be affected by other tests'
         // entries in the process-wide `LOCKS` map running concurrently.
-        ensure(&repo, "lockmap-test-project", "lockmap-test-task")
+        let path = ensure(&repo, "lockmap-test-project", "lockmap-test-task")
             .await
             .unwrap();
         remove(&repo, "lockmap-test-project", "lockmap-test-task")
             .await
             .unwrap();
 
-        let key = lock_key("lockmap-test-project", "lockmap-test-task");
+        let key = lock_key(&path);
         assert!(!LOCKS.lock().unwrap().contains_key(&key));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn distinct_identifier_pairs_that_collide_on_disk_share_a_lock_key() {
+        // ("foo", "bar-wt-baz") and ("foo-wt-bar", "baz") both resolve to
+        // the same on-disk directory via the `-wt-` join in
+        // `worktree_path`; they must therefore also resolve to the same
+        // lock key, or two unrelated tasks could race on that directory
+        // with no mutual exclusion between them.
+        let repo = Path::new("/home/user/myrepo");
+        let path_a = worktree_path(repo, "foo", "bar-wt-baz").unwrap();
+        let path_b = worktree_path(repo, "foo-wt-bar", "baz").unwrap();
+        assert_eq!(path_a, path_b);
+        assert_eq!(lock_key(&path_a), lock_key(&path_b));
     }
 
     #[tokio::test]
