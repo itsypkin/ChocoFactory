@@ -72,10 +72,10 @@ just the lines you touched:
 
 Do not open the PR off your own self-check alone. Spawn a **read-only**
 subagent (Read/Grep only — no Bash writes, no git mutations, no Edit) as
-an independent reviewer, and iterate with it until it formally approves:
+an independent reviewer, and iterate with it — resuming the *same*
+subagent each round via `SendMessage` — until it formally approves:
 
-1. Spawn a fresh subagent (no memory of your implementation rationale —
-   a new spawn each round, not a resumed one) with this brief:
+1. Spawn the reviewer with this brief:
 
    > Do a thorough, detailed review of this change before it becomes a
    > PR. Here is the issue: [issue title/body/#]. Here is
@@ -98,8 +98,15 @@ an independent reviewer, and iterate with it until it formally approves:
 3. Address every need-to-fix item. Nits are optional — use judgment, but
    don't let them stall the loop.
 4. Re-run the verification gate (step 5) if you touched code.
-5. Spawn a **new** subagent reviewer (fresh, not resumed) against the
-   updated diff. Repeat from step 1.
+5. `SendMessage` the **same** reviewer (don't spawn a new one — it keeps
+   its memory of what it already flagged, so it can confirm those
+   specific items are actually resolved instead of re-deriving that from
+   scratch) with the updated `git diff origin/main...HEAD` and this
+   instruction: *"Re-scan the entire diff end-to-end again, not just the
+   lines you previously flagged — this repo's fixes have a history of
+   introducing new bugs elsewhere in the diff, not just leaving old ones
+   unfixed. Then re-state APPROVE / CHANGES REQUESTED."* Repeat from
+   step 2.
 6. If you reach **5 iterations** without an APPROVE, stop. Do not open
    the PR and do not keep looping. Escalate to the user: show the diff,
    the outstanding need-to-fix items from the last round, and what you
