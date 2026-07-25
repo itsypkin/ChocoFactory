@@ -1,7 +1,11 @@
 pub mod adapter;
 pub mod capture;
+pub mod config_root;
 pub mod db;
 pub mod engine;
+pub mod fileref;
+pub mod global_config;
 pub mod retention;
+pub mod role_config;
 pub mod session;
 pub mod workflow_def;

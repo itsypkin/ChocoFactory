@@ -1,0 +1,11 @@
+name: chat
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
