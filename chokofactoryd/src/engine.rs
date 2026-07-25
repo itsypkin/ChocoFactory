@@ -185,6 +185,12 @@ impl fmt::Display for CreateTaskError {
 
 impl std::error::Error for CreateTaskError {}
 
+impl From<sqlx::Error> for CreateTaskError {
+    fn from(err: sqlx::Error) -> Self {
+        CreateTaskError::Db(err)
+    }
+}
+
 #[derive(Debug)]
 pub enum SendMessageError {
     NoSuchTask,
@@ -244,6 +250,12 @@ impl fmt::Display for SendMessageError {
 
 impl std::error::Error for SendMessageError {}
 
+impl From<sqlx::Error> for SendMessageError {
+    fn from(err: sqlx::Error) -> Self {
+        SendMessageError::Db(err)
+    }
+}
+
 impl WorkflowEngine {
     pub fn new(
         pool: SqlitePool,
@@ -302,8 +314,7 @@ impl WorkflowEngine {
                 config,
             },
         )
-        .await
-        .map_err(CreateTaskError::Db)?;
+        .await?;
 
         self.start_task(&task.id, &definition, Some(initial_input))
             .await
@@ -325,8 +336,7 @@ impl WorkflowEngine {
         text: &str,
     ) -> Result<(), SendMessageError> {
         let task = tasks::get(&self.pool, task_id)
-            .await
-            .map_err(SendMessageError::Db)?
+            .await?
             .ok_or(SendMessageError::NoSuchTask)?;
 
         let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
@@ -334,8 +344,7 @@ impl WorkflowEngine {
         let definition = WorkflowDefinition::load(&path).map_err(SendMessageError::WorkflowDef)?;
 
         let state = workflow_state::get(&self.pool, task_id)
-            .await
-            .map_err(SendMessageError::Db)?
+            .await?
             .ok_or(SendMessageError::NoWorkflowState)?;
         let current_stage = state.current_stage;
 
@@ -351,6 +360,11 @@ impl WorkflowEngine {
             return Err(SendMessageError::StageNotOpenEnded(current_stage));
         }
 
+        // Same defensive check as `enter_agent_turn`'s: the loader rejects
+        // an agent_turn stage with an unknown role, but `roles`/`stages`
+        // are `pub` fields with no private-construction guard, so a
+        // definition built by hand could still reach here unvalidated
+        // (§ review on PR #35).
         let role_def = definition
             .roles
             .get(role)
@@ -360,21 +374,13 @@ impl WorkflowEngine {
             })?;
 
         let task_run = task_runs::get_current_for_stage(&self.pool, task_id, &current_stage)
-            .await
-            .map_err(SendMessageError::Db)?
+            .await?
             .ok_or_else(|| SendMessageError::NoOpenRun(current_stage.clone()))?;
 
-        let cwd = task
-            .config
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
         let global = self
             .load_global_config()
             .map_err(SendMessageError::GlobalConfig)?;
-        let resolved = role_config::resolve(role, role_def, &global, &task.config, cwd)
+        let resolved = role_config::resolve(role, role_def, &global, &task.config, task_cwd(&task))
             .map_err(SendMessageError::RoleConfig)?;
 
         self.session_manager
@@ -650,17 +656,10 @@ impl WorkflowEngine {
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(EngineError::NoSuchTask)?;
-        let cwd = task
-            .config
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
         let global = self
             .load_global_config()
             .map_err(EngineError::GlobalConfig)?;
-        let resolved = role_config::resolve(role, role_def, &global, &task.config, cwd)
+        let resolved = role_config::resolve(role, role_def, &global, &task.config, task_cwd(&task))
             .map_err(EngineError::RoleConfig)?;
 
         let task_run = task_runs::create(
@@ -781,6 +780,20 @@ impl WorkflowEngine {
             }
         });
     }
+}
+
+/// A task's working directory for its agent subprocess: `task.config.cwd`
+/// if set, else the daemon's own current directory, else (only if that
+/// fails too) an empty path. Shared by `enter_agent_turn` and
+/// `send_message` — both need the same task-wide (not per-role) value
+/// alongside `role_config::resolve`'s per-role fields.
+fn task_cwd(task: &Task) -> PathBuf {
+    task.config
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
 }
 
 /// Increments the guarded stage's transition count. Seeds a fresh entry

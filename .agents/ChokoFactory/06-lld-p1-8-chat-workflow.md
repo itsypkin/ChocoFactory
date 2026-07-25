@@ -466,14 +466,34 @@ something to bolt on speculatively here.
 
 ### 4.6 `task_runs::get_current_for_stage` ordering
 
-`ORDER BY created_at DESC LIMIT 1` needs `created_at` to actually
-disambiguate concurrent inserts. `chat.yaml`'s stage only ever gets one
-`task_run` ever created for it (no loop, no re-entry), so this query
-returning "the" row rather than "the most recent of several" is the
+`ORDER BY started_at DESC LIMIT 1` needs `started_at` to actually
+disambiguate concurrent inserts (`task_runs` has no `created_at` column —
+`started_at` is the timestamp that exists). `chat.yaml`'s stage only ever
+gets one `task_run` ever created for it (no loop, no re-entry), so this
+query returning "the" row rather than "the most recent of several" is the
 common case by construction, not something the ordering has to work hard
-for. The ordering is still correct in general (matches the existing
-`task_runs::list_for_task` ordering convention) so this helper is safe to
-reuse as-is once other workflows with re-entrant stages exist.
+for. Note this is deliberately *not* the same ordering as the existing
+`task_runs::list_for_task` (which orders `BY id`, a random UUID with no
+temporal meaning) — `get_current_for_stage` needs a real time-ordering
+that `list_for_task` never needed, not a continuation of its convention.
+The ordering here is correct in general, so this helper is safe to reuse
+as-is once other workflows with re-entrant stages exist.
+
+### 4.7 `seed_builtin_workflows` needed an atomic create, not `exists()` + `write()`
+
+Caught in review, not in the original draft of this doc: the first
+implementation checked `!path.exists()` before writing — a check-then-act
+race. Two daemon processes seeding the same `workflows_dir` at once
+(started concurrently, or overlapping during a supervisor restart) could
+both observe "missing" before either writes, which doesn't corrupt
+anything here (both would write the same embedded bytes) but does
+contradict the "never overwritten" guarantee this function exists to
+provide, and is exactly the kind of check-then-act gap worth closing on
+principle given this repo's history with exactly this bug class
+elsewhere. Fixed by using `OpenOptions::new().write(true).create_new(true)`
+(atomic create-or-fail) and treating `ErrorKind::AlreadyExists` as
+success — the file being present is the desired end state regardless of
+which caller's write actually landed.
 
 ## 5. Error handling
 

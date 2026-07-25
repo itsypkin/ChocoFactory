@@ -5,7 +5,8 @@
 //! lives under one root that survives a binary upgrade/reinstall
 //! untouched.
 
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// `$HOME/.config/chokofactory`, or `None` if `$HOME` isn't set. Callers
@@ -27,6 +28,17 @@ const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[("chat", include_str!("../../workfl
 /// one seeded by a previous release, is never overwritten. Creates
 /// `workflows_dir` itself if missing.
 ///
+/// Uses `create_new` (atomic create-or-fail), not a separate
+/// `exists()` check followed by `write` — the latter is a check-then-act
+/// race: two daemon processes seeding the same `workflows_dir` at once
+/// (e.g. started concurrently, or overlapping during a supervisor
+/// restart) could both observe "missing" before either writes, defeating
+/// the "never overwritten" guarantee this function exists to provide.
+/// `create_new` fails atomically if the file already exists, and that
+/// specific failure (`AlreadyExists`) is treated as success — the file
+/// is present, seeded either by an earlier run or a concurrent one, which
+/// is exactly the desired end state either way.
+///
 /// Not folded into `WorkflowEngine::new` — constructors stay side-effect-
 /// free, matching how `session.rs`'s idle reaper and
 /// `task_runs::recover_stale_active_runs` are already separate steps the
@@ -35,8 +47,10 @@ pub fn seed_builtin_workflows(workflows_dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(workflows_dir)?;
     for (name, source) in BUILTIN_WORKFLOWS {
         let path = workflows_dir.join(format!("{name}.yaml"));
-        if !path.exists() {
-            std::fs::write(&path, source)?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => file.write_all(source.as_bytes())?,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
         }
     }
     Ok(())
