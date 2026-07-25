@@ -1,6 +1,6 @@
 ---
 name: implement-issue
-description: Implement a ChocoFactory GitHub issue end-to-end — confirm scope and dependencies, get a short design approved, implement, run the fmt/clippy/test gate, self-check for this repo's recurring review findings, and open a draft PR. Use when picking up a specific issue number to build.
+description: Implement a ChocoFactory GitHub issue end-to-end — confirm scope and dependencies, get a short design approved, implement, run the fmt/clippy/test gate, self-check for this repo's recurring review findings, get an independent subagent reviewer to formally approve the diff, and open a draft PR. Use when picking up a specific issue number to build.
 ---
 
 # Implement Issue
@@ -68,7 +68,44 @@ just the lines you touched:
   defaulted away, or logged-and-dropped where the caller should see the
   failure.
 
-## 7. Open the PR
+## 7. Independent subagent review — must formally approve before opening a PR
+
+Do not open the PR off your own self-check alone. Spawn a **read-only**
+subagent (Read/Grep only — no Bash writes, no git mutations, no Edit) as
+an independent reviewer, and iterate with it until it formally approves:
+
+1. Spawn a fresh subagent (no memory of your implementation rationale —
+   a new spawn each round, not a resumed one) with this brief:
+
+   > Do a thorough, detailed review of this change before it becomes a
+   > PR. Here is the issue: [issue title/body/#]. Here is
+   > `git diff origin/main...HEAD`. Review it as if you'll be blamed for
+   > anything you miss — read every changed function end-to-end, not
+   > just the hunks. Specifically hunt for: non-atomic read-modify-write
+   > sequences on shared/persisted state, swallowed or discarded errors,
+   > other correctness bugs, security issues, and missing test coverage
+   > for the new behavior.
+   >
+   > Classify every finding as **need-to-fix** (a real bug, security
+   > issue, or missing coverage for a case that matters) or **nit**
+   > (style, naming, optional polish). Formally state APPROVE if and
+   > only if there are zero need-to-fix findings — nits alone do not
+   > block approval. Otherwise state CHANGES REQUESTED and list the
+   > need-to-fix items with file:line.
+
+2. Share the subagent's findings with the user as you go (don't just
+   silently loop).
+3. Address every need-to-fix item. Nits are optional — use judgment, but
+   don't let them stall the loop.
+4. Re-run the verification gate (step 5) if you touched code.
+5. Spawn a **new** subagent reviewer (fresh, not resumed) against the
+   updated diff. Repeat from step 1.
+6. If you reach **5 iterations** without an APPROVE, stop. Do not open
+   the PR and do not keep looping. Escalate to the user: show the diff,
+   the outstanding need-to-fix items from the last round, and what you
+   tried across rounds, and ask how they want to proceed.
+
+## 8. Open the PR
 
 - `gh pr create --draft --title "..." --body "Closes #$1
 
