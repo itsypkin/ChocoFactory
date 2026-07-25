@@ -25,6 +25,18 @@ pub enum WorktreeError {
         kind: &'static str,
         value: String,
     },
+    /// `project` and `task_id` each pass `validate_identifier` on their
+    /// own, but joined via `-wt-` they'd produce a path component longer
+    /// than `MAX_WORKTREE_DIR_LEN`.
+    CombinedIdentifierTooLong {
+        project: String,
+        task_id: String,
+        len: usize,
+    },
+    /// Something already exists at the computed worktree path that isn't
+    /// a valid git worktree (no `.git`) — e.g. a `git worktree add` that
+    /// was interrupted mid-checkout, or an unrelated directory.
+    PathOccupied(PathBuf),
     GitFailed {
         args: Vec<String>,
         stderr: String,
@@ -46,9 +58,22 @@ impl fmt::Display for WorktreeError {
             WorktreeError::InvalidIdentifier { kind, value } => {
                 write!(
                     f,
-                    "invalid {kind} {value:?}: must be non-empty, at most {MAX_IDENTIFIER_LEN} bytes, and must not contain '/', '\\', or be \".\"/\"..\""
+                    "invalid {kind} {value:?}: must be non-empty, at most {MAX_IDENTIFIER_LEN} bytes, must not contain '/', '\\', or \"-wt-\", and must not be \".\"/\"..\""
                 )
             }
+            WorktreeError::CombinedIdentifierTooLong {
+                project,
+                task_id,
+                len,
+            } => write!(
+                f,
+                "project {project:?} and task_id {task_id:?} combine into a {len}-byte worktree directory name, exceeding the {MAX_WORKTREE_DIR_LEN}-byte filesystem limit"
+            ),
+            WorktreeError::PathOccupied(path) => write!(
+                f,
+                "worktree path {} already exists but isn't a valid git worktree (no .git found) — a previous `ensure` may have been interrupted, or the path is used by something else; remove it manually before retrying",
+                path.display()
+            ),
             WorktreeError::GitFailed { args, stderr } => {
                 write!(f, "git {} failed: {}", args.join(" "), stderr.trim())
             }
@@ -134,17 +159,30 @@ impl Drop for KeyLock {
     }
 }
 
-/// Comfortably under typical filesystem filename limits (~255 bytes) even
-/// after both `project`/`task_id` are combined with the `-wt-`/`task/`
-/// affixes in `worktree_path`/`branch_name`.
+/// A generous per-identifier sanity cap. Doesn't by itself bound the
+/// combined `{project}-wt-{task_id}` path component — see
+/// `MAX_WORKTREE_DIR_LEN` for that.
 const MAX_IDENTIFIER_LEN: usize = 200;
+
+/// POSIX `NAME_MAX` on most Linux/macOS filesystems: the length limit for
+/// a single path component, which `worktree_path` builds as
+/// `{project}-wt-{task_id}`. Two identifiers each under
+/// `MAX_IDENTIFIER_LEN` can still combine past this, so it's checked
+/// separately in `worktree_path`.
+const MAX_WORKTREE_DIR_LEN: usize = 255;
 
 fn validate_identifier(kind: &'static str, value: &str) -> Result<(), WorktreeError> {
     let is_valid = !value.is_empty()
         && value.len() <= MAX_IDENTIFIER_LEN
         && value != "."
         && value != ".."
-        && !value.contains(['/', '\\', '\0']);
+        && !value.contains(['/', '\\', '\0'])
+        // `worktree_path` joins `project`/`task_id` with a literal
+        // `-wt-`; banning that substring from either part prevents the
+        // documented collision (e.g. ("foo", "bar-wt-baz") vs.
+        // ("foo-wt-bar", "baz")) from silently aliasing two unrelated
+        // tasks onto the same checkout/branch.
+        && !value.contains("-wt-");
     if is_valid {
         Ok(())
     } else {
@@ -160,10 +198,18 @@ fn validate_identifier(kind: &'static str, value: &str) -> Result<(), WorktreeEr
 pub fn worktree_path(repo: &Path, project: &str, task_id: &str) -> Result<PathBuf, WorktreeError> {
     validate_identifier("project", project)?;
     validate_identifier("task_id", task_id)?;
+    let dir_name = format!("{project}-wt-{task_id}");
+    if dir_name.len() > MAX_WORKTREE_DIR_LEN {
+        return Err(WorktreeError::CombinedIdentifierTooLong {
+            project: project.to_string(),
+            task_id: task_id.to_string(),
+            len: dir_name.len(),
+        });
+    }
     let parent = repo
         .parent()
         .ok_or_else(|| WorktreeError::NoParentDir(repo.to_path_buf()))?;
-    Ok(parent.join(format!("{project}-wt-{task_id}")))
+    Ok(parent.join(dir_name))
 }
 
 /// The branch a task's worktree checks out, per design §5.5: `task/<task_id>`.
@@ -197,6 +243,15 @@ pub async fn ensure(repo: &Path, project: &str, task_id: &str) -> Result<PathBuf
 
 async fn ensure_locked(repo: &Path, task_id: &str, path: &Path) -> Result<PathBuf, WorktreeError> {
     if path.exists() {
+        // A linked worktree always has a `.git` file (pointing back at
+        // the main repo's `.git/worktrees/<name>`). Its absence means
+        // whatever is at `path` isn't a worktree we created — either an
+        // unrelated directory, or a `git worktree add` that was
+        // interrupted before finishing. Either way, silently treating it
+        // as "already ensured" would hand back a bogus/partial checkout.
+        if !path.join(".git").exists() {
+            return Err(WorktreeError::PathOccupied(path.to_path_buf()));
+        }
         return Ok(path.to_path_buf());
     }
 
@@ -243,12 +298,18 @@ async fn remove_locked(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
 }
 
 async fn ensure_git_repo(repo: &Path) -> Result<(), WorktreeError> {
-    run_git(repo, &["rev-parse", "--git-dir"])
-        .await
-        .map_err(|err| WorktreeError::NotAGitRepo {
+    match run_git(repo, &["rev-parse", "--git-dir"]).await {
+        Ok(()) => Ok(()),
+        // `rev-parse --git-dir` ran and reported `repo` isn't inside a
+        // git working tree — that's the actual "not a git repo" case.
+        Err(err @ WorktreeError::GitFailed { .. }) => Err(WorktreeError::NotAGitRepo {
             path: repo.to_path_buf(),
             source: Box::new(err),
-        })
+        }),
+        // Anything else (e.g. `Spawn` if the `git` binary itself is
+        // missing/unexecutable) isn't a repo problem — don't mislabel it.
+        Err(other) => Err(other),
+    }
 }
 
 async fn run_git(repo: &Path, args: &[&str]) -> Result<(), WorktreeError> {
@@ -410,6 +471,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_errors_when_path_exists_but_is_not_a_git_worktree() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+
+        // Simulate a directory left behind by an interrupted `git
+        // worktree add` (or an unrelated directory occupying the path):
+        // it exists, but has no `.git`.
+        let bogus_path = root.join("myrepo-wt-task-1");
+        std::fs::create_dir_all(&bogus_path).unwrap();
+        std::fs::write(bogus_path.join("stray.txt"), "not a worktree\n").unwrap();
+
+        let err = ensure(&repo, "myrepo", "task-1").await.unwrap_err();
+        assert!(matches!(err, WorktreeError::PathOccupied(p) if p == bogus_path));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn concurrent_ensure_calls_for_same_task_do_not_race() {
         let root = tempdir();
         let repo = root.join("myrepo");
@@ -475,17 +555,31 @@ mod tests {
     }
 
     #[test]
-    fn distinct_identifier_pairs_that_collide_on_disk_share_a_lock_key() {
-        // ("foo", "bar-wt-baz") and ("foo-wt-bar", "baz") both resolve to
-        // the same on-disk directory via the `-wt-` join in
-        // `worktree_path`; they must therefore also resolve to the same
-        // lock key, or two unrelated tasks could race on that directory
-        // with no mutual exclusion between them.
+    fn worktree_path_rejects_wt_substring_to_prevent_directory_collisions() {
+        // ("foo", "bar-wt-baz") and ("foo-wt-bar", "baz") would otherwise
+        // both resolve to the same on-disk directory ("foo-wt-bar-wt-baz")
+        // via the `-wt-` join in `worktree_path`, silently aliasing two
+        // unrelated tasks onto the same checkout/branch. Banning the
+        // separator substring from either part rejects both instead of
+        // handing back a path for either.
         let repo = Path::new("/home/user/myrepo");
-        let path_a = worktree_path(repo, "foo", "bar-wt-baz").unwrap();
-        let path_b = worktree_path(repo, "foo-wt-bar", "baz").unwrap();
-        assert_eq!(path_a, path_b);
-        assert_eq!(lock_key(&path_a), lock_key(&path_b));
+        assert!(worktree_path(repo, "foo", "bar-wt-baz").is_err());
+        assert!(worktree_path(repo, "foo-wt-bar", "baz").is_err());
+    }
+
+    #[test]
+    fn worktree_path_rejects_combined_identifiers_that_exceed_filesystem_limit() {
+        // Individually well within MAX_IDENTIFIER_LEN, but joined via
+        // `-wt-` the path component would be 200 + 4 + 200 = 404 bytes,
+        // past the typical 255-byte filesystem NAME_MAX.
+        let repo = Path::new("/home/user/myrepo");
+        let project = "a".repeat(200);
+        let task_id = "b".repeat(200);
+        let err = worktree_path(repo, &project, &task_id).unwrap_err();
+        assert!(matches!(
+            err,
+            WorktreeError::CombinedIdentifierTooLong { .. }
+        ));
     }
 
     #[tokio::test]
