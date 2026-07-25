@@ -96,19 +96,27 @@ pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<TaskR
 
 /// The most recent `task_run` recorded against `task_id` for `stage` — the
 /// run currently "open" for that stage, if any (P1-8 LLD §2.5,
-/// `WorkflowEngine::send_message`'s lookup). Ordered by `started_at`
-/// rather than `id`, since `id` is a random UUID with no ordering
-/// meaning. For a stage like `chat.yaml`'s (never re-entered — see
-/// `role_config`/`send_message`'s `on: {}` requirement), there's only ever
-/// one row to find; the ordering matters once workflows with re-entrant
-/// stages exist.
+/// `WorkflowEngine::send_message`'s lookup). Primarily ordered by
+/// `started_at` (unlike `list_for_task`'s `BY id`, which has no temporal
+/// meaning — a random UUID); `id DESC` is only a deterministic tie-break
+/// for two rows whose timestamps happen to collide, not a claim that `id`
+/// carries ordering meaning of its own. For a stage like `chat.yaml`'s
+/// (never re-entered — see `role_config`/`send_message`'s `on: {}`
+/// requirement), there's only ever one row to find; both the ordering and
+/// the tie-break matter once workflows with re-entrant stages exist.
 pub async fn get_current_for_stage(
     pool: &SqlitePool,
     task_id: &str,
     stage: &str,
 ) -> Result<Option<TaskRun>, sqlx::Error> {
+    // `id DESC` is a tie-break, not the primary ordering: SQLite/chrono
+    // timestamp precision isn't guaranteed to differ between two rows
+    // inserted close together, and without a tie-break that'd make this
+    // query's result nondeterministic (`fetch_optional` would pick
+    // whichever row the engine happened to visit first) rather than
+    // merely "arbitrary among ties" the way an explicit tie-break is.
     let row = sqlx::query_as::<_, TaskRunRow>(&format!(
-        "SELECT {COLUMNS} FROM task_runs WHERE task_id = ? AND stage = ? ORDER BY started_at DESC LIMIT 1"
+        "SELECT {COLUMNS} FROM task_runs WHERE task_id = ? AND stage = ? ORDER BY started_at DESC, id DESC LIMIT 1"
     ))
     .bind(task_id)
     .bind(stage)
@@ -394,7 +402,7 @@ mod tests {
         )
         .await
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let second = create(
             &pool,
             NewTaskRun {

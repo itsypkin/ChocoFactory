@@ -495,6 +495,26 @@ elsewhere. Fixed by using `OpenOptions::new().write(true).create_new(true)`
 success — the file being present is the desired end state regardless of
 which caller's write actually landed.
 
+### 4.8 `GlobalConfig`'s `roles:` block needed the loader's duplicate-key guard too
+
+Also caught in review: `workflow_def.rs`'s `roles:`/`stages:` maps reject
+a repeated YAML key rather than silently keeping only the last entry
+(`deserialize_map_rejecting_duplicate_keys`, itself added in an earlier
+review round on #33/#35) — but `global_config.rs`'s own `roles:` block,
+added by this PR, used a plain `HashMap` deserialization and didn't pick
+up the same guard, reopening exactly the bug this repo already fixed
+once elsewhere. A hand-edited `~/.config/chokofactory/config.yaml` with a
+copy-pasted `roles:` entry would parse successfully and silently drop the
+first one — a real, silent-data-loss correctness bug on legitimate user
+input, not just a hypothetical.
+
+Fixed by extracting the guard out of `workflow_def.rs` into a new shared
+`serde_util.rs` (`deserialize_map_rejecting_duplicate_keys`, unchanged
+logic) and having both `workflow_def.rs` and `global_config.rs` use it —
+one implementation of "reject a duplicate map key," not two copies that
+could drift, and not a second place for the exact same authoring-typo
+class to slip back in.
+
 ## 5. Error handling
 
 New error enums (`CreateTaskError`, `SendMessageError`,

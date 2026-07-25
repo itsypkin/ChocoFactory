@@ -48,7 +48,20 @@ pub fn seed_builtin_workflows(workflows_dir: &Path) -> io::Result<()> {
     for (name, source) in BUILTIN_WORKFLOWS {
         let path = workflows_dir.join(format!("{name}.yaml"));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => file.write_all(source.as_bytes())?,
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(source.as_bytes()) {
+                    // Otherwise a write failure partway through (e.g. disk
+                    // full) leaves a truncated file behind, and every
+                    // future startup's `create_new` would see
+                    // `AlreadyExists` and treat that corrupt fragment as
+                    // "already seeded" forever. Best-effort: if the
+                    // cleanup itself fails, the original write error is
+                    // still what gets reported.
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(err);
+                }
+            }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err),
         }

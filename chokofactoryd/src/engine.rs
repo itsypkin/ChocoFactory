@@ -1851,6 +1851,42 @@ stages:
         ));
     }
 
+    #[tokio::test]
+    async fn send_message_errors_for_a_nonexistent_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+
+        let err = engine
+            .send_message("no-such-task", "hello?")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendMessageError::NoSuchTask));
+    }
+
+    #[tokio::test]
+    async fn send_message_errors_when_workflow_state_references_an_unknown_stage() {
+        // Reachable given this design's "no caching, always re-read from
+        // disk" stance (P1-8 LLD §4.5): the workflow file backing a task
+        // could be edited to remove a stage after the task already
+        // recorded `workflow_state.current_stage` there.
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+
+        let task_id = seed_task(&pool, "chat").await;
+        workflow_state::create(&pool, &task_id, "ghost-stage")
+            .await
+            .unwrap();
+
+        let err = engine.send_message(&task_id, "hello?").await.unwrap_err();
+        assert!(matches!(
+            err,
+            SendMessageError::UnknownStage(stage) if stage == "ghost-stage"
+        ));
+    }
+
     struct TempDir(PathBuf);
     impl std::ops::Deref for TempDir {
         type Target = Path;

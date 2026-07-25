@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::fileref::{self, FileRefError};
@@ -40,11 +41,20 @@ impl GlobalConfig {
     /// traversal guard the workflow loader uses for its file references —
     /// this is an operator-controlled file, not request input, but
     /// there's no reason to hold it to a lower bar.
+    ///
+    /// Attempts the read directly rather than checking `path.is_file()`
+    /// first: a separate existence check followed by a read is a
+    /// check-then-act race (the file could vanish in between), and it's
+    /// entirely avoidable here since a failed read's `NotFound` already
+    /// tells us exactly the same thing the check would have, atomically.
     pub fn load(path: &Path) -> Result<Self, GlobalConfigError> {
-        if !path.is_file() {
-            return Ok(Self::default());
-        }
-        let raw = std::fs::read_to_string(path).map_err(GlobalConfigError::Io)?;
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(err) => return Err(GlobalConfigError::Io(err)),
+        };
         let parsed: RawGlobalConfig =
             serde_yaml::from_str(&raw).map_err(GlobalConfigError::Yaml)?;
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -87,8 +97,16 @@ impl GlobalConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawGlobalConfig {
-    #[serde(default)]
-    roles: HashMap<String, RawGlobalRoleConfig>,
+    // Same duplicate-key guard as the workflow loader's `roles:`/`stages:`
+    // maps (`serde_util::deserialize_map_rejecting_duplicate_keys`) — a
+    // plain `HashMap`/`IndexMap` deserialization silently keeps only the
+    // last of two repeated `roles:` keys in a hand-edited config.yaml,
+    // discarding the first without a trace. Caught in review round 2.
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+    )]
+    roles: IndexMap<String, RawGlobalRoleConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,5 +247,17 @@ mod tests {
             err,
             GlobalConfigError::MissingReferencedFile { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_a_duplicate_role_key_instead_of_silently_dropping_the_first() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "config.yaml",
+            "roles:\n  chat:\n    model: opus\n  chat:\n    cli: claude\n",
+        );
+        let err = GlobalConfig::load(&path).unwrap_err();
+        assert!(matches!(err, GlobalConfigError::Yaml(_)));
+        assert!(err.to_string().contains("duplicate key"));
     }
 }
