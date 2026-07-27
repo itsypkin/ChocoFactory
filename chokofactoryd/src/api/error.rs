@@ -44,6 +44,9 @@ impl From<CreateTaskError> for ApiError {
             CreateTaskError::Resolve(ResolveError::NotFound(_)) => {
                 ApiError::NotFound(err.to_string())
             }
+            CreateTaskError::NoSuchProject(_) | CreateTaskError::NoSuchParentTask(_) => {
+                ApiError::NotFound(err.to_string())
+            }
             CreateTaskError::Start(EngineError::MissingAgentTurnInput(_)) => {
                 ApiError::BadRequest(err.to_string())
             }
@@ -61,6 +64,17 @@ impl From<SendMessageOrResumeError> for ApiError {
             SendMessageOrResumeError::UnsupportedStageKind(_) => {
                 ApiError::Conflict(err.to_string())
             }
+            // A `human_gate`'s `resumed` relay lost a race with another
+            // caller resuming the same task concurrently (P1-9 review):
+            // `advance()`'s own per-task lock means `workflow_state` is
+            // never corrupted, but the loser's `advance` call re-reads
+            // the *already-transitioned* stage and finds "resumed" isn't
+            // one of its outcomes (or that it's now terminal) — a benign
+            // "someone already resumed this" conflict, not a server
+            // fault.
+            SendMessageOrResumeError::Advance(
+                EngineError::UnknownOutcome { .. } | EngineError::TerminalStageHasNoTransitions(_),
+            ) => ApiError::Conflict(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }

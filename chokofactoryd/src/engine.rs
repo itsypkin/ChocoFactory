@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
-use crate::db::{task_runs, tasks, workflow_state};
+use crate::db::{projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
 use crate::role_config::{self, RoleConfigError};
 use crate::session::{SessionError, SessionManager};
@@ -168,6 +168,15 @@ impl std::error::Error for ResolveError {}
 pub enum CreateTaskError {
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
+    /// `project_id` doesn't reference an existing project. Checked
+    /// explicitly (P1-9 review) rather than left to surface as whatever
+    /// `sqlx::Error` a raw `tasks.project_id` foreign-key violation
+    /// produces — the same care `db::projects::delete`'s own caller
+    /// already takes for the opposite direction of that same FK.
+    NoSuchProject(String),
+    /// `parent_task_id` was supplied but doesn't reference an existing
+    /// task — same reasoning as `NoSuchProject`.
+    NoSuchParentTask(String),
     Db(sqlx::Error),
     Start(EngineError),
 }
@@ -177,6 +186,8 @@ impl fmt::Display for CreateTaskError {
         match self {
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
+            CreateTaskError::NoSuchProject(id) => write!(f, "no such project '{id}'"),
+            CreateTaskError::NoSuchParentTask(id) => write!(f, "no such parent task '{id}'"),
             CreateTaskError::Db(err) => write!(f, "{err}"),
             CreateTaskError::Start(err) => write!(f, "{err}"),
         }
@@ -361,6 +372,21 @@ impl WorkflowEngine {
             .map_err(CreateTaskError::Resolve)?;
         let definition =
             Arc::new(WorkflowDefinition::load(&path).map_err(CreateTaskError::WorkflowDef)?);
+
+        // Checked explicitly rather than left to surface as a raw FK
+        // violation from the `INSERT` below (P1-9 review): both columns
+        // are foreign keys (`tasks.project_id`/`tasks.parent_task_id`),
+        // and `db::pool::connect` enables `foreign_keys`, so a bad id
+        // would otherwise fail as an opaque `sqlx::Error` instead of a
+        // reported, specific error the API layer can map to 404.
+        if projects::get(&self.pool, project_id).await?.is_none() {
+            return Err(CreateTaskError::NoSuchProject(project_id.to_string()));
+        }
+        if let Some(parent_id) = parent_task_id
+            && tasks::get(&self.pool, parent_id).await?.is_none()
+        {
+            return Err(CreateTaskError::NoSuchParentTask(parent_id.to_string()));
+        }
 
         let task = tasks::create(
             &self.pool,
@@ -1860,6 +1886,48 @@ stages:
         assert!(matches!(
             err,
             CreateTaskError::Resolve(ResolveError::NotFound(name)) if name == "ghost"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_task_with_a_nonexistent_project_id_is_a_reported_error_not_a_raw_fk_failure() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
+
+        let err = engine
+            .create_task("no-such-project", None, "chat", "t", "hi", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CreateTaskError::NoSuchProject(id) if id == "no-such-project"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_task_with_a_nonexistent_parent_task_id_is_a_reported_error() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
+
+        let err = engine
+            .create_task(
+                &project_id,
+                Some("no-such-task"),
+                "chat",
+                "t",
+                "hi",
+                json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CreateTaskError::NoSuchParentTask(id) if id == "no-such-task"
         ));
     }
 

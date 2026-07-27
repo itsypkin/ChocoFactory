@@ -163,6 +163,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_task_with_a_nonexistent_project_id_is_404_not_500() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": "no-such-project",
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test]
     async fn get_task_returns_task_and_workflow_state() {
         let server = TestServer::start().await;
         server.seed_chat_workflow();
@@ -307,5 +326,78 @@ stages:
             )
             .await;
         assert_eq!(response.status(), 409);
+    }
+
+    /// Regression test for the P1-9 review: two overlapping resumes of the
+    /// same `human_gate` (a plausible double-click/retry against a UI's
+    /// "resume" button) must not surface as a 500. `advance()`'s per-task
+    /// lock means `workflow_state` itself is never corrupted — the race is
+    /// serialized, not lost — but the loser's `advance("resumed")` call
+    /// then runs against whatever stage the winner already transitioned
+    /// to, which doesn't have "resumed" as a valid outcome (`review`'s
+    /// `on:` map below is `approved`/`changes_requested`), and that should
+    /// map to 409 (a benign "already resumed" conflict), not 500.
+    ///
+    /// This doesn't depend on true thread-scheduling luck: regardless of
+    /// whether the second call's initial (unlocked) stage read still sees
+    /// "gate" or already sees "review", `review` is a `human_gate` too and
+    /// neither has "resumed" in its `on:` map, so the second call
+    /// converges on the same `UnknownOutcome` -> 409 mapping either way.
+    #[tokio::test]
+    async fn concurrent_resumes_of_the_same_human_gate_do_not_500() {
+        let server = TestServer::start().await;
+        server.write_workflow(
+            "gated-relay",
+            r#"
+name: gated-relay
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: review }
+  review:
+    kind: human_gate
+    on:
+      approved: done
+      changes_requested: gate
+  done:
+    kind: terminal
+"#,
+        );
+        let project_id = create_project(&server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "gated-relay",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
+
+        let send = |text: &'static str| {
+            let server = &server;
+            let task_id = task_id.clone();
+            async move {
+                server
+                    .post(
+                        &format!("/tasks/{task_id}/messages"),
+                        json!({ "text": text }),
+                    )
+                    .await
+            }
+        };
+        let (first, second) = tokio::join!(send("go"), send("go"));
+
+        let mut statuses = [first.status(), second.status()];
+        statuses.sort_unstable();
+        assert_eq!(
+            statuses,
+            [202, 409],
+            "expected exactly one resume to win (202) and the other to conflict (409), got {statuses:?}"
+        );
     }
 }

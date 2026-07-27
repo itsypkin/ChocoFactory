@@ -10,15 +10,23 @@ use axum::extract::{Path, State};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
 
-use super::AppState;
-use crate::db::events;
+use super::{ApiError, AppState};
+use crate::db::{events, tasks};
 
+/// Checks `task_id` exists before upgrading (P1-9 review): `events::
+/// list_for_task` alone can't distinguish "a real task with zero events
+/// yet" from "no such task" — both are an empty `Vec`, not an error — so
+/// without this check a bad `task_id` would silently open a socket that
+/// then waits forever for events that can never arrive, instead of a 404.
 pub async fn task_events(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
     ws: WebSocketUpgrade,
-) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, task_id))
+) -> Result<Response, ApiError> {
+    if tasks::get(&state.pool, &task_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("no such task '{task_id}'")));
+    }
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, task_id)))
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState, task_id: String) {
@@ -237,5 +245,22 @@ mod tests {
         );
 
         let _ = ws.close(None).await;
+    }
+
+    #[tokio::test]
+    async fn connecting_to_a_nonexistent_task_is_rejected_instead_of_hanging_forever() {
+        let server = TestServer::start().await;
+
+        // Before the P1-9 review fix, `events::list_for_task` returns an
+        // empty `Vec` (not an error) for a task_id that was never created
+        // at all — indistinguishable from a real task with zero events —
+        // so the socket would upgrade successfully and then wait forever
+        // for events that can never arrive. It should instead fail the
+        // handshake with a 404 and never upgrade.
+        let result = connect_async(format!("{}/tasks/does-not-exist/events", server.ws_url)).await;
+        assert!(
+            result.is_err(),
+            "connecting to a nonexistent task should not succeed"
+        );
     }
 }
