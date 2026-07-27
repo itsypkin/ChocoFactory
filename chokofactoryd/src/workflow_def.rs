@@ -301,7 +301,10 @@ struct RawRole {
 struct RawStage {
     #[serde(flatten)]
     kind: RawStageKind,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+    )]
     on: IndexMap<String, String>,
     #[serde(default)]
     loop_guard: Option<LoopGuard>,
@@ -1086,6 +1089,27 @@ stages:
     kind: agent_turn
     role: chat
     on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(err, WorkflowDefError::Yaml(_)));
+        assert!(err.to_string().contains("duplicate key"));
+    }
+
+    #[test]
+    fn rejects_a_stage_with_a_duplicate_on_outcome_key() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  a:
+    kind: human_gate
+    on:
+      done: b
+      done: c
+  b:
+    kind: terminal
+  c:
+    kind: terminal
 "#;
         let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
         assert!(matches!(err, WorkflowDefError::Yaml(_)));

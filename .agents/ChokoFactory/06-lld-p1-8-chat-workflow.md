@@ -515,6 +515,26 @@ one implementation of "reject a duplicate map key," not two copies that
 could drift, and not a second place for the exact same authoring-typo
 class to slip back in.
 
+### 4.9 A stage's `on:` map needed the same duplicate-key guard as `roles:`/`stages:`
+
+Caught in a third review round: `RawStage.on` (a stage's outcome →
+next-stage transition map) was still a plain `IndexMap<String, String>`
+with no `deserialize_with`, even after §4.8 fixed the same gap in
+`roles:`. A workflow author who copy-pastes an `on:` block and forgets to
+rename a repeated outcome key (e.g. two `done:` entries after an edit)
+gets a file that parses successfully, with only the last transition kept
+— the engine silently has no route for the outcome the author believed
+was wired up, discoverable only by exercising that exact path in
+production.
+
+Fixed the same way as §4.8: `RawStage.on` now uses
+`serde_util::deserialize_map_rejecting_duplicate_keys`, with a regression
+test (`rejects_a_stage_with_a_duplicate_on_outcome_key`). A grep across
+`workflow_def.rs`, `global_config.rs`, `role_config.rs`, and `engine.rs`
+turned up no other unguarded map deserialization — `roles:`, `stages:`,
+and now `on:` are the only maps this format has, and all three are
+covered.
+
 ## 5. Error handling
 
 New error enums (`CreateTaskError`, `SendMessageError`,
