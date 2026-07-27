@@ -88,13 +88,16 @@ fits without a schema change later.
 ### P1-8. Built-in chat workflow
 
 Ship `workflows/chat.yaml` (§5.4): a single `agent_turn` stage, role
-`chat`, `on: {}`. Wire task creation for this workflow so the task's
-initial input becomes the first message into the session, and all
-further messages are fed into the same open stage. Implement role config
-resolution (§5.5, Q8) scoped to a single role for now: global config →
-workflow-def `roles:` block → task-level `config` override.
+`chat`, `on: {}` — embedded into the `chokofactoryd` binary and seeded
+(write-if-missing) into `~/.config/chokofactory/workflows/` on first run
+(§2.2). Wire task creation for this workflow so the task's initial input
+becomes the first message into the session, and all further messages are
+fed into the same open stage. Implement role config resolution (§5.5,
+Q8) scoped to a single role for now: global config → workflow-def
+`roles:` block → task-level `config` override, all three keyed by role
+name (e.g. `config.roles.chat.model`).
 
-- Design ref: §5.4
+- Design ref: §5.4, §2.2
 - Depends on: P1-7
 
 ### P1-9. HTTP/WS API layer
@@ -195,7 +198,11 @@ workflow-def → task-level layering (§5.5, Q8).
 
 Author `workflows/coding-task.yaml` (§5.1) and its prompt files
 (`coder-system.md`, `reviewer-system.md`, `coder-turn.md`,
-`reviewer-turn.md`), wiring the full stage graph: `coding` →
+`reviewer-turn.md`) — same embed-and-seed treatment as `chat.yaml`
+(§2.2, P1-8): the prompt files travel with the definition into the seed
+step, not just the YAML, since `roles:`/stage `*_file` fields resolve
+relative to wherever the seeded copy ends up on disk. Wiring the full
+stage graph: `coding` →
 `internal_review` (loop-guarded, escalates via `escalate_to_human`) →
 `open_pr` → `checks_polling` → `awaiting_human_review` → `done`, using
 the `shell`/`poll` kinds, templating, loop guards, and worktree manager

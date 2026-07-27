@@ -75,6 +75,42 @@ Simplicity given the requirements: single user, no auth, restart-safe via
 SQLite. A single daemon avoids inter-process coordination for something
 like the idle-subprocess reaper (§4.3) or the loop-guard logic (§5.3).
 
+### 2.2 On-disk layout
+
+The tool is distributed as a binary (or built from a repo checkout, but
+never run *out of* one) — nothing at runtime may assume a source
+checkout is present or writable. So there has to be a separate,
+user-owned location for everything the tool reads/writes that isn't the
+binary itself, one that survives a binary upgrade/reinstall untouched:
+
+- **`~/.config/chokofactory/`** is that root. Single directory, no
+  XDG data/config split — this is a small single-user local tool, not
+  worth the extra indirection.
+- **`~/.config/chokofactory/config.yaml`**: global config (§5.5) — this
+  user's default `cli`/`model`/`system_prompt_file` per role name,
+  applied whenever a workflow-def doesn't pin that field itself. Absent
+  file ⇒ no global defaults, not an error.
+- **`~/.config/chokofactory/workflows/`**: every workflow definition the
+  daemon can reference by name, `chat`/`coding-task` (the two built-ins)
+  included. This is the one thing that needed the most thought: the
+  built-ins ship compiled into the `chokofactoryd` binary (embedded at
+  build time from the repo's own `workflows/` directory, which is the
+  source of truth for their content) and are seeded out to this
+  directory **on first run, only if not already present** — never
+  overwritten on a later version's startup, so a user's edits to their
+  own copy always survive an upgrade. §5 already intends this: *"you can
+  copy/edit either one, or author entirely new ones, without
+  recompiling"* — that only holds if what a user is copying/editing is a
+  real file in a location the tool never touches again, not something
+  hidden inside the binary.
+- The SQLite file (§3) is a natural sibling here too
+  (`~/.config/chokofactory/chokofactory.db`), though its exact wiring is
+  the daemon-startup layer's call (§6.2/P1-9), not decided here.
+
+Nothing above blocks a user (or a project) from pointing the daemon at a
+different root via a flag/env var later if that turns out to matter —
+just not needed yet with a single-user, single-machine deployment.
+
 ## 3. Core concepts / data model
 
 SQLite tables (names indicative, not final schema):
@@ -221,8 +257,9 @@ or author entirely new ones, without recompiling.
 
 ### 5.1 Workflow definition format
 
-A workflow definition is a YAML file (e.g. `workflows/coding-task.yaml`)
-describing stages and how they connect. Each stage has a **kind** (from a
+A workflow definition is a YAML file (e.g.
+`~/.config/chokofactory/workflows/coding-task.yaml`, §2.2) describing
+stages and how they connect. Each stage has a **kind** (from a
 fixed set implemented in Rust — see §5.2), the config that kind needs,
 and an `on:` map from outcome → next stage name. Long prompts/system
 prompts are referenced by file path rather than inlined, since the graph
@@ -417,8 +454,14 @@ arms.
 
 - **Role config resolution** (Q8): `coder`/`reviewer` resolve
   CLI/model/system-prompt from, in increasing specificity: global config
-  → this workflow definition's `roles:` block → task-level `config`
-  override.
+  (§2.2) → this workflow definition's `roles:` block → task-level
+  `config` override. All three are keyed by role name with the same
+  shape (`{cli, model, system_prompt(_file)}`) — including the
+  task-level layer, e.g. `config: { roles: { reviewer: { model: opus } } }`
+  — so overriding one role on one task never has to guess which role a
+  flat field would've meant. `cwd` is the one task-`config` field that
+  isn't per-role (it's task-wide), so it stays a flat top-level key
+  alongside `roles`.
 - **Worktree manager** (Q7): triggered by the first stage that needs a
   working copy (`coding`); creates `git worktree add
   ../<project>-wt-<task-id> -b task/<task-id>` in the task's configured
@@ -444,8 +487,9 @@ arms.
   redirection messages to Type 3's `escalated_to_human` state; full
   event timeline (§4.2) for visibility into everything an agent did.
 - New-task flow: pick project, workflow definition (chat, coding-task, or
-  any custom one placed under `workflows/`), repo/working dir, role
-  overrides (CLI/model/system prompt), initial prompt.
+  any custom one placed under `~/.config/chokofactory/workflows/`, §2.2),
+  repo/working dir, per-role overrides (CLI/model/system prompt),
+  initial prompt.
 - No auth (Q15); backend binds `127.0.0.1` by default, accessed remotely
   via SSH port forwarding.
 

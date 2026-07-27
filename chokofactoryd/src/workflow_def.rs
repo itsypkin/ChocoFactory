@@ -205,10 +205,17 @@ impl WorkflowDefinition {
     }
 }
 
+/// A role's settings as declared in a workflow definition's `roles:`
+/// block. `cli`/`model` are optional here (unlike the fully-resolved role
+/// config the engine actually runs with, `role_config::ResolvedRoleConfig`)
+/// — a workflow-def is only the *middle* of three layers (global config →
+/// workflow-def → task-level override, P1-8 LLD §2.3); leaving a role
+/// partially specified here is what lets it fall through to a global
+/// default instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoleDef {
-    pub cli: String,
-    pub model: String,
+    pub cli: Option<String>,
+    pub model: Option<String>,
     pub system_prompt_file: Option<PathBuf>,
 }
 
@@ -271,55 +278,21 @@ pub struct LoopGuard {
 #[derive(Debug, Deserialize)]
 struct RawDefinition {
     name: String,
-    #[serde(default, deserialize_with = "deserialize_map_rejecting_duplicate_keys")]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+    )]
     roles: IndexMap<String, RawRole>,
-    #[serde(deserialize_with = "deserialize_map_rejecting_duplicate_keys")]
+    #[serde(deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys")]
     stages: IndexMap<String, RawStage>,
-}
-
-/// `serde_yaml`'s map deserialization (like most `Deserialize` map impls)
-/// just inserts each key as it's read, so a YAML mapping with a repeated
-/// key — a copy-pasted stage/role name — silently keeps only the last
-/// entry instead of erroring. That's exactly the kind of authoring typo
-/// this loader exists to catch at load time, so entries are read one at a
-/// time here and a repeat key is rejected instead of silently overwriting.
-fn deserialize_map_rejecting_duplicate_keys<'de, D, T>(
-    deserializer: D,
-) -> Result<IndexMap<String, T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct Visitor<T>(std::marker::PhantomData<T>);
-
-    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
-        type Value = IndexMap<String, T>;
-
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a map with unique keys")
-        }
-
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::MapAccess<'de>,
-        {
-            let mut result = IndexMap::new();
-            while let Some((key, value)) = map.next_entry::<String, T>()? {
-                if result.insert(key.clone(), value).is_some() {
-                    return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
-                }
-            }
-            Ok(result)
-        }
-    }
-
-    deserializer.deserialize_map(Visitor(std::marker::PhantomData))
 }
 
 #[derive(Debug, Deserialize)]
 struct RawRole {
-    cli: String,
-    model: String,
+    #[serde(default)]
+    cli: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     system_prompt_file: Option<String>,
 }
@@ -328,7 +301,10 @@ struct RawRole {
 struct RawStage {
     #[serde(flatten)]
     kind: RawStageKind,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+    )]
     on: IndexMap<String, String>,
     #[serde(default)]
     loop_guard: Option<LoopGuard>,
@@ -473,17 +449,10 @@ enum RefOwner<'a> {
     Stage(&'a str),
 }
 
-/// Joins `relative` onto `base_dir` and fails fast if the result doesn't
-/// exist on disk — a typo'd prompt/script path is exactly the kind of
-/// malformed definition this loader should catch at load time rather than
-/// leaving to fail deep inside a running task.
-///
-/// Rejects absolute paths and `..` components up front: without this, a
-/// `prompt_file`/`system_prompt_file`/`script_file` value could walk
-/// straight out of the definition's directory (e.g. `/etc/passwd` or
-/// `../../../../etc/passwd`), contradicting "resolved relative to the
-/// definition dir" and letting the daemon read/execute arbitrary files a
-/// workflow author (or generator) points it at.
+/// Thin wrapper over `fileref::resolve_relative` (the traversal guard
+/// itself — reject absolute/`..` paths, then check existence — lives there
+/// so `global_config.rs` can reuse it) that attaches this loader's own
+/// error type and owner/field labels.
 fn resolve_file(
     base_dir: &Path,
     relative: &str,
@@ -495,28 +464,18 @@ fn resolve_file(
         RefOwner::Stage(name) => format!("stage '{name}'"),
     };
 
-    let rel_path = Path::new(relative);
-    let escapes = rel_path.is_absolute()
-        || rel_path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir));
-    if escapes {
-        return Err(WorkflowDefError::InvalidFileReference {
+    crate::fileref::resolve_relative(base_dir, relative).map_err(|err| match err {
+        crate::fileref::FileRefError::Escapes => WorkflowDefError::InvalidFileReference {
             owner: owner_label(),
             field,
             value: relative.to_string(),
-        });
-    }
-
-    let resolved = base_dir.join(rel_path);
-    if !resolved.is_file() {
-        return Err(WorkflowDefError::MissingReferencedFile {
+        },
+        crate::fileref::FileRefError::Missing(path) => WorkflowDefError::MissingReferencedFile {
             owner: owner_label(),
             field,
-            path: resolved,
-        });
-    }
-    Ok(resolved)
+            path,
+        },
+    })
 }
 
 /// Parses durations in the `<integer><unit>` shape used by §5.1's examples
@@ -731,7 +690,7 @@ stages:
         let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
         assert_eq!(def.name, "chat");
         assert_eq!(def.start_stage(), "chatting");
-        assert_eq!(def.roles["chat"].cli, "claude");
+        assert_eq!(def.roles["chat"].cli.as_deref(), Some("claude"));
         assert!(def.roles["chat"].system_prompt_file.is_some());
 
         let StageKind::AgentTurn { role, prompt_file } = &def.stages["chatting"].kind else {
@@ -739,6 +698,29 @@ stages:
         };
         assert_eq!(role, "chat");
         assert!(prompt_file.is_none());
+    }
+
+    #[test]
+    fn accepts_a_role_that_omits_cli_and_model() {
+        // P1-8 LLD §2.4: a workflow-def role is the middle of three
+        // resolution layers, so it must be allowed to leave cli/model
+        // unset and fall through to global config instead of being
+        // required to fully specify them.
+        let dir = TempDir::new();
+        let yaml = r#"
+name: chat
+roles:
+  chat: {}
+
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        assert_eq!(def.roles["chat"].cli, None);
+        assert_eq!(def.roles["chat"].model, None);
     }
 
     fn coding_task_yaml() -> &'static str {
@@ -1107,6 +1089,27 @@ stages:
     kind: agent_turn
     role: chat
     on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(err, WorkflowDefError::Yaml(_)));
+        assert!(err.to_string().contains("duplicate key"));
+    }
+
+    #[test]
+    fn rejects_a_stage_with_a_duplicate_on_outcome_key() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  a:
+    kind: human_gate
+    on:
+      done: b
+      done: c
+  b:
+    kind: terminal
+  c:
+    kind: terminal
 "#;
         let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
         assert!(matches!(err, WorkflowDefError::Yaml(_)));

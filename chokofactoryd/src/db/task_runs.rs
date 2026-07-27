@@ -94,6 +94,37 @@ pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<TaskR
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// The most recent `task_run` recorded against `task_id` for `stage` — the
+/// run currently "open" for that stage, if any (P1-8 LLD §2.5,
+/// `WorkflowEngine::send_message`'s lookup). Primarily ordered by
+/// `started_at` (unlike `list_for_task`'s `BY id`, which has no temporal
+/// meaning — a random UUID); `id DESC` is only a deterministic tie-break
+/// for two rows whose timestamps happen to collide, not a claim that `id`
+/// carries ordering meaning of its own. For a stage like `chat.yaml`'s
+/// (never re-entered — see `role_config`/`send_message`'s `on: {}`
+/// requirement), there's only ever one row to find; both the ordering and
+/// the tie-break matter once workflows with re-entrant stages exist.
+pub async fn get_current_for_stage(
+    pool: &SqlitePool,
+    task_id: &str,
+    stage: &str,
+) -> Result<Option<TaskRun>, sqlx::Error> {
+    // `id DESC` is a tie-break, not the primary ordering: SQLite/chrono
+    // timestamp precision isn't guaranteed to differ between two rows
+    // inserted close together, and without a tie-break that'd make this
+    // query's result nondeterministic (`fetch_optional` would pick
+    // whichever row the engine happened to visit first) rather than
+    // merely "arbitrary among ties" the way an explicit tie-break is.
+    let row = sqlx::query_as::<_, TaskRunRow>(&format!(
+        "SELECT {COLUMNS} FROM task_runs WHERE task_id = ? AND stage = ? ORDER BY started_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(task_id)
+    .bind(stage)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
 /// Persists the CLI's `session_id` for later resume (§4.1).
 pub async fn set_session_id(
     pool: &SqlitePool,
@@ -327,5 +358,70 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, TaskRunStatus::Exited);
         assert!(run.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_current_for_stage_returns_none_when_no_run_exists() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+        assert!(
+            get_current_for_stage(&pool, &task_id, "chatting")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_current_for_stage_filters_by_stage_and_picks_the_most_recent() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+
+        let other_stage = create(
+            &pool,
+            NewTaskRun {
+                task_id: &task_id,
+                stage: "other",
+                role: "chat",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap();
+
+        let first = create(
+            &pool,
+            NewTaskRun {
+                task_id: &task_id,
+                stage: "chatting",
+                role: "chat",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let second = create(
+            &pool,
+            NewTaskRun {
+                task_id: &task_id,
+                stage: "chatting",
+                role: "chat",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap();
+
+        let current = get_current_for_stage(&pool, &task_id, "chatting")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.id, second.id);
+        assert_ne!(current.id, first.id);
+        assert_ne!(current.id, other_stage.id);
     }
 }

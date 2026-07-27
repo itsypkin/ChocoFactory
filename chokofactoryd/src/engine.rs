@@ -17,20 +17,21 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chokofactory_core::models::{TaskRunEndReason, TaskRunStatus};
+use chokofactory_core::models::{Task, TaskRunEndReason, TaskRunStatus};
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
-use crate::adapter::RoleConfig;
 use crate::db::{task_runs, tasks, workflow_state};
+use crate::global_config::{GlobalConfig, GlobalConfigError};
+use crate::role_config::{self, RoleConfigError};
 use crate::session::{SessionError, SessionManager};
-use crate::workflow_def::{StageDef, StageKind, WorkflowDefinition};
+use crate::workflow_def::{StageDef, StageKind, WorkflowDefError, WorkflowDefinition};
 
 /// How often the `agent_turn` completion watcher polls a `task_run`'s
 /// status. Not configurable (yet) — this is an internal implementation
@@ -46,6 +47,15 @@ pub struct WorkflowEngine {
     /// relay, P1-9) could both read the same row and then both write,
     /// silently clobbering one call's `stage_history`/`loop_counters`.
     task_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Where `create_task`/`send_message` resolve a `workflow_def` name to
+    /// a file (P1-8 LLD §2.6/§2.8) — the *seeded* user directory
+    /// (`~/.config/chokofactory/workflows/` in production), never a
+    /// repo-relative path.
+    workflows_dir: PathBuf,
+    /// `None` means "no global config file configured" (e.g. `$HOME`
+    /// unset, or a test that doesn't care) — treated the same as a
+    /// missing file: role resolution just gets no global defaults.
+    global_config_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -61,6 +71,8 @@ pub enum EngineError {
     Session(SessionError),
     Db(sqlx::Error),
     Io(std::io::Error),
+    GlobalConfig(GlobalConfigError),
+    RoleConfig(RoleConfigError),
 }
 
 impl fmt::Display for EngineError {
@@ -93,6 +105,8 @@ impl fmt::Display for EngineError {
             EngineError::Session(err) => write!(f, "{err}"),
             EngineError::Db(err) => write!(f, "{err}"),
             EngineError::Io(err) => write!(f, "{err}"),
+            EngineError::GlobalConfig(err) => write!(f, "{err}"),
+            EngineError::RoleConfig(err) => write!(f, "{err}"),
         }
     }
 }
@@ -105,13 +119,274 @@ impl From<sqlx::Error> for EngineError {
     }
 }
 
+/// A `workflow_def` name resolved to a file under a `WorkflowEngine`'s
+/// `workflows_dir` (P1-8 LLD §2.8). Deliberately an allowlist
+/// (`^[A-Za-z0-9_-]+$`), not the workflow loader's absolute-path/`..`
+/// blocklist (`workflow_def.rs::resolve_file`/`fileref::resolve_relative`):
+/// `name` is a single opaque identifier that will eventually arrive
+/// straight from an HTTP request body (#9) or CLI arg (#10), materially
+/// less trusted than a relative path written into a workflow file already
+/// sitting on disk — an allowlist leaves no path syntax to reason about.
+fn resolve_workflow_path(workflows_dir: &Path, name: &str) -> Result<PathBuf, ResolveError> {
+    let valid_name = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !valid_name {
+        return Err(ResolveError::InvalidName(name.to_string()));
+    }
+    let path = workflows_dir.join(format!("{name}.yaml"));
+    if !path.is_file() {
+        return Err(ResolveError::NotFound(name.to_string()));
+    }
+    Ok(path)
+}
+
+#[derive(Debug)]
+pub enum ResolveError {
+    InvalidName(String),
+    NotFound(String),
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResolveError::InvalidName(name) => {
+                write!(
+                    f,
+                    "'{name}' is not a valid workflow name (expected only letters, digits, '_', '-')"
+                )
+            }
+            ResolveError::NotFound(name) => write!(f, "no workflow named '{name}' was found"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+#[derive(Debug)]
+pub enum CreateTaskError {
+    Resolve(ResolveError),
+    WorkflowDef(WorkflowDefError),
+    Db(sqlx::Error),
+    Start(EngineError),
+}
+
+impl fmt::Display for CreateTaskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CreateTaskError::Resolve(err) => write!(f, "{err}"),
+            CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
+            CreateTaskError::Db(err) => write!(f, "{err}"),
+            CreateTaskError::Start(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for CreateTaskError {}
+
+impl From<sqlx::Error> for CreateTaskError {
+    fn from(err: sqlx::Error) -> Self {
+        CreateTaskError::Db(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum SendMessageError {
+    NoSuchTask,
+    NoWorkflowState,
+    UnknownStage(String),
+    UnknownRole {
+        stage: String,
+        role: String,
+    },
+    /// The task's current stage isn't a standing-open `agent_turn` (empty
+    /// `on:`) — it's either a different kind, or an `agent_turn` that
+    /// *can* transition. Relaying a message into a stage that can
+    /// transition needs the API-layer wiring `human_gate`'s `resumed`
+    /// relay is waiting on (#9) — see P1-8 LLD §4.3 for why this is a hard
+    /// boundary, not a Phase-1 gap.
+    StageNotOpenEnded(String),
+    /// The stage is open-ended, but no `task_run` has ever been recorded
+    /// for it (e.g. `create_task`'s `start_task` failed before spawning
+    /// one).
+    NoOpenRun(String),
+    Resolve(ResolveError),
+    WorkflowDef(WorkflowDefError),
+    RoleConfig(RoleConfigError),
+    GlobalConfig(GlobalConfigError),
+    Session(SessionError),
+    Db(sqlx::Error),
+}
+
+impl fmt::Display for SendMessageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SendMessageError::NoSuchTask => write!(f, "no such task"),
+            SendMessageError::NoWorkflowState => write!(f, "task has no workflow_state row"),
+            SendMessageError::UnknownStage(stage) => {
+                write!(f, "workflow_state references unknown stage '{stage}'")
+            }
+            SendMessageError::UnknownRole { stage, role } => write!(
+                f,
+                "stage '{stage}' is an agent_turn with unknown role '{role}'"
+            ),
+            SendMessageError::StageNotOpenEnded(stage) => write!(
+                f,
+                "stage '{stage}' can transition to another stage, so it cannot accept a relayed message here"
+            ),
+            SendMessageError::NoOpenRun(stage) => {
+                write!(f, "stage '{stage}' has no task_run recorded for it yet")
+            }
+            SendMessageError::Resolve(err) => write!(f, "{err}"),
+            SendMessageError::WorkflowDef(err) => write!(f, "{err}"),
+            SendMessageError::RoleConfig(err) => write!(f, "{err}"),
+            SendMessageError::GlobalConfig(err) => write!(f, "{err}"),
+            SendMessageError::Session(err) => write!(f, "{err}"),
+            SendMessageError::Db(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for SendMessageError {}
+
+impl From<sqlx::Error> for SendMessageError {
+    fn from(err: sqlx::Error) -> Self {
+        SendMessageError::Db(err)
+    }
+}
+
 impl WorkflowEngine {
-    pub fn new(pool: SqlitePool, session_manager: Arc<SessionManager>) -> Arc<Self> {
+    pub fn new(
+        pool: SqlitePool,
+        session_manager: Arc<SessionManager>,
+        workflows_dir: PathBuf,
+        global_config_path: Option<PathBuf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pool,
             session_manager,
             task_locks: Mutex::new(HashMap::new()),
+            workflows_dir,
+            global_config_path,
         })
+    }
+
+    /// Missing `global_config_path` (not configured) and a missing file at
+    /// a configured path are both just "no global defaults" — not cached
+    /// (P1-8 LLD §4.5): re-read and re-parsed on every call.
+    fn load_global_config(&self) -> Result<GlobalConfig, GlobalConfigError> {
+        match &self.global_config_path {
+            Some(path) => GlobalConfig::load(path),
+            None => Ok(GlobalConfig::default()),
+        }
+    }
+
+    /// Creates a task under `project_id` running `workflow_def_name`,
+    /// feeding `initial_input` in as the entry stage's first message
+    /// (P1-8 LLD §2.7). `config` is the task-level override layer
+    /// `role_config::resolve` reads (`config.roles.<name>.*`, plus the
+    /// task-wide `config.cwd`).
+    ///
+    /// `workflow_def_name` is resolved and the definition freshly loaded
+    /// on every call, not cached (P1-8 LLD §4.5) — the same file `WorkflowEngine`
+    /// would otherwise have to invalidate a cache entry for.
+    pub async fn create_task(
+        self: &Arc<Self>,
+        project_id: &str,
+        workflow_def_name: &str,
+        title: &str,
+        initial_input: &str,
+        config: Value,
+    ) -> Result<Task, CreateTaskError> {
+        let path = resolve_workflow_path(&self.workflows_dir, workflow_def_name)
+            .map_err(CreateTaskError::Resolve)?;
+        let definition =
+            Arc::new(WorkflowDefinition::load(&path).map_err(CreateTaskError::WorkflowDef)?);
+
+        let task = tasks::create(
+            &self.pool,
+            tasks::NewTask {
+                project_id,
+                parent_task_id: None,
+                workflow_def: workflow_def_name,
+                title,
+                config,
+            },
+        )
+        .await?;
+
+        self.start_task(&task.id, &definition, Some(initial_input))
+            .await
+            .map_err(CreateTaskError::Start)?;
+
+        Ok(task)
+    }
+
+    /// Feeds a follow-up human message into `task_id`'s current stage,
+    /// which must be a standing-open `agent_turn` (empty `on:` — never
+    /// advances, so there's no risk of the stage changing out from under
+    /// this lookup, P1-8 LLD §4.3). Anything else — a different kind, or
+    /// an `agent_turn` that *can* transition (`human_gate`'s `resumed`
+    /// relay is #9's job) — is rejected rather than silently racing a
+    /// concurrent `advance()`.
+    pub async fn send_message(
+        self: &Arc<Self>,
+        task_id: &str,
+        text: &str,
+    ) -> Result<(), SendMessageError> {
+        let task = tasks::get(&self.pool, task_id)
+            .await?
+            .ok_or(SendMessageError::NoSuchTask)?;
+
+        let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
+            .map_err(SendMessageError::Resolve)?;
+        let definition = WorkflowDefinition::load(&path).map_err(SendMessageError::WorkflowDef)?;
+
+        let state = workflow_state::get(&self.pool, task_id)
+            .await?
+            .ok_or(SendMessageError::NoWorkflowState)?;
+        let current_stage = state.current_stage;
+
+        let stage_def = definition
+            .stages
+            .get(&current_stage)
+            .ok_or_else(|| SendMessageError::UnknownStage(current_stage.clone()))?;
+
+        let StageKind::AgentTurn { role, .. } = &stage_def.kind else {
+            return Err(SendMessageError::StageNotOpenEnded(current_stage));
+        };
+        if !stage_def.on.is_empty() {
+            return Err(SendMessageError::StageNotOpenEnded(current_stage));
+        }
+
+        // Same defensive check as `enter_agent_turn`'s: the loader rejects
+        // an agent_turn stage with an unknown role, but `roles`/`stages`
+        // are `pub` fields with no private-construction guard, so a
+        // definition built by hand could still reach here unvalidated
+        // (§ review on PR #35).
+        let role_def = definition
+            .roles
+            .get(role)
+            .ok_or_else(|| SendMessageError::UnknownRole {
+                stage: current_stage.clone(),
+                role: role.clone(),
+            })?;
+
+        let task_run = task_runs::get_current_for_stage(&self.pool, task_id, &current_stage)
+            .await?
+            .ok_or_else(|| SendMessageError::NoOpenRun(current_stage.clone()))?;
+
+        let global = self
+            .load_global_config()
+            .map_err(SendMessageError::GlobalConfig)?;
+        let resolved = role_config::resolve(role, role_def, &global, &task.config, task_cwd(&task))
+            .map_err(SendMessageError::RoleConfig)?;
+
+        self.session_manager
+            .send_message(&task_run.id, text, &resolved.role_config)
+            .await
+            .map_err(SendMessageError::Session)
     }
 
     /// Returns (creating if needed) the lock guarding `task_id`'s
@@ -377,27 +652,15 @@ impl WorkflowEngine {
                 .ok_or_else(|| EngineError::MissingAgentTurnInput(stage_name.to_string()))?
                 .to_string(),
         };
-        let system_prompt = role_def
-            .system_prompt_file
-            .as_ref()
-            .map(|path| fs::read_to_string(path).map_err(EngineError::Io))
-            .transpose()?;
 
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(EngineError::NoSuchTask)?;
-        let cwd = task
-            .config
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
-        let role_config = RoleConfig {
-            cwd,
-            model: Some(role_def.model.clone()),
-            system_prompt,
-        };
+        let global = self
+            .load_global_config()
+            .map_err(EngineError::GlobalConfig)?;
+        let resolved = role_config::resolve(role, role_def, &global, &task.config, task_cwd(&task))
+            .map_err(EngineError::RoleConfig)?;
 
         let task_run = task_runs::create(
             &self.pool,
@@ -405,15 +668,15 @@ impl WorkflowEngine {
                 task_id,
                 stage: stage_name,
                 role,
-                cli_adapter: &role_def.cli,
-                model: &role_def.model,
+                cli_adapter: &resolved.cli,
+                model: &resolved.model,
             },
         )
         .await?;
 
         if let Err(err) = self
             .session_manager
-            .start(&task_run.id, &prompt, &role_config)
+            .start(&task_run.id, &prompt, &resolved.role_config)
             .await
         {
             // The task_run row was just created `Active` above; without
@@ -519,6 +782,20 @@ impl WorkflowEngine {
     }
 }
 
+/// A task's working directory for its agent subprocess: `task.config.cwd`
+/// if set, else the daemon's own current directory, else (only if that
+/// fails too) an empty path. Shared by `enter_agent_turn` and
+/// `send_message` — both need the same task-wide (not per-role) value
+/// alongside `role_config::resolve`'s per-role fields.
+fn task_cwd(task: &Task) -> PathBuf {
+    task.config
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default()
+}
+
 /// Increments the guarded stage's transition count. Seeds a fresh entry
 /// with `entered_from: stage` (rather than e.g. `null`) so that the
 /// `note_stage_entry` call later in the same `advance()` — which, for a
@@ -615,7 +892,23 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let session_manager =
             SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
-        WorkflowEngine::new(pool, session_manager)
+        // No test here drives create_task/send_message's workflow-name
+        // resolution or a global config file, so an inert directory and
+        // no config path are enough — role_config::resolve just falls
+        // through to whatever the hand-built definition's `roles:` block
+        // already specifies, exactly like before this field existed.
+        WorkflowEngine::new(pool, session_manager, PathBuf::from("."), None)
+    }
+
+    fn engine_with_adapter_and_workflows_dir(
+        pool: SqlitePool,
+        binary: &str,
+        workflows_dir: &Path,
+    ) -> Arc<WorkflowEngine> {
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let session_manager =
+            SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        WorkflowEngine::new(pool, session_manager, workflows_dir.to_path_buf(), None)
     }
 
     async fn wait_until_stage(pool: &SqlitePool, task_id: &str, expected: &str) {
@@ -1357,6 +1650,241 @@ stages:
 
         let err = engine.start_task(&task_id, &def, None).await.unwrap_err();
         assert!(matches!(err, EngineError::UnsupportedStageKind(stage) if stage == "run"));
+    }
+
+    #[test]
+    fn resolve_workflow_path_only_accepts_a_safe_allowlisted_name() {
+        let dir = tempdir();
+        std::fs::write(dir.join("chat.yaml"), "irrelevant").unwrap();
+
+        assert!(resolve_workflow_path(&dir, "chat").is_ok());
+        assert!(matches!(
+            resolve_workflow_path(&dir, "").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+        assert!(matches!(
+            resolve_workflow_path(&dir, "../etc/passwd").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+        assert!(matches!(
+            resolve_workflow_path(&dir, "chat/../../etc").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+        assert!(matches!(
+            resolve_workflow_path(&dir, "does-not-exist").unwrap_err(),
+            ResolveError::NotFound(_)
+        ));
+    }
+
+    fn write_chat_workflow(workflows_dir: &Path) {
+        std::fs::write(
+            workflows_dir.join("chat.yaml"),
+            r#"
+name: chat
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_task_resolves_the_named_workflow_and_starts_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(
+                &project_id,
+                "chat",
+                "flaky test",
+                "hey, look into it",
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task.workflow_def, "chat");
+        let state = workflow_state::get(&pool, &task.id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "chatting");
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].stage, "chatting");
+    }
+
+    #[tokio::test]
+    async fn create_task_with_an_unknown_workflow_name_errors() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
+
+        let err = engine
+            .create_task(&project_id, "ghost", "t", "hi", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CreateTaskError::Resolve(ResolveError::NotFound(name)) if name == "ghost"
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_message_reaches_the_live_session_started_by_create_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(&project_id, "chat", "t", "hello", json!({}))
+            .await
+            .unwrap();
+
+        engine
+            .send_message(&task.id, "actually check the other branch too")
+            .await
+            .unwrap();
+
+        // fake_claude.py echoes each line it receives as `echo:<text>` in
+        // an assistant message event — proves the follow-up reached the
+        // same live process this task's create_task call started.
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let mut saw_echo = false;
+        for _ in 0..200 {
+            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+                .await
+                .unwrap();
+            if events.iter().any(|e| {
+                e.payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t == "echo:actually check the other branch too")
+            }) {
+                saw_echo = true;
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(saw_echo, "follow-up message never reached the live session");
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_a_stage_that_can_transition() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        std::fs::write(
+            workflows_dir.join("has-outcome.yaml"),
+            r#"
+name: has-outcome
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(&project_id, "has-outcome", "t", "hello", json!({}))
+            .await
+            .unwrap();
+
+        let err = engine.send_message(&task.id, "hi again").await.unwrap_err();
+        assert!(matches!(
+            err,
+            SendMessageError::StageNotOpenEnded(stage) if stage == "chatting"
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_message_errors_when_the_open_stage_has_no_task_run_yet() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+
+        // workflow_state seeded directly, skipping create_task/start_task
+        // (and therefore skipping the task_run it would have created) —
+        // simulates a task whose entry stage never actually got entered.
+        let task_id = seed_task(&pool, "chat").await;
+        workflow_state::create(&pool, &task_id, "chatting")
+            .await
+            .unwrap();
+
+        let err = engine.send_message(&task_id, "hello?").await.unwrap_err();
+        assert!(matches!(
+            err,
+            SendMessageError::NoOpenRun(stage) if stage == "chatting"
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_message_errors_for_a_nonexistent_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+
+        let err = engine
+            .send_message("no-such-task", "hello?")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendMessageError::NoSuchTask));
+    }
+
+    #[tokio::test]
+    async fn send_message_errors_when_workflow_state_references_an_unknown_stage() {
+        // Reachable given this design's "no caching, always re-read from
+        // disk" stance (P1-8 LLD §4.5): the workflow file backing a task
+        // could be edited to remove a stage after the task already
+        // recorded `workflow_state.current_stage` there.
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+
+        let task_id = seed_task(&pool, "chat").await;
+        workflow_state::create(&pool, &task_id, "ghost-stage")
+            .await
+            .unwrap();
+
+        let err = engine.send_message(&task_id, "hello?").await.unwrap_err();
+        assert!(matches!(
+            err,
+            SendMessageError::UnknownStage(stage) if stage == "ghost-stage"
+        ));
     }
 
     struct TempDir(PathBuf);
