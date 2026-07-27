@@ -43,9 +43,9 @@ pub struct WorkflowEngine {
     session_manager: Arc<SessionManager>,
     /// Serializes `advance()` calls per task (§ review on PR #35): without
     /// this, two callers racing to advance the same task's `workflow_state`
-    /// (e.g. the turn-completion watcher and a future human_gate message
-    /// relay, P1-9) could both read the same row and then both write,
-    /// silently clobbering one call's `stage_history`/`loop_counters`.
+    /// (e.g. the turn-completion watcher and `send_message_or_resume`'s
+    /// `human_gate` relay) could both read the same row and then both
+    /// write, silently clobbering one call's `stage_history`/`loop_counters`.
     task_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Where `create_task`/`send_message` resolve a `workflow_def` name to
     /// a file (P1-8 LLD §2.6/§2.8) — the *seeded* user directory
@@ -202,10 +202,10 @@ pub enum SendMessageError {
     },
     /// The task's current stage isn't a standing-open `agent_turn` (empty
     /// `on:`) — it's either a different kind, or an `agent_turn` that
-    /// *can* transition. Relaying a message into a stage that can
-    /// transition needs the API-layer wiring `human_gate`'s `resumed`
-    /// relay is waiting on (#9) — see P1-8 LLD §4.3 for why this is a hard
-    /// boundary, not a Phase-1 gap.
+    /// *can* transition. Callers that don't already know the stage kind
+    /// should go through `send_message_or_resume` instead, which picks
+    /// between this and `advance`'s `human_gate` relay — see P1-8 LLD
+    /// §4.3 for why this is a hard boundary, not a Phase-1 gap.
     StageNotOpenEnded(String),
     /// The stage is open-ended, but no `task_run` has ever been recorded
     /// for it (e.g. `create_task`'s `start_task` failed before spawning
@@ -256,6 +256,57 @@ impl From<sqlx::Error> for SendMessageError {
     }
 }
 
+/// Errors from [`WorkflowEngine::send_message_or_resume`] — the dispatch
+/// this stage's own doc comments (and `SendMessageError::StageNotOpenEnded`'s)
+/// call out as "issue #9's job": relay a human message into whichever of
+/// `send_message`/`advance` the task's current stage actually needs.
+#[derive(Debug)]
+pub enum SendMessageOrResumeError {
+    NoSuchTask,
+    NoWorkflowState,
+    UnknownStage(String),
+    /// The current stage is neither a standing-open `agent_turn` nor a
+    /// `human_gate` — e.g. `shell`/`poll`/`terminal`, or an `agent_turn`
+    /// that can itself transition (not yet a case this dispatch handles).
+    UnsupportedStageKind(String),
+    Resolve(ResolveError),
+    WorkflowDef(WorkflowDefError),
+    Db(sqlx::Error),
+    SendMessage(SendMessageError),
+    Advance(EngineError),
+}
+
+impl fmt::Display for SendMessageOrResumeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SendMessageOrResumeError::NoSuchTask => write!(f, "no such task"),
+            SendMessageOrResumeError::NoWorkflowState => {
+                write!(f, "task has no workflow_state row")
+            }
+            SendMessageOrResumeError::UnknownStage(stage) => {
+                write!(f, "workflow_state references unknown stage '{stage}'")
+            }
+            SendMessageOrResumeError::UnsupportedStageKind(stage) => write!(
+                f,
+                "stage '{stage}' cannot accept a message or resume signal here"
+            ),
+            SendMessageOrResumeError::Resolve(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::WorkflowDef(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::Db(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::SendMessage(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::Advance(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for SendMessageOrResumeError {}
+
+impl From<sqlx::Error> for SendMessageOrResumeError {
+    fn from(err: sqlx::Error) -> Self {
+        SendMessageOrResumeError::Db(err)
+    }
+}
+
 impl WorkflowEngine {
     pub fn new(
         pool: SqlitePool,
@@ -291,9 +342,16 @@ impl WorkflowEngine {
     /// `workflow_def_name` is resolved and the definition freshly loaded
     /// on every call, not cached (P1-8 LLD §4.5) — the same file `WorkflowEngine`
     /// would otherwise have to invalidate a cache entry for.
+    ///
+    /// `parent_task_id` tags this task as spawned via delegation (§6.2's
+    /// `choco task create --parent-task <id>`) — purely a label for the UI
+    /// and for a parent task to poll; it has no effect on how this task's
+    /// own workflow runs.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_task(
         self: &Arc<Self>,
         project_id: &str,
+        parent_task_id: Option<&str>,
         workflow_def_name: &str,
         title: &str,
         initial_input: &str,
@@ -308,7 +366,7 @@ impl WorkflowEngine {
             &self.pool,
             tasks::NewTask {
                 project_id,
-                parent_task_id: None,
+                parent_task_id,
                 workflow_def: workflow_def_name,
                 title,
                 config,
@@ -327,9 +385,9 @@ impl WorkflowEngine {
     /// which must be a standing-open `agent_turn` (empty `on:` — never
     /// advances, so there's no risk of the stage changing out from under
     /// this lookup, P1-8 LLD §4.3). Anything else — a different kind, or
-    /// an `agent_turn` that *can* transition (`human_gate`'s `resumed`
-    /// relay is #9's job) — is rejected rather than silently racing a
-    /// concurrent `advance()`.
+    /// an `agent_turn` that *can* transition — is rejected rather than
+    /// silently racing a concurrent `advance()`; callers that don't already
+    /// know the stage kind should go through `send_message_or_resume`.
     pub async fn send_message(
         self: &Arc<Self>,
         task_id: &str,
@@ -387,6 +445,60 @@ impl WorkflowEngine {
             .send_message(&task_run.id, text, &resolved.role_config)
             .await
             .map_err(SendMessageError::Session)
+    }
+
+    /// Dispatches a human message against `task_id`'s current stage to
+    /// whichever of `send_message`/`advance` it actually needs (P1-9): a
+    /// standing-open `agent_turn` relays `text` straight into its live
+    /// session via `send_message`; a `human_gate` has no session to relay
+    /// into at all — the human's `text` is the resume signal itself, so
+    /// this calls `advance(task_id, definition, "resumed")` instead. Any
+    /// other stage kind (a mid-transition `agent_turn`, `shell`, `poll`,
+    /// `terminal`) is rejected rather than guessing.
+    ///
+    /// This re-loads `task`/`workflow_state`/the workflow definition itself
+    /// before delegating to a primitive that re-loads them again —
+    /// redundant, but consistent with `send_message`'s own "not cached,
+    /// freshly loaded on every call" stance (P1-8 LLD §4.5), and cheap for
+    /// a single-user local daemon.
+    pub async fn send_message_or_resume(
+        self: &Arc<Self>,
+        task_id: &str,
+        text: &str,
+    ) -> Result<(), SendMessageOrResumeError> {
+        let task = tasks::get(&self.pool, task_id)
+            .await?
+            .ok_or(SendMessageOrResumeError::NoSuchTask)?;
+
+        let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
+            .map_err(SendMessageOrResumeError::Resolve)?;
+        let definition = Arc::new(
+            WorkflowDefinition::load(&path).map_err(SendMessageOrResumeError::WorkflowDef)?,
+        );
+
+        let state = workflow_state::get(&self.pool, task_id)
+            .await?
+            .ok_or(SendMessageOrResumeError::NoWorkflowState)?;
+        let current_stage = state.current_stage;
+
+        let stage_def = definition
+            .stages
+            .get(&current_stage)
+            .ok_or_else(|| SendMessageOrResumeError::UnknownStage(current_stage.clone()))?;
+
+        match &stage_def.kind {
+            StageKind::HumanGate => self
+                .advance(task_id, &definition, "resumed")
+                .await
+                .map_err(SendMessageOrResumeError::Advance),
+            StageKind::AgentTurn { .. } if stage_def.on.is_empty() => self
+                .send_message(task_id, text)
+                .await
+                .map_err(SendMessageOrResumeError::SendMessage),
+            _ => Err(SendMessageOrResumeError::UnsupportedStageKind(
+                current_stage,
+            )),
+        }
     }
 
     /// Returns (creating if needed) the lock guarding `task_id`'s
@@ -475,8 +587,7 @@ impl WorkflowEngine {
     ///
     /// Callers: the `agent_turn` completion watcher spawned by
     /// `enter_stage` (for a plain single-shot turn's `done`), and
-    /// whatever receives a human's message during a `human_gate` (its
-    /// `resumed`) — the latter not yet wired to an API layer (P1-9).
+    /// `send_message_or_resume`'s `human_gate` relay (its `resumed`).
     pub async fn advance(
         self: &Arc<Self>,
         task_id: &str,
@@ -890,8 +1001,12 @@ mod tests {
 
     fn engine_with_adapter(pool: SqlitePool, binary: &str) -> Arc<WorkflowEngine> {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
-        let session_manager =
-            SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let session_manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(tokio::sync::Notify::new()),
+        );
         // No test here drives create_task/send_message's workflow-name
         // resolution or a global config file, so an inert directory and
         // no config path are enough — role_config::resolve just falls
@@ -906,8 +1021,12 @@ mod tests {
         workflows_dir: &Path,
     ) -> Arc<WorkflowEngine> {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
-        let session_manager =
-            SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let session_manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(tokio::sync::Notify::new()),
+        );
         WorkflowEngine::new(pool, session_manager, workflows_dir.to_path_buf(), None)
     }
 
@@ -1710,6 +1829,7 @@ stages:
         let task = engine
             .create_task(
                 &project_id,
+                None,
                 "chat",
                 "flaky test",
                 "hey, look into it",
@@ -1734,7 +1854,7 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
 
         let err = engine
-            .create_task(&project_id, "ghost", "t", "hi", json!({}))
+            .create_task(&project_id, None, "ghost", "t", "hi", json!({}))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1756,7 +1876,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, "chat", "t", "hello", json!({}))
+            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -1818,7 +1938,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, "has-outcome", "t", "hello", json!({}))
+            .create_task(&project_id, None, "has-outcome", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -1884,6 +2004,110 @@ stages:
         assert!(matches!(
             err,
             SendMessageError::UnknownStage(stage) if stage == "ghost-stage"
+        ));
+    }
+
+    /// `send_message_or_resume` resolves its workflow definition from disk
+    /// (like `send_message`/`create_task`), unlike `advance`/`start_task`
+    /// which take an already-loaded `&Arc<WorkflowDefinition>` straight
+    /// from the caller — so, unlike this file's other `human_gate_chain_def`
+    /// tests, these two need the same YAML actually written to a
+    /// `workflows_dir` under the name the seeded task references.
+    fn write_human_gate_chain_workflow(workflows_dir: &Path) {
+        std::fs::write(
+            workflows_dir.join("gated.yaml"),
+            r#"
+name: gated
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_message_or_resume_routes_a_human_gate_stage_to_advance() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_human_gate_chain_workflow(&workflows_dir);
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, "gated").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine
+            .send_message_or_resume(&task_id, "ignored for a human_gate")
+            .await
+            .unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "done");
+    }
+
+    #[tokio::test]
+    async fn send_message_or_resume_routes_an_open_agent_turn_to_send_message() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .await
+            .unwrap();
+
+        engine
+            .send_message_or_resume(&task.id, "actually check the other branch too")
+            .await
+            .unwrap();
+
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let mut saw_echo = false;
+        for _ in 0..200 {
+            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+                .await
+                .unwrap();
+            if events.iter().any(|e| {
+                e.payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t == "echo:actually check the other branch too")
+            }) {
+                saw_echo = true;
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(saw_echo, "follow-up message never reached the live session");
+    }
+
+    #[tokio::test]
+    async fn send_message_or_resume_rejects_an_unsupported_stage_kind() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_human_gate_chain_workflow(&workflows_dir);
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, "gated").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.advance(&task_id, &def, "resumed").await.unwrap(); // -> "done" (terminal)
+
+        let err = engine
+            .send_message_or_resume(&task_id, "too late")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SendMessageOrResumeError::UnsupportedStageKind(stage) if stage == "done"
         ));
     }
 

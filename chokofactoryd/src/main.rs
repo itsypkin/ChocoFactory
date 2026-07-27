@@ -1,3 +1,77 @@
-fn main() {
-    println!("chokofactoryd: not yet implemented");
+use std::sync::Arc;
+
+use chokofactoryd::adapter::{AgentAdapter, ClaudeAdapter};
+use chokofactoryd::api::{self, AppState};
+use chokofactoryd::config_root;
+use chokofactoryd::db::{self, task_runs};
+use chokofactoryd::engine::WorkflowEngine;
+use chokofactoryd::global_config::GlobalConfig;
+use chokofactoryd::retention::{self, RetentionConfig};
+use chokofactoryd::session::{IdleReaperConfig, SessionManager};
+use tokio::sync::Notify;
+
+/// Bound to `127.0.0.1` only (design §6.1/§6.2, Q15: no auth, accessed
+/// remotely only via SSH port forwarding) — hardcoded for now, no CLI
+/// flag/env var until something downstream actually needs one.
+const DEFAULT_PORT: u16 = 4141;
+
+/// §4.1 leaves the idle-session timeout as "configurable, default TBD in
+/// plan" — this is that default, hardcoded until a config surface for it
+/// exists.
+const DEFAULT_IDLE_TIMEOUT_MINUTES: i64 = 30;
+
+#[tokio::main]
+async fn main() {
+    let root = config_root::config_root()
+        .expect("chokofactoryd: $HOME is not set, cannot determine ~/.config/chokofactory");
+    let workflows_dir = root.join("workflows");
+    // Once before serving any request (P1-9): the built-ins ship compiled
+    // into this binary and are seeded out to the user's own workflows
+    // directory only if not already present (§2.2) — never overwritten on
+    // a later version's startup.
+    config_root::seed_builtin_workflows(&workflows_dir)
+        .expect("chokofactoryd: failed to seed builtin workflow definitions");
+
+    let pool = db::connect(&root.join("chokofactory.db"))
+        .await
+        .expect("chokofactoryd: failed to connect to the database");
+    // Before any SessionManager use (its own doc comment): any run left
+    // `active` in the DB from a previous process is dead by now.
+    task_runs::recover_stale_active_runs(&pool)
+        .await
+        .expect("chokofactoryd: failed to recover stale active task runs");
+
+    let events_notify = Arc::new(Notify::new());
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::new());
+    let session_manager = SessionManager::new(
+        pool.clone(),
+        adapter,
+        chrono::Duration::minutes(DEFAULT_IDLE_TIMEOUT_MINUTES),
+        Arc::clone(&events_notify),
+    );
+    let engine = WorkflowEngine::new(
+        pool.clone(),
+        Arc::clone(&session_manager),
+        workflows_dir,
+        GlobalConfig::default_path(),
+    );
+
+    tokio::spawn(Arc::clone(&session_manager).run_idle_reaper(IdleReaperConfig::default()));
+    tokio::spawn(retention::run_retention_job(
+        pool.clone(),
+        RetentionConfig::default(),
+    ));
+
+    let state = AppState {
+        pool,
+        engine,
+        events_notify,
+    };
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", DEFAULT_PORT))
+        .await
+        .expect("chokofactoryd: failed to bind 127.0.0.1");
+    println!("chokofactoryd: listening on http://127.0.0.1:{DEFAULT_PORT}");
+    axum::serve(listener, api::router(state))
+        .await
+        .expect("chokofactoryd: server error");
 }
