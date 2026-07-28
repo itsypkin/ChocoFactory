@@ -130,9 +130,11 @@ impl SessionManager {
             Ok(handle) => handle,
             Err(err) => {
                 self.sessions.lock().await.remove(task_run_id);
+                tracing::error!(task_run_id, %err, "failed to start session");
                 return Err(SessionError::Adapter(err));
             }
         };
+        tracing::info!(task_run_id, "session started");
         self.spawn_drain(task_run_id.to_string(), handle).await;
         Ok(())
     }
@@ -186,6 +188,7 @@ impl SessionManager {
             Ok(handle) => handle,
             Err(err) => {
                 self.sessions.lock().await.remove(task_run_id);
+                tracing::error!(task_run_id, %err, "failed to resume session");
                 return Err(SessionError::Adapter(err));
             }
         };
@@ -196,6 +199,7 @@ impl SessionManager {
             self.sessions.lock().await.remove(task_run_id);
             return Err(SessionError::Db(err));
         }
+        tracing::info!(task_run_id, "session resumed");
         self.spawn_drain(task_run_id.to_string(), handle).await;
         Ok(())
     }
@@ -275,20 +279,26 @@ impl SessionManager {
         let snapshot: Vec<_> = {
             let sessions = self.sessions.lock().await;
             sessions
-                .values()
-                .filter_map(|slot| match slot {
-                    SessionSlot::Live(session) => {
-                        Some((session.cmd_tx.clone(), Arc::clone(&session.last_activity)))
-                    }
+                .iter()
+                .filter_map(|(task_run_id, slot)| match slot {
+                    SessionSlot::Live(session) => Some((
+                        task_run_id.clone(),
+                        session.cmd_tx.clone(),
+                        Arc::clone(&session.last_activity),
+                    )),
                     SessionSlot::Establishing => None,
                 })
                 .collect()
         };
 
         let now = Utc::now();
-        for (cmd_tx, last_activity) in snapshot {
+        for (task_run_id, cmd_tx, last_activity) in snapshot {
             let last_activity = *last_activity.lock().await;
             if now - last_activity >= self.idle_timeout {
+                tracing::info!(
+                    task_run_id,
+                    "idle reaper: closing session past its idle timeout"
+                );
                 let _ = cmd_tx.send(Command::Close);
             }
         }
@@ -352,11 +362,14 @@ async fn drain_session(
                         if let AgentEvent::SessionMeta { session_id } = &event
                             && let Err(err) = task_runs::set_session_id(pool, task_run_id, session_id).await
                         {
-                            eprintln!("session {task_run_id}: failed to persist session_id: {err}");
+                            tracing::error!(task_run_id, %err, "failed to persist session_id");
                         }
                         match events::append(pool, task_run_id, event.event_type(), event.payload()).await {
-                            Ok(_) => events_notify.notify_waiters(),
-                            Err(err) => eprintln!("session {task_run_id}: failed to append event: {err}"),
+                            Ok(event) => {
+                                tracing::debug!(task_run_id, seq = event.seq, event_type = %event.event_type, "appended event");
+                                events_notify.notify_waiters();
+                            }
+                            Err(err) => tracing::error!(task_run_id, %err, "failed to append event"),
                         }
                         // Any drained output counts as activity, not just
                         // inbound `Send`s — broader than §4.1's "no input"
@@ -374,7 +387,7 @@ async fn drain_session(
                 match cmd {
                     Some(Command::Send(text)) => {
                         if let Err(err) = handle.send(&text) {
-                            eprintln!("session {task_run_id}: failed to deliver message, process already gone: {err}");
+                            tracing::error!(task_run_id, %err, "failed to deliver message, process already gone");
                         }
                         *last_activity.lock().await = Utc::now();
                     }
@@ -406,7 +419,7 @@ async fn drain_session(
     let exit_status = handle.wait().await;
     let clean_exit = matches!(&exit_status, Ok(status) if status.success());
     if let Err(err) = &exit_status {
-        eprintln!("session {task_run_id}: failed to reap subprocess: {err}");
+        tracing::error!(task_run_id, %err, "failed to reap subprocess");
     }
     let (final_status, ended_at) = if clean_exit {
         (TaskRunStatus::Idle, None)
@@ -423,7 +436,9 @@ async fn drain_session(
     if let Err(err) =
         task_runs::update_status(pool, task_run_id, final_status, ended_at, end_reason).await
     {
-        eprintln!("session {task_run_id}: failed to update status after drain: {err}");
+        tracing::error!(task_run_id, %err, "failed to update status after drain");
+    } else {
+        tracing::info!(task_run_id, status = %final_status, ?end_reason, "session drained");
     }
 }
 

@@ -38,8 +38,10 @@ async fn run_loop(pool: &SqlitePool, config: &RetentionConfig, max_iterations: O
     let mut ran = 0usize;
     loop {
         interval.tick().await;
-        if let Err(err) = run_once(pool, config.max_age).await {
-            eprintln!("retention job: failed to prune events: {err}");
+        match run_once(pool, config.max_age).await {
+            Ok(pruned) if pruned > 0 => tracing::info!(pruned, "retention job: pruned old events"),
+            Ok(_) => tracing::debug!("retention job: no events old enough to prune"),
+            Err(err) => tracing::error!(%err, "retention job: failed to prune events"),
         }
         ran += 1;
         if max_iterations.is_some_and(|limit| ran >= limit) {

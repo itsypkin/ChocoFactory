@@ -9,6 +9,19 @@ use chokofactoryd::global_config::GlobalConfig;
 use chokofactoryd::retention::{self, RetentionConfig};
 use chokofactoryd::session::{IdleReaperConfig, SessionManager};
 use tokio::sync::Notify;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
+
+/// Every HTTP request/response (method, path, status, latency) logs at
+/// `info` via `TraceLayer` regardless of `RUST_LOG`, so a plain `curl`
+/// against the daemon is visible without extra setup; `RUST_LOG` still
+/// overrides everything (e.g. `RUST_LOG=debug` for full detail, or
+/// `RUST_LOG=chokofactoryd=trace,tower_http=debug` to narrow it down).
+fn init_logging() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,chokofactoryd=debug,tower_http=info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
 
 /// Bound to `127.0.0.1` only (design §6.1/§6.2, Q15: no auth, accessed
 /// remotely only via SSH port forwarding) — hardcoded for now, no CLI
@@ -22,24 +35,33 @@ const DEFAULT_IDLE_TIMEOUT_MINUTES: i64 = 30;
 
 #[tokio::main]
 async fn main() {
+    init_logging();
+
     let root = config_root::config_root()
         .expect("chokofactoryd: $HOME is not set, cannot determine ~/.config/chokofactory");
     let workflows_dir = root.join("workflows");
+    tracing::info!(root = %root.display(), "starting chokofactoryd");
+
     // Once before serving any request (P1-9): the built-ins ship compiled
     // into this binary and are seeded out to the user's own workflows
     // directory only if not already present (§2.2) — never overwritten on
     // a later version's startup.
     config_root::seed_builtin_workflows(&workflows_dir)
         .expect("chokofactoryd: failed to seed builtin workflow definitions");
+    tracing::info!(dir = %workflows_dir.display(), "seeded builtin workflows");
 
-    let pool = db::connect(&root.join("chokofactory.db"))
+    let db_path = root.join("chokofactory.db");
+    let pool = db::connect(&db_path)
         .await
         .expect("chokofactoryd: failed to connect to the database");
+    tracing::info!(path = %db_path.display(), "connected to database");
+
     // Before any SessionManager use (its own doc comment): any run left
     // `active` in the DB from a previous process is dead by now.
-    task_runs::recover_stale_active_runs(&pool)
+    let recovered = task_runs::recover_stale_active_runs(&pool)
         .await
         .expect("chokofactoryd: failed to recover stale active task runs");
+    tracing::info!(recovered, "recovered stale active task runs");
 
     let events_notify = Arc::new(Notify::new());
     let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::new());
@@ -61,17 +83,22 @@ async fn main() {
         pool.clone(),
         RetentionConfig::default(),
     ));
+    tracing::info!("spawned idle reaper and retention job");
 
     let state = AppState {
         pool,
         engine,
         events_notify,
     };
+    let router = api::router(state).layer(TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", DEFAULT_PORT))
         .await
         .expect("chokofactoryd: failed to bind 127.0.0.1");
-    println!("chokofactoryd: listening on http://127.0.0.1:{DEFAULT_PORT}");
-    axum::serve(listener, api::router(state))
+    tracing::info!(
+        port = DEFAULT_PORT,
+        "listening on http://127.0.0.1:{DEFAULT_PORT}"
+    );
+    axum::serve(listener, router)
         .await
         .expect("chokofactoryd: server error");
 }

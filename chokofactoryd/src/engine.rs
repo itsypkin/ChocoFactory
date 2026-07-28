@@ -746,8 +746,15 @@ impl WorkflowEngine {
                 // references it (`evict_task_lock_if_unshared`) — this
                 // function has no access to that `Arc`.
                 if let Err(err) = tasks::update_status(&self.pool, task_id, "closed").await {
-                    eprintln!(
-                        "workflow engine: failed to mark task {task_id} closed after entering a terminal stage: {err}"
+                    tracing::error!(
+                        task_id, %err,
+                        "failed to mark task closed after entering a terminal stage"
+                    );
+                } else {
+                    tracing::info!(
+                        task_id,
+                        stage = stage_name,
+                        "task closed (entered terminal stage)"
                     );
                 }
                 Ok(())
@@ -823,14 +830,15 @@ impl WorkflowEngine {
             // the caller before enter_stage ran (§ review on PR #35).
             //
             // This still leaves the *task* itself — as opposed to this
-            // task_run — with no queryable "stuck" signal beyond this
-            // eprintln! and `end_reason: "start_failed"` on the task_run:
+            // task_run — with no queryable "stuck" signal beyond this log
+            // line and `end_reason: "start_failed"` on the task_run:
             // nothing here marks `workflow_state`/`tasks` in a way an
             // operator or API layer could discover without already knowing
             // to look. Acknowledged gap for Phase 1; surfacing it (e.g. a
             // task status or a query joining `tasks` to a stalled
-            // `task_run`) is expected to land with the API layer (P1-9) or
-            // a dedicated follow-up, not silently absorbed here.
+            // `task_run`) is expected to land with a dedicated follow-up,
+            // not silently absorbed here.
+            tracing::error!(task_id, task_run_id = %task_run.id, %err, "failed to start session for agent_turn");
             if let Err(update_err) = task_runs::update_status(
                 &self.pool,
                 &task_run.id,
@@ -840,9 +848,9 @@ impl WorkflowEngine {
             )
             .await
             {
-                eprintln!(
-                    "workflow engine: failed to mark task run {} exited after a failed session start: {update_err}",
-                    task_run.id
+                tracing::error!(
+                    task_run_id = %task_run.id, %update_err,
+                    "failed to mark task run exited after a failed session start"
                 );
             }
             return Err(EngineError::Session(err));
@@ -882,28 +890,35 @@ impl WorkflowEngine {
                         if run.status == TaskRunStatus::Idle
                             && run.end_reason == Some(TaskRunEndReason::Reaped) =>
                     {
-                        eprintln!(
-                            "workflow engine: task run {task_run_id} (task {task_id}) was force-closed by the idle reaper before completing its turn; not auto-advancing"
+                        tracing::warn!(
+                            task_id,
+                            task_run_id,
+                            "task run was force-closed by the idle reaper before completing its turn; not auto-advancing"
                         );
                         return;
                     }
                     Ok(Some(run)) if run.status == TaskRunStatus::Idle => break,
                     Ok(Some(run)) if run.status == TaskRunStatus::Exited => {
-                        eprintln!(
-                            "workflow engine: task run {task_run_id} (task {task_id}) exited without completing its turn cleanly; not auto-advancing"
+                        tracing::warn!(
+                            task_id,
+                            task_run_id,
+                            "task run exited without completing its turn cleanly; not auto-advancing"
                         );
                         return;
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        eprintln!(
-                            "workflow engine: task run {task_run_id} (task {task_id}) disappeared while watching for turn completion; not auto-advancing"
+                        tracing::error!(
+                            task_id,
+                            task_run_id,
+                            "task run disappeared while watching for turn completion; not auto-advancing"
                         );
                         return;
                     }
                     Err(err) => {
-                        eprintln!(
-                            "workflow engine: failed to poll task run {task_run_id} (task {task_id}) while watching for turn completion: {err}; not auto-advancing"
+                        tracing::error!(
+                            task_id, task_run_id, %err,
+                            "failed to poll task run while watching for turn completion; not auto-advancing"
                         );
                         return;
                     }
@@ -911,8 +926,12 @@ impl WorkflowEngine {
                 tokio::time::sleep(TURN_WATCH_INTERVAL).await;
             }
             if let Err(err) = engine.advance(&task_id, &definition, "done").await {
-                eprintln!(
-                    "workflow engine: failed to auto-advance task {task_id} on turn completion: {err}"
+                tracing::error!(task_id, %err, "failed to auto-advance task on turn completion");
+            } else {
+                tracing::debug!(
+                    task_id,
+                    task_run_id,
+                    "turn completed; auto-advanced with \"done\""
                 );
             }
         });
