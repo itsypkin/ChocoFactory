@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chokofactory_core::models::{Task, TaskRunEndReason, TaskRunStatus};
+use chokofactory_core::models::{EventType, Task, TaskRunEndReason, TaskRunStatus};
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
-use crate::db::{projects, task_runs, tasks, workflow_state};
+use crate::db::{events, projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
 use crate::role_config::{self, RoleConfigError};
 use crate::session::{SessionError, SessionManager};
@@ -467,6 +467,29 @@ impl WorkflowEngine {
         let resolved = role_config::resolve(role, role_def, &global, &task.config, task_cwd(&task))
             .map_err(SendMessageError::RoleConfig)?;
 
+        // Recorded *before* handing off to the live session, not after —
+        // once handed off, the session's own drain task can react and
+        // append its reply's events at any point, on any thread. Recording
+        // first guarantees this event's `(created_at, id)` always sorts
+        // before anything that reply could produce, regardless of
+        // scheduling; recording after would leave the two racing, with no
+        // ordering guarantee under a real multi-threaded runtime (a
+        // sequential-looking "send_message" test can hide this, since a
+        // single-threaded test runtime happens not to schedule the drain
+        // task until this task yields). Best-effort like `drain_session`'s
+        // own event-append calls: a transient DB failure here shouldn't
+        // block the relay that follows.
+        if let Err(err) = events::append(
+            &self.pool,
+            &task_run.id,
+            EventType::HumanMessage,
+            json!({ "text": text }),
+        )
+        .await
+        {
+            tracing::error!(task_run_id = %task_run.id, %err, "failed to record human message event");
+        }
+
         self.session_manager
             .send_message(&task_run.id, text, &resolved.role_config)
             .await
@@ -818,6 +841,31 @@ impl WorkflowEngine {
         )
         .await?;
 
+        // Recorded *before* starting the session, not after — once
+        // started, the drain task can react and append its own events
+        // (session_meta, the reply) at any point, on any thread, so
+        // recording first is what guarantees this event always sorts
+        // ahead of anything the session produces, regardless of
+        // scheduling (see `send_message`'s identical reasoning). Only
+        // when `prompt` came from human-typed `input`, not a
+        // `prompt_file` — a template-rendered system prompt (a
+        // coder/reviewer turn's own instructions, say) isn't something a
+        // human said, so it doesn't belong in the human side of the
+        // conversation the way a chat task's initial message does.
+        // Best-effort: a transient DB failure here shouldn't block
+        // starting the turn.
+        if prompt_file.is_none()
+            && let Err(err) = events::append(
+                &self.pool,
+                &task_run.id,
+                EventType::HumanMessage,
+                json!({ "text": prompt }),
+            )
+            .await
+        {
+            tracing::error!(task_run_id = %task_run.id, %err, "failed to record human message event");
+        }
+
         if let Err(err) = self
             .session_manager
             .start(&task_run.id, &prompt, &resolved.role_config)
@@ -1084,6 +1132,25 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         panic!("timed out waiting for stage {expected}");
+    }
+
+    /// Polls `task_run_id`'s events for one whose `payload.text` equals
+    /// `text` (e.g. an assistant reply from the fake-claude fixture),
+    /// since event persistence happens on a spawned background task.
+    async fn wait_until_events_contain(pool: &SqlitePool, task_run_id: &str, text: &str) {
+        for _ in 0..200 {
+            let events = crate::db::events::list_for_task_run(pool, task_run_id)
+                .await
+                .unwrap();
+            if events
+                .iter()
+                .any(|e| e.payload.get("text").and_then(Value::as_str) == Some(text))
+            {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for an event with text {text:?}");
     }
 
     fn human_gate_chain_def() -> Arc<WorkflowDefinition> {
@@ -1993,6 +2060,119 @@ stages:
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         assert!(saw_echo, "follow-up message never reached the live session");
+    }
+
+    /// Regression test: the `events` table used to only ever hold what the
+    /// agent adapter emitted — the human's own side of the conversation
+    /// (both the task's initial prompt and every `send_message` relay)
+    /// has nowhere to land otherwise. Checks both write sites at once
+    /// (`enter_agent_turn`'s initial-input path and `send_message`'s
+    /// relay path) and that they interleave in the right order with the
+    /// agent's replies.
+    #[tokio::test]
+    async fn human_messages_are_recorded_as_events_interleaved_with_replies() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .await
+            .unwrap();
+
+        // Wait for the initial turn's reply before sending the follow-up,
+        // so the two round trips can't land out of order.
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        wait_until_events_contain(&pool, &runs[0].id, "echo:hello").await;
+
+        engine.send_message(&task.id, "again").await.unwrap();
+        wait_until_events_contain(&pool, &runs[0].id, "echo:again").await;
+
+        let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            .await
+            .unwrap();
+        let kinds_and_text: Vec<(String, Option<&str>)> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.event_type.to_string(),
+                    e.payload.get("text").and_then(Value::as_str),
+                )
+            })
+            .collect();
+
+        // human_message("hello") is recorded before the session even
+        // starts (see engine.rs's `enter_agent_turn`), so it always
+        // precedes session_meta/the reply — same for the "again" relay
+        // against its own reply. The human's own messages now show up in
+        // their correct chronological place, not just the agent's replies.
+        assert_eq!(
+            kinds_and_text,
+            vec![
+                ("human_message".to_string(), Some("hello")),
+                ("session_meta".to_string(), None),
+                ("assistant_message".to_string(), Some("echo:hello")),
+                ("human_message".to_string(), Some("again")),
+                ("assistant_message".to_string(), Some("echo:again")),
+            ]
+        );
+    }
+
+    /// A `prompt_file`-rendered turn's prompt is template/system-authored
+    /// content, not something a human typed — it must not be recorded as
+    /// a `human_message` event.
+    #[tokio::test]
+    async fn a_prompt_file_backed_turn_does_not_record_a_human_message_event() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        std::fs::write(workflows_dir.join("prompt.md"), "Do the templated thing.").unwrap();
+        std::fs::write(
+            workflows_dir.join("templated.yaml"),
+            r#"
+name: templated
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    prompt_file: prompt.md
+    on: {}
+"#,
+        )
+        .unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(&project_id, None, "templated", "t", "ignored", json!({}))
+            .await
+            .unwrap();
+
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        wait_until_events_contain(&pool, &runs[0].id, "echo:Do the templated thing.").await;
+
+        let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            .await
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type == chokofactory_core::models::EventType::HumanMessage),
+            "a prompt_file-backed turn should never record a human_message event"
+        );
     }
 
     #[tokio::test]

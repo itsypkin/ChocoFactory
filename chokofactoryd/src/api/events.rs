@@ -172,6 +172,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_human_side_of_the_conversation_shows_up_in_the_paginated_history() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project: Value = server
+            .post("/projects", json!({ "name": "demo" }))
+            .await
+            .json();
+        let project_id = project["id"].as_str().unwrap();
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
+
+        server
+            .post(
+                &format!("/tasks/{task_id}/messages"),
+                json!({ "text": "again" }),
+            )
+            .await;
+
+        let mut page = Value::Null;
+        for _ in 0..200 {
+            page = server.get(&format!("/tasks/{task_id}/events")).await.json();
+            let texts: Vec<&str> = page["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["event_type"] == "human_message")
+                .map(|e| e["payload"]["text"].as_str().unwrap())
+                .collect();
+            if texts == vec!["hello", "again"] {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("human_message events never showed up as expected: {page}");
+    }
+
+    #[tokio::test]
     async fn events_for_a_nonexistent_task_is_404() {
         let server = TestServer::start().await;
         let status = server.get("/tasks/does-not-exist/events").await.status();
