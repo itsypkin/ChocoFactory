@@ -95,8 +95,8 @@ pub struct SendMessageRequest {
 
 /// Relays a human message into `id`'s current stage — an open `agent_turn`
 /// or a `human_gate`'s resume — via `WorkflowEngine::send_message_or_resume`
-/// (P1-9). The actual reply, if any, arrives over `/tasks/:id/events`, not
-/// in this response.
+/// (P1-9). The actual reply, if any, arrives over `/tasks/:id/events`
+/// (paginated) or `/tasks/:id/events/live` (WS), not in this response.
 pub async fn send_message(
     State(state): State<AppState>,
     Path(id): Path<String>,

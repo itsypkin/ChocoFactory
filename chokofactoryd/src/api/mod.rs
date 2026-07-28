@@ -4,6 +4,7 @@
 //! [`router`] (Q15).
 
 mod error;
+mod events;
 mod projects;
 mod tasks;
 mod ws;
@@ -40,7 +41,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks", post(tasks::create).get(tasks::list))
         .route("/tasks/{id}", get(tasks::get))
         .route("/tasks/{id}/messages", post(tasks::send_message))
-        .route("/tasks/{id}/events", get(ws::task_events))
+        .route("/tasks/{id}/events", get(events::list))
+        .route("/tasks/{id}/events/live", get(ws::task_events))
         .with_state(state)
 }
 

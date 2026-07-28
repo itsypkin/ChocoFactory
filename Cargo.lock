@@ -204,6 +204,7 @@ name = "chokofactoryd"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "chokofactory-core",
  "chrono",
  "futures-util",

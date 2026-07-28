@@ -1,9 +1,11 @@
-//! Live events WebSocket (P1-9, design §6.1: task detail's live event
-//! timeline). Pushes a task's backlog on connect, then live-tails new
-//! events as they land — woken by `AppState::events_notify` rather than
-//! polling on a timer (see `session.rs`'s `SessionManager::events_notify`
-//! doc comment for why this is a single shared `Notify`, not a per-task
-//! registry).
+//! Live events WebSocket (`GET /tasks/:id/events/live`, P1-9, design
+//! §6.1: task detail's live event timeline) — distinct from the paginated
+//! `GET /tasks/:id/events` in `api/events.rs`, which a client uses to
+//! catch up on history instead of holding a socket open. Pushes a task's
+//! backlog on connect, then live-tails new events as they land — woken by
+//! `AppState::events_notify` rather than polling on a timer (see
+//! `session.rs`'s `SessionManager::events_notify` doc comment for why
+//! this is a single shared `Notify`, not a per-task registry).
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -149,7 +151,7 @@ mod tests {
         }
         assert!(saw_initial_echo, "initial turn never produced its echo");
 
-        let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events", server.ws_url))
+        let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", server.ws_url))
             .await
             .unwrap();
 
@@ -232,7 +234,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (mut ws, _) = connect_async(format!("{}/tasks/{}/events", server.ws_url, task.id))
+        let (mut ws, _) = connect_async(format!("{}/tasks/{}/events/live", server.ws_url, task.id))
             .await
             .unwrap();
 
@@ -257,7 +259,11 @@ mod tests {
         // so the socket would upgrade successfully and then wait forever
         // for events that can never arrive. It should instead fail the
         // handshake with a 404 and never upgrade.
-        let result = connect_async(format!("{}/tasks/does-not-exist/events", server.ws_url)).await;
+        let result = connect_async(format!(
+            "{}/tasks/does-not-exist/events/live",
+            server.ws_url
+        ))
+        .await;
         assert!(
             result.is_err(),
             "connecting to a nonexistent task should not succeed"

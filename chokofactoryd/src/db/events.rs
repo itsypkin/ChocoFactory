@@ -133,6 +133,39 @@ pub async fn list_for_task_after(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Same shape as [`list_for_task_after`], but capped to at most `limit`
+/// rows (P1-9: paginated `GET /tasks/:id/events`) — unlike the live-WS
+/// caller of `list_for_task_after`, a REST page must never load a task's
+/// entire history in one response.
+pub async fn list_for_task_page(
+    pool: &SqlitePool,
+    task_id: &str,
+    cursor: Option<&(DateTime<Utc>, String)>,
+    limit: i64,
+) -> Result<Vec<Event>, sqlx::Error> {
+    let prefixed_columns = prefix_columns();
+    let mut query = sqlx::QueryBuilder::new(format!(
+        "SELECT {prefixed_columns} FROM events e
+         JOIN task_runs tr ON tr.id = e.task_run_id
+         WHERE tr.task_id = "
+    ));
+    query.push_bind(task_id);
+    if let Some((created_at, id)) = cursor {
+        query.push(" AND (e.created_at > ");
+        query.push_bind(*created_at);
+        query.push(" OR (e.created_at = ");
+        query.push_bind(*created_at);
+        query.push(" AND e.id > ");
+        query.push_bind(id.clone());
+        query.push("))");
+    }
+    query.push(" ORDER BY e.created_at, e.id LIMIT ");
+    query.push_bind(limit);
+
+    let rows = query.build_query_as::<EventRow>().fetch_all(pool).await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// `COLUMNS`, but each column prefixed with `e.` so it's unambiguous once
 /// joined against `task_runs` (which also has an `id` column).
 fn prefix_columns() -> String {
@@ -311,6 +344,60 @@ mod tests {
 
         let none_yet = list_for_task_after(&pool, &task_id, None).await.unwrap();
         assert_eq!(none_yet.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_for_task_page_caps_results_and_pages_via_the_cursor() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let run = seed_task_run_for_task(&pool, &task_id, "chatting").await;
+
+        let mut events = Vec::new();
+        for n in 0..5 {
+            events.push(
+                append(&pool, &run, EventType::AssistantMessage, json!({ "n": n }))
+                    .await
+                    .unwrap(),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        let page1 = list_for_task_page(&pool, &task_id, None, 2).await.unwrap();
+        assert_eq!(
+            page1.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![events[0].id.clone(), events[1].id.clone()]
+        );
+
+        let cursor = (page1[1].created_at, page1[1].id.clone());
+        let page2 = list_for_task_page(&pool, &task_id, Some(&cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            page2.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![events[2].id.clone(), events[3].id.clone()]
+        );
+
+        let cursor = (page2[1].created_at, page2[1].id.clone());
+        let page3 = list_for_task_page(&pool, &task_id, Some(&cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            page3.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![events[4].id.clone()]
+        );
     }
 
     #[tokio::test]
