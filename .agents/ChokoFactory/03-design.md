@@ -518,7 +518,8 @@ script would.
 - **Multi-git-host abstraction** (Q14) — GitHub only.
 - **Global concurrency cap** (Q17) — unbounded for v1.
 - **Cross-task shared project memory** (Q2 follow-up) — open question,
-  not designed here.
+  not designed here. Tracked so it doesn't get silently dropped:
+  [issue #40](https://github.com/itsypkin/ChocoFactory/issues/40).
 - **General scripting/expression language for stage outcomes** — the
   workflow engine (§5) is intentionally an interpreter over a fixed set
   of stage kinds, not a Turing-complete workflow scripting system. Adding
