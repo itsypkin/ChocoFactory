@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chokofactory_core::models::{Task, TaskRunEndReason, TaskRunStatus};
+use chokofactory_core::models::{EventType, Task, TaskRunEndReason, TaskRunStatus};
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
-use crate::db::{task_runs, tasks, workflow_state};
+use crate::db::{events, projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
 use crate::role_config::{self, RoleConfigError};
 use crate::session::{SessionError, SessionManager};
@@ -43,9 +43,9 @@ pub struct WorkflowEngine {
     session_manager: Arc<SessionManager>,
     /// Serializes `advance()` calls per task (§ review on PR #35): without
     /// this, two callers racing to advance the same task's `workflow_state`
-    /// (e.g. the turn-completion watcher and a future human_gate message
-    /// relay, P1-9) could both read the same row and then both write,
-    /// silently clobbering one call's `stage_history`/`loop_counters`.
+    /// (e.g. the turn-completion watcher and `send_message_or_resume`'s
+    /// `human_gate` relay) could both read the same row and then both
+    /// write, silently clobbering one call's `stage_history`/`loop_counters`.
     task_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Where `create_task`/`send_message` resolve a `workflow_def` name to
     /// a file (P1-8 LLD §2.6/§2.8) — the *seeded* user directory
@@ -168,6 +168,15 @@ impl std::error::Error for ResolveError {}
 pub enum CreateTaskError {
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
+    /// `project_id` doesn't reference an existing project. Checked
+    /// explicitly (P1-9 review) rather than left to surface as whatever
+    /// `sqlx::Error` a raw `tasks.project_id` foreign-key violation
+    /// produces — the same care `db::projects::delete`'s own caller
+    /// already takes for the opposite direction of that same FK.
+    NoSuchProject(String),
+    /// `parent_task_id` was supplied but doesn't reference an existing
+    /// task — same reasoning as `NoSuchProject`.
+    NoSuchParentTask(String),
     Db(sqlx::Error),
     Start(EngineError),
 }
@@ -177,6 +186,8 @@ impl fmt::Display for CreateTaskError {
         match self {
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
+            CreateTaskError::NoSuchProject(id) => write!(f, "no such project '{id}'"),
+            CreateTaskError::NoSuchParentTask(id) => write!(f, "no such parent task '{id}'"),
             CreateTaskError::Db(err) => write!(f, "{err}"),
             CreateTaskError::Start(err) => write!(f, "{err}"),
         }
@@ -202,10 +213,10 @@ pub enum SendMessageError {
     },
     /// The task's current stage isn't a standing-open `agent_turn` (empty
     /// `on:`) — it's either a different kind, or an `agent_turn` that
-    /// *can* transition. Relaying a message into a stage that can
-    /// transition needs the API-layer wiring `human_gate`'s `resumed`
-    /// relay is waiting on (#9) — see P1-8 LLD §4.3 for why this is a hard
-    /// boundary, not a Phase-1 gap.
+    /// *can* transition. Callers that don't already know the stage kind
+    /// should go through `send_message_or_resume` instead, which picks
+    /// between this and `advance`'s `human_gate` relay — see P1-8 LLD
+    /// §4.3 for why this is a hard boundary, not a Phase-1 gap.
     StageNotOpenEnded(String),
     /// The stage is open-ended, but no `task_run` has ever been recorded
     /// for it (e.g. `create_task`'s `start_task` failed before spawning
@@ -256,6 +267,57 @@ impl From<sqlx::Error> for SendMessageError {
     }
 }
 
+/// Errors from [`WorkflowEngine::send_message_or_resume`] — the dispatch
+/// this stage's own doc comments (and `SendMessageError::StageNotOpenEnded`'s)
+/// call out as "issue #9's job": relay a human message into whichever of
+/// `send_message`/`advance` the task's current stage actually needs.
+#[derive(Debug)]
+pub enum SendMessageOrResumeError {
+    NoSuchTask,
+    NoWorkflowState,
+    UnknownStage(String),
+    /// The current stage is neither a standing-open `agent_turn` nor a
+    /// `human_gate` — e.g. `shell`/`poll`/`terminal`, or an `agent_turn`
+    /// that can itself transition (not yet a case this dispatch handles).
+    UnsupportedStageKind(String),
+    Resolve(ResolveError),
+    WorkflowDef(WorkflowDefError),
+    Db(sqlx::Error),
+    SendMessage(SendMessageError),
+    Advance(EngineError),
+}
+
+impl fmt::Display for SendMessageOrResumeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SendMessageOrResumeError::NoSuchTask => write!(f, "no such task"),
+            SendMessageOrResumeError::NoWorkflowState => {
+                write!(f, "task has no workflow_state row")
+            }
+            SendMessageOrResumeError::UnknownStage(stage) => {
+                write!(f, "workflow_state references unknown stage '{stage}'")
+            }
+            SendMessageOrResumeError::UnsupportedStageKind(stage) => write!(
+                f,
+                "stage '{stage}' cannot accept a message or resume signal here"
+            ),
+            SendMessageOrResumeError::Resolve(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::WorkflowDef(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::Db(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::SendMessage(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::Advance(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for SendMessageOrResumeError {}
+
+impl From<sqlx::Error> for SendMessageOrResumeError {
+    fn from(err: sqlx::Error) -> Self {
+        SendMessageOrResumeError::Db(err)
+    }
+}
+
 impl WorkflowEngine {
     pub fn new(
         pool: SqlitePool,
@@ -291,9 +353,16 @@ impl WorkflowEngine {
     /// `workflow_def_name` is resolved and the definition freshly loaded
     /// on every call, not cached (P1-8 LLD §4.5) — the same file `WorkflowEngine`
     /// would otherwise have to invalidate a cache entry for.
+    ///
+    /// `parent_task_id` tags this task as spawned via delegation (§6.2's
+    /// `choco task create --parent-task <id>`) — purely a label for the UI
+    /// and for a parent task to poll; it has no effect on how this task's
+    /// own workflow runs.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_task(
         self: &Arc<Self>,
         project_id: &str,
+        parent_task_id: Option<&str>,
         workflow_def_name: &str,
         title: &str,
         initial_input: &str,
@@ -304,11 +373,26 @@ impl WorkflowEngine {
         let definition =
             Arc::new(WorkflowDefinition::load(&path).map_err(CreateTaskError::WorkflowDef)?);
 
+        // Checked explicitly rather than left to surface as a raw FK
+        // violation from the `INSERT` below (P1-9 review): both columns
+        // are foreign keys (`tasks.project_id`/`tasks.parent_task_id`),
+        // and `db::pool::connect` enables `foreign_keys`, so a bad id
+        // would otherwise fail as an opaque `sqlx::Error` instead of a
+        // reported, specific error the API layer can map to 404.
+        if projects::get(&self.pool, project_id).await?.is_none() {
+            return Err(CreateTaskError::NoSuchProject(project_id.to_string()));
+        }
+        if let Some(parent_id) = parent_task_id
+            && tasks::get(&self.pool, parent_id).await?.is_none()
+        {
+            return Err(CreateTaskError::NoSuchParentTask(parent_id.to_string()));
+        }
+
         let task = tasks::create(
             &self.pool,
             tasks::NewTask {
                 project_id,
-                parent_task_id: None,
+                parent_task_id,
                 workflow_def: workflow_def_name,
                 title,
                 config,
@@ -327,9 +411,9 @@ impl WorkflowEngine {
     /// which must be a standing-open `agent_turn` (empty `on:` — never
     /// advances, so there's no risk of the stage changing out from under
     /// this lookup, P1-8 LLD §4.3). Anything else — a different kind, or
-    /// an `agent_turn` that *can* transition (`human_gate`'s `resumed`
-    /// relay is #9's job) — is rejected rather than silently racing a
-    /// concurrent `advance()`.
+    /// an `agent_turn` that *can* transition — is rejected rather than
+    /// silently racing a concurrent `advance()`; callers that don't already
+    /// know the stage kind should go through `send_message_or_resume`.
     pub async fn send_message(
         self: &Arc<Self>,
         task_id: &str,
@@ -383,10 +467,87 @@ impl WorkflowEngine {
         let resolved = role_config::resolve(role, role_def, &global, &task.config, task_cwd(&task))
             .map_err(SendMessageError::RoleConfig)?;
 
+        // Recorded *before* handing off to the live session, not after —
+        // once handed off, the session's own drain task can react and
+        // append its reply's events at any point, on any thread. Recording
+        // first guarantees this event's `(created_at, id)` always sorts
+        // before anything that reply could produce, regardless of
+        // scheduling; recording after would leave the two racing, with no
+        // ordering guarantee under a real multi-threaded runtime (a
+        // sequential-looking "send_message" test can hide this, since a
+        // single-threaded test runtime happens not to schedule the drain
+        // task until this task yields). Best-effort like `drain_session`'s
+        // own event-append calls: a transient DB failure here shouldn't
+        // block the relay that follows.
+        if let Err(err) = events::append(
+            &self.pool,
+            &task_run.id,
+            EventType::HumanMessage,
+            json!({ "text": text }),
+        )
+        .await
+        {
+            tracing::error!(task_run_id = %task_run.id, %err, "failed to record human message event");
+        }
+
         self.session_manager
             .send_message(&task_run.id, text, &resolved.role_config)
             .await
             .map_err(SendMessageError::Session)
+    }
+
+    /// Dispatches a human message against `task_id`'s current stage to
+    /// whichever of `send_message`/`advance` it actually needs (P1-9): a
+    /// standing-open `agent_turn` relays `text` straight into its live
+    /// session via `send_message`; a `human_gate` has no session to relay
+    /// into at all — the human's `text` is the resume signal itself, so
+    /// this calls `advance(task_id, definition, "resumed")` instead. Any
+    /// other stage kind (a mid-transition `agent_turn`, `shell`, `poll`,
+    /// `terminal`) is rejected rather than guessing.
+    ///
+    /// This re-loads `task`/`workflow_state`/the workflow definition itself
+    /// before delegating to a primitive that re-loads them again —
+    /// redundant, but consistent with `send_message`'s own "not cached,
+    /// freshly loaded on every call" stance (P1-8 LLD §4.5), and cheap for
+    /// a single-user local daemon.
+    pub async fn send_message_or_resume(
+        self: &Arc<Self>,
+        task_id: &str,
+        text: &str,
+    ) -> Result<(), SendMessageOrResumeError> {
+        let task = tasks::get(&self.pool, task_id)
+            .await?
+            .ok_or(SendMessageOrResumeError::NoSuchTask)?;
+
+        let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
+            .map_err(SendMessageOrResumeError::Resolve)?;
+        let definition = Arc::new(
+            WorkflowDefinition::load(&path).map_err(SendMessageOrResumeError::WorkflowDef)?,
+        );
+
+        let state = workflow_state::get(&self.pool, task_id)
+            .await?
+            .ok_or(SendMessageOrResumeError::NoWorkflowState)?;
+        let current_stage = state.current_stage;
+
+        let stage_def = definition
+            .stages
+            .get(&current_stage)
+            .ok_or_else(|| SendMessageOrResumeError::UnknownStage(current_stage.clone()))?;
+
+        match &stage_def.kind {
+            StageKind::HumanGate => self
+                .advance(task_id, &definition, "resumed")
+                .await
+                .map_err(SendMessageOrResumeError::Advance),
+            StageKind::AgentTurn { .. } if stage_def.on.is_empty() => self
+                .send_message(task_id, text)
+                .await
+                .map_err(SendMessageOrResumeError::SendMessage),
+            _ => Err(SendMessageOrResumeError::UnsupportedStageKind(
+                current_stage,
+            )),
+        }
     }
 
     /// Returns (creating if needed) the lock guarding `task_id`'s
@@ -475,8 +636,7 @@ impl WorkflowEngine {
     ///
     /// Callers: the `agent_turn` completion watcher spawned by
     /// `enter_stage` (for a plain single-shot turn's `done`), and
-    /// whatever receives a human's message during a `human_gate` (its
-    /// `resumed`) — the latter not yet wired to an API layer (P1-9).
+    /// `send_message_or_resume`'s `human_gate` relay (its `resumed`).
     pub async fn advance(
         self: &Arc<Self>,
         task_id: &str,
@@ -609,8 +769,15 @@ impl WorkflowEngine {
                 // references it (`evict_task_lock_if_unshared`) — this
                 // function has no access to that `Arc`.
                 if let Err(err) = tasks::update_status(&self.pool, task_id, "closed").await {
-                    eprintln!(
-                        "workflow engine: failed to mark task {task_id} closed after entering a terminal stage: {err}"
+                    tracing::error!(
+                        task_id, %err,
+                        "failed to mark task closed after entering a terminal stage"
+                    );
+                } else {
+                    tracing::info!(
+                        task_id,
+                        stage = stage_name,
+                        "task closed (entered terminal stage)"
                     );
                 }
                 Ok(())
@@ -674,6 +841,31 @@ impl WorkflowEngine {
         )
         .await?;
 
+        // Recorded *before* starting the session, not after — once
+        // started, the drain task can react and append its own events
+        // (session_meta, the reply) at any point, on any thread, so
+        // recording first is what guarantees this event always sorts
+        // ahead of anything the session produces, regardless of
+        // scheduling (see `send_message`'s identical reasoning). Only
+        // when `prompt` came from human-typed `input`, not a
+        // `prompt_file` — a template-rendered system prompt (a
+        // coder/reviewer turn's own instructions, say) isn't something a
+        // human said, so it doesn't belong in the human side of the
+        // conversation the way a chat task's initial message does.
+        // Best-effort: a transient DB failure here shouldn't block
+        // starting the turn.
+        if prompt_file.is_none()
+            && let Err(err) = events::append(
+                &self.pool,
+                &task_run.id,
+                EventType::HumanMessage,
+                json!({ "text": prompt }),
+            )
+            .await
+        {
+            tracing::error!(task_run_id = %task_run.id, %err, "failed to record human message event");
+        }
+
         if let Err(err) = self
             .session_manager
             .start(&task_run.id, &prompt, &resolved.role_config)
@@ -686,14 +878,15 @@ impl WorkflowEngine {
             // the caller before enter_stage ran (§ review on PR #35).
             //
             // This still leaves the *task* itself — as opposed to this
-            // task_run — with no queryable "stuck" signal beyond this
-            // eprintln! and `end_reason: "start_failed"` on the task_run:
+            // task_run — with no queryable "stuck" signal beyond this log
+            // line and `end_reason: "start_failed"` on the task_run:
             // nothing here marks `workflow_state`/`tasks` in a way an
             // operator or API layer could discover without already knowing
             // to look. Acknowledged gap for Phase 1; surfacing it (e.g. a
             // task status or a query joining `tasks` to a stalled
-            // `task_run`) is expected to land with the API layer (P1-9) or
-            // a dedicated follow-up, not silently absorbed here.
+            // `task_run`) is expected to land with a dedicated follow-up,
+            // not silently absorbed here.
+            tracing::error!(task_id, task_run_id = %task_run.id, %err, "failed to start session for agent_turn");
             if let Err(update_err) = task_runs::update_status(
                 &self.pool,
                 &task_run.id,
@@ -703,9 +896,9 @@ impl WorkflowEngine {
             )
             .await
             {
-                eprintln!(
-                    "workflow engine: failed to mark task run {} exited after a failed session start: {update_err}",
-                    task_run.id
+                tracing::error!(
+                    task_run_id = %task_run.id, %update_err,
+                    "failed to mark task run exited after a failed session start"
                 );
             }
             return Err(EngineError::Session(err));
@@ -745,28 +938,35 @@ impl WorkflowEngine {
                         if run.status == TaskRunStatus::Idle
                             && run.end_reason == Some(TaskRunEndReason::Reaped) =>
                     {
-                        eprintln!(
-                            "workflow engine: task run {task_run_id} (task {task_id}) was force-closed by the idle reaper before completing its turn; not auto-advancing"
+                        tracing::warn!(
+                            task_id,
+                            task_run_id,
+                            "task run was force-closed by the idle reaper before completing its turn; not auto-advancing"
                         );
                         return;
                     }
                     Ok(Some(run)) if run.status == TaskRunStatus::Idle => break,
                     Ok(Some(run)) if run.status == TaskRunStatus::Exited => {
-                        eprintln!(
-                            "workflow engine: task run {task_run_id} (task {task_id}) exited without completing its turn cleanly; not auto-advancing"
+                        tracing::warn!(
+                            task_id,
+                            task_run_id,
+                            "task run exited without completing its turn cleanly; not auto-advancing"
                         );
                         return;
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        eprintln!(
-                            "workflow engine: task run {task_run_id} (task {task_id}) disappeared while watching for turn completion; not auto-advancing"
+                        tracing::error!(
+                            task_id,
+                            task_run_id,
+                            "task run disappeared while watching for turn completion; not auto-advancing"
                         );
                         return;
                     }
                     Err(err) => {
-                        eprintln!(
-                            "workflow engine: failed to poll task run {task_run_id} (task {task_id}) while watching for turn completion: {err}; not auto-advancing"
+                        tracing::error!(
+                            task_id, task_run_id, %err,
+                            "failed to poll task run while watching for turn completion; not auto-advancing"
                         );
                         return;
                     }
@@ -774,8 +974,12 @@ impl WorkflowEngine {
                 tokio::time::sleep(TURN_WATCH_INTERVAL).await;
             }
             if let Err(err) = engine.advance(&task_id, &definition, "done").await {
-                eprintln!(
-                    "workflow engine: failed to auto-advance task {task_id} on turn completion: {err}"
+                tracing::error!(task_id, %err, "failed to auto-advance task on turn completion");
+            } else {
+                tracing::debug!(
+                    task_id,
+                    task_run_id,
+                    "turn completed; auto-advanced with \"done\""
                 );
             }
         });
@@ -890,8 +1094,12 @@ mod tests {
 
     fn engine_with_adapter(pool: SqlitePool, binary: &str) -> Arc<WorkflowEngine> {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
-        let session_manager =
-            SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let session_manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(tokio::sync::Notify::new()),
+        );
         // No test here drives create_task/send_message's workflow-name
         // resolution or a global config file, so an inert directory and
         // no config path are enough — role_config::resolve just falls
@@ -906,8 +1114,12 @@ mod tests {
         workflows_dir: &Path,
     ) -> Arc<WorkflowEngine> {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
-        let session_manager =
-            SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let session_manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(tokio::sync::Notify::new()),
+        );
         WorkflowEngine::new(pool, session_manager, workflows_dir.to_path_buf(), None)
     }
 
@@ -920,6 +1132,25 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         panic!("timed out waiting for stage {expected}");
+    }
+
+    /// Polls `task_run_id`'s events for one whose `payload.text` equals
+    /// `text` (e.g. an assistant reply from the fake-claude fixture),
+    /// since event persistence happens on a spawned background task.
+    async fn wait_until_events_contain(pool: &SqlitePool, task_run_id: &str, text: &str) {
+        for _ in 0..200 {
+            let events = crate::db::events::list_for_task_run(pool, task_run_id)
+                .await
+                .unwrap();
+            if events
+                .iter()
+                .any(|e| e.payload.get("text").and_then(Value::as_str) == Some(text))
+            {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for an event with text {text:?}");
     }
 
     fn human_gate_chain_def() -> Arc<WorkflowDefinition> {
@@ -1710,6 +1941,7 @@ stages:
         let task = engine
             .create_task(
                 &project_id,
+                None,
                 "chat",
                 "flaky test",
                 "hey, look into it",
@@ -1734,12 +1966,54 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
 
         let err = engine
-            .create_task(&project_id, "ghost", "t", "hi", json!({}))
+            .create_task(&project_id, None, "ghost", "t", "hi", json!({}))
             .await
             .unwrap_err();
         assert!(matches!(
             err,
             CreateTaskError::Resolve(ResolveError::NotFound(name)) if name == "ghost"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_task_with_a_nonexistent_project_id_is_a_reported_error_not_a_raw_fk_failure() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
+
+        let err = engine
+            .create_task("no-such-project", None, "chat", "t", "hi", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CreateTaskError::NoSuchProject(id) if id == "no-such-project"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_task_with_a_nonexistent_parent_task_id_is_a_reported_error() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
+
+        let err = engine
+            .create_task(
+                &project_id,
+                Some("no-such-task"),
+                "chat",
+                "t",
+                "hi",
+                json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CreateTaskError::NoSuchParentTask(id) if id == "no-such-task"
         ));
     }
 
@@ -1756,7 +2030,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, "chat", "t", "hello", json!({}))
+            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -1786,6 +2060,119 @@ stages:
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         assert!(saw_echo, "follow-up message never reached the live session");
+    }
+
+    /// Regression test: the `events` table used to only ever hold what the
+    /// agent adapter emitted — the human's own side of the conversation
+    /// (both the task's initial prompt and every `send_message` relay)
+    /// has nowhere to land otherwise. Checks both write sites at once
+    /// (`enter_agent_turn`'s initial-input path and `send_message`'s
+    /// relay path) and that they interleave in the right order with the
+    /// agent's replies.
+    #[tokio::test]
+    async fn human_messages_are_recorded_as_events_interleaved_with_replies() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .await
+            .unwrap();
+
+        // Wait for the initial turn's reply before sending the follow-up,
+        // so the two round trips can't land out of order.
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        wait_until_events_contain(&pool, &runs[0].id, "echo:hello").await;
+
+        engine.send_message(&task.id, "again").await.unwrap();
+        wait_until_events_contain(&pool, &runs[0].id, "echo:again").await;
+
+        let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            .await
+            .unwrap();
+        let kinds_and_text: Vec<(String, Option<&str>)> = events
+            .iter()
+            .map(|e| {
+                (
+                    e.event_type.to_string(),
+                    e.payload.get("text").and_then(Value::as_str),
+                )
+            })
+            .collect();
+
+        // human_message("hello") is recorded before the session even
+        // starts (see engine.rs's `enter_agent_turn`), so it always
+        // precedes session_meta/the reply — same for the "again" relay
+        // against its own reply. The human's own messages now show up in
+        // their correct chronological place, not just the agent's replies.
+        assert_eq!(
+            kinds_and_text,
+            vec![
+                ("human_message".to_string(), Some("hello")),
+                ("session_meta".to_string(), None),
+                ("assistant_message".to_string(), Some("echo:hello")),
+                ("human_message".to_string(), Some("again")),
+                ("assistant_message".to_string(), Some("echo:again")),
+            ]
+        );
+    }
+
+    /// A `prompt_file`-rendered turn's prompt is template/system-authored
+    /// content, not something a human typed — it must not be recorded as
+    /// a `human_message` event.
+    #[tokio::test]
+    async fn a_prompt_file_backed_turn_does_not_record_a_human_message_event() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        std::fs::write(workflows_dir.join("prompt.md"), "Do the templated thing.").unwrap();
+        std::fs::write(
+            workflows_dir.join("templated.yaml"),
+            r#"
+name: templated
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    prompt_file: prompt.md
+    on: {}
+"#,
+        )
+        .unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(&project_id, None, "templated", "t", "ignored", json!({}))
+            .await
+            .unwrap();
+
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        wait_until_events_contain(&pool, &runs[0].id, "echo:Do the templated thing.").await;
+
+        let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            .await
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type == chokofactory_core::models::EventType::HumanMessage),
+            "a prompt_file-backed turn should never record a human_message event"
+        );
     }
 
     #[tokio::test]
@@ -1818,7 +2205,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, "has-outcome", "t", "hello", json!({}))
+            .create_task(&project_id, None, "has-outcome", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -1884,6 +2271,110 @@ stages:
         assert!(matches!(
             err,
             SendMessageError::UnknownStage(stage) if stage == "ghost-stage"
+        ));
+    }
+
+    /// `send_message_or_resume` resolves its workflow definition from disk
+    /// (like `send_message`/`create_task`), unlike `advance`/`start_task`
+    /// which take an already-loaded `&Arc<WorkflowDefinition>` straight
+    /// from the caller — so, unlike this file's other `human_gate_chain_def`
+    /// tests, these two need the same YAML actually written to a
+    /// `workflows_dir` under the name the seeded task references.
+    fn write_human_gate_chain_workflow(workflows_dir: &Path) {
+        std::fs::write(
+            workflows_dir.join("gated.yaml"),
+            r#"
+name: gated
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_message_or_resume_routes_a_human_gate_stage_to_advance() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_human_gate_chain_workflow(&workflows_dir);
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, "gated").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine
+            .send_message_or_resume(&task_id, "ignored for a human_gate")
+            .await
+            .unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "done");
+    }
+
+    #[tokio::test]
+    async fn send_message_or_resume_routes_an_open_agent_turn_to_send_message() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        let task = engine
+            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .await
+            .unwrap();
+
+        engine
+            .send_message_or_resume(&task.id, "actually check the other branch too")
+            .await
+            .unwrap();
+
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let mut saw_echo = false;
+        for _ in 0..200 {
+            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+                .await
+                .unwrap();
+            if events.iter().any(|e| {
+                e.payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t == "echo:actually check the other branch too")
+            }) {
+                saw_echo = true;
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(saw_echo, "follow-up message never reached the live session");
+    }
+
+    #[tokio::test]
+    async fn send_message_or_resume_rejects_an_unsupported_stage_kind() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_human_gate_chain_workflow(&workflows_dir);
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, "gated").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.advance(&task_id, &def, "resumed").await.unwrap(); // -> "done" (terminal)
+
+        let err = engine
+            .send_message_or_resume(&task_id, "too late")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SendMessageOrResumeError::UnsupportedStageKind(stage) if stage == "done"
         ));
     }
 

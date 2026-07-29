@@ -12,6 +12,8 @@ name = "chokofactoryd"
 path = "src/main.rs"
 
 [dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
 chokofactory-core = { workspace = true }
 chrono = { workspace = true }
 indexmap = { workspace = true }
@@ -21,4 +23,12 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }

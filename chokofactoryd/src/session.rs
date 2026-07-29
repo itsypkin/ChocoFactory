@@ -6,7 +6,7 @@ use std::time::Duration;
 use chokofactory_core::models::{TaskRunEndReason, TaskRunStatus};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, RoleConfig};
 use crate::db::{events, task_runs};
@@ -21,6 +21,16 @@ pub struct SessionManager {
     adapter: Arc<dyn AgentAdapter>,
     idle_timeout: chrono::Duration,
     sessions: Mutex<HashMap<String, SessionSlot>>,
+    /// Triggered after every successfully-appended event (P1-9), so the
+    /// HTTP layer's live-events WebSocket can wake up and re-query instead
+    /// of polling. One shared `Notify` for every task rather than a
+    /// per-task registry — this is a single-user local daemon with few
+    /// concurrent connections, so a global wakeup (each subscriber
+    /// re-queries only its own task's rows) is cheap, and avoids a
+    /// HashMap-of-notifies whose entries would need their own lifecycle
+    /// management (exactly the class of eviction bug this codebase's
+    /// reviews keep flagging elsewhere, e.g. `WorkflowEngine::task_locks`).
+    events_notify: Arc<Notify>,
 }
 
 /// A `sessions` map entry: reserved while a process is being spawned or
@@ -93,12 +103,14 @@ impl SessionManager {
         pool: SqlitePool,
         adapter: Arc<dyn AgentAdapter>,
         idle_timeout: chrono::Duration,
+        events_notify: Arc<Notify>,
     ) -> Arc<Self> {
         Arc::new(Self {
             pool,
             adapter,
             idle_timeout,
             sessions: Mutex::new(HashMap::new()),
+            events_notify,
         })
     }
 
@@ -118,9 +130,11 @@ impl SessionManager {
             Ok(handle) => handle,
             Err(err) => {
                 self.sessions.lock().await.remove(task_run_id);
+                tracing::error!(task_run_id, %err, "failed to start session");
                 return Err(SessionError::Adapter(err));
             }
         };
+        tracing::info!(task_run_id, "session started");
         self.spawn_drain(task_run_id.to_string(), handle).await;
         Ok(())
     }
@@ -174,6 +188,7 @@ impl SessionManager {
             Ok(handle) => handle,
             Err(err) => {
                 self.sessions.lock().await.remove(task_run_id);
+                tracing::error!(task_run_id, %err, "failed to resume session");
                 return Err(SessionError::Adapter(err));
             }
         };
@@ -184,6 +199,7 @@ impl SessionManager {
             self.sessions.lock().await.remove(task_run_id);
             return Err(SessionError::Db(err));
         }
+        tracing::info!(task_run_id, "session resumed");
         self.spawn_drain(task_run_id.to_string(), handle).await;
         Ok(())
     }
@@ -224,6 +240,7 @@ impl SessionManager {
                 cmd_rx,
                 last_activity,
                 manager.idle_timeout,
+                &manager.events_notify,
             )
             .await;
             manager.sessions.lock().await.remove(&task_run_id);
@@ -262,20 +279,26 @@ impl SessionManager {
         let snapshot: Vec<_> = {
             let sessions = self.sessions.lock().await;
             sessions
-                .values()
-                .filter_map(|slot| match slot {
-                    SessionSlot::Live(session) => {
-                        Some((session.cmd_tx.clone(), Arc::clone(&session.last_activity)))
-                    }
+                .iter()
+                .filter_map(|(task_run_id, slot)| match slot {
+                    SessionSlot::Live(session) => Some((
+                        task_run_id.clone(),
+                        session.cmd_tx.clone(),
+                        Arc::clone(&session.last_activity),
+                    )),
                     SessionSlot::Establishing => None,
                 })
                 .collect()
         };
 
         let now = Utc::now();
-        for (cmd_tx, last_activity) in snapshot {
+        for (task_run_id, cmd_tx, last_activity) in snapshot {
             let last_activity = *last_activity.lock().await;
             if now - last_activity >= self.idle_timeout {
+                tracing::info!(
+                    task_run_id,
+                    "idle reaper: closing session past its idle timeout"
+                );
                 let _ = cmd_tx.send(Command::Close);
             }
         }
@@ -295,6 +318,7 @@ async fn drain_session(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     last_activity: Arc<Mutex<DateTime<Utc>>>,
     idle_timeout: chrono::Duration,
+    events_notify: &Notify,
 ) {
     // Once `cmd_rx` closes, `recv()` resolves to `None` immediately on
     // every poll — stop selecting on it (rather than matching `None`
@@ -338,10 +362,14 @@ async fn drain_session(
                         if let AgentEvent::SessionMeta { session_id } = &event
                             && let Err(err) = task_runs::set_session_id(pool, task_run_id, session_id).await
                         {
-                            eprintln!("session {task_run_id}: failed to persist session_id: {err}");
+                            tracing::error!(task_run_id, %err, "failed to persist session_id");
                         }
-                        if let Err(err) = events::append(pool, task_run_id, event.event_type(), event.payload()).await {
-                            eprintln!("session {task_run_id}: failed to append event: {err}");
+                        match events::append(pool, task_run_id, event.event_type(), event.payload()).await {
+                            Ok(event) => {
+                                tracing::debug!(task_run_id, seq = event.seq, event_type = %event.event_type, "appended event");
+                                events_notify.notify_waiters();
+                            }
+                            Err(err) => tracing::error!(task_run_id, %err, "failed to append event"),
                         }
                         // Any drained output counts as activity, not just
                         // inbound `Send`s — broader than §4.1's "no input"
@@ -359,7 +387,7 @@ async fn drain_session(
                 match cmd {
                     Some(Command::Send(text)) => {
                         if let Err(err) = handle.send(&text) {
-                            eprintln!("session {task_run_id}: failed to deliver message, process already gone: {err}");
+                            tracing::error!(task_run_id, %err, "failed to deliver message, process already gone");
                         }
                         *last_activity.lock().await = Utc::now();
                     }
@@ -391,7 +419,7 @@ async fn drain_session(
     let exit_status = handle.wait().await;
     let clean_exit = matches!(&exit_status, Ok(status) if status.success());
     if let Err(err) = &exit_status {
-        eprintln!("session {task_run_id}: failed to reap subprocess: {err}");
+        tracing::error!(task_run_id, %err, "failed to reap subprocess");
     }
     let (final_status, ended_at) = if clean_exit {
         (TaskRunStatus::Idle, None)
@@ -408,7 +436,9 @@ async fn drain_session(
     if let Err(err) =
         task_runs::update_status(pool, task_run_id, final_status, ended_at, end_reason).await
     {
-        eprintln!("session {task_run_id}: failed to update status after drain: {err}");
+        tracing::error!(task_run_id, %err, "failed to update status after drain");
+    } else {
+        tracing::info!(task_run_id, status = %final_status, ?end_reason, "session drained");
     }
 }
 
@@ -504,7 +534,12 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
             "fake_claude_crash.py",
         )));
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .start(&task_run_id, "hello", &role_config())
@@ -524,7 +559,12 @@ mod tests {
         let task_run_id = seed_task_run(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .start(&task_run_id, "hello", &role_config())
@@ -545,7 +585,12 @@ mod tests {
         let task_run_id = seed_task_run(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .start(&task_run_id, "hello", &role_config())
@@ -575,7 +620,12 @@ mod tests {
 
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .send_message(&task_run_id, "hello again", &role_config())
@@ -598,7 +648,12 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         // A real timeout, so last_activity looks fresh once the queued
         // Close below is actually dequeued and re-checked.
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .start(&task_run_id, "hello", &role_config())
@@ -643,7 +698,12 @@ mod tests {
 
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         let err = manager
             .send_message(&task_run_id, "hello", &role_config())
@@ -668,7 +728,12 @@ mod tests {
 
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         // Simulate another in-flight call that already claimed the slot
         // between send_message's optimistic map check and its DB read.
@@ -688,7 +753,12 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         // Zero timeout: the reaper closes the session on its first pass.
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::zero());
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::zero(),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .start(&task_run_id, "hello", &role_config())
@@ -726,7 +796,12 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         // Zero timeout: any session is immediately overdue.
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::zero());
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::zero(),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .start(&task_run_id, "hello", &role_config())
@@ -761,7 +836,12 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
             "fake_claude_oneshot.py",
         )));
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .start(&task_run_id, "hello", &role_config())
@@ -779,7 +859,12 @@ mod tests {
         let task_run_id = seed_task_run(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
-        let manager = SessionManager::new(pool.clone(), adapter, chrono::Duration::hours(1));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
 
         manager
             .start(&task_run_id, "hello", &role_config())

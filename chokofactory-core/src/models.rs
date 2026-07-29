@@ -144,6 +144,12 @@ pub struct TaskRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
+    /// A human-sent message being fed into a session — the initial prompt
+    /// a task was created with, or a `send_message` relay into an
+    /// already-open `agent_turn` (P1-9). This is the only variant here
+    /// that isn't normalized from an agent adapter's own output; without
+    /// it, `events` only ever recorded the agent's half of a conversation.
+    HumanMessage,
     AssistantMessage,
     ToolCall,
     ToolResult,
@@ -155,6 +161,7 @@ pub enum EventType {
 impl fmt::Display for EventType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            EventType::HumanMessage => "human_message",
             EventType::AssistantMessage => "assistant_message",
             EventType::ToolCall => "tool_call",
             EventType::ToolResult => "tool_result",
@@ -181,6 +188,7 @@ impl FromStr for EventType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "human_message" => Ok(EventType::HumanMessage),
             "assistant_message" => Ok(EventType::AssistantMessage),
             "tool_call" => Ok(EventType::ToolCall),
             "tool_result" => Ok(EventType::ToolResult),
@@ -260,6 +268,7 @@ mod tests {
     #[test]
     fn event_type_round_trips_through_display_and_from_str() {
         for event_type in [
+            EventType::HumanMessage,
             EventType::AssistantMessage,
             EventType::ToolCall,
             EventType::ToolResult,
