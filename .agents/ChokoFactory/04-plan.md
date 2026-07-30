@@ -253,6 +253,63 @@ since it's conditional on the go/no-go call.
 - Depends on: P1-3 (needs the shipped `AgentAdapter` trait/`AgentEvent`
   enum to prototype against)
 
+### X-2. Mock claude provider for e2e tests + safe manual smoke testing
+
+Today's tests (`chokofactoryd/src/api/mod.rs`'s in-process `TestServer`)
+already avoid the real `claude` CLI by pointing `ClaudeAdapter` at a
+Python stand-in (`chokofactoryd/tests/fixtures/fake_claude*.py`) via
+`ClaudeAdapter::with_binary`. Two gaps that leaves open: (1) there's no
+true e2e test that drives the actual `chokofactoryd` binary (`main.rs`)
+over real HTTP/WS — only the in-process axum router; `main.rs` hardcodes
+`ClaudeAdapter::new()` with no override, so a real e2e run would hit the
+real CLI, and (2) manual smoke-testing the daemon has the same problem —
+already bit us once, spawning a real billable `claude --print` session
+during P1-9 testing. Scope:
+
+1. Add a `CHOKOFACTORY_CLAUDE_BINARY` env var read in `main.rs`: if set,
+   `ClaudeAdapter::with_binary(path)`; otherwise `ClaudeAdapter::new()`
+   (today's default, unchanged). This alone unblocks both (1) and (2)
+   using the existing `with_binary` seam — no `AgentAdapter`/`AgentHandle`
+   changes needed.
+2. Promote the ad hoc Python fixtures into a first-class, supported mock:
+   a small Rust binary (new workspace member, e.g. `mock-claude`) that
+   speaks the same `--print --output-format=stream-json
+   --input-format=stream-json [--resume <id>]` protocol `ClaudeAdapter`
+   already targets. Rust over Python removes the interpreter/venv
+   friction hit during manual testing (missing `websockets` module, etc.)
+   and keeps it buildable via plain `cargo build` for CI/e2e use.
+3. Reply behavior: default to echoing the input turn back (matches
+   `fake_claude.py`'s current `echo:{text}` behavior, i.e. "reply
+   whatever's in the prompt" per the original request), with an env var
+   escape hatch (e.g. `MOCK_CLAUDE_REPLY`) for a fixed static reply when a
+   test needs a deterministic, prompt-independent response. `--resume
+   <id>` reuses the same `session_id` (§4.1), matching real `claude`'s
+   resume contract closely enough for the idle/resume tests already in
+   `session.rs`/`engine.rs`.
+4. Add a true e2e test (new `chokofactoryd/tests/e2e_*.rs`): spawn the
+   real `chokofactoryd` binary as a subprocess (`std::process::Command`,
+   `CHOKOFACTORY_CLAUDE_BINARY` pointed at `mock-claude`, `HOME`/config
+   root pointed at a temp dir), drive it over real HTTP + WS
+   (`reqwest`/`tokio-tungstenite`, already dev-deps from P1-9), and tear
+   it down — covering the full startup sequence (seeding, migrations,
+   idle reaper, retention) that in-process `TestServer` skips.
+5. Update the smoke-testing instructions (or a short `docs/`/README note)
+   to point at `CHOKOFACTORY_CLAUDE_BINARY=/path/to/mock-claude` as the
+   safe default for manual runs, real `claude` as an explicit opt-in.
+
+Migrating the *existing* `TestServer`-based integration tests off the
+Python fixtures onto `mock-claude` is a nice-to-have, not required —
+they're free to keep using `fake_claude*.py` if the Rust binary doesn't
+cover a scenario they need (e.g. `fake_claude_crash.py`'s abrupt-exit
+case). A real multi-provider abstraction (Codex/Gemini `AgentAdapter`
+implementations) is explicitly out of scope here — this task only proves
+the *testing* seam works, same spirit as X-1 proving the *transport*
+seam.
+
+- Design ref: §4, §4.1
+- Depends on: P1-9 (needs `main.rs`'s real startup sequence and the
+  HTTP/WS surface to e2e-test against)
+
 ## GitHub issue mapping
 
 Milestones: [Phase 1 — Chat MVP](https://github.com/itsypkin/ChocoFactory/milestone/1),
@@ -280,3 +337,4 @@ Milestones: [Phase 1 — Chat MVP](https://github.com/itsypkin/ChocoFactory/mile
 | P2-7  | [#18](https://github.com/itsypkin/ChocoFactory/issues/18) |
 | P2-8  | [#19](https://github.com/itsypkin/ChocoFactory/issues/19) |
 | X-1   | [#32](https://github.com/itsypkin/ChocoFactory/issues/32) |
+| X-2   | [#42](https://github.com/itsypkin/ChocoFactory/issues/42) |
