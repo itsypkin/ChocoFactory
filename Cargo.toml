@@ -4,6 +4,7 @@ members = [
     "chokofactoryd",
     "choco",
     "chokofactory-core",
+    "mock-claude",
 ]
 
 [workspace.package]

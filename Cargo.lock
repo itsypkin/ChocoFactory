@@ -1025,6 +1025,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mock-claude"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
