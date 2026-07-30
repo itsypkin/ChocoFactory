@@ -1,0 +1,12 @@
+[package]
+name = "mock-claude"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mock-claude"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+uuid = { workspace = true }
