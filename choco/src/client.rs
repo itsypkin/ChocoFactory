@@ -96,15 +96,17 @@ impl Client {
         if resp.status().is_success() {
             return Ok(resp);
         }
-        let body: Value = resp
-            .json()
-            .await
-            .unwrap_or_else(|_| json!({"error": "unknown error"}));
-        let message = body
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error")
-            .to_string();
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        // The daemon always sends `{"error": "..."}` (`api/error.rs`), and
+        // that message is self-contained enough to show verbatim. Anything
+        // else on this path didn't come from the daemon — a proxy's HTML
+        // 502, say — so fall back to the status code rather than a bare
+        // "unknown error" that gives the user nothing to act on.
+        let message = match body.get("error").and_then(Value::as_str) {
+            Some(message) => message.to_string(),
+            None => format!("chokofactoryd returned HTTP {status}"),
+        };
         Err(ClientError::Api(message))
     }
 

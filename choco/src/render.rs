@@ -3,7 +3,7 @@
 //! is the machine half). No colour/ANSI: output is routinely piped, and
 //! this repo ships no terminal-styling dependency.
 
-use chokofactory_core::models::{Event, Project, Task};
+use chokofactory_core::models::{Event, EventType, Project, Task};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -49,7 +49,9 @@ fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
                 line.push_str(&format!("{:<width$}  ", cell, width = width));
             }
         }
-        line
+        // An empty final cell (e.g. an event with no renderable payload)
+        // would otherwise leave the separator dangling at end of line.
+        line.trim_end().to_string()
     };
 
     let header: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
@@ -67,7 +69,11 @@ fn fields(pairs: &[(&str, String)]) -> String {
         .unwrap_or(0);
     pairs
         .iter()
-        .map(|(k, v)| format!("{:<width$}  {}", k, v, width = width))
+        .map(|(k, v)| {
+            format!("{:<width$}  {}", k, v, width = width)
+                .trim_end()
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -252,17 +258,67 @@ pub fn events(page: &EventsPage) -> String {
 /// Pulls the field worth showing for each event kind, falling back to the
 /// whole payload so an unrecognized shape still renders something real
 /// rather than being silently blanked.
+///
+/// Payload shapes come from `AgentEvent::payload` (`adapter/mod.rs`) and
+/// the engine's own `HumanMessage` events:
+/// `text` for human/assistant/thinking, `session_id` for session_meta,
+/// `message` for error, and `{tool_use_id, tool, input|output}` for the two
+/// tool kinds — which carry no single "the interesting bit" field, so they
+/// get composed rather than probed. Tool events dominate a real coding
+/// transcript, so dumping their raw JSON here would defeat the point of
+/// this view.
 fn event_summary(event: &Event) -> String {
     let payload = &event.payload;
-    for key in ["text", "name", "message", "session_id"] {
-        if let Some(value) = payload.get(key).and_then(Value::as_str) {
-            return one_line(value);
+
+    match event.event_type {
+        EventType::ToolCall => {
+            let tool = payload.get("tool").and_then(Value::as_str).unwrap_or("?");
+            match payload.get("input") {
+                Some(input) if !input.is_null() => {
+                    one_line(&format!("{tool}  {}", value_text(input)))
+                }
+                _ => tool.to_string(),
+            }
+        }
+        EventType::ToolResult => {
+            let tool = payload.get("tool").and_then(Value::as_str).unwrap_or("?");
+            let failed = payload
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let tool = if failed {
+                format!("{tool} [error]")
+            } else {
+                tool.to_string()
+            };
+            match payload.get("output") {
+                Some(output) if !output.is_null() => {
+                    one_line(&format!("{tool}  {}", value_text(output)))
+                }
+                _ => tool,
+            }
+        }
+        _ => {
+            for key in ["text", "message", "session_id"] {
+                if let Some(value) = payload.get(key).and_then(Value::as_str) {
+                    return one_line(value);
+                }
+            }
+            match payload {
+                Value::Null => String::new(),
+                Value::Object(map) if map.is_empty() => String::new(),
+                other => one_line(&value_text(other)),
+            }
         }
     }
-    match payload {
-        Value::Null => String::new(),
-        Value::Object(map) if map.is_empty() => String::new(),
-        other => one_line(&other.to_string()),
+}
+
+/// A JSON value as display text: strings unquoted (the common case for
+/// tool output), everything else compact JSON.
+fn value_text(value: &Value) -> String {
+    match value.as_str() {
+        Some(text) => text.to_string(),
+        None => value.to_string(),
     }
 }
 
@@ -338,6 +394,93 @@ mod tests {
         let rendered = task_detail(&detail);
         assert!(rendered.contains("has not started"), "{rendered}");
         assert!(!rendered.contains("Stage "), "{rendered}");
+    }
+
+    fn event(event_type: EventType, payload: Value) -> Event {
+        Event {
+            id: "e1".to_string(),
+            task_run_id: "r1".to_string(),
+            seq: 1,
+            event_type,
+            payload,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Covers every payload shape `AgentEvent::payload` (`adapter/mod.rs`)
+    /// and the engine's `HumanMessage` actually produce. The tool kinds
+    /// carry no single "interesting" field, and they dominate a real
+    /// coding transcript, so a regression here would make the events view
+    /// useless exactly where it matters most.
+    #[test]
+    fn event_summary_renders_every_real_payload_shape() {
+        let cases = [
+            (
+                EventType::HumanMessage,
+                json!({"text": "do the thing"}),
+                "do the thing",
+            ),
+            (
+                EventType::AssistantMessage,
+                json!({"text": "on it"}),
+                "on it",
+            ),
+            (EventType::Thinking, json!({"text": "hmm"}), "hmm"),
+            (
+                EventType::SessionMeta,
+                json!({"session_id": "abc-123"}),
+                "abc-123",
+            ),
+            (EventType::Error, json!({"message": "boom"}), "boom"),
+        ];
+        for (event_type, payload, expected) in cases {
+            assert_eq!(event_summary(&event(event_type, payload)), expected);
+        }
+
+        // Tool events: the tool name leads, then its input/output — never
+        // the opaque `tool_use_id`, which would eat the width budget.
+        let call = event_summary(&event(
+            EventType::ToolCall,
+            json!({"tool_use_id": "toolu_01ABCDEFGHIJKLMNOPQRSTUV", "tool": "Bash",
+                   "input": {"command": "ls -la"}}),
+        ));
+        assert!(call.starts_with("Bash"), "{call}");
+        assert!(call.contains("ls -la"), "{call}");
+        assert!(!call.contains("toolu_01"), "id should not be shown: {call}");
+
+        let result = event_summary(&event(
+            EventType::ToolResult,
+            json!({"tool_use_id": "toolu_01ABC", "tool": "Bash",
+                   "output": "total 0", "is_error": false}),
+        ));
+        assert!(result.starts_with("Bash"), "{result}");
+        assert!(result.contains("total 0"), "{result}");
+        assert!(!result.contains("[error]"), "{result}");
+
+        let failed = event_summary(&event(
+            EventType::ToolResult,
+            json!({"tool_use_id": "t", "tool": "Bash", "output": "nope", "is_error": true}),
+        ));
+        assert!(failed.contains("[error]"), "{failed}");
+    }
+
+    #[test]
+    fn event_summary_survives_an_unrecognized_or_empty_payload() {
+        assert_eq!(event_summary(&event(EventType::Error, json!({}))), "");
+        // An unexpected shape still shows something real rather than blank.
+        let odd = event_summary(&event(EventType::Error, json!({"unexpected": 42})));
+        assert!(odd.contains("42"), "{odd}");
+    }
+
+    #[test]
+    fn events_table_has_no_trailing_whitespace_when_a_summary_is_empty() {
+        let page = EventsPage {
+            events: vec![event(EventType::Error, json!({}))],
+            next_token: None,
+        };
+        for line in events(&page).lines() {
+            assert_eq!(line, line.trim_end(), "trailing space: {line:?}");
+        }
     }
 
     #[test]

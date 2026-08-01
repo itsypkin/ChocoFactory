@@ -683,9 +683,24 @@ async fn task_events_shows_the_conversation() {
     .await
     .json();
     assert_eq!(limited["events"].as_array().unwrap().len(), 1);
-    assert!(
-        limited["next_token"].is_string(),
-        "expected a continuation token: {limited:?}"
+    let token = limited["next_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a continuation token: {limited:?}"));
+
+    // Feeding the token back is the exact move the human view tells users
+    // to make ("continue with `--after <token>`"), so it gets exercised
+    // end to end rather than only being printed.
+    let next = run_choco_json(
+        &daemon.base_url,
+        &["task", "events", &task_id, "--limit", "1", "--after", token],
+    )
+    .await
+    .json();
+    let first_id = limited["events"][0]["id"].as_str().unwrap();
+    let next_id = next["events"][0]["id"].as_str().unwrap();
+    assert_ne!(
+        first_id, next_id,
+        "--after should advance past the first page, got the same event twice"
     );
 }
 
