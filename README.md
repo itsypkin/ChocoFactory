@@ -61,70 +61,113 @@ choco [--base-url <url>] <COMMAND>
 ```
 
 The base URL defaults to `http://127.0.0.1:4141`, and can also be set via
-the `CHOCO_BASE_URL` environment variable. Every command prints compact
-JSON to stdout on success; on failure it prints `error: <message>` to
-stderr and exits `1`.
+the `CHOCO_BASE_URL` environment variable.
+
+Commands print a human-readable summary by default. Pass `--json` to get
+the daemon's raw JSON instead — `choco` is meant to be both human-scriptable
+and agent-callable, and `--json` is the half you pipe into `jq` or parse
+from an agent. On failure it prints `error: <message>` to stderr and exits
+`1`.
 
 ### A full walkthrough
 
-Create a project — everything else hangs off a project id:
+Create a project:
 
 ```
-$ ./target/debug/choco project create demo
-{"id":"6cd3fcff-...","name":"demo","created_at":"2026-08-01T11:55:07.497841029Z"}
+$ choco project create acme
+Name     acme
+ID       7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
+Created  2026-08-01 12:33:37 UTC
 ```
 
-Create a task in it. `--workflow` names any definition in
-`~/.config/chokofactory/workflows/` (`chat` ships built in), and
-`--title`/`--prompt` are both required:
+Create a task in it. `--project` takes **either the project name or its
+id** — a name is resolved against `project list`, and is rejected naming
+the candidates if it matches more than one project (names aren't unique).
+`--workflow` names any definition in `~/.config/chokofactory/workflows/`
+(`chat` ships built in):
 
 ```
-$ ./target/debug/choco task create \
-    --project 6cd3fcff-... \
-    --workflow chat \
-    --title "example task" \
-    --prompt "hello there"
-{"id":"34c9a1eb-...","project_id":"6cd3fcff-...","parent_task_id":null,
- "workflow_def":"chat","title":"example task","status":"open","config":{}, ...}
+$ choco task create --project acme --workflow gated \
+    --title "ship the thing" --prompt "start"
+Title     ship the thing
+ID        bb93ada3-2910-4b94-911d-f6e8aab426dd
+Project   7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
+Workflow  gated
+Status    open
+Created   2026-08-01 12:33:37 UTC
 ```
 
-Check where it is. The useful field is `workflow_state.current_stage` —
-top-level `status` is only ever `open`/`closed`:
+Check where it is. `Progress` shows the stages the task has passed
+through, the outcome that caused each hop, and when it happened:
 
 ```
-$ ./target/debug/choco task status 34c9a1eb-...
-{"id":"34c9a1eb-...","status":"open", ...,
- "workflow_state":{"current_stage":"chatting","stage_history":[],
-                   "loop_counters":{},"payload":{}, ...}}
+$ choco task status bb93ada3-...
+Title     ship the thing
+...
+Stage     review
+
+Progress
+  1. gate --[resumed]--> review   2026-08-01 12:33:37 UTC
+  → review (current)
 ```
 
-`stage_history` is the list of stages the task has already left, appended
-on each transition — it's empty above only because this task hasn't
-transitioned yet. A multi-stage workflow after one hop looks like:
+A task that hasn't moved yet says so, rather than showing a blank list:
 
 ```
-"workflow_state":{"current_stage":"review","stage_history":["gate"], ...}
+Progress
+  → gate (current, no transitions yet)
 ```
 
-Send a follow-up message into the task's live session (or resume a
-`human_gate`). The daemon accepts it asynchronously, so this prints
-nothing and exits `0` — the agent's reply arrives as an *event*, not in
-this response:
+Send a message into the task's live session (or resume a `human_gate`).
+The daemon accepts it asynchronously — the agent's reply lands as an
+event, not in this response:
 
 ```
-$ ./target/debug/choco task send 34c9a1eb-... --text "another message"
-$ echo $?
-0
+$ choco task send bb93ada3-... --text "go"
+Message accepted for task bb93ada3-.... The reply is recorded as an event
+— see `choco task events bb93ada3-...`.
 ```
 
-List tasks, optionally filtered. Both filters are free-form strings, not
-fixed enums:
+Read the conversation:
 
 ```
-$ ./target/debug/choco task list --project 6cd3fcff-...
-$ ./target/debug/choco task list --status open
-$ ./target/debug/choco project list
+$ choco task events bb93ada3-...
+TIME                     KIND               DETAIL
+2026-08-01 12:33:51 UTC  human_message      explain the plan
+2026-08-01 12:33:51 UTC  session_meta       a4cbce43-e70c-49ab-a407-2ae4701b7838
+2026-08-01 12:33:51 UTC  assistant_message  echo:explain the plan
 ```
+
+Long output is paginated — pass `--limit N`, and follow the `--after
+<token>` hint printed when more events remain. There is also a live
+WebSocket stream at `/tasks/{id}/events/live` that the CLI doesn't wrap.
+
+List things:
+
+```
+$ choco task list
+TITLE      ID                                    STATUS  WORKFLOW  CREATED
+chat task  ed9e8a7d-e5d4-4aeb-b04c-b47d14145940  open    chat      2026-08-01 12:33:51 UTC
+
+$ choco task list --project acme          # by name or id
+$ choco task list --status open           # free-form, not a fixed enum
+$ choco project list
+```
+
+### Scripting it
+
+`--json` turns any command into machine-readable output:
+
+```
+$ choco --json task list | jq -r '.[0].id'
+ed9e8a7d-e5d4-4aeb-b04c-b47d14145940
+
+$ choco --json task status <id> | jq -r '.workflow_state.current_stage'
+review
+```
+
+`task send` returns 202 with no body, so under `--json` it prints nothing
+at all rather than a message that would break a pipe.
 
 ### Delegation
 
@@ -132,14 +175,25 @@ $ ./target/debug/choco project list
 agent working inside task A can spin up task B and poll it:
 
 ```
-$ ./target/debug/choco task create --project <p> --workflow chat \
-    --title "subtask" --prompt "do the thing" --parent-task 34c9a1eb-...
-{"id":"...","parent_task_id":"34c9a1eb-...", ...}
+$ choco task create --project acme --workflow chat \
+    --title "subtask" --prompt "do the thing" --parent-task bb93ada3-...
+Title        subtask
+ID           e94b3293-c547-4dce-a31a-71dccffe8f3c
+Project      7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
+Workflow     chat
+Status       open
+Parent task  bb93ada3-2910-4b94-911d-f6e8aab426dd
+Created      2026-08-01 12:33:37 UTC
 ```
 
 The parent id round-trips through `choco task status <child-id>`, and the
-child can be polled with the same `task status` call any external script
-would use.
+child is polled with that same call — which is why the delegating agent
+wants `--json`:
+
+```
+$ choco --json task status <child-id> | jq -r '.workflow_state.current_stage'
+chatting
+```
 
 ### Other flags
 
@@ -148,20 +202,6 @@ would use.
   daemon's own working directory.
 - `--base-url <url>` targets a daemon on a non-default port, e.g. one
   started with `CHOKOFACTORY_PORT=41500`.
-
-### Reading a task's output
-
-Agent replies are recorded as events, which the CLI does not currently
-wrap — `choco` covers task/project management only. To read them, hit the
-daemon's endpoints directly:
-
-```
-$ curl -s http://127.0.0.1:4141/tasks/34c9a1eb-.../events | python3 -m json.tool
-```
-
-That returns a paginated `{"events": [...], "next_token": ...}` page
-(`?limit=`/`?after=`), with `human_message` and `assistant_message` entries.
-There is also a live WebSocket stream at `/tasks/{id}/events/live`.
 
 ## Tests
 

@@ -161,7 +161,8 @@ impl ChocoOutput {
 }
 
 /// Spawns the real `choco` binary with `--base-url <base_url>` plus
-/// `args`, and waits for it to exit.
+/// `args`, and waits for it to exit. Output is the default human-readable
+/// rendering — use [`run_choco_json`] for the machine-facing form.
 async fn run_choco(base_url: &str, args: &[&str]) -> ChocoOutput {
     let output = Command::new(env!("CARGO_BIN_EXE_choco"))
         .arg("--base-url")
@@ -175,6 +176,13 @@ async fn run_choco(base_url: &str, args: &[&str]) -> ChocoOutput {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         code: output.status.code(),
     }
+}
+
+/// Same, with `--json` — the form an agent or script consumes.
+async fn run_choco_json(base_url: &str, args: &[&str]) -> ChocoOutput {
+    let mut with_json = vec!["--json"];
+    with_json.extend_from_slice(args);
+    run_choco(base_url, &with_json).await
 }
 
 const ECHO_WORKFLOW_YAML: &str = r#"
@@ -194,13 +202,13 @@ stages:
 async fn project_create_and_list_round_trip() {
     let daemon = Daemon::spawn(TempHome::new()).await;
 
-    let created = run_choco(&daemon.base_url, &["project", "create", "demo"]).await;
+    let created = run_choco_json(&daemon.base_url, &["project", "create", "demo"]).await;
     assert_eq!(created.code, Some(0), "stderr: {}", created.stderr);
     let project = created.json();
     assert_eq!(project["name"], "demo");
     let project_id = project["id"].as_str().unwrap().to_string();
 
-    let listed = run_choco(&daemon.base_url, &["project", "list"]).await;
+    let listed = run_choco_json(&daemon.base_url, &["project", "list"]).await;
     assert_eq!(listed.code, Some(0), "stderr: {}", listed.stderr);
     let projects = listed.json();
     assert!(
@@ -222,12 +230,12 @@ async fn task_create_with_a_custom_workflow_and_parent_task_tags_delegation() {
     home.write_workflow("echo-workflow", ECHO_WORKFLOW_YAML);
     let daemon = Daemon::spawn(home).await;
 
-    let project = run_choco(&daemon.base_url, &["project", "create", "demo"])
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
         .await
         .json();
     let project_id = project["id"].as_str().unwrap().to_string();
 
-    let parent = run_choco(
+    let parent = run_choco_json(
         &daemon.base_url,
         &[
             "task",
@@ -246,7 +254,7 @@ async fn task_create_with_a_custom_workflow_and_parent_task_tags_delegation() {
     assert_eq!(parent.code, Some(0), "stderr: {}", parent.stderr);
     let parent_id = parent.json()["id"].as_str().unwrap().to_string();
 
-    let child = run_choco(
+    let child = run_choco_json(
         &daemon.base_url,
         &[
             "task",
@@ -269,7 +277,7 @@ async fn task_create_with_a_custom_workflow_and_parent_task_tags_delegation() {
     assert_eq!(child_task["parent_task_id"], parent_id);
     let child_id = child_task["id"].as_str().unwrap().to_string();
 
-    let status = run_choco(&daemon.base_url, &["task", "status", &child_id]).await;
+    let status = run_choco_json(&daemon.base_url, &["task", "status", &child_id]).await;
     assert_eq!(status.code, Some(0), "stderr: {}", status.stderr);
     let detail = status.json();
     assert_eq!(detail["parent_task_id"], parent_id);
@@ -277,13 +285,13 @@ async fn task_create_with_a_custom_workflow_and_parent_task_tags_delegation() {
 }
 
 #[tokio::test]
-async fn task_send_succeeds_with_empty_stdout() {
+async fn task_send_confirms_in_human_mode_and_stays_silent_under_json() {
     let daemon = Daemon::spawn(TempHome::new()).await;
-    let project = run_choco(&daemon.base_url, &["project", "create", "demo"])
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
         .await
         .json();
     let project_id = project["id"].as_str().unwrap().to_string();
-    let task = run_choco(
+    let task = run_choco_json(
         &daemon.base_url,
         &[
             "task",
@@ -308,17 +316,32 @@ async fn task_send_succeeds_with_empty_stdout() {
     )
     .await;
     assert_eq!(send.code, Some(0), "stderr: {}", send.stderr);
+    assert!(
+        send.stdout.contains("accepted"),
+        "human mode should confirm the send landed: {:?}",
+        send.stdout
+    );
+
+    // The endpoint answers 202 with no body, so there is nothing for a
+    // script to parse — `--json` emits nothing rather than a courtesy
+    // message that would break `| jq`.
+    let send = run_choco_json(
+        &daemon.base_url,
+        &["task", "send", &task_id, "--text", "once more"],
+    )
+    .await;
+    assert_eq!(send.code, Some(0), "stderr: {}", send.stderr);
     assert_eq!(send.stdout, "");
 }
 
 #[tokio::test]
 async fn task_list_filters_by_project_id() {
     let daemon = Daemon::spawn(TempHome::new()).await;
-    let project_a = run_choco(&daemon.base_url, &["project", "create", "a"])
+    let project_a = run_choco_json(&daemon.base_url, &["project", "create", "a"])
         .await
         .json();
     let project_a_id = project_a["id"].as_str().unwrap().to_string();
-    let project_b = run_choco(&daemon.base_url, &["project", "create", "b"])
+    let project_b = run_choco_json(&daemon.base_url, &["project", "create", "b"])
         .await
         .json();
     let project_b_id = project_b["id"].as_str().unwrap().to_string();
@@ -343,7 +366,7 @@ async fn task_list_filters_by_project_id() {
         assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     }
 
-    let listed = run_choco(
+    let listed = run_choco_json(
         &daemon.base_url,
         &["task", "list", "--project", &project_a_id],
     )
@@ -362,7 +385,7 @@ async fn task_list_filters_by_project_id() {
 #[tokio::test]
 async fn task_list_accepts_an_arbitrary_status_value() {
     let daemon = Daemon::spawn(TempHome::new()).await;
-    let out = run_choco(
+    let out = run_choco_json(
         &daemon.base_url,
         &["task", "list", "--status", "definitely-not-a-real-status"],
     )
@@ -377,7 +400,7 @@ async fn task_list_accepts_an_arbitrary_status_value() {
 #[tokio::test]
 async fn task_create_with_an_unknown_workflow_surfaces_the_daemons_404() {
     let daemon = Daemon::spawn(TempHome::new()).await;
-    let project = run_choco(&daemon.base_url, &["project", "create", "demo"])
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
         .await
         .json();
     let project_id = project["id"].as_str().unwrap().to_string();
@@ -428,4 +451,338 @@ async fn reports_a_clear_error_when_the_daemon_is_unreachable() {
         "stderr: {}",
         out.stderr
     );
+}
+
+/// Default output is a human-readable summary, not raw JSON — and the
+/// same call under `--json` is machine-parseable. Both halves matter:
+/// `choco` is human-scriptable *and* agent-callable (design Q12).
+#[tokio::test]
+async fn default_output_is_human_readable_and_json_is_opt_in() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+
+    let human = run_choco(&daemon.base_url, &["project", "create", "demo"]).await;
+    assert_eq!(human.code, Some(0), "stderr: {}", human.stderr);
+    assert!(
+        human.stdout.contains("Name") && human.stdout.contains("demo"),
+        "expected a labelled summary: {:?}",
+        human.stdout
+    );
+    assert!(
+        serde_json::from_str::<Value>(human.stdout.trim()).is_err(),
+        "default output should not be raw JSON: {:?}",
+        human.stdout
+    );
+
+    let json = run_choco_json(&daemon.base_url, &["project", "list"]).await;
+    assert_eq!(json.code, Some(0), "stderr: {}", json.stderr);
+    assert_eq!(json.json().as_array().unwrap().len(), 1);
+}
+
+/// `--project` takes a name, not just an id — the id path still works, so
+/// existing scripted callers are unaffected.
+#[tokio::test]
+async fn task_create_accepts_a_project_name_as_well_as_an_id() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "my-project"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let by_name = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            "my-project",
+            "--workflow",
+            "chat",
+            "--title",
+            "named",
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(by_name.code, Some(0), "stderr: {}", by_name.stderr);
+    assert_eq!(by_name.json()["project_id"], project_id);
+
+    let by_id = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "chat",
+            "--title",
+            "by-id",
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(by_id.code, Some(0), "stderr: {}", by_id.stderr);
+    assert_eq!(by_id.json()["project_id"], project_id);
+
+    // Filtering by name works too, not just at task-creation time.
+    let listed = run_choco_json(
+        &daemon.base_url,
+        &["task", "list", "--project", "my-project"],
+    )
+    .await;
+    assert_eq!(listed.json().as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn an_unknown_project_name_is_a_clear_error() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let out = run_choco(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            "nope",
+            "--workflow",
+            "chat",
+            "--title",
+            "t",
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(out.code, Some(1));
+    assert!(
+        out.stderr.contains("no project named 'nope'"),
+        "stderr: {}",
+        out.stderr
+    );
+}
+
+/// `projects.name` has no unique constraint, so a duplicated name must
+/// report the candidates rather than silently picking one.
+#[tokio::test]
+async fn an_ambiguous_project_name_is_rejected_with_the_candidate_ids() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let first = run_choco_json(&daemon.base_url, &["project", "create", "dupe"])
+        .await
+        .json();
+    let second = run_choco_json(&daemon.base_url, &["project", "create", "dupe"])
+        .await
+        .json();
+    let (first_id, second_id) = (
+        first["id"].as_str().unwrap().to_string(),
+        second["id"].as_str().unwrap().to_string(),
+    );
+
+    let out = run_choco(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            "dupe",
+            "--workflow",
+            "chat",
+            "--title",
+            "t",
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(out.code, Some(1));
+    assert!(out.stderr.contains("matches 2 projects"), "{}", out.stderr);
+    assert!(out.stderr.contains(&first_id), "{}", out.stderr);
+    assert!(out.stderr.contains(&second_id), "{}", out.stderr);
+
+    // ...and passing the id resolves the ambiguity.
+    let ok = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &first_id,
+            "--workflow",
+            "chat",
+            "--title",
+            "t",
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(ok.code, Some(0), "stderr: {}", ok.stderr);
+}
+
+#[tokio::test]
+async fn task_events_shows_the_conversation() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let task = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            project["id"].as_str().unwrap(),
+            "--workflow",
+            "chat",
+            "--title",
+            "t",
+            "--prompt",
+            "hello there",
+        ],
+    )
+    .await
+    .json();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // mock-claude echoes `echo:{text}`; wait for that reply to land so the
+    // assertion covers a real round trip, not just the human_message.
+    let mut human = ChocoOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+        code: None,
+    };
+    for _ in 0..100 {
+        human = run_choco(&daemon.base_url, &["task", "events", &task_id]).await;
+        if human.stdout.contains("echo:hello there") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(human.code, Some(0), "stderr: {}", human.stderr);
+    assert!(
+        human.stdout.contains("human_message") && human.stdout.contains("hello there"),
+        "expected the prompt in the transcript: {:?}",
+        human.stdout
+    );
+    assert!(
+        human.stdout.contains("echo:hello there"),
+        "expected the agent's reply in the transcript: {:?}",
+        human.stdout
+    );
+
+    let json = run_choco_json(&daemon.base_url, &["task", "events", &task_id]).await;
+    let page = json.json();
+    assert!(!page["events"].as_array().unwrap().is_empty());
+
+    // `--limit` is passed through to the daemon's own pagination, which
+    // hands back a token to continue from.
+    let limited = run_choco_json(
+        &daemon.base_url,
+        &["task", "events", &task_id, "--limit", "1"],
+    )
+    .await
+    .json();
+    assert_eq!(limited["events"].as_array().unwrap().len(), 1);
+    assert!(
+        limited["next_token"].is_string(),
+        "expected a continuation token: {limited:?}"
+    );
+}
+
+#[tokio::test]
+async fn task_events_for_an_unknown_task_is_an_error() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let out = run_choco(&daemon.base_url, &["task", "events", "does-not-exist"]).await;
+    assert_eq!(out.code, Some(1));
+    assert!(out.stderr.starts_with("error: "), "stderr: {}", out.stderr);
+}
+
+/// The headline fix for `task status`: the stage trail carries the outcome
+/// that caused each hop and when it happened, and the human view renders
+/// it as a timeline rather than a bare list of names.
+#[tokio::test]
+async fn task_status_shows_stage_progress_with_outcomes_and_timestamps() {
+    let home = TempHome::new();
+    home.write_workflow(
+        "gated",
+        r#"
+name: gated
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: review }
+  review:
+    kind: human_gate
+    on:
+      approved: done
+      changes_requested: gate
+  done:
+    kind: terminal
+"#,
+    );
+    let daemon = Daemon::spawn(home).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let task = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            project["id"].as_str().unwrap(),
+            "--workflow",
+            "gated",
+            "--title",
+            "gated task",
+            "--prompt",
+            "start",
+        ],
+    )
+    .await
+    .json();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Before any transition, the view says so rather than showing a blank.
+    let fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    assert!(
+        fresh.stdout.contains("no transitions yet"),
+        "{:?}",
+        fresh.stdout
+    );
+
+    // Sending into a human_gate resumes it, moving gate -> review.
+    let sent = run_choco(
+        &daemon.base_url,
+        &["task", "send", &task_id, "--text", "go"],
+    )
+    .await;
+    assert_eq!(sent.code, Some(0), "stderr: {}", sent.stderr);
+
+    let status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    assert_eq!(status.code, Some(0), "stderr: {}", status.stderr);
+    assert!(
+        status.stdout.contains("gate --[resumed]--> review"),
+        "expected the hop with its outcome: {:?}",
+        status.stdout
+    );
+    assert!(
+        status.stdout.contains("→ review (current)"),
+        "expected the current stage marked: {:?}",
+        status.stdout
+    );
+
+    // The same data is present structurally under --json, with a real
+    // timestamp — the CLI renders it, the daemon records it.
+    let detail = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
+        .await
+        .json();
+    let history = detail["workflow_state"]["stage_history"]
+        .as_array()
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["stage"], "gate");
+    assert_eq!(history[0]["outcome"], "resumed");
+    assert_eq!(history[0]["to"], "review");
+    assert!(history[0]["at"].is_string(), "{history:?}");
 }

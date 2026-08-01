@@ -14,13 +14,19 @@ pub struct Cli {
     #[arg(long, env = "CHOCO_BASE_URL", default_value = "http://127.0.0.1:4141")]
     pub base_url: String,
 
+    /// Print the daemon's raw JSON instead of a human-readable summary.
+    /// `choco` is meant to be both human-scriptable and agent-callable
+    /// (design Q12) — this is the machine-facing half.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Task create/status/send/list.
+    /// Task create/status/send/list/events.
     #[command(subcommand)]
     Task(TaskCmd),
     /// Project create/list.
@@ -32,7 +38,7 @@ pub enum Command {
 pub enum TaskCmd {
     /// Create a task under a project, starting the named workflow.
     Create(TaskCreateArgs),
-    /// Fetch a task plus its current workflow state.
+    /// Show a task, its current stage, and how it got there.
     Status {
         /// Task id.
         id: String,
@@ -46,18 +52,30 @@ pub enum TaskCmd {
     },
     /// List tasks, optionally filtered by project and/or status.
     List {
-        /// Project id to filter by.
+        /// Project name or id to filter by.
         #[arg(long)]
         project: Option<String>,
         /// Status to filter by (free-form — driven by workflow definitions).
         #[arg(long)]
         status: Option<String>,
     },
+    /// Show a task's recorded events (the agent conversation and tool calls).
+    Events {
+        /// Task id.
+        id: String,
+        /// Maximum events to return. The daemon caps this at 500.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Opaque `next_token` from a previous page, to continue from there.
+        #[arg(long)]
+        after: Option<String>,
+    },
 }
 
 #[derive(Args)]
 pub struct TaskCreateArgs {
-    /// Project id this task belongs to (no name lookup — pass the id).
+    /// Project name or id this task belongs to. A name is resolved against
+    /// `project list`, and is rejected if it matches more than one project.
     #[arg(long)]
     pub project: String,
     /// Workflow definition name (any name under

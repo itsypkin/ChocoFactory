@@ -686,7 +686,24 @@ impl WorkflowEngine {
                     Value::Array(entries) => entries,
                     _ => Vec::new(),
                 };
-                stage_history.push(json!(from_stage));
+                // Records *why* and *when* each hop happened, not just the
+                // stage name it departed: a bare `["gate"]` trail can't tell
+                // a caller polling `task status` (§6.2 delegation) whether
+                // `gate` was approved or rejected, nor how long it sat
+                // there. `outcome`/`next_stage` are already resolved above,
+                // so this costs nothing extra to record.
+                //
+                // Entries written before this change are plain strings.
+                // Nothing in the daemon reads `stage_history` back for
+                // logic — it's append-only bookkeeping surfaced through the
+                // API — so the two shapes coexist in one array without a
+                // migration, and readers handle both.
+                stage_history.push(json!({
+                    "stage": from_stage,
+                    "outcome": outcome,
+                    "to": next_stage,
+                    "at": Utc::now(),
+                }));
 
                 workflow_state::update(
                     &self.pool,
@@ -1233,7 +1250,47 @@ stages:
 
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "done");
-        assert_eq!(state.stage_history, json!(["gate"]));
+
+        // Each entry records the hop, not just the stage departed, so a
+        // caller polling `task status` can see why the task moved and when.
+        let history = state.stage_history.as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["stage"], "gate");
+        assert_eq!(history[0]["outcome"], "resumed");
+        assert_eq!(history[0]["to"], "done");
+        assert!(
+            history[0]["at"].as_str().is_some(),
+            "expected an `at` timestamp, got {:?}",
+            history[0]
+        );
+    }
+
+    /// A loop-guard reroute sends the task somewhere other than the
+    /// outcome's mapped target, so `to` must record where it *actually*
+    /// went, not what the `on:` map said.
+    #[tokio::test]
+    async fn stage_history_records_the_rerouted_target_when_a_loop_guard_fires() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = self_loop_guard_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        // `self_loop_guard_def` maps `resumed: a` but guards it at max 3,
+        // so the 4th traversal reroutes to "done" instead of back to "a".
+        for _ in 0..4 {
+            engine.advance(&task_id, &def, "resumed").await.unwrap();
+        }
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "done");
+        let history = state.stage_history.as_array().unwrap();
+        let last = history.last().unwrap();
+        assert_eq!(
+            last["to"], "done",
+            "`to` must record where the task actually landed after the \
+             guard rerouted it, not the `on:` map's target: {history:?}"
+        );
     }
 
     #[tokio::test]

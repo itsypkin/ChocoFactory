@@ -6,8 +6,19 @@
 
 use std::fmt;
 
-use chokofactory_core::models::{Project, Task};
+use chokofactory_core::models::{Event, Project, Task};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// One page of `GET /tasks/{id}/events`. Defined here rather than imported
+/// because the daemon's `EventsPage` lives in its bin-only API layer;
+/// `Event` itself does come from `chokofactory-core`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventsPage {
+    pub events: Vec<Event>,
+    /// `Some` iff more events may follow — pass it back as `--after`.
+    pub next_token: Option<String>,
+}
 
 /// Mirrors this repo's hand-rolled `Display`-impl error convention
 /// (`ApiError`, `EngineError`, ...) rather than pulling in `anyhow`/`thiserror`.
@@ -22,6 +33,12 @@ pub enum ClientError {
     Api(String),
     /// Response body wasn't the JSON shape expected.
     Decode(String),
+    /// `--project <name>` matched no project.
+    NoSuchProject(String),
+    /// `--project <name>` matched several — `projects.name` has no unique
+    /// constraint (`0001_init.sql`), so this is a reachable state, not a
+    /// theoretical one. Resolved by passing the id instead.
+    AmbiguousProject { name: String, ids: Vec<String> },
 }
 
 impl fmt::Display for ClientError {
@@ -33,6 +50,15 @@ impl fmt::Display for ClientError {
             ),
             ClientError::Api(message) => write!(f, "{message}"),
             ClientError::Decode(msg) => write!(f, "unexpected response from chokofactoryd: {msg}"),
+            ClientError::NoSuchProject(name) => {
+                write!(f, "no project named '{name}' (try `choco project list`)")
+            }
+            ClientError::AmbiguousProject { name, ids } => write!(
+                f,
+                "'{name}' matches {} projects — pass one of these ids instead: {}",
+                ids.len(),
+                ids.join(", ")
+            ),
         }
     }
 }
@@ -106,6 +132,53 @@ impl Client {
     pub async fn list_projects(&self) -> Result<Vec<Project>, ClientError> {
         let resp = self
             .send(self.http.get(format!("{}/projects", self.base_url)))
+            .await?;
+        let resp = self.check_status(resp).await?;
+        self.decode(resp).await
+    }
+
+    /// Resolves a user-supplied `--project` value, which may be either an
+    /// id or a name, to an id.
+    ///
+    /// Tries id first so an exact id always wins, then falls back to an
+    /// exact name match. `projects.name` carries no unique constraint, so a
+    /// name matching several projects is an error naming the candidates
+    /// rather than an arbitrary pick.
+    pub async fn resolve_project(&self, name_or_id: &str) -> Result<String, ClientError> {
+        let projects = self.list_projects().await?;
+        if projects.iter().any(|p| p.id == name_or_id) {
+            return Ok(name_or_id.to_string());
+        }
+        let matches: Vec<&Project> = projects.iter().filter(|p| p.name == name_or_id).collect();
+        match matches.as_slice() {
+            [only] => Ok(only.id.clone()),
+            [] => Err(ClientError::NoSuchProject(name_or_id.to_string())),
+            many => Err(ClientError::AmbiguousProject {
+                name: name_or_id.to_string(),
+                ids: many.iter().map(|p| p.id.clone()).collect(),
+            }),
+        }
+    }
+
+    pub async fn list_events(
+        &self,
+        id: &str,
+        limit: Option<usize>,
+        after: Option<&str>,
+    ) -> Result<EventsPage, ClientError> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(after) = after {
+            query.push(("after", after.to_string()));
+        }
+        let resp = self
+            .send(
+                self.http
+                    .get(format!("{}/tasks/{id}/events", self.base_url))
+                    .query(&query),
+            )
             .await?;
         let resp = self.check_status(resp).await?;
         self.decode(resp).await
