@@ -172,6 +172,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_transitions_interleave_with_conversation_events_in_the_history() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project: Value = server
+            .post("/projects", json!({ "name": "demo" }))
+            .await
+            .json();
+        let project_id = project["id"].as_str().unwrap();
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
+
+        // Wait for the initial turn's reply to land on top of the entry
+        // stage's transition. Waits on that specific event rather than on a
+        // count, so a slow fixture subprocess under a loaded test run
+        // doesn't leave a partial history to assert against.
+        let mut events = Vec::new();
+        let mut saw_reply = false;
+        for _ in 0..500 {
+            let history: Value = server.get(&format!("/tasks/{task_id}/events")).await.json();
+            events = history["events"].as_array().unwrap().clone();
+            if events
+                .iter()
+                .any(|e| e["event_type"] == "assistant_message")
+            {
+                saw_reply = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let seen: Vec<&str> = events
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect();
+        assert!(saw_reply, "initial turn never produced a reply: {seen:?}");
+
+        // The stage transition comes first: `start_task` records it before
+        // the session it opens can emit anything.
+        assert_eq!(events[0]["event_type"], "stage_entered");
+        assert_eq!(events[0]["payload"]["stage"], "chatting");
+        assert_eq!(events[0]["payload"]["outcome"], Value::Null);
+        // It belongs to the task, not to a session — and is served over the
+        // same endpoint as everything else rather than a parallel one.
+        assert_eq!(events[0]["task_run_id"], Value::Null);
+        assert_eq!(events[0]["task_id"], task_id.as_str());
+
+        // Everything after it is session-scoped conversation, in order.
+        let rest: Vec<&str> = events[1..]
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect();
+        assert!(
+            rest.iter().all(|t| *t != "stage_entered"),
+            "chat has one stage, so only one transition should appear: {rest:?}"
+        );
+        assert!(
+            events[1..].iter().all(|e| e["task_run_id"] != Value::Null),
+            "conversation events should still name their session"
+        );
+        assert!(
+            rest.contains(&"assistant_message"),
+            "the reply must sort after the transition, not before it: {rest:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_human_side_of_the_conversation_shows_up_in_the_paginated_history() {
         let server = TestServer::start().await;
         server.seed_chat_workflow();

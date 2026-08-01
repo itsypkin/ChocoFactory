@@ -153,8 +153,13 @@ stages:
                 chrono::Duration::hours(1),
                 Arc::clone(&events_notify),
             );
-            let engine =
-                WorkflowEngine::new(pool.clone(), session_manager, workflows_dir.0.clone(), None);
+            let engine = WorkflowEngine::new(
+                pool.clone(),
+                session_manager,
+                workflows_dir.0.clone(),
+                None,
+                Arc::clone(&events_notify),
+            );
             let state = AppState {
                 pool: pool.clone(),
                 engine,

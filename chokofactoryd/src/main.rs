@@ -76,6 +76,7 @@ async fn main() {
         Arc::clone(&session_manager),
         workflows_dir,
         GlobalConfig::default_path(),
+        Arc::clone(&events_notify),
     );
 
     tokio::spawn(Arc::clone(&session_manager).run_idle_reaper(IdleReaperConfig::default()));
