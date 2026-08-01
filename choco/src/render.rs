@@ -80,7 +80,7 @@ fn fields(pairs: &[(&str, String)]) -> String {
 
 pub fn project(p: &Project) -> String {
     fields(&[
-        ("Name", p.name.clone()),
+        ("Name", single_line(&p.name)),
         ("ID", p.id.clone()),
         ("Created", timestamp(&p.created_at)),
     ])
@@ -92,14 +92,14 @@ pub fn projects(list: &[Project]) -> String {
     }
     let rows: Vec<Vec<String>> = list
         .iter()
-        .map(|p| vec![p.name.clone(), p.id.clone(), timestamp(&p.created_at)])
+        .map(|p| vec![one_line(&p.name), p.id.clone(), timestamp(&p.created_at)])
         .collect();
     table(&["NAME", "ID", "CREATED"], &rows)
 }
 
 pub fn task(t: &Task) -> String {
     let mut pairs = vec![
-        ("Title", t.title.clone()),
+        ("Title", single_line(&t.title)),
         ("ID", t.id.clone()),
         ("Project", t.project_id.clone()),
         ("Workflow", t.workflow_def.clone()),
@@ -120,7 +120,7 @@ pub fn tasks(list: &[Task]) -> String {
         .iter()
         .map(|t| {
             vec![
-                t.title.clone(),
+                one_line(&t.title),
                 t.id.clone(),
                 t.status.clone(),
                 t.workflow_def.clone(),
@@ -137,7 +137,7 @@ pub fn task_detail(detail: &Value) -> String {
     let get = |key: &str| detail.get(key).and_then(Value::as_str).unwrap_or("-");
 
     let mut pairs = vec![
-        ("Title", get("title").to_string()),
+        ("Title", single_line(get("title"))),
         ("ID", get("id").to_string()),
         ("Project", get("project_id").to_string()),
         ("Workflow", get("workflow_def").to_string()),
@@ -322,11 +322,19 @@ fn value_text(value: &Value) -> String {
     }
 }
 
+/// Collapses any internal newline/whitespace run to a single space. Titles
+/// and project names are free-form and reach the API unvalidated (`POST
+/// /tasks` takes any string, and a shell can pass `--title $'a\nb'`), so a
+/// raw one would otherwise split a row across lines and break the layout.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Events carry whole agent messages; unbounded multi-line text would wreck
 /// a table, so collapse newlines and cap the width.
 fn one_line(text: &str) -> String {
     const MAX: usize = 100;
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = single_line(text);
     if flat.chars().count() > MAX {
         let kept: String = flat.chars().take(MAX).collect();
         format!("{kept}…")
@@ -489,6 +497,35 @@ mod tests {
         assert_eq!(one_line("hello\n  there"), "hello there");
         assert!(one_line(&long).ends_with('…'));
         assert!(one_line(&long).chars().count() <= 101);
+    }
+
+    /// Titles and project names reach the API unvalidated, so a newline in
+    /// one would otherwise split a row across lines and wreck the layout.
+    #[test]
+    fn a_title_containing_a_newline_does_not_break_the_table() {
+        let task = Task {
+            id: "t1".to_string(),
+            project_id: "p1".to_string(),
+            parent_task_id: None,
+            workflow_def: "chat".to_string(),
+            title: "first line\nsecond line".to_string(),
+            status: "open".to_string(),
+            config: json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let rendered = tasks(std::slice::from_ref(&task));
+        assert_eq!(
+            rendered.lines().count(),
+            2,
+            "header + one row expected, got: {rendered}"
+        );
+        assert!(rendered.contains("first line second line"), "{rendered}");
+
+        // The single-task view collapses it too, but keeps the full text.
+        let detail = super::task(&task);
+        assert!(detail.contains("first line second line"), "{detail}");
     }
 
     #[test]

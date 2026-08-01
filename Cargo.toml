@@ -15,8 +15,8 @@ edition = "2024"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chokofactory-core = { path = "chokofactory-core" }
-clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 indexmap = { version = "2", features = ["serde"] }
 regex = "1"
