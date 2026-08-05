@@ -765,6 +765,17 @@ impl WorkflowEngine {
         // returning early can't undo it — it would only skip the caller's
         // lock-eviction check and abort a stage that has, in fact, been
         // entered.
+        //
+        // Note this is two writes, not one: the caller commits
+        // `workflow_state` and then this records the trail entry, where the
+        // old `stage_history` column was updated in the same statement as
+        // `current_stage`. A crash or SQLITE_BUSY in between drops a
+        // transition from the timeline permanently, and with no per-session
+        // counter left there's no gap to detect it by. Making the pair
+        // atomic means threading a transaction from `advance`/`start_task`
+        // through this function; deliberately not done here (X-3), since
+        // `current_stage` — the value the engine actually reads back — is
+        // the one that must be durable, and the failure is logged loudly.
         match events::append_stage_transition(&self.pool, task_id, stage_name, entered_via).await {
             Ok(_) => self.events_notify.notify_waiters(),
             Err(err) => tracing::error!(
@@ -1589,6 +1600,41 @@ stages:
         engine.advance(&task_id, &def, "resumed").await.unwrap();
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "done");
+    }
+
+    #[tokio::test]
+    async fn a_loop_guard_reroute_records_the_outcome_that_tripped_the_guard() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = self_loop_guard_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        for _ in 0..4 {
+            engine.advance(&task_id, &def, "resumed").await.unwrap();
+        }
+
+        // Pins the semantics of `outcome` when a `loop_guard` overrides the
+        // destination. The recorded outcome is the one that *triggered* the
+        // transition ("resumed"), not a synthetic name for the guard — even
+        // though on the last hop `on["resumed"]` is `a` while the task
+        // actually landed on the guard's `then` (`done`).
+        //
+        // So a consumer reconstructing the trail against the definition
+        // can't read the final hop off the `on:` map alone; it has to also
+        // consult `loop_guard.then`, which is where the definition already
+        // says that redirect lives. Recording a fabricated outcome instead
+        // would be worse — it would name an `on:` key that doesn't exist.
+        assert_eq!(
+            stage_trail(&pool, &task_id).await,
+            vec![
+                ("a".to_string(), Value::Null),
+                ("a".to_string(), json!("resumed")),
+                ("a".to_string(), json!("resumed")),
+                ("a".to_string(), json!("resumed")),
+                ("done".to_string(), json!("resumed")),
+            ]
+        );
     }
 
     #[tokio::test]

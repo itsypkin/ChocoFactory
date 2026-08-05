@@ -34,7 +34,11 @@ CREATE TABLE events_new (
 );
 
 -- Every pre-existing row came from a session, so `task_id` backfills from
--- the run it was appended against and none of them are dropped by the join.
+-- the run it was appended against. The join is inner: a row whose
+-- `task_run_id` didn't resolve would be dropped rather than migrated, but
+-- no such row can exist -- `events.task_run_id` was NOT NULL with an
+-- enforced FK to `task_runs`, and there is no alternative anyway, since
+-- the new `task_id` is itself NOT NULL.
 INSERT INTO events_new (id, task_id, task_run_id, event_type, payload, created_at)
 SELECT e.id, tr.task_id, e.task_run_id, e.event_type, e.payload, e.created_at
 FROM events e

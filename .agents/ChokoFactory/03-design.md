@@ -145,7 +145,9 @@ SQLite tables (names indicative, not final schema):
   Ordering is always `(created_at, id)`, one rule for the whole table.
   There is no per-session sequence counter: events within a session are
   appended sequentially by a single drain loop with a full write between
-  them, and `created_at` carries microsecond resolution, so a counter
+  them, and `created_at` preserves whatever sub-second precision the
+  platform clock offers (encoded to nanoseconds; ~1 µs granularity as
+  measured on macOS), so a counter
   bought no ordering safety on the only path it covered. The trade-off
   taken deliberately is that clients cannot detect a missing entry by
   spotting a gap.
@@ -243,6 +245,14 @@ safety goal from the rough idea.
 Scheduled job (daily) deletes `events` rows older than 1 year (Q16).
 Runs off `events.created_at`; doesn't touch `tasks`/`task_runs` rows
 themselves, so task history/metadata outlives its detailed transcript.
+
+One consequence of §3's move of the stage trail into `events`: the trail
+is now subject to this job, where `workflow_state.stage_history` was
+permanent. A task closed over a year ago keeps its `task_runs` metadata
+but loses its `stage_entered` entries along with the rest of its
+transcript. If the trail should outlive the transcript, retention needs
+to exempt `event_type = 'stage_entered'` — deliberately not done here,
+just noted so the choice is explicit rather than accidental.
 
 ### 4.5 ACP as a candidate adapter transport (under evaluation)
 
