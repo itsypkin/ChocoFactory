@@ -25,7 +25,7 @@ use chokofactory_core::models::{EventType, Task, TaskRunEndReason, TaskRunStatus
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::db::{events, projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
@@ -45,7 +45,7 @@ pub struct WorkflowEngine {
     /// this, two callers racing to advance the same task's `workflow_state`
     /// (e.g. the turn-completion watcher and `send_message_or_resume`'s
     /// `human_gate` relay) could both read the same row and then both
-    /// write, silently clobbering one call's `stage_history`/`loop_counters`.
+    /// write, silently clobbering one call's `loop_counters`.
     task_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Where `create_task`/`send_message` resolve a `workflow_def` name to
     /// a file (P1-8 LLD §2.6/§2.8) — the *seeded* user directory
@@ -56,6 +56,13 @@ pub struct WorkflowEngine {
     /// unset, or a test that doesn't care) — treated the same as a
     /// missing file: role resolution just gets no global defaults.
     global_config_path: Option<PathBuf>,
+    /// Woken after a stage transition is recorded (X-3), so the live-events
+    /// WebSocket pushes it immediately. The same `Notify` the
+    /// `SessionManager` signals for session events — a stage transition is
+    /// just another entry in the one timeline both write to, and without
+    /// this a `human_gate`-only workflow would sit silent until some
+    /// unrelated event happened to arrive.
+    events_notify: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -324,6 +331,7 @@ impl WorkflowEngine {
         session_manager: Arc<SessionManager>,
         workflows_dir: PathBuf,
         global_config_path: Option<PathBuf>,
+        events_notify: Arc<Notify>,
     ) -> Arc<Self> {
         Arc::new(Self {
             pool,
@@ -331,6 +339,7 @@ impl WorkflowEngine {
             task_locks: Mutex::new(HashMap::new()),
             workflows_dir,
             global_config_path,
+            events_notify,
         })
     }
 
@@ -609,7 +618,7 @@ impl WorkflowEngine {
         let start = definition.start_stage();
         let result: Result<(), EngineError> = async {
             workflow_state::create(&self.pool, task_id, start).await?;
-            self.enter_stage(task_id, definition, start, initial_input)
+            self.enter_stage(task_id, definition, start, initial_input, None)
                 .await
         }
         .await;
@@ -682,42 +691,22 @@ impl WorkflowEngine {
                 }
                 note_stage_entry(&mut loop_counters, definition, &next_stage, &from_stage);
 
-                let mut stage_history = match state.stage_history {
-                    Value::Array(entries) => entries,
-                    _ => Vec::new(),
-                };
-                // Records *why* and *when* each hop happened, not just the
-                // stage name it departed: a bare `["gate"]` trail can't tell
-                // a caller polling `task status` (§6.2 delegation) whether
-                // `gate` was approved or rejected, nor how long it sat
-                // there. `outcome`/`next_stage` are already resolved above,
-                // so this costs nothing extra to record.
-                //
-                // Entries written before this change are plain strings.
-                // Nothing in the daemon reads `stage_history` back for
-                // logic — it's append-only bookkeeping surfaced through the
-                // API — so the two shapes coexist in one array without a
-                // migration, and readers handle both.
-                stage_history.push(json!({
-                    "stage": from_stage,
-                    "outcome": outcome,
-                    "to": next_stage,
-                    "at": Utc::now(),
-                }));
-
                 workflow_state::update(
                     &self.pool,
                     task_id,
                     workflow_state::WorkflowStateUpdate {
                         current_stage: next_stage.clone(),
                         loop_counters,
-                        stage_history: Value::Array(stage_history),
                         payload: state.payload,
                     },
                 )
                 .await?;
 
-                self.enter_stage(task_id, definition, &next_stage, None)
+                // `enter_stage` records the transition itself (X-3), so the
+                // trail this used to push onto `workflow_state.stage_history`
+                // now lives in the events timeline with a timestamp and the
+                // outcome that caused it.
+                self.enter_stage(task_id, definition, &next_stage, None, Some(outcome))
                     .await?;
                 Ok(next_stage)
             }
@@ -743,19 +732,57 @@ impl WorkflowEngine {
         result.map(|_| ())
     }
 
-    /// Dispatches the behavior for whichever kind `stage_name` is (§5.2).
+    /// Dispatches the behavior for whichever kind `stage_name` is (§5.2),
+    /// and records the transition into it on the task's timeline (X-3).
     /// `input` is only consulted for a `prompt_file`-less `agent_turn`.
+    /// `entered_via` is the outcome that selected this stage — `None` when
+    /// it's the task's entry stage, which nothing transitioned into.
     async fn enter_stage(
         self: &Arc<Self>,
         task_id: &str,
         definition: &Arc<WorkflowDefinition>,
         stage_name: &str,
         input: Option<&str>,
+        entered_via: Option<&str>,
     ) -> Result<(), EngineError> {
         let stage_def = definition
             .stages
             .get(stage_name)
             .ok_or_else(|| EngineError::UnknownStage(stage_name.to_string()))?;
+
+        // Every stage kind funnels through here, so recording the
+        // transition once at this point covers `start_task`'s entry stage,
+        // every `advance`, and terminal entry alike (X-3). Placed after
+        // `stage_def` resolves so an unknown stage doesn't record a
+        // transition that never happened, but before dispatching on the
+        // kind so it's unconditional — `workflow_state.current_stage` is
+        // already committed by the caller regardless of whether this engine
+        // can execute that kind yet.
+        //
+        // Best-effort, not `?`: the same reasoning as the `human_message`
+        // append below and the terminal-stage `update_status` further down
+        // (§ review on PR #35). The state transition is already durable, so
+        // returning early can't undo it — it would only skip the caller's
+        // lock-eviction check and abort a stage that has, in fact, been
+        // entered.
+        //
+        // Note this is two writes, not one: the caller commits
+        // `workflow_state` and then this records the trail entry, where the
+        // old `stage_history` column was updated in the same statement as
+        // `current_stage`. A crash or SQLITE_BUSY in between drops a
+        // transition from the timeline permanently, and with no per-session
+        // counter left there's no gap to detect it by. Making the pair
+        // atomic means threading a transaction from `advance`/`start_task`
+        // through this function; deliberately not done here (X-3), since
+        // `current_stage` — the value the engine actually reads back — is
+        // the one that must be durable, and the failure is logged loudly.
+        match events::append_stage_transition(&self.pool, task_id, stage_name, entered_via).await {
+            Ok(_) => self.events_notify.notify_waiters(),
+            Err(err) => tracing::error!(
+                task_id, stage = stage_name, %err,
+                "failed to record stage transition event"
+            ),
+        }
 
         match &stage_def.kind {
             StageKind::AgentTurn { role, prompt_file } => {
@@ -1111,18 +1138,25 @@ mod tests {
 
     fn engine_with_adapter(pool: SqlitePool, binary: &str) -> Arc<WorkflowEngine> {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let events_notify = Arc::new(Notify::new());
         let session_manager = SessionManager::new(
             pool.clone(),
             adapter,
             chrono::Duration::hours(1),
-            Arc::new(tokio::sync::Notify::new()),
+            Arc::clone(&events_notify),
         );
         // No test here drives create_task/send_message's workflow-name
         // resolution or a global config file, so an inert directory and
         // no config path are enough — role_config::resolve just falls
         // through to whatever the hand-built definition's `roles:` block
         // already specifies, exactly like before this field existed.
-        WorkflowEngine::new(pool, session_manager, PathBuf::from("."), None)
+        WorkflowEngine::new(
+            pool,
+            session_manager,
+            PathBuf::from("."),
+            None,
+            events_notify,
+        )
     }
 
     fn engine_with_adapter_and_workflows_dir(
@@ -1131,17 +1165,32 @@ mod tests {
         workflows_dir: &Path,
     ) -> Arc<WorkflowEngine> {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let events_notify = Arc::new(Notify::new());
         let session_manager = SessionManager::new(
             pool.clone(),
             adapter,
             chrono::Duration::hours(1),
-            Arc::new(tokio::sync::Notify::new()),
+            Arc::clone(&events_notify),
         );
-        WorkflowEngine::new(pool, session_manager, workflows_dir.to_path_buf(), None)
+        WorkflowEngine::new(
+            pool,
+            session_manager,
+            workflows_dir.to_path_buf(),
+            None,
+            events_notify,
+        )
     }
 
+    /// Waits for `workflow_state.current_stage` to reach `expected`.
+    ///
+    /// Note what this does *not* tell you: `advance` writes `current_stage`
+    /// before calling `enter_stage`, so this goes true while the stage's own
+    /// effects — the `stage_entered` event, and `update_status("closed")`
+    /// for a terminal stage — are still pending. A test asserting on those
+    /// must wait for them directly (see [`wait_until_task_status`]) rather
+    /// than treating arrival at the stage as proof they already happened.
     async fn wait_until_stage(pool: &SqlitePool, task_id: &str, expected: &str) {
-        for _ in 0..200 {
+        for _ in 0..500 {
             let state = workflow_state::get(pool, task_id).await.unwrap().unwrap();
             if state.current_stage == expected {
                 return;
@@ -1149,6 +1198,23 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         panic!("timed out waiting for stage {expected}");
+    }
+
+    /// Waits for `tasks.status`, which a terminal stage sets from inside
+    /// `enter_stage` — strictly after `current_stage` already names that
+    /// stage. Budgeted for a loaded parallel suite: these tests drive a real
+    /// python subprocess, and spawning one can take well over a second when
+    /// the whole workspace is running at once.
+    async fn wait_until_task_status(pool: &SqlitePool, task_id: &str, expected: &str) {
+        let mut last = String::new();
+        for _ in 0..500 {
+            last = tasks::get(pool, task_id).await.unwrap().unwrap().status;
+            if last == expected {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for status {expected}, last saw {last:?}");
     }
 
     /// Polls `task_run_id`'s events for one whose `payload.text` equals
@@ -1168,6 +1234,25 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         panic!("timed out waiting for an event with text {text:?}");
+    }
+
+    /// A task's stage trail, read back off the events timeline. This is
+    /// what replaced `workflow_state.stage_history` (X-3), and it records
+    /// strictly more: a timestamp, the outcome that caused each transition,
+    /// and — unlike the old column — the entry stage itself.
+    async fn stage_trail(pool: &SqlitePool, task_id: &str) -> Vec<(String, Value)> {
+        events::list_for_task(pool, task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::StageEntered)
+            .map(|e| {
+                (
+                    e.payload["stage"].as_str().unwrap().to_string(),
+                    e.payload["outcome"].clone(),
+                )
+            })
+            .collect()
     }
 
     fn human_gate_chain_def() -> Arc<WorkflowDefinition> {
@@ -1235,11 +1320,25 @@ stages:
 
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "gate");
-        assert_eq!(state.stage_history, json!([]));
+
+        // The entry stage is recorded too (X-3) — the old
+        // `stage_history` column only ever appended a stage on the way
+        // *out*, so a task's starting stage was never in the trail.
+        assert_eq!(
+            stage_trail(&pool, &task_id).await,
+            vec![("gate".to_string(), Value::Null)]
+        );
+
+        // `gate` is a human_gate, so no task_run exists to attribute this
+        // to — the case the old schema could not store at all.
+        let recorded = events::list_for_task(&pool, &task_id).await.unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].task_run_id, None);
+        assert_eq!(recorded[0].task_id, task_id);
     }
 
     #[tokio::test]
-    async fn advance_transitions_through_the_on_map_and_records_history() {
+    async fn advance_transitions_through_the_on_map_and_records_the_trail() {
         let pool = connect_in_memory().await.unwrap();
         let def = human_gate_chain_def();
         let task_id = seed_task(&pool, &def.name).await;
@@ -1251,45 +1350,14 @@ stages:
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "done");
 
-        // Each entry records the hop, not just the stage departed, so a
-        // caller polling `task status` can see why the task moved and when.
-        let history = state.stage_history.as_array().unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0]["stage"], "gate");
-        assert_eq!(history[0]["outcome"], "resumed");
-        assert_eq!(history[0]["to"], "done");
-        assert!(
-            history[0]["at"].as_str().is_some(),
-            "expected an `at` timestamp, got {:?}",
-            history[0]
-        );
-    }
-
-    /// A loop-guard reroute sends the task somewhere other than the
-    /// outcome's mapped target, so `to` must record where it *actually*
-    /// went, not what the `on:` map said.
-    #[tokio::test]
-    async fn stage_history_records_the_rerouted_target_when_a_loop_guard_fires() {
-        let pool = connect_in_memory().await.unwrap();
-        let def = self_loop_guard_def();
-        let task_id = seed_task(&pool, &def.name).await;
-        let engine = engine_with_adapter(pool.clone(), "unused");
-        engine.start_task(&task_id, &def, None).await.unwrap();
-
-        // `self_loop_guard_def` maps `resumed: a` but guards it at max 3,
-        // so the 4th traversal reroutes to "done" instead of back to "a".
-        for _ in 0..4 {
-            engine.advance(&task_id, &def, "resumed").await.unwrap();
-        }
-
-        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
-        assert_eq!(state.current_stage, "done");
-        let history = state.stage_history.as_array().unwrap();
-        let last = history.last().unwrap();
+        // One entry per stage entered, each carrying the outcome that
+        // selected it. `done` is terminal and still gets recorded.
         assert_eq!(
-            last["to"], "done",
-            "`to` must record where the task actually landed after the \
-             guard rerouted it, not the `on:` map's target: {history:?}"
+            stage_trail(&pool, &task_id).await,
+            vec![
+                ("gate".to_string(), Value::Null),
+                ("done".to_string(), json!("resumed")),
+            ]
         );
     }
 
@@ -1560,6 +1628,41 @@ stages:
     }
 
     #[tokio::test]
+    async fn a_loop_guard_reroute_records_the_outcome_that_tripped_the_guard() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = self_loop_guard_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        for _ in 0..4 {
+            engine.advance(&task_id, &def, "resumed").await.unwrap();
+        }
+
+        // Pins the semantics of `outcome` when a `loop_guard` overrides the
+        // destination. The recorded outcome is the one that *triggered* the
+        // transition ("resumed"), not a synthetic name for the guard — even
+        // though on the last hop `on["resumed"]` is `a` while the task
+        // actually landed on the guard's `then` (`done`).
+        //
+        // So a consumer reconstructing the trail against the definition
+        // can't read the final hop off the `on:` map alone; it has to also
+        // consult `loop_guard.then`, which is where the definition already
+        // says that redirect lives. Recording a fabricated outcome instead
+        // would be worse — it would name an `on:` key that doesn't exist.
+        assert_eq!(
+            stage_trail(&pool, &task_id).await,
+            vec![
+                ("a".to_string(), Value::Null),
+                ("a".to_string(), json!("resumed")),
+                ("a".to_string(), json!("resumed")),
+                ("a".to_string(), json!("resumed")),
+                ("done".to_string(), json!("resumed")),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn loop_guard_count_resets_after_rerouting_so_the_loop_can_run_again() {
         let pool = connect_in_memory().await.unwrap();
         let def = coder_reviewer_guard_def();
@@ -1779,8 +1882,20 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
 
         wait_until_stage(&pool, &task_id, "finished").await;
-        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-        assert_eq!(task.status, "closed");
+        // Closing the task happens inside `enter_stage`, after
+        // `current_stage` is already "finished" — so this has to be waited
+        // for, not read once off the back of the stage having changed.
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        // The auto-advance is visible in the trail too, with the outcome the
+        // adapter reported as what carried it into the terminal stage.
+        assert_eq!(
+            stage_trail(&pool, &task_id).await,
+            vec![
+                ("coding".to_string(), Value::Null),
+                ("finished".to_string(), json!("done")),
+            ]
+        );
     }
 
     #[tokio::test]

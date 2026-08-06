@@ -4,12 +4,12 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use chokofactory_core::models::{Task, WorkflowState};
+use chokofactory_core::models::{Event, Task, WorkflowState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{ApiError, AppState};
-use crate::db::{tasks, workflow_state};
+use crate::db::{events, tasks, workflow_state};
 
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
@@ -72,8 +72,26 @@ pub struct TaskDetail {
     #[serde(flatten)]
     pub task: Task,
     pub workflow_state: Option<WorkflowState>,
+    /// Every stage this task has entered, oldest first — the replacement
+    /// for `workflow_state.stage_history`, which X-3 removed in favour of
+    /// the events timeline. Served from here rather than left to the caller
+    /// to filter out of `GET /tasks/:id/events` so `choco task status`
+    /// stays one request and can't show a page-truncated trail.
+    pub stage_trail: Vec<Event>,
 }
 
+/// Three separate reads, deliberately not one transaction: a transition
+/// committing between them can hand back a `current_stage` and a
+/// `stage_trail` that disagree by one hop in either direction, since the
+/// engine updates `workflow_state` and appends the `stage_entered` event as
+/// two writes.
+///
+/// Both skews are harmless *because the renderer never assumes they agree*:
+/// it marks the last trail entry as current only when it actually matches
+/// `current_stage`, and otherwise names the current stage on its own line.
+/// A poll one moment later shows the settled pair. Wrapping this in a
+/// transaction would not fix it either — the engine's own two writes aren't
+/// atomic, so the skew is in the data, not in the read.
 pub async fn get(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -82,9 +100,11 @@ pub async fn get(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;
     let workflow_state = workflow_state::get(&state.pool, &id).await?;
+    let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
     Ok(Json(TaskDetail {
         task,
         workflow_state,
+        stage_trail,
     }))
 }
 

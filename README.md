@@ -98,7 +98,8 @@ Created   2026-08-01 12:33:37 UTC
 ```
 
 Check where it is. `Progress` shows the stages the task has passed
-through, the outcome that caused each hop, and when it happened:
+through, the outcome that caused each hop, and when it happened —
+starting with the stage it began in:
 
 ```
 $ choco task status bb93ada3-...
@@ -107,11 +108,17 @@ Title     ship the thing
 Stage     review
 
 Progress
-  1. gate --[resumed]--> review   2026-08-01 12:33:37 UTC
-  → review (current)
+  1. gate (start)   2026-08-01 12:33:31 UTC
+  2. gate --[resumed]--> review   2026-08-01 12:33:37 UTC   (current)
 ```
 
-A task that hasn't moved yet says so, rather than showing a blank list:
+The trail comes from the task's `stage_entered` events, so the same
+transitions also show up inline in `choco task events` alongside the
+conversation. A task whose history has aged out of retention still gets
+its current stage named on a trailing line.
+
+A task with no recorded transitions at all says so, rather than showing
+a blank list:
 
 ```
 Progress

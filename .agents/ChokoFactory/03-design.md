@@ -128,17 +128,38 @@ SQLite tables (names indicative, not final schema):
   it belongs to). `id, task_id, stage, role, cli_adapter, model,
   session_id (from the CLI), status (active|idle|exited), started_at,
   ended_at`.
-- **`events`**: append-only normalized event log. `id, task_run_id, seq,
-  event_type (assistant_message|tool_call|tool_result|thinking|error|
-  session_meta), payload (json), created_at`. This is what the UI
-  timeline and the 1-year retention job operate on (§4.4).
+- **`events`**: append-only **task timeline** — every entry a task has
+  accumulated, in one totally-ordered log. `id, task_id, task_run_id,
+  event_type, payload (json), created_at`. This is what the UI timeline
+  and the 1-year retention job operate on (§4.4).
+
+  Most entries are normalized from an agent session and name the session
+  they came from. Session attribution is *optional*, though: a
+  `stage_entered` entry (§4.2) describes the task itself and leaves
+  `task_run_id` NULL, because `human_gate` and `terminal` stages never
+  open a session at all — there is no `task_runs` row to point at. Reading
+  a task's timeline therefore filters `events.task_id` directly rather
+  than joining through `task_runs`, which would silently drop exactly
+  those entries.
+
+  Ordering is always `(created_at, id)`, one rule for the whole table.
+  There is no per-session sequence counter: events within a session are
+  appended sequentially by a single drain loop with a full write between
+  them, and `created_at` preserves whatever sub-second precision the
+  platform clock offers (encoded to nanoseconds; ~1 µs granularity as
+  measured on macOS), so a counter
+  bought no ordering safety on the only path it covered. The trade-off
+  taken deliberately is that clients cannot detect a missing entry by
+  spotting a gap.
 - **`workflow_state`**: generic engine bookkeeping per task — current
-  stage name, per-stage loop counters (for `loop_guard`, §5.3), and a
-  stage-history trail. Shape is the same regardless of which workflow
-  definition is driving the task; stage-specific data (e.g. PR URL,
-  last check status) lives in each stage's own `payload` blob within this
-  row rather than as dedicated columns, since new workflow definitions
-  can introduce stage kinds with arbitrary data needs.
+  stage name and per-stage loop counters (for `loop_guard`, §5.3). Shape
+  is the same regardless of which workflow definition is driving the
+  task; stage-specific data (e.g. PR URL, last check status) lives in each
+  stage's own `payload` blob within this row rather than as dedicated
+  columns, since new workflow definitions can introduce stage kinds with
+  arbitrary data needs. The stage trail is *not* here — it is derived by
+  filtering the task's timeline for `stage_entered` entries, which carry a
+  timestamp and the outcome that caused each transition.
 
 ## 4. Agent adapter abstraction
 
@@ -181,17 +202,33 @@ by the Workflow Engine instead of direct user input.
 Shared enum (illustrative):
 
 ```
+Event::HumanMessage { text }
 Event::AssistantMessage { text }
 Event::ToolCall { tool, input }
 Event::ToolResult { tool, output, is_error }
 Event::Thinking { text }
 Event::SessionMeta { session_id }
 Event::Error { message }
+Event::StageEntered { stage, outcome }
 ```
 
 Full stream is stored per Q16 — nothing is summarized away at write time.
 The UI decides how much detail to render (collapsed tool calls by
 default, expandable).
+
+Two of these are not adapter output:
+
+- `HumanMessage` is the human half of a conversation — the prompt a task
+  was created with, or a message relayed into an already-open
+  `agent_turn`. Without it the log recorded only the agent's replies.
+- `StageEntered` is the workflow engine's own record of a stage
+  transition, written at the single choke point every stage kind funnels
+  through (§5.2), so one entry covers a task's entry stage, every
+  subsequent transition, and terminal entry alike. `outcome` is the
+  transition that selected the stage, null for the entry stage. Because
+  it describes the task rather than a session it has no `task_run_id`
+  (§3), and it is what makes a `human_gate`-only workflow observable at
+  all — such a task opens no session and would otherwise emit nothing.
 
 ### 4.3 Idle reaper
 
@@ -208,6 +245,14 @@ safety goal from the rough idea.
 Scheduled job (daily) deletes `events` rows older than 1 year (Q16).
 Runs off `events.created_at`; doesn't touch `tasks`/`task_runs` rows
 themselves, so task history/metadata outlives its detailed transcript.
+
+One consequence of §3's move of the stage trail into `events`: the trail
+is now subject to this job, where `workflow_state.stage_history` was
+permanent. A task closed over a year ago keeps its `task_runs` metadata
+but loses its `stage_entered` entries along with the rest of its
+transcript. If the trail should outlive the transcript, retention needs
+to exempt `event_type = 'stage_entered'` — deliberately not done here,
+just noted so the choice is explicit rather than accidental.
 
 ### 4.5 ACP as a candidate adapter transport (under evaluation)
 

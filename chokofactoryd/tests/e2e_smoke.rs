@@ -24,6 +24,16 @@ impl TempHome {
         std::fs::create_dir_all(&path).unwrap();
         TempHome(path)
     }
+
+    /// Pre-seeds a workflow definition before the daemon starts — safe
+    /// because `seed_builtin_workflows` only ever writes `chat.yaml` when
+    /// absent (`create_new`, never overwrites), so this is untouched by
+    /// startup.
+    fn write_workflow(&self, name: &str, yaml: &str) {
+        let dir = self.0.join(".config/chokofactory/workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
+    }
 }
 
 impl Drop for TempHome {
@@ -77,6 +87,14 @@ struct Daemon {
 
 impl Daemon {
     async fn spawn() -> Self {
+        Self::spawn_with_home(TempHome::new()).await
+    }
+
+    /// Like [`Self::spawn`], but against a home directory the caller has
+    /// already seeded (e.g. with [`TempHome::write_workflow`]) — the
+    /// workflows dir is read at startup, so it has to be populated before
+    /// the process exists.
+    async fn spawn_with_home(home: TempHome) -> Self {
         let daemon_bin = workspace_binary("chokofactoryd");
         let mock_claude_bin = workspace_binary("mock-claude");
         assert!(
@@ -90,7 +108,6 @@ impl Daemon {
              (run `cargo build --workspace --all-targets` first)"
         );
 
-        let home = TempHome::new();
         let port = free_port();
 
         let mut child = Command::new(&daemon_bin)
@@ -163,6 +180,21 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("chokofactoryd did not become ready within 5s");
+}
+
+/// Reads the next WS frame as a parsed event, or `None` on timeout.
+async fn next_event(
+    ws: &mut (
+             impl futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+             + Unpin
+         ),
+) -> Option<Value> {
+    let Ok(Some(Ok(WsMessage::Text(raw)))) =
+        tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+    else {
+        return None;
+    };
+    serde_json::from_str(&raw).ok()
 }
 
 /// Reads WS frames until an `assistant_message` event carrying `text`
@@ -242,4 +274,130 @@ async fn real_binary_serves_a_chat_task_end_to_end_over_http_and_ws() {
         wait_for_echo(&mut ws, "echo:again").await,
         "did not see the follow-up message's echoed reply over the live WS"
     );
+}
+
+/// X-3's headline behavior, against the real binary: a stage transition is
+/// an event on the task's timeline and reaches a live subscriber.
+///
+/// Every stage here is a `human_gate`, so the task opens no agent session
+/// and produces *zero* conversation events for its whole life — the
+/// transitions are the only thing there is to stream. That makes this the
+/// case nothing else can cover by accident: before X-3 a subscriber to this
+/// task would have seen nothing at all, ever, because `events.task_run_id`
+/// was `NOT NULL` and no run exists to attribute a transition to.
+///
+/// `api/ws.rs` asserts the same thing in-process. This one goes through the
+/// spawned daemon, so it also proves the wiring that only exists in
+/// `main.rs`: the single `Arc<Notify>` shared between `SessionManager` and
+/// `WorkflowEngine`. Hand the engine its own `Notify` there and the
+/// in-process test still passes while the shipped daemon goes silent.
+#[tokio::test]
+async fn real_binary_pushes_a_stage_transition_over_ws_with_no_session_involved() {
+    let home = TempHome::new();
+    home.write_workflow(
+        "gated-e2e",
+        r#"
+name: gated-e2e
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: review }
+  review:
+    kind: human_gate
+    on: { approved: done }
+  done:
+    kind: terminal
+"#,
+    );
+    let daemon = Daemon::spawn_with_home(home).await;
+
+    let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    assert_eq!(status, 201);
+    let project_id = project["id"].as_str().unwrap();
+
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project_id,
+                "workflow_def": "gated-e2e",
+                "title": "gated smoke",
+                "prompt": "start",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Let the entry stage's transition land before connecting, so the
+    // backlog is settled rather than racing the socket. Polled over HTTP —
+    // unlike the in-process test there's no pool to look at from here.
+    let mut history = Value::Null;
+    let mut recorded = false;
+    for _ in 0..100 {
+        history = daemon.get(&format!("/tasks/{task_id}/events")).await;
+        if !history["events"].as_array().unwrap().is_empty() {
+            recorded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(recorded, "entry stage was never recorded: {history}");
+
+    // The premise this test rests on: this workflow really is silent apart
+    // from its transitions. If a conversation event ever showed up here,
+    // the WS assertions below could pass for the wrong reason.
+    let events = history["events"].as_array().unwrap();
+    assert!(
+        events.iter().all(|e| e["event_type"] == "stage_entered"),
+        "a human_gate-only task should produce nothing but transitions: {events:?}"
+    );
+
+    let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", daemon.ws_url))
+        .await
+        .expect("failed to open the events websocket");
+
+    // Replayed backlog: the stage the task started in.
+    let backlog = next_event(&mut ws)
+        .await
+        .expect("entry stage transition was not replayed on connect");
+    assert_eq!(backlog["event_type"], "stage_entered");
+    assert_eq!(backlog["payload"]["stage"], "gate");
+    assert_eq!(backlog["payload"]["outcome"], Value::Null);
+    assert_eq!(backlog["task_id"], task_id.as_str());
+    assert_eq!(backlog["task_run_id"], Value::Null);
+
+    // Resume the gate. This advances the workflow without starting any
+    // session, so the engine's own notify for the transition it just
+    // recorded is the only thing that can wake this socket.
+    let (status, _) = daemon
+        .post(
+            &format!("/tasks/{task_id}/messages"),
+            json!({ "text": "go" }),
+        )
+        .await;
+    assert_eq!(status, 202);
+
+    let live = next_event(&mut ws)
+        .await
+        .expect("stage transition was not pushed over the already-open socket");
+    assert_eq!(live["event_type"], "stage_entered");
+    assert_eq!(live["payload"]["stage"], "review");
+    assert_eq!(live["payload"]["outcome"], "resumed");
+    assert_eq!(live["task_id"], task_id.as_str());
+    assert_eq!(live["task_run_id"], Value::Null);
+
+    // The same transition is served by the real binary's `GET /tasks/:id`
+    // as `stage_trail`, so the live and polled views agree.
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    assert_eq!(detail["workflow_state"]["current_stage"], "review");
+    let trail: Vec<&str> = detail["stage_trail"]
+        .as_array()
+        .expect("stage_trail missing from the real binary's task detail")
+        .iter()
+        .map(|e| e["payload"]["stage"].as_str().unwrap())
+        .collect();
+    assert_eq!(trail, vec!["gate", "review"]);
+
+    let _ = ws.close(None).await;
 }

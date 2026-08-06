@@ -211,6 +211,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stage_transition_is_pushed_live_without_any_conversation_event() {
+        let server = TestServer::start().await;
+        // Every stage here is a human_gate, so this task opens no agent
+        // session and produces zero conversation events for its whole life
+        // — the transitions are the only thing there is to stream. Before
+        // X-3 a subscriber would have seen nothing at all.
+        server.write_workflow(
+            "gated-relay",
+            r#"
+name: gated-relay
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: review }
+  review:
+    kind: human_gate
+    on: { approved: done }
+  done:
+    kind: terminal
+"#,
+        );
+        let project: Value = server
+            .post("/projects", json!({ "name": "demo" }))
+            .await
+            .json();
+        let project_id = project["id"].as_str().unwrap();
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "gated-relay",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
+
+        // Wait for the entry stage's transition so the backlog is settled
+        // before connecting, then drain it.
+        for _ in 0..200 {
+            let events = crate::db::events::list_for_task(server.pool(), &task_id)
+                .await
+                .unwrap();
+            if !events.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", server.ws_url))
+            .await
+            .unwrap();
+
+        let Ok(Some(Ok(WsMessage::Text(text)))) =
+            tokio::time::timeout(Duration::from_secs(2), ws.next()).await
+        else {
+            panic!("entry stage transition was not replayed on connect");
+        };
+        let backlog: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(backlog["event_type"], "stage_entered");
+        assert_eq!(backlog["payload"]["stage"], "gate");
+
+        // Resume the gate over HTTP. This advances the workflow without
+        // starting any session, so the only thing that can wake this socket
+        // is the engine's own notify for the transition it just recorded.
+        let response = server
+            .post(
+                &format!("/tasks/{task_id}/messages"),
+                json!({ "text": "go" }),
+            )
+            .await;
+        assert_eq!(response.status(), 202);
+
+        let Ok(Some(Ok(WsMessage::Text(text)))) =
+            tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        else {
+            panic!("stage transition was not pushed over the already-open socket");
+        };
+        let live: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(live["event_type"], "stage_entered");
+        assert_eq!(live["payload"]["stage"], "review");
+        assert_eq!(live["payload"]["outcome"], "resumed");
+        assert_eq!(live["task_run_id"], Value::Null);
+
+        let _ = ws.close(None).await;
+    }
+
+    #[tokio::test]
     async fn connecting_to_a_task_with_no_events_yet_sends_nothing_until_one_arrives() {
         let server = TestServer::start().await;
 

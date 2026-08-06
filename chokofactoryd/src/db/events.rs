@@ -1,17 +1,17 @@
 use chokofactory_core::models::{Event, EventType};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::types::Json;
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-const COLUMNS: &str = "id, task_run_id, seq, event_type, payload, created_at";
+const COLUMNS: &str = "id, task_id, task_run_id, event_type, payload, created_at";
 
 #[derive(FromRow)]
 struct EventRow {
     id: String,
-    task_run_id: String,
-    seq: i64,
+    task_id: String,
+    task_run_id: Option<String>,
     event_type: String,
     payload: Json<Value>,
     created_at: DateTime<Utc>,
@@ -21,8 +21,8 @@ impl From<EventRow> for Event {
     fn from(row: EventRow) -> Self {
         Event {
             id: row.id,
+            task_id: row.task_id,
             task_run_id: row.task_run_id,
-            seq: row.seq,
             event_type: row
                 .event_type
                 .parse()
@@ -33,8 +33,15 @@ impl From<EventRow> for Event {
     }
 }
 
-/// Appends a normalized event, assigning it the next `seq` for its
-/// `task_run_id` (§4.2). The log is append-only: there is no update.
+/// Appends an event produced by an agent session (§4.2). The log is
+/// append-only: there is no update.
+///
+/// `task_id` is denormalized onto every row so the task timeline needs no
+/// join (X-3), and is read here from the run itself rather than taken as a
+/// parameter — callers only ever hold a `task_run_id`, and deriving it
+/// inside the INSERT keeps the two consistent by construction. A
+/// `task_run_id` that doesn't exist therefore selects no row and surfaces
+/// as `RowNotFound` rather than as a foreign-key violation.
 pub async fn append(
     pool: &SqlitePool,
     task_run_id: &str,
@@ -44,17 +51,47 @@ pub async fn append(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, EventRow>(&format!(
-        "INSERT INTO events (id, task_run_id, seq, event_type, payload, created_at)
-         SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?
-         FROM events WHERE task_run_id = ?
+        "INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
+         SELECT ?, tr.task_id, tr.id, ?, ?, ?
+         FROM task_runs tr WHERE tr.id = ?
          RETURNING {COLUMNS}"
     ))
     .bind(id)
-    .bind(task_run_id)
     .bind(event_type.to_string())
     .bind(Json(payload))
     .bind(now)
     .bind(task_run_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.into())
+}
+
+/// Appends a stage-transition entry to a task's timeline (X-3).
+///
+/// Unlike [`append`] this belongs to the task rather than to any agent
+/// session, so `task_run_id` is NULL: `human_gate` and `terminal` stages
+/// never open a session at all, and a task's entry stage is recorded before
+/// one exists. `entered_via` is the transition outcome that selected this
+/// stage — `None` for the entry stage — and is stored under the payload key
+/// `outcome`.
+pub async fn append_stage_transition(
+    pool: &SqlitePool,
+    task_id: &str,
+    stage: &str,
+    entered_via: Option<&str>,
+) -> Result<Event, sqlx::Error> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    let row = sqlx::query_as::<_, EventRow>(&format!(
+        "INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
+         VALUES (?, ?, NULL, ?, ?, ?)
+         RETURNING {COLUMNS}"
+    ))
+    .bind(id)
+    .bind(task_id)
+    .bind(EventType::StageEntered.to_string())
+    .bind(Json(json!({ "stage": stage, "outcome": entered_via })))
+    .bind(now)
     .fetch_one(pool)
     .await?;
     Ok(row.into())
@@ -73,7 +110,7 @@ pub async fn list_for_task_run(
     task_run_id: &str,
 ) -> Result<Vec<Event>, sqlx::Error> {
     let rows = sqlx::query_as::<_, EventRow>(&format!(
-        "SELECT {COLUMNS} FROM events WHERE task_run_id = ? ORDER BY seq"
+        "SELECT {COLUMNS} FROM events WHERE task_run_id = ? ORDER BY created_at, id"
     ))
     .bind(task_run_id)
     .fetch_all(pool)
@@ -81,23 +118,48 @@ pub async fn list_for_task_run(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
-/// Every event across all of `task_id`'s `task_runs`, oldest first (P1-9).
-/// `events` has no `task_id` column of its own — a task can span multiple
-/// `task_runs` over its lifetime (idle/resume cycles, §4.1) — so this joins
-/// through `task_runs.task_id`. `seq` is only unique per `task_run_id`
-/// (`UNIQUE(task_run_id, seq)`), not a total order across runs, so ordering
-/// here is `created_at, id` instead — the same tie-break shape already used
-/// by `task_runs::get_current_for_stage`'s `ORDER BY started_at DESC, id
-/// DESC` for the same "chrono column plus a deterministic tie-break" need.
+/// A task's whole timeline, oldest first (P1-9) — every session's events
+/// interleaved with the task's own `stage_entered` entries.
+///
+/// Filters `events.task_id` directly. This used to join through
+/// `task_runs.task_id`, which is no longer merely slower but *wrong*: a
+/// stage transition has no `task_run_id` (X-3) and would be dropped by the
+/// join. Ordering is `created_at, id` — the same "chrono column plus a
+/// deterministic tie-break" shape already used by
+/// `task_runs::get_current_for_stage`'s `ORDER BY started_at DESC, id DESC`.
 pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<Event>, sqlx::Error> {
-    let prefixed_columns = prefix_columns();
     let rows = sqlx::query_as::<_, EventRow>(&format!(
-        "SELECT {prefixed_columns} FROM events e
-         JOIN task_runs tr ON tr.id = e.task_run_id
-         WHERE tr.task_id = ?
-         ORDER BY e.created_at, e.id"
+        "SELECT {COLUMNS} FROM events
+         WHERE task_id = ?
+         ORDER BY created_at, id"
     ))
     .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Just the `stage_entered` slice of [`list_for_task`], same order — the
+/// task's stage trail.
+///
+/// This is what `workflow_state.stage_history` used to hold before X-3, and
+/// it exists as its own query so `GET /tasks/:id` can keep serving the trail
+/// in one round trip. Filtering the paginated events endpoint client-side
+/// would not do: on a task with a real coding transcript the tool events
+/// dominate, so the stage entries fall past the first page and the trail
+/// would silently render truncated.
+///
+/// Served by `idx_events_task_id_created_at`; unbounded in principle, but
+/// `stage_history` grew the same way and this version is at least aged out
+/// by retention.
+pub async fn list_stage_trail(pool: &SqlitePool, task_id: &str) -> Result<Vec<Event>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, EventRow>(&format!(
+        "SELECT {COLUMNS} FROM events
+         WHERE task_id = ? AND event_type = ?
+         ORDER BY created_at, id"
+    ))
+    .bind(task_id)
+    .bind(EventType::StageEntered.to_string())
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
@@ -111,23 +173,19 @@ pub async fn list_for_task_after(
     task_id: &str,
     cursor: Option<&(DateTime<Utc>, String)>,
 ) -> Result<Vec<Event>, sqlx::Error> {
-    let prefixed_columns = prefix_columns();
-    let mut query = sqlx::QueryBuilder::new(format!(
-        "SELECT {prefixed_columns} FROM events e
-         JOIN task_runs tr ON tr.id = e.task_run_id
-         WHERE tr.task_id = "
-    ));
+    let mut query =
+        sqlx::QueryBuilder::new(format!("SELECT {COLUMNS} FROM events WHERE task_id = "));
     query.push_bind(task_id);
     if let Some((created_at, id)) = cursor {
-        query.push(" AND (e.created_at > ");
+        query.push(" AND (created_at > ");
         query.push_bind(*created_at);
-        query.push(" OR (e.created_at = ");
+        query.push(" OR (created_at = ");
         query.push_bind(*created_at);
-        query.push(" AND e.id > ");
+        query.push(" AND id > ");
         query.push_bind(id.clone());
         query.push("))");
     }
-    query.push(" ORDER BY e.created_at, e.id");
+    query.push(" ORDER BY created_at, id");
 
     let rows = query.build_query_as::<EventRow>().fetch_all(pool).await?;
     Ok(rows.into_iter().map(Into::into).collect())
@@ -143,37 +201,23 @@ pub async fn list_for_task_page(
     cursor: Option<&(DateTime<Utc>, String)>,
     limit: i64,
 ) -> Result<Vec<Event>, sqlx::Error> {
-    let prefixed_columns = prefix_columns();
-    let mut query = sqlx::QueryBuilder::new(format!(
-        "SELECT {prefixed_columns} FROM events e
-         JOIN task_runs tr ON tr.id = e.task_run_id
-         WHERE tr.task_id = "
-    ));
+    let mut query =
+        sqlx::QueryBuilder::new(format!("SELECT {COLUMNS} FROM events WHERE task_id = "));
     query.push_bind(task_id);
     if let Some((created_at, id)) = cursor {
-        query.push(" AND (e.created_at > ");
+        query.push(" AND (created_at > ");
         query.push_bind(*created_at);
-        query.push(" OR (e.created_at = ");
+        query.push(" OR (created_at = ");
         query.push_bind(*created_at);
-        query.push(" AND e.id > ");
+        query.push(" AND id > ");
         query.push_bind(id.clone());
         query.push("))");
     }
-    query.push(" ORDER BY e.created_at, e.id LIMIT ");
+    query.push(" ORDER BY created_at, id LIMIT ");
     query.push_bind(limit);
 
     let rows = query.build_query_as::<EventRow>().fetch_all(pool).await?;
     Ok(rows.into_iter().map(Into::into).collect())
-}
-
-/// `COLUMNS`, but each column prefixed with `e.` so it's unambiguous once
-/// joined against `task_runs` (which also has an `id` column).
-fn prefix_columns() -> String {
-    COLUMNS
-        .split(", ")
-        .map(|col| format!("e.{col}"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Prunes events older than `cutoff`, returning the number of rows removed.
@@ -227,9 +271,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_assigns_increasing_seq() {
+    async fn append_derives_the_owning_task_from_the_run() {
         let pool = connect_in_memory().await.unwrap();
         let task_run_id = seed_task_run(&pool).await;
+        let owning_task = task_runs::get(&pool, &task_run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id;
 
         let e1 = append(
             &pool,
@@ -239,41 +288,212 @@ mod tests {
         )
         .await
         .unwrap();
-        let e2 = append(
-            &pool,
-            &task_run_id,
-            EventType::ToolCall,
-            json!({"tool": "bash"}),
-        )
-        .await
-        .unwrap();
 
-        assert_eq!(e1.seq, 1);
-        assert_eq!(e2.seq, 2);
         assert!(!e1.id.is_empty());
+        assert_eq!(e1.task_run_id.as_deref(), Some(task_run_id.as_str()));
+        // Callers only pass a run; the task is resolved inside the INSERT.
+        assert_eq!(e1.task_id, owning_task);
 
         let fetched = get(&pool, &e1.id).await.unwrap().unwrap();
+        assert_eq!(fetched, e1);
         assert_eq!(fetched.event_type, EventType::AssistantMessage);
-
-        let all = list_for_task_run(&pool, &task_run_id).await.unwrap();
-        assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[tokio::test]
-    async fn seq_is_scoped_per_task_run() {
+    async fn append_against_an_unknown_run_is_an_error_not_an_orphan_row() {
         let pool = connect_in_memory().await.unwrap();
-        let run_a = seed_task_run(&pool).await;
-        let run_b = seed_task_run(&pool).await;
 
-        let a1 = append(&pool, &run_a, EventType::Thinking, json!({}))
+        // The task_id is derived by selecting the run, so a missing run
+        // selects nothing and inserts nothing (rather than writing a row
+        // with a dangling reference).
+        let err = append(&pool, "no-such-run", EventType::Error, json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, sqlx::Error::RowNotFound), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn stage_transitions_are_task_scoped_and_carry_stage_and_outcome() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        // An entry stage: nothing transitioned into it, so no outcome.
+        let entry = append_stage_transition(&pool, &task_id, "coding", None)
             .await
             .unwrap();
-        let b1 = append(&pool, &run_b, EventType::Thinking, json!({}))
+        assert_eq!(entry.event_type, EventType::StageEntered);
+        assert_eq!(entry.task_id, task_id);
+        // The point of the change: no session is involved, and none needed
+        // to exist for this to be recorded.
+        assert_eq!(entry.task_run_id, None);
+        assert_eq!(entry.payload["stage"], "coding");
+        assert_eq!(entry.payload["outcome"], Value::Null);
+
+        let next = append_stage_transition(&pool, &task_id, "review", Some("approved"))
+            .await
+            .unwrap();
+        assert_eq!(next.payload["stage"], "review");
+        assert_eq!(next.payload["outcome"], "approved");
+
+        // Reachable from the task timeline without any task_run existing.
+        let timeline = list_for_task(&pool, &task_id).await.unwrap();
+        assert_eq!(
+            timeline.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![entry.id, next.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_transitions_interleave_with_session_events_in_one_timeline() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        let entered = append_stage_transition(&pool, &task_id, "chatting", None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let run = seed_task_run_for_task(&pool, &task_id, "chatting").await;
+        let said = append(&pool, &run, EventType::AssistantMessage, json!({"n": 1}))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let advanced = append_stage_transition(&pool, &task_id, "done", Some("finished"))
             .await
             .unwrap();
 
-        assert_eq!(a1.seq, 1);
-        assert_eq!(b1.seq, 1);
+        // Both kinds sort into one `(created_at, id)` order, and the
+        // session-scoped row still resolves to the same task.
+        let timeline = list_for_task(&pool, &task_id).await.unwrap();
+        assert_eq!(
+            timeline.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![entered.id.clone(), said.id.clone(), advanced.id.clone()]
+        );
+        assert_eq!(said.task_id, task_id);
+
+        // The cursor-based readers behave identically for both kinds.
+        let cursor = (entered.created_at, entered.id.clone());
+        let after = list_for_task_after(&pool, &task_id, Some(&cursor))
+            .await
+            .unwrap();
+        assert_eq!(
+            after.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            vec![said.id, advanced.id.clone()]
+        );
+
+        // A session's own slice excludes the task-level entries.
+        let run_only = list_for_task_run(&pool, &run).await.unwrap();
+        assert_eq!(run_only.len(), 1);
+        assert_eq!(run_only[0].event_type, EventType::AssistantMessage);
+
+        // ...and the trail is the mirror image: the stage entries only, in
+        // the same order, with the conversation filtered out. This is what
+        // `GET /tasks/:id` serves as `stage_trail`, so a conversation event
+        // leaking in would show up as a phantom hop in `choco task status`.
+        let trail = list_stage_trail(&pool, &task_id).await.unwrap();
+        assert_eq!(
+            trail
+                .iter()
+                .map(|e| (e.id.clone(), e.payload["stage"].clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (entered.id.clone(), json!("chatting")),
+                (advanced.id.clone(), json!("done")),
+            ]
+        );
+    }
+
+    /// The trail is scoped to one task. A second task's transitions sharing
+    /// the same `events` table must not bleed into it — that would render
+    /// as another task's stages in this one's `choco task status`.
+    #[tokio::test]
+    async fn the_stage_trail_of_one_task_excludes_another_tasks_transitions() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let new_task = |title: &'static str| tasks::NewTask {
+            project_id: &project_id,
+            parent_task_id: None,
+            workflow_def: "chat",
+            title,
+            config: json!({}),
+        };
+        let first = tasks::create(&pool, new_task("A")).await.unwrap().id;
+        let second = tasks::create(&pool, new_task("B")).await.unwrap().id;
+
+        append_stage_transition(&pool, &first, "coding", None)
+            .await
+            .unwrap();
+        append_stage_transition(&pool, &second, "triage", None)
+            .await
+            .unwrap();
+        append_stage_transition(&pool, &first, "review", Some("approved"))
+            .await
+            .unwrap();
+
+        let trail = list_stage_trail(&pool, &first).await.unwrap();
+        assert_eq!(
+            trail
+                .iter()
+                .map(|e| e.payload["stage"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("coding"), json!("review")]
+        );
+        assert!(trail.iter().all(|e| e.task_id == first));
+    }
+
+    /// A task with no transitions recorded — every task that ran before X-3
+    /// — gets an empty trail rather than an error or someone else's rows.
+    #[tokio::test]
+    async fn the_stage_trail_of_a_task_with_no_transitions_is_empty() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        // A session event exists, so "empty" is the filter working, not the
+        // task simply having no events at all.
+        let run = seed_task_run_for_task(&pool, &task_id, "chatting").await;
+        append(&pool, &run, EventType::AssistantMessage, json!({"n": 1}))
+            .await
+            .unwrap();
+
+        assert!(list_stage_trail(&pool, &task_id).await.unwrap().is_empty());
     }
 
     async fn seed_task_run_for_task(pool: &SqlitePool, task_id: &str, stage: &str) -> String {
@@ -310,9 +530,10 @@ mod tests {
         .unwrap()
         .id;
 
-        // Two task_runs under the same task (an idle/resume cycle, §4.1) —
-        // each has its own seq starting at 1, so a naive per-run cursor
-        // can't tell these apart; only the join on task_id can.
+        // Two task_runs under the same task (an idle/resume cycle, §4.1),
+        // with a third event going back to the *first* run — so a reader
+        // that walked runs in order would emit these out of sequence.
+        // Only one `task_id`-scoped `(created_at, id)` order gets it right.
         let run_a = seed_task_run_for_task(&pool, &task_id, "chatting").await;
         let e1 = append(&pool, &run_a, EventType::AssistantMessage, json!({"n": 1}))
             .await

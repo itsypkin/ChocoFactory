@@ -156,6 +156,14 @@ pub enum EventType {
     Thinking,
     Error,
     SessionMeta,
+    /// The task entered a workflow stage (X-3). Unlike every other variant
+    /// this describes the *task*, not an agent session — `human_gate` and
+    /// `terminal` stages never open one — so its `Event` has no
+    /// `task_run_id`. Payload is `{"stage", "outcome"}`, where `outcome` is
+    /// the transition that selected this stage and is null for the entry
+    /// stage. Filtering a task's timeline for these replaces the former
+    /// `workflow_state.stage_history` column.
+    StageEntered,
 }
 
 impl fmt::Display for EventType {
@@ -168,6 +176,7 @@ impl fmt::Display for EventType {
             EventType::Thinking => "thinking",
             EventType::Error => "error",
             EventType::SessionMeta => "session_meta",
+            EventType::StageEntered => "stage_entered",
         })
     }
 }
@@ -195,17 +204,25 @@ impl FromStr for EventType {
             "thinking" => Ok(EventType::Thinking),
             "error" => Ok(EventType::Error),
             "session_meta" => Ok(EventType::SessionMeta),
+            "stage_entered" => Ok(EventType::StageEntered),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
 }
 
-/// Append-only normalized event log row (§3, §4.2).
+/// Append-only entry in a task's timeline (§3, §4.2).
+///
+/// Most entries are normalized from an agent session's output and name the
+/// session they came from; a `StageEntered` entry belongs to the task
+/// itself and leaves `task_run_id` `None`. Ordering across a task is always
+/// `(created_at, id)` — there is no per-session sequence counter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,
-    pub task_run_id: String,
-    pub seq: i64,
+    pub task_id: String,
+    /// The agent session this entry came from, or `None` when it describes
+    /// the task rather than a session (see [`EventType::StageEntered`]).
+    pub task_run_id: Option<String>,
     pub event_type: EventType,
     pub payload: Value,
     pub created_at: DateTime<Utc>,
@@ -218,8 +235,6 @@ pub struct WorkflowState {
     pub current_stage: String,
     /// JSON object mapping stage name -> loop count (§5.3).
     pub loop_counters: Value,
-    /// JSON array trail of past stage transitions.
-    pub stage_history: Value,
     /// Stage-specific data (e.g. PR URL, last check status) owned by
     /// whichever stage kind is currently active.
     pub payload: Value,
@@ -275,6 +290,7 @@ mod tests {
             EventType::Thinking,
             EventType::Error,
             EventType::SessionMeta,
+            EventType::StageEntered,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),

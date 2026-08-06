@@ -366,7 +366,7 @@ async fn drain_session(
                         }
                         match events::append(pool, task_run_id, event.event_type(), event.payload()).await {
                             Ok(event) => {
-                                tracing::debug!(task_run_id, seq = event.seq, event_type = %event.event_type, "appended event");
+                                tracing::debug!(task_run_id, event_type = %event.event_type, "appended event");
                                 events_notify.notify_waiters();
                             }
                             Err(err) => tracing::error!(task_run_id, %err, "failed to append event"),

@@ -159,8 +159,16 @@ pub fn task_detail(detail: &Value) -> String {
     let mut out = fields(&pairs);
 
     if let Some(state) = state.filter(|s| !s.is_null()) {
+        // The trail is a sibling of `workflow_state`, not a field inside
+        // it: X-3 moved it out of `stage_history` and into the events
+        // timeline, which the daemon re-exposes here as `stage_trail`.
+        let trail = detail
+            .get("stage_trail")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         out.push_str("\n\nProgress\n");
-        out.push_str(&stage_progress(state, current));
+        out.push_str(&stage_progress(trail, current));
 
         let counters = state.get("loop_counters");
         if let Some(counters) = counters
@@ -182,45 +190,84 @@ pub fn task_detail(detail: &Value) -> String {
 
 /// The stage trail as a timeline, ending at the current stage.
 ///
-/// Entries are objects (`{stage, outcome, to, at}`) as of the engine change
-/// that records why and when each hop happened; entries written before that
-/// are bare stage-name strings, and both shapes can coexist in one array,
-/// so each is rendered for what it is rather than assumed.
-fn stage_progress(state: &Value, current: Option<&str>) -> String {
-    let history = state
-        .get("stage_history")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+/// Entries are `stage_entered` events (X-3), so each names a stage the task
+/// *entered* and the outcome that selected it — the previous
+/// `stage_history` shape named the stage it *departed* and where it was
+/// headed. The hop arrow is reconstructed by pairing each entry with its
+/// predecessor, which reads the same as before while gaining the entry
+/// stage: `stage_history` only ever appended on the way out, so the stage a
+/// task started in was never in the trail at all.
+///
+/// A task that ran before X-3 has no `stage_entered` events and no
+/// backfill, so its trail is legitimately empty and renders as "no
+/// transitions yet" rather than being reconstructed from data that isn't
+/// there.
+fn stage_progress(trail: &[Value], current: Option<&str>) -> String {
+    let stage_of = |entry: &Value| {
+        entry
+            .get("payload")
+            .and_then(|p| p.get("stage"))
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
 
     let mut lines = Vec::new();
-    for (i, entry) in history.iter().enumerate() {
+    for (i, entry) in trail.iter().enumerate() {
         let step = i + 1;
-        match entry {
-            Value::String(stage) => lines.push(format!("  {step}. {stage}")),
-            Value::Object(_) => {
-                let field = |key: &str| entry.get(key).and_then(Value::as_str);
-                let stage = field("stage").unwrap_or("?");
-                let to = field("to").unwrap_or("?");
-                let outcome = field("outcome").unwrap_or("?");
-                let at = field("at").map(timestamp_str).unwrap_or_default();
-                let at = if at.is_empty() {
-                    String::new()
-                } else {
-                    format!("   {at}")
-                };
-                lines.push(format!("  {step}. {stage} --[{outcome}]--> {to}{at}"));
+        let stage = stage_of(entry);
+        let at = entry
+            .get("created_at")
+            .and_then(Value::as_str)
+            .map(timestamp_str)
+            .map(|at| format!("   {at}"))
+            .unwrap_or_default();
+
+        // A null `outcome` — not a missing predecessor — is what marks a
+        // starting point: the engine writes `entered_via: None` only for a
+        // stage nothing transitioned into. Keying on the predecessor
+        // instead would label the *first surviving* entry "(start)" on a
+        // trail whose head has been truncated, inventing a beginning that
+        // never happened and discarding the recorded outcome with it.
+        // Retention prunes `stage_entered` rows like any other event, and
+        // the entry-stage append is best-effort, so a trail that opens
+        // mid-flight is reachable, not hypothetical.
+        let hop = match (
+            entry
+                .get("payload")
+                .and_then(|p| p.get("outcome"))
+                .and_then(Value::as_str),
+            i.checked_sub(1).and_then(|p| trail.get(p)),
+        ) {
+            (Some(outcome), Some(previous)) => {
+                format!("{} --[{outcome}]--> {stage}", stage_of(previous))
             }
-            other => lines.push(format!("  {step}. {other}")),
-        }
+            // Something carried the task here, but whatever it departed is
+            // no longer on record — say so rather than guessing or dropping
+            // the outcome.
+            (Some(outcome), None) => format!("… --[{outcome}]--> {stage}"),
+            (None, _) => format!("{stage} (start)"),
+        };
+        lines.push(format!("  {step}. {hop}{at}"));
     }
 
     match current {
         Some(current) if lines.is_empty() => {
             format!("  → {current} (current, no transitions yet)")
         }
+        // The last entry *is* the current stage — `enter_stage` records on
+        // entry — so this marks it in place rather than repeating it on a
+        // trailing arrow line. It's still worth stating: a mismatch means
+        // the trail was truncated by retention, and silently rendering a
+        // stale last hop as "where the task is" would be a lie.
         Some(current) => {
-            lines.push(format!("  → {current} (current)"));
+            if let Some(last) = lines.last_mut()
+                && trail.last().map(stage_of).as_deref() == Some(current)
+            {
+                last.push_str("   (current)");
+            } else {
+                lines.push(format!("  → {current} (current)"));
+            }
             lines.join("\n")
         }
         None if lines.is_empty() => "  (none)".to_string(),
@@ -271,6 +318,16 @@ fn event_summary(event: &Event) -> String {
     let payload = &event.payload;
 
     match event.event_type {
+        // `{stage, outcome}` has no "text"-ish field for the fallback below
+        // to find, so without this arm the timeline would show a raw JSON
+        // object for every stage transition.
+        EventType::StageEntered => {
+            let stage = payload.get("stage").and_then(Value::as_str).unwrap_or("?");
+            match payload.get("outcome").and_then(Value::as_str) {
+                Some(outcome) => format!("{stage}  (via {outcome})"),
+                None => stage.to_string(),
+            }
+        }
         EventType::ToolCall => {
             let tool = payload.get("tool").and_then(Value::as_str).unwrap_or("?");
             match payload.get("input") {
@@ -349,47 +406,129 @@ mod tests {
 
     use super::*;
 
+    /// One `stage_entered` event per entry, shaped as the daemon serializes
+    /// them, with the hop arrow reconstructed from consecutive entries.
+    fn stage_entry(stage: &str, outcome: Value, at: &str) -> Value {
+        json!({
+            "id": format!("e-{stage}-{at}"),
+            "task_id": "t1",
+            "task_run_id": Value::Null,
+            "event_type": "stage_entered",
+            "payload": {"stage": stage, "outcome": outcome},
+            "created_at": at,
+        })
+    }
+
     #[test]
-    fn stage_progress_renders_the_new_object_entries_with_outcome_and_target() {
-        let state = json!({
-            "current_stage": "review",
-            "stage_history": [
-                {"stage": "gate", "outcome": "resumed", "to": "review",
-                 "at": "2026-08-01T11:58:18.972857783Z"}
-            ],
-        });
-        let rendered = stage_progress(&state, Some("review"));
+    fn stage_progress_reconstructs_each_hop_from_consecutive_entries() {
+        let trail = [
+            stage_entry("gate", Value::Null, "2026-08-01T11:58:00Z"),
+            stage_entry("review", json!("resumed"), "2026-08-01T11:58:18.972857783Z"),
+        ];
+        let rendered = stage_progress(&trail, Some("review"));
         assert!(
             rendered.contains("gate --[resumed]--> review"),
             "{rendered}"
         );
         assert!(rendered.contains("2026-08-01 11:58:18 UTC"), "{rendered}");
-        assert!(rendered.contains("→ review (current)"), "{rendered}");
+        // The last entry *is* the current stage, so it's marked in place
+        // rather than repeated on a trailing arrow line.
+        assert!(rendered.contains("(current)"), "{rendered}");
+        assert!(!rendered.contains("→ review"), "duplicated: {rendered}");
     }
 
-    /// Entries written before the engine started recording outcomes are
-    /// bare strings; they must still render rather than showing "?" noise
-    /// or being dropped.
+    /// The stage a task *starts* in was never in `stage_history`, which only
+    /// appended on the way out. It has no predecessor and no outcome, so it
+    /// must render as a starting point rather than an arrow from "?".
     #[test]
-    fn stage_progress_still_renders_legacy_string_entries() {
-        let state = json!({
-            "current_stage": "done",
-            "stage_history": ["gate", {"stage": "review", "outcome": "approved",
-                                       "to": "done", "at": "2026-08-01T12:00:00Z"}],
-        });
-        let rendered = stage_progress(&state, Some("done"));
-        assert!(rendered.contains("1. gate"), "{rendered}");
+    fn stage_progress_shows_the_entry_stage_that_stage_history_never_had() {
+        let trail = [stage_entry("chatting", Value::Null, "2026-08-01T11:58:00Z")];
+        let rendered = stage_progress(&trail, Some("chatting"));
+        assert!(rendered.contains("1. chatting (start)"), "{rendered}");
         assert!(
-            rendered.contains("2. review --[approved]--> done"),
+            !rendered.contains("?"),
+            "no phantom predecessor: {rendered}"
+        );
+    }
+
+    /// The other end of the same truncation. Retention prunes
+    /// `stage_entered` rows like any other event, so the first *surviving*
+    /// entry can be one the task was transitioned into. Labelling it
+    /// "(start)" would assert a beginning that never happened and throw
+    /// away the recorded outcome, so the outcome — not the presence of a
+    /// predecessor — decides.
+    #[test]
+    fn stage_progress_does_not_claim_a_truncated_trail_head_is_the_start() {
+        let trail = [
+            stage_entry("review", json!("changes_requested"), "2026-08-01T11:58:00Z"),
+            stage_entry("gate", json!("rejected"), "2026-08-01T11:59:00Z"),
+        ];
+        let rendered = stage_progress(&trail, Some("gate"));
+        assert!(
+            !rendered.contains("(start)"),
+            "nothing here started the task: {rendered}"
+        );
+        assert!(
+            rendered.contains("changes_requested"),
+            "the outcome that carried it here was dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("… --[changes_requested]--> review"),
+            "{rendered}"
+        );
+        // The hop that *does* have its predecessor still renders normally.
+        assert!(
+            rendered.contains("review --[rejected]--> gate"),
             "{rendered}"
         );
     }
 
+    /// Retention ages events out, so a long-lived task's trail can lose its
+    /// head. Rendering the surviving last hop as "where the task is" would
+    /// be a lie whenever it disagrees with `current_stage`.
+    #[test]
+    fn stage_progress_still_names_the_current_stage_when_the_trail_is_stale() {
+        let trail = [stage_entry("gate", Value::Null, "2026-08-01T11:58:00Z")];
+        let rendered = stage_progress(&trail, Some("done"));
+        assert!(rendered.contains("→ done (current)"), "{rendered}");
+    }
+
+    /// A task that ran before X-3 has no `stage_entered` events and no
+    /// backfill, so an absent trail must read as "nothing recorded" rather
+    /// than being invented.
     #[test]
     fn stage_progress_reports_a_task_that_has_not_transitioned_yet() {
-        let state = json!({"current_stage": "chatting", "stage_history": []});
-        let rendered = stage_progress(&state, Some("chatting"));
+        let rendered = stage_progress(&[], Some("chatting"));
         assert!(rendered.contains("no transitions yet"), "{rendered}");
+    }
+
+    /// The trail is a sibling of `workflow_state`, not a field inside it —
+    /// reading it from the wrong place would silently render every task as
+    /// having no history at all.
+    #[test]
+    fn task_detail_reads_the_trail_from_the_top_level_not_from_workflow_state() {
+        let detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": {
+                "task_id": "t1", "current_stage": "review",
+                "loop_counters": {}, "payload": {},
+                "updated_at": "2026-08-01T12:00:00Z",
+            },
+            "stage_trail": [
+                stage_entry("gate", Value::Null, "2026-08-01T11:58:00Z"),
+                stage_entry("review", json!("resumed"), "2026-08-01T11:58:18Z"),
+            ],
+        });
+        let rendered = task_detail(&detail);
+        assert!(
+            rendered.contains("gate --[resumed]--> review"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("no transitions yet"),
+            "trail was not found: {rendered}"
+        );
     }
 
     #[test]
@@ -407,8 +546,8 @@ mod tests {
     fn event(event_type: EventType, payload: Value) -> Event {
         Event {
             id: "e1".to_string(),
-            task_run_id: "r1".to_string(),
-            seq: 1,
+            task_id: "t1".to_string(),
+            task_run_id: Some("r1".to_string()),
             event_type,
             payload,
             created_at: Utc::now(),
@@ -440,6 +579,18 @@ mod tests {
                 "abc-123",
             ),
             (EventType::Error, json!({"message": "boom"}), "boom"),
+            // A stage transition carries neither text nor a session, so
+            // without its own arm it would render as raw JSON.
+            (
+                EventType::StageEntered,
+                json!({"stage": "review", "outcome": "approved"}),
+                "review  (via approved)",
+            ),
+            (
+                EventType::StageEntered,
+                json!({"stage": "gate", "outcome": null}),
+                "gate",
+            ),
         ];
         for (event_type, payload, expected) in cases {
             assert_eq!(event_summary(&event(event_type, payload)), expected);

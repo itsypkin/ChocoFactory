@@ -94,6 +94,11 @@ mod tests {
             vec![EventType::SessionMeta, EventType::AssistantMessage]
         );
         assert_eq!(stored[1].payload["text"], "echo:hello");
-        assert_eq!(stored.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        // Both rows resolve back to the run they were captured from.
+        assert!(
+            stored
+                .iter()
+                .all(|e| e.task_run_id.as_deref() == Some(task_run_id.as_str()))
+        );
     }
 }

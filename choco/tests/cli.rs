@@ -758,11 +758,20 @@ stages:
     .json();
     let task_id = task["id"].as_str().unwrap().to_string();
 
-    // Before any transition, the view says so rather than showing a blank.
-    let fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    // Before any transition the trail already has the stage the task
+    // started in — `stage_history` never recorded that, because it only
+    // appended on the way *out* of a stage (X-3).
+    let mut fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    for _ in 0..100 {
+        if fresh.stdout.contains("gate (start)") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    }
     assert!(
-        fresh.stdout.contains("no transitions yet"),
-        "{:?}",
+        fresh.stdout.contains("1. gate (start)"),
+        "expected the entry stage in the trail: {:?}",
         fresh.stdout
     );
 
@@ -774,30 +783,69 @@ stages:
     .await;
     assert_eq!(sent.code, Some(0), "stderr: {}", sent.stderr);
 
-    let status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    // `task send` is accepted with a 202 and the transition runs behind it,
+    // so poll for the hop rather than assuming it has already landed.
+    //
+    // The break condition is deliberately *identical* to the assertion
+    // below, not a weaker proxy for it: `GET /tasks/:id` reads
+    // `workflow_state` before `stage_trail`, so a response can pair
+    // `current_stage == "gate"` with a trail already ending at `review`
+    // (the skew documented at `api/tasks.rs`). That renders the hop line
+    // without `(current)` — enough to satisfy a break keyed on the hop
+    // alone, and then fail the assertion. Polling for exactly what's
+    // asserted costs one extra poll instead.
+    let settled = |out: &str| {
+        out.lines()
+            .any(|l| l.contains("gate --[resumed]--> review") && l.contains("(current)"))
+    };
+    let mut status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    for _ in 0..100 {
+        if settled(&status.stdout) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    }
     assert_eq!(status.code, Some(0), "stderr: {}", status.stderr);
+    // The stage the task entered is the last trail entry, so it's marked in
+    // place instead of repeated on a trailing `→` line. Asserted against
+    // the whole line, not a bare "(current)": the duplicate-line regression
+    // this guards against would still contain that substring.
     assert!(
-        status.stdout.contains("gate --[resumed]--> review"),
-        "expected the hop with its outcome: {:?}",
+        settled(&status.stdout),
+        "expected the hop with its outcome, marked current on the same line: {:?}",
         status.stdout
     );
     assert!(
-        status.stdout.contains("→ review (current)"),
-        "expected the current stage marked: {:?}",
+        !status.stdout.contains("→ review"),
+        "the current stage should not also get a trailing arrow line: {:?}",
         status.stdout
     );
 
     // The same data is present structurally under --json, with a real
-    // timestamp — the CLI renders it, the daemon records it.
+    // timestamp — the CLI renders it, the daemon records it. It arrives as
+    // `stage_trail` alongside `workflow_state`, one `stage_entered` event
+    // per stage entered, rather than as the departed-stage edges the old
+    // `workflow_state.stage_history` held.
     let detail = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
         .await
         .json();
-    let history = detail["workflow_state"]["stage_history"]
-        .as_array()
-        .unwrap();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0]["stage"], "gate");
-    assert_eq!(history[0]["outcome"], "resumed");
-    assert_eq!(history[0]["to"], "review");
-    assert!(history[0]["at"].is_string(), "{history:?}");
+    assert!(
+        detail["workflow_state"]["stage_history"].is_null(),
+        "stage_history should be gone: {detail}"
+    );
+    let trail = detail["stage_trail"].as_array().unwrap();
+    assert_eq!(trail.len(), 2, "{trail:?}");
+    assert_eq!(trail[0]["payload"]["stage"], "gate");
+    assert_eq!(trail[0]["payload"]["outcome"], serde_json::Value::Null);
+    assert_eq!(trail[1]["payload"]["stage"], "review");
+    assert_eq!(trail[1]["payload"]["outcome"], "resumed");
+    // Task-scoped, not session-scoped: `gate` is a human_gate and opens no
+    // agent session at all, which the pre-X-3 schema could not represent.
+    for entry in trail {
+        assert_eq!(entry["event_type"], "stage_entered");
+        assert_eq!(entry["task_id"], task_id.as_str());
+        assert!(entry["created_at"].is_string(), "{entry}");
+    }
+    assert_eq!(trail[0]["task_run_id"], serde_json::Value::Null);
 }

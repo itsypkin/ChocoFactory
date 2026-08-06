@@ -4,14 +4,13 @@ use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{FromRow, SqlitePool};
 
-const COLUMNS: &str = "task_id, current_stage, loop_counters, stage_history, payload, updated_at";
+const COLUMNS: &str = "task_id, current_stage, loop_counters, payload, updated_at";
 
 #[derive(FromRow)]
 struct WorkflowStateRow {
     task_id: String,
     current_stage: String,
     loop_counters: Json<Value>,
-    stage_history: Json<Value>,
     payload: Json<Value>,
     updated_at: DateTime<Utc>,
 }
@@ -22,7 +21,6 @@ impl From<WorkflowStateRow> for WorkflowState {
             task_id: row.task_id,
             current_stage: row.current_stage,
             loop_counters: row.loop_counters.0,
-            stage_history: row.stage_history.0,
             payload: row.payload.0,
             updated_at: row.updated_at,
         }
@@ -30,7 +28,8 @@ impl From<WorkflowStateRow> for WorkflowState {
 }
 
 /// Creates the single workflow_state row for a task, seeding empty loop
-/// counters/history/payload (§3).
+/// counters and payload (§3). The stage trail lives in the events
+/// timeline instead, as `stage_entered` entries (X-3).
 pub async fn create(
     pool: &SqlitePool,
     task_id: &str,
@@ -38,8 +37,8 @@ pub async fn create(
 ) -> Result<WorkflowState, sqlx::Error> {
     let now = Utc::now();
     let row = sqlx::query_as::<_, WorkflowStateRow>(&format!(
-        "INSERT INTO workflow_state (task_id, current_stage, loop_counters, stage_history, payload, updated_at)
-         VALUES (?, ?, '{{}}', '[]', '{{}}', ?)
+        "INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, updated_at)
+         VALUES (?, ?, '{{}}', '{{}}', ?)
          RETURNING {COLUMNS}"
     ))
     .bind(task_id)
@@ -63,7 +62,6 @@ pub async fn get(pool: &SqlitePool, task_id: &str) -> Result<Option<WorkflowStat
 pub struct WorkflowStateUpdate {
     pub current_stage: String,
     pub loop_counters: Value,
-    pub stage_history: Value,
     pub payload: Value,
 }
 
@@ -75,13 +73,12 @@ pub async fn update(
     let now = Utc::now();
     let row = sqlx::query_as::<_, WorkflowStateRow>(&format!(
         "UPDATE workflow_state
-         SET current_stage = ?, loop_counters = ?, stage_history = ?, payload = ?, updated_at = ?
+         SET current_stage = ?, loop_counters = ?, payload = ?, updated_at = ?
          WHERE task_id = ?
          RETURNING {COLUMNS}"
     ))
     .bind(update.current_stage)
     .bind(Json(update.loop_counters))
-    .bind(Json(update.stage_history))
     .bind(Json(update.payload))
     .bind(now)
     .bind(task_id)
@@ -129,7 +126,6 @@ mod tests {
         let created = create(&pool, &task_id, "coding").await.unwrap();
         assert_eq!(created.current_stage, "coding");
         assert_eq!(created.loop_counters, json!({}));
-        assert_eq!(created.stage_history, json!([]));
 
         let updated = update(
             &pool,
@@ -137,7 +133,6 @@ mod tests {
             WorkflowStateUpdate {
                 current_stage: "internal_review".to_string(),
                 loop_counters: json!({"internal_review": 1}),
-                stage_history: json!(["coding"]),
                 payload: json!({"pr_url": null}),
             },
         )
