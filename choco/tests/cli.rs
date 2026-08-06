@@ -785,30 +785,35 @@ stages:
 
     // `task send` is accepted with a 202 and the transition runs behind it,
     // so poll for the hop rather than assuming it has already landed.
+    //
+    // The break condition is deliberately *identical* to the assertion
+    // below, not a weaker proxy for it: `GET /tasks/:id` reads
+    // `workflow_state` before `stage_trail`, so a response can pair
+    // `current_stage == "gate"` with a trail already ending at `review`
+    // (the skew documented at `api/tasks.rs`). That renders the hop line
+    // without `(current)` — enough to satisfy a break keyed on the hop
+    // alone, and then fail the assertion. Polling for exactly what's
+    // asserted costs one extra poll instead.
+    let settled = |out: &str| {
+        out.lines()
+            .any(|l| l.contains("gate --[resumed]--> review") && l.contains("(current)"))
+    };
     let mut status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
     for _ in 0..100 {
-        if status.stdout.contains("gate --[resumed]--> review") {
+        if settled(&status.stdout) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
     }
     assert_eq!(status.code, Some(0), "stderr: {}", status.stderr);
-    assert!(
-        status.stdout.contains("gate --[resumed]--> review"),
-        "expected the hop with its outcome: {:?}",
-        status.stdout
-    );
     // The stage the task entered is the last trail entry, so it's marked in
     // place instead of repeated on a trailing `→` line. Asserted against
     // the whole line, not a bare "(current)": the duplicate-line regression
     // this guards against would still contain that substring.
     assert!(
-        status
-            .stdout
-            .lines()
-            .any(|l| l.contains("--> review") && l.contains("(current)")),
-        "expected the current stage marked on the hop itself: {:?}",
+        settled(&status.stdout),
+        "expected the hop with its outcome, marked current on the same line: {:?}",
         status.stdout
     );
     assert!(
