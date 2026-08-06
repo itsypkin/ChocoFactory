@@ -346,6 +346,7 @@ stages:
     kind: shell
     command: "gh pr create --fill --json url,number"
     capture: json                # parses stdout as JSON into this stage's payload
+    timeout: 5m                  # optional; killed and treated as `error` if exceeded
     on: { done: checks_polling, error: escalate_to_human }
 
   checks_polling:
@@ -385,13 +386,22 @@ stage payload) through it.
 
 **Templating/capture across stages**: a `shell`/`poll` stage's stdout can
 be captured into that stage's `workflow_state` payload (`capture: json`
-parses it as JSON, otherwise it's stored as raw text) and referenced by
+parses it as JSON, `capture: text` stores it as raw text; a stage that
+sets neither captures nothing) and referenced by
 later stages via `{{ stages.<name>.<field> }}` in their own `command:`
 (and `agent_turn` stages can reference it in their `prompt_file`
 template the same way — e.g. handing the reviewer the PR url). This is
 the only templating the engine supports: variable substitution into
 commands/prompts, not conditional logic — branching stays in `on:` maps
 and `outcomes:` matching, not in the template language (§7).
+
+The captured value is stored at `payload.stages.<stage name>`, which is
+what `{{ stages.<name>.<field> }}` resolves against. `stages` is an
+explicit namespace inside the payload rather than the payload root, so
+other engine-owned bookkeeping can join it later without a migration.
+Re-entering a stage overwrites its previous capture — the value means
+"what this stage produced most recently"; the `stage_entered` trail on
+the events timeline is what records that it ran more than once.
 
 ### 5.2 Stage kinds (fixed set, implemented in Rust)
 
@@ -410,7 +420,19 @@ scripting runtime (see §7 non-goal):
   specific — it's just "run this command" (`gh pr create`, a custom
   deploy script, anything). Exit code 0 → `done`, nonzero → `error`;
   `capture:` optionally parses stdout into the stage's payload for later
-  stages to reference (see templating, §5.1).
+  stages to reference (see templating, §5.1). An inline `command:` runs
+  through `sh -c`, since these are shell strings and the examples above
+  are pipelines; a `script_file:` is executed directly, so its `#!` line
+  picks the interpreter (and it must be executable). Exit code is the
+  *only* thing that decides the outcome — stdout that doesn't parse under
+  `capture: json` is kept as text rather than failing the stage. An
+  optional `timeout:` kills a command that runs too long and treats it as
+  `error`; unlike an `agent_turn` there is no reaper behind a shell stage,
+  so without one a hung command parks its task indefinitely. The command
+  runs in the task's working directory, and what it did (exit code,
+  duration, output tails) is recorded on the task's timeline as a
+  `shell_output` event — a shell stage opens no agent session, so that
+  entry belongs to the task and carries no `task_run_id`.
 - **`poll`**: runs a command repeatedly (`interval`) up to an optional
   `timeout`, matching its output against an `outcomes:` list (ordered
   substring/regex matches) to decide when/how to transition; `on_timeout`

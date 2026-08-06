@@ -138,7 +138,14 @@ working dir, initial prompt.
 Implement the `shell` stage kind (§5.2): run a one-shot `command` or
 `script_file` to completion; exit code 0 → `done`, nonzero → `error`;
 `capture: json|text` parses stdout into the stage's `workflow_state`
-payload.
+payload at `stages.<stage name>`.
+
+The command runs detached and reports its outcome through `advance`,
+carrying the capture into the same locked write as the transition. Adds
+an optional per-stage `timeout:` (nothing else would ever reap a hung
+command) and a `shell_output` timeline event, since a shell stage has no
+`task_run` to hang events off. The runner lives in its own module so P2-2
+can drive it on an interval.
 
 - Design ref: §5.1, §5.2
 - Depends on: P1-7
