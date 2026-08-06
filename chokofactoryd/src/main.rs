@@ -24,9 +24,27 @@ fn init_logging() {
 }
 
 /// Bound to `127.0.0.1` only (design §6.1/§6.2, Q15: no auth, accessed
-/// remotely only via SSH port forwarding) — hardcoded for now, no CLI
-/// flag/env var until something downstream actually needs one.
+/// remotely only via SSH port forwarding).
 const DEFAULT_PORT: u16 = 4141;
+
+/// Overrides `DEFAULT_PORT` (§6.1's "no CLI flag/env var until something
+/// downstream actually needs one" — the e2e test suite added in #42 is
+/// that downstream need): lets it bind an ephemeral/test-only port
+/// instead of colliding with a real `chokofactoryd` a developer might
+/// already have running on 4141. Unset in normal use.
+fn port_override() -> Option<u16> {
+    std::env::var("CHOKOFACTORY_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+}
+
+/// Overrides the adapter's `claude` binary path (#42) — set by the e2e
+/// test suite and by manual smoke-testing to point at `mock-claude`
+/// instead of the real, billable `claude` CLI. Unset in normal use, where
+/// `ClaudeAdapter::new()`'s `"claude"` default applies unchanged.
+fn claude_binary_override() -> Option<String> {
+    std::env::var("CHOKOFACTORY_CLAUDE_BINARY").ok()
+}
 
 /// §4.1 leaves the idle-session timeout as "configurable, default TBD in
 /// plan" — this is that default, hardcoded until a config surface for it
@@ -64,7 +82,10 @@ async fn main() {
     tracing::info!(recovered, "recovered stale active task runs");
 
     let events_notify = Arc::new(Notify::new());
-    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::new());
+    let adapter: Arc<dyn AgentAdapter> = match claude_binary_override() {
+        Some(binary) => Arc::new(ClaudeAdapter::with_binary(binary)),
+        None => Arc::new(ClaudeAdapter::new()),
+    };
     let session_manager = SessionManager::new(
         pool.clone(),
         adapter,
@@ -92,13 +113,11 @@ async fn main() {
         events_notify,
     };
     let router = api::router(state).layer(TraceLayer::new_for_http());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", DEFAULT_PORT))
+    let port = port_override().unwrap_or(DEFAULT_PORT);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .expect("chokofactoryd: failed to bind 127.0.0.1");
-    tracing::info!(
-        port = DEFAULT_PORT,
-        "listening on http://127.0.0.1:{DEFAULT_PORT}"
-    );
+    tracing::info!(port, "listening on http://127.0.0.1:{port}");
     axum::serve(listener, router)
         .await
         .expect("chokofactoryd: server error");

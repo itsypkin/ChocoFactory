@@ -139,6 +139,32 @@ pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<Event
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Just the `stage_entered` slice of [`list_for_task`], same order — the
+/// task's stage trail.
+///
+/// This is what `workflow_state.stage_history` used to hold before X-3, and
+/// it exists as its own query so `GET /tasks/:id` can keep serving the trail
+/// in one round trip. Filtering the paginated events endpoint client-side
+/// would not do: on a task with a real coding transcript the tool events
+/// dominate, so the stage entries fall past the first page and the trail
+/// would silently render truncated.
+///
+/// Served by `idx_events_task_id_created_at`; unbounded in principle, but
+/// `stage_history` grew the same way and this version is at least aged out
+/// by retention.
+pub async fn list_stage_trail(pool: &SqlitePool, task_id: &str) -> Result<Vec<Event>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, EventRow>(&format!(
+        "SELECT {COLUMNS} FROM events
+         WHERE task_id = ? AND event_type = ?
+         ORDER BY created_at, id"
+    ))
+    .bind(task_id)
+    .bind(EventType::StageEntered.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// Same total order as [`list_for_task`], but only events strictly after
 /// `cursor` — the `(created_at, id)` of the last event a caller has already
 /// seen (P1-9, live WS streaming). `None` means "from the beginning."
@@ -377,13 +403,97 @@ mod tests {
             .unwrap();
         assert_eq!(
             after.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
-            vec![said.id, advanced.id]
+            vec![said.id, advanced.id.clone()]
         );
 
         // A session's own slice excludes the task-level entries.
         let run_only = list_for_task_run(&pool, &run).await.unwrap();
         assert_eq!(run_only.len(), 1);
         assert_eq!(run_only[0].event_type, EventType::AssistantMessage);
+
+        // ...and the trail is the mirror image: the stage entries only, in
+        // the same order, with the conversation filtered out. This is what
+        // `GET /tasks/:id` serves as `stage_trail`, so a conversation event
+        // leaking in would show up as a phantom hop in `choco task status`.
+        let trail = list_stage_trail(&pool, &task_id).await.unwrap();
+        assert_eq!(
+            trail
+                .iter()
+                .map(|e| (e.id.clone(), e.payload["stage"].clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (entered.id.clone(), json!("chatting")),
+                (advanced.id.clone(), json!("done")),
+            ]
+        );
+    }
+
+    /// The trail is scoped to one task. A second task's transitions sharing
+    /// the same `events` table must not bleed into it — that would render
+    /// as another task's stages in this one's `choco task status`.
+    #[tokio::test]
+    async fn the_stage_trail_of_one_task_excludes_another_tasks_transitions() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let new_task = |title: &'static str| tasks::NewTask {
+            project_id: &project_id,
+            parent_task_id: None,
+            workflow_def: "chat",
+            title,
+            config: json!({}),
+        };
+        let first = tasks::create(&pool, new_task("A")).await.unwrap().id;
+        let second = tasks::create(&pool, new_task("B")).await.unwrap().id;
+
+        append_stage_transition(&pool, &first, "coding", None)
+            .await
+            .unwrap();
+        append_stage_transition(&pool, &second, "triage", None)
+            .await
+            .unwrap();
+        append_stage_transition(&pool, &first, "review", Some("approved"))
+            .await
+            .unwrap();
+
+        let trail = list_stage_trail(&pool, &first).await.unwrap();
+        assert_eq!(
+            trail
+                .iter()
+                .map(|e| e.payload["stage"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("coding"), json!("review")]
+        );
+        assert!(trail.iter().all(|e| e.task_id == first));
+    }
+
+    /// A task with no transitions recorded — every task that ran before X-3
+    /// — gets an empty trail rather than an error or someone else's rows.
+    #[tokio::test]
+    async fn the_stage_trail_of_a_task_with_no_transitions_is_empty() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        // A session event exists, so "empty" is the filter working, not the
+        // task simply having no events at all.
+        let run = seed_task_run_for_task(&pool, &task_id, "chatting").await;
+        append(&pool, &run, EventType::AssistantMessage, json!({"n": 1}))
+            .await
+            .unwrap();
+
+        assert!(list_stage_trail(&pool, &task_id).await.unwrap().is_empty());
     }
 
     async fn seed_task_run_for_task(pool: &SqlitePool, task_id: &str, stage: &str) -> String {

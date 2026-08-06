@@ -1,1 +1,221 @@
 # ChocoFactory
+
+Two binaries:
+
+- **`chokofactoryd`** — the daemon. Owns the SQLite database, the workflow
+  engine, and an HTTP/WS API on `127.0.0.1:4141`.
+- **`choco`** — a thin CLI client against that API (create/inspect/message
+  tasks and projects).
+
+## Build
+
+```
+cargo build --workspace
+```
+
+Binaries land in `target/debug/`.
+
+## Running the daemon
+
+> **`chokofactoryd` spawns the real `claude` CLI by default** — running the
+> daemon will hit the real, billable `claude` unless you point it at a
+> stand-in first.
+
+For manual testing, use the bundled `mock-claude` stand-in:
+
+```
+CHOKOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude ./target/debug/chokofactoryd
+```
+
+`mock-claude` echoes back whatever it's sent (`echo:{text}`); set
+`MOCK_CLAUDE_REPLY=<text>` to get a fixed reply instead. Point
+`CHOKOFACTORY_CLAUDE_BINARY` at the real `claude` binary only when you
+specifically mean to exercise the real CLI.
+
+The daemon stores its database and workflow definitions under
+`~/.config/chokofactory/`. On first start it seeds the built-in `chat`
+workflow into `~/.config/chokofactory/workflows/` (existing files are never
+overwritten). To keep a test run fully isolated from your real state,
+override `HOME`:
+
+```
+HOME=$(mktemp -d) CHOKOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude \
+  ./target/debug/chokofactoryd
+```
+
+### Daemon environment variables
+
+| Variable | Purpose |
+|---|---|
+| `CHOKOFACTORY_CLAUDE_BINARY` | Path to the agent CLI. Unset = the real, billable `claude`. |
+| `CHOKOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. |
+| `MOCK_CLAUDE_REPLY` | Read by `mock-claude` only — reply with this fixed text instead of echoing. |
+| `RUST_LOG` | Log filter, e.g. `error` to quiet startup, `debug` for detail. |
+
+## Using the `choco` CLI
+
+With a daemon running, in a second shell:
+
+```
+choco [--base-url <url>] <COMMAND>
+```
+
+The base URL defaults to `http://127.0.0.1:4141`, and can also be set via
+the `CHOCO_BASE_URL` environment variable.
+
+Commands print a human-readable summary by default. Pass `--json` to get
+the daemon's raw JSON instead — `choco` is meant to be both human-scriptable
+and agent-callable, and `--json` is the half you pipe into `jq` or parse
+from an agent. On failure it prints `error: <message>` to stderr and exits
+`1`.
+
+### A full walkthrough
+
+Create a project:
+
+```
+$ choco project create acme
+Name     acme
+ID       7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
+Created  2026-08-01 12:33:37 UTC
+```
+
+Create a task in it. `--project` takes **either the project name or its
+id** — a name is resolved against `project list`, and is rejected naming
+the candidates if it matches more than one project (names aren't unique).
+`--workflow` names any definition in `~/.config/chokofactory/workflows/`
+(`chat` ships built in):
+
+```
+$ choco task create --project acme --workflow gated \
+    --title "ship the thing" --prompt "start"
+Title     ship the thing
+ID        bb93ada3-2910-4b94-911d-f6e8aab426dd
+Project   7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
+Workflow  gated
+Status    open
+Created   2026-08-01 12:33:37 UTC
+```
+
+Check where it is. `Progress` shows the stages the task has passed
+through, the outcome that caused each hop, and when it happened —
+starting with the stage it began in:
+
+```
+$ choco task status bb93ada3-...
+Title     ship the thing
+...
+Stage     review
+
+Progress
+  1. gate (start)                  2026-08-01 12:33:31 UTC
+  2. gate --[resumed]--> review    2026-08-01 12:33:37 UTC   (current)
+```
+
+The trail comes from the task's `stage_entered` events, so the same
+transitions also show up inline in `choco task events` alongside the
+conversation. A task whose history has aged out of retention still gets
+its current stage named on a trailing line.
+
+A task with no recorded transitions at all says so, rather than showing
+a blank list:
+
+```
+Progress
+  → gate (current, no transitions yet)
+```
+
+Send a message into the task's live session (or resume a `human_gate`).
+The daemon accepts it asynchronously — the agent's reply lands as an
+event, not in this response:
+
+```
+$ choco task send bb93ada3-... --text "go"
+Message accepted for task bb93ada3-.... The reply is recorded as an event
+— see `choco task events bb93ada3-...`.
+```
+
+Read the conversation:
+
+```
+$ choco task events bb93ada3-...
+TIME                     KIND               DETAIL
+2026-08-01 12:33:51 UTC  human_message      explain the plan
+2026-08-01 12:33:51 UTC  session_meta       a4cbce43-e70c-49ab-a407-2ae4701b7838
+2026-08-01 12:33:51 UTC  assistant_message  echo:explain the plan
+```
+
+Long output is paginated — pass `--limit N`, and follow the `--after
+<token>` hint printed when more events remain. There is also a live
+WebSocket stream at `/tasks/{id}/events/live` that the CLI doesn't wrap.
+
+List things:
+
+```
+$ choco task list
+TITLE      ID                                    STATUS  WORKFLOW  CREATED
+chat task  ed9e8a7d-e5d4-4aeb-b04c-b47d14145940  open    chat      2026-08-01 12:33:51 UTC
+
+$ choco task list --project acme          # by name or id
+$ choco task list --status open           # free-form, not a fixed enum
+$ choco project list
+```
+
+### Scripting it
+
+`--json` turns any command into machine-readable output:
+
+```
+$ choco --json task list | jq -r '.[0].id'
+ed9e8a7d-e5d4-4aeb-b04c-b47d14145940
+
+$ choco --json task status <id> | jq -r '.workflow_state.current_stage'
+review
+```
+
+`task send` returns 202 with no body, so under `--json` it prints nothing
+at all rather than a message that would break a pipe.
+
+### Delegation
+
+`--parent-task <id>` tags a new task as spawned from an existing one, so an
+agent working inside task A can spin up task B and poll it:
+
+```
+$ choco task create --project acme --workflow chat \
+    --title "subtask" --prompt "do the thing" --parent-task bb93ada3-...
+Title        subtask
+ID           e94b3293-c547-4dce-a31a-71dccffe8f3c
+Project      7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
+Workflow     chat
+Status       open
+Parent task  bb93ada3-2910-4b94-911d-f6e8aab426dd
+Created      2026-08-01 12:33:37 UTC
+```
+
+The parent id round-trips through `choco task status <child-id>`, and the
+child is polled with that same call — which is why the delegating agent
+wants `--json`:
+
+```
+$ choco --json task status <child-id> | jq -r '.workflow_state.current_stage'
+chatting
+```
+
+### Other flags
+
+- `--repo <path>` on `task create` sets the working directory for the
+  task's agent subprocess (stored as `config.cwd`). Defaults to the
+  daemon's own working directory.
+- `--base-url <url>` targets a daemon on a non-default port, e.g. one
+  started with `CHOKOFACTORY_PORT=41500`.
+
+## Tests
+
+```
+cargo build --workspace --all-targets   # test harnesses spawn these binaries
+cargo test --workspace
+```
+
+Tests never spawn the real `claude` — the integration suites point the
+daemon at `mock-claude` or a Python fixture instead.

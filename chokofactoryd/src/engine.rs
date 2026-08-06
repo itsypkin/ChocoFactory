@@ -1181,8 +1181,16 @@ mod tests {
         )
     }
 
+    /// Waits for `workflow_state.current_stage` to reach `expected`.
+    ///
+    /// Note what this does *not* tell you: `advance` writes `current_stage`
+    /// before calling `enter_stage`, so this goes true while the stage's own
+    /// effects — the `stage_entered` event, and `update_status("closed")`
+    /// for a terminal stage — are still pending. A test asserting on those
+    /// must wait for them directly (see [`wait_until_task_status`]) rather
+    /// than treating arrival at the stage as proof they already happened.
     async fn wait_until_stage(pool: &SqlitePool, task_id: &str, expected: &str) {
-        for _ in 0..200 {
+        for _ in 0..500 {
             let state = workflow_state::get(pool, task_id).await.unwrap().unwrap();
             if state.current_stage == expected {
                 return;
@@ -1190,6 +1198,23 @@ mod tests {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         panic!("timed out waiting for stage {expected}");
+    }
+
+    /// Waits for `tasks.status`, which a terminal stage sets from inside
+    /// `enter_stage` — strictly after `current_stage` already names that
+    /// stage. Budgeted for a loaded parallel suite: these tests drive a real
+    /// python subprocess, and spawning one can take well over a second when
+    /// the whole workspace is running at once.
+    async fn wait_until_task_status(pool: &SqlitePool, task_id: &str, expected: &str) {
+        let mut last = String::new();
+        for _ in 0..500 {
+            last = tasks::get(pool, task_id).await.unwrap().unwrap().status;
+            if last == expected {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for status {expected}, last saw {last:?}");
     }
 
     /// Polls `task_run_id`'s events for one whose `payload.text` equals
@@ -1857,8 +1882,20 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
 
         wait_until_stage(&pool, &task_id, "finished").await;
-        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-        assert_eq!(task.status, "closed");
+        // Closing the task happens inside `enter_stage`, after
+        // `current_stage` is already "finished" — so this has to be waited
+        // for, not read once off the back of the stage having changed.
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        // The auto-advance is visible in the trail too, with the outcome the
+        // adapter reported as what carried it into the terminal stage.
+        assert_eq!(
+            stage_trail(&pool, &task_id).await,
+            vec![
+                ("coding".to_string(), Value::Null),
+                ("finished".to_string(), json!("done")),
+            ]
+        );
     }
 
     #[tokio::test]
