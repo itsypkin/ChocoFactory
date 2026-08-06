@@ -800,10 +800,20 @@ stages:
         status.stdout
     );
     // The stage the task entered is the last trail entry, so it's marked in
-    // place instead of repeated on a trailing `→` line.
+    // place instead of repeated on a trailing `→` line. Asserted against
+    // the whole line, not a bare "(current)": the duplicate-line regression
+    // this guards against would still contain that substring.
     assert!(
-        status.stdout.contains("(current)"),
-        "expected the current stage marked: {:?}",
+        status
+            .stdout
+            .lines()
+            .any(|l| l.contains("--> review") && l.contains("(current)")),
+        "expected the current stage marked on the hop itself: {:?}",
+        status.stdout
+    );
+    assert!(
+        !status.stdout.contains("→ review"),
+        "the current stage should not also get a trailing arrow line: {:?}",
         status.stdout
     );
 

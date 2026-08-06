@@ -108,8 +108,8 @@ Title     ship the thing
 Stage     review
 
 Progress
-  1. gate (start)                  2026-08-01 12:33:31 UTC
-  2. gate --[resumed]--> review    2026-08-01 12:33:37 UTC   (current)
+  1. gate (start)   2026-08-01 12:33:31 UTC
+  2. gate --[resumed]--> review   2026-08-01 12:33:37 UTC   (current)
 ```
 
 The trail comes from the task's `stage_entered` events, so the same

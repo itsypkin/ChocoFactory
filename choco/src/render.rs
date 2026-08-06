@@ -223,20 +223,30 @@ fn stage_progress(trail: &[Value], current: Option<&str>) -> String {
             .map(|at| format!("   {at}"))
             .unwrap_or_default();
 
-        // The first entry has no predecessor to point an arrow from: it's
-        // where the task started, not a hop. Its `outcome` is null for the
-        // same reason, so there's nothing to label an arrow with either.
+        // A null `outcome` — not a missing predecessor — is what marks a
+        // starting point: the engine writes `entered_via: None` only for a
+        // stage nothing transitioned into. Keying on the predecessor
+        // instead would label the *first surviving* entry "(start)" on a
+        // trail whose head has been truncated, inventing a beginning that
+        // never happened and discarding the recorded outcome with it.
+        // Retention prunes `stage_entered` rows like any other event, and
+        // the entry-stage append is best-effort, so a trail that opens
+        // mid-flight is reachable, not hypothetical.
         let hop = match (
-            i.checked_sub(1).and_then(|p| trail.get(p)),
             entry
                 .get("payload")
                 .and_then(|p| p.get("outcome"))
                 .and_then(Value::as_str),
+            i.checked_sub(1).and_then(|p| trail.get(p)),
         ) {
-            (Some(previous), Some(outcome)) => {
+            (Some(outcome), Some(previous)) => {
                 format!("{} --[{outcome}]--> {stage}", stage_of(previous))
             }
-            _ => format!("{stage} (start)"),
+            // Something carried the task here, but whatever it departed is
+            // no longer on record — say so rather than guessing or dropping
+            // the outcome.
+            (Some(outcome), None) => format!("… --[{outcome}]--> {stage}"),
+            (None, _) => format!("{stage} (start)"),
         };
         lines.push(format!("  {step}. {hop}{at}"));
     }
@@ -438,6 +448,38 @@ mod tests {
         assert!(
             !rendered.contains("?"),
             "no phantom predecessor: {rendered}"
+        );
+    }
+
+    /// The other end of the same truncation. Retention prunes
+    /// `stage_entered` rows like any other event, so the first *surviving*
+    /// entry can be one the task was transitioned into. Labelling it
+    /// "(start)" would assert a beginning that never happened and throw
+    /// away the recorded outcome, so the outcome — not the presence of a
+    /// predecessor — decides.
+    #[test]
+    fn stage_progress_does_not_claim_a_truncated_trail_head_is_the_start() {
+        let trail = [
+            stage_entry("review", json!("changes_requested"), "2026-08-01T11:58:00Z"),
+            stage_entry("gate", json!("rejected"), "2026-08-01T11:59:00Z"),
+        ];
+        let rendered = stage_progress(&trail, Some("gate"));
+        assert!(
+            !rendered.contains("(start)"),
+            "nothing here started the task: {rendered}"
+        );
+        assert!(
+            rendered.contains("changes_requested"),
+            "the outcome that carried it here was dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("… --[changes_requested]--> review"),
+            "{rendered}"
+        );
+        // The hop that *does* have its predecessor still renders normally.
+        assert!(
+            rendered.contains("review --[rejected]--> gate"),
+            "{rendered}"
         );
     }
 
