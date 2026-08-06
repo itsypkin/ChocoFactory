@@ -164,6 +164,17 @@ pub enum EventType {
     /// stage. Filtering a task's timeline for these replaces the former
     /// `workflow_state.stage_history` column.
     StageEntered,
+    /// A `shell` stage's command ran to completion, was killed by its
+    /// `timeout`, or failed to spawn at all (P2-1). Like [`Self::StageEntered`]
+    /// this belongs to the *task* rather than to an agent session — a shell
+    /// stage opens no session and has no `task_run` — so its `Event` has no
+    /// `task_run_id`. Payload is `{"stage", "command", "exit_code",
+    /// "timed_out", "duration_ms", "stdout_tail", "stderr_tail"}`, plus an
+    /// optional `"note"` when something about the capture needs explaining
+    /// (unparseable JSON, oversized output, a spawn failure). Without it a
+    /// failed command would route through `on: error` with the reason
+    /// nowhere in the API.
+    ShellOutput,
 }
 
 impl fmt::Display for EventType {
@@ -177,6 +188,7 @@ impl fmt::Display for EventType {
             EventType::Error => "error",
             EventType::SessionMeta => "session_meta",
             EventType::StageEntered => "stage_entered",
+            EventType::ShellOutput => "shell_output",
         })
     }
 }
@@ -205,6 +217,7 @@ impl FromStr for EventType {
             "error" => Ok(EventType::Error),
             "session_meta" => Ok(EventType::SessionMeta),
             "stage_entered" => Ok(EventType::StageEntered),
+            "shell_output" => Ok(EventType::ShellOutput),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -213,8 +226,8 @@ impl FromStr for EventType {
 /// Append-only entry in a task's timeline (§3, §4.2).
 ///
 /// Most entries are normalized from an agent session's output and name the
-/// session they came from; a `StageEntered` entry belongs to the task
-/// itself and leaves `task_run_id` `None`. Ordering across a task is always
+/// session they came from; `StageEntered`/`ShellOutput` entries belong to the
+/// task itself and leave `task_run_id` `None`. Ordering across a task is always
 /// `(created_at, id)` — there is no per-session sequence counter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {

@@ -2,11 +2,19 @@
 //! that drives a task's `workflow_state` through a loaded
 //! `WorkflowDefinition`. The graph's topology comes entirely from the
 //! definition (§5.1); this module only supplies the fixed, small
-//! vocabulary of stage *behaviors* (§5.2). Phase 1 implements
-//! `agent_turn`, `human_gate`, `terminal` — `shell`/`poll` are already
-//! parsed by the loader (P1-6) but their execution lands in Phase 2
-//! (P2-1/P2-2), so entering one here is a deliberate, reported error
-//! rather than a silent no-op.
+//! vocabulary of stage *behaviors* (§5.2): `agent_turn`, `human_gate`,
+//! `terminal` (P1-7) and `shell` (P2-1). `poll` is already parsed by the
+//! loader (P1-6) but its execution lands with P2-2, so entering one here
+//! is a deliberate, reported error rather than a silent no-op.
+//!
+//! Two kinds — `agent_turn` and `shell` — do work that outlives the call
+//! that started them, and both hand their outcome back the same way: they
+//! return from `enter_stage` as soon as the work is under way and a
+//! detached task calls `advance` once it finishes. That indirection is
+//! load-bearing, not stylistic. `enter_stage` runs inside the per-task
+//! lock that `advance` re-acquires, and `tokio::sync::Mutex` is not
+//! reentrant, so a stage kind that blocked here and advanced inline would
+//! wedge its task forever.
 //!
 //! `loop_guard` bookkeeping (§5.3) lives entirely in `workflow_state.
 //! loop_counters`, keyed by stage name to `{ entered_from, count }`:
@@ -31,7 +39,10 @@ use crate::db::{events, projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
 use crate::role_config::{self, RoleConfigError};
 use crate::session::{SessionError, SessionManager};
-use crate::workflow_def::{StageDef, StageKind, WorkflowDefError, WorkflowDefinition};
+use crate::shell;
+use crate::workflow_def::{
+    Capture, ShellCommand, StageDef, StageKind, WorkflowDefError, WorkflowDefinition,
+};
 
 /// How often the `agent_turn` completion watcher polls a `task_run`'s
 /// status. Not configurable (yet) — this is an internal implementation
@@ -652,6 +663,30 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         outcome: &str,
     ) -> Result<(), EngineError> {
+        self.advance_with_capture(task_id, definition, outcome, None)
+            .await
+    }
+
+    /// [`Self::advance`], additionally storing `capture` — a `(stage name,
+    /// value)` pair from a `shell` stage's `capture:` (§5.1) — into
+    /// `workflow_state.payload` under `stages.<stage name>`.
+    ///
+    /// The capture is threaded *through* the transition rather than written
+    /// by the caller beforehand, and that is the whole point of this
+    /// function existing. `workflow_state::update` rewrites the entire row,
+    /// so a caller that read the state, merged its capture, and wrote it
+    /// back would be doing a read-modify-write outside this function's
+    /// per-task lock — and a transition interleaving between that read and
+    /// write would silently lose either the capture or the new
+    /// `current_stage`/`loop_counters`. Merging here keeps all three fields
+    /// in the single UPDATE already made under the lock.
+    async fn advance_with_capture(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        outcome: &str,
+        capture: Option<(&str, Value)>,
+    ) -> Result<(), EngineError> {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
 
@@ -691,13 +726,18 @@ impl WorkflowEngine {
                 }
                 note_stage_entry(&mut loop_counters, definition, &next_stage, &from_stage);
 
+                let mut payload = state.payload;
+                if let Some((stage, value)) = capture {
+                    merge_stage_capture(&mut payload, stage, value);
+                }
+
                 workflow_state::update(
                     &self.pool,
                     task_id,
                     workflow_state::WorkflowStateUpdate {
                         current_stage: next_stage.clone(),
                         loop_counters,
-                        payload: state.payload,
+                        payload,
                     },
                 )
                 .await?;
@@ -826,9 +866,243 @@ impl WorkflowEngine {
                 }
                 Ok(())
             }
-            StageKind::Shell { .. } | StageKind::Poll { .. } => {
+            StageKind::Shell {
+                command,
+                capture,
+                timeout,
+            } => {
+                self.enter_shell(
+                    task_id,
+                    definition,
+                    stage_name,
+                    command.clone(),
+                    *capture,
+                    *timeout,
+                )
+                .await
+            }
+            StageKind::Poll { .. } => {
                 Err(EngineError::UnsupportedStageKind(stage_name.to_string()))
             }
+        }
+    }
+
+    /// Starts a `shell` stage's command (§5.2) and returns immediately; the
+    /// outcome arrives later, from the detached runner below.
+    ///
+    /// Running the command inline here instead would deadlock the task
+    /// permanently: `enter_stage` is called from inside the per-task lock
+    /// held by `advance`/`start_task`, the runner has to call `advance` to
+    /// report its outcome, and `tokio::sync::Mutex` is not reentrant. The
+    /// `agent_turn` path has the same constraint and resolves it the same
+    /// way, via `spawn_turn_watcher`.
+    async fn enter_shell(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        command: ShellCommand,
+        capture: Option<Capture>,
+        timeout: Option<Duration>,
+    ) -> Result<(), EngineError> {
+        // Resolved here rather than in the spawned task so that a missing
+        // task fails the transition that caused it, where the caller can
+        // still see the error, instead of only reaching a log line.
+        let task = tasks::get(&self.pool, task_id)
+            .await?
+            .ok_or(EngineError::NoSuchTask)?;
+        let cwd = task_cwd(&task);
+
+        self.spawn_shell_runner(
+            task_id.to_string(),
+            Arc::clone(definition),
+            stage_name.to_string(),
+            command,
+            capture,
+            timeout,
+            cwd,
+        );
+        Ok(())
+    }
+
+    /// Deliberately a *synchronous* fn, like `spawn_turn_watcher`. The
+    /// spawned future eventually calls `advance` → `enter_stage` →
+    /// `enter_shell`, i.e. back to here; discharging `tokio::spawn`'s
+    /// `Send` obligation from inside an `async fn` would make that cycle
+    /// part of the compiler's auto-trait inference for `enter_shell`'s own
+    /// future and fail to resolve. A sync fn's body is checked
+    /// independently, which breaks the cycle.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_shell_runner(
+        self: &Arc<Self>,
+        task_id: String,
+        definition: Arc<WorkflowDefinition>,
+        stage_name: String,
+        command: ShellCommand,
+        capture: Option<Capture>,
+        timeout: Option<Duration>,
+        cwd: PathBuf,
+    ) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            engine
+                .run_shell_stage(
+                    &task_id,
+                    &definition,
+                    &stage_name,
+                    command,
+                    capture,
+                    timeout,
+                    cwd,
+                )
+                .await;
+        });
+    }
+
+    /// Runs the command, records what it did on the task's timeline, and
+    /// advances the task with `done`/`error` (§5.2) carrying any capture.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_shell_stage(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        command: ShellCommand,
+        capture: Option<Capture>,
+        timeout: Option<Duration>,
+        cwd: PathBuf,
+    ) {
+        let described = describe_command(&command);
+
+        // A spawn failure is reported as the stage's `error` outcome rather
+        // than dropped: from the workflow's point of view "the command
+        // could not be run" and "the command ran and failed" both mean this
+        // stage did not succeed, and a task whose `on: error` edge exists
+        // should follow it either way. The reason goes on the timeline,
+        // since it's the only place an operator would find it.
+        let outcome = match shell::run(&command, &cwd, timeout).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::error!(
+                    task_id, stage = stage_name, %err,
+                    "shell stage command could not be started"
+                );
+                self.append_shell_event(
+                    task_id,
+                    json!({
+                        "stage": stage_name,
+                        "command": described,
+                        "exit_code": Value::Null,
+                        "timed_out": false,
+                        "duration_ms": 0,
+                        "stdout_tail": "",
+                        "stderr_tail": "",
+                        "note": err.to_string(),
+                    }),
+                )
+                .await;
+                self.finish_shell_stage(task_id, definition, stage_name, "error", None)
+                    .await;
+                return;
+            }
+        };
+
+        let stage_outcome = if outcome.succeeded() { "done" } else { "error" };
+
+        // Only a command that succeeded contributes a capture. A failed one
+        // has nothing worth handing to a later stage, and storing it anyway
+        // would be actively harmful: `stages.<name>` is keyed by stage, so
+        // a stage re-entered by a retry loop would overwrite the good value
+        // from the attempt that worked with the failed attempt's output (or,
+        // on a timeout, with an empty string). A later
+        // `{{ stages.open_pr.number }}` would then resolve against garbage.
+        // The command's output is still on the timeline either way.
+        let (captured, note) = if outcome.succeeded() {
+            derive_capture(capture, &outcome.stdout, task_id, stage_name)
+        } else if capture.is_some() {
+            (
+                None,
+                Some("stdout not captured: the command did not succeed".to_string()),
+            )
+        } else {
+            (None, None)
+        };
+
+        if outcome.timed_out {
+            tracing::warn!(
+                task_id,
+                stage = stage_name,
+                "shell stage command exceeded its timeout and was killed"
+            );
+        }
+
+        let mut payload = json!({
+            "stage": stage_name,
+            "command": described,
+            "exit_code": outcome.exit_code,
+            "timed_out": outcome.timed_out,
+            "duration_ms": u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
+            "stdout_tail": tail(&outcome.stdout),
+            "stderr_tail": tail(&outcome.stderr),
+        });
+        if let Some(note) = note {
+            payload["note"] = Value::String(note);
+        }
+        self.append_shell_event(task_id, payload).await;
+
+        self.finish_shell_stage(
+            task_id,
+            definition,
+            stage_name,
+            stage_outcome,
+            captured.map(|value| (stage_name, value)),
+        )
+        .await;
+    }
+
+    /// Best-effort, like every other event append in this module: the
+    /// command has already run, so failing to record it can't be undone by
+    /// refusing to transition — and refusing would strand the task in a
+    /// stage whose work is complete.
+    async fn append_shell_event(&self, task_id: &str, payload: Value) {
+        match events::append_for_task(&self.pool, task_id, EventType::ShellOutput, payload).await {
+            Ok(_) => self.events_notify.notify_waiters(),
+            Err(err) => tracing::error!(
+                task_id, %err,
+                "failed to record shell stage output event"
+            ),
+        }
+    }
+
+    /// Applies a finished shell stage's outcome. Nothing is left to return
+    /// it to — this runs detached — so a failure is logged and the task
+    /// parks in its current stage.
+    async fn finish_shell_stage(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        outcome: &str,
+        capture: Option<(&str, Value)>,
+    ) {
+        match self
+            .advance_with_capture(task_id, definition, outcome, capture)
+            .await
+        {
+            Ok(()) => tracing::debug!(
+                task_id,
+                stage = stage_name,
+                outcome,
+                "shell stage completed; advanced"
+            ),
+            // The loader guarantees a `done` edge exists, so in practice
+            // this is a failed command on a stage that deliberately maps no
+            // `error` edge — the task parks for a human, which is the
+            // documented behavior, not a lost outcome.
+            Err(err) => tracing::error!(
+                task_id, stage = stage_name, outcome, %err,
+                "failed to advance task after its shell stage completed"
+            ),
         }
     }
 
@@ -1042,6 +1316,138 @@ fn task_cwd(task: &Task) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default()
+}
+
+/// Largest captured value stored in `workflow_state.payload`. The payload
+/// is rewritten in full on every transition for the rest of the task's
+/// life, so an unbounded capture from one chatty command would be paid for
+/// again on every subsequent hop. Output past this cap isn't captured at
+/// all — silently truncating it would hand a later stage a value that
+/// looks whole but isn't.
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// How much of a command's stdout/stderr goes onto the timeline. Small on
+/// purpose: this is a human-facing breadcrumb, and the full output isn't
+/// retained anywhere.
+const EVENT_OUTPUT_TAIL_BYTES: usize = 2048;
+
+/// The trailing `EVENT_OUTPUT_TAIL_BYTES` of `text`, trimmed. The *tail*
+/// rather than the head because a failing command's actual error is
+/// almost always the last thing it printed.
+fn tail(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= EVENT_OUTPUT_TAIL_BYTES {
+        return trimmed.to_string();
+    }
+    // Walk back to a char boundary so a multi-byte char isn't split.
+    let mut start = trimmed.len() - EVENT_OUTPUT_TAIL_BYTES;
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &trimmed[start..])
+}
+
+/// How a command is named on the timeline. A `script_file` shows its path;
+/// there's no meaningful "command line" to display for one.
+fn describe_command(command: &ShellCommand) -> String {
+    match command {
+        ShellCommand::Inline(line) => line.clone(),
+        ShellCommand::ScriptFile(path) => path.display().to_string(),
+    }
+}
+
+/// Turns a finished command's stdout into the value stored under
+/// `payload.stages.<stage>`, plus an optional note for the timeline when
+/// something about that needed explaining.
+///
+/// A stage with no `capture:` stores nothing at all — only a stage that
+/// asked for its output to be kept gets a payload entry.
+///
+/// Unparseable JSON under `capture: json` is deliberately *not* an error:
+/// §5.2 makes the exit code the only thing that decides a shell stage's
+/// outcome, so the stdout is kept as text and the stage still reports what
+/// its exit code said. The note is what tells a reader why the value isn't
+/// the object they expected.
+fn derive_capture(
+    capture: Option<Capture>,
+    stdout: &str,
+    task_id: &str,
+    stage_name: &str,
+) -> (Option<Value>, Option<String>) {
+    let Some(capture) = capture else {
+        return (None, None);
+    };
+
+    let trimmed = stdout.trim();
+    if trimmed.len() > MAX_CAPTURE_BYTES {
+        tracing::warn!(
+            task_id,
+            stage = stage_name,
+            bytes = trimmed.len(),
+            "shell stage output too large to capture; not stored"
+        );
+        return (
+            None,
+            Some(format!(
+                "output not captured: {} bytes exceeds the {MAX_CAPTURE_BYTES}-byte limit",
+                trimmed.len()
+            )),
+        );
+    }
+
+    match capture {
+        Capture::Text => (Some(Value::String(trimmed.to_string())), None),
+        Capture::Json => match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => (Some(value), None),
+            Err(err) => {
+                tracing::warn!(
+                    task_id, stage = stage_name, %err,
+                    "shell stage output was not valid JSON; captured as text"
+                );
+                (
+                    Some(Value::String(trimmed.to_string())),
+                    Some(format!(
+                        "stdout was not valid JSON ({err}); captured as text"
+                    )),
+                )
+            }
+        },
+    }
+}
+
+/// Stores a stage's captured stdout at `payload.stages.<stage>` (§5.1).
+///
+/// The `stages` namespace is explicit rather than the payload root because
+/// `payload` is one shared blob for the whole task — reserving a top-level
+/// key leaves room for other engine-owned namespaces later without a
+/// migration, and without a workflow whose stage is *named* `stages`
+/// colliding with one. The path matches the `{{ stages.<name>.<field> }}`
+/// templating P2-3 will resolve against it.
+///
+/// Re-entering a stage overwrites its previous capture: the value means
+/// "what this stage produced most recently", which is what a later stage
+/// templating it wants. The stage trail on the events timeline is what
+/// records that it ran more than once.
+fn merge_stage_capture(payload: &mut Value, stage: &str, value: Value) {
+    // A payload that isn't an object (hand-edited row, or a shape some
+    // future writer chose) would silently swallow the capture if this
+    // just gave up, so replace it — the engine owns this column, and
+    // nothing else writes it today.
+    if !payload.is_object() {
+        *payload = json!({});
+    }
+    let stages = payload
+        .as_object_mut()
+        .expect("payload was just ensured to be an object")
+        .entry("stages")
+        .or_insert_with(|| json!({}));
+    if !stages.is_object() {
+        *stages = json!({});
+    }
+    stages
+        .as_object_mut()
+        .expect("stages was just ensured to be an object")
+        .insert(stage.to_string(), value);
 }
 
 /// Increments the guarded stage's transition count. Seeds a fresh entry
@@ -2033,16 +2439,22 @@ stages:
         assert!(runs[0].ended_at.is_some());
     }
 
+    /// `poll` is the one kind the loader still parses but the engine can't
+    /// execute (P2-2). This used to cover `shell` too, until P2-1.
     #[tokio::test]
     async fn entering_an_unsupported_stage_kind_is_a_reported_error_not_a_panic() {
         let pool = connect_in_memory().await.unwrap();
         let dir = tempdir();
         let yaml = r#"
-name: has-shell
+name: has-poll
 stages:
   run:
-    kind: shell
+    kind: poll
     command: "true"
+    interval: 1s
+    outcomes:
+      - match: "ok"
+        then: done
     on: { done: finished }
   finished:
     kind: terminal
@@ -2053,6 +2465,579 @@ stages:
 
         let err = engine.start_task(&task_id, &def, None).await.unwrap_err();
         assert!(matches!(err, EngineError::UnsupportedStageKind(stage) if stage == "run"));
+    }
+
+    // ---- shell stage kind (P2-1) ----------------------------------------
+
+    /// A one-shell-stage workflow: `run` executes `command`, then hands off
+    /// to a terminal stage on `done` and a human gate on `error`, so a test
+    /// can tell the two outcomes apart by where the task ends up.
+    fn shell_def(command: &str, extra: &str) -> Arc<WorkflowDefinition> {
+        let yaml = format!(
+            r#"
+name: shell-flow
+stages:
+  run:
+    kind: shell
+    command: "{command}"
+{extra}
+    on: {{ done: finished, error: failed }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        Arc::new(WorkflowDefinition::parse(&yaml, Path::new(".")).unwrap())
+    }
+
+    async fn payload_of(pool: &SqlitePool, task_id: &str) -> Value {
+        workflow_state::get(pool, task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload
+    }
+
+    /// Waits for the `shell_output` entry a shell stage records, and
+    /// returns its payload.
+    async fn wait_until_shell_event(pool: &SqlitePool, task_id: &str) -> Value {
+        for _ in 0..500 {
+            let found = events::list_for_task(pool, task_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|e| e.event_type == EventType::ShellOutput);
+            if let Some(event) = found {
+                return event.payload;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for a shell_output event");
+    }
+
+    #[tokio::test]
+    async fn a_successful_shell_stage_advances_through_done() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def("exit 0", "");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "finished").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+    }
+
+    #[tokio::test]
+    async fn a_failing_shell_stage_advances_through_error() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def("exit 7", "");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "failed").await;
+        let event = wait_until_shell_event(&pool, &task_id).await;
+        assert_eq!(event["exit_code"], json!(7));
+        assert_eq!(event["timed_out"], json!(false));
+    }
+
+    /// The capture has to land under `stages.<name>` specifically: that's
+    /// the path P2-3's `{{ stages.run.number }}` templating will resolve.
+    #[tokio::test]
+    async fn capture_json_parses_stdout_into_the_stage_payload() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def(
+            r#"printf '{\"number\": 42, \"url\": \"http://x\"}'"#,
+            "    capture: json",
+        );
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(payload["stages"]["run"]["number"], json!(42));
+        assert_eq!(payload["stages"]["run"]["url"], json!("http://x"));
+    }
+
+    #[tokio::test]
+    async fn capture_text_stores_trimmed_stdout_as_a_string() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def(r#"printf '  hello\n'"#, "    capture: text");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["run"],
+            json!("hello")
+        );
+    }
+
+    /// §5.2 makes the exit code the *only* thing that decides the outcome,
+    /// so stdout that isn't the JSON the stage asked for must not turn a
+    /// successful command into a failed stage.
+    #[tokio::test]
+    async fn unparseable_json_still_succeeds_and_is_captured_as_text() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def("printf 'not json at all'", "    capture: json");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["run"],
+            json!("not json at all")
+        );
+        let event = wait_until_shell_event(&pool, &task_id).await;
+        assert!(
+            event["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not valid JSON"),
+            "expected an explanatory note, got {event}"
+        );
+    }
+
+    /// A failed attempt must not overwrite the capture a successful earlier
+    /// attempt at the same stage left behind — `stages.<name>` is keyed by
+    /// stage, so a retry loop would otherwise poison the value a later
+    /// stage templates.
+    #[tokio::test]
+    async fn a_failed_command_does_not_overwrite_an_earlier_capture() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: retrying
+stages:
+  run:
+    kind: shell
+    command: "if [ -f attempted ]; then exit 1; else touch attempted; printf 'good'; fi"
+    capture: text
+    on: { done: again, error: failed }
+  again:
+    kind: shell
+    command: "true"
+    on: { done: run }
+  failed:
+    kind: terminal
+"#;
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: &def.name,
+                title: "T",
+                config: json!({ "cwd": dir.to_string_lossy() }),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        // First pass captures "good", loops back, second pass exits 1.
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "failed").await;
+
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["run"],
+            json!("good"),
+            "the failed retry should not have replaced the good capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stage_without_capture_writes_no_payload() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def("printf 'ignored output'", "");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        assert_eq!(payload_of(&pool, &task_id).await, json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_command_that_exceeds_its_timeout_is_killed_and_errors() {
+        let pool = connect_in_memory().await.unwrap();
+        // `parse_duration` (shared with `poll`) has whole-second
+        // granularity, so 1s is the shortest timeout expressible.
+        let def = shell_def("sleep 30", "    timeout: 1s");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "failed").await;
+        let event = wait_until_shell_event(&pool, &task_id).await;
+        assert_eq!(event["timed_out"], json!(true));
+        assert_eq!(event["exit_code"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn the_command_and_its_output_land_on_the_task_timeline() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def("printf 'to-stderr' >&2; exit 2", "");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "failed").await;
+
+        let event = wait_until_shell_event(&pool, &task_id).await;
+        assert_eq!(event["stage"], json!("run"));
+        assert!(
+            event["command"].as_str().unwrap().contains("to-stderr"),
+            "expected the command line, got {event}"
+        );
+        assert_eq!(event["stderr_tail"], json!("to-stderr"));
+        assert!(event["duration_ms"].is_number());
+    }
+
+    /// The event belongs to the task, not to any agent session — a shell
+    /// stage opens none — so it must carry a null `task_run_id` and still
+    /// appear on the task's timeline.
+    #[tokio::test]
+    async fn the_shell_event_is_task_scoped_with_no_task_run() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def("exit 0", "");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_shell_event(&pool, &task_id).await;
+
+        let event = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == EventType::ShellOutput)
+            .unwrap();
+        assert_eq!(event.task_run_id, None);
+        assert_eq!(event.task_id, task_id);
+        assert!(
+            task_runs::list_for_task(&pool, &task_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `error` is deliberately optional in a shell stage's `on:` map, so a
+    /// failed command with nowhere to go parks the task where it is rather
+    /// than crashing or inventing a transition.
+    #[tokio::test]
+    async fn a_failure_with_no_error_edge_parks_the_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: no-error-edge
+stages:
+  run:
+    kind: shell
+    command: "exit 1"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        // The command ran and was recorded...
+        let event = wait_until_shell_event(&pool, &task_id).await;
+        assert_eq!(event["exit_code"], json!(1));
+        // ...but there was nowhere to go, so the task stays put.
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "run");
+        assert_eq!(
+            tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+            "open"
+        );
+    }
+
+    /// A shell stage's outcome goes through the same `advance` as every
+    /// other kind's, so `loop_guard` (§5.3) applies to it unchanged.
+    #[tokio::test]
+    async fn a_shell_failure_counts_against_a_loop_guard() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: guarded-shell
+stages:
+  run:
+    kind: shell
+    command: "exit 1"
+    on: { done: finished, error: run }
+    loop_guard: { on: error, max: 2, then: gave_up }
+  gave_up:
+    kind: terminal
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        // Retries itself twice, then the guard reroutes it.
+        wait_until_stage(&pool, &task_id, "gave_up").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+    }
+
+    #[tokio::test]
+    async fn the_command_runs_in_the_tasks_configured_cwd() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("marker-file"), b"x").unwrap();
+
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let def = shell_def("ls", "    capture: text");
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: &def.name,
+                title: "T",
+                config: json!({ "cwd": dir.to_string_lossy() }),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["run"],
+            json!("marker-file")
+        );
+    }
+
+    /// A capture from an earlier stage has to survive later transitions —
+    /// it's the whole point of storing it — and must not be clobbered by
+    /// the `advance` that moves the task on.
+    #[tokio::test]
+    async fn an_earlier_stages_capture_survives_later_transitions() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: two-shells
+stages:
+  first:
+    kind: shell
+    command: "printf 'one'"
+    capture: text
+    on: { done: second }
+  second:
+    kind: shell
+    command: "printf 'two'"
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(payload["stages"]["first"], json!("one"));
+        assert_eq!(payload["stages"]["second"], json!("two"));
+    }
+
+    /// A `script_file` runs under its own shebang rather than as a shell
+    /// string, and its stdout is captured the same way an inline command's
+    /// is.
+    #[tokio::test]
+    async fn a_script_file_stage_runs_and_captures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let script = dir.join("do-it.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'from script'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let yaml = r#"
+name: script-flow
+stages:
+  run:
+    kind: shell
+    script_file: do-it.sh
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["run"],
+            json!("from script")
+        );
+    }
+
+    /// A command that can't be started at all still has to move the task —
+    /// "couldn't run it" and "ran and failed" are the same thing to the
+    /// workflow — and has to say why on the timeline, since nothing else
+    /// records it.
+    #[tokio::test]
+    async fn a_command_that_cannot_start_errors_with_a_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let script = dir.join("not-executable.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let yaml = r#"
+name: bad-script
+stages:
+  run:
+    kind: shell
+    script_file: not-executable.sh
+    on: { done: finished, error: failed }
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: { resumed: finished }
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "failed").await;
+
+        let event = wait_until_shell_event(&pool, &task_id).await;
+        assert!(
+            event["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("failed to start command"),
+            "expected a spawn reason, got {event}"
+        );
+    }
+
+    /// A task busy running a shell command has no session to relay into,
+    /// so a human message is rejected (409 at the API layer) rather than
+    /// silently dropped.
+    #[tokio::test]
+    async fn sending_a_message_to_a_running_shell_stage_is_rejected() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: slow-shell
+stages:
+  run:
+    kind: shell
+    command: "sleep 30"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        std::fs::write(dir.join("slow-shell.yaml"), yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        let err = engine
+            .send_message_or_resume(&task_id, "are you there?")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendMessageOrResumeError::UnsupportedStageKind(stage) if stage == "run"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_capture_goes_under_the_stages_namespace() {
+        let mut payload = json!({});
+        merge_stage_capture(&mut payload, "open_pr", json!({"number": 42}));
+        assert_eq!(payload, json!({"stages": {"open_pr": {"number": 42}}}));
+
+        // A second stage joins it rather than replacing it.
+        merge_stage_capture(&mut payload, "checks", json!("green"));
+        assert_eq!(
+            payload,
+            json!({"stages": {"open_pr": {"number": 42}, "checks": "green"}})
+        );
+
+        // Re-entering a stage overwrites just that stage's value.
+        merge_stage_capture(&mut payload, "open_pr", json!({"number": 43}));
+        assert_eq!(payload["stages"]["open_pr"]["number"], json!(43));
+        assert_eq!(payload["stages"]["checks"], json!("green"));
+    }
+
+    /// A payload (or a `stages` key) that isn't an object can't be merged
+    /// into, and dropping the capture there would lose it silently.
+    #[test]
+    fn a_capture_replaces_a_non_object_payload_rather_than_vanishing() {
+        let mut payload = json!("not an object");
+        merge_stage_capture(&mut payload, "run", json!(1));
+        assert_eq!(payload, json!({"stages": {"run": 1}}));
+
+        let mut payload = json!({"stages": "also not an object"});
+        merge_stage_capture(&mut payload, "run", json!(2));
+        assert_eq!(payload, json!({"stages": {"run": 2}}));
+    }
+
+    #[test]
+    fn an_oversized_capture_is_skipped_with_an_explanation() {
+        let huge = "x".repeat(MAX_CAPTURE_BYTES + 1);
+        let (captured, note) = derive_capture(Some(Capture::Text), &huge, "task", "run");
+        assert!(captured.is_none());
+        assert!(note.unwrap().contains("exceeds"));
+
+        // The limit itself is fine.
+        let at_limit = "y".repeat(MAX_CAPTURE_BYTES);
+        let (captured, note) = derive_capture(Some(Capture::Text), &at_limit, "task", "run");
+        assert_eq!(captured, Some(Value::String(at_limit)));
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn event_output_tails_are_bounded_and_utf8_safe() {
+        assert_eq!(tail("  short  "), "short");
+
+        let long = "é".repeat(EVENT_OUTPUT_TAIL_BYTES);
+        let tailed = tail(&long);
+        assert!(tailed.starts_with('…'));
+        // Truncation landed on a char boundary, so the tail is still the
+        // same character repeated — no replacement chars, no panic.
+        assert!(tailed.trim_start_matches('…').chars().all(|c| c == 'é'));
     }
 
     #[test]

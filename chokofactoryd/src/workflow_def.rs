@@ -138,6 +138,21 @@ impl WorkflowDefinition {
                 }
             }
 
+            // A shell stage always concludes with one of exactly two
+            // outcomes (§5.2), and `error` is legitimately optional — a
+            // workflow may want a failed command to park the task for a
+            // human rather than route anywhere. `done` isn't: a stage that
+            // can't act on the success path is a typo every time, and
+            // without this the mistake only surfaces at runtime as an
+            // `UnknownOutcome` from a detached runner, long after the
+            // definition was loaded. Same shape as the `MissingTimeoutOutcome`
+            // rule for `poll` below.
+            if matches!(stage.kind, StageKind::Shell { .. }) && !stage.on.contains_key("done") {
+                return Err(WorkflowDefError::MissingShellDoneOutcome {
+                    stage: stage_name.clone(),
+                });
+            }
+
             if let StageKind::Poll {
                 timeout, outcomes, ..
             } = &stage.kind
@@ -238,6 +253,14 @@ pub enum StageKind {
     Shell {
         command: ShellCommand,
         capture: Option<Capture>,
+        /// How long the command may run before it's killed and the stage
+        /// emits `error`. §5.2 gives `timeout` only to `poll`, but a
+        /// `shell` stage has no reaper of any kind behind it — unlike an
+        /// `agent_turn`, which the idle reaper eventually force-closes —
+        /// so without this a hung command parks its task until the daemon
+        /// restarts. Optional: `None` means run to completion, however
+        /// long that takes.
+        timeout: Option<Duration>,
     },
     Poll {
         command: String,
@@ -255,9 +278,13 @@ pub enum ShellCommand {
     ScriptFile(PathBuf),
 }
 
+/// What to do with a `shell`/`poll` stage's stdout (§5.1). Absent
+/// entirely, the output is simply not retained — only a stage that says
+/// what it wants captured writes into `workflow_state.payload`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capture {
     Json,
+    Text,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -325,6 +352,8 @@ enum RawStageKind {
         script_file: Option<String>,
         #[serde(default)]
         capture: Option<Capture>,
+        #[serde(default)]
+        timeout: Option<String>,
     },
     Poll {
         command: String,
@@ -353,8 +382,9 @@ impl<'de> Deserialize<'de> for Capture {
         let s = String::deserialize(deserializer)?;
         match s.as_str() {
             "json" => Ok(Capture::Json),
+            "text" => Ok(Capture::Text),
             other => Err(serde::de::Error::custom(format!(
-                "unsupported capture kind '{other}' (expected 'json')"
+                "unsupported capture kind '{other}' (expected 'json' or 'text')"
             ))),
         }
     }
@@ -375,6 +405,7 @@ impl RawStage {
                 command,
                 script_file,
                 capture,
+                timeout,
             } => {
                 let resolved_command = match (command, script_file) {
                     (Some(command), None) => ShellCommand::Inline(command),
@@ -398,6 +429,17 @@ impl RawStage {
                 StageKind::Shell {
                     command: resolved_command,
                     capture,
+                    timeout: timeout
+                        .map(|value| {
+                            parse_duration(&value).map_err(|value| {
+                                WorkflowDefError::InvalidDuration {
+                                    stage: stage_name.to_string(),
+                                    field: "timeout",
+                                    value,
+                                }
+                            })
+                        })
+                        .transpose()?,
                 }
             }
             RawStageKind::Poll {
@@ -536,6 +578,9 @@ pub enum WorkflowDefError {
     MissingShellCommand {
         stage: String,
     },
+    MissingShellDoneOutcome {
+        stage: String,
+    },
     InvalidDuration {
         stage: String,
         field: &'static str,
@@ -603,6 +648,10 @@ impl fmt::Display for WorkflowDefError {
             WorkflowDefError::MissingShellCommand { stage } => write!(
                 f,
                 "stage '{stage}' is a shell stage but sets neither 'command' nor 'script_file'"
+            ),
+            WorkflowDefError::MissingShellDoneOutcome { stage } => write!(
+                f,
+                "stage '{stage}' is a shell stage but has no 'done' key in its 'on:' map"
             ),
             WorkflowDefError::InvalidDuration {
                 stage,
@@ -829,11 +878,17 @@ stages:
         assert_eq!(guard.max, 3);
         assert_eq!(guard.then, "escalate_to_human");
 
-        let StageKind::Shell { command, capture } = &def.stages["open_pr"].kind else {
+        let StageKind::Shell {
+            command,
+            capture,
+            timeout,
+        } = &def.stages["open_pr"].kind
+        else {
             panic!("expected shell stage");
         };
         assert!(matches!(command, ShellCommand::Inline(_)));
         assert_eq!(*capture, Some(Capture::Json));
+        assert_eq!(*timeout, None);
     }
 
     #[test]
@@ -1023,6 +1078,116 @@ stages:
             err,
             WorkflowDefError::AmbiguousShellCommand { stage } if stage == "run"
         ));
+    }
+
+    #[test]
+    fn parses_a_shell_stage_with_capture_text_and_a_timeout() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: shelly
+stages:
+  run:
+    kind: shell
+    command: "echo hi"
+    capture: text
+    timeout: 5m
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::Shell {
+            capture, timeout, ..
+        } = &def.stages["run"].kind
+        else {
+            panic!("expected shell stage");
+        };
+        assert_eq!(*capture, Some(Capture::Text));
+        assert_eq!(*timeout, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn rejects_an_unsupported_capture_kind() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: shelly
+stages:
+  run:
+    kind: shell
+    command: "echo hi"
+    capture: yaml
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            err.to_string().contains("expected 'json' or 'text'"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_shell_timeout() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  run:
+    kind: shell
+    command: "true"
+    timeout: eventually
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidDuration { stage, field, value }
+                if stage == "run" && field == "timeout" && value == "eventually"
+        ));
+    }
+
+    /// Without a `done` edge a successful command has nowhere to go, and
+    /// the mistake would otherwise only surface at runtime — long after the
+    /// definition was loaded — as a task silently parked mid-workflow.
+    #[test]
+    fn rejects_a_shell_stage_with_no_done_outcome() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  run:
+    kind: shell
+    command: "true"
+    on: { error: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::MissingShellDoneOutcome { stage } if stage == "run"
+        ));
+    }
+
+    /// `error` stays optional, though: a workflow may deliberately want a
+    /// failed command to park the task for a human.
+    #[test]
+    fn accepts_a_shell_stage_with_only_a_done_outcome() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: fine
+stages:
+  run:
+    kind: shell
+    command: "true"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
     }
 
     #[test]
