@@ -687,7 +687,11 @@ impl WorkflowEngine {
     /// [`Self::advance`] for a caller that ran detached work for a specific
     /// stage: it only applies `outcome` if the task is still *in*
     /// `expected_stage`, and stores `capture` (a `shell` stage's `capture:`,
-    /// §5.1) into `workflow_state.payload` under `stages.<expected_stage>`.
+    /// §5.1) into `workflow_state.payload` under the stage it transitions
+    /// *from* — which, once the check below has passed, is
+    /// `expected_stage`. (Passing a `capture` with no `expected_stage` would
+    /// key it to whatever stage happened to be current; no caller does, and
+    /// the check exists so none can do it unknowingly.)
     ///
     /// The capture is threaded *through* the transition rather than written
     /// by the caller beforehand, and that is the whole point of this
@@ -1032,14 +1036,19 @@ impl WorkflowEngine {
                 // means the command *did* run — possibly for a long time,
                 // possibly mutating the working copy — and only reading its
                 // output failed. Reporting both as "could not be started"
-                // would actively mislead.
-                let message = match err {
-                    shell::ShellError::Spawn(_) => "shell stage command could not be started",
-                    shell::ShellError::Io(_) => {
+                // would actively mislead. Two call sites rather than one
+                // interpolated message, so each stays a static string that
+                // log aggregation can group on.
+                match err {
+                    shell::ShellError::Spawn(_) => tracing::error!(
+                        task_id, stage = stage_name, %err,
+                        "shell stage command could not be started"
+                    ),
+                    shell::ShellError::Io(_) => tracing::error!(
+                        task_id, stage = stage_name, %err,
                         "shell stage command ran but its output could not be read"
-                    }
-                };
-                tracing::error!(task_id, stage = stage_name, %err, "{message}");
+                    ),
+                }
                 self.append_shell_event(
                     task_id,
                     json!({
@@ -1070,7 +1079,7 @@ impl WorkflowEngine {
         // on a timeout, with an empty string). A later
         // `{{ stages.open_pr.number }}` would then resolve against garbage.
         // The command's output is still on the timeline either way.
-        let (captured, note) = if outcome.succeeded() {
+        let (captured, mut note) = if outcome.succeeded() {
             derive_capture(capture, &outcome.stdout, task_id, stage_name)
         } else if capture.is_some() {
             (
@@ -1085,7 +1094,19 @@ impl WorkflowEngine {
             tracing::warn!(
                 task_id,
                 stage = stage_name,
+                escaped = outcome.escaped,
                 "shell stage command exceeded its timeout and was killed"
+            );
+        }
+        // Outranks any capture note: the workflow is about to follow its
+        // `on: error` edge, quite possibly straight back into this same
+        // command, while the last one is still running in the same working
+        // copy. The timeline is where an operator would find that out.
+        if outcome.escaped {
+            note = Some(
+                "timed out, and the command's process group did not exit — something escaped it \
+                 and may still be running"
+                    .to_string(),
             );
         }
 
@@ -3058,6 +3079,35 @@ stages:
             matches!(&err, SendMessageOrResumeError::UnsupportedStageKind(stage) if stage == "run"),
             "got {err:?}"
         );
+    }
+
+    /// The whole point of `expected_stage` is to refuse an outcome from a
+    /// stage the task has already left. Every other shell test exercises the
+    /// path where it matches, so this pins down the path where it doesn't —
+    /// the one P2-2's longer-running `poll` is expected to hit.
+    #[tokio::test]
+    async fn an_outcome_for_a_stage_the_task_has_left_is_discarded() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = shell_def("exit 0", "");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let err = engine
+            .advance_from_stage(&task_id, &def, "done", Some("run"), Some(json!("late")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::StageMovedOn { expected, actual }
+                if expected == "run" && actual == "finished"),
+            "got {err:?}"
+        );
+        // Neither the transition nor the capture was applied.
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "finished");
+        assert_eq!(state.payload, json!({}));
     }
 
     #[test]

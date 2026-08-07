@@ -38,6 +38,13 @@ pub struct ShellOutcome {
     pub stderr: String,
     pub duration: Duration,
     pub timed_out: bool,
+    /// The command was killed but its process group didn't finish dying
+    /// within [`REAP_GRACE`] — something escaped the group and is likely
+    /// still running in the task's working directory. Only ever set
+    /// alongside `timed_out`; surfaced to the operator rather than folded
+    /// into an ordinary timeout, since the workflow is about to retry on
+    /// top of whatever survived.
+    pub escaped: bool,
 }
 
 impl ShellOutcome {
@@ -122,11 +129,27 @@ fn kill_group(pid: u32) {
     let Ok(pgid) = i32::try_from(pid) else {
         return;
     };
+    // `killpg(0, …)` means "my own process group" — the daemon would
+    // SIGKILL itself and everything sharing its group. `child.id()` can't
+    // return 0, so this is unreachable; it's here because the cost of the
+    // check is two lines and the cost of being wrong is the whole daemon.
+    if pgid <= 0 {
+        return;
+    }
     // SAFETY: `killpg` is async-signal-safe and merely sends a signal; the
     // only failure modes are "no such group" and "not permitted", both of
     // which are reported through the return value rather than by any
-    // memory effect. The pgid is the child's own pid, which is still
-    // un-reusable here because tokio has not yet waited on it.
+    // memory effect.
+    //
+    // The pgid is the child's own pid. On the timeout path tokio has not
+    // yet waited on it, so it cannot have been reused. On the `Io` paths
+    // this runs from `Drop` after `wait_with_output` already returned an
+    // error, and `try_join3` may have reaped the child before the pipe read
+    // failed — leaving a window in which the pid could in principle have
+    // been reused by a new group leader. That needs a rare pipe error plus
+    // immediate pid reuse in the same instant; killing on `Io` is still the
+    // right call, since the alternative is orphaning a command that may
+    // well still be running.
     let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
     if result != 0 {
         let err = std::io::Error::last_os_error();
@@ -175,6 +198,15 @@ pub async fn run(
         // `make && npm test` can't leave grandchildren running in the
         // task's working copy while the workflow retries the same command
         // on top of them.
+        //
+        // The tradeoff: a command in its own group no longer receives the
+        // terminal's signals, so Ctrl-C on a foreground daemon reaches the
+        // daemon but not the command. The daemon installs no shutdown
+        // handler today, so neither this guard nor `kill_on_drop` runs on
+        // exit and such a command outlives it. That only affects foreground
+        // dev runs, and it's strictly smaller than the orphaned-tree
+        // problem above; the real fix is graceful shutdown, which is not
+        // this change's to make.
         .process_group(0)
         .kill_on_drop(true);
 
@@ -203,17 +235,42 @@ pub async fn run(
                 // The pipes are still open, so finishing the wait both
                 // reaps the zombie and yields whatever the command managed
                 // to print before it died — the most useful thing an
-                // operator gets from a hung stage. Bounded, because a
-                // process wedged in uninterruptible I/O won't die even on
-                // SIGKILL and must not wedge this task with it.
+                // operator gets from a hung stage. Bounded, because the
+                // wait can fail to complete for reasons SIGKILL can't fix
+                // (see `escaped` below) and must not wedge this task.
                 let collected = tokio::time::timeout(REAP_GRACE, &mut wait).await;
                 group.disarm();
-                let (stdout, stderr) = match collected {
+                let (stdout, stderr, escaped) = match collected {
                     Ok(Ok(output)) => (
                         String::from_utf8_lossy(&output.stdout).into_owned(),
                         String::from_utf8_lossy(&output.stderr).into_owned(),
+                        false,
                     ),
-                    _ => (String::new(), String::new()),
+                    // The command ran and was killed; failing to read what
+                    // it printed loses a diagnostic, not the outcome.
+                    Ok(Err(err)) => {
+                        tracing::warn!(%err, "could not read a killed command's output");
+                        (String::new(), String::new(), true)
+                    }
+                    // SIGKILL went out and the wait still hasn't finished.
+                    // `wait_with_output` needs EOF on both pipes as well as
+                    // the child's exit, so the reachable cause isn't
+                    // uninterruptible I/O — it's a process that escaped the
+                    // group (`setsid`, `nohup … &`, anything that
+                    // double-forks) and is holding the inherited pipes open
+                    // while still running in the task's working copy. That
+                    // is precisely what the process group exists to
+                    // prevent, so it must not be reported as an ordinary
+                    // timeout: the caller surfaces `escaped` on the
+                    // timeline, because a workflow's `on: error` edge is
+                    // about to start another copy on top of it.
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            grace_secs = REAP_GRACE.as_secs(),
+                            "a killed command's process group did not exit; something escaped it and may still be running"
+                        );
+                        (String::new(), String::new(), true)
+                    }
                 };
                 return Ok(ShellOutcome {
                     exit_code: None,
@@ -221,6 +278,7 @@ pub async fn run(
                     stderr,
                     duration: started.elapsed(),
                     timed_out: true,
+                    escaped,
                 });
             }
         },
@@ -240,6 +298,7 @@ pub async fn run(
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         duration: started.elapsed(),
         timed_out: false,
+        escaped: false,
     })
 }
 
@@ -363,11 +422,17 @@ mod tests {
                 marker.display()
             )),
             dir.path(),
-            Some(Duration::from_millis(1)),
+            // Long enough that `sh` has certainly forked the grandchild
+            // before the kill lands. With a 1ms timeout this test could
+            // pass on a loaded machine because nothing had been forked
+            // yet — never failing spuriously, but quietly ceasing to test
+            // anything.
+            Some(Duration::from_millis(300)),
         )
         .await
         .unwrap();
         assert!(outcome.timed_out);
+        assert!(!outcome.escaped, "the group should have died on SIGKILL");
 
         // Well past when the grandchild would have fired had it lived.
         tokio::time::sleep(Duration::from_secs(3)).await;
