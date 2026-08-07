@@ -1102,10 +1102,15 @@ impl WorkflowEngine {
         // `on: error` edge, quite possibly straight back into this same
         // command, while the last one is still running in the same working
         // copy. The timeline is where an operator would find that out.
+        //
+        // Worded for what both `escaped` arms actually know — one saw the
+        // group outlive SIGKILL, the other only failed to read its pipes —
+        // and kept short enough to survive `choco task events`' 100-char
+        // line budget, since being truncated before "may still be running"
+        // would defeat the point of recording it.
         if outcome.escaped {
             note = Some(
-                "timed out, and the command's process group did not exit — something escaped it \
-                 and may still be running"
+                "could not confirm the process group exited — something may still be running"
                     .to_string(),
             );
         }
@@ -1115,6 +1120,10 @@ impl WorkflowEngine {
             "command": described,
             "exit_code": outcome.exit_code,
             "timed_out": outcome.timed_out,
+            // A queryable sibling of `timed_out` rather than only a phrase
+            // inside `note`, so "did any stage leave something running?" is
+            // answerable from `choco --json` without matching free text.
+            "escaped": outcome.escaped,
             "duration_ms": duration_ms(outcome.duration),
             "stdout_tail": tail(&outcome.stdout),
             "stderr_tail": tail(&outcome.stderr),

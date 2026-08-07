@@ -38,12 +38,16 @@ pub struct ShellOutcome {
     pub stderr: String,
     pub duration: Duration,
     pub timed_out: bool,
-    /// The command was killed but its process group didn't finish dying
-    /// within [`REAP_GRACE`] — something escaped the group and is likely
-    /// still running in the task's working directory. Only ever set
-    /// alongside `timed_out`; surfaced to the operator rather than folded
-    /// into an ordinary timeout, since the workflow is about to retry on
-    /// top of whatever survived.
+    /// The command was killed, but this module could not confirm its
+    /// process group actually died — either the group outlived SIGKILL for
+    /// [`REAP_GRACE`] (something escaped it and is holding the inherited
+    /// pipes open) or reading its output failed, which short-circuits the
+    /// wait and so proves nothing about the child either.
+    ///
+    /// Deliberately "could not confirm" rather than "did not exit": the
+    /// conservative reading is the safe one here, because the caller is
+    /// about to follow an `error` edge and retry on top of whatever
+    /// survived. Only ever set alongside `timed_out`.
     pub escaped: bool,
 }
 

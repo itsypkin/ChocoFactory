@@ -435,7 +435,10 @@ scripting runtime (see §7 non-goal):
   entry belongs to the task and carries no `task_run_id`. A `timeout:`
   kills the command's whole process group, not just the shell the daemon
   spawned, so a timed-out pipeline can't leave grandchildren running in the
-  working copy while the workflow retries. Known gap: a shell stage
+  working copy while the workflow retries. A process that escapes the group
+  anyway (`setsid`, a double-fork) can still outlive the kill; that isn't
+  silently tolerated — the stage reports it on the timeline so an operator
+  knows a retry is about to run on top of something still live. Known gap: a shell stage
   interrupted by a daemon restart has no `task_run` row and no recovery
   hook, so its task parks at the stage it had entered — the same class of
   gap an interrupted `agent_turn` has, but without the stale-run sweep that

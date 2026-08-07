@@ -653,6 +653,19 @@ mod tests {
                        "stdout_tail": "", "stderr_tail": ""}),
                 "$ sleep 600 → timed out",
             ),
+            // The one that matters most: a timed-out command whose process
+            // group may have survived. The whole clause has to fit inside
+            // `one_line`'s budget alongside a realistic command, or the
+            // operator never sees the part that tells them something is
+            // still running.
+            (
+                EventType::ShellOutput,
+                json!({"stage": "build", "command": "make build",
+                       "exit_code": null, "timed_out": true, "escaped": true,
+                       "duration_ms": 300000, "stdout_tail": "", "stderr_tail": "",
+                       "note": "could not confirm the process group exited — something may still be running"}),
+                "$ make build → timed out could not confirm the process group exited — something may still be running",
+            ),
             // A `note` outranks the command's own chatter — it's the part
             // that explains a surprising result.
             (
