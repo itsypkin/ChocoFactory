@@ -66,19 +66,18 @@ pub async fn append(
     Ok(row.into())
 }
 
-/// Appends a stage-transition entry to a task's timeline (X-3).
-///
-/// Unlike [`append`] this belongs to the task rather than to any agent
-/// session, so `task_run_id` is NULL: `human_gate` and `terminal` stages
-/// never open a session at all, and a task's entry stage is recorded before
-/// one exists. `entered_via` is the transition outcome that selected this
-/// stage — `None` for the entry stage — and is stored under the payload key
-/// `outcome`.
-pub async fn append_stage_transition(
+/// Appends an entry that belongs to the *task* rather than to any agent
+/// session, so `task_run_id` is NULL (X-3): stage transitions happen in
+/// stages that never open a session (`human_gate`, `terminal`) and before
+/// one exists (a task's entry stage), and a `shell` stage (P2-1) has no
+/// `task_run` at all. Unlike [`append`] there is no run to derive `task_id`
+/// from, so the caller supplies it directly — an unknown `task_id` is a
+/// foreign-key violation rather than `RowNotFound`.
+pub async fn append_for_task(
     pool: &SqlitePool,
     task_id: &str,
-    stage: &str,
-    entered_via: Option<&str>,
+    event_type: EventType,
+    payload: Value,
 ) -> Result<Event, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -89,12 +88,32 @@ pub async fn append_stage_transition(
     ))
     .bind(id)
     .bind(task_id)
-    .bind(EventType::StageEntered.to_string())
-    .bind(Json(json!({ "stage": stage, "outcome": entered_via })))
+    .bind(event_type.to_string())
+    .bind(Json(payload))
     .bind(now)
     .fetch_one(pool)
     .await?;
     Ok(row.into())
+}
+
+/// Appends a stage-transition entry to a task's timeline (X-3).
+///
+/// `entered_via` is the transition outcome that selected this stage —
+/// `None` for the entry stage — and is stored under the payload key
+/// `outcome`.
+pub async fn append_stage_transition(
+    pool: &SqlitePool,
+    task_id: &str,
+    stage: &str,
+    entered_via: Option<&str>,
+) -> Result<Event, sqlx::Error> {
+    append_for_task(
+        pool,
+        task_id,
+        EventType::StageEntered,
+        json!({ "stage": stage, "outcome": entered_via }),
+    )
+    .await
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Event>, sqlx::Error> {

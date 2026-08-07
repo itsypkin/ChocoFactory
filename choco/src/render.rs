@@ -313,7 +313,8 @@ pub fn events(page: &EventsPage) -> String {
 /// tool kinds — which carry no single "the interesting bit" field, so they
 /// get composed rather than probed. Tool events dominate a real coding
 /// transcript, so dumping their raw JSON here would defeat the point of
-/// this view.
+/// this view. The engine's own task-scoped events (`stage_entered`,
+/// `shell_output`) are composed for the same reason.
 fn event_summary(event: &Event) -> String {
     let payload = &event.payload;
 
@@ -327,6 +328,44 @@ fn event_summary(event: &Event) -> String {
                 Some(outcome) => format!("{stage}  (via {outcome})"),
                 None => stage.to_string(),
             }
+        }
+        // Likewise `{stage, command, exit_code, …}` (P2-1): the fallback
+        // would find no "text"-ish key and dump the raw object, when what
+        // a reader wants is the command and whether it worked.
+        EventType::ShellOutput => {
+            let command = payload
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let status = if payload
+                .get("timed_out")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                "timed out".to_string()
+            } else {
+                match payload.get("exit_code").and_then(Value::as_i64) {
+                    Some(code) => format!("exit {code}"),
+                    // No exit code and no timeout: killed by a signal, or
+                    // never started at all (`note` carries the reason).
+                    None => "did not exit cleanly".to_string(),
+                }
+            };
+            let mut summary = format!("$ {command}  →  {status}");
+            // Whatever explains a surprising result — the spawn failure, an
+            // uncaptured oversized output, JSON that wouldn't parse —
+            // outranks the command's own chatter.
+            for key in ["note", "stderr_tail", "stdout_tail"] {
+                match payload.get(key).and_then(Value::as_str) {
+                    Some(detail) if !detail.is_empty() => {
+                        summary.push_str("  ");
+                        summary.push_str(detail);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            one_line(&summary)
         }
         EventType::ToolCall => {
             let tool = payload.get("tool").and_then(Value::as_str).unwrap_or("?");
@@ -590,6 +629,52 @@ mod tests {
                 EventType::StageEntered,
                 json!({"stage": "gate", "outcome": null}),
                 "gate",
+            ),
+            // Same for a shell stage's output: the command and whether it
+            // worked, not the raw payload object.
+            (
+                EventType::ShellOutput,
+                json!({"stage": "open_pr", "command": "gh pr create --fill",
+                       "exit_code": 0, "timed_out": false, "duration_ms": 840,
+                       "stdout_tail": "", "stderr_tail": ""}),
+                "$ gh pr create --fill → exit 0",
+            ),
+            (
+                EventType::ShellOutput,
+                json!({"stage": "open_pr", "command": "gh pr create --fill",
+                       "exit_code": 1, "timed_out": false, "duration_ms": 840,
+                       "stdout_tail": "", "stderr_tail": "no commits between"}),
+                "$ gh pr create --fill → exit 1 no commits between",
+            ),
+            (
+                EventType::ShellOutput,
+                json!({"stage": "checks", "command": "sleep 600",
+                       "exit_code": null, "timed_out": true, "duration_ms": 300000,
+                       "stdout_tail": "", "stderr_tail": ""}),
+                "$ sleep 600 → timed out",
+            ),
+            // The one that matters most: a timed-out command whose process
+            // group may have survived. The whole clause has to fit inside
+            // `one_line`'s budget alongside a realistic command, or the
+            // operator never sees the part that tells them something is
+            // still running.
+            (
+                EventType::ShellOutput,
+                json!({"stage": "build", "command": "make build",
+                       "exit_code": null, "timed_out": true, "escaped": true,
+                       "duration_ms": 300000, "stdout_tail": "", "stderr_tail": "",
+                       "note": "could not confirm the process group exited — something may still be running"}),
+                "$ make build → timed out could not confirm the process group exited — something may still be running",
+            ),
+            // A `note` outranks the command's own chatter — it's the part
+            // that explains a surprising result.
+            (
+                EventType::ShellOutput,
+                json!({"stage": "run", "command": "./deploy.sh",
+                       "exit_code": null, "timed_out": false, "duration_ms": 0,
+                       "stdout_tail": "", "stderr_tail": "",
+                       "note": "failed to start command: permission denied"}),
+                "$ ./deploy.sh → did not exit cleanly failed to start command: permission denied",
             ),
         ];
         for (event_type, payload, expected) in cases {
