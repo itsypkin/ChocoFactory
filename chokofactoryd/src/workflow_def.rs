@@ -537,6 +537,13 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     let secs = amount
         .checked_mul(multiplier)
         .ok_or_else(|| s.to_string())?;
+    // Zero is never what anyone meant: as a shell `timeout:` it elapses on
+    // the first poll, so the command is killed before it can do anything;
+    // as a poll `interval:` it's a busy loop. Rejecting it at load time
+    // beats either behaviour at runtime.
+    if secs == 0 {
+        return Err(s.to_string());
+    }
     Ok(Duration::from_secs(secs))
 }
 
@@ -1125,6 +1132,30 @@ stages:
             err.to_string().contains("expected 'json' or 'text'"),
             "got {err}"
         );
+    }
+
+    /// A zero timeout would kill every command before it could run, and a
+    /// zero poll interval is a busy loop — neither is ever intended.
+    #[test]
+    fn rejects_a_zero_duration() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  run:
+    kind: shell
+    command: "true"
+    timeout: 0s
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::InvalidDuration { stage, field, value }
+                if stage == "run" && field == "timeout" && value == "0s"
+        ));
     }
 
     #[test]

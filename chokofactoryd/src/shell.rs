@@ -7,6 +7,15 @@
 //!
 //! Deliberately knows nothing about tasks, stages, or the database: it
 //! takes a command and a working directory and reports what happened.
+//!
+//! The command inherits the daemon's environment wholesale, like every
+//! other subprocess this codebase spawns (`adapter/claude.rs`,
+//! `worktree.rs`) — a stage command is operator-authored YAML, trusted the
+//! same way the daemon's own configuration is. Output is buffered in full
+//! before any cap is applied, so a command that prints without bound is
+//! bounded only by memory; that is the same exposure `worktree.rs` already
+//! carries, and streaming it would mean draining both pipes by hand for
+//! every command.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -60,6 +69,75 @@ impl std::fmt::Display for ShellError {
 
 impl std::error::Error for ShellError {}
 
+/// How long to wait for a killed process group to actually die before
+/// giving up on collecting its output. SIGKILL is not refusable, so this
+/// only matters for a process stuck in uninterruptible I/O — which must
+/// not take the task down with it.
+const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Kills a command's whole process group when dropped, unless disarmed.
+///
+/// `Command::kill_on_drop` only signals the process the daemon spawned. An
+/// inline command is `sh -c "<line>"`, so for anything that isn't a single
+/// leaf process — a pipeline, `make && npm test`, a script that backgrounds
+/// work — the grandchildren survive and keep running in the task's working
+/// directory. The stage meanwhile reports `error`, and a workflow with
+/// `on: { error: <self> }` and a `loop_guard` promptly starts another copy
+/// on top of the first.
+///
+/// Paired with `Command::process_group(0)`, which makes the child a group
+/// leader whose pgid equals its pid.
+struct ProcessGroup(Option<u32>);
+
+impl ProcessGroup {
+    fn armed(pid: Option<u32>) -> Self {
+        // `None` means the child already exited and tokio reaped it, so
+        // there is no group left to signal.
+        ProcessGroup(pid)
+    }
+
+    /// Signals the group now, and stops the drop path from signalling it a
+    /// second time.
+    fn kill(&mut self) {
+        if let Some(pid) = self.0.take() {
+            kill_group(pid);
+        }
+    }
+
+    /// The command is over on its own; there is nothing left to kill.
+    /// Signalling anyway would risk hitting an unrelated process that has
+    /// since been given the same pid.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn kill_group(pid: u32) {
+    let Ok(pgid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: `killpg` is async-signal-safe and merely sends a signal; the
+    // only failure modes are "no such group" and "not permitted", both of
+    // which are reported through the return value rather than by any
+    // memory effect. The pgid is the child's own pid, which is still
+    // un-reusable here because tokio has not yet waited on it.
+    let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        // ESRCH just means the group is already gone, which is the common
+        // and entirely fine case.
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            tracing::warn!(pgid, %err, "failed to kill a shell command's process group");
+        }
+    }
+}
+
 /// Runs `command` in `cwd` to completion, or kills it once `timeout`
 /// elapses.
 ///
@@ -90,40 +168,67 @@ pub async fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Both the timeout path below and a dropped caller rely on this:
-        // without it the child outlives the future that was awaiting it
-        // and keeps running — and mutating the task's working copy —
-        // unsupervised. Same convention as `adapter/claude.rs` and
-        // `worktree.rs`.
+        // `kill_on_drop` alone only reaps the process the daemon spawned —
+        // for an inline command that's the `sh`, not the pipeline or build
+        // it started. Putting the command in its own process group lets
+        // `ProcessGroup` below signal the whole tree, so a timed-out
+        // `make && npm test` can't leave grandchildren running in the
+        // task's working copy while the workflow retries the same command
+        // on top of them.
+        .process_group(0)
         .kill_on_drop(true);
 
     let started = Instant::now();
-    let child = cmd.spawn().map_err(ShellError::Spawn)?;
+    let mut child = cmd.spawn().map_err(ShellError::Spawn)?;
+
+    // Armed until the command is known to be over: every early return below
+    // (an I/O failure, the caller dropping this future mid-run) then reaps
+    // the whole group on the way out rather than orphaning it.
+    let mut group = ProcessGroup::armed(child.id());
+    // `stdin` is `Stdio::null()`, so nothing can be blocked writing to the
+    // child; dropping our handle just closes an unused pipe.
+    drop(child.stdin.take());
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
 
     let output = match timeout {
-        // Dropping the `wait_with_output` future on elapse drops the child
-        // with it, and `kill_on_drop` reaps it — there is no branch here
-        // that leaves the process running.
-        //
-        // Whatever the child had printed before being killed goes with it:
-        // `wait_with_output` buffers internally and only yields on
-        // completion, so recovering partial output would mean draining both
-        // pipes into our own buffers for every command, timeout or not.
-        // Not worth it — a timed-out stage's useful signal is that it hung,
-        // and that is reported.
-        Some(limit) => match tokio::time::timeout(limit, child.wait_with_output()).await {
-            Ok(result) => result.map_err(ShellError::Io)?,
+        Some(limit) => match tokio::time::timeout(limit, &mut wait).await {
+            Ok(result) => {
+                let output = result.map_err(ShellError::Io)?;
+                group.disarm();
+                output
+            }
             Err(_elapsed) => {
+                group.kill();
+                // The pipes are still open, so finishing the wait both
+                // reaps the zombie and yields whatever the command managed
+                // to print before it died — the most useful thing an
+                // operator gets from a hung stage. Bounded, because a
+                // process wedged in uninterruptible I/O won't die even on
+                // SIGKILL and must not wedge this task with it.
+                let collected = tokio::time::timeout(REAP_GRACE, &mut wait).await;
+                group.disarm();
+                let (stdout, stderr) = match collected {
+                    Ok(Ok(output)) => (
+                        String::from_utf8_lossy(&output.stdout).into_owned(),
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    ),
+                    _ => (String::new(), String::new()),
+                };
                 return Ok(ShellOutcome {
                     exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout,
+                    stderr,
                     duration: started.elapsed(),
                     timed_out: true,
                 });
             }
         },
-        None => child.wait_with_output().await.map_err(ShellError::Io)?,
+        None => {
+            let output = wait.await.map_err(ShellError::Io)?;
+            group.disarm();
+            output
+        }
     };
 
     Ok(ShellOutcome {
@@ -240,6 +345,54 @@ mod tests {
         assert!(outcome.duration < Duration::from_secs(5));
     }
 
+    /// The timeout has to reap the command's whole process tree, not just
+    /// the `sh` we spawned. Otherwise a timed-out pipeline or build keeps
+    /// running in the task's working copy while the workflow's `on: error`
+    /// edge starts another copy on top of it.
+    ///
+    /// The grandchild here touches a file after a delay; if it survived the
+    /// timeout, that file would appear.
+    #[tokio::test]
+    async fn a_timeout_kills_the_whole_process_group_not_just_the_shell() {
+        let dir = TempDir::new();
+        let marker = dir.path().join("grandchild-survived");
+
+        let outcome = run(
+            &inline(&format!(
+                "sh -c 'sleep 2; touch {}' & wait",
+                marker.display()
+            )),
+            dir.path(),
+            Some(Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.timed_out);
+
+        // Well past when the grandchild would have fired had it lived.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "grandchild outlived the timeout and kept working in the task's cwd"
+        );
+    }
+
+    /// A killed command's partial output is still worth reporting — it is
+    /// often the only clue about where the command hung.
+    #[tokio::test]
+    async fn a_timed_out_command_still_reports_what_it_printed() {
+        let outcome = run(
+            &inline("printf 'got this far'; sleep 30"),
+            &std::env::temp_dir(),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.timed_out);
+        assert_eq!(outcome.stdout, "got this far");
+    }
+
     #[tokio::test]
     async fn a_command_finishing_inside_its_timeout_is_not_timed_out() {
         let outcome = run(
@@ -264,8 +417,8 @@ mod tests {
 
         let dir = TempDir::new();
         let script = dir.path().join("script");
-        // `false` is a shell builtin but not a python one, so this only
-        // exits 0 if the shebang was actually honored.
+        // `print(...)` is a syntax error in sh, so this only produces the
+        // expected stdout if the shebang was actually honored.
         std::fs::write(&script, "#!/usr/bin/env python3\nprint('from python')\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 

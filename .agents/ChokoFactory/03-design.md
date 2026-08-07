@@ -432,7 +432,14 @@ scripting runtime (see §7 non-goal):
   runs in the task's working directory, and what it did (exit code,
   duration, output tails) is recorded on the task's timeline as a
   `shell_output` event — a shell stage opens no agent session, so that
-  entry belongs to the task and carries no `task_run_id`.
+  entry belongs to the task and carries no `task_run_id`. A `timeout:`
+  kills the command's whole process group, not just the shell the daemon
+  spawned, so a timed-out pipeline can't leave grandchildren running in the
+  working copy while the workflow retries. Known gap: a shell stage
+  interrupted by a daemon restart has no `task_run` row and no recovery
+  hook, so its task parks at the stage it had entered — the same class of
+  gap an interrupted `agent_turn` has, but without the stale-run sweep that
+  covers that one.
 - **`poll`**: runs a command repeatedly (`interval`) up to an optional
   `timeout`, matching its output against an `outcomes:` list (ordered
   substring/regex matches) to decide when/how to transition; `on_timeout`

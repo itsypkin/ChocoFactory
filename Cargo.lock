@@ -265,6 +265,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "indexmap",
+ "libc",
  "regex",
  "reqwest",
  "serde",

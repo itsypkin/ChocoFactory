@@ -81,10 +81,23 @@ pub enum EngineError {
     NoWorkflowState,
     NoSuchTask,
     UnknownStage(String),
-    UnknownOutcome { stage: String, outcome: String },
+    UnknownOutcome {
+        stage: String,
+        outcome: String,
+    },
+    /// A detached runner finished work for a stage the task has since left,
+    /// so its outcome was discarded rather than applied to whatever stage
+    /// is current now.
+    StageMovedOn {
+        expected: String,
+        actual: String,
+    },
     TerminalStageHasNoTransitions(String),
     MissingAgentTurnInput(String),
-    UnknownRole { stage: String, role: String },
+    UnknownRole {
+        stage: String,
+        role: String,
+    },
     UnsupportedStageKind(String),
     Session(SessionError),
     Db(sqlx::Error),
@@ -104,6 +117,10 @@ impl fmt::Display for EngineError {
             EngineError::UnknownOutcome { stage, outcome } => write!(
                 f,
                 "stage '{stage}' has no 'on:' transition for outcome '{outcome}'"
+            ),
+            EngineError::StageMovedOn { expected, actual } => write!(
+                f,
+                "task left stage '{expected}' (now in '{actual}') before its outcome could be applied"
             ),
             EngineError::TerminalStageHasNoTransitions(stage) => {
                 write!(f, "stage '{stage}' is terminal and cannot be advanced")
@@ -663,13 +680,14 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         outcome: &str,
     ) -> Result<(), EngineError> {
-        self.advance_with_capture(task_id, definition, outcome, None)
+        self.advance_from_stage(task_id, definition, outcome, None, None)
             .await
     }
 
-    /// [`Self::advance`], additionally storing `capture` — a `(stage name,
-    /// value)` pair from a `shell` stage's `capture:` (§5.1) — into
-    /// `workflow_state.payload` under `stages.<stage name>`.
+    /// [`Self::advance`] for a caller that ran detached work for a specific
+    /// stage: it only applies `outcome` if the task is still *in*
+    /// `expected_stage`, and stores `capture` (a `shell` stage's `capture:`,
+    /// §5.1) into `workflow_state.payload` under `stages.<expected_stage>`.
     ///
     /// The capture is threaded *through* the transition rather than written
     /// by the caller beforehand, and that is the whole point of this
@@ -680,12 +698,21 @@ impl WorkflowEngine {
     /// write would silently lose either the capture or the new
     /// `current_stage`/`loop_counters`. Merging here keeps all three fields
     /// in the single UPDATE already made under the lock.
-    async fn advance_with_capture(
+    ///
+    /// `expected_stage` makes the detached runner's assumption explicit
+    /// rather than merely true-by-construction. No path today can move a
+    /// task out of a stage while its runner is still in flight, but the
+    /// window is only as short as the command; P2-2's `poll` will hold it
+    /// open for an `interval`/`timeout` at a time, and an outcome applied
+    /// to whatever stage happened to be current by then would be a
+    /// transition nobody asked for.
+    async fn advance_from_stage(
         self: &Arc<Self>,
         task_id: &str,
         definition: &Arc<WorkflowDefinition>,
         outcome: &str,
-        capture: Option<(&str, Value)>,
+        expected_stage: Option<&str>,
+        capture: Option<Value>,
     ) -> Result<(), EngineError> {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
@@ -698,6 +725,19 @@ impl WorkflowEngine {
                     .await?
                     .ok_or(EngineError::NoWorkflowState)?;
                 let from_stage = state.current_stage.clone();
+
+                // Checked inside the lock, against the same read the
+                // transition below is computed from — outside it, the
+                // answer could go stale before it was used.
+                if let Some(expected) = expected_stage
+                    && from_stage != expected
+                {
+                    return Err(EngineError::StageMovedOn {
+                        expected: expected.to_string(),
+                        actual: from_stage,
+                    });
+                }
+
                 let stage_def = definition
                     .stages
                     .get(&from_stage)
@@ -727,8 +767,10 @@ impl WorkflowEngine {
                 note_stage_entry(&mut loop_counters, definition, &next_stage, &from_stage);
 
                 let mut payload = state.payload;
-                if let Some((stage, value)) = capture {
-                    merge_stage_capture(&mut payload, stage, value);
+                if let Some(value) = capture {
+                    // Keyed by the stage that produced it, which the check
+                    // above has confirmed is still the current one.
+                    merge_stage_capture(&mut payload, &from_stage, value);
                 }
 
                 workflow_state::update(
@@ -974,19 +1016,30 @@ impl WorkflowEngine {
     ) {
         let described = describe_command(&command);
 
-        // A spawn failure is reported as the stage's `error` outcome rather
-        // than dropped: from the workflow's point of view "the command
-        // could not be run" and "the command ran and failed" both mean this
-        // stage did not succeed, and a task whose `on: error` edge exists
-        // should follow it either way. The reason goes on the timeline,
-        // since it's the only place an operator would find it.
+        // A failure to run the command at all is reported as the stage's
+        // `error` outcome rather than dropped: from the workflow's point of
+        // view "the command could not be run" and "the command ran and
+        // failed" both mean this stage did not succeed, and a task whose
+        // `on: error` edge exists should follow it either way. The reason
+        // goes on the timeline, since it's the only place an operator would
+        // find it.
+        let started = std::time::Instant::now();
         let outcome = match shell::run(&command, &cwd, timeout).await {
             Ok(outcome) => outcome,
             Err(err) => {
-                tracing::error!(
-                    task_id, stage = stage_name, %err,
-                    "shell stage command could not be started"
-                );
+                // The two variants mean materially different things to
+                // whoever reads this: `Spawn` means nothing ran, while `Io`
+                // means the command *did* run — possibly for a long time,
+                // possibly mutating the working copy — and only reading its
+                // output failed. Reporting both as "could not be started"
+                // would actively mislead.
+                let message = match err {
+                    shell::ShellError::Spawn(_) => "shell stage command could not be started",
+                    shell::ShellError::Io(_) => {
+                        "shell stage command ran but its output could not be read"
+                    }
+                };
+                tracing::error!(task_id, stage = stage_name, %err, "{message}");
                 self.append_shell_event(
                     task_id,
                     json!({
@@ -994,7 +1047,7 @@ impl WorkflowEngine {
                         "command": described,
                         "exit_code": Value::Null,
                         "timed_out": false,
-                        "duration_ms": 0,
+                        "duration_ms": elapsed_ms(started),
                         "stdout_tail": "",
                         "stderr_tail": "",
                         "note": err.to_string(),
@@ -1041,7 +1094,7 @@ impl WorkflowEngine {
             "command": described,
             "exit_code": outcome.exit_code,
             "timed_out": outcome.timed_out,
-            "duration_ms": u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
+            "duration_ms": duration_ms(outcome.duration),
             "stdout_tail": tail(&outcome.stdout),
             "stderr_tail": tail(&outcome.stderr),
         });
@@ -1050,14 +1103,8 @@ impl WorkflowEngine {
         }
         self.append_shell_event(task_id, payload).await;
 
-        self.finish_shell_stage(
-            task_id,
-            definition,
-            stage_name,
-            stage_outcome,
-            captured.map(|value| (stage_name, value)),
-        )
-        .await;
+        self.finish_shell_stage(task_id, definition, stage_name, stage_outcome, captured)
+            .await;
     }
 
     /// Best-effort, like every other event append in this module: the
@@ -1083,10 +1130,10 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         stage_name: &str,
         outcome: &str,
-        capture: Option<(&str, Value)>,
+        capture: Option<Value>,
     ) {
         match self
-            .advance_with_capture(task_id, definition, outcome, capture)
+            .advance_from_stage(task_id, definition, outcome, Some(stage_name), capture)
             .await
         {
             Ok(()) => tracing::debug!(
@@ -1095,13 +1142,33 @@ impl WorkflowEngine {
                 outcome,
                 "shell stage completed; advanced"
             ),
-            // The loader guarantees a `done` edge exists, so in practice
-            // this is a failed command on a stage that deliberately maps no
-            // `error` edge — the task parks for a human, which is the
-            // documented behavior, not a lost outcome.
+            // Deliberately parked, not broken: the loader guarantees a
+            // `done` edge exists, so this is a failed command on a stage
+            // that maps no `error` edge on purpose, waiting for a human.
+            // Logged at info so it doesn't read as a fault.
+            Err(EngineError::UnknownOutcome { stage, outcome }) => tracing::info!(
+                task_id,
+                stage,
+                outcome,
+                "shell stage parked: its outcome has no 'on:' edge"
+            ),
+            // Not reachable from any path today (nothing moves a task out
+            // of a shell stage while its command is running), so this is
+            // the invariant announcing itself rather than a known case.
+            Err(EngineError::StageMovedOn { expected, actual }) => tracing::warn!(
+                task_id,
+                expected,
+                actual,
+                outcome,
+                "discarded a shell stage's outcome: the task had already left that stage"
+            ),
+            // Anything else — a transient DB failure in `advance`, say —
+            // leaves the task stuck in a stage whose work is already done,
+            // with nothing that will retry it. Distinguished from the park
+            // above so it doesn't hide among expected outcomes.
             Err(err) => tracing::error!(
                 task_id, stage = stage_name, outcome, %err,
-                "failed to advance task after its shell stage completed"
+                "task wedged: its shell stage completed but the transition failed"
             ),
         }
     }
@@ -1318,18 +1385,29 @@ fn task_cwd(task: &Task) -> PathBuf {
         .unwrap_or_default()
 }
 
-/// Largest captured value stored in `workflow_state.payload`. The payload
-/// is rewritten in full on every transition for the rest of the task's
-/// life, so an unbounded capture from one chatty command would be paid for
-/// again on every subsequent hop. Output past this cap isn't captured at
-/// all — silently truncating it would hand a later stage a value that
-/// looks whole but isn't.
+/// Largest captured value stored in `workflow_state.payload`, *per stage* —
+/// a workflow with several capturing stages can hold a multiple of this.
+/// The payload is rewritten in full on every transition for the rest of the
+/// task's life, so an unbounded capture from one chatty command would be
+/// paid for again on every subsequent hop. Output past this cap isn't
+/// captured at all — silently truncating it would hand a later stage a
+/// value that looks whole but isn't.
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
 /// How much of a command's stdout/stderr goes onto the timeline. Small on
 /// purpose: this is a human-facing breadcrumb, and the full output isn't
 /// retained anywhere.
 const EVENT_OUTPUT_TAIL_BYTES: usize = 2048;
+
+/// A duration as whole milliseconds, saturating rather than wrapping — a
+/// nonsense number on the timeline is worse than a clamped one.
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn elapsed_ms(since: std::time::Instant) -> u64 {
+    duration_ms(since.elapsed())
+}
 
 /// The trailing `EVENT_OUTPUT_TAIL_BYTES` of `text`, trimmed. The *tail*
 /// rather than the head because a failing command's actual error is
