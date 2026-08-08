@@ -478,7 +478,8 @@ scripting runtime (see §7 non-goal):
   for hours: a poll interrupted by a daemon restart leaves `current_stage`
   correct but no runner, and nothing re-enters the stage, so its task
   parks; no deadline is persisted either, so a future recovery sweep
-  couldn't know how much of the budget was already spent.
+  couldn't know how much of the budget was already spent. Tracked as
+  [#52](https://github.com/itsypkin/ChocoFactory/issues/52).
 - **`human_gate`**: pauses the task and waits for a human message (same
   live/async mechanism as chat, §4.1) before emitting `resumed`.
 - **`terminal`**: marks the task finished; no `on:` transitions.
