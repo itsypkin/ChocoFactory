@@ -401,3 +401,169 @@ stages:
 
     let _ = ws.close(None).await;
 }
+
+/// Every `shell_output` entry on a task, oldest first.
+async fn command_events(daemon: &Daemon, task_id: &str) -> Vec<Value> {
+    daemon.get(&format!("/tasks/{task_id}/events")).await["events"]
+        .as_array()
+        .expect("events endpoint returned no array")
+        .iter()
+        .filter(|e| e["event_type"] == "shell_output")
+        .cloned()
+        .collect()
+}
+
+/// Reads WS frames until a `stage_entered` for `stage` shows up.
+async fn wait_for_stage_entered(
+    ws: &mut (
+             impl futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+             + Unpin
+         ),
+    stage: &str,
+) -> Option<Value> {
+    // A poll pushes its own command output over the same socket, so the
+    // transition is not necessarily the next frame.
+    for _ in 0..20 {
+        let event = next_event(ws).await?;
+        if event["event_type"] == "stage_entered" && event["payload"]["stage"] == stage {
+            return Some(event);
+        }
+    }
+    None
+}
+
+/// The `poll` stage kind (P2-2) driven through the real binary: the
+/// in-process engine tests exercise `WorkflowEngine` directly, so only this
+/// shows that a *detached* poll runner survives inside the actual daemon
+/// and that what it records reaches a client over real HTTP and WS.
+///
+/// Costs nothing to run: a poll stage opens no agent session, so unlike the
+/// chat test above this never invokes `mock-claude` at all.
+///
+/// Scoped to the match path deliberately. The timeout, spawn-failure and
+/// capture paths are covered in-process, and a second daemon spin-up here
+/// would add seconds of wall time for no extra integration coverage.
+#[tokio::test]
+async fn real_binary_runs_a_poll_stage_until_its_command_output_changes() {
+    let home = TempHome::new();
+    // The state the poll watches. An absolute path inside the temp home
+    // (cleaned up with it) so the workflow needs no `cwd` on the task.
+    let marker = home.0.join("checks-state");
+    std::fs::write(&marker, "PENDING\n").unwrap();
+
+    home.write_workflow(
+        "poll-e2e",
+        &format!(
+            r#"
+name: poll-e2e
+stages:
+  polling:
+    kind: poll
+    command: "cat {}"
+    interval: 1s
+    timeout: 60s
+    outcomes:
+      - match: "SUCCESS"
+        then: green
+    on: {{ green: done, timeout: stalled }}
+  done:
+    kind: terminal
+  stalled:
+    kind: human_gate
+    on: {{ resumed: done }}
+"#,
+            marker.display()
+        ),
+    );
+    // Deliberately generous against the 1s interval: this test asserts the
+    // *match* path, and a slow CI box must not flake into `stalled`. The
+    // `timeout` edge exists so that if it ever does, the failure names the
+    // stage it got stuck in instead of just timing out.
+    let daemon = Daemon::spawn_with_home(home).await;
+
+    let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    assert_eq!(status, 201);
+    let project_id = project["id"].as_str().unwrap();
+
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project_id,
+                "workflow_def": "poll-e2e",
+                "title": "poll smoke",
+                "prompt": "start",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Wait for the poll to actually report an attempt, so what follows is
+    // testing a running loop rather than racing its startup.
+    let mut pending = Vec::new();
+    for _ in 0..200 {
+        pending = command_events(&daemon, &task_id).await;
+        if !pending.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        pending.len(),
+        1,
+        "expected exactly one progress entry while the state was unchanged: {pending:?}"
+    );
+    assert_eq!(pending[0]["payload"]["stdout_tail"], "PENDING");
+    assert_eq!(pending[0]["payload"]["attempt"], 1);
+    // A poll stage opens no session, so its output belongs to the task
+    // itself and carries no run id.
+    assert_eq!(pending[0]["task_run_id"], Value::Null);
+    assert_eq!(pending[0]["task_id"], task_id.as_str());
+
+    // Opened before the state flips, so the transition below can only
+    // arrive by being pushed rather than replayed from the backlog.
+    let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", daemon.ws_url))
+        .await
+        .expect("failed to open the events websocket");
+
+    // Written-then-renamed so a `cat` racing this can't read a half-written
+    // file and match on nothing.
+    let staged = marker.with_extension("next");
+    std::fs::write(&staged, "SUCCESS\n").unwrap();
+    std::fs::rename(&staged, &marker).unwrap();
+
+    let live = wait_for_stage_entered(&mut ws, "done")
+        .await
+        .expect("the poll's transition was never pushed over the socket");
+    assert_eq!(live["payload"]["outcome"], "green");
+    assert_eq!(live["task_run_id"], Value::Null);
+
+    let events = command_events(&daemon, &task_id).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "expected one progress entry and one decisive entry: {events:?}"
+    );
+    let decisive = &events[1]["payload"];
+    assert_eq!(decisive["outcome"], "green");
+    assert_eq!(decisive["matched"], "SUCCESS");
+    assert_eq!(decisive["stdout_tail"], "SUCCESS");
+    assert!(
+        decisive["note"].as_str().unwrap().contains("matched"),
+        "the decisive entry should say which rule fired: {decisive}"
+    );
+
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    assert_eq!(detail["workflow_state"]["current_stage"], "done");
+    assert_eq!(detail["status"], "closed");
+    let trail: Vec<&str> = detail["stage_trail"]
+        .as_array()
+        .expect("stage_trail missing from the real binary's task detail")
+        .iter()
+        .map(|e| e["payload"]["stage"].as_str().unwrap())
+        .collect();
+    assert_eq!(trail, vec!["polling", "done"]);
+
+    let _ = ws.close(None).await;
+}

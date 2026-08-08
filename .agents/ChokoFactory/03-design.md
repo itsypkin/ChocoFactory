@@ -448,7 +448,37 @@ scripting runtime (see §7 non-goal):
   substring/regex matches) to decide when/how to transition; `on_timeout`
   fires if `timeout` elapses with no match. Covers "wait on some external
   state" generically — GitHub check/review polling is just a `poll`
-  stage with a `gh` command, not a dedicated GitHub kind.
+  stage with a `gh` command, not a dedicated GitHub kind. It takes the
+  same `command:`/`script_file:` pair and `capture:` as `shell`, run the
+  same way in the same working directory. Where it differs from `shell`
+  is that **the exit code decides nothing**: a polled command failing is
+  ordinary — `gh` on a rate limit or a dropped connection — and is
+  precisely what polling exists to ride out, so only the output is
+  matched and the loop keeps going. The one failure that ends it early is
+  a command that could not be *started* at all (no `sh`, a `script_file`
+  that isn't executable), which no amount of retrying fixes and which
+  emits `error`; a stage that maps no `error` edge parks for a human
+  instead. Patterns match against stdout only, in declaration order, with
+  surrounding whitespace trimmed first — otherwise the `^SUCCESS$`
+  example above could never match a command's newline-terminated output,
+  and the stage would silently run to its timeout. `on_timeout` is spelled
+  as a reserved `timeout` outcome in the ordinary `on:` map, which the
+  loader requires whenever `timeout:` is set. Each attempt is capped at
+  whatever is *left* of the budget rather than at `interval`, so a command
+  slower than its own interval isn't killed on every attempt; the interval
+  is then a delay measured after the command finishes, so attempts never
+  overlap. What the command did is recorded as `shell_output` on the
+  task's timeline, as for `shell` — but only for the attempt that resolves
+  the stage and for attempts whose output *changed*, since a 30s poll over
+  an hour is 120 identical `PENDING`s and the retention job prunes by age
+  alone. A poll also re-checks that its task is still in the stage before
+  each attempt, since it holds that window open long enough for a human to
+  close or advance the task underneath it. Known gap, shared with `shell`
+  and `agent_turn` but sharper here because a poll is *designed* to run
+  for hours: a poll interrupted by a daemon restart leaves `current_stage`
+  correct but no runner, and nothing re-enters the stage, so its task
+  parks; no deadline is persisted either, so a future recovery sweep
+  couldn't know how much of the budget was already spent.
 - **`human_gate`**: pauses the task and waits for a human message (same
   live/async mechanism as chat, §4.1) before emitting `resumed`.
 - **`terminal`**: marks the task finished; no `on:` transitions.

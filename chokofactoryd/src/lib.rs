@@ -6,6 +6,7 @@ pub mod db;
 pub mod engine;
 pub mod fileref;
 pub mod global_config;
+pub mod poll;
 pub mod retention;
 pub mod role_config;
 pub mod serde_util;

@@ -157,6 +157,15 @@ an optional `timeout`, matching output against an ordered `outcomes:`
 list (substring/regex) to pick the outcome; `on_timeout` fires if
 `timeout` elapses with no match.
 
+The loader already parsed and validated `poll`, and P2-1 built `shell.rs`
+as a reusable runner for exactly this, so the work is the loop, the
+matching (`poll.rs`) and the timeline policy. Widens `poll` to take
+`script_file:` and `capture:` like `shell`, sharing one `command:`
+resolution between the two kinds. Exit codes decide nothing — only a
+command that can't start ends the loop early; each attempt is capped at
+the remaining budget; only decisive and changed-output attempts are
+recorded; and the loop abandons itself if the task leaves the stage.
+
 - Design ref: §5.1, §5.2
 - Depends on: P1-7
 
