@@ -1424,13 +1424,27 @@ impl WorkflowEngine {
                         }),
                     )
                     .await;
+                    // This attempt produced no outcome, and an *older* one
+                    // must not be reported under this attempt's number — a
+                    // timeout entry saying "attempt 7" while carrying
+                    // attempt 6's exit code and output would be a quietly
+                    // wrong record. Clearing it means both timeout paths
+                    // below report empty fields after an I/O failure, which
+                    // is honest about what the last attempt actually
+                    // yielded: nothing.
+                    last_outcome = None;
                     if self
                         .sleep_before_next_attempt(run.interval, deadline)
                         .await
                         .is_break()
                     {
                         self.finish_poll_timed_out(
-                            task_id, definition, stage_name, &described, attempt, None,
+                            task_id,
+                            definition,
+                            stage_name,
+                            &described,
+                            attempt,
+                            last_outcome.as_ref(),
                         )
                         .await;
                         return;
