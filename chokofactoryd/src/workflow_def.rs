@@ -263,8 +263,16 @@ pub enum StageKind {
         timeout: Option<Duration>,
     },
     Poll {
-        command: String,
+        command: ShellCommand,
+        capture: Option<Capture>,
+        /// How long to wait between the end of one attempt and the start
+        /// of the next.
         interval: Duration,
+        /// How long to keep polling before giving up and emitting
+        /// `timeout`. Unlike `Shell`'s field of the same name this is a
+        /// budget for the whole loop rather than a per-command kill —
+        /// though it doubles as the latter, since each attempt is capped
+        /// at whatever is left of it.
         timeout: Option<Duration>,
         outcomes: Vec<PollOutcome>,
     },
@@ -356,7 +364,12 @@ enum RawStageKind {
         timeout: Option<String>,
     },
     Poll {
-        command: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        script_file: Option<String>,
+        #[serde(default)]
+        capture: Option<Capture>,
         interval: String,
         #[serde(default)]
         timeout: Option<String>,
@@ -407,25 +420,7 @@ impl RawStage {
                 capture,
                 timeout,
             } => {
-                let resolved_command = match (command, script_file) {
-                    (Some(command), None) => ShellCommand::Inline(command),
-                    (None, Some(script_file)) => ShellCommand::ScriptFile(resolve_file(
-                        base_dir,
-                        &script_file,
-                        RefOwner::Stage(stage_name),
-                        "script_file",
-                    )?),
-                    (Some(_), Some(_)) => {
-                        return Err(WorkflowDefError::AmbiguousShellCommand {
-                            stage: stage_name.to_string(),
-                        });
-                    }
-                    (None, None) => {
-                        return Err(WorkflowDefError::MissingShellCommand {
-                            stage: stage_name.to_string(),
-                        });
-                    }
-                };
+                let resolved_command = resolve_command(base_dir, stage_name, command, script_file)?;
                 StageKind::Shell {
                     command: resolved_command,
                     capture,
@@ -444,11 +439,14 @@ impl RawStage {
             }
             RawStageKind::Poll {
                 command,
+                script_file,
+                capture,
                 interval,
                 timeout,
                 outcomes,
             } => StageKind::Poll {
-                command,
+                command: resolve_command(base_dir, stage_name, command, script_file)?,
+                capture,
                 interval: parse_duration(&interval).map_err(|value| {
                     WorkflowDefError::InvalidDuration {
                         stage: stage_name.to_string(),
@@ -482,6 +480,38 @@ impl RawStage {
             on: self.on,
             loop_guard: self.loop_guard,
         })
+    }
+}
+
+/// Resolves the `command:`/`script_file:` pair that `shell` and `poll`
+/// stages both take: exactly one of the two, an inline shell line or a path
+/// to an executable resolved relative to the definition file.
+///
+/// Shared rather than duplicated per kind so the two can't drift — a
+/// `poll` that accepted a `script_file` the loader resolved differently
+/// from `shell`'s would be a silent trap. The `…ShellCommand` error
+/// variants are named for the *field pair*, not the `shell` kind, so they
+/// read correctly for a `poll` stage too.
+fn resolve_command(
+    base_dir: &Path,
+    stage_name: &str,
+    command: Option<String>,
+    script_file: Option<String>,
+) -> Result<ShellCommand, WorkflowDefError> {
+    match (command, script_file) {
+        (Some(command), None) => Ok(ShellCommand::Inline(command)),
+        (None, Some(script_file)) => Ok(ShellCommand::ScriptFile(resolve_file(
+            base_dir,
+            &script_file,
+            RefOwner::Stage(stage_name),
+            "script_file",
+        )?)),
+        (Some(_), Some(_)) => Err(WorkflowDefError::AmbiguousShellCommand {
+            stage: stage_name.to_string(),
+        }),
+        (None, None) => Err(WorkflowDefError::MissingShellCommand {
+            stage: stage_name.to_string(),
+        }),
     }
 }
 
@@ -654,7 +684,7 @@ impl fmt::Display for WorkflowDefError {
             ),
             WorkflowDefError::MissingShellCommand { stage } => write!(
                 f,
-                "stage '{stage}' is a shell stage but sets neither 'command' nor 'script_file'"
+                "stage '{stage}' sets neither 'command' nor 'script_file'; exactly one is required"
             ),
             WorkflowDefError::MissingShellDoneOutcome { stage } => write!(
                 f,
@@ -1111,6 +1141,112 @@ stages:
         };
         assert_eq!(*capture, Some(Capture::Text));
         assert_eq!(*timeout, Some(Duration::from_secs(300)));
+    }
+
+    /// `command:`/`script_file:` resolution is shared with `shell` (P2-2),
+    /// so a poll stage must reach the same three answers.
+    #[test]
+    fn parses_a_poll_stage_with_a_script_file_and_capture() {
+        let dir = TempDir::new();
+        dir.write("check.sh", "#!/bin/sh\necho SUCCESS\n");
+        let yaml = r#"
+name: pollster
+stages:
+  waiting:
+    kind: poll
+    script_file: check.sh
+    capture: text
+    interval: 30s
+    outcomes:
+      - match: "SUCCESS"
+        then: green
+    on: { green: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::Poll {
+            command, capture, ..
+        } = &def.stages["waiting"].kind
+        else {
+            panic!("expected poll stage");
+        };
+        assert_eq!(
+            *command,
+            ShellCommand::ScriptFile(dir.path.join("check.sh"))
+        );
+        assert_eq!(*capture, Some(Capture::Text));
+    }
+
+    #[test]
+    fn parses_a_poll_stages_inline_command() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: pollster
+stages:
+  waiting:
+    kind: poll
+    command: "gh pr checks 1"
+    interval: 30s
+    outcomes:
+      - match: "SUCCESS"
+        then: green
+    on: { green: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::Poll {
+            command, capture, ..
+        } = &def.stages["waiting"].kind
+        else {
+            panic!("expected poll stage");
+        };
+        assert_eq!(*command, ShellCommand::Inline("gh pr checks 1".to_string()));
+        assert_eq!(*capture, None);
+    }
+
+    #[test]
+    fn rejects_a_poll_stage_missing_both_command_and_script_file() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  waiting:
+    kind: poll
+    interval: 30s
+    on: { green: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::MissingShellCommand { stage } if stage == "waiting"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_poll_stage_with_both_command_and_script_file() {
+        let dir = TempDir::new();
+        dir.write("check.sh", "#!/bin/sh\necho SUCCESS\n");
+        let yaml = r#"
+name: broken
+stages:
+  waiting:
+    kind: poll
+    command: "echo SUCCESS"
+    script_file: check.sh
+    interval: 30s
+    on: { green: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::AmbiguousShellCommand { stage } if stage == "waiting"
+        ));
     }
 
     #[test]

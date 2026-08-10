@@ -37,11 +37,12 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::db::{events, projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
+use crate::poll;
 use crate::role_config::{self, RoleConfigError};
 use crate::session::{SessionError, SessionManager};
 use crate::shell;
 use crate::workflow_def::{
-    Capture, ShellCommand, StageDef, StageKind, WorkflowDefError, WorkflowDefinition,
+    Capture, PollOutcome, ShellCommand, StageDef, StageKind, WorkflowDefError, WorkflowDefinition,
 };
 
 /// How often the `agent_turn` completion watcher polls a `task_run`'s
@@ -98,7 +99,13 @@ pub enum EngineError {
         stage: String,
         role: String,
     },
-    UnsupportedStageKind(String),
+    /// A `poll` stage whose `outcomes:` pattern doesn't compile.
+    /// `WorkflowDefinition::validate` rejects these at load, so this is
+    /// only reachable for a definition built by hand — see `poll::compile`.
+    InvalidPollPattern {
+        stage: String,
+        reason: String,
+    },
     Session(SessionError),
     Db(sqlx::Error),
     Io(std::io::Error),
@@ -133,9 +140,9 @@ impl fmt::Display for EngineError {
                 f,
                 "stage '{stage}' is an agent_turn with unknown role '{role}'"
             ),
-            EngineError::UnsupportedStageKind(stage) => write!(
+            EngineError::InvalidPollPattern { stage, reason } => write!(
                 f,
-                "stage '{stage}' has a kind the engine cannot execute yet"
+                "stage '{stage}' has a poll outcome pattern that does not compile: {reason}"
             ),
             EngineError::Session(err) => write!(f, "{err}"),
             EngineError::Db(err) => write!(f, "{err}"),
@@ -927,8 +934,24 @@ impl WorkflowEngine {
                 )
                 .await
             }
-            StageKind::Poll { .. } => {
-                Err(EngineError::UnsupportedStageKind(stage_name.to_string()))
+            StageKind::Poll {
+                command,
+                capture,
+                interval,
+                timeout,
+                outcomes,
+            } => {
+                self.enter_poll(
+                    task_id,
+                    definition,
+                    stage_name,
+                    command.clone(),
+                    *capture,
+                    *interval,
+                    *timeout,
+                    outcomes,
+                )
+                .await
             }
         }
     }
@@ -1049,7 +1072,7 @@ impl WorkflowEngine {
                         "shell stage command ran but its output could not be read"
                     ),
                 }
-                self.append_shell_event(
+                self.append_command_event(
                     task_id,
                     json!({
                         "stage": stage_name,
@@ -1131,22 +1154,24 @@ impl WorkflowEngine {
         if let Some(note) = note {
             payload["note"] = Value::String(note);
         }
-        self.append_shell_event(task_id, payload).await;
+        self.append_command_event(task_id, payload).await;
 
         self.finish_shell_stage(task_id, definition, stage_name, stage_outcome, captured)
             .await;
     }
 
+    /// Records what a `shell` or `poll` stage's command did.
+    ///
     /// Best-effort, like every other event append in this module: the
     /// command has already run, so failing to record it can't be undone by
     /// refusing to transition — and refusing would strand the task in a
     /// stage whose work is complete.
-    async fn append_shell_event(&self, task_id: &str, payload: Value) {
+    async fn append_command_event(&self, task_id: &str, payload: Value) {
         match events::append_for_task(&self.pool, task_id, EventType::ShellOutput, payload).await {
             Ok(_) => self.events_notify.notify_waiters(),
             Err(err) => tracing::error!(
                 task_id, %err,
-                "failed to record shell stage output event"
+                "failed to record stage command output event"
             ),
         }
     }
@@ -1199,6 +1224,524 @@ impl WorkflowEngine {
             Err(err) => tracing::error!(
                 task_id, stage = stage_name, outcome, %err,
                 "task wedged: its shell stage completed but the transition failed"
+            ),
+        }
+    }
+
+    /// Starts a `poll` stage's loop (§5.2) and returns immediately.
+    ///
+    /// Everything that should fail the transition that entered the stage —
+    /// where a caller can still see the error — is resolved here rather
+    /// than in the detached loop: the task's working directory, and the
+    /// `outcomes:` patterns, which are compiled once for the whole stage
+    /// instead of per attempt.
+    #[allow(clippy::too_many_arguments)]
+    async fn enter_poll(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        command: ShellCommand,
+        capture: Option<Capture>,
+        interval: Duration,
+        timeout: Option<Duration>,
+        outcomes: &[PollOutcome],
+    ) -> Result<(), EngineError> {
+        let task = tasks::get(&self.pool, task_id)
+            .await?
+            .ok_or(EngineError::NoSuchTask)?;
+
+        let compiled = poll::compile(outcomes).map_err(|err| EngineError::InvalidPollPattern {
+            stage: stage_name.to_string(),
+            reason: err.to_string(),
+        })?;
+
+        self.spawn_poll_runner(
+            task_id.to_string(),
+            Arc::clone(definition),
+            stage_name.to_string(),
+            PollRun {
+                command,
+                capture,
+                interval,
+                timeout,
+                outcomes: compiled,
+                cwd: task_cwd(&task),
+            },
+        );
+        Ok(())
+    }
+
+    /// Deliberately a *synchronous* fn, for the same reason
+    /// `spawn_shell_runner` is: the spawned future eventually calls
+    /// `advance` → `enter_stage` → `enter_poll`, i.e. back to here, and
+    /// discharging `tokio::spawn`'s `Send` obligation from inside an
+    /// `async fn` would make that cycle part of the compiler's auto-trait
+    /// inference for `enter_poll`'s own future and fail to resolve.
+    fn spawn_poll_runner(
+        self: &Arc<Self>,
+        task_id: String,
+        definition: Arc<WorkflowDefinition>,
+        stage_name: String,
+        run: PollRun,
+    ) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            engine
+                .run_poll_stage(&task_id, &definition, &stage_name, run)
+                .await;
+        });
+    }
+
+    /// Runs the command on `interval` until an outcome matches or the
+    /// `timeout` budget runs out (§5.2).
+    ///
+    /// Unlike `shell`, the command's *exit code decides nothing*: a polled
+    /// command failing is ordinary — `gh` on a rate limit or a dropped
+    /// connection — and is exactly the condition polling exists to ride
+    /// out. Only the output is matched. The one failure that does end the
+    /// loop is a command that could not be started at all, which no amount
+    /// of retrying will fix.
+    async fn run_poll_stage(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        run: PollRun,
+    ) {
+        let described = describe_command(&run.command);
+        // Captured once, so a long poll's budget can't drift with the
+        // accumulated cost of its own bookkeeping.
+        let deadline = run.timeout.map(|limit| std::time::Instant::now() + limit);
+        let mut attempt: u64 = 0;
+        // What the previous attempt produced, for the "only record what
+        // changed" rule below. `None` until the first attempt reports.
+        let mut previous: Option<String> = None;
+        // The most recent attempt that actually ran, so every timeout path
+        // can report what the command last said rather than an empty entry.
+        let mut last_outcome: Option<shell::ShellOutcome> = None;
+
+        loop {
+            // A poll is the one stage kind that holds its window open for
+            // minutes or hours, so unlike `shell` it cannot assume the task
+            // is still where it left it. Without this, a poll with no
+            // `timeout:` on a task a human has since closed would run
+            // forever. This is advisory only — the authoritative check is
+            // `advance_from_stage`'s `expected_stage`, taken inside the
+            // per-task lock; this just stops the loop early rather than
+            // letting it burn a command every interval until the deadline.
+            if attempt > 0 && !self.still_in_stage(task_id, stage_name).await {
+                tracing::info!(
+                    task_id,
+                    stage = stage_name,
+                    attempts = attempt,
+                    "abandoned a poll: the task had already left that stage"
+                );
+                return;
+            }
+
+            let remaining =
+                deadline.map(|at| at.saturating_duration_since(std::time::Instant::now()));
+            if remaining == Some(Duration::ZERO) {
+                self.finish_poll_timed_out(
+                    task_id,
+                    definition,
+                    stage_name,
+                    &described,
+                    attempt,
+                    last_outcome.as_ref(),
+                )
+                .await;
+                return;
+            }
+
+            attempt += 1;
+            let started = std::time::Instant::now();
+            // Each attempt is capped at whatever is left of the stage's
+            // budget rather than at `interval`: a command that legitimately
+            // takes longer than its own interval — a slow `gh` call on a
+            // 30s poll — would otherwise be killed on every single attempt
+            // and the stage could never resolve. With no `timeout:` at all
+            // there is no cap, and a hung command parks the task, the same
+            // gap `shell` carries without one.
+            let outcome = match shell::run(&run.command, &run.cwd, remaining).await {
+                Ok(outcome) => outcome,
+                // Nothing ran and nothing will: no `sh` on PATH, or a
+                // `script_file` that isn't executable. Retrying on an
+                // interval would just burn the whole budget to reach the
+                // same place, so this ends the poll.
+                Err(err @ shell::ShellError::Spawn(_)) => {
+                    tracing::error!(
+                        task_id, stage = stage_name, %err,
+                        "poll stage command could not be started"
+                    );
+                    self.append_command_event(
+                        task_id,
+                        json!({
+                            "stage": stage_name,
+                            "command": described,
+                            "attempt": attempt,
+                            "exit_code": Value::Null,
+                            "timed_out": false,
+                            "duration_ms": elapsed_ms(started),
+                            "stdout_tail": "",
+                            "stderr_tail": "",
+                            "note": err.to_string(),
+                        }),
+                    )
+                    .await;
+                    self.finish_poll_stage(task_id, definition, stage_name, "error", None)
+                        .await;
+                    return;
+                }
+                // The command *did* run — possibly for a long time — and
+                // only reading its pipes failed. That says nothing about
+                // the state being polled, so keep polling; the attempt
+                // simply contributes no output to match against.
+                Err(err @ shell::ShellError::Io(_)) => {
+                    tracing::warn!(
+                        task_id, stage = stage_name, %err,
+                        "poll stage command ran but its output could not be read"
+                    );
+                    let note = err.to_string();
+                    self.record_poll_attempt(
+                        task_id,
+                        &mut previous,
+                        // Prefixed with a NUL so an I/O failure can never
+                        // collide with a command that happens to print the
+                        // same text, which would suppress the event.
+                        format!("\0io:{note}"),
+                        json!({
+                            "stage": stage_name,
+                            "command": described,
+                            "attempt": attempt,
+                            "exit_code": Value::Null,
+                            "timed_out": false,
+                            "duration_ms": elapsed_ms(started),
+                            "stdout_tail": "",
+                            "stderr_tail": "",
+                            "note": note,
+                        }),
+                    )
+                    .await;
+                    // This attempt produced no outcome, and an *older* one
+                    // must not be reported under this attempt's number — a
+                    // timeout entry saying "attempt 7" while carrying
+                    // attempt 6's exit code and output would be a quietly
+                    // wrong record. Clearing it means both timeout paths
+                    // below report empty fields after an I/O failure, which
+                    // is honest about what the last attempt actually
+                    // yielded: nothing.
+                    last_outcome = None;
+                    if self
+                        .sleep_before_next_attempt(run.interval, deadline)
+                        .await
+                        .is_break()
+                    {
+                        self.finish_poll_timed_out(
+                            task_id,
+                            definition,
+                            stage_name,
+                            &described,
+                            attempt,
+                            last_outcome.as_ref(),
+                        )
+                        .await;
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            if let Some(matched) = run.outcomes.matching(&outcome.stdout) {
+                let (captured, capture_note) =
+                    derive_capture(run.capture, &outcome.stdout, task_id, stage_name);
+                let mut note = format!("matched \"{}\" on attempt {attempt}", matched.pattern);
+                if let Some(capture_note) = capture_note {
+                    note.push_str("; ");
+                    note.push_str(&capture_note);
+                }
+                // A match can still come from an attempt that was killed at
+                // the budget's edge — the output it printed before dying is
+                // real and worth honouring — but if its process group
+                // outlived the kill, that outranks everything else here:
+                // the workflow is about to move on while something may
+                // still be running in the same working copy. Same
+                // precedence `run_shell_stage` gives it.
+                if outcome.escaped {
+                    note = "could not confirm the process group exited — something may still be running"
+                        .to_string();
+                }
+                warn_if_escaped(task_id, stage_name, &outcome);
+                // Always recorded, changed output or not: this is the
+                // attempt that decided the stage.
+                self.append_command_event(
+                    task_id,
+                    json!({
+                        "stage": stage_name,
+                        "command": described,
+                        "attempt": attempt,
+                        "exit_code": outcome.exit_code,
+                        "timed_out": outcome.timed_out,
+                        "escaped": outcome.escaped,
+                        "duration_ms": duration_ms(outcome.duration),
+                        // Queryable siblings of the note, so "which rule
+                        // fired?" is answerable from `choco --json`
+                        // without matching free text.
+                        "matched": matched.pattern,
+                        "outcome": matched.then,
+                        "stdout_tail": tail(&outcome.stdout),
+                        "stderr_tail": tail(&outcome.stderr),
+                        "note": note,
+                    }),
+                )
+                .await;
+                self.finish_poll_stage(task_id, definition, stage_name, matched.then, captured)
+                    .await;
+                return;
+            }
+
+            // No match. A killed attempt means the budget it was capped at
+            // is now spent, so the stage is out of time regardless of what
+            // the interval says.
+            let killed = outcome.timed_out;
+            warn_if_escaped(task_id, stage_name, &outcome);
+
+            // A killed attempt is reported once, by `finish_poll_timed_out`
+            // below, which carries the same fields plus the reason. Passing
+            // it through here as well would put two entries on the timeline
+            // for one attempt.
+            if !killed {
+                self.record_poll_attempt(
+                    task_id,
+                    &mut previous,
+                    // Compared trimmed, matching what `tail` puts on the
+                    // timeline: two attempts differing only in trailing
+                    // whitespace would otherwise record two entries a reader
+                    // can't tell apart.
+                    outcome.stdout.trim().to_string(),
+                    json!({
+                        "stage": stage_name,
+                        "command": described,
+                        "attempt": attempt,
+                        "exit_code": outcome.exit_code,
+                        "timed_out": outcome.timed_out,
+                        "escaped": outcome.escaped,
+                        "duration_ms": duration_ms(outcome.duration),
+                        "stdout_tail": tail(&outcome.stdout),
+                        "stderr_tail": tail(&outcome.stderr),
+                    }),
+                )
+                .await;
+            }
+
+            // Kept so whichever timeout path fires can report what the
+            // command last actually said. Without it, a poll that printed
+            // `PENDING` for an hour and then ran out of budget leaves a
+            // final timeline entry showing nothing at all — the repeated
+            // attempts having been deliberately suppressed above.
+            last_outcome = Some(outcome);
+
+            if killed {
+                self.finish_poll_timed_out(
+                    task_id,
+                    definition,
+                    stage_name,
+                    &described,
+                    attempt,
+                    last_outcome.as_ref(),
+                )
+                .await;
+                return;
+            }
+
+            if self
+                .sleep_before_next_attempt(run.interval, deadline)
+                .await
+                .is_break()
+            {
+                self.finish_poll_timed_out(
+                    task_id,
+                    definition,
+                    stage_name,
+                    &described,
+                    attempt,
+                    last_outcome.as_ref(),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    /// Whether the task is still sitting in the stage this runner belongs
+    /// to.
+    ///
+    /// A read failure answers "yes" on purpose: the alternative is
+    /// abandoning a live poll because one `SELECT` failed, which strands a
+    /// task nothing will come back to. The error is logged rather than
+    /// dropped, and a genuinely departed stage is caught anyway by
+    /// `advance_from_stage`'s `expected_stage` check when the poll
+    /// eventually reports.
+    async fn still_in_stage(&self, task_id: &str, stage_name: &str) -> bool {
+        match workflow_state::get(&self.pool, task_id).await {
+            Ok(Some(state)) => state.current_stage == stage_name,
+            // No row at all means the task was deleted underneath us;
+            // there is nothing left to poll for.
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    task_id, stage = stage_name, %err,
+                    "could not confirm a polling task is still in its stage; continuing to poll"
+                );
+                true
+            }
+        }
+    }
+
+    /// Records an attempt that decided nothing, but only when it said
+    /// something new.
+    ///
+    /// A `gh pr checks` poll at 30s over an hour is 120 attempts printing
+    /// the same `PENDING`; one timeline entry per attempt would bury every
+    /// other event the task produced, and the retention job prunes by age
+    /// alone so nothing else bounds it. Recording only what *changed*
+    /// keeps the useful signal — the moment the output flips — while
+    /// collapsing the noise, and the first attempt always reports because
+    /// it has nothing to be the same as.
+    async fn record_poll_attempt(
+        &self,
+        task_id: &str,
+        previous: &mut Option<String>,
+        current: String,
+        payload: Value,
+    ) {
+        let changed = previous.as_deref() != Some(current.as_str());
+        *previous = Some(current);
+        if changed {
+            self.append_command_event(task_id, payload).await;
+        }
+    }
+
+    /// Waits out the interval, or reports that the budget is gone.
+    ///
+    /// Measured from the end of one attempt to the start of the next
+    /// rather than on a fixed cadence, so a command slower than its own
+    /// interval can't have attempts overlap and stack up on top of each
+    /// other in the task's working copy.
+    async fn sleep_before_next_attempt(
+        &self,
+        interval: Duration,
+        deadline: Option<std::time::Instant>,
+    ) -> std::ops::ControlFlow<()> {
+        let Some(deadline) = deadline else {
+            tokio::time::sleep(interval).await;
+            return std::ops::ControlFlow::Continue(());
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return std::ops::ControlFlow::Break(());
+        }
+        // Never sleep past the deadline: a 60s interval under a 70s budget
+        // should give up at 70s, not at 120s.
+        tokio::time::sleep(interval.min(remaining)).await;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    /// Ends a poll that ran out of budget with no matching outcome (§5.2's
+    /// `on_timeout`). The loader guarantees a `timeout` edge exists
+    /// whenever the stage sets a `timeout:`, so this reaches
+    /// `finish_poll_stage`'s park path only for a hand-built definition.
+    async fn finish_poll_timed_out(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        described: &str,
+        attempts: u64,
+        last: Option<&shell::ShellOutcome>,
+    ) {
+        tracing::info!(
+            task_id,
+            stage = stage_name,
+            attempts,
+            "poll stage gave up: its timeout elapsed with no matching outcome"
+        );
+
+        let mut note = format!("no outcome matched in {attempts} attempts; timeout elapsed");
+        // Outranks the plain timeout wording: the workflow is about to
+        // follow its `timeout` edge while the last command may still be
+        // running in the same working copy.
+        if last.is_some_and(|outcome| outcome.escaped) {
+            note = "could not confirm the process group exited — something may still be running"
+                .to_string();
+        }
+        self.append_command_event(
+            task_id,
+            json!({
+                "stage": stage_name,
+                "command": described,
+                "attempt": attempts,
+                "exit_code": last.and_then(|outcome| outcome.exit_code),
+                "timed_out": true,
+                "escaped": last.is_some_and(|outcome| outcome.escaped),
+                "duration_ms": last.map_or(0, |outcome| duration_ms(outcome.duration)),
+                "stdout_tail": last.map_or_else(String::new, |outcome| tail(&outcome.stdout)),
+                "stderr_tail": last.map_or_else(String::new, |outcome| tail(&outcome.stderr)),
+                "note": note,
+            }),
+        )
+        .await;
+
+        self.finish_poll_stage(task_id, definition, stage_name, "timeout", None)
+            .await;
+    }
+
+    /// Applies a finished poll stage's outcome. Nothing is left to return
+    /// it to — this runs detached — so a failure is logged and the task
+    /// parks in its current stage. Mirrors `finish_shell_stage`, with its
+    /// own messages so log aggregation can tell the two kinds apart.
+    async fn finish_poll_stage(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        outcome: &str,
+        capture: Option<Value>,
+    ) {
+        match self
+            .advance_from_stage(task_id, definition, outcome, Some(stage_name), capture)
+            .await
+        {
+            Ok(()) => tracing::debug!(
+                task_id,
+                stage = stage_name,
+                outcome,
+                "poll stage resolved; advanced"
+            ),
+            // Deliberately parked, not broken: a stage that maps no edge
+            // for the outcome it just produced — an `error` with no
+            // `on: { error: … }` — is waiting for a human on purpose.
+            Err(EngineError::UnknownOutcome { stage, outcome }) => tracing::info!(
+                task_id,
+                stage,
+                outcome,
+                "poll stage parked: its outcome has no 'on:' edge"
+            ),
+            // Reachable here in a way it isn't for `shell`: a poll holds
+            // its stage open for as long as its budget allows, so a human
+            // resuming or closing the task mid-poll really can move it on
+            // between the last `still_in_stage` check and this write.
+            Err(EngineError::StageMovedOn { expected, actual }) => tracing::info!(
+                task_id,
+                expected,
+                actual,
+                outcome,
+                "discarded a poll stage's outcome: the task had already left that stage"
+            ),
+            Err(err) => tracing::error!(
+                task_id, stage = stage_name, outcome, %err,
+                "task wedged: its poll stage resolved but the transition failed"
             ),
         }
     }
@@ -1428,6 +1971,37 @@ const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 /// purpose: this is a human-facing breadcrumb, and the full output isn't
 /// retained anywhere.
 const EVENT_OUTPUT_TAIL_BYTES: usize = 2048;
+
+/// Logs a poll attempt whose process group outlived its kill.
+///
+/// `run_shell_stage` warns on the same condition, and an operator grepping
+/// logs for escaped process groups should find both kinds — a poll is if
+/// anything the likelier source, since it can kill an attempt on every
+/// interval for as long as its budget lasts.
+fn warn_if_escaped(task_id: &str, stage_name: &str, outcome: &shell::ShellOutcome) {
+    if outcome.escaped {
+        tracing::warn!(
+            task_id,
+            stage = stage_name,
+            "a poll attempt was killed but its process group could not be confirmed dead"
+        );
+    }
+}
+
+/// Everything a detached poll runner needs, resolved once on stage entry.
+///
+/// A struct rather than eight parameters threaded through three functions:
+/// the trio hands this straight down untouched, and `outcomes` in
+/// particular must be compiled exactly once for the whole stage rather
+/// than per attempt.
+struct PollRun {
+    command: ShellCommand,
+    capture: Option<Capture>,
+    interval: Duration,
+    timeout: Option<Duration>,
+    outcomes: poll::CompiledOutcomes,
+    cwd: PathBuf,
+}
 
 /// A duration as whole milliseconds, saturating rather than wrapping — a
 /// nonsense number on the timeline is worse than a clamped one.
@@ -2547,33 +3121,17 @@ stages:
         assert!(runs[0].ended_at.is_some());
     }
 
-    /// `poll` is the one kind the loader still parses but the engine can't
-    /// execute (P2-2). This used to cover `shell` too, until P2-1.
-    #[tokio::test]
-    async fn entering_an_unsupported_stage_kind_is_a_reported_error_not_a_panic() {
-        let pool = connect_in_memory().await.unwrap();
-        let dir = tempdir();
-        let yaml = r#"
-name: has-poll
-stages:
-  run:
-    kind: poll
-    command: "true"
-    interval: 1s
-    outcomes:
-      - match: "ok"
-        then: done
-    on: { done: finished }
-  finished:
-    kind: terminal
-"#;
-        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
-        let task_id = seed_task(&pool, &def.name).await;
-        let engine = engine_with_adapter(pool.clone(), "unused");
-
-        let err = engine.start_task(&task_id, &def, None).await.unwrap_err();
-        assert!(matches!(err, EngineError::UnsupportedStageKind(stage) if stage == "run"));
-    }
+    // P2-2 was the last unimplemented kind, so `enter_stage` now executes
+    // every kind the loader accepts and `EngineError::UnsupportedStageKind`
+    // is gone, along with the test that covered it (which had already
+    // narrowed from `shell`+`poll` to `poll` alone at P2-1).
+    // `send_message_or_resume` keeps its own `UnsupportedStageKind` — that
+    // one is about which stages accept a *human message*, a different
+    // question that still has real answers.
+    //
+    // What that test asserted is now the compiler's job: the `match` in
+    // `enter_stage` is exhaustive over `StageKind`, so adding a kind
+    // without executing it won't build.
 
     // ---- shell stage kind (P2-1) ----------------------------------------
 
@@ -3670,6 +4228,509 @@ stages:
             err,
             SendMessageOrResumeError::UnsupportedStageKind(stage) if stage == "done"
         ));
+    }
+
+    // ---- poll stage kind (P2-2) ------------------------------------------
+
+    /// A one-poll-stage workflow. `outcomes` and any extra stage fields are
+    /// injected as raw YAML so each test can shape them; the three
+    /// destinations are distinct so a test can tell which edge fired purely
+    /// by where the task ends up — `finished` for a match, `stalled` for the
+    /// timeout, `failed` for an error.
+    ///
+    /// `interval: 1s` is the floor the loader allows (`0s` is a busy loop
+    /// and is rejected), so multi-attempt tests below cost real seconds.
+    fn poll_def(command: &str, extra: &str) -> String {
+        format!(
+            r#"
+name: poll-flow
+stages:
+  watch:
+    kind: poll
+    command: "{command}"
+    interval: 1s
+{extra}
+    on: {{ green: finished, red: failed, error: failed, timeout: stalled }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+  stalled:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        )
+    }
+
+    fn parsed_poll_def(command: &str, extra: &str) -> Arc<WorkflowDefinition> {
+        Arc::new(WorkflowDefinition::parse(&poll_def(command, extra), Path::new(".")).unwrap())
+    }
+
+    /// The `outcomes:` block most tests want: `SUCCESS` is green, anything
+    /// mentioning failure is red.
+    const GREEN_OR_RED: &str = r#"    outcomes:
+      - match: "SUCCESS"
+        then: green
+      - match: "FAILURE|ERROR"
+        then: red"#;
+
+    async fn poll_events(pool: &SqlitePool, task_id: &str) -> Vec<Value> {
+        events::list_for_task(pool, task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::ShellOutput)
+            .map(|e| e.payload)
+            .collect()
+    }
+
+    /// Waits until a poll has recorded at least one attempt, i.e. its loop
+    /// is genuinely running. Not `wait_until_events_contain`, which looks
+    /// events up by `task_run_id` — a poll stage opens no session, so its
+    /// entries are task-scoped with no run id at all.
+    async fn wait_until_poll_attempt_recorded(pool: &SqlitePool, task_id: &str) {
+        for _ in 0..600 {
+            if !poll_events(pool, task_id).await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for a poll attempt to be recorded");
+    }
+
+    /// Waits for the entry a poll records when it resolves — the one
+    /// carrying a `note`, as opposed to the bare progress entries.
+    async fn wait_until_decisive_poll_event(pool: &SqlitePool, task_id: &str) -> Value {
+        for _ in 0..600 {
+            if let Some(event) = poll_events(pool, task_id)
+                .await
+                .into_iter()
+                .find(|payload| payload.get("note").is_some())
+            {
+                return event;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for a decisive poll event");
+    }
+
+    async fn seed_task_in(pool: &SqlitePool, workflow_def: &str, cwd: &Path) -> String {
+        let project_id = projects::create(pool, "demo").await.unwrap().id;
+        tasks::create(
+            pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def,
+                title: "T",
+                config: json!({ "cwd": cwd.to_string_lossy() }),
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    #[tokio::test]
+    async fn a_poll_advances_as_soon_as_an_outcome_matches() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def("echo SUCCESS", GREEN_OR_RED);
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "finished").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(event["attempt"], json!(1));
+        assert_eq!(event["outcome"], json!("green"));
+        assert_eq!(event["matched"], json!("SUCCESS"));
+    }
+
+    /// Declaration order decides, not which pattern the output happens to
+    /// satisfy — `FAILURE` here matches only the second rule, so the task
+    /// must take the `red` edge rather than falling through.
+    #[tokio::test]
+    async fn a_poll_takes_the_edge_of_the_outcome_that_matched() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def("echo FAILURE", GREEN_OR_RED);
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "failed").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(event["outcome"], json!("red"));
+    }
+
+    /// The behaviour the whole kind exists for: the command keeps saying
+    /// nothing interesting until the state it watches changes, and only
+    /// then does the stage move.
+    ///
+    /// Also pins the timeline policy. Three attempts print `PENDING`,
+    /// `PENDING`, `SUCCESS`, and exactly two entries are recorded — the
+    /// first `PENDING` (nothing to be the same as) and the decisive
+    /// `SUCCESS`. The repeated `PENDING` is what a real `gh pr checks` poll
+    /// produces dozens of times, and burying the timeline under it is the
+    /// thing this rule prevents.
+    #[tokio::test]
+    async fn a_poll_keeps_running_until_its_output_changes_and_records_only_the_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        // Counts its own runs through a file in the task's working
+        // directory, so this doubles as the check that `cwd` is honoured:
+        // with the wrong directory the counter never accumulates and the
+        // poll would run to its timeout instead.
+        let script = dir.join("check.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nn=$(cat count 2>/dev/null || echo 0)\nn=$((n+1))\n\
+             echo $n > count\nif [ $n -ge 3 ]; then echo SUCCESS; else echo PENDING; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let yaml = format!(
+            r#"
+name: poll-flow
+stages:
+  watch:
+    kind: poll
+    script_file: check.sh
+    interval: 1s
+    timeout: 30s
+{GREEN_OR_RED}
+    on: {{ green: finished, red: failed, timeout: stalled }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+  stalled:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let decisive = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(decisive["attempt"], json!(3));
+        assert_eq!(decisive["outcome"], json!("green"));
+
+        let events = poll_events(&pool, &task_id).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "the repeated PENDING attempt should not have been recorded: {events:?}"
+        );
+        assert_eq!(events[0]["attempt"], json!(1));
+        assert_eq!(events[0]["stdout_tail"], json!("PENDING"));
+        assert!(
+            events[0].get("note").is_none(),
+            "a progress entry carries no note: {:?}",
+            events[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_never_matches_gives_up_through_the_timeout_edge() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def("echo PENDING", &format!("    timeout: 1s\n{GREEN_OR_RED}"));
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "stalled").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(event["timed_out"], json!(true));
+        assert!(
+            event["note"].as_str().unwrap().contains("timeout elapsed"),
+            "the timeout entry should say why: {event:?}"
+        );
+    }
+
+    /// Pins the per-attempt cap: an attempt gets whatever is *left of the
+    /// stage's budget*, not `interval`.
+    ///
+    /// The command here takes 3s under a 1s interval. Capping attempts at
+    /// `interval` — which is what the field name intuitively suggests, and a
+    /// very natural-looking "hardening" of that line — would SIGKILL this on
+    /// every single attempt, so the stage could only ever end in `stalled`.
+    /// Every other poll test uses a command that returns in milliseconds and
+    /// would stay green through exactly that regression.
+    #[tokio::test]
+    async fn an_attempt_slower_than_the_interval_is_not_killed() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def(
+            "sleep 3; echo SUCCESS",
+            &format!("    timeout: 30s\n{GREEN_OR_RED}"),
+        );
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "finished").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(
+            event["attempt"],
+            json!(1),
+            "the slow command should have been allowed to finish on its first attempt"
+        );
+        assert_eq!(event["timed_out"], json!(false));
+    }
+
+    /// The other half of the same rule: an attempt that outlives the budget
+    /// *is* killed, and the timeout entry carries what that last attempt
+    /// managed to do rather than an empty placeholder.
+    #[tokio::test]
+    async fn an_attempt_that_outlives_the_budget_is_killed_and_reported() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def(
+            "echo waiting; sleep 30",
+            &format!("    timeout: 2s\n{GREEN_OR_RED}"),
+        );
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "stalled").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(event["timed_out"], json!(true));
+        assert_eq!(event["attempt"], json!(1));
+        // Killed rather than exited on its own, and what it printed before
+        // dying survives onto the timeline.
+        assert_eq!(event["exit_code"], Value::Null);
+        assert_eq!(event["stdout_tail"], json!("waiting"));
+
+        // One entry for the one attempt, not two.
+        let events = poll_events(&pool, &task_id).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "a killed attempt should be reported once, not twice: {events:?}"
+        );
+    }
+
+    /// Unlike `shell`, a poll's exit code decides nothing — a `gh` that
+    /// exits nonzero on a rate limit while still printing the state is the
+    /// case polling exists to ride out. The output is what matters.
+    #[tokio::test]
+    async fn a_polls_exit_code_does_not_decide_its_outcome() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def("echo SUCCESS; exit 7", GREEN_OR_RED);
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "finished").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(event["exit_code"], json!(7));
+        assert_eq!(event["outcome"], json!("green"));
+    }
+
+    /// …but a command that never starts is permanent, and retrying it on an
+    /// interval would only burn the whole budget to reach the same place.
+    #[tokio::test]
+    async fn a_poll_command_that_cannot_start_takes_the_error_edge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let script = dir.join("not-executable.sh");
+        std::fs::write(&script, "#!/bin/sh\necho SUCCESS\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let yaml = format!(
+            r#"
+name: poll-flow
+stages:
+  watch:
+    kind: poll
+    script_file: not-executable.sh
+    interval: 1s
+{GREEN_OR_RED}
+    on: {{ green: finished, red: failed, error: failed }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "failed").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(event["attempt"], json!(1));
+        assert!(
+            event["note"]
+                .as_str()
+                .unwrap()
+                .contains("failed to start command"),
+            "the error entry should say the command never ran: {event:?}"
+        );
+    }
+
+    /// A poll with no `error` edge is waiting for a human on purpose, so it
+    /// parks rather than wedging — and must not keep polling a command that
+    /// can never start.
+    #[tokio::test]
+    async fn a_poll_with_no_error_edge_parks_instead_of_transitioning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let script = dir.join("not-executable.sh");
+        std::fs::write(&script, "#!/bin/sh\necho SUCCESS\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let yaml = format!(
+            r#"
+name: poll-flow
+stages:
+  watch:
+    kind: poll
+    script_file: not-executable.sh
+    interval: 1s
+{GREEN_OR_RED}
+    on: {{ green: finished, red: failed }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_decisive_poll_event(&pool, &task_id).await;
+
+        // Long enough that a loop which kept going would have run several
+        // more attempts and recorded them.
+        tokio::time::sleep(StdDuration::from_millis(2500)).await;
+        assert_eq!(
+            workflow_state::get(&pool, &task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_stage,
+            "watch"
+        );
+        assert_eq!(poll_events(&pool, &task_id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_poll_captures_the_matching_attempts_stdout() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def(
+            r#"printf '{\"state\": \"SUCCESS\"}'"#,
+            &format!("    capture: json\n{GREEN_OR_RED}"),
+        );
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["watch"]["state"],
+            json!("SUCCESS")
+        );
+    }
+
+    /// A poll holds its stage open for as long as its budget allows, so
+    /// unlike `shell` it really can be overtaken by a human. It must notice
+    /// and stop rather than keep burning a command every interval — and
+    /// must not drag the task back out of wherever it went.
+    #[tokio::test]
+    async fn a_poll_abandons_its_loop_once_the_task_leaves_the_stage() {
+        let pool = connect_in_memory().await.unwrap();
+        // Never matches and has no timeout, so nothing but the
+        // stage-departure check can end this loop.
+        let def = parsed_poll_def("echo PENDING", GREEN_OR_RED);
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        // Let the first attempt land, so the loop is genuinely running.
+        wait_until_poll_attempt_recorded(&pool, &task_id).await;
+
+        engine.advance(&task_id, &def, "red").await.unwrap();
+        wait_until_stage(&pool, &task_id, "failed").await;
+        let recorded = poll_events(&pool, &task_id).await.len();
+
+        tokio::time::sleep(StdDuration::from_millis(2500)).await;
+        assert_eq!(
+            workflow_state::get(&pool, &task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_stage,
+            "failed",
+            "the abandoned poll must not have advanced the task again"
+        );
+        assert_eq!(
+            poll_events(&pool, &task_id).await.len(),
+            recorded,
+            "the poll should have stopped running its command"
+        );
+    }
+
+    /// A poll's outcome goes through the stage's `on:` map like any other,
+    /// so `loop_guard` applies to it without the kind knowing anything
+    /// about guards.
+    #[tokio::test]
+    async fn a_polls_outcome_is_subject_to_loop_guards() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = format!(
+            r#"
+name: poll-flow
+stages:
+  watch:
+    kind: poll
+    command: "echo FAILURE"
+    interval: 1s
+{GREEN_OR_RED}
+    on: {{ green: finished, red: watch }}
+    loop_guard: {{ on: red, max: 1, then: stalled }}
+  finished:
+    kind: terminal
+  stalled:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        // First `red` loops back into `watch`; the second exceeds the
+        // guard and reroutes.
+        wait_until_stage(&pool, &task_id, "stalled").await;
     }
 
     struct TempDir(PathBuf);
