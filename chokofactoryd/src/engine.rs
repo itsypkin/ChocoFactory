@@ -1317,6 +1317,9 @@ impl WorkflowEngine {
         // What the previous attempt produced, for the "only record what
         // changed" rule below. `None` until the first attempt reports.
         let mut previous: Option<String> = None;
+        // The most recent attempt that actually ran, so every timeout path
+        // can report what the command last said rather than an empty entry.
+        let mut last_outcome: Option<shell::ShellOutcome> = None;
 
         loop {
             // A poll is the one stage kind that holds its window open for
@@ -1341,7 +1344,12 @@ impl WorkflowEngine {
                 deadline.map(|at| at.saturating_duration_since(std::time::Instant::now()));
             if remaining == Some(Duration::ZERO) {
                 self.finish_poll_timed_out(
-                    task_id, definition, stage_name, &described, attempt, None,
+                    task_id,
+                    definition,
+                    stage_name,
+                    &described,
+                    attempt,
+                    last_outcome.as_ref(),
                 )
                 .await;
                 return;
@@ -1450,6 +1458,7 @@ impl WorkflowEngine {
                     note = "could not confirm the process group exited — something may still be running"
                         .to_string();
                 }
+                warn_if_escaped(task_id, stage_name, &outcome);
                 // Always recorded, changed output or not: this is the
                 // attempt that decided the stage.
                 self.append_command_event(
@@ -1482,27 +1491,42 @@ impl WorkflowEngine {
             // is now spent, so the stage is out of time regardless of what
             // the interval says.
             let killed = outcome.timed_out;
-            self.record_poll_attempt(
-                task_id,
-                &mut previous,
-                // Compared trimmed, matching what `tail` puts on the
-                // timeline: two attempts differing only in trailing
-                // whitespace would otherwise record two entries a reader
-                // can't tell apart.
-                outcome.stdout.trim().to_string(),
-                json!({
-                    "stage": stage_name,
-                    "command": described,
-                    "attempt": attempt,
-                    "exit_code": outcome.exit_code,
-                    "timed_out": outcome.timed_out,
-                    "escaped": outcome.escaped,
-                    "duration_ms": duration_ms(outcome.duration),
-                    "stdout_tail": tail(&outcome.stdout),
-                    "stderr_tail": tail(&outcome.stderr),
-                }),
-            )
-            .await;
+            warn_if_escaped(task_id, stage_name, &outcome);
+
+            // A killed attempt is reported once, by `finish_poll_timed_out`
+            // below, which carries the same fields plus the reason. Passing
+            // it through here as well would put two entries on the timeline
+            // for one attempt.
+            if !killed {
+                self.record_poll_attempt(
+                    task_id,
+                    &mut previous,
+                    // Compared trimmed, matching what `tail` puts on the
+                    // timeline: two attempts differing only in trailing
+                    // whitespace would otherwise record two entries a reader
+                    // can't tell apart.
+                    outcome.stdout.trim().to_string(),
+                    json!({
+                        "stage": stage_name,
+                        "command": described,
+                        "attempt": attempt,
+                        "exit_code": outcome.exit_code,
+                        "timed_out": outcome.timed_out,
+                        "escaped": outcome.escaped,
+                        "duration_ms": duration_ms(outcome.duration),
+                        "stdout_tail": tail(&outcome.stdout),
+                        "stderr_tail": tail(&outcome.stderr),
+                    }),
+                )
+                .await;
+            }
+
+            // Kept so whichever timeout path fires can report what the
+            // command last actually said. Without it, a poll that printed
+            // `PENDING` for an hour and then ran out of budget leaves a
+            // final timeline entry showing nothing at all — the repeated
+            // attempts having been deliberately suppressed above.
+            last_outcome = Some(outcome);
 
             if killed {
                 self.finish_poll_timed_out(
@@ -1511,7 +1535,7 @@ impl WorkflowEngine {
                     stage_name,
                     &described,
                     attempt,
-                    Some(&outcome),
+                    last_outcome.as_ref(),
                 )
                 .await;
                 return;
@@ -1523,7 +1547,12 @@ impl WorkflowEngine {
                 .is_break()
             {
                 self.finish_poll_timed_out(
-                    task_id, definition, stage_name, &described, attempt, None,
+                    task_id,
+                    definition,
+                    stage_name,
+                    &described,
+                    attempt,
+                    last_outcome.as_ref(),
                 )
                 .await;
                 return;
@@ -1928,6 +1957,22 @@ const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 /// purpose: this is a human-facing breadcrumb, and the full output isn't
 /// retained anywhere.
 const EVENT_OUTPUT_TAIL_BYTES: usize = 2048;
+
+/// Logs a poll attempt whose process group outlived its kill.
+///
+/// `run_shell_stage` warns on the same condition, and an operator grepping
+/// logs for escaped process groups should find both kinds — a poll is if
+/// anything the likelier source, since it can kill an attempt on every
+/// interval for as long as its budget lasts.
+fn warn_if_escaped(task_id: &str, stage_name: &str, outcome: &shell::ShellOutcome) {
+    if outcome.escaped {
+        tracing::warn!(
+            task_id,
+            stage = stage_name,
+            "a poll attempt was killed but its process group could not be confirmed dead"
+        );
+    }
+}
 
 /// Everything a detached poll runner needs, resolved once on stage entry.
 ///
@@ -4399,6 +4444,70 @@ stages:
         assert!(
             event["note"].as_str().unwrap().contains("timeout elapsed"),
             "the timeout entry should say why: {event:?}"
+        );
+    }
+
+    /// Pins the per-attempt cap: an attempt gets whatever is *left of the
+    /// stage's budget*, not `interval`.
+    ///
+    /// The command here takes 3s under a 1s interval. Capping attempts at
+    /// `interval` — which is what the field name intuitively suggests, and a
+    /// very natural-looking "hardening" of that line — would SIGKILL this on
+    /// every single attempt, so the stage could only ever end in `stalled`.
+    /// Every other poll test uses a command that returns in milliseconds and
+    /// would stay green through exactly that regression.
+    #[tokio::test]
+    async fn an_attempt_slower_than_the_interval_is_not_killed() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def(
+            "sleep 3; echo SUCCESS",
+            &format!("    timeout: 30s\n{GREEN_OR_RED}"),
+        );
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "finished").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(
+            event["attempt"],
+            json!(1),
+            "the slow command should have been allowed to finish on its first attempt"
+        );
+        assert_eq!(event["timed_out"], json!(false));
+    }
+
+    /// The other half of the same rule: an attempt that outlives the budget
+    /// *is* killed, and the timeout entry carries what that last attempt
+    /// managed to do rather than an empty placeholder.
+    #[tokio::test]
+    async fn an_attempt_that_outlives_the_budget_is_killed_and_reported() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = parsed_poll_def(
+            "echo waiting; sleep 30",
+            &format!("    timeout: 2s\n{GREEN_OR_RED}"),
+        );
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "stalled").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(event["timed_out"], json!(true));
+        assert_eq!(event["attempt"], json!(1));
+        // Killed rather than exited on its own, and what it printed before
+        // dying survives onto the timeline.
+        assert_eq!(event["exit_code"], Value::Null);
+        assert_eq!(event["stdout_tail"], json!("waiting"));
+
+        // One entry for the one attempt, not two.
+        let events = poll_events(&pool, &task_id).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "a killed attempt should be reported once, not twice: {events:?}"
         );
     }
 
