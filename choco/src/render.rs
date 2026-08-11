@@ -367,6 +367,24 @@ fn event_summary(event: &Event) -> String {
             }
             one_line(&summary)
         }
+        // `{stage, capture, outcome, note}` (#45) — same reasoning as the two
+        // arms above. The `note` is the point of the entry when it's present:
+        // it's what says a reply wasn't the JSON the stage asked for and the
+        // outcome fell back to `done`.
+        EventType::TurnOutcome => {
+            let outcome = payload
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("no outcome");
+            let mut summary = format!("turn →  {outcome}");
+            if let Some(note) = payload.get("note").and_then(Value::as_str)
+                && !note.is_empty()
+            {
+                summary.push_str("  ");
+                summary.push_str(note);
+            }
+            one_line(&summary)
+        }
         EventType::ToolCall => {
             let tool = payload.get("tool").and_then(Value::as_str).unwrap_or("?");
             match payload.get("input") {

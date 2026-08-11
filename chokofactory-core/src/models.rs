@@ -175,6 +175,17 @@ pub enum EventType {
     /// failed command would route through `on: error` with the reason
     /// nowhere in the API.
     ShellOutput,
+    /// A capture-bearing `agent_turn` concluded (#45): what its `capture:`
+    /// asked for, the outcome it transitioned on, and an optional `"note"`
+    /// when those two didn't line up — a reply that wasn't valid JSON under
+    /// `capture: json`, or that carried no usable `outcome` key and so fell
+    /// back to `done`. Payload is `{"stage", "capture", "outcome", "note"}`.
+    ///
+    /// Unlike [`Self::StageEntered`]/[`Self::ShellOutput`] this one *does*
+    /// belong to a session — a turn has a `task_run` — so it carries a
+    /// `task_run_id`. It exists so the lenient fallback above is visible in
+    /// the timeline rather than only in the daemon's logs.
+    TurnOutcome,
 }
 
 impl fmt::Display for EventType {
@@ -189,6 +200,7 @@ impl fmt::Display for EventType {
             EventType::SessionMeta => "session_meta",
             EventType::StageEntered => "stage_entered",
             EventType::ShellOutput => "shell_output",
+            EventType::TurnOutcome => "turn_outcome",
         })
     }
 }
@@ -218,6 +230,7 @@ impl FromStr for EventType {
             "session_meta" => Ok(EventType::SessionMeta),
             "stage_entered" => Ok(EventType::StageEntered),
             "shell_output" => Ok(EventType::ShellOutput),
+            "turn_outcome" => Ok(EventType::TurnOutcome),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -304,6 +317,8 @@ mod tests {
             EventType::Error,
             EventType::SessionMeta,
             EventType::StageEntered,
+            EventType::ShellOutput,
+            EventType::TurnOutcome,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),

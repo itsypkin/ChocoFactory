@@ -137,6 +137,76 @@ pub async fn list_for_task_run(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Everything a session's agent actually said, oldest first, joined with
+/// newlines — the text an `agent_turn`'s `capture:` is taken from (#45).
+///
+/// The engine keeps no copy of a turn's reply: `drain_session` appends each
+/// `AssistantMessage` here and drops it, and the completion watcher only ever
+/// sees `task_runs` rows. So the reply is read back from the timeline.
+///
+/// Filtering by `event_type` in SQL rather than fetching the run's whole
+/// event list and filtering in Rust is deliberate — that list also holds tool
+/// results, which can be far larger than the reply and would be loaded only
+/// to be discarded.
+///
+/// Scoped to one run, which on this path is one turn: a stage that captures
+/// has a non-empty `on:` map, and `send_message` only accepts stages whose
+/// `on:` is empty, so no second turn can be added to this run. A future
+/// change that lets a capturing stage take more than one turn would need to
+/// bound this further (by the last `human_message`, say).
+///
+/// Blocks are joined with a newline: the adapter emits one event per text
+/// block of a single reply (`normalize_assistant`), so a reply the agent
+/// wrote as one JSON document can arrive as several rows that have to be put
+/// back together before anything can parse it.
+///
+/// Decoding through `Json<Value>` rather than parsing the column by hand
+/// makes a payload that isn't valid JSON a `sqlx` decode error the caller has
+/// to handle, instead of a block quietly dropped from the middle of a reply —
+/// which would hand the capture a truncated document that might still parse.
+///
+/// Reading this after the run reports `idle` is safe by construction:
+/// `drain_session` appends every event before it touches the run's status, so
+/// a completed run's reply is whole here. The one gap is that those appends
+/// are best-effort — a transient DB failure there is logged and dropped, and
+/// the block it lost is simply not part of the text this returns. That
+/// predates capture; it matters more now that a `capture: json` turn parses
+/// the result, where the worst case is a truncated document that still
+/// parses into the wrong verdict.
+pub async fn assistant_text_for_run(
+    pool: &SqlitePool,
+    task_run_id: &str,
+) -> Result<String, sqlx::Error> {
+    let rows: Vec<(Json<Value>,)> = sqlx::query_as(
+        "SELECT payload FROM events
+         WHERE task_run_id = ? AND event_type = ?
+         ORDER BY created_at, id",
+    )
+    .bind(task_run_id)
+    .bind(EventType::AssistantMessage.to_string())
+    .fetch_all(pool)
+    .await?;
+
+    let mut blocks = Vec::with_capacity(rows.len());
+    for (payload,) in &rows {
+        match payload.0.get("text").and_then(Value::as_str) {
+            Some(text) => blocks.push(text),
+            // Every `assistant_message` this daemon writes carries a `text`
+            // string (`AgentEvent::payload`), so this is an invariant
+            // violation rather than a shape to tolerate. It can't be a hard
+            // error without a richer error type than `sqlx::Error`, but it is
+            // loud rather than silent — a dropped block would otherwise
+            // silently corrupt the capture.
+            None => tracing::error!(
+                task_run_id,
+                "an assistant_message event has no 'text' field; \
+                 it is missing from the text of this run's reply"
+            ),
+        }
+    }
+    Ok(blocks.join("\n"))
+}
+
 /// A task's whole timeline, oldest first (P1-9) — every session's events
 /// interleaved with the task's own `stage_entered` entries.
 ///
@@ -656,6 +726,48 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// A reply arrives as one event per text block, so the blocks have to be
+    /// rejoined in order before a `capture: json` turn can parse them (#45) —
+    /// and nothing that isn't the agent speaking may leak into that text.
+    #[tokio::test]
+    async fn assistant_text_joins_only_the_agents_own_blocks_in_order() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        for (event_type, payload) in [
+            (EventType::HumanMessage, json!({ "text": "review this" })),
+            (
+                EventType::AssistantMessage,
+                json!({ "text": "{\"outcome\":" }),
+            ),
+            (
+                EventType::ToolResult,
+                json!({ "tool": "Read", "output": "a huge file" }),
+            ),
+            (
+                EventType::AssistantMessage,
+                json!({ "text": " \"approved\"}" }),
+            ),
+        ] {
+            append(&pool, &task_run_id, event_type, payload)
+                .await
+                .unwrap();
+        }
+
+        let text = assistant_text_for_run(&pool, &task_run_id).await.unwrap();
+        assert_eq!(text, "{\"outcome\":\n \"approved\"}");
+    }
+
+    #[tokio::test]
+    async fn assistant_text_is_empty_for_a_run_that_said_nothing() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        assert_eq!(
+            assistant_text_for_run(&pool, &task_run_id).await.unwrap(),
+            ""
         );
     }
 }
