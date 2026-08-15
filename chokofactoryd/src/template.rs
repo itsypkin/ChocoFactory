@@ -309,10 +309,49 @@ mod tests {
     #[test]
     fn tolerates_whitespace_around_the_path() {
         let payload = payload();
+        for input in [
+            "{{stages.open_pr.number}}",
+            "{{ stages.open_pr.number }}",
+            "{{      stages.open_pr.number   }}",
+            "{{\tstages.open_pr.number\n}}",
+        ] {
+            assert_eq!(render(input, &payload).unwrap(), "42", "for {input:?}");
+        }
+    }
+
+    /// This is a hand-written scanner over byte indices, so multi-byte text
+    /// around and inside a placeholder is the standing panic risk. `{`/`}`
+    /// can't appear inside a UTF-8 continuation byte, so every index it
+    /// derives is a char boundary — this is the guard against a refactor
+    /// quietly breaking that.
+    #[test]
+    fn handles_multibyte_text_around_and_inside_placeholders() {
+        let payload = json!({
+            "stages": { "review": { "comments": "见 café ☕", "n": 1 } }
+        });
         assert_eq!(
-            render("{{stages.open_pr.number}}", &payload).unwrap(),
-            render("{{      stages.open_pr.number   }}", &payload).unwrap()
+            render("café {{ stages.review.comments }} 🚀", &payload).unwrap(),
+            "café 见 café ☕ 🚀"
         );
+        // Multi-byte in the *error* paths too, where the placeholder text is
+        // sliced out of the input to quote back.
+        assert!(render("🚀 {{ stages.review.née }}", &payload).is_err());
+        assert!(render("🚀 {{ stages.☕.x }}", &payload).is_err());
+        assert!(render("🚀 {{ stages.review", &payload).is_err());
+        assert!(render("🚀 {{ 見.x }}", &payload).is_err());
+    }
+
+    #[test]
+    fn handles_adjacent_and_nested_looking_placeholders() {
+        let payload = json!({"stages": {"a": {"x": 1}, "b": {"y": 2}}});
+        assert_eq!(
+            render("{{ stages.a.x }}{{ stages.b.y }}", &payload).unwrap(),
+            "12"
+        );
+        // A `}}` with no opener is literal text, not an error.
+        assert_eq!(render("}} plain", &payload).unwrap(), "}} plain");
+        // An inner `{{` is part of the path and simply fails to resolve.
+        assert!(render("{{ {{ stages.a.x }} }}", &payload).is_err());
     }
 
     #[test]

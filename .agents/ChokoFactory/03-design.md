@@ -437,6 +437,38 @@ Substitution rules, in full (P2-3):
   captures are only written as part of a transition. The rendered
   command — not the template — is what the timeline records, because
   that is what actually ran.
+- A run-time failure (a field the capture didn't carry, a value that
+  isn't a scalar) fails the stage and is recorded on the task's timeline
+  as an `error` entry naming the stage and the placeholder, not only in
+  the daemon's log. It is the *expected* failure of this feature, since
+  the loader cannot know a payload's shape, so it has to be visible
+  where an operator looks.
+
+**Two consequences worth stating plainly.**
+
+*Substituted values are not shell-escaped.* A rendered `command:` runs
+through `sh -c`, and what gets spliced in is now, under §5.2's
+`agent_turn` capture, text an **agent** wrote — or text a `shell` stage
+scraped from somewhere else (`gh pr view --json title`). A capture
+containing `; rm -rf …` becomes part of the command the daemon runs.
+This is accepted for now rather than overlooked: the roles a workflow
+runs already have tool access to the same working copy, so this is not a
+new capability so much as a new path to it. It is *not* equivalent
+though — the daemon's shell sits outside whatever sandbox the agent's
+own tools run in, and the content may be relayed from a third party (a
+PR title) rather than authored by the role. Anyone templating a capture
+into a command that does more than echo it should treat the value as
+untrusted. Quoting on substitution was considered and rejected as a
+silent behaviour change: `"{{ x }}"` in an already-quoted context would
+gain literal quotes. If this needs closing, the honest fix is an
+explicit filter syntax, which the format doesn't have yet.
+
+*`{{` is reserved everywhere in an inline `command:`.* A command that
+legitimately contains GitHub Actions syntax (`gh workflow run …
+'${{ inputs.x }}'`) now fails to load, because the loader rejects any
+placeholder whose root isn't `stages`. That's the cost of catching a
+mistyped namespace at load rather than at run time. The escape hatch is
+`script_file:`, whose contents are never templated.
 
 ### 5.2 Stage kinds (fixed set, implemented in Rust)
 
@@ -447,10 +479,22 @@ scripting runtime (see §7 non-goal):
 
 - **`agent_turn`**: runs one turn (or resumed session) of a role via the
   agent adapter abstraction (§4). A plain turn emits `done`. A turn that
-  declares `capture:` (§5.1) keeps what the agent said — the
-  concatenated text of its `assistant_message` events, which is read
+  declares `capture:` (§5.1) keeps the agent's **final message** — read
   back off the timeline, since the engine holds no copy of a reply once
-  the session drain has stored it. Under `capture: json` the reply's
+  the session drain has stored it.
+
+  The final message specifically, not everything the agent said: a turn
+  is not one message. An agent that uses a tool produces
+  `assistant(text) → tool_call → tool_result → assistant(text)`, so
+  capturing the lot would put its narration ("I'll read the diff
+  first.") in front of its answer and a `capture: json` reply would
+  never parse. What a verdict means is the last thing said, after the
+  work. Text blocks within that message are concatenated with no
+  separator, so a JSON document split across blocks survives reassembly.
+  A reply that is *entirely* one ``` fence is unwrapped — the commonest
+  thing a model does unbidden — and that is the only normalization
+  applied; there is no search for JSON buried in prose, which would be
+  guessing. Under `capture: json` the reply's
   reserved **`outcome`** key is what the stage transitions on, so a
   reviewer answering `{"outcome": "approved", "comments": "…"}` drives
   both the `on:` edge and the `comments` a later stage templates in —

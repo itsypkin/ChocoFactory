@@ -137,28 +137,38 @@ pub async fn list_for_task_run(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
-/// Everything a session's agent actually said, oldest first, joined with
-/// newlines — the text an `agent_turn`'s `capture:` is taken from (#45).
+/// The agent's **final message** in a session — the text an `agent_turn`'s
+/// `capture:` is taken from (#45).
 ///
 /// The engine keeps no copy of a turn's reply: `drain_session` appends each
 /// `AssistantMessage` here and drops it, and the completion watcher only ever
 /// sees `task_runs` rows. So the reply is read back from the timeline.
 ///
-/// Filtering by `event_type` in SQL rather than fetching the run's whole
-/// event list and filtering in Rust is deliberate — that list also holds tool
-/// results, which can be far larger than the reply and would be loaded only
-/// to be discarded.
+/// **Why the final message rather than everything the agent said.** A turn is
+/// not one message. An agent that uses a tool produces
+/// `assistant(text) → tool_call → tool_result → assistant(text)`, and
+/// `normalize_assistant` flattens every text block of every one of those into
+/// its own row. Concatenating them all would prepend the agent's narration
+/// ("I'll read the diff first.") to its answer, so a `capture: json` turn
+/// would never parse — and would then fall back to `done` and route the graph
+/// down the wrong edge. What a verdict means is the *last* thing the agent
+/// said, after it finished working.
+///
+/// So this takes the trailing run of `assistant_message` rows: everything
+/// after the last event that was something else. Text blocks within that one
+/// message are concatenated with no separator, since a JSON document split
+/// across blocks has to survive being put back together — a newline inserted
+/// inside a string literal would make it unparseable.
+///
+/// Only `assistant_message` payloads are transferred; a `tool_result` can be
+/// far larger than the reply and is only needed here as a boundary marker, so
+/// the query selects its type and discards its payload in SQL.
 ///
 /// Scoped to one run, which on this path is one turn: a stage that captures
 /// has a non-empty `on:` map, and `send_message` only accepts stages whose
 /// `on:` is empty, so no second turn can be added to this run. A future
-/// change that lets a capturing stage take more than one turn would need to
-/// bound this further (by the last `human_message`, say).
-///
-/// Blocks are joined with a newline: the adapter emits one event per text
-/// block of a single reply (`normalize_assistant`), so a reply the agent
-/// wrote as one JSON document can arrive as several rows that have to be put
-/// back together before anything can parse it.
+/// change that lets a capturing stage take more than one turn would still be
+/// correct here — "the last thing said" is per-turn by construction.
 ///
 /// Decoding through `Json<Value>` rather than parsing the column by hand
 /// makes a payload that isn't valid JSON a `sqlx` decode error the caller has
@@ -173,22 +183,32 @@ pub async fn list_for_task_run(
 /// predates capture; it matters more now that a `capture: json` turn parses
 /// the result, where the worst case is a truncated document that still
 /// parses into the wrong verdict.
-pub async fn assistant_text_for_run(
+pub async fn final_assistant_text_for_run(
     pool: &SqlitePool,
     task_run_id: &str,
 ) -> Result<String, sqlx::Error> {
-    let rows: Vec<(Json<Value>,)> = sqlx::query_as(
-        "SELECT payload FROM events
-         WHERE task_run_id = ? AND event_type = ?
+    let assistant = EventType::AssistantMessage.to_string();
+    let rows: Vec<(String, Option<Json<Value>>)> = sqlx::query_as(
+        "SELECT event_type,
+                CASE WHEN event_type = ? THEN payload END AS text_payload
+         FROM events
+         WHERE task_run_id = ?
          ORDER BY created_at, id",
     )
+    .bind(&assistant)
     .bind(task_run_id)
-    .bind(EventType::AssistantMessage.to_string())
     .fetch_all(pool)
     .await?;
 
-    let mut blocks = Vec::with_capacity(rows.len());
-    for (payload,) in &rows {
+    let final_message = rows
+        .iter()
+        .rev()
+        .take_while(|(event_type, _)| *event_type == assistant);
+
+    let mut blocks: Vec<&str> = Vec::new();
+    for (_, payload) in final_message {
+        // `CASE WHEN` guarantees a payload on exactly the rows taken above.
+        let Some(payload) = payload else { continue };
         match payload.0.get("text").and_then(Value::as_str) {
             Some(text) => blocks.push(text),
             // Every `assistant_message` this daemon writes carries a `text`
@@ -204,7 +224,8 @@ pub async fn assistant_text_for_run(
             ),
         }
     }
-    Ok(blocks.join("\n"))
+    blocks.reverse();
+    Ok(blocks.concat())
 }
 
 /// A task's whole timeline, oldest first (P1-9) — every session's events
@@ -729,45 +750,178 @@ mod tests {
         );
     }
 
-    /// A reply arrives as one event per text block, so the blocks have to be
-    /// rejoined in order before a `capture: json` turn can parse them (#45) —
-    /// and nothing that isn't the agent speaking may leak into that text.
-    #[tokio::test]
-    async fn assistant_text_joins_only_the_agents_own_blocks_in_order() {
-        let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
-
-        for (event_type, payload) in [
-            (EventType::HumanMessage, json!({ "text": "review this" })),
-            (
-                EventType::AssistantMessage,
-                json!({ "text": "{\"outcome\":" }),
-            ),
-            (
-                EventType::ToolResult,
-                json!({ "tool": "Read", "output": "a huge file" }),
-            ),
-            (
-                EventType::AssistantMessage,
-                json!({ "text": " \"approved\"}" }),
-            ),
-        ] {
-            append(&pool, &task_run_id, event_type, payload)
+    async fn append_all(pool: &SqlitePool, task_run_id: &str, events: &[(EventType, Value)]) {
+        for (event_type, payload) in events {
+            append(pool, task_run_id, *event_type, payload.clone())
                 .await
                 .unwrap();
         }
+    }
 
-        let text = assistant_text_for_run(&pool, &task_run_id).await.unwrap();
-        assert_eq!(text, "{\"outcome\":\n \"approved\"}");
+    /// The shape a real tool-using turn produces. Only the *last* message is
+    /// the answer — concatenating the narration in front of it would make a
+    /// `capture: json` reply unparseable and route the graph on a verdict the
+    /// agent never gave (#45).
+    #[tokio::test]
+    async fn the_final_message_excludes_narration_before_a_tool_call() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (EventType::HumanMessage, json!({ "text": "review this" })),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "I'll read the diff first." }),
+                ),
+                (
+                    EventType::ToolCall,
+                    json!({ "tool": "Read", "input": {"path": "a.rs"} }),
+                ),
+                (
+                    EventType::ToolResult,
+                    json!({ "tool": "Read", "output": "a huge file" }),
+                ),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": r#"{"outcome": "approved"}"# }),
+                ),
+            ],
+        )
+        .await;
+
+        let text = final_assistant_text_for_run(&pool, &task_run_id)
+            .await
+            .unwrap();
+        assert_eq!(text, r#"{"outcome": "approved"}"#);
+        assert!(
+            serde_json::from_str::<Value>(&text).is_ok(),
+            "the captured reply has to parse"
+        );
+    }
+
+    /// Text blocks of one message are concatenated with no separator: a JSON
+    /// document split mid-string must survive reassembly, and a newline
+    /// inserted inside a string literal would not be valid JSON.
+    #[tokio::test]
+    async fn the_final_messages_blocks_are_concatenated_in_order() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": r#"{"comments": "he"# }),
+                ),
+                (EventType::AssistantMessage, json!({ "text": r#"llo"}"# })),
+            ],
+        )
+        .await;
+
+        let text = final_assistant_text_for_run(&pool, &task_run_id)
+            .await
+            .unwrap();
+        assert_eq!(text, r#"{"comments": "hello"}"#);
+        assert!(serde_json::from_str::<Value>(&text).is_ok());
+    }
+
+    /// A `thinking` block precedes the text of the same message; it is not
+    /// something the agent said to us and must not reach the capture.
+    #[tokio::test]
+    async fn the_final_message_excludes_thinking() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::Thinking,
+                    json!({ "text": "hmm, is this approved?" }),
+                ),
+                (EventType::AssistantMessage, json!({ "text": "approved" })),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            "approved"
+        );
+    }
+
+    /// A turn that ended mid-tool-call never gave a final answer, and
+    /// inventing one out of its earlier narration would be worse than none.
+    #[tokio::test]
+    async fn a_turn_that_ended_on_a_tool_call_has_no_final_message() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "let me look" }),
+                ),
+                (EventType::ToolCall, json!({ "tool": "Read" })),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            ""
+        );
     }
 
     #[tokio::test]
-    async fn assistant_text_is_empty_for_a_run_that_said_nothing() {
+    async fn a_run_that_said_nothing_has_no_final_message() {
         let pool = connect_in_memory().await.unwrap();
         let task_run_id = seed_task_run(&pool).await;
         assert_eq!(
-            assistant_text_for_run(&pool, &task_run_id).await.unwrap(),
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
             ""
+        );
+    }
+
+    /// One run is one turn on the capture path, but a chat run accumulates
+    /// several — and "the last thing said" stays correct for those too.
+    #[tokio::test]
+    async fn the_final_message_is_the_latest_turns_answer() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (EventType::HumanMessage, json!({ "text": "first" })),
+                (EventType::AssistantMessage, json!({ "text": "answer one" })),
+                (EventType::HumanMessage, json!({ "text": "second" })),
+                (EventType::AssistantMessage, json!({ "text": "answer two" })),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            "answer two"
         );
     }
 }

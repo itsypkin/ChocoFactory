@@ -882,7 +882,6 @@ impl WorkflowEngine {
     /// authoritative value: re-reading here would be a second query for the
     /// same row, and — worse — would invite a future caller to render
     /// against state some other writer had moved on from.
-    #[allow(clippy::too_many_arguments)]
     async fn enter_stage(
         self: &Arc<Self>,
         task_id: &str,
@@ -931,6 +930,50 @@ impl WorkflowEngine {
             ),
         }
 
+        let entered =
+            self.dispatch_stage(task_id, definition, stage_name, stage_def, input, payload);
+        let entered = entered.await;
+
+        // The loader settles what it can about a template, but not whether a
+        // captured payload actually carries the field — so this is *the*
+        // expected run-time failure of P2-3, and on a detached path it would
+        // otherwise leave the timeline showing a stage entered and then
+        // nothing at all, with the reason only in the daemon's log. Same
+        // reasoning as `shell_output`'s `note` and `turn_outcome`: a failure
+        // this feature expects should be visible where an operator looks.
+        // Task-scoped, since rendering happens before any `task_run` exists.
+        if let Err(EngineError::Template { stage, reason }) = &entered {
+            let message = format!("stage '{stage}' could not render a template: {reason}");
+            tracing::error!(task_id, stage, reason, "stage parked: {message}");
+            match events::append_for_task(
+                &self.pool,
+                task_id,
+                EventType::Error,
+                json!({ "stage": stage, "message": message }),
+            )
+            .await
+            {
+                Ok(_) => self.events_notify.notify_waiters(),
+                Err(err) => tracing::error!(
+                    task_id, stage, %err,
+                    "failed to record a template failure event"
+                ),
+            }
+        }
+        entered
+    }
+
+    /// The per-kind behavior half of `enter_stage`, split out so the caller
+    /// can act on the result once rather than at five `return` sites.
+    async fn dispatch_stage(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        stage_def: &StageDef,
+        input: Option<&str>,
+        payload: &Value,
+    ) -> Result<(), EngineError> {
         match &stage_def.kind {
             StageKind::AgentTurn {
                 role,
@@ -1965,7 +2008,6 @@ impl WorkflowEngine {
     /// A crashed/non-zero exit is logged and left for a human to notice
     /// rather than guessing an outcome the stage's `on:` map was never
     /// designed to receive.
-    #[allow(clippy::too_many_arguments)]
     fn spawn_turn_watcher(
         self: &Arc<Self>,
         task_id: String,
@@ -2047,10 +2089,11 @@ impl WorkflowEngine {
                 // stream is drained straight into `events` by `drain_session`
                 // and dropped, and this watcher only ever sees `task_runs`
                 // rows. So the reply is read back from the timeline.
-                match events::assistant_text_for_run(&self.pool, task_run_id).await {
+                match events::final_assistant_text_for_run(&self.pool, task_run_id).await {
                     Ok(reply) => {
+                        let reply = unwrap_code_fence(reply.trim());
                         let (captured, capture_note) =
-                            derive_capture(Some(capture), &reply, task_id, stage_name, "the reply");
+                            derive_capture(Some(capture), reply, task_id, stage_name, "the reply");
                         let (outcome, outcome_note) = turn_outcome(capture, captured.as_ref());
                         (captured, outcome, capture_note.or(outcome_note))
                     }
@@ -2079,7 +2122,93 @@ impl WorkflowEngine {
             }
         };
 
+        // `expected_stage` below catches a task that has *left* this stage,
+        // but not one that left and came back: re-entering opens a new
+        // `task_run`, and a late watcher for the superseded one would pass
+        // that check and overwrite the fresh capture with a stale verdict.
+        // Advisory only, like poll's `still_in_stage` — it runs outside the
+        // lock, and nothing can produce that interleaving today (nothing
+        // moves a task out of an `agent_turn` while its run is live), so this
+        // is the invariant announcing itself rather than a known case.
+        if !self
+            .is_current_run_for_stage(task_id, stage_name, task_run_id)
+            .await
+        {
+            tracing::warn!(
+                task_id,
+                task_run_id,
+                stage = stage_name,
+                "discarded a turn's outcome: its stage has since started a newer run"
+            );
+            return;
+        }
+
+        // `expected_stage` matters even though a turn holds its stage open:
+        // a human can close or resume the task between the run going idle
+        // and this write, and the capture is keyed by the stage the check
+        // confirms is still current.
+        let applied = self
+            .advance_from_stage(task_id, definition, &outcome, Some(stage_name), captured)
+            .await;
+
+        let applied_note = match &applied {
+            Ok(()) => {
+                tracing::debug!(
+                    task_id,
+                    task_run_id,
+                    stage = stage_name,
+                    outcome,
+                    "turn completed; advanced"
+                );
+                None
+            }
+            // Deliberately parked, not broken — the same classification
+            // `finish_shell_stage` uses. A reviewer stage that declares only
+            // `approved`/`changes_requested` and whose reply carried neither
+            // lands here, which is the intended place for a human to pick it
+            // up rather than the engine inventing a transition.
+            Err(EngineError::UnknownOutcome { stage, outcome }) => {
+                tracing::info!(
+                    task_id,
+                    stage,
+                    outcome,
+                    "turn parked: its outcome has no 'on:' edge"
+                );
+                Some(format!(
+                    "parked: stage '{stage}' has no 'on:' edge for '{outcome}'"
+                ))
+            }
+            Err(EngineError::StageMovedOn { expected, actual }) => {
+                tracing::info!(
+                    task_id,
+                    expected,
+                    actual,
+                    outcome,
+                    "discarded a turn's outcome: the task had already left that stage"
+                );
+                Some(format!(
+                    "not applied: the task had already left '{expected}' for '{actual}'"
+                ))
+            }
+            Err(err) => {
+                tracing::error!(
+                    task_id, stage = stage_name, outcome, %err,
+                    "task wedged: its turn completed but the transition failed"
+                );
+                Some(format!("not applied: {err}"))
+            }
+        };
+
+        // Written *after* the advance, and carrying whether it was applied,
+        // so the entry can't claim a transition that was rejected — the park
+        // this feature's lenient fallback relies on is exactly the case where
+        // the outcome is computed but deliberately not taken.
         if capture.is_some() {
+            let note = match (note, applied_note) {
+                (Some(why), Some(applied)) => Some(format!("{why}; {applied}")),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            };
             self.append_turn_outcome_event(
                 task_id,
                 task_run_id,
@@ -2087,49 +2216,37 @@ impl WorkflowEngine {
                     "stage": stage_name,
                     "capture": capture_label(capture),
                     "outcome": outcome,
+                    "applied": applied.is_ok(),
                     "note": note,
                 }),
             )
             .await;
         }
+    }
 
-        // `expected_stage` matters even though a turn holds its stage open:
-        // a human can close or resume the task between the run going idle
-        // and this write, and the capture is keyed by the stage the check
-        // confirms is still current.
-        match self
-            .advance_from_stage(task_id, definition, &outcome, Some(stage_name), captured)
-            .await
-        {
-            Ok(()) => tracing::debug!(
-                task_id,
-                task_run_id,
-                stage = stage_name,
-                outcome,
-                "turn completed; advanced"
-            ),
-            // Deliberately parked, not broken — the same classification
-            // `finish_shell_stage` uses. A reviewer stage that declares only
-            // `approved`/`changes_requested` and whose reply carried neither
-            // lands here, which is the intended place for a human to pick it
-            // up rather than the engine inventing a transition.
-            Err(EngineError::UnknownOutcome { stage, outcome }) => tracing::info!(
-                task_id,
-                stage,
-                outcome,
-                "turn parked: its outcome has no 'on:' edge"
-            ),
-            Err(EngineError::StageMovedOn { expected, actual }) => tracing::info!(
-                task_id,
-                expected,
-                actual,
-                outcome,
-                "discarded a turn's outcome: the task had already left that stage"
-            ),
-            Err(err) => tracing::error!(
-                task_id, stage = stage_name, outcome, %err,
-                "task wedged: its turn completed but the transition failed"
-            ),
+    /// Whether `task_run_id` is still the newest run of `stage_name`.
+    ///
+    /// Errs towards proceeding: this only narrows a window nothing can reach
+    /// today, and refusing to advance because a *check* failed would strand a
+    /// task whose turn genuinely completed.
+    async fn is_current_run_for_stage(
+        &self,
+        task_id: &str,
+        stage_name: &str,
+        task_run_id: &str,
+    ) -> bool {
+        match task_runs::get_current_for_stage(&self.pool, task_id, stage_name).await {
+            Ok(Some(current)) => current.id == task_run_id,
+            // The run this watcher is for exists, so no row at all means the
+            // task was deleted underneath it.
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    task_id, task_run_id, stage = stage_name, %err,
+                    "could not confirm a completed turn is its stage's current run; advancing anyway"
+                );
+                true
+            }
         }
     }
 
@@ -2319,7 +2436,17 @@ fn derive_capture(
 /// lenient rule shared with `shell`/`poll` rather than two.
 fn turn_outcome(capture: Capture, captured: Option<&Value>) -> (String, Option<String>) {
     if capture != Capture::Json {
-        return (TURN_DEFAULT_OUTCOME.to_string(), None);
+        // Not a silent fallback either: `capture: text` keeps the reply but
+        // has no reserved key to read a verdict out of, and an author who
+        // expected one is otherwise left with a stage that parks forever and
+        // a timeline entry that explains nothing.
+        return (
+            TURN_DEFAULT_OUTCOME.to_string(),
+            Some(format!(
+                "'capture: text' keeps the reply but carries no verdict; advancing with \
+                 '{TURN_DEFAULT_OUTCOME}' (use 'capture: json' to route on an 'outcome' key)"
+            )),
+        );
     }
     match captured.and_then(|value| value.get("outcome")) {
         Some(Value::String(outcome)) if !outcome.is_empty() => (outcome.clone(), None),
@@ -2344,6 +2471,38 @@ fn turn_outcome(capture: Capture, captured: Option<&Value>) -> (String, Option<S
             )),
         ),
     }
+}
+
+/// Strips a surrounding ```` ``` ```` fence from a turn's reply.
+///
+/// The one normalization applied to a reply before it is captured, and it
+/// earns its place: wrapping structured output in a fenced block is the single
+/// commonest thing a model does unbidden, and without this a `capture: json`
+/// reviewer would fail to parse, fall back to `done`, and route the graph on a
+/// verdict it never gave. Everything else is left exactly as the agent wrote
+/// it — this is not a general "find the JSON somewhere in the prose" search,
+/// which would be guessing.
+///
+/// Only an *entire* reply that is one fenced block is unwrapped; a fence in
+/// the middle of prose is left alone, since that reply wasn't a document.
+fn unwrap_code_fence(reply: &str) -> &str {
+    let Some(rest) = reply.strip_prefix("```") else {
+        return reply;
+    };
+    let Some(body) = rest.strip_suffix("```") else {
+        return reply;
+    };
+    // Drop the info string (` ```json `), which is the rest of the opening
+    // line. A fence with no newline at all isn't a block.
+    let Some((_info, body)) = body.split_once('\n') else {
+        return reply;
+    };
+    // A second fence inside means this was prose containing two blocks, not
+    // one document.
+    if body.contains("```") {
+        return reply;
+    }
+    body.trim()
 }
 
 fn json_type_of(value: &Value) -> &'static str {
@@ -5250,6 +5409,25 @@ stages:
                 .all(|p| p.get("stage").and_then(Value::as_str) != Some("report")),
             "the unrenderable command should never have run: {ran:?}"
         );
+
+        // And the reason has to be discoverable. This is *the* expected
+        // run-time failure of templating — the loader can't check whether a
+        // captured payload carries the field — so a timeline that showed the
+        // stage entered and then nothing would leave an operator with only
+        // the daemon's log to go on.
+        let reason = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == EventType::Error)
+            .unwrap_or_else(|| panic!("expected a template failure on the timeline"));
+        let message = reason.payload["message"].as_str().unwrap();
+        assert!(message.contains("report"), "{message}");
+        assert!(message.contains("missing"), "{message}");
+        assert_eq!(
+            reason.task_run_id, None,
+            "a template fails before any session exists, so it is task-scoped"
+        );
     }
 
     /// #45's headline case: a reviewer's structured reply drives both the
@@ -5305,6 +5483,61 @@ stages:
         // ...and templated into the next stage's command.
         let event = wait_until_shell_event_for(&pool, &task_id, "report").await;
         assert_eq!(event["command"], "echo ship-it");
+    }
+
+    /// The case a real agent hits constantly: it narrates, uses a tool, and
+    /// only then answers. Capturing everything it said would put prose in
+    /// front of the JSON, fail to parse, and fall back to `done` — routing the
+    /// graph on a verdict the reviewer never gave.
+    #[tokio::test]
+    async fn a_verdict_after_tool_use_is_captured_without_the_narration() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "TOOL\n{\"outcome\": \"approved\", \"n\": 1}");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(
+            payload["stages"]["review"]["n"], 1,
+            "the narration must not reach the capture: {payload}"
+        );
+
+        let trail = stage_trail(&pool, &task_id).await;
+        assert!(
+            trail
+                .iter()
+                .any(|(stage, outcome)| stage == "finished" && outcome == "approved"),
+            "expected the reply's own verdict to route, got {trail:?}"
+        );
+    }
+
+    /// Wrapping structured output in a fence is the commonest thing a model
+    /// does unbidden; without unwrapping it the verdict never parses.
+    #[tokio::test]
+    async fn a_fenced_json_reply_is_captured() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "```json\n{\"outcome\": \"approved\"}\n```");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(payload["stages"]["review"]["outcome"], "approved");
     }
 
     /// Several assistant text blocks are one reply; the capture has to see
@@ -5424,13 +5657,22 @@ stages:
             .await
             .unwrap();
 
-        // The note lands first; the task then stays where it was.
-        wait_until_turn_outcome_event(&pool, &task_id).await;
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
         tokio::time::sleep(StdDuration::from_millis(100)).await;
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "review");
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
         assert_ne!(task.status, "closed");
+
+        // The entry must not claim a transition that was rejected: the
+        // outcome was computed, and deliberately not taken.
+        assert_eq!(event["applied"], false, "got {event}");
+        assert!(
+            event["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("parked")),
+            "got {event}"
+        );
     }
 
     /// Decision taken with #45: only a stage that asks for a capture gets
@@ -5502,6 +5744,36 @@ stages:
     }
 
     #[test]
+    fn unwrap_code_fence_unwraps_a_whole_fenced_reply() {
+        assert_eq!(
+            unwrap_code_fence("```json\n{\"outcome\": \"approved\"}\n```"),
+            "{\"outcome\": \"approved\"}"
+        );
+        assert_eq!(
+            unwrap_code_fence("```\n{\"a\": 1}\n```"),
+            "{\"a\": 1}",
+            "an absent info string is still a fence"
+        );
+    }
+
+    /// Anything that isn't *entirely* one fenced block is left exactly as the
+    /// agent wrote it — this is a narrow normalization, not a search for JSON
+    /// hidden somewhere in prose.
+    #[test]
+    fn unwrap_code_fence_leaves_everything_else_alone() {
+        for reply in [
+            "{\"outcome\": \"approved\"}",
+            "here you go:\n```json\n{\"a\": 1}\n```",
+            "```json\n{\"a\": 1}\n``` and also ```\n{\"b\": 2}\n```",
+            "```no newline```",
+            "plain text",
+            "",
+        ] {
+            assert_eq!(unwrap_code_fence(reply), reply, "for {reply:?}");
+        }
+    }
+
+    #[test]
     fn turn_outcome_reads_the_replys_outcome_key() {
         let captured = json!({"outcome": "changes_requested", "comments": "nope"});
         let (outcome, note) = turn_outcome(Capture::Json, Some(&captured));
@@ -5524,13 +5796,18 @@ stages:
     }
 
     /// `capture: text` says "keep the reply", not "read a verdict out of
-    /// it" — there's no reserved key in a plain string to read.
+    /// it" — there's no reserved key in a plain string to read. It still says
+    /// so on the timeline, since an author who expected routing would
+    /// otherwise get a stage that parks forever and no explanation.
     #[test]
-    fn turn_outcome_is_done_for_a_text_capture() {
+    fn turn_outcome_is_done_for_a_text_capture_and_says_why() {
         let captured = json!("approved");
         let (outcome, note) = turn_outcome(Capture::Text, Some(&captured));
         assert_eq!(outcome, "done");
-        assert!(note.is_none());
+        assert!(
+            note.is_some_and(|note| note.contains("capture: json")),
+            "the note should point at what would route"
+        );
     }
 
     #[test]

@@ -222,7 +222,7 @@ impl WorkflowDefinition {
         stage_name: &str,
         stage: &StageDef,
     ) -> Result<(), WorkflowDefError> {
-        for (field, source) in templatable_sources(stage)? {
+        for (field, source) in templatable_sources(stage_name, stage)? {
             let references = crate::template::references(&source).map_err(|err| {
                 WorkflowDefError::InvalidTemplate {
                     stage: stage_name.to_string(),
@@ -623,7 +623,10 @@ fn declares_capture(kind: &StageKind) -> bool {
 /// too. The engine re-reads it when the turn actually runs, so a file edited
 /// in between isn't re-validated; that's the same staleness every
 /// `prompt_file` already has and not worth a cache.
-fn templatable_sources(stage: &StageDef) -> Result<Vec<(&'static str, String)>, WorkflowDefError> {
+fn templatable_sources(
+    stage_name: &str,
+    stage: &StageDef,
+) -> Result<Vec<(&'static str, String)>, WorkflowDefError> {
     let source = match &stage.kind {
         StageKind::Shell {
             command: ShellCommand::Inline(command),
@@ -638,7 +641,18 @@ fn templatable_sources(stage: &StageDef) -> Result<Vec<(&'static str, String)>, 
             ..
         } => (
             "prompt_file",
-            fs::read_to_string(path).map_err(WorkflowDefError::Io)?,
+            // Not `WorkflowDefError::Io`, whose Display says "failed to read
+            // workflow definition" — the definition read fine; it's a file it
+            // points at that didn't, and the reader needs the stage and the
+            // path to find it. Existence is already checked by `resolve_file`,
+            // so what reaches here is a directory, a permissions problem, or
+            // non-UTF-8 content.
+            fs::read_to_string(path).map_err(|err| WorkflowDefError::UnreadableReferencedFile {
+                owner: format!("stage '{stage_name}'"),
+                field: "prompt_file",
+                path: path.clone(),
+                reason: err.to_string(),
+            })?,
         ),
         _ => return Ok(Vec::new()),
     };
@@ -739,6 +753,12 @@ pub enum WorkflowDefError {
         field: &'static str,
         value: String,
     },
+    UnreadableReferencedFile {
+        owner: String,
+        field: &'static str,
+        path: PathBuf,
+        reason: String,
+    },
     AmbiguousShellCommand {
         stage: String,
     },
@@ -827,6 +847,16 @@ impl fmt::Display for WorkflowDefError {
             } => write!(
                 f,
                 "{owner} references {field} '{value}', which is an absolute path or escapes the workflow definition's directory"
+            ),
+            WorkflowDefError::UnreadableReferencedFile {
+                owner,
+                field,
+                path,
+                reason,
+            } => write!(
+                f,
+                "{owner} references {field} '{}', which exists but could not be read: {reason}",
+                path.display()
             ),
             WorkflowDefError::AmbiguousShellCommand { stage } => write!(
                 f,
