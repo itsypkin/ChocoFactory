@@ -181,10 +181,19 @@ pub enum EventType {
     /// `capture: json`, or that carried no usable `outcome` key and so fell
     /// back to `done`. Payload is `{"stage", "capture", "outcome", "note"}`.
     ///
+    /// `applied` says whether the transition was actually taken: an outcome
+    /// can be computed and then deliberately not applied, which is what a
+    /// reviewer stage declaring no `done` edge relies on.
+    ///
     /// Unlike [`Self::StageEntered`]/[`Self::ShellOutput`] this one *does*
     /// belong to a session — a turn has a `task_run` — so it carries a
     /// `task_run_id`. It exists so the lenient fallback above is visible in
     /// the timeline rather than only in the daemon's logs.
+    ///
+    /// Written after the transition it describes, so it sorts just *after*
+    /// the `stage_entered` it explains, where [`Self::ShellOutput`] is
+    /// written before its own and sorts before. The inconsistency is the
+    /// price of `applied` being truthful (see `engine::finish_turn`).
     TurnOutcome,
 }
 

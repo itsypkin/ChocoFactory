@@ -154,11 +154,25 @@ pub async fn list_for_task_run(
 /// down the wrong edge. What a verdict means is the *last* thing the agent
 /// said, after it finished working.
 ///
-/// So this takes the trailing run of `assistant_message` rows: everything
-/// after the last event that was something else. Text blocks within that one
-/// message are concatenated with no separator, since a JSON document split
-/// across blocks has to survive being put back together — a newline inserted
-/// inside a string literal would make it unparseable.
+/// So this scans back from the end and keeps `assistant_message` rows until
+/// it hits something that ends a message: a `tool_call`, a `tool_result`, or
+/// a `human_message`. Text blocks within that final message are concatenated
+/// with no separator, since a JSON document split across blocks has to
+/// survive being put back together — a newline inserted inside a string
+/// literal would make it unparseable.
+///
+/// Every *other* event type is transparent here rather than a boundary, and
+/// that distinction is load-bearing. `run_stderr_reader` turns each non-empty
+/// stderr line into an `error` event on this same run, so a CLI that prints a
+/// deprecation warning or an update banner *after* its final message would,
+/// under a "anything that isn't assistant_message ends it" rule, leave
+/// nothing to capture at all — and a `capture: json` stage would then fall
+/// back to `done` and route on a verdict the agent never gave. `session_meta`
+/// is the same shape of hazard, and `turn_outcome` (which the engine appends
+/// to this very run after reading) would make a second read poison itself.
+/// `thinking` is skipped rather than treated as a boundary too: the API puts
+/// thinking blocks first today, but if one were ever interleaved between two
+/// text blocks, a boundary there would silently drop the earlier half.
 ///
 /// Only `assistant_message` payloads are transferred; a `tool_result` can be
 /// far larger than the reply and is only needed here as a boundary marker, so
@@ -200,15 +214,24 @@ pub async fn final_assistant_text_for_run(
     .fetch_all(pool)
     .await?;
 
-    let final_message = rows
-        .iter()
-        .rev()
-        .take_while(|(event_type, _)| *event_type == assistant);
-
     let mut blocks: Vec<&str> = Vec::new();
-    for (_, payload) in final_message {
-        // `CASE WHEN` guarantees a payload on exactly the rows taken above.
-        let Some(payload) = payload else { continue };
+    for (event_type, payload) in rows.iter().rev() {
+        if ends_a_message(event_type) {
+            break;
+        }
+        if *event_type != assistant {
+            continue;
+        }
+        // `CASE WHEN` selects the payload on exactly the `assistant_message`
+        // rows, which is what this arm has just established.
+        let Some(payload) = payload else {
+            tracing::error!(
+                task_run_id,
+                "an assistant_message event came back with no payload; \
+                 it is missing from the text of this run's reply"
+            );
+            continue;
+        };
         match payload.0.get("text").and_then(Value::as_str) {
             Some(text) => blocks.push(text),
             // Every `assistant_message` this daemon writes carries a `text`
@@ -226,6 +249,19 @@ pub async fn final_assistant_text_for_run(
     }
     blocks.reverse();
     Ok(blocks.concat())
+}
+
+/// Whether an event marks the end of the message before it — i.e. whether
+/// scanning back for an agent's final message should stop here.
+///
+/// Deliberately a small allow-list of things that genuinely close a message,
+/// not "everything that isn't an `assistant_message`". See
+/// [`final_assistant_text_for_run`] for why the difference matters.
+fn ends_a_message(event_type: &str) -> bool {
+    matches!(
+        event_type.parse(),
+        Ok(EventType::ToolCall | EventType::ToolResult | EventType::HumanMessage)
+    )
 }
 
 /// A task's whole timeline, oldest first (P1-9) — every session's events
@@ -828,6 +864,71 @@ mod tests {
             .unwrap();
         assert_eq!(text, r#"{"comments": "hello"}"#);
         assert!(serde_json::from_str::<Value>(&text).is_ok());
+    }
+
+    /// `run_stderr_reader` turns every non-empty stderr line into an `error`
+    /// event on this run, and a Node CLI prints deprecation and update
+    /// banners there — often *after* its final message. Treating any
+    /// non-`assistant_message` row as a message boundary would leave nothing
+    /// to capture, and a `capture: json` stage would fall back to `done` and
+    /// route on a verdict the agent never gave.
+    #[tokio::test]
+    async fn stderr_chatter_after_the_reply_does_not_erase_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": r#"{"outcome": "approved"}"# }),
+                ),
+                (
+                    EventType::Error,
+                    json!({ "message": "(node:123) DeprecationWarning: ..." }),
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            r#"{"outcome": "approved"}"#
+        );
+    }
+
+    /// `session_meta`, and the engine's own `turn_outcome` entry against this
+    /// same run, are likewise not message boundaries — the latter would make
+    /// a second read of the same run return nothing.
+    #[tokio::test]
+    async fn session_and_engine_events_are_not_message_boundaries() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (EventType::SessionMeta, json!({ "session_id": "s-1" })),
+                (EventType::AssistantMessage, json!({ "text": "approved" })),
+                (
+                    EventType::TurnOutcome,
+                    json!({ "stage": "review", "outcome": "approved" }),
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            "approved"
+        );
     }
 
     /// A `thinking` block precedes the text of the same message; it is not

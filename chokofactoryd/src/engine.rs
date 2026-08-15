@@ -2112,6 +2112,7 @@ impl WorkflowEngine {
                                 "stage": stage_name,
                                 "capture": capture_label(Some(capture)),
                                 "outcome": Value::Null,
+                                "applied": false,
                                 "note": format!("the turn's reply could not be read back: {err}"),
                             }),
                         )
@@ -2203,11 +2204,27 @@ impl WorkflowEngine {
         // so the entry can't claim a transition that was rejected — the park
         // this feature's lenient fallback relies on is exactly the case where
         // the outcome is computed but deliberately not taken.
+        //
+        // The cost of that ordering: `advance_from_stage` records the next
+        // stage's `stage_entered` first, so on the timeline this entry sits
+        // just *after* the transition it explains (and after a fast next
+        // stage's own output). `shell_output` is written before its advance
+        // and so reads the other way round. Accepted deliberately: an entry
+        // that is one line late is a smaller problem than one that asserts a
+        // transition which never happened.
         if capture.is_some() {
             let note = match (note, applied_note) {
                 (Some(why), Some(applied)) => Some(format!("{why}; {applied}")),
                 (Some(only), None) | (None, Some(only)) => Some(only),
                 (None, None) => None,
+            };
+            // A `capture: text` turn that routed fine needs no lecture about
+            // `capture: json`; that note only helps the author whose stage
+            // just parked because it expected a verdict.
+            let note = if applied.is_ok() && capture == Some(Capture::Text) {
+                None
+            } else {
+                note
             };
             self.append_turn_outcome_event(
                 task_id,
@@ -2226,9 +2243,17 @@ impl WorkflowEngine {
 
     /// Whether `task_run_id` is still the newest run of `stage_name`.
     ///
-    /// Errs towards proceeding: this only narrows a window nothing can reach
-    /// today, and refusing to advance because a *check* failed would strand a
-    /// task whose turn genuinely completed.
+    /// The `Err` arm errs towards proceeding: this only narrows a window
+    /// nothing can reach today, and refusing to advance because a *check*
+    /// failed would strand a task whose turn genuinely completed.
+    ///
+    /// Two caveats, both unreachable today and both deliberate. A `false`
+    /// answer returns without a timeline entry, unlike the template failure
+    /// above — it means two runs of one stage overlapped, which no path
+    /// produces. And `get_current_for_stage` tie-breaks on a random UUID, so
+    /// two runs started within one timestamp tick could pick the wrong
+    /// "current" one and discard a legitimate outcome; that needs the same
+    /// impossible overlap to happen at all.
     async fn is_current_run_for_stage(
         &self,
         task_id: &str,
@@ -2485,6 +2510,10 @@ fn turn_outcome(capture: Capture, captured: Option<&Value>) -> (String, Option<S
 ///
 /// Only an *entire* reply that is one fenced block is unwrapped; a fence in
 /// the middle of prose is left alone, since that reply wasn't a document.
+///
+/// Applied for `capture: text` too, not just `json`. A text capture of a
+/// reply the agent chose to fence almost certainly wants the contents rather
+/// than the markup, and one rule for both beats a mode-dependent surprise.
 fn unwrap_code_fence(reply: &str) -> &str {
     let Some(rest) = reply.strip_prefix("```") else {
         return reply;
