@@ -257,11 +257,33 @@ pub async fn final_assistant_text_for_run(
 /// Deliberately a small allow-list of things that genuinely close a message,
 /// not "everything that isn't an `assistant_message`". See
 /// [`final_assistant_text_for_run`] for why the difference matters.
+///
+/// Written as an exhaustive `match` rather than a `matches!` so that adding
+/// an `EventType` fails to compile until someone classifies it. A type nobody
+/// classified is precisely what made a stderr banner erase a reply.
 fn ends_a_message(event_type: &str) -> bool {
-    matches!(
-        event_type.parse(),
-        Ok(EventType::ToolCall | EventType::ToolResult | EventType::HumanMessage)
-    )
+    let Ok(event_type) = event_type.parse() else {
+        // Written by a newer version, or by hand. Treated as transparent for
+        // the same reason the default direction is fail-open: including too
+        // much of a reply is recoverable, erasing it is not.
+        return false;
+    };
+    match event_type {
+        // A tool round-trip ends the message that asked for it.
+        EventType::ToolCall | EventType::ToolResult => true,
+        // A new prompt ends the previous turn's answer.
+        EventType::HumanMessage => true,
+        // What we're collecting.
+        EventType::AssistantMessage => false,
+        // Interleaved within a message, not a break in it.
+        EventType::Thinking => false,
+        // Out-of-band: stderr lines, session metadata, and the engine's own
+        // bookkeeping all land on the run without interrupting what was said.
+        EventType::Error | EventType::SessionMeta | EventType::TurnOutcome => false,
+        // Task-scoped (`task_run_id` is NULL), so unreachable from this
+        // run-scoped query — classified anyway so the match stays total.
+        EventType::StageEntered | EventType::ShellOutput => false,
+    }
 }
 
 /// A task's whole timeline, oldest first (P1-9) — every session's events

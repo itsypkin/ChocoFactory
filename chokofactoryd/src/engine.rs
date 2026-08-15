@@ -2213,19 +2213,22 @@ impl WorkflowEngine {
         // that is one line late is a smaller problem than one that asserts a
         // transition which never happened.
         if capture.is_some() {
-            let note = match (note, applied_note) {
-                (Some(why), Some(applied)) => Some(format!("{why}; {applied}")),
-                (Some(only), None) | (None, Some(only)) => Some(only),
-                (None, None) => None,
-            };
-            // A `capture: text` turn that routed fine needs no lecture about
-            // `capture: json`; that note only helps the author whose stage
-            // just parked because it expected a verdict.
-            let note = if applied.is_ok() && capture == Some(Capture::Text) {
-                None
-            } else {
-                note
-            };
+            // Only added when the stage actually parked: an author whose
+            // `capture: text` turn routed fine through `on: { done: … }`
+            // doesn't need to be told about `capture: json`. Added *here*
+            // rather than suppressed later, so it can't swallow a note that
+            // was explaining something else — an oversized reply that wasn't
+            // stored at all is the one that must always survive.
+            let text_hint = (capture == Some(Capture::Text) && applied.is_err()).then(|| {
+                "'capture: text' keeps the reply but carries no verdict; use 'capture: json' \
+                 to route on an 'outcome' key"
+                    .to_string()
+            });
+            let note = [note, applied_note, text_hint]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let note = (!note.is_empty()).then(|| note.join("; "));
             self.append_turn_outcome_event(
                 task_id,
                 task_run_id,
@@ -2460,18 +2463,13 @@ fn derive_capture(
 /// *does* declare `done` will take it, which is the accepted cost of one
 /// lenient rule shared with `shell`/`poll` rather than two.
 fn turn_outcome(capture: Capture, captured: Option<&Value>) -> (String, Option<String>) {
+    // `capture: text` keeps the reply but has no reserved key to read a
+    // verdict out of. That isn't worth remarking on by itself — plenty of
+    // stages capture text and route on `done` quite correctly — so the
+    // explanation is added by `finish_turn`, and only when the stage
+    // actually parked.
     if capture != Capture::Json {
-        // Not a silent fallback either: `capture: text` keeps the reply but
-        // has no reserved key to read a verdict out of, and an author who
-        // expected one is otherwise left with a stage that parks forever and
-        // a timeline entry that explains nothing.
-        return (
-            TURN_DEFAULT_OUTCOME.to_string(),
-            Some(format!(
-                "'capture: text' keeps the reply but carries no verdict; advancing with \
-                 '{TURN_DEFAULT_OUTCOME}' (use 'capture: json' to route on an 'outcome' key)"
-            )),
-        );
+        return (TURN_DEFAULT_OUTCOME.to_string(), None);
     }
     match captured.and_then(|value| value.get("outcome")) {
         Some(Value::String(outcome)) if !outcome.is_empty() => (outcome.clone(), None),
@@ -5825,18 +5823,93 @@ stages:
     }
 
     /// `capture: text` says "keep the reply", not "read a verdict out of
-    /// it" — there's no reserved key in a plain string to read. It still says
-    /// so on the timeline, since an author who expected routing would
-    /// otherwise get a stage that parks forever and no explanation.
+    /// it" — there's no reserved key in a plain string to read. No note here:
+    /// capturing text and routing on `done` is a perfectly correct thing to
+    /// do, so the explanation belongs to the case that actually parks
+    /// (`finish_turn`), not to every text-capturing turn.
     #[test]
-    fn turn_outcome_is_done_for_a_text_capture_and_says_why() {
+    fn turn_outcome_is_done_for_a_text_capture() {
         let captured = json!("approved");
         let (outcome, note) = turn_outcome(Capture::Text, Some(&captured));
         assert_eq!(outcome, "done");
-        assert!(
-            note.is_some_and(|note| note.contains("capture: json")),
-            "the note should point at what would route"
+        assert_eq!(note, None);
+    }
+
+    /// A `capture: text` stage that routes correctly gets no lecture...
+    #[tokio::test]
+    async fn a_text_capture_that_routes_is_not_second_guessed() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: noted
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "looks good to me");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["review"],
+            "looks good to me"
         );
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        assert_eq!(event["applied"], true);
+        assert_eq!(event["note"], Value::Null, "got {event}");
+    }
+
+    /// ...but one that parks because it expected a verdict is told why.
+    #[tokio::test]
+    async fn a_text_capture_that_parks_is_told_what_would_have_routed() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: noted
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: text
+    on: { approved: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "approved");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        assert_eq!(event["applied"], false);
+        let note = event["note"].as_str().unwrap_or_default();
+        assert!(note.contains("capture: json"), "got {event}");
+        assert!(note.contains("parked"), "got {event}");
     }
 
     #[test]
