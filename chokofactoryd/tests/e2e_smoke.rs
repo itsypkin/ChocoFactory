@@ -95,6 +95,14 @@ impl Daemon {
     /// workflows dir is read at startup, so it has to be populated before
     /// the process exists.
     async fn spawn_with_home(home: TempHome) -> Self {
+        Self::spawn_with_home_and_env(home, &[]).await
+    }
+
+    /// Like [`Self::spawn_with_home`], but with extra environment for the
+    /// daemon. The adapter's subprocess inherits it, so this is how a test
+    /// drives `mock-claude`'s behaviour (a fixed reply, one-shot exit, tool
+    /// use) without a separate binary.
+    async fn spawn_with_home_and_env(home: TempHome, env: &[(&str, &str)]) -> Self {
         let daemon_bin = workspace_binary("chokofactoryd");
         let mock_claude_bin = workspace_binary("mock-claude");
         assert!(
@@ -110,14 +118,17 @@ impl Daemon {
 
         let port = free_port();
 
-        let mut child = Command::new(&daemon_bin)
+        let mut command = Command::new(&daemon_bin);
+        command
             .env("HOME", &home.0)
             .env("CHOKOFACTORY_CLAUDE_BINARY", &mock_claude_bin)
             .env("CHOKOFACTORY_PORT", port.to_string())
             .env("RUST_LOG", "error")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("failed to spawn chokofactoryd");
+            .kill_on_drop(true);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("failed to spawn chokofactoryd");
 
         let base_url = format!("http://127.0.0.1:{port}");
         let ws_url = format!("ws://127.0.0.1:{port}");
@@ -566,4 +577,137 @@ stages:
     assert_eq!(trail, vec!["polling", "done"]);
 
     let _ = ws.close(None).await;
+}
+
+/// The whole P2-3/#45 feature through the shipped binary: a reviewer turn
+/// captures its reply as JSON, the graph routes on that reply's `outcome`
+/// key, and a later stage templates a *different* field of the same capture
+/// into its own command.
+///
+/// The in-process engine tests cover each half, but only this one proves the
+/// wiring that exists solely in `main.rs` and the real adapter — and it runs
+/// the mock with `MOCK_CLAUDE_TOOL_USE`, so the agent narrates and calls a
+/// tool before answering. That is what every real turn touching a tool looks
+/// like, and a capture that concatenated everything the agent said would fail
+/// to parse here, fall back to `done`, and never reach `report` with a
+/// verdict at all.
+#[tokio::test]
+async fn real_binary_routes_a_turn_on_its_captured_verdict_and_templates_it_onward() {
+    let home = TempHome::new();
+    home.write_workflow(
+        "capture-e2e",
+        r#"
+name: capture-e2e
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on:
+      approved: report
+      changes_requested: report
+  report:
+    kind: shell
+    command: "echo verdict={{ stages.review.comments }}"
+    on: { done: done }
+  done:
+    kind: terminal
+"#,
+    );
+    let daemon = Daemon::spawn_with_home_and_env(
+        home,
+        &[
+            (
+                "MOCK_CLAUDE_REPLY",
+                r#"{"outcome": "approved", "comments": "ship-it"}"#,
+            ),
+            // A capturing stage only concludes when its run goes idle, and
+            // a reaped run deliberately does not auto-advance.
+            ("MOCK_CLAUDE_ONESHOT", "1"),
+            ("MOCK_CLAUDE_TOOL_USE", "1"),
+        ],
+    )
+    .await;
+
+    let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    assert_eq!(status, 201);
+    let project_id = project["id"].as_str().unwrap();
+
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project_id,
+                "workflow_def": "capture-e2e",
+                "title": "capture smoke",
+                "prompt": "review this",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // The task runs to completion only if the verdict routed and the
+    // templated command rendered.
+    for _ in 0..200 {
+        let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+        if detail["workflow_state"]["current_stage"] == "done" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    assert_eq!(
+        detail["workflow_state"]["current_stage"], "done",
+        "task did not finish: {detail}"
+    );
+
+    // The capture landed under the stage that produced it, narration and
+    // tool output excluded.
+    let captured = &detail["workflow_state"]["payload"]["stages"]["review"];
+    assert_eq!(captured["outcome"], "approved", "got {captured}");
+    assert_eq!(captured["comments"], "ship-it", "got {captured}");
+
+    // The reply's own verdict — not `done` — is what carried the transition.
+    let trail: Vec<(&str, &str)> = detail["stage_trail"]
+        .as_array()
+        .expect("stage_trail missing")
+        .iter()
+        .map(|e| {
+            (
+                e["payload"]["stage"].as_str().unwrap(),
+                e["payload"]["outcome"].as_str().unwrap_or("-"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        trail,
+        vec![("review", "-"), ("report", "approved"), ("done", "done")],
+        "expected the captured verdict to route the graph"
+    );
+
+    // And a *different* field of that same capture reached the next stage's
+    // command, rendered rather than left as a placeholder.
+    let shell = command_events(&daemon, &task_id).await;
+    assert_eq!(shell.len(), 1, "expected one shell_output: {shell:?}");
+    assert_eq!(shell[0]["payload"]["command"], "echo verdict=ship-it");
+    assert_eq!(shell[0]["payload"]["stdout_tail"], "verdict=ship-it");
+
+    // The turn recorded what it did, and that it was applied.
+    let turn: Vec<Value> = daemon.get(&format!("/tasks/{task_id}/events")).await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event_type"] == "turn_outcome")
+        .cloned()
+        .collect();
+    assert_eq!(turn.len(), 1, "expected one turn_outcome: {turn:?}");
+    assert_eq!(turn[0]["payload"]["outcome"], "approved");
+    assert_eq!(turn[0]["payload"]["applied"], true);
+    assert_eq!(turn[0]["payload"]["note"], Value::Null);
 }
