@@ -41,6 +41,7 @@ use crate::poll;
 use crate::role_config::{self, RoleConfigError};
 use crate::session::{SessionError, SessionManager};
 use crate::shell;
+use crate::template;
 use crate::workflow_def::{
     Capture, PollOutcome, ShellCommand, StageDef, StageKind, WorkflowDefError, WorkflowDefinition,
 };
@@ -49,6 +50,10 @@ use crate::workflow_def::{
 /// status. Not configurable (yet) — this is an internal implementation
 /// detail of auto-advancing single-shot turns, not a user-facing knob.
 const TURN_WATCH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What a completed `agent_turn` transitions on when its reply carried no
+/// verdict of its own — §5.2's "a plain single-shot turn just emits `done`".
+const TURN_DEFAULT_OUTCOME: &str = "done";
 
 pub struct WorkflowEngine {
     pool: SqlitePool,
@@ -106,6 +111,15 @@ pub enum EngineError {
         stage: String,
         reason: String,
     },
+    /// A `{{ stages.… }}` reference in this stage's `command:`/`prompt_file`
+    /// that couldn't be resolved against the task's payload (P2-3, §5.1).
+    /// The loader catches unknown stage names and bad syntax, so what
+    /// reaches here is a field the referenced stage's capture didn't
+    /// actually contain, or a value that isn't a scalar.
+    Template {
+        stage: String,
+        reason: String,
+    },
     Session(SessionError),
     Db(sqlx::Error),
     Io(std::io::Error),
@@ -144,6 +158,9 @@ impl fmt::Display for EngineError {
                 f,
                 "stage '{stage}' has a poll outcome pattern that does not compile: {reason}"
             ),
+            EngineError::Template { stage, reason } => {
+                write!(f, "stage '{stage}' could not render a template: {reason}")
+            }
             EngineError::Session(err) => write!(f, "{err}"),
             EngineError::Db(err) => write!(f, "{err}"),
             EngineError::Io(err) => write!(f, "{err}"),
@@ -652,9 +669,21 @@ impl WorkflowEngine {
 
         let start = definition.start_stage();
         let result: Result<(), EngineError> = async {
-            workflow_state::create(&self.pool, task_id, start).await?;
-            self.enter_stage(task_id, definition, start, initial_input, None)
-                .await
+            // The freshly-created payload (`{}`) is what the entry stage
+            // renders its templates against — no stage has run yet, so any
+            // `{{ stages.… }}` in it is unresolvable by construction. Passing
+            // it explicitly keeps `enter_stage` off a second read of a row
+            // this call already knows the contents of.
+            let state = workflow_state::create(&self.pool, task_id, start).await?;
+            self.enter_stage(
+                task_id,
+                definition,
+                start,
+                initial_input,
+                None,
+                &state.payload,
+            )
+            .await
         }
         .await;
         // Evict on any error (either nothing was written yet, or
@@ -784,7 +813,14 @@ impl WorkflowEngine {
                     merge_stage_capture(&mut payload, &from_stage, value);
                 }
 
-                workflow_state::update(
+                // The returned row is the authority on what was actually
+                // committed, and it's what the next stage renders its
+                // templates against (P2-3). A `None` here means the row
+                // vanished between this function's read and its write —
+                // impossible while the lock is held, but discarding the
+                // `Option` would turn that broken invariant into a task that
+                // silently transitions against state nothing persisted.
+                let updated = workflow_state::update(
                     &self.pool,
                     task_id,
                     workflow_state::WorkflowStateUpdate {
@@ -793,14 +829,22 @@ impl WorkflowEngine {
                         payload,
                     },
                 )
-                .await?;
+                .await?
+                .ok_or(EngineError::NoWorkflowState)?;
 
                 // `enter_stage` records the transition itself (X-3), so the
                 // trail this used to push onto `workflow_state.stage_history`
                 // now lives in the events timeline with a timestamp and the
                 // outcome that caused it.
-                self.enter_stage(task_id, definition, &next_stage, None, Some(outcome))
-                    .await?;
+                self.enter_stage(
+                    task_id,
+                    definition,
+                    &next_stage,
+                    None,
+                    Some(outcome),
+                    &updated.payload,
+                )
+                .await?;
                 Ok(next_stage)
             }
             .await;
@@ -830,6 +874,14 @@ impl WorkflowEngine {
     /// `input` is only consulted for a `prompt_file`-less `agent_turn`.
     /// `entered_via` is the outcome that selected this stage — `None` when
     /// it's the task's entry stage, which nothing transitioned into.
+    ///
+    /// `payload` is the task's `workflow_state.payload` as the caller just
+    /// committed it, and is what this stage's `{{ stages.… }}` references
+    /// render against (P2-3, §5.1). It's passed in rather than re-read
+    /// because both callers hold the per-task lock and already have the
+    /// authoritative value: re-reading here would be a second query for the
+    /// same row, and — worse — would invite a future caller to render
+    /// against state some other writer had moved on from.
     async fn enter_stage(
         self: &Arc<Self>,
         task_id: &str,
@@ -837,6 +889,7 @@ impl WorkflowEngine {
         stage_name: &str,
         input: Option<&str>,
         entered_via: Option<&str>,
+        payload: &Value,
     ) -> Result<(), EngineError> {
         let stage_def = definition
             .stages
@@ -877,8 +930,56 @@ impl WorkflowEngine {
             ),
         }
 
+        let entered =
+            self.dispatch_stage(task_id, definition, stage_name, stage_def, input, payload);
+        let entered = entered.await;
+
+        // The loader settles what it can about a template, but not whether a
+        // captured payload actually carries the field — so this is *the*
+        // expected run-time failure of P2-3, and on a detached path it would
+        // otherwise leave the timeline showing a stage entered and then
+        // nothing at all, with the reason only in the daemon's log. Same
+        // reasoning as `shell_output`'s `note` and `turn_outcome`: a failure
+        // this feature expects should be visible where an operator looks.
+        // Task-scoped, since rendering happens before any `task_run` exists.
+        if let Err(EngineError::Template { stage, reason }) = &entered {
+            let message = format!("stage '{stage}' could not render a template: {reason}");
+            tracing::error!(task_id, stage, reason, "stage parked: {message}");
+            match events::append_for_task(
+                &self.pool,
+                task_id,
+                EventType::Error,
+                json!({ "stage": stage, "message": message }),
+            )
+            .await
+            {
+                Ok(_) => self.events_notify.notify_waiters(),
+                Err(err) => tracing::error!(
+                    task_id, stage, %err,
+                    "failed to record a template failure event"
+                ),
+            }
+        }
+        entered
+    }
+
+    /// The per-kind behavior half of `enter_stage`, split out so the caller
+    /// can act on the result once rather than at five `return` sites.
+    async fn dispatch_stage(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        stage_def: &StageDef,
+        input: Option<&str>,
+        payload: &Value,
+    ) -> Result<(), EngineError> {
         match &stage_def.kind {
-            StageKind::AgentTurn { role, prompt_file } => {
+            StageKind::AgentTurn {
+                role,
+                prompt_file,
+                capture,
+            } => {
                 self.enter_agent_turn(
                     task_id,
                     definition,
@@ -886,7 +987,9 @@ impl WorkflowEngine {
                     stage_def,
                     role,
                     prompt_file.as_deref(),
+                    *capture,
                     input,
+                    payload,
                 )
                 .await
             }
@@ -928,7 +1031,7 @@ impl WorkflowEngine {
                     task_id,
                     definition,
                     stage_name,
-                    command.clone(),
+                    render_command(command, payload, stage_name)?,
                     *capture,
                     *timeout,
                 )
@@ -945,7 +1048,7 @@ impl WorkflowEngine {
                     task_id,
                     definition,
                     stage_name,
-                    command.clone(),
+                    render_command(command, payload, stage_name)?,
                     *capture,
                     *interval,
                     *timeout,
@@ -1103,7 +1206,7 @@ impl WorkflowEngine {
         // `{{ stages.open_pr.number }}` would then resolve against garbage.
         // The command's output is still on the timeline either way.
         let (captured, mut note) = if outcome.succeeded() {
-            derive_capture(capture, &outcome.stdout, task_id, stage_name)
+            derive_capture(capture, &outcome.stdout, task_id, stage_name, "stdout")
         } else if capture.is_some() {
             (
                 None,
@@ -1455,7 +1558,7 @@ impl WorkflowEngine {
 
             if let Some(matched) = run.outcomes.matching(&outcome.stdout) {
                 let (captured, capture_note) =
-                    derive_capture(run.capture, &outcome.stdout, task_id, stage_name);
+                    derive_capture(run.capture, &outcome.stdout, task_id, stage_name, "stdout");
                 let mut note = format!("matched \"{}\" on attempt {attempt}", matched.pattern);
                 if let Some(capture_note) = capture_note {
                     note.push_str("; ");
@@ -1755,7 +1858,9 @@ impl WorkflowEngine {
         stage_def: &StageDef,
         role: &str,
         prompt_file: Option<&std::path::Path>,
+        capture: Option<Capture>,
         input: Option<&str>,
+        payload: &Value,
     ) -> Result<(), EngineError> {
         // `WorkflowDefinition::parse`/`load` reject an agent_turn stage
         // with an unknown role, but `roles`/`stages` are `pub` fields with
@@ -1772,7 +1877,19 @@ impl WorkflowEngine {
             })?;
 
         let prompt = match prompt_file {
-            Some(path) => fs::read_to_string(path).map_err(EngineError::Io)?,
+            // A workflow-authored prompt is templated against earlier stages'
+            // captures (P2-3, §5.1) — this is how a reviewer's verdict
+            // reaches the coder's next turn. Live human input is not: it's
+            // what a person typed, and quietly rewriting parts of it would be
+            // both surprising and a way to smuggle payload contents into a
+            // message the human believes they authored.
+            Some(path) => {
+                let raw = fs::read_to_string(path).map_err(EngineError::Io)?;
+                template::render(&raw, payload).map_err(|err| EngineError::Template {
+                    stage: stage_name.to_string(),
+                    reason: err.to_string(),
+                })?
+            }
             None => input
                 .ok_or_else(|| EngineError::MissingAgentTurnInput(stage_name.to_string()))?
                 .to_string(),
@@ -1865,21 +1982,38 @@ impl WorkflowEngine {
         // A stage with an empty `on:` map (chat, §5.4) never concludes —
         // it just keeps accepting further live messages into the same
         // session indefinitely, so there's no outcome to ever watch for.
+        // This is also why the loader rejects `capture:` on such a stage:
+        // with no watcher there is no moment at which it could be taken.
         if !stage_def.on.is_empty() {
-            self.spawn_turn_watcher(task_id.to_string(), Arc::clone(definition), task_run.id);
+            self.spawn_turn_watcher(
+                task_id.to_string(),
+                Arc::clone(definition),
+                stage_name.to_string(),
+                capture,
+                task_run.id,
+            );
         }
         Ok(())
     }
 
-    /// Watches a single-shot `agent_turn`'s `task_run` for completion and
-    /// auto-advances with the outcome a plain turn emits (§5.2: "a plain
-    /// single-shot turn just emits `done`"). A crashed/non-zero exit is
-    /// logged and left for a human to notice rather than guessing an
-    /// outcome the stage's `on:` map was never designed to receive.
+    /// Watches a single-shot `agent_turn`'s `task_run` for completion, takes
+    /// its `capture:` if it declared one, and auto-advances.
+    ///
+    /// Without a `capture:` the outcome is `done`, which is what §5.2 says a
+    /// plain single-shot turn emits. With `capture: json` it is instead read
+    /// from the reply's reserved `outcome` key (#45) — one mechanism serving
+    /// both the `on:` transition and the values later stages template in,
+    /// rather than a separate verdict channel.
+    ///
+    /// A crashed/non-zero exit is logged and left for a human to notice
+    /// rather than guessing an outcome the stage's `on:` map was never
+    /// designed to receive.
     fn spawn_turn_watcher(
         self: &Arc<Self>,
         task_id: String,
         definition: Arc<WorkflowDefinition>,
+        stage_name: String,
+        capture: Option<Capture>,
         task_run_id: String,
     ) {
         let engine = Arc::clone(self);
@@ -1931,16 +2065,227 @@ impl WorkflowEngine {
                 }
                 tokio::time::sleep(TURN_WATCH_INTERVAL).await;
             }
-            if let Err(err) = engine.advance(&task_id, &definition, "done").await {
-                tracing::error!(task_id, %err, "failed to auto-advance task on turn completion");
-            } else {
+            engine
+                .finish_turn(&task_id, &definition, &stage_name, capture, &task_run_id)
+                .await;
+        });
+    }
+
+    /// Applies a completed turn's capture and outcome. Runs detached, like
+    /// `finish_shell_stage`/`finish_poll_stage`, so there is nothing to
+    /// return a failure to — it is logged and the task parks.
+    async fn finish_turn(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        capture: Option<Capture>,
+        task_run_id: &str,
+    ) {
+        let (captured, outcome, note) = match capture {
+            None => (None, TURN_DEFAULT_OUTCOME.to_string(), None),
+            Some(capture) => {
+                // The turn's text isn't held anywhere in memory: the adapter
+                // stream is drained straight into `events` by `drain_session`
+                // and dropped, and this watcher only ever sees `task_runs`
+                // rows. So the reply is read back from the timeline.
+                match events::final_assistant_text_for_run(&self.pool, task_run_id).await {
+                    Ok(reply) => {
+                        let reply = unwrap_code_fence(reply.trim());
+                        let (captured, capture_note) =
+                            derive_capture(Some(capture), reply, task_id, stage_name, "the reply");
+                        let (outcome, outcome_note) = turn_outcome(capture, captured.as_ref());
+                        (captured, outcome, capture_note.or(outcome_note))
+                    }
+                    // Nothing to capture and no basis for a verdict, so this
+                    // does not fall through to a default outcome — a task
+                    // that can't read its own turn back parks for a human.
+                    Err(err) => {
+                        tracing::error!(
+                            task_id, task_run_id, stage = stage_name, %err,
+                            "could not read a turn's reply back to capture it; not auto-advancing"
+                        );
+                        self.append_turn_outcome_event(
+                            task_id,
+                            task_run_id,
+                            json!({
+                                "stage": stage_name,
+                                "capture": capture_label(Some(capture)),
+                                "outcome": Value::Null,
+                                "applied": false,
+                                "note": format!("the turn's reply could not be read back: {err}"),
+                            }),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+        };
+
+        // `expected_stage` below catches a task that has *left* this stage,
+        // but not one that left and came back: re-entering opens a new
+        // `task_run`, and a late watcher for the superseded one would pass
+        // that check and overwrite the fresh capture with a stale verdict.
+        // Advisory only, like poll's `still_in_stage` — it runs outside the
+        // lock, and nothing can produce that interleaving today (nothing
+        // moves a task out of an `agent_turn` while its run is live), so this
+        // is the invariant announcing itself rather than a known case.
+        if !self
+            .is_current_run_for_stage(task_id, stage_name, task_run_id)
+            .await
+        {
+            tracing::warn!(
+                task_id,
+                task_run_id,
+                stage = stage_name,
+                "discarded a turn's outcome: its stage has since started a newer run"
+            );
+            return;
+        }
+
+        // `expected_stage` matters even though a turn holds its stage open:
+        // a human can close or resume the task between the run going idle
+        // and this write, and the capture is keyed by the stage the check
+        // confirms is still current.
+        let applied = self
+            .advance_from_stage(task_id, definition, &outcome, Some(stage_name), captured)
+            .await;
+
+        let applied_note = match &applied {
+            Ok(()) => {
                 tracing::debug!(
                     task_id,
                     task_run_id,
-                    "turn completed; auto-advanced with \"done\""
+                    stage = stage_name,
+                    outcome,
+                    "turn completed; advanced"
                 );
+                None
             }
-        });
+            // Deliberately parked, not broken — the same classification
+            // `finish_shell_stage` uses. A reviewer stage that declares only
+            // `approved`/`changes_requested` and whose reply carried neither
+            // lands here, which is the intended place for a human to pick it
+            // up rather than the engine inventing a transition.
+            Err(EngineError::UnknownOutcome { stage, outcome }) => {
+                tracing::info!(
+                    task_id,
+                    stage,
+                    outcome,
+                    "turn parked: its outcome has no 'on:' edge"
+                );
+                Some(format!(
+                    "parked: stage '{stage}' has no 'on:' edge for '{outcome}'"
+                ))
+            }
+            Err(EngineError::StageMovedOn { expected, actual }) => {
+                tracing::info!(
+                    task_id,
+                    expected,
+                    actual,
+                    outcome,
+                    "discarded a turn's outcome: the task had already left that stage"
+                );
+                Some(format!(
+                    "not applied: the task had already left '{expected}' for '{actual}'"
+                ))
+            }
+            Err(err) => {
+                tracing::error!(
+                    task_id, stage = stage_name, outcome, %err,
+                    "task wedged: its turn completed but the transition failed"
+                );
+                Some(format!("not applied: {err}"))
+            }
+        };
+
+        // Written *after* the advance, and carrying whether it was applied,
+        // so the entry can't claim a transition that was rejected — the park
+        // this feature's lenient fallback relies on is exactly the case where
+        // the outcome is computed but deliberately not taken.
+        //
+        // The cost of that ordering: `advance_from_stage` records the next
+        // stage's `stage_entered` first, so on the timeline this entry sits
+        // just *after* the transition it explains (and after a fast next
+        // stage's own output). `shell_output` is written before its advance
+        // and so reads the other way round. Accepted deliberately: an entry
+        // that is one line late is a smaller problem than one that asserts a
+        // transition which never happened.
+        if capture.is_some() {
+            // Only added when the stage actually parked: an author whose
+            // `capture: text` turn routed fine through `on: { done: … }`
+            // doesn't need to be told about `capture: json`. Added *here*
+            // rather than suppressed later, so it can't swallow a note that
+            // was explaining something else — an oversized reply that wasn't
+            // stored at all is the one that must always survive.
+            let text_hint = (capture == Some(Capture::Text) && applied.is_err()).then(|| {
+                "'capture: text' keeps the reply but carries no verdict; use 'capture: json' \
+                 to route on an 'outcome' key"
+                    .to_string()
+            });
+            let note = [note, applied_note, text_hint]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let note = (!note.is_empty()).then(|| note.join("; "));
+            self.append_turn_outcome_event(
+                task_id,
+                task_run_id,
+                json!({
+                    "stage": stage_name,
+                    "capture": capture_label(capture),
+                    "outcome": outcome,
+                    "applied": applied.is_ok(),
+                    "note": note,
+                }),
+            )
+            .await;
+        }
+    }
+
+    /// Whether `task_run_id` is still the newest run of `stage_name`.
+    ///
+    /// The `Err` arm errs towards proceeding: this only narrows a window
+    /// nothing can reach today, and refusing to advance because a *check*
+    /// failed would strand a task whose turn genuinely completed.
+    ///
+    /// Two caveats, both unreachable today and both deliberate. A `false`
+    /// answer returns without a timeline entry, unlike the template failure
+    /// above — it means two runs of one stage overlapped, which no path
+    /// produces. And `get_current_for_stage` tie-breaks on a random UUID, so
+    /// two runs started within one timestamp tick could pick the wrong
+    /// "current" one and discard a legitimate outcome; that needs the same
+    /// impossible overlap to happen at all.
+    async fn is_current_run_for_stage(
+        &self,
+        task_id: &str,
+        stage_name: &str,
+        task_run_id: &str,
+    ) -> bool {
+        match task_runs::get_current_for_stage(&self.pool, task_id, stage_name).await {
+            Ok(Some(current)) => current.id == task_run_id,
+            // The run this watcher is for exists, so no row at all means the
+            // task was deleted underneath it.
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    task_id, task_run_id, stage = stage_name, %err,
+                    "could not confirm a completed turn is its stage's current run; advancing anyway"
+                );
+                true
+            }
+        }
+    }
+
+    async fn append_turn_outcome_event(&self, task_id: &str, task_run_id: &str, payload: Value) {
+        match events::append(&self.pool, task_run_id, EventType::TurnOutcome, payload).await {
+            Ok(_) => self.events_notify.notify_waiters(),
+            Err(err) => tracing::error!(
+                task_id, task_run_id, %err,
+                "failed to record turn outcome event"
+            ),
+        }
     }
 }
 
@@ -2038,35 +2383,41 @@ fn describe_command(command: &ShellCommand) -> String {
     }
 }
 
-/// Turns a finished command's stdout into the value stored under
-/// `payload.stages.<stage>`, plus an optional note for the timeline when
-/// something about that needed explaining.
+/// Turns what a stage produced — a command's stdout, or an `agent_turn`'s
+/// reply — into the value stored under `payload.stages.<stage>`, plus an
+/// optional note for the timeline when something about that needed
+/// explaining. `source` names that output in the note ("stdout", "the
+/// reply"), since the same rules serve every kind that can capture.
 ///
 /// A stage with no `capture:` stores nothing at all — only a stage that
 /// asked for its output to be kept gets a payload entry.
 ///
-/// Unparseable JSON under `capture: json` is deliberately *not* an error:
-/// §5.2 makes the exit code the only thing that decides a shell stage's
-/// outcome, so the stdout is kept as text and the stage still reports what
-/// its exit code said. The note is what tells a reader why the value isn't
-/// the object they expected.
+/// Unparseable JSON under `capture: json` is deliberately *not* an error.
+/// For `shell`/`poll`, §5.2 makes the exit code (or the `outcomes:` match)
+/// the only thing that decides the outcome, so the output is kept as text
+/// and the stage still reports what its exit code said. An `agent_turn`
+/// follows the same rule rather than a stricter one of its own: capture is
+/// one mechanism, and a turn whose reply carries no usable verdict falls
+/// back to the outcome a plain turn emits (see `turn_outcome`). The note is
+/// what tells a reader why the value isn't the object they expected.
 fn derive_capture(
     capture: Option<Capture>,
-    stdout: &str,
+    output: &str,
     task_id: &str,
     stage_name: &str,
+    source: &str,
 ) -> (Option<Value>, Option<String>) {
     let Some(capture) = capture else {
         return (None, None);
     };
 
-    let trimmed = stdout.trim();
+    let trimmed = output.trim();
     if trimmed.len() > MAX_CAPTURE_BYTES {
         tracing::warn!(
             task_id,
             stage = stage_name,
             bytes = trimmed.len(),
-            "shell stage output too large to capture; not stored"
+            "stage output too large to capture; not stored"
         );
         return (
             None,
@@ -2084,16 +2435,149 @@ fn derive_capture(
             Err(err) => {
                 tracing::warn!(
                     task_id, stage = stage_name, %err,
-                    "shell stage output was not valid JSON; captured as text"
+                    "stage output was not valid JSON; captured as text"
                 );
                 (
                     Some(Value::String(trimmed.to_string())),
                     Some(format!(
-                        "stdout was not valid JSON ({err}); captured as text"
+                        "{source} was not valid JSON ({err}); captured as text"
                     )),
                 )
             }
         },
+    }
+}
+
+/// The outcome a completed `agent_turn` transitions on, and a note when that
+/// wasn't what the stage's `capture:` implied it would be.
+///
+/// Under `capture: json` the reply's reserved `outcome` key is the verdict
+/// (#45) — the whole point of capturing a turn as JSON. Anything else falls
+/// back to `done`, the outcome §5.2 gives a plain single-shot turn.
+///
+/// That fallback is deliberate but not silent: it is recorded as a note on
+/// the `turn_outcome` timeline entry and logged. The practical effect is that
+/// a stage whose `on:` map declares real verdicts and no `done` edge — the
+/// normal shape for a reviewer — parks for a human instead of guessing,
+/// because `advance_from_stage` finds no `done` transition. A stage that
+/// *does* declare `done` will take it, which is the accepted cost of one
+/// lenient rule shared with `shell`/`poll` rather than two.
+fn turn_outcome(capture: Capture, captured: Option<&Value>) -> (String, Option<String>) {
+    // `capture: text` keeps the reply but has no reserved key to read a
+    // verdict out of. That isn't worth remarking on by itself — plenty of
+    // stages capture text and route on `done` quite correctly — so the
+    // explanation is added by `finish_turn`, and only when the stage
+    // actually parked.
+    if capture != Capture::Json {
+        return (TURN_DEFAULT_OUTCOME.to_string(), None);
+    }
+    match captured.and_then(|value| value.get("outcome")) {
+        Some(Value::String(outcome)) if !outcome.is_empty() => (outcome.clone(), None),
+        Some(Value::String(_)) => (
+            TURN_DEFAULT_OUTCOME.to_string(),
+            Some(format!(
+                "the reply's 'outcome' was empty; advancing with '{TURN_DEFAULT_OUTCOME}'"
+            )),
+        ),
+        Some(other) => (
+            TURN_DEFAULT_OUTCOME.to_string(),
+            Some(format!(
+                "the reply's 'outcome' was {}, not a string; advancing with \
+                 '{TURN_DEFAULT_OUTCOME}'",
+                json_type_of(other)
+            )),
+        ),
+        None => (
+            TURN_DEFAULT_OUTCOME.to_string(),
+            Some(format!(
+                "the reply carried no 'outcome' key; advancing with '{TURN_DEFAULT_OUTCOME}'"
+            )),
+        ),
+    }
+}
+
+/// Strips a surrounding ```` ``` ```` fence from a turn's reply.
+///
+/// The one normalization applied to a reply before it is captured, and it
+/// earns its place: wrapping structured output in a fenced block is the single
+/// commonest thing a model does unbidden, and without this a `capture: json`
+/// reviewer would fail to parse, fall back to `done`, and route the graph on a
+/// verdict it never gave. Everything else is left exactly as the agent wrote
+/// it — this is not a general "find the JSON somewhere in the prose" search,
+/// which would be guessing.
+///
+/// Only an *entire* reply that is one fenced block is unwrapped; a fence in
+/// the middle of prose is left alone, since that reply wasn't a document.
+///
+/// Applied for `capture: text` too, not just `json`. A text capture of a
+/// reply the agent chose to fence almost certainly wants the contents rather
+/// than the markup, and one rule for both beats a mode-dependent surprise.
+fn unwrap_code_fence(reply: &str) -> &str {
+    let Some(rest) = reply.strip_prefix("```") else {
+        return reply;
+    };
+    let Some(body) = rest.strip_suffix("```") else {
+        return reply;
+    };
+    // Drop the info string (` ```json `), which is the rest of the opening
+    // line. A fence with no newline at all isn't a block.
+    let Some((_info, body)) = body.split_once('\n') else {
+        return reply;
+    };
+    // A second fence inside means this was prose containing two blocks, not
+    // one document.
+    if body.contains("```") {
+        return reply;
+    }
+    body.trim()
+}
+
+fn json_type_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// How a stage's `capture:` reads on the timeline.
+fn capture_label(capture: Option<Capture>) -> Value {
+    match capture {
+        Some(Capture::Json) => Value::String("json".to_string()),
+        Some(Capture::Text) => Value::String("text".to_string()),
+        None => Value::Null,
+    }
+}
+
+/// Substitutes a stage's earlier-captured values into an inline `command:`
+/// (P2-3, §5.1).
+///
+/// A `script_file` is passed through untouched: §5.1 scopes templating to
+/// `command:` and `prompt_file`, and rewriting an executable's contents on
+/// the way to running it would be a different and much larger promise.
+///
+/// Rendered once here, on stage entry, rather than per attempt — a `poll`
+/// re-runs the same command on every interval, and the payload cannot change
+/// while the stage is current (captures land only on a transition), so
+/// re-rendering would do identical work and invite the two to disagree.
+fn render_command(
+    command: &ShellCommand,
+    payload: &Value,
+    stage_name: &str,
+) -> Result<ShellCommand, EngineError> {
+    match command {
+        ShellCommand::Inline(line) => {
+            let rendered =
+                template::render(line, payload).map_err(|err| EngineError::Template {
+                    stage: stage_name.to_string(),
+                    reason: err.to_string(),
+                })?;
+            Ok(ShellCommand::Inline(rendered))
+        }
+        ShellCommand::ScriptFile(path) => Ok(ShellCommand::ScriptFile(path.clone())),
     }
 }
 
@@ -3079,7 +3563,13 @@ stages:
         .unwrap();
 
         let engine = engine_with_adapter(pool.clone(), "unused");
-        engine.spawn_turn_watcher(task_id.clone(), Arc::clone(&def), task_run.id.clone());
+        engine.spawn_turn_watcher(
+            task_id.clone(),
+            Arc::clone(&def),
+            "chatting".to_string(),
+            None,
+            task_run.id.clone(),
+        );
 
         tokio::time::sleep(StdDuration::from_millis(150)).await;
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
@@ -3712,13 +4202,14 @@ stages:
     #[test]
     fn an_oversized_capture_is_skipped_with_an_explanation() {
         let huge = "x".repeat(MAX_CAPTURE_BYTES + 1);
-        let (captured, note) = derive_capture(Some(Capture::Text), &huge, "task", "run");
+        let (captured, note) = derive_capture(Some(Capture::Text), &huge, "task", "run", "stdout");
         assert!(captured.is_none());
         assert!(note.unwrap().contains("exceeds"));
 
         // The limit itself is fine.
         let at_limit = "y".repeat(MAX_CAPTURE_BYTES);
-        let (captured, note) = derive_capture(Some(Capture::Text), &at_limit, "task", "run");
+        let (captured, note) =
+            derive_capture(Some(Capture::Text), &at_limit, "task", "run", "stdout");
         assert_eq!(captured, Some(Value::String(at_limit)));
         assert!(note.is_none());
     }
@@ -4753,5 +5244,701 @@ stages:
         ));
         fs::create_dir_all(&path).unwrap();
         TempDir(path)
+    }
+
+    // ---- P2-3 cross-stage templating (#14) and agent_turn capture (#45) ----
+
+    /// An adapter "binary" that replies with exactly `reply`.
+    ///
+    /// A generated wrapper rather than an env var on the test process:
+    /// `std::env::set_var` is process-global, and these tests run in parallel
+    /// in one process, so two of them would clobber each other's reply.
+    fn reply_binary(dir: &Path, reply: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let reply_path = dir.join("reply.txt");
+        fs::write(&reply_path, reply).unwrap();
+
+        let wrapper = dir.join("fake-claude-reply");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_REPLY_FILE='{}' exec '{}' \"$@\"\n",
+                reply_path.display(),
+                fixture_binary("fake_claude_reply.py"),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper.display().to_string()
+    }
+
+    /// The `shell_output` entry for one particular stage — the plain
+    /// `wait_until_shell_event` returns whichever came first, which isn't
+    /// enough once a flow has two shell stages.
+    async fn wait_until_shell_event_for(pool: &SqlitePool, task_id: &str, stage: &str) -> Value {
+        for _ in 0..500 {
+            let found = events::list_for_task(pool, task_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|e| {
+                    e.event_type == EventType::ShellOutput
+                        && e.payload.get("stage").and_then(Value::as_str) == Some(stage)
+                });
+            if let Some(event) = found {
+                return event.payload;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for a shell_output event for stage '{stage}'");
+    }
+
+    async fn wait_until_turn_outcome_event(pool: &SqlitePool, task_id: &str) -> Value {
+        for _ in 0..500 {
+            let found = events::list_for_task(pool, task_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|e| e.event_type == EventType::TurnOutcome);
+            if let Some(event) = found {
+                return event.payload;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for a turn_outcome event");
+    }
+
+    /// The end-to-end shape §5.1 exists for: one stage captures, a later
+    /// stage's `command:` reads a field out of that capture.
+    #[tokio::test]
+    async fn a_captured_field_is_templated_into_a_later_shell_command() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: templated
+stages:
+  open_pr:
+    kind: shell
+    command: "printf '{\"number\": 42, \"url\": \"http://pr/42\"}'"
+    capture: json
+    on: { done: report }
+  report:
+    kind: shell
+    command: "echo checking {{ stages.open_pr.number }} at {{ stages.open_pr.url }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let event = wait_until_shell_event_for(&pool, &task_id, "report").await;
+        // The *rendered* command is what the timeline records — an operator
+        // debugging this needs the value that actually ran, not the template.
+        assert_eq!(
+            event["command"], "echo checking 42 at http://pr/42",
+            "got {event}"
+        );
+        assert_eq!(event["stdout_tail"], "checking 42 at http://pr/42");
+    }
+
+    /// The other half of §5.1: the same substitution into a `prompt_file`,
+    /// which is how a reviewer's verdict reaches the coder's next turn.
+    #[tokio::test]
+    async fn a_captured_field_is_templated_into_a_later_agent_turn_prompt() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        fs::write(
+            dir.join("coder-turn.md"),
+            "fix pr {{ stages.open_pr.number }}",
+        )
+        .unwrap();
+        let yaml = r#"
+name: templated
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  open_pr:
+    kind: shell
+    command: "printf '{\"number\": 42}'"
+    capture: json
+    on: { done: coding }
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: {}
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "coding").await;
+
+        // The fixture echoes back whatever prompt it was handed, so the
+        // rendered text showing up as the reply proves what was sent.
+        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+        wait_until_events_contain(&pool, &run.id, "echo:fix pr 42").await;
+    }
+
+    /// The loader can only check that the referenced stage exists and
+    /// captures something; whether its captured JSON actually carries the
+    /// field is a run-time question. An absent one fails the stage rather
+    /// than substituting an empty string into the command.
+    #[tokio::test]
+    async fn an_unresolved_field_fails_the_stage_rather_than_rendering_empty() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: templated
+stages:
+  open_pr:
+    kind: shell
+    command: "printf '{\"number\": 42}'"
+    capture: json
+    on: { done: report }
+  report:
+    kind: shell
+    command: "echo {{ stages.open_pr.missing }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        // The transition into `report` is already committed when its command
+        // fails to render, so the task parks there rather than reaching
+        // `finished` or running anything.
+        wait_until_stage(&pool, &task_id, "report").await;
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "report");
+
+        let ran: Vec<Value> = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::ShellOutput)
+            .map(|e| e.payload)
+            .collect();
+        assert!(
+            ran.iter()
+                .all(|p| p.get("stage").and_then(Value::as_str) != Some("report")),
+            "the unrenderable command should never have run: {ran:?}"
+        );
+
+        // And the reason has to be discoverable. This is *the* expected
+        // run-time failure of templating — the loader can't check whether a
+        // captured payload carries the field — so a timeline that showed the
+        // stage entered and then nothing would leave an operator with only
+        // the daemon's log to go on.
+        let reason = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == EventType::Error)
+            .unwrap_or_else(|| panic!("expected a template failure on the timeline"));
+        let message = reason.payload["message"].as_str().unwrap();
+        assert!(message.contains("report"), "{message}");
+        assert!(message.contains("missing"), "{message}");
+        assert_eq!(
+            reason.task_run_id, None,
+            "a template fails before any session exists, so it is task-scoped"
+        );
+    }
+
+    /// #45's headline case: a reviewer's structured reply drives both the
+    /// `on:` transition and the value a later stage templates in.
+    #[tokio::test]
+    async fn a_capturing_turn_routes_on_its_replys_outcome_and_feeds_a_later_stage() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on: { approved: report, changes_requested: report }
+  report:
+    kind: shell
+    command: "echo {{ stages.review.comments }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, r#"{"outcome": "approved", "comments": "ship-it"}"#);
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        // Captured under the stage that produced it...
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(payload["stages"]["review"]["outcome"], "approved");
+        assert_eq!(payload["stages"]["review"]["comments"], "ship-it");
+
+        // ...routed through the `on:` edge that the reply named...
+        let trail = stage_trail(&pool, &task_id).await;
+        assert!(
+            trail
+                .iter()
+                .any(|(stage, outcome)| stage == "report" && outcome == "approved"),
+            "got {trail:?}"
+        );
+
+        // ...and templated into the next stage's command.
+        let event = wait_until_shell_event_for(&pool, &task_id, "report").await;
+        assert_eq!(event["command"], "echo ship-it");
+    }
+
+    /// The case a real agent hits constantly: it narrates, uses a tool, and
+    /// only then answers. Capturing everything it said would put prose in
+    /// front of the JSON, fail to parse, and fall back to `done` — routing the
+    /// graph on a verdict the reviewer never gave.
+    #[tokio::test]
+    async fn a_verdict_after_tool_use_is_captured_without_the_narration() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "TOOL\n{\"outcome\": \"approved\", \"n\": 1}");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(
+            payload["stages"]["review"]["n"], 1,
+            "the narration must not reach the capture: {payload}"
+        );
+
+        let trail = stage_trail(&pool, &task_id).await;
+        assert!(
+            trail
+                .iter()
+                .any(|(stage, outcome)| stage == "finished" && outcome == "approved"),
+            "expected the reply's own verdict to route, got {trail:?}"
+        );
+    }
+
+    /// Wrapping structured output in a fence is the commonest thing a model
+    /// does unbidden; without unwrapping it the verdict never parses.
+    #[tokio::test]
+    async fn a_fenced_json_reply_is_captured() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "```json\n{\"outcome\": \"approved\"}\n```");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(payload["stages"]["review"]["outcome"], "approved");
+    }
+
+    /// Several assistant text blocks are one reply; the capture has to see
+    /// the whole thing or the JSON won't parse.
+    #[tokio::test]
+    async fn a_reply_split_across_text_blocks_is_captured_as_one_document() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "BLOCKS\n{\"outcome\": \"approved\",| \"n\": 1}");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(payload["stages"]["review"]["n"], 1);
+    }
+
+    /// Decision taken with #45: a turn's capture follows the same lenient
+    /// rule `shell`/`poll` use rather than a stricter one of its own. The
+    /// reply is kept as text, the outcome falls back to `done`, and the note
+    /// on the timeline is what stops that being silent.
+    #[tokio::test]
+    async fn a_reply_that_is_not_json_is_captured_as_text_and_falls_back_to_done() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "sorry, I could not do it");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(
+            payload["stages"]["review"], "sorry, I could not do it",
+            "an unparseable reply is kept as text"
+        );
+
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        assert_eq!(event["outcome"], "done");
+        assert!(
+            event["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("not valid JSON")),
+            "got {event}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_an_outcome_key_falls_back_to_done_with_a_note() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, r#"{"comments": "no verdict here"}"#);
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        // Still captured — the payload is useful even without a verdict.
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(payload["stages"]["review"]["comments"], "no verdict here");
+
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        assert_eq!(event["outcome"], "done");
+        assert!(
+            event["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("no 'outcome' key")),
+            "got {event}"
+        );
+    }
+
+    /// The safety net behind that fallback: a reviewer stage declares real
+    /// verdicts and no `done` edge, so a reply with no usable outcome parks
+    /// the task for a human instead of taking a happy path.
+    #[tokio::test]
+    async fn a_capturing_turn_whose_fallback_has_no_edge_parks_the_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on: { approved: finished, changes_requested: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "not json at all");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "review");
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_ne!(task.status, "closed");
+
+        // The entry must not claim a transition that was rejected: the
+        // outcome was computed, and deliberately not taken.
+        assert_eq!(event["applied"], false, "got {event}");
+        assert!(
+            event["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("parked")),
+            "got {event}"
+        );
+    }
+
+    /// Decision taken with #45: only a stage that asks for a capture gets
+    /// one. Without this a long-running chat stage would rewrite its whole
+    /// transcript into `workflow_state` on every turn.
+    #[tokio::test]
+    async fn an_agent_turn_without_capture_stores_nothing_and_still_emits_done() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        fs::write(dir.join("turn.md"), "do the thing").unwrap();
+        let yaml = r#"
+name: plain
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, r#"{"outcome": "approved"}"#);
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        // Even though the reply *was* a JSON verdict, a stage that declared
+        // no `capture:` neither stores it nor routes on it.
+        assert_eq!(payload_of(&pool, &task_id).await, json!({}));
+        let trail = stage_trail(&pool, &task_id).await;
+        assert!(
+            trail
+                .iter()
+                .any(|(stage, outcome)| stage == "finished" && outcome == "done"),
+            "got {trail:?}"
+        );
+        let turn_events = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::TurnOutcome)
+            .count();
+        assert_eq!(turn_events, 0, "no capture, nothing to report");
+    }
+
+    fn capturing_turn_yaml() -> &'static str {
+        r#"
+name: reviewed
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on: { approved: finished, done: finished }
+  finished:
+    kind: terminal
+"#
+    }
+
+    #[test]
+    fn unwrap_code_fence_unwraps_a_whole_fenced_reply() {
+        assert_eq!(
+            unwrap_code_fence("```json\n{\"outcome\": \"approved\"}\n```"),
+            "{\"outcome\": \"approved\"}"
+        );
+        assert_eq!(
+            unwrap_code_fence("```\n{\"a\": 1}\n```"),
+            "{\"a\": 1}",
+            "an absent info string is still a fence"
+        );
+    }
+
+    /// Anything that isn't *entirely* one fenced block is left exactly as the
+    /// agent wrote it — this is a narrow normalization, not a search for JSON
+    /// hidden somewhere in prose.
+    #[test]
+    fn unwrap_code_fence_leaves_everything_else_alone() {
+        for reply in [
+            "{\"outcome\": \"approved\"}",
+            "here you go:\n```json\n{\"a\": 1}\n```",
+            "```json\n{\"a\": 1}\n``` and also ```\n{\"b\": 2}\n```",
+            "```no newline```",
+            "plain text",
+            "",
+        ] {
+            assert_eq!(unwrap_code_fence(reply), reply, "for {reply:?}");
+        }
+    }
+
+    #[test]
+    fn turn_outcome_reads_the_replys_outcome_key() {
+        let captured = json!({"outcome": "changes_requested", "comments": "nope"});
+        let (outcome, note) = turn_outcome(Capture::Json, Some(&captured));
+        assert_eq!(outcome, "changes_requested");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn turn_outcome_falls_back_for_a_non_string_or_missing_outcome() {
+        for captured in [
+            json!({"outcome": 7}),
+            json!({"outcome": ""}),
+            json!({"comments": "x"}),
+            json!("plain text"),
+        ] {
+            let (outcome, note) = turn_outcome(Capture::Json, Some(&captured));
+            assert_eq!(outcome, "done", "for {captured}");
+            assert!(note.is_some(), "for {captured}");
+        }
+    }
+
+    /// `capture: text` says "keep the reply", not "read a verdict out of
+    /// it" — there's no reserved key in a plain string to read. No note here:
+    /// capturing text and routing on `done` is a perfectly correct thing to
+    /// do, so the explanation belongs to the case that actually parks
+    /// (`finish_turn`), not to every text-capturing turn.
+    #[test]
+    fn turn_outcome_is_done_for_a_text_capture() {
+        let captured = json!("approved");
+        let (outcome, note) = turn_outcome(Capture::Text, Some(&captured));
+        assert_eq!(outcome, "done");
+        assert_eq!(note, None);
+    }
+
+    /// A `capture: text` stage that routes correctly gets no lecture...
+    #[tokio::test]
+    async fn a_text_capture_that_routes_is_not_second_guessed() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: noted
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "looks good to me");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["review"],
+            "looks good to me"
+        );
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        assert_eq!(event["applied"], true);
+        assert_eq!(event["note"], Value::Null, "got {event}");
+    }
+
+    /// ...but one that parks because it expected a verdict is told why.
+    #[tokio::test]
+    async fn a_text_capture_that_parks_is_told_what_would_have_routed() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: noted
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: text
+    on: { approved: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "approved");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        assert_eq!(event["applied"], false);
+        let note = event["note"].as_str().unwrap_or_default();
+        assert!(note.contains("capture: json"), "got {event}");
+        assert!(note.contains("parked"), "got {event}");
+    }
+
+    #[test]
+    fn render_command_substitutes_an_inline_command() {
+        let payload = json!({"stages": {"open_pr": {"number": 42}}});
+        let command = ShellCommand::Inline("gh pr checks {{ stages.open_pr.number }}".to_string());
+        let rendered = render_command(&command, &payload, "checks").unwrap();
+        assert_eq!(
+            rendered,
+            ShellCommand::Inline("gh pr checks 42".to_string())
+        );
+    }
+
+    #[test]
+    fn render_command_leaves_a_script_file_alone() {
+        let payload = json!({});
+        let command = ShellCommand::ScriptFile(PathBuf::from("/tmp/run.sh"));
+        let rendered = render_command(&command, &payload, "run").unwrap();
+        assert_eq!(rendered, command);
+    }
+
+    #[test]
+    fn render_command_reports_an_unresolvable_reference() {
+        let payload = json!({"stages": {"open_pr": {"number": 42}}});
+        let command = ShellCommand::Inline("echo {{ stages.open_pr.missing }}".to_string());
+        let err = render_command(&command, &payload, "report").unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Template { stage, .. } if stage == "report"),
+            "got {err}"
+        );
     }
 }

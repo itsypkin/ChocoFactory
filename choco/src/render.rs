@@ -367,6 +367,33 @@ fn event_summary(event: &Event) -> String {
             }
             one_line(&summary)
         }
+        // `{stage, capture, outcome, applied, note}` (#45) — same reasoning as
+        // the two arms above. The `note` is the point of the entry when it's
+        // present: it's what says a reply wasn't the JSON the stage asked for
+        // and the outcome fell back to `done`. `applied: false` marks an
+        // outcome that was computed but deliberately not taken, which is the
+        // park a reviewer stage relies on — without it the line would read as
+        // a transition that happened.
+        EventType::TurnOutcome => {
+            let stage = payload.get("stage").and_then(Value::as_str).unwrap_or("?");
+            let outcome = payload
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("no outcome");
+            let applied = payload
+                .get("applied")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let arrow = if applied { "→" } else { "⨯" };
+            let mut summary = format!("{stage} turn  {arrow}  {outcome}");
+            if let Some(note) = payload.get("note").and_then(Value::as_str)
+                && !note.is_empty()
+            {
+                summary.push_str("  ");
+                summary.push_str(note);
+            }
+            one_line(&summary)
+        }
         EventType::ToolCall => {
             let tool = payload.get("tool").and_then(Value::as_str).unwrap_or("?");
             match payload.get("input") {
@@ -675,6 +702,23 @@ mod tests {
                        "stdout_tail": "", "stderr_tail": "",
                        "note": "failed to start command: permission denied"}),
                 "$ ./deploy.sh → did not exit cleanly failed to start command: permission denied",
+            ),
+            // A capturing turn (#45): the verdict it produced, and whether
+            // the graph actually moved on it.
+            (
+                EventType::TurnOutcome,
+                json!({"stage": "review", "capture": "json", "outcome": "approved",
+                       "applied": true, "note": null}),
+                "review turn → approved",
+            ),
+            // The park a reviewer stage relies on: an outcome computed but
+            // deliberately not taken. It must not read as a transition.
+            (
+                EventType::TurnOutcome,
+                json!({"stage": "review", "capture": "json", "outcome": "done",
+                       "applied": false,
+                       "note": "no 'outcome' key; parked"}),
+                "review turn ⨯ done no 'outcome' key; parked",
             ),
         ];
         for (event_type, payload, expected) in cases {

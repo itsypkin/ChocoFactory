@@ -12,6 +12,20 @@
 //! real `claude`'s resume contract closely enough for the idle/resume
 //! tests in `session.rs`/`engine.rs`.
 //!
+//! Two further env knobs exist for the `agent_turn` `capture:` path (#45),
+//! which a chat-shaped mock cannot exercise:
+//!
+//! - `MOCK_CLAUDE_ONESHOT=1` — exit after one turn instead of waiting for
+//!   more input, the way a `coding`/`internal_review` stage's subprocess
+//!   does. A capturing stage only concludes when its run goes idle, and a
+//!   process that never exits is only reaped — which deliberately does
+//!   *not* auto-advance. Mirrors `fake_claude_oneshot.py`.
+//! - `MOCK_CLAUDE_TOOL_USE=1` — narrate, call a tool, receive its result,
+//!   and only then answer. This is what every real turn that touches a
+//!   tool looks like, and it is the shape that breaks a capture which
+//!   concatenates everything the agent said rather than taking its final
+//!   message.
+//!
 //! Every other flag (`--print`, `--input-format`, `--output-format`,
 //! `--verbose`, `--model`, `--system-prompt`) is accepted but ignored —
 //! this binary only needs to *emit* valid stream-json, not validate the
@@ -35,6 +49,8 @@ fn main() {
     }
 
     let reply_override = std::env::var("MOCK_CLAUDE_REPLY").ok();
+    let oneshot = std::env::var_os("MOCK_CLAUDE_ONESHOT").is_some();
+    let uses_tool = std::env::var_os("MOCK_CLAUDE_TOOL_USE").is_some();
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.expect("failed to read a line from stdin");
@@ -51,6 +67,34 @@ fn main() {
         let reply = reply_override
             .clone()
             .unwrap_or_else(|| format!("echo:{text}"));
+
+        if uses_tool {
+            // The answer is the *last* message, not everything that was
+            // said — narration first, then the tool round-trip.
+            let narrated = emit(&json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "text", "text": "I'll read the diff first." },
+                    { "type": "tool_use", "id": "toolu_1", "name": "Read",
+                      "input": { "path": "a.rs" } },
+                ]},
+                "session_id": session_id,
+            }));
+            if !narrated {
+                return;
+            }
+            let tool_result = emit(&json!({
+                "type": "user",
+                "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1",
+                      "content": "fn main() {}" },
+                ]},
+                "session_id": session_id,
+            }));
+            if !tool_result {
+                return;
+            }
+        }
 
         let assistant_ok = emit(&json!({
             "type": "assistant",
@@ -69,6 +113,10 @@ fn main() {
             "session_id": session_id,
         }));
         if !result_ok {
+            return;
+        }
+
+        if oneshot {
             return;
         }
     }

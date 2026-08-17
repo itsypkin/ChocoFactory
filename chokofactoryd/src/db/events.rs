@@ -137,6 +137,155 @@ pub async fn list_for_task_run(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// The agent's **final message** in a session — the text an `agent_turn`'s
+/// `capture:` is taken from (#45).
+///
+/// The engine keeps no copy of a turn's reply: `drain_session` appends each
+/// `AssistantMessage` here and drops it, and the completion watcher only ever
+/// sees `task_runs` rows. So the reply is read back from the timeline.
+///
+/// **Why the final message rather than everything the agent said.** A turn is
+/// not one message. An agent that uses a tool produces
+/// `assistant(text) → tool_call → tool_result → assistant(text)`, and
+/// `normalize_assistant` flattens every text block of every one of those into
+/// its own row. Concatenating them all would prepend the agent's narration
+/// ("I'll read the diff first.") to its answer, so a `capture: json` turn
+/// would never parse — and would then fall back to `done` and route the graph
+/// down the wrong edge. What a verdict means is the *last* thing the agent
+/// said, after it finished working.
+///
+/// So this scans back from the end and keeps `assistant_message` rows until
+/// it hits something that ends a message: a `tool_call`, a `tool_result`, or
+/// a `human_message`. Text blocks within that final message are concatenated
+/// with no separator, since a JSON document split across blocks has to
+/// survive being put back together — a newline inserted inside a string
+/// literal would make it unparseable.
+///
+/// Every *other* event type is transparent here rather than a boundary, and
+/// that distinction is load-bearing. `run_stderr_reader` turns each non-empty
+/// stderr line into an `error` event on this same run, so a CLI that prints a
+/// deprecation warning or an update banner *after* its final message would,
+/// under a "anything that isn't assistant_message ends it" rule, leave
+/// nothing to capture at all — and a `capture: json` stage would then fall
+/// back to `done` and route on a verdict the agent never gave. `session_meta`
+/// is the same shape of hazard, and `turn_outcome` (which the engine appends
+/// to this very run after reading) would make a second read poison itself.
+/// `thinking` is skipped rather than treated as a boundary too: the API puts
+/// thinking blocks first today, but if one were ever interleaved between two
+/// text blocks, a boundary there would silently drop the earlier half.
+///
+/// Only `assistant_message` payloads are transferred; a `tool_result` can be
+/// far larger than the reply and is only needed here as a boundary marker, so
+/// the query selects its type and discards its payload in SQL.
+///
+/// Scoped to one run, which on this path is one turn: a stage that captures
+/// has a non-empty `on:` map, and `send_message` only accepts stages whose
+/// `on:` is empty, so no second turn can be added to this run. A future
+/// change that lets a capturing stage take more than one turn would still be
+/// correct here — "the last thing said" is per-turn by construction.
+///
+/// Decoding through `Json<Value>` rather than parsing the column by hand
+/// makes a payload that isn't valid JSON a `sqlx` decode error the caller has
+/// to handle, instead of a block quietly dropped from the middle of a reply —
+/// which would hand the capture a truncated document that might still parse.
+///
+/// Reading this after the run reports `idle` is safe by construction:
+/// `drain_session` appends every event before it touches the run's status, so
+/// a completed run's reply is whole here. The one gap is that those appends
+/// are best-effort — a transient DB failure there is logged and dropped, and
+/// the block it lost is simply not part of the text this returns. That
+/// predates capture; it matters more now that a `capture: json` turn parses
+/// the result, where the worst case is a truncated document that still
+/// parses into the wrong verdict.
+pub async fn final_assistant_text_for_run(
+    pool: &SqlitePool,
+    task_run_id: &str,
+) -> Result<String, sqlx::Error> {
+    let assistant = EventType::AssistantMessage.to_string();
+    let rows: Vec<(String, Option<Json<Value>>)> = sqlx::query_as(
+        "SELECT event_type,
+                CASE WHEN event_type = ? THEN payload END AS text_payload
+         FROM events
+         WHERE task_run_id = ?
+         ORDER BY created_at, id",
+    )
+    .bind(&assistant)
+    .bind(task_run_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut blocks: Vec<&str> = Vec::new();
+    for (event_type, payload) in rows.iter().rev() {
+        if ends_a_message(event_type) {
+            break;
+        }
+        if *event_type != assistant {
+            continue;
+        }
+        // `CASE WHEN` selects the payload on exactly the `assistant_message`
+        // rows, which is what this arm has just established.
+        let Some(payload) = payload else {
+            tracing::error!(
+                task_run_id,
+                "an assistant_message event came back with no payload; \
+                 it is missing from the text of this run's reply"
+            );
+            continue;
+        };
+        match payload.0.get("text").and_then(Value::as_str) {
+            Some(text) => blocks.push(text),
+            // Every `assistant_message` this daemon writes carries a `text`
+            // string (`AgentEvent::payload`), so this is an invariant
+            // violation rather than a shape to tolerate. It can't be a hard
+            // error without a richer error type than `sqlx::Error`, but it is
+            // loud rather than silent — a dropped block would otherwise
+            // silently corrupt the capture.
+            None => tracing::error!(
+                task_run_id,
+                "an assistant_message event has no 'text' field; \
+                 it is missing from the text of this run's reply"
+            ),
+        }
+    }
+    blocks.reverse();
+    Ok(blocks.concat())
+}
+
+/// Whether an event marks the end of the message before it — i.e. whether
+/// scanning back for an agent's final message should stop here.
+///
+/// Deliberately a small allow-list of things that genuinely close a message,
+/// not "everything that isn't an `assistant_message`". See
+/// [`final_assistant_text_for_run`] for why the difference matters.
+///
+/// Written as an exhaustive `match` rather than a `matches!` so that adding
+/// an `EventType` fails to compile until someone classifies it. A type nobody
+/// classified is precisely what made a stderr banner erase a reply.
+fn ends_a_message(event_type: &str) -> bool {
+    let Ok(event_type) = event_type.parse() else {
+        // Written by a newer version, or by hand. Treated as transparent for
+        // the same reason the default direction is fail-open: including too
+        // much of a reply is recoverable, erasing it is not.
+        return false;
+    };
+    match event_type {
+        // A tool round-trip ends the message that asked for it.
+        EventType::ToolCall | EventType::ToolResult => true,
+        // A new prompt ends the previous turn's answer.
+        EventType::HumanMessage => true,
+        // What we're collecting.
+        EventType::AssistantMessage => false,
+        // Interleaved within a message, not a break in it.
+        EventType::Thinking => false,
+        // Out-of-band: stderr lines, session metadata, and the engine's own
+        // bookkeeping all land on the run without interrupting what was said.
+        EventType::Error | EventType::SessionMeta | EventType::TurnOutcome => false,
+        // Task-scoped (`task_run_id` is NULL), so unreachable from this
+        // run-scoped query — classified anyway so the match stays total.
+        EventType::StageEntered | EventType::ShellOutput => false,
+    }
+}
+
 /// A task's whole timeline, oldest first (P1-9) — every session's events
 /// interleaved with the task's own `stage_entered` entries.
 ///
@@ -656,6 +805,246 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    async fn append_all(pool: &SqlitePool, task_run_id: &str, events: &[(EventType, Value)]) {
+        for (event_type, payload) in events {
+            append(pool, task_run_id, *event_type, payload.clone())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The shape a real tool-using turn produces. Only the *last* message is
+    /// the answer — concatenating the narration in front of it would make a
+    /// `capture: json` reply unparseable and route the graph on a verdict the
+    /// agent never gave (#45).
+    #[tokio::test]
+    async fn the_final_message_excludes_narration_before_a_tool_call() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (EventType::HumanMessage, json!({ "text": "review this" })),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "I'll read the diff first." }),
+                ),
+                (
+                    EventType::ToolCall,
+                    json!({ "tool": "Read", "input": {"path": "a.rs"} }),
+                ),
+                (
+                    EventType::ToolResult,
+                    json!({ "tool": "Read", "output": "a huge file" }),
+                ),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": r#"{"outcome": "approved"}"# }),
+                ),
+            ],
+        )
+        .await;
+
+        let text = final_assistant_text_for_run(&pool, &task_run_id)
+            .await
+            .unwrap();
+        assert_eq!(text, r#"{"outcome": "approved"}"#);
+        assert!(
+            serde_json::from_str::<Value>(&text).is_ok(),
+            "the captured reply has to parse"
+        );
+    }
+
+    /// Text blocks of one message are concatenated with no separator: a JSON
+    /// document split mid-string must survive reassembly, and a newline
+    /// inserted inside a string literal would not be valid JSON.
+    #[tokio::test]
+    async fn the_final_messages_blocks_are_concatenated_in_order() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": r#"{"comments": "he"# }),
+                ),
+                (EventType::AssistantMessage, json!({ "text": r#"llo"}"# })),
+            ],
+        )
+        .await;
+
+        let text = final_assistant_text_for_run(&pool, &task_run_id)
+            .await
+            .unwrap();
+        assert_eq!(text, r#"{"comments": "hello"}"#);
+        assert!(serde_json::from_str::<Value>(&text).is_ok());
+    }
+
+    /// `run_stderr_reader` turns every non-empty stderr line into an `error`
+    /// event on this run, and a Node CLI prints deprecation and update
+    /// banners there — often *after* its final message. Treating any
+    /// non-`assistant_message` row as a message boundary would leave nothing
+    /// to capture, and a `capture: json` stage would fall back to `done` and
+    /// route on a verdict the agent never gave.
+    #[tokio::test]
+    async fn stderr_chatter_after_the_reply_does_not_erase_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": r#"{"outcome": "approved"}"# }),
+                ),
+                (
+                    EventType::Error,
+                    json!({ "message": "(node:123) DeprecationWarning: ..." }),
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            r#"{"outcome": "approved"}"#
+        );
+    }
+
+    /// `session_meta`, and the engine's own `turn_outcome` entry against this
+    /// same run, are likewise not message boundaries — the latter would make
+    /// a second read of the same run return nothing.
+    #[tokio::test]
+    async fn session_and_engine_events_are_not_message_boundaries() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (EventType::SessionMeta, json!({ "session_id": "s-1" })),
+                (EventType::AssistantMessage, json!({ "text": "approved" })),
+                (
+                    EventType::TurnOutcome,
+                    json!({ "stage": "review", "outcome": "approved" }),
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            "approved"
+        );
+    }
+
+    /// A `thinking` block precedes the text of the same message; it is not
+    /// something the agent said to us and must not reach the capture.
+    #[tokio::test]
+    async fn the_final_message_excludes_thinking() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::Thinking,
+                    json!({ "text": "hmm, is this approved?" }),
+                ),
+                (EventType::AssistantMessage, json!({ "text": "approved" })),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            "approved"
+        );
+    }
+
+    /// A turn that ended mid-tool-call never gave a final answer, and
+    /// inventing one out of its earlier narration would be worse than none.
+    #[tokio::test]
+    async fn a_turn_that_ended_on_a_tool_call_has_no_final_message() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "let me look" }),
+                ),
+                (EventType::ToolCall, json!({ "tool": "Read" })),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_said_nothing_has_no_final_message() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            ""
+        );
+    }
+
+    /// One run is one turn on the capture path, but a chat run accumulates
+    /// several — and "the last thing said" stays correct for those too.
+    #[tokio::test]
+    async fn the_final_message_is_the_latest_turns_answer() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (EventType::HumanMessage, json!({ "text": "first" })),
+                (EventType::AssistantMessage, json!({ "text": "answer one" })),
+                (EventType::HumanMessage, json!({ "text": "second" })),
+                (EventType::AssistantMessage, json!({ "text": "answer two" })),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            "answer two"
         );
     }
 }

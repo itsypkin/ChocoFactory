@@ -12,5 +12,6 @@ pub mod role_config;
 pub mod serde_util;
 pub mod session;
 pub mod shell;
+pub mod template;
 pub mod workflow_def;
 pub mod worktree;

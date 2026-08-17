@@ -178,12 +178,78 @@ impl WorkflowDefinition {
                     });
                 }
             }
+
+            // An `agent_turn` with an empty `on:` is chat's open-ended shape
+            // (§5.4): it never concludes, so the engine spawns no turn
+            // watcher for it and there is no moment at which a capture could
+            // be taken. Declaring one is therefore dead config that would do
+            // nothing — exactly the silent no-op #45 exists to remove, so it
+            // is rejected here rather than ignored.
+            if let StageKind::AgentTurn {
+                capture: Some(_), ..
+            } = &stage.kind
+                && stage.on.is_empty()
+            {
+                return Err(WorkflowDefError::CaptureOnOpenEndedTurn {
+                    stage: stage_name.clone(),
+                });
+            }
+
+            self.validate_templates(stage_name, stage)?;
         }
 
         if !self.sink_reachable_from_start() {
             return Err(WorkflowDefError::NoReachableSink);
         }
 
+        Ok(())
+    }
+
+    /// Checks every `{{ stages.<name>.<field> }}` reference this stage would
+    /// render at run time (P2-3, §5.1).
+    ///
+    /// Only what the *definition* can know is checked: that the reference
+    /// parses, and that the stage it names exists and captures something at
+    /// all. Whether that stage's captured JSON actually carries the field is
+    /// a run-time question — the shape isn't known until the command runs.
+    ///
+    /// Checking it here at all follows the same reasoning as
+    /// `MissingShellDoneOutcome` above: a mistyped stage name is a typo every
+    /// time, and left to run time it surfaces from a detached runner as a
+    /// parked task, long after the definition was loaded.
+    fn validate_templates(
+        &self,
+        stage_name: &str,
+        stage: &StageDef,
+    ) -> Result<(), WorkflowDefError> {
+        for (field, source) in templatable_sources(stage_name, stage)? {
+            let references = crate::template::references(&source).map_err(|err| {
+                WorkflowDefError::InvalidTemplate {
+                    stage: stage_name.to_string(),
+                    field,
+                    reason: err.to_string(),
+                }
+            })?;
+
+            for reference in references {
+                let Some(target) = self.stages.get(&reference.stage) else {
+                    return Err(WorkflowDefError::UnknownTemplateStage {
+                        stage: stage_name.to_string(),
+                        field,
+                        placeholder: reference.placeholder,
+                        referenced: reference.stage,
+                    });
+                };
+                if !declares_capture(&target.kind) {
+                    return Err(WorkflowDefError::TemplateStageCapturesNothing {
+                        stage: stage_name.to_string(),
+                        field,
+                        placeholder: reference.placeholder,
+                        referenced: reference.stage,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -249,6 +315,11 @@ pub enum StageKind {
         /// Absent for stages like chat's, which just relay live human
         /// input into the session rather than running a templated prompt.
         prompt_file: Option<PathBuf>,
+        /// What to keep of the turn's reply (X-3/#45). `json` additionally
+        /// makes the reply's reserved `outcome` key drive this stage's `on:`
+        /// transition, which is how a reviewer's structured verdict routes
+        /// the graph (§5.2).
+        capture: Option<Capture>,
     },
     Shell {
         command: ShellCommand,
@@ -286,9 +357,10 @@ pub enum ShellCommand {
     ScriptFile(PathBuf),
 }
 
-/// What to do with a `shell`/`poll` stage's stdout (§5.1). Absent
-/// entirely, the output is simply not retained — only a stage that says
-/// what it wants captured writes into `workflow_state.payload`.
+/// What to do with what a stage produced — a `shell`/`poll` stage's stdout,
+/// or an `agent_turn`'s reply (§5.1). Absent entirely, the output is simply
+/// not retained — only a stage that says what it wants captured writes into
+/// `workflow_state.payload`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capture {
     Json,
@@ -352,6 +424,8 @@ enum RawStageKind {
         role: String,
         #[serde(default)]
         prompt_file: Option<String>,
+        #[serde(default)]
+        capture: Option<Capture>,
     },
     Shell {
         #[serde(default)]
@@ -406,13 +480,18 @@ impl<'de> Deserialize<'de> for Capture {
 impl RawStage {
     fn resolve(self, base_dir: &Path, stage_name: &str) -> Result<StageDef, WorkflowDefError> {
         let kind = match self.kind {
-            RawStageKind::AgentTurn { role, prompt_file } => StageKind::AgentTurn {
+            RawStageKind::AgentTurn {
+                role,
+                prompt_file,
+                capture,
+            } => StageKind::AgentTurn {
                 role,
                 prompt_file: prompt_file
                     .map(|rel| {
                         resolve_file(base_dir, &rel, RefOwner::Stage(stage_name), "prompt_file")
                     })
                     .transpose()?,
+                capture,
             },
             RawStageKind::Shell {
                 command,
@@ -515,6 +594,71 @@ fn resolve_command(
     }
 }
 
+/// Whether a stage keeps anything in `workflow_state.payload` — i.e. whether
+/// `{{ stages.<this stage>.… }}` could ever resolve against it.
+fn declares_capture(kind: &StageKind) -> bool {
+    matches!(
+        kind,
+        StageKind::AgentTurn {
+            capture: Some(_),
+            ..
+        } | StageKind::Shell {
+            capture: Some(_),
+            ..
+        } | StageKind::Poll {
+            capture: Some(_),
+            ..
+        }
+    )
+}
+
+/// The text a stage renders templates into (§5.1): an inline `command:`, or
+/// an `agent_turn`'s `prompt_file` contents.
+///
+/// A `script_file` is deliberately absent — §5.1 scopes templating to
+/// `command:` and `prompt_file`, and a script is an executable artifact in
+/// its own right rather than a string the engine composes.
+///
+/// The prompt file is read here so its references are validated at load time
+/// too. The engine re-reads it when the turn actually runs, so a file edited
+/// in between isn't re-validated; that's the same staleness every
+/// `prompt_file` already has and not worth a cache.
+fn templatable_sources(
+    stage_name: &str,
+    stage: &StageDef,
+) -> Result<Vec<(&'static str, String)>, WorkflowDefError> {
+    let source = match &stage.kind {
+        StageKind::Shell {
+            command: ShellCommand::Inline(command),
+            ..
+        }
+        | StageKind::Poll {
+            command: ShellCommand::Inline(command),
+            ..
+        } => ("command", command.clone()),
+        StageKind::AgentTurn {
+            prompt_file: Some(path),
+            ..
+        } => (
+            "prompt_file",
+            // Not `WorkflowDefError::Io`, whose Display says "failed to read
+            // workflow definition" — the definition read fine; it's a file it
+            // points at that didn't, and the reader needs the stage and the
+            // path to find it. Existence is already checked by `resolve_file`,
+            // so what reaches here is a directory, a permissions problem, or
+            // non-UTF-8 content.
+            fs::read_to_string(path).map_err(|err| WorkflowDefError::UnreadableReferencedFile {
+                owner: format!("stage '{stage_name}'"),
+                field: "prompt_file",
+                path: path.clone(),
+                reason: err.to_string(),
+            })?,
+        ),
+        _ => return Ok(Vec::new()),
+    };
+    Ok(vec![source])
+}
+
 #[derive(Clone, Copy)]
 enum RefOwner<'a> {
     Role(&'a str),
@@ -609,6 +753,12 @@ pub enum WorkflowDefError {
         field: &'static str,
         value: String,
     },
+    UnreadableReferencedFile {
+        owner: String,
+        field: &'static str,
+        path: PathBuf,
+        reason: String,
+    },
     AmbiguousShellCommand {
         stage: String,
     },
@@ -637,6 +787,26 @@ pub enum WorkflowDefError {
     },
     TerminalStageHasTransitions {
         stage: String,
+    },
+    CaptureOnOpenEndedTurn {
+        stage: String,
+    },
+    InvalidTemplate {
+        stage: String,
+        field: &'static str,
+        reason: String,
+    },
+    UnknownTemplateStage {
+        stage: String,
+        field: &'static str,
+        placeholder: String,
+        referenced: String,
+    },
+    TemplateStageCapturesNothing {
+        stage: String,
+        field: &'static str,
+        placeholder: String,
+        referenced: String,
     },
 }
 
@@ -678,6 +848,16 @@ impl fmt::Display for WorkflowDefError {
                 f,
                 "{owner} references {field} '{value}', which is an absolute path or escapes the workflow definition's directory"
             ),
+            WorkflowDefError::UnreadableReferencedFile {
+                owner,
+                field,
+                path,
+                reason,
+            } => write!(
+                f,
+                "{owner} references {field} '{}', which exists but could not be read: {reason}",
+                path.display()
+            ),
             WorkflowDefError::AmbiguousShellCommand { stage } => write!(
                 f,
                 "stage '{stage}' sets both 'command' and 'script_file'; only one is allowed"
@@ -717,6 +897,39 @@ impl fmt::Display for WorkflowDefError {
             WorkflowDefError::TerminalStageHasTransitions { stage } => write!(
                 f,
                 "stage '{stage}' is a terminal stage but declares 'on:' transitions, which can never run"
+            ),
+            WorkflowDefError::CaptureOnOpenEndedTurn { stage } => write!(
+                f,
+                "agent_turn stage '{stage}' declares 'capture:' but has an empty 'on:' map, so it \
+                 never concludes and the capture could never be taken"
+            ),
+            WorkflowDefError::InvalidTemplate {
+                stage,
+                field,
+                reason,
+            } => write!(
+                f,
+                "stage '{stage}' has an invalid {field} template: {reason}"
+            ),
+            WorkflowDefError::UnknownTemplateStage {
+                stage,
+                field,
+                placeholder,
+                referenced,
+            } => write!(
+                f,
+                "stage '{stage}' has {placeholder} in its {field}, but '{referenced}' is not a \
+                 stage in this workflow"
+            ),
+            WorkflowDefError::TemplateStageCapturesNothing {
+                stage,
+                field,
+                placeholder,
+                referenced,
+            } => write!(
+                f,
+                "stage '{stage}' has {placeholder} in its {field}, but stage '{referenced}' \
+                 declares no 'capture:' so it stores nothing to reference"
             ),
         }
     }
@@ -779,7 +992,10 @@ stages:
         assert_eq!(def.roles["chat"].cli.as_deref(), Some("claude"));
         assert!(def.roles["chat"].system_prompt_file.is_some());
 
-        let StageKind::AgentTurn { role, prompt_file } = &def.stages["chatting"].kind else {
+        let StageKind::AgentTurn {
+            role, prompt_file, ..
+        } = &def.stages["chatting"].kind
+        else {
             panic!("expected agent_turn stage");
         };
         assert_eq!(role, "chat");
@@ -1688,5 +1904,267 @@ stages:
             WorkflowDefError::InvalidPollPattern { stage, pattern, .. }
                 if stage == "waiting" && pattern == "("
         ));
+    }
+
+    /// The loader gap #45 closes: `capture:` under an `agent_turn` used to be
+    /// swallowed by the flattened, internally-tagged `RawStageKind` rather
+    /// than parsed or rejected.
+    #[test]
+    fn parses_capture_on_an_agent_turn() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer: { cli: claude }
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on: { approved: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::AgentTurn { capture, .. } = &def.stages["review"].kind else {
+            panic!("expected agent_turn stage");
+        };
+        assert_eq!(*capture, Some(Capture::Json));
+    }
+
+    #[test]
+    fn an_agent_turn_without_capture_parses_as_none() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: chat
+roles:
+  chat: { cli: claude }
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::AgentTurn { capture, .. } = &def.stages["chatting"].kind else {
+            panic!("expected agent_turn stage");
+        };
+        assert_eq!(*capture, None);
+    }
+
+    /// An open-ended turn never concludes, so no watcher runs and the capture
+    /// could never be taken — dead config, rejected rather than ignored.
+    #[test]
+    fn rejects_capture_on_an_open_ended_agent_turn() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: chat
+roles:
+  chat: { cli: claude }
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    capture: json
+    on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::CaptureOnOpenEndedTurn { stage } if stage == "chatting"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_template_reference_to_a_capturing_stage() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: templated
+stages:
+  open_pr:
+    kind: shell
+    command: "gh pr create --fill --json url,number"
+    capture: json
+    on: { done: report }
+  report:
+    kind: shell
+    command: "echo pr {{ stages.open_pr.number }} at {{ stages.open_pr.url }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    #[test]
+    fn accepts_a_template_reference_in_a_prompt_file() {
+        let dir = TempDir::new();
+        dir.write("coder.md", "Address: {{ stages.review.comments }}\n");
+        let yaml = r#"
+name: templated
+roles:
+  coder: { cli: claude }
+  reviewer: { cli: claude }
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on: { changes_requested: coding }
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder.md
+    on: {}
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    /// The same reasoning as `MissingShellDoneOutcome`: a mistyped stage name
+    /// is a typo every time, and left to run time it only surfaces as a
+    /// parked task long after the definition was loaded.
+    #[test]
+    fn rejects_a_template_reference_to_an_unknown_stage() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: templated
+stages:
+  report:
+    kind: shell
+    command: "echo {{ stages.open_pr.number }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WorkflowDefError::UnknownTemplateStage { stage, referenced, .. }
+                    if stage == "report" && referenced == "open_pr"
+            ),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_template_reference_to_a_stage_that_captures_nothing() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: templated
+stages:
+  open_pr:
+    kind: shell
+    command: "gh pr create --fill"
+    on: { done: report }
+  report:
+    kind: shell
+    command: "echo {{ stages.open_pr.number }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WorkflowDefError::TemplateStageCapturesNothing { stage, referenced, .. }
+                    if stage == "report" && referenced == "open_pr"
+            ),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_template_syntax() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: templated
+stages:
+  report:
+    kind: shell
+    command: "echo {{ stages.open_pr.number"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WorkflowDefError::InvalidTemplate { stage, field, .. }
+                    if stage == "report" && *field == "command"
+            ),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_template_reading_a_namespace_other_than_stages() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: templated
+stages:
+  report:
+    kind: shell
+    command: "echo {{ task.id }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::InvalidTemplate { stage, .. } if stage == "report"),
+            "got {err}"
+        );
+    }
+
+    /// A `poll` command is templated on the same terms as a `shell` one —
+    /// §5.1's own example polls `gh pr checks {{ stages.open_pr.number }}`.
+    #[test]
+    fn validates_template_references_in_a_poll_command() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: templated
+stages:
+  checks:
+    kind: poll
+    command: "gh pr checks {{ stages.nope.number }}"
+    interval: 30s
+    outcomes:
+      - match: "SUCCESS"
+        then: green
+    on: { green: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WorkflowDefError::UnknownTemplateStage { referenced, .. } if referenced == "nope"
+            ),
+            "got {err}"
+        );
+    }
+
+    /// A `script_file` is an executable in its own right, not a string the
+    /// engine composes, so §5.1 leaves its contents alone — including
+    /// anything that merely looks like a placeholder.
+    #[test]
+    fn does_not_template_a_script_file() {
+        let dir = TempDir::new();
+        dir.write("run.sh", "#!/bin/sh\necho '{{ stages.nope.field }}'\n");
+        let yaml = r#"
+name: scripted
+stages:
+  run:
+    kind: shell
+    script_file: run.sh
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
     }
 }

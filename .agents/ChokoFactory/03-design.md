@@ -384,8 +384,9 @@ references (prompts, system prompts) relative to the definition file, and
 drives the task's `workflow_state` (current stage, loop counters, per-
 stage payload) through it.
 
-**Templating/capture across stages**: a `shell`/`poll` stage's stdout can
-be captured into that stage's `workflow_state` payload (`capture: json`
+**Templating/capture across stages**: a `shell`/`poll` stage's stdout —
+or an `agent_turn`'s reply (§5.2) — can be captured into that stage's
+`workflow_state` payload (`capture: json`
 parses it as JSON, `capture: text` stores it as raw text; a stage that
 sets neither captures nothing) and referenced by
 later stages via `{{ stages.<name>.<field> }}` in their own `command:`
@@ -403,6 +404,72 @@ Re-entering a stage overwrites its previous capture — the value means
 "what this stage produced most recently"; the `stage_entered` trail on
 the events timeline is what records that it ran more than once.
 
+Substitution rules, in full (P2-3):
+
+- The path is `{{ stages.<name>[.<field>…] }}`, whitespace-tolerant
+  around it but not inside it. Nested fields work (`stages.a.b.c`); a
+  bare `{{ stages.<name> }}` is how a `capture: text` stage is read,
+  since its payload entry is a plain string rather than an object.
+- `stages` is the only namespace a template may read. Reserving the rest
+  keeps room for engine-owned keys later without a definition that
+  guessed at one silently changing meaning.
+- Only scalars substitute: strings verbatim, numbers and booleans as
+  their JSON text. `null`, objects and arrays are an error — capture is
+  for short structured signals (a verdict, an id, a url), and splicing a
+  blob into a shell command is not something the format promises.
+- Only `command:` and `prompt_file` are templated. A `script_file` is an
+  executable in its own right and its contents are left alone; so is
+  live human input into an open `agent_turn`, which is what a person
+  typed rather than something the graph composed.
+- **Unresolvable references are errors, never empty strings.** Whatever
+  the loader can settle it settles at load time: that the syntax parses,
+  that the named stage exists, and that it declares a `capture:` at all
+  — a reference to a stage that stores nothing can never resolve, and
+  catching the typo when the definition is read beats discovering it as
+  a parked task much later. What's left is genuinely run-time — a field
+  the captured JSON turned out not to carry — and that fails the stage.
+  Substituting nothing instead would hand `sh -c` a malformed command,
+  or an agent a prompt with a hole in it, and the damage would surface
+  far from its cause.
+- Rendering happens once, when the stage is entered, against the payload
+  as of that moment. A `poll` therefore runs the same rendered command
+  on every attempt; nothing could change it mid-stage anyway, since
+  captures are only written as part of a transition. The rendered
+  command — not the template — is what the timeline records, because
+  that is what actually ran.
+- A run-time failure (a field the capture didn't carry, a value that
+  isn't a scalar) fails the stage and is recorded on the task's timeline
+  as an `error` entry naming the stage and the placeholder, not only in
+  the daemon's log. It is the *expected* failure of this feature, since
+  the loader cannot know a payload's shape, so it has to be visible
+  where an operator looks.
+
+**Two consequences worth stating plainly.**
+
+*Substituted values are not shell-escaped.* A rendered `command:` runs
+through `sh -c`, and what gets spliced in is now, under §5.2's
+`agent_turn` capture, text an **agent** wrote — or text a `shell` stage
+scraped from somewhere else (`gh pr view --json title`). A capture
+containing `; rm -rf …` becomes part of the command the daemon runs.
+This is accepted for now rather than overlooked: the roles a workflow
+runs already have tool access to the same working copy, so this is not a
+new capability so much as a new path to it. It is *not* equivalent
+though — the daemon's shell sits outside whatever sandbox the agent's
+own tools run in, and the content may be relayed from a third party (a
+PR title) rather than authored by the role. Anyone templating a capture
+into a command that does more than echo it should treat the value as
+untrusted. Quoting on substitution was considered and rejected as a
+silent behaviour change: `"{{ x }}"` in an already-quoted context would
+gain literal quotes. If this needs closing, the honest fix is an
+explicit filter syntax, which the format doesn't have yet.
+
+*`{{` is reserved everywhere in an inline `command:`.* A command that
+legitimately contains GitHub Actions syntax (`gh workflow run …
+'${{ inputs.x }}'`) now fails to load, because the loader rejects any
+placeholder whose root isn't `stages`. That's the cost of catching a
+mistyped namespace at load rather than at run time. The escape hatch is
+`script_file:`, whose contents are never templated.
+
 ### 5.2 Stage kinds (fixed set, implemented in Rust)
 
 The graph's *topology* is fully data-driven, but each stage's *behavior*
@@ -411,10 +478,48 @@ boundary that keeps the engine an interpreter rather than a general
 scripting runtime (see §7 non-goal):
 
 - **`agent_turn`**: runs one turn (or resumed session) of a role via the
-  agent adapter abstraction (§4). Emits an outcome by inspecting the
-  turn's result against kind-specific rules (e.g. a reviewer role's
-  structured verdict maps to `approved`/`changes_requested`; a plain
-  single-shot turn just emits `done`).
+  agent adapter abstraction (§4). A plain turn emits `done`. A turn that
+  declares `capture:` (§5.1) keeps the agent's **final message** — read
+  back off the timeline, since the engine holds no copy of a reply once
+  the session drain has stored it.
+
+  The final message specifically, not everything the agent said: a turn
+  is not one message. An agent that uses a tool produces
+  `assistant(text) → tool_call → tool_result → assistant(text)`, so
+  capturing the lot would put its narration ("I'll read the diff
+  first.") in front of its answer and a `capture: json` reply would
+  never parse. What a verdict means is the last thing said, after the
+  work. Text blocks within that message are concatenated with no
+  separator, so a JSON document split across blocks survives reassembly.
+  A reply that is *entirely* one ``` fence is unwrapped — the commonest
+  thing a model does unbidden — and that is the only normalization
+  applied; there is no search for JSON buried in prose, which would be
+  guessing. Under `capture: json` the reply's
+  reserved **`outcome`** key is what the stage transitions on, so a
+  reviewer answering `{"outcome": "approved", "comments": "…"}` drives
+  both the `on:` edge and the `comments` a later stage templates in —
+  one mechanism rather than a verdict channel bolted alongside a capture
+  channel. This is what §5.2 previously left as undefined "kind-specific
+  rules".
+
+  Capture is *only* taken when asked for. A stage with no `capture:`
+  stores nothing, exactly as for `shell`/`poll`; without that rule a chat
+  stage would rewrite its whole transcript into `workflow_state` on every
+  turn. For the same reason `capture:` on an open-ended (`on: {}`) turn
+  is rejected at load: such a stage never concludes, so there is no
+  moment at which the capture could be taken, and accepting it would be
+  accepting dead config.
+
+  A reply that isn't valid JSON under `capture: json`, or that carries no
+  usable `outcome`, is treated leniently — kept as text, outcome falls
+  back to `done` — because that is the rule `shell`/`poll` already
+  follow, and one rule for capture beats a stricter per-kind variant.
+  The fallback is recorded as a `turn_outcome` entry on the timeline
+  rather than only in the logs. The practical safety net is the `on:`
+  map: a reviewer stage declaring `approved`/`changes_requested` and no
+  `done` edge parks for a human instead of advancing, since there is no
+  `done` transition to take. A stage that *does* declare `done` will take
+  it, which is the accepted cost of the lenient rule.
 - **`shell`**: runs a one-shot command or `script_file` (same file-
   reference convention as prompts) to completion. Not git- or GitHub-
   specific — it's just "run this command" (`gh pr create`, a custom
