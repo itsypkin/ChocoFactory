@@ -127,9 +127,11 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                         .to_string(),
                 ));
             }
-            // `--repo` is deliberately not accepted here: `reconfigure` is the
-            // per-role surface, and moving a running task's working directory
-            // is a different operation with different consequences.
+            // No `--repo` flag here: `reconfigure` is the per-role surface, and
+            // moving a running task's working directory is a different
+            // operation with different consequences. This is only the absence
+            // of a convenience flag, not a guarantee — `--config '{"cwd":...}'`
+            // still sets it, as does `PATCH /tasks/{id}` directly.
             //
             // `build_task_config` can still return `None` even though flags
             // were supplied — `--config '{}'` is the case — so that's reported

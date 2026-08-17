@@ -204,24 +204,29 @@ chatting
 
 ### Per-role config
 
-A workflow can declare more than one role (`coding-task.yaml` has a `coder`
-and a `reviewer`), and each resolves its own CLI, model and system prompt
-from three layers — most specific wins, independently per field:
+A workflow can declare more than one role — a `coder` and a `reviewer`, say —
+and each resolves its own CLI, model and system prompt from three layers,
+most specific wins, independently per field:
 
 ```
 task config (--role-* below)  >  the workflow's roles: block  >  ~/.config/chokofactory/config.yaml
 ```
 
 The `--role-*` flags set the task-level layer. Each is `ROLE=VALUE` and each
-is repeatable, so several roles can be configured in one command:
+is repeatable, so several roles can be configured in one command. Using a
+two-role workflow of your own under `~/.config/chokofactory/workflows/` (the
+built-in multi-role `coding-task.yaml` is still to come):
 
 ```
-$ choco task create --project acme --workflow coding-task \
+$ choco task create --project acme --workflow my-coding-task \
     --title "fix the flaky test" --prompt "see issue 41" --repo ~/src/acme \
     --role-model coder=opus \
     --role-model reviewer=sonnet \
     --role-system-prompt-file reviewer=./strict-reviewer.md
 ```
+
+The role names are whatever that workflow's `roles:` block declares — a name
+that isn't in it is simply not applied to anything.
 
 | Flag | Sets |
 |---|---|

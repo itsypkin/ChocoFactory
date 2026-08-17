@@ -141,12 +141,17 @@ fn role_summaries(config: &Value) -> Vec<(String, String)> {
             keys.sort();
             let rendered: Vec<String> = keys
                 .into_iter()
-                .map(|key| match settings.get(key).and_then(Value::as_str) {
-                    // A system prompt is arbitrary multi-line prose; summarize
-                    // rather than dumping it into the middle of a field list.
-                    Some(_) if key == "system_prompt" => format!("{key}=<text>"),
-                    Some(value) => format!("{key}={}", one_line(value)),
-                    None => format!("{key}={}", settings[key]),
+                .filter_map(|key| {
+                    let value = settings.get(key)?;
+                    Some(match value.as_str() {
+                        // A system prompt is arbitrary multi-line prose;
+                        // summarize rather than dumping it into a field list.
+                        Some(_) if key == "system_prompt" => format!("{key}=<text>"),
+                        Some(text) => format!("{key}={}", one_line(text)),
+                        // Not a string: the daemon doesn't constrain these, so
+                        // show the raw JSON rather than hiding the field.
+                        None => format!("{key}={value}"),
+                    })
                 })
                 .collect();
             (!rendered.is_empty()).then(|| (name.clone(), rendered.join(", ")))
@@ -187,6 +192,18 @@ pub fn task_detail(detail: &Value) -> String {
     ];
     if let Some(parent) = detail.get("parent_task_id").and_then(Value::as_str) {
         pairs.push(("Parent task", parent.to_string()));
+    }
+    // Same per-role lines `task` renders: `task status` is where an existing
+    // task gets inspected, so leaving them out would mean `--json` was the
+    // only way to see what `task reconfigure` actually did. `TaskDetail`
+    // flattens the `Task`, so `config` is a top-level key here.
+    if let Some(config) = detail.get("config") {
+        if let Some(cwd) = config.get("cwd").and_then(Value::as_str) {
+            pairs.push(("Repo", cwd.to_string()));
+        }
+        for (role, settings) in role_summaries(config) {
+            pairs.push(("Role", format!("{role}: {settings}")));
+        }
     }
     pairs.push(("Created", timestamp_str(get("created_at"))));
 
@@ -705,6 +722,49 @@ mod tests {
             let rendered = task(&task_with_config(odd.clone()));
             assert!(rendered.contains("Workflow"), "{odd} -> {rendered}");
         }
+    }
+
+    /// `task status` is where an existing task gets inspected, so it has to
+    /// show per-role config too — otherwise `task reconfigure`'s effect is
+    /// only visible under `--json`.
+    #[test]
+    fn task_detail_lists_every_configured_role_and_the_repo() {
+        let detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "two-role",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "config": {
+                "cwd": "/src/app",
+                "roles": {
+                    "reviewer": { "model": "sonnet" },
+                    "coder": { "model": "opus", "cli": "claude" }
+                }
+            },
+            "workflow_state": null,
+        });
+
+        let rendered = task_detail(&detail);
+
+        assert!(rendered.contains("/src/app"), "{rendered}");
+        assert!(
+            rendered.contains("coder: cli=claude, model=opus"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("reviewer: model=sonnet"), "{rendered}");
+    }
+
+    /// A task with no config at all must render exactly as before.
+    #[test]
+    fn task_detail_without_config_adds_no_role_lines() {
+        let detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+        });
+
+        let rendered = task_detail(&detail);
+
+        assert!(!rendered.contains("Role"), "{rendered}");
+        assert!(!rendered.contains("Repo"), "{rendered}");
     }
 
     fn event(event_type: EventType, payload: Value) -> Event {

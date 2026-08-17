@@ -358,19 +358,23 @@ mod tests {
         }
 
         let task = get(&pool, &task_id).await.unwrap().unwrap();
-        for i in 0..ROLES {
-            assert_eq!(
-                task.config["roles"][format!("role{i}")]["model"],
-                format!("model{i}"),
-                "role{i} was lost — merge is not atomic. config: {}",
-                task.config
-            );
-        }
-        // The pre-existing task-wide key survived every merge too.
-        assert_eq!(task.config["cwd"], "/repo");
 
+        // Cleaned up before asserting, so a failure doesn't leak the temp dir.
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+
+        let missing: Vec<String> = (0..ROLES)
+            .filter(|i| task.config["roles"][format!("role{i}")]["model"] != format!("model{i}"))
+            .map(|i| format!("role{i}"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {ROLES} roles were lost — merge is not atomic. missing: {missing:?}, config: {}",
+            missing.len(),
+            task.config
+        );
+        // The pre-existing task-wide key survived every merge too.
+        assert_eq!(task.config["cwd"], "/repo");
     }
 
     #[tokio::test]

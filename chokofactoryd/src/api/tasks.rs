@@ -123,10 +123,16 @@ pub struct UpdateTaskConfigRequest {
 ///
 /// A non-object `config` is rejected here, before the DB call: `json_patch`
 /// would treat a scalar or array as a wholesale replacement of the column,
-/// silently wiping every role. This is *not* the same check as validating
-/// what's *inside* `config.roles` — per the P1-8 LLD, an unknown role name
-/// or a wrong-typed field there deliberately means "not overridden" rather
-/// than an error, and that leniency is preserved.
+/// silently wiping every role. `create` above deliberately doesn't make the
+/// same check — it *establishes* a task's config rather than merging into an
+/// existing one, so a odd shape there destroys nothing, and `resolve` reads
+/// through it as "no overrides"
+/// (`role_config::tests::malformed_task_config_falls_through_instead_of_erroring`).
+///
+/// This is *not* the same check as validating what's *inside* `config.roles` —
+/// per the P1-8 LLD, an unknown role name or a wrong-typed field there
+/// deliberately means "not overridden" rather than an error, and that leniency
+/// is preserved (same test).
 ///
 /// Takes effect on the task's **next** turn: `resolve` re-reads
 /// `task.config` on every `enter_agent_turn`/`send_message` and caches

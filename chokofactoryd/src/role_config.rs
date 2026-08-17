@@ -233,6 +233,110 @@ mod tests {
         );
     }
 
+    /// The security invariant the whole task-config layer is designed around
+    /// (P1-8 LLD, "Deliberate omission"): there is no `system_prompt_file`
+    /// field at the task level, because task config is the least-trusted
+    /// layer — it arrives over HTTP (`POST /tasks`, and since P2-6 also
+    /// `PATCH /tasks/{id}`) — and must never make the daemon read a path off
+    /// disk. `task_level_system_prompt_is_inline_text_not_a_file` only pins
+    /// the positive half; without this, adding a task-level file branch would
+    /// reopen the path-traversal class silently.
+    #[test]
+    fn a_task_level_system_prompt_file_is_ignored_not_read() {
+        let secret = temp_prompt("secret.md", "SHOULD NEVER BE READ");
+        let def = role_def(Some("cli"), Some("model"));
+        let task_config = json!({
+            "roles": { "coder": { "system_prompt_file": secret.to_str().unwrap() } }
+        });
+
+        let resolved = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &task_config,
+            "/cwd".into(),
+        )
+        .unwrap();
+
+        // Ignored entirely: not read, and not an error either.
+        assert_eq!(resolved.role_config.system_prompt, None);
+    }
+
+    /// Same invariant, but with a lower layer also in play: the task-level
+    /// path must not win over — or be read instead of — the workflow-def file.
+    #[test]
+    fn a_task_level_system_prompt_file_cannot_override_the_workflow_def_file() {
+        let secret = temp_prompt("secret.md", "SHOULD NEVER BE READ");
+        let def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(temp_prompt("def.md", "from the workflow definition")),
+        };
+        let task_config = json!({
+            "roles": { "coder": { "system_prompt_file": secret.to_str().unwrap() } }
+        });
+
+        let resolved = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &task_config,
+            "/cwd".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.role_config.system_prompt.as_deref(),
+            Some("from the workflow definition")
+        );
+    }
+
+    /// The other half of the task-config contract (P1-8 LLD): a missing or
+    /// wrong-shaped `roles` key, an unknown role name, or a wrong-typed field
+    /// deliberately means "not overridden" and falls through to the next
+    /// layer — never a validation error. `api::tasks::update_config`'s docs
+    /// claim this leniency is preserved, so it needs pinning: `merge_config`
+    /// will happily store any of these shapes, and turning one into an error
+    /// later would wedge the task's next turn.
+    #[test]
+    fn malformed_task_config_falls_through_instead_of_erroring() {
+        let def = role_def(Some("def-cli"), Some("def-model"));
+        let cases = [
+            // No `roles` key at all.
+            json!({}),
+            // `roles` present but not an object.
+            json!({ "roles": 7 }),
+            json!({ "roles": "nope" }),
+            json!({ "roles": ["coder"] }),
+            // `roles` an object, but this role's entry isn't.
+            json!({ "roles": { "coder": 7 } }),
+            // Only *another* role is configured — resolving `coder` must not
+            // pick up `reviewer`'s settings or complain about the extra key.
+            json!({ "roles": { "reviewer": { "model": "reviewer-model" } } }),
+            // Right shape, wrong types for every field.
+            json!({ "roles": { "coder": { "cli": 1, "model": true, "system_prompt": [] } } }),
+            // Wholly non-object config (reachable: `POST /tasks` doesn't
+            // constrain the shape, and RFC 7396 lets a patch replace it).
+            json!("not a config"),
+            json!(42),
+        ];
+
+        for task_config in cases {
+            let resolved = resolve(
+                "coder",
+                &def,
+                &GlobalConfig::default(),
+                &task_config,
+                "/cwd".into(),
+            )
+            .unwrap_or_else(|err| panic!("config {task_config} should not error, got {err}"));
+
+            assert_eq!(resolved.cli, "def-cli", "config {task_config}");
+            assert_eq!(resolved.model, "def-model", "config {task_config}");
+            assert_eq!(resolved.role_config.system_prompt, None, "{task_config}");
+        }
+    }
+
     #[test]
     fn resolving_two_different_role_names_never_cross_contaminates() {
         // Directly de-risks #17: proves `resolve` reads whatever

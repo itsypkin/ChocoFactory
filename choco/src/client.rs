@@ -110,6 +110,7 @@ pub fn build_task_config(
                         .to_string(),
                 ));
             }
+            reject_smuggled_prompt_file(&parsed)?;
             parsed
         }
         None => json!({}),
@@ -195,6 +196,37 @@ pub fn build_task_config(
     Ok(Some(config))
 }
 
+/// Rejects `roles.<name>.system_prompt_file` in a `--config` blob.
+///
+/// The daemon has no such field by design — task config is the least-trusted
+/// of the three layers, so it can't ask the daemon to read a path off disk —
+/// which means sending one is a guaranteed silent no-op. Reporting it beats
+/// letting someone believe they set a system prompt and never find out they
+/// didn't. `--role-system-prompt-file` is the supported spelling: `choco`
+/// reads the file here and sends its text.
+///
+/// Only this one field is checked, deliberately: everything else unknown is
+/// left alone, because the daemon's own rule is that unrecognized task-config
+/// content means "not overridden", never an error.
+fn reject_smuggled_prompt_file(config: &Value) -> Result<(), ClientError> {
+    let Some(roles) = config.get("roles").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (role, settings) in roles {
+        if settings
+            .as_object()
+            .is_some_and(|s| s.contains_key("system_prompt_file"))
+        {
+            return Err(ClientError::InvalidConfig(format!(
+                "--config sets roles.{role}.system_prompt_file, which the daemon \
+                 never reads (task config may not reference files) — use \
+                 --role-system-prompt-file {role}=<path> instead"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Splits a `ROLE=VALUE` flag argument on its *first* `=`, so a value may
 /// itself contain `=` (a system prompt often will).
 fn split_role_value<'a>(raw: &'a str, flag: &str) -> Result<(&'a str, &'a str), ClientError> {
@@ -206,6 +238,13 @@ fn split_role_value<'a>(raw: &'a str, flag: &str) -> Result<(&'a str, &'a str), 
     if role.is_empty() {
         return Err(ClientError::InvalidConfig(format!(
             "{flag}: role name is empty in '{raw}'"
+        )));
+    }
+    // An empty value would be forwarded faithfully — `--model ''` on the
+    // agent's command line — which is never what `--role-model coder=` meant.
+    if value.is_empty() {
+        return Err(ClientError::InvalidConfig(format!(
+            "{flag}: value is empty in '{raw}' (nothing to set for role '{role}')"
         )));
     }
     Ok((role, value))
@@ -674,6 +713,52 @@ mod tests {
         });
         assert!(msg.contains("/definitely/not/here.md"), "{msg}");
         assert!(msg.contains("coder"), "{msg}");
+    }
+
+    #[test]
+    fn build_config_rejects_an_empty_value() {
+        for raw in ["coder=", "coder"] {
+            let msg = expect_err(&RoleOverrides {
+                role_model: &strs(&[raw]),
+                ..RoleOverrides::default()
+            });
+            assert!(msg.contains("--role-model"), "{raw} gave: {msg}");
+        }
+        // Specifically the empty-value case, which would otherwise be
+        // forwarded as `--model ''` to the agent.
+        let msg = expect_err(&RoleOverrides {
+            role_model: &strs(&["coder="]),
+            ..RoleOverrides::default()
+        });
+        assert!(msg.contains("value is empty"), "{msg}");
+    }
+
+    /// `system_prompt_file` has no meaning at the task level by design, so
+    /// smuggling one through `--config` would be a silent no-op. Reported
+    /// instead, pointing at the flag that does work.
+    #[test]
+    fn build_config_rejects_a_system_prompt_file_smuggled_through_config() {
+        let msg = expect_err(&RoleOverrides {
+            config: Some(r#"{"roles":{"coder":{"system_prompt_file":"/etc/passwd"}}}"#),
+            ..RoleOverrides::default()
+        });
+        assert!(msg.contains("system_prompt_file"), "{msg}");
+        assert!(msg.contains("--role-system-prompt-file"), "{msg}");
+
+        // Other unrecognized keys are left alone: the daemon's own rule is
+        // that unknown task-config content means "not overridden", not an
+        // error, and `choco` shouldn't be stricter than the thing it calls.
+        let config = build_task_config(
+            &RoleOverrides {
+                config: Some(r#"{"roles":{"coder":{"future_field":"x"}},"unknown":1}"#),
+                ..RoleOverrides::default()
+            },
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config["roles"]["coder"]["future_field"], "x");
+        assert_eq!(config["unknown"], 1);
     }
 
     #[test]
