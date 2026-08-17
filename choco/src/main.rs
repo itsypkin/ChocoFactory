@@ -10,9 +10,22 @@ use std::process::ExitCode;
 
 use chokofactory_core::models::{Project, Task};
 use clap::Parser;
-use cli::{Cli, Command, ProjectCmd, TaskCmd};
-use client::{Client, ClientError, EventsPage};
+use cli::{Cli, Command, ProjectCmd, RoleOverrideArgs, TaskCmd};
+use client::{Client, ClientError, CreateTaskParams, EventsPage, RoleOverrides, build_task_config};
 use serde_json::Value;
+
+/// Borrows the parsed `--role-*`/`--config` flags in the shape
+/// `build_task_config` wants, keeping `cli` free of any dependency on
+/// `client`'s types.
+fn role_overrides(args: &RoleOverrideArgs) -> RoleOverrides<'_> {
+    RoleOverrides {
+        role_cli: &args.role_cli,
+        role_model: &args.role_model,
+        role_system_prompt: &args.role_system_prompt,
+        role_system_prompt_file: &args.role_system_prompt_file,
+        config: args.config.as_deref(),
+    }
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -90,18 +103,43 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         }
         Command::Project(ProjectCmd::List) => Ok(Output::Projects(client.list_projects().await?)),
         Command::Task(TaskCmd::Create(args)) => {
+            // Built before resolving the project so a malformed flag fails
+            // immediately, without a lookup request first.
+            let config = build_task_config(&role_overrides(&args.roles), args.repo.as_deref())?;
             let project_id = client.resolve_project(&args.project).await?;
             let task = client
-                .create_task(
-                    &project_id,
-                    &args.workflow,
-                    &args.title,
-                    &args.prompt,
-                    args.repo.as_deref(),
-                    args.parent_task.as_deref(),
-                )
+                .create_task(&CreateTaskParams {
+                    project_id: &project_id,
+                    workflow_def: &args.workflow,
+                    title: &args.title,
+                    prompt: &args.prompt,
+                    config,
+                    parent_task_id: args.parent_task.as_deref(),
+                })
                 .await?;
             Ok(Output::Task(task))
+        }
+        Command::Task(TaskCmd::Reconfigure { id, roles }) => {
+            if roles.is_empty() {
+                return Err(ClientError::InvalidConfig(
+                    "nothing to change — pass at least one --role-cli/--role-model/\
+                     --role-system-prompt/--role-system-prompt-file/--config"
+                        .to_string(),
+                ));
+            }
+            // `--repo` is deliberately not accepted here: `reconfigure` is the
+            // per-role surface, and moving a running task's working directory
+            // is a different operation with different consequences.
+            //
+            // `build_task_config` can still return `None` even though flags
+            // were supplied — `--config '{}'` is the case — so that's reported
+            // rather than unwrapped into a panic or sent as an empty patch.
+            let config = build_task_config(&role_overrides(&roles), None)?.ok_or_else(|| {
+                ClientError::InvalidConfig(
+                    "the supplied config is empty — nothing would change".to_string(),
+                )
+            })?;
+            Ok(Output::Task(client.update_task_config(&id, &config).await?))
         }
         Command::Task(TaskCmd::Status { id }) => {
             Ok(Output::TaskDetail(client.get_task(&id).await?))

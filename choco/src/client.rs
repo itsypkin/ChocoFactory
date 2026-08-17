@@ -39,6 +39,10 @@ pub enum ClientError {
     /// constraint (`0001_init.sql`), so this is a reachable state, not a
     /// theoretical one. Resolved by passing the id instead.
     AmbiguousProject { name: String, ids: Vec<String> },
+    /// A `--role-*`/`--config` flag couldn't be turned into task config.
+    /// Always reported rather than skipped: silently dropping an override
+    /// would run the task on a model the caller didn't ask for.
+    InvalidConfig(String),
 }
 
 impl fmt::Display for ClientError {
@@ -59,8 +63,166 @@ impl fmt::Display for ClientError {
                 ids.len(),
                 ids.join(", ")
             ),
+            ClientError::InvalidConfig(msg) => write!(f, "{msg}"),
         }
     }
+}
+
+/// `POST /tasks` inputs, grouped into a struct rather than passed as eight
+/// positional parameters (which is what `create_task` used to need an
+/// `#[allow(clippy::too_many_arguments)]` for).
+pub struct CreateTaskParams<'a> {
+    pub project_id: &'a str,
+    pub workflow_def: &'a str,
+    pub title: &'a str,
+    pub prompt: &'a str,
+    /// Already-assembled task config, or `None` to send no config at all.
+    /// Build it with [`build_task_config`].
+    pub config: Option<Value>,
+    pub parent_task_id: Option<&'a str>,
+}
+
+/// Assembles the task-level `config` object (design §5.5) from the CLI's
+/// `--config` blob, the repeatable `--role-*` flags, and `--repo`.
+///
+/// Layered least- to most-specific, so the typed flags win per *field* and
+/// don't clobber sibling fields the `--config` blob set for the same role:
+/// `--config` -> `--role-*` -> `--repo`.
+///
+/// Returns `None` when nothing was supplied, so `choco task create` with no
+/// config flags keeps sending `"config": null` rather than an empty object.
+///
+/// Every malformed input is an error, never a skipped override — running on
+/// a model the caller didn't ask for is worse than failing loudly.
+pub fn build_task_config(
+    overrides: &RoleOverrides<'_>,
+    repo: Option<&str>,
+) -> Result<Option<Value>, ClientError> {
+    let mut config = match overrides.config {
+        Some(raw) => {
+            let parsed: Value = serde_json::from_str(raw).map_err(|err| {
+                ClientError::InvalidConfig(format!("--config is not valid JSON: {err}"))
+            })?;
+            if !parsed.is_object() {
+                return Err(ClientError::InvalidConfig(
+                    "--config must be a JSON object, e.g. \
+                     '{\"roles\":{\"coder\":{\"model\":\"opus\"}}}'"
+                        .to_string(),
+                ));
+            }
+            parsed
+        }
+        None => json!({}),
+    };
+
+    // Tracks which (role, field) pairs the typed flags have already set, so a
+    // repeated flag is reported instead of silently taking the last value.
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    let groups: [(&[String], &str, bool); 4] = [
+        (overrides.role_cli, "cli", false),
+        (overrides.role_model, "model", false),
+        (overrides.role_system_prompt, "system_prompt", false),
+        (
+            overrides.role_system_prompt_file,
+            "system_prompt",
+            /* from_file */ true,
+        ),
+    ];
+
+    for (values, field, from_file) in groups {
+        let flag = match (field, from_file) {
+            ("cli", _) => "--role-cli",
+            ("model", _) => "--role-model",
+            (_, false) => "--role-system-prompt",
+            (_, true) => "--role-system-prompt-file",
+        };
+        for raw in values {
+            let (role, value) = split_role_value(raw, flag)?;
+            if seen.iter().any(|(r, f)| r == role && *f == field) {
+                return Err(ClientError::InvalidConfig(format!(
+                    "'{field}' given more than once for role '{role}' — \
+                     pass a single value per role per field"
+                )));
+            }
+            seen.push((role.to_string(), field));
+
+            let value = if from_file {
+                std::fs::read_to_string(value).map_err(|err| {
+                    ClientError::InvalidConfig(format!(
+                        "{flag}: failed to read '{value}' for role '{role}': {err}"
+                    ))
+                })?
+            } else {
+                value.to_string()
+            };
+
+            // `config` is known to be an object (checked above / built as
+            // one), and each level is replaced if it isn't an object, so a
+            // `--config` blob with a non-object `roles` can't panic here.
+            let roles = config
+                .as_object_mut()
+                .expect("config is an object")
+                .entry("roles")
+                .or_insert_with(|| json!({}));
+            if !roles.is_object() {
+                *roles = json!({});
+            }
+            let role_entry = roles
+                .as_object_mut()
+                .expect("roles is an object")
+                .entry(role)
+                .or_insert_with(|| json!({}));
+            if !role_entry.is_object() {
+                *role_entry = json!({});
+            }
+            role_entry
+                .as_object_mut()
+                .expect("role entry is an object")
+                .insert(field.to_string(), Value::String(value));
+        }
+    }
+
+    if let Some(cwd) = repo {
+        config
+            .as_object_mut()
+            .expect("config is an object")
+            .insert("cwd".to_string(), Value::String(cwd.to_string()));
+    }
+
+    if config.as_object().is_some_and(|map| map.is_empty()) {
+        return Ok(None);
+    }
+    Ok(Some(config))
+}
+
+/// Splits a `ROLE=VALUE` flag argument on its *first* `=`, so a value may
+/// itself contain `=` (a system prompt often will).
+fn split_role_value<'a>(raw: &'a str, flag: &str) -> Result<(&'a str, &'a str), ClientError> {
+    let (role, value) = raw.split_once('=').ok_or_else(|| {
+        ClientError::InvalidConfig(format!(
+            "{flag} expects ROLE=VALUE, got '{raw}' (no '=' found)"
+        ))
+    })?;
+    if role.is_empty() {
+        return Err(ClientError::InvalidConfig(format!(
+            "{flag}: role name is empty in '{raw}'"
+        )));
+    }
+    Ok((role, value))
+}
+
+/// The `--role-*`/`--config` flag values [`build_task_config`] reads.
+///
+/// A borrowed view rather than `cli::RoleOverrideArgs` itself, so this
+/// module stays independent of the `clap` layer (and the unit tests below can
+/// build cases without constructing a parser).
+#[derive(Default)]
+pub struct RoleOverrides<'a> {
+    pub role_cli: &'a [String],
+    pub role_model: &'a [String],
+    pub role_system_prompt: &'a [String],
+    pub role_system_prompt_file: &'a [String],
+    pub config: Option<&'a str>,
 }
 
 pub struct Client {
@@ -187,49 +349,37 @@ impl Client {
     }
 
     /// Builds the `POST /tasks` request body — split out from
-    /// [`Self::create_task`] so the `--repo` -> `config.cwd` mapping is
+    /// [`Self::create_task`] so the flag -> `config` mapping is
     /// unit-testable without a network round trip.
-    fn create_task_request(
-        &self,
-        project_id: &str,
-        workflow_def: &str,
-        title: &str,
-        prompt: &str,
-        repo: Option<&str>,
-        parent_task_id: Option<&str>,
-    ) -> reqwest::RequestBuilder {
-        let config = repo.map(|cwd| json!({ "cwd": cwd }));
+    fn create_task_request(&self, params: &CreateTaskParams<'_>) -> reqwest::RequestBuilder {
         self.http
             .post(format!("{}/tasks", self.base_url))
             .json(&json!({
-                "project_id": project_id,
-                "workflow_def": workflow_def,
-                "title": title,
-                "prompt": prompt,
-                "config": config,
-                "parent_task_id": parent_task_id,
+                "project_id": params.project_id,
+                "workflow_def": params.workflow_def,
+                "title": params.title,
+                "prompt": params.prompt,
+                "config": params.config,
+                "parent_task_id": params.parent_task_id,
             }))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_task(
-        &self,
-        project_id: &str,
-        workflow_def: &str,
-        title: &str,
-        prompt: &str,
-        repo: Option<&str>,
-        parent_task_id: Option<&str>,
-    ) -> Result<Task, ClientError> {
+    pub async fn create_task(&self, params: &CreateTaskParams<'_>) -> Result<Task, ClientError> {
+        let resp = self.send(self.create_task_request(params)).await?;
+        let resp = self.check_status(resp).await?;
+        self.decode(resp).await
+    }
+
+    fn update_task_config_request(&self, id: &str, config: &Value) -> reqwest::RequestBuilder {
+        self.http
+            .patch(format!("{}/tasks/{id}", self.base_url))
+            .json(&json!({ "config": config }))
+    }
+
+    /// `PATCH /tasks/{id}` — merges `config` into the task's existing config.
+    pub async fn update_task_config(&self, id: &str, config: &Value) -> Result<Task, ClientError> {
         let resp = self
-            .send(self.create_task_request(
-                project_id,
-                workflow_def,
-                title,
-                prompt,
-                repo,
-                parent_task_id,
-            ))
+            .send(self.update_task_config_request(id, config))
             .await?;
         let resp = self.check_status(resp).await?;
         self.decode(resp).await
@@ -302,37 +452,248 @@ mod tests {
         Client::new("http://127.0.0.1:4141".to_string())
     }
 
+    fn params<'a>(config: Option<Value>, parent_task_id: Option<&'a str>) -> CreateTaskParams<'a> {
+        CreateTaskParams {
+            project_id: "p",
+            workflow_def: "chat",
+            title: "t",
+            prompt: "hi",
+            config,
+            parent_task_id,
+        }
+    }
+
+    fn body_of(req: reqwest::RequestBuilder) -> Value {
+        let req = req.build().unwrap();
+        serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
+
+    /// `strs(&["a=b"])` — the `Vec<String>` shape clap produces.
+    fn strs(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn create_task_includes_config_cwd_when_repo_is_given() {
-        let c = client();
-        let req = c
-            .create_task_request("p", "chat", "t", "hi", Some("/repo"), None)
-            .build()
-            .unwrap();
-        let body: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        let config = build_task_config(&RoleOverrides::default(), Some("/repo")).unwrap();
+        let body = body_of(client().create_task_request(&params(config, None)));
         assert_eq!(body["config"]["cwd"], "/repo");
     }
 
     #[test]
     fn create_task_sends_null_config_when_repo_is_absent() {
-        let c = client();
-        let req = c
-            .create_task_request("p", "chat", "t", "hi", None, None)
-            .build()
-            .unwrap();
-        let body: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        let config = build_task_config(&RoleOverrides::default(), None).unwrap();
+        assert!(config.is_none());
+        let body = body_of(client().create_task_request(&params(config, None)));
         assert!(body["config"].is_null());
     }
 
     #[test]
     fn create_task_includes_parent_task_id_when_given() {
-        let c = client();
-        let req = c
-            .create_task_request("p", "chat", "t", "hi", None, Some("parent-1"))
+        let body = body_of(client().create_task_request(&params(None, Some("parent-1"))));
+        assert_eq!(body["parent_task_id"], "parent-1");
+    }
+
+    #[test]
+    fn update_task_config_patches_the_task_with_the_config_wrapped() {
+        let config = json!({ "roles": { "coder": { "model": "opus" } } });
+        let req = client()
+            .update_task_config_request("task-1", &config)
             .build()
             .unwrap();
+        assert_eq!(req.method(), "PATCH");
+        assert!(req.url().path().ends_with("/tasks/task-1"));
         let body: Value = serde_json::from_slice(req.body().unwrap().as_bytes().unwrap()).unwrap();
-        assert_eq!(body["parent_task_id"], "parent-1");
+        assert_eq!(body["config"], config);
+    }
+
+    // --- build_task_config: the P2-6 multi-role surface ---
+
+    /// The headline case for #17: two roles configured independently in one
+    /// invocation, each landing under its own key.
+    #[test]
+    fn build_config_sets_more_than_one_role_at_once() {
+        let overrides = RoleOverrides {
+            role_model: &strs(&["coder=opus", "reviewer=sonnet"]),
+            role_cli: &strs(&["reviewer=claude"]),
+            ..RoleOverrides::default()
+        };
+
+        let config = build_task_config(&overrides, Some("/repo"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(config["roles"]["coder"]["model"], "opus");
+        assert_eq!(config["roles"]["reviewer"]["model"], "sonnet");
+        assert_eq!(config["roles"]["reviewer"]["cli"], "claude");
+        assert_eq!(config["cwd"], "/repo");
+        // `coder` got no --role-cli, so nothing is invented for it.
+        assert!(config["roles"]["coder"].get("cli").is_none());
+    }
+
+    /// A typed flag overrides only the field it names, leaving the rest of
+    /// that role's `--config` object intact — the "typed flags win per field"
+    /// rule, not "per role".
+    #[test]
+    fn build_config_typed_flag_beats_config_blob_without_erasing_siblings() {
+        let overrides = RoleOverrides {
+            role_model: &strs(&["coder=opus"]),
+            config: Some(
+                r#"{"roles":{"coder":{"model":"sonnet","cli":"claude"},
+                             "reviewer":{"model":"haiku"}},"extra":1}"#,
+            ),
+            ..RoleOverrides::default()
+        };
+
+        let config = build_task_config(&overrides, None).unwrap().unwrap();
+
+        assert_eq!(config["roles"]["coder"]["model"], "opus");
+        assert_eq!(config["roles"]["coder"]["cli"], "claude");
+        assert_eq!(config["roles"]["reviewer"]["model"], "haiku");
+        assert_eq!(config["extra"], 1);
+    }
+
+    #[test]
+    fn build_config_repo_overrides_a_cwd_from_the_config_blob() {
+        let overrides = RoleOverrides {
+            config: Some(r#"{"cwd":"/from-blob"}"#),
+            ..RoleOverrides::default()
+        };
+        let config = build_task_config(&overrides, Some("/from-flag"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config["cwd"], "/from-flag");
+    }
+
+    #[test]
+    fn build_config_reads_a_system_prompt_from_a_file_client_side() {
+        let dir = std::env::temp_dir().join(format!("choco-sp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("coder-system.md");
+        std::fs::write(&path, "be careful").unwrap();
+
+        let overrides = RoleOverrides {
+            role_system_prompt_file: &strs(&[&format!("coder={}", path.display())]),
+            ..RoleOverrides::default()
+        };
+        let config = build_task_config(&overrides, None).unwrap().unwrap();
+
+        // Sent as inline text: the daemon is never handed a path, because
+        // task config is the least-trusted config layer.
+        assert_eq!(config["roles"]["coder"]["system_prompt"], "be careful");
+        assert!(
+            config["roles"]["coder"].get("system_prompt_file").is_none(),
+            "must not forward a path to the daemon"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_config_splits_on_the_first_equals_so_values_may_contain_one() {
+        let overrides = RoleOverrides {
+            role_system_prompt: &strs(&["coder=x = y = z"]),
+            ..RoleOverrides::default()
+        };
+        let config = build_task_config(&overrides, None).unwrap().unwrap();
+        assert_eq!(config["roles"]["coder"]["system_prompt"], "x = y = z");
+    }
+
+    /// A `--config` blob whose `roles` (or a role entry) isn't an object
+    /// must not panic the index-and-insert path below it.
+    #[test]
+    fn build_config_replaces_a_non_object_roles_from_the_config_blob() {
+        for blob in [r#"{"roles":7}"#, r#"{"roles":{"coder":"nope"}}"#] {
+            let overrides = RoleOverrides {
+                role_model: &strs(&["coder=opus"]),
+                config: Some(blob),
+                ..RoleOverrides::default()
+            };
+            let config = build_task_config(&overrides, None).unwrap().unwrap();
+            assert_eq!(
+                config["roles"]["coder"]["model"], "opus",
+                "blob {blob} produced {config}"
+            );
+        }
+    }
+
+    // --- error cases: every bad input is reported, never silently dropped ---
+
+    fn expect_err(overrides: &RoleOverrides<'_>) -> String {
+        match build_task_config(overrides, None) {
+            Err(ClientError::InvalidConfig(msg)) => msg,
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_config_rejects_a_flag_without_an_equals() {
+        let msg = expect_err(&RoleOverrides {
+            role_model: &strs(&["opus"]),
+            ..RoleOverrides::default()
+        });
+        assert!(msg.contains("--role-model"), "{msg}");
+        assert!(msg.contains("ROLE=VALUE"), "{msg}");
+    }
+
+    #[test]
+    fn build_config_rejects_an_empty_role_name() {
+        let msg = expect_err(&RoleOverrides {
+            role_model: &strs(&["=opus"]),
+            ..RoleOverrides::default()
+        });
+        assert!(msg.contains("role name is empty"), "{msg}");
+    }
+
+    #[test]
+    fn build_config_rejects_the_same_role_and_field_twice() {
+        let msg = expect_err(&RoleOverrides {
+            role_model: &strs(&["coder=opus", "coder=sonnet"]),
+            ..RoleOverrides::default()
+        });
+        assert!(msg.contains("more than once"), "{msg}");
+        assert!(msg.contains("coder"), "{msg}");
+    }
+
+    /// Both system-prompt flags target the same field, so asking for both is
+    /// a conflict rather than a silent winner.
+    #[test]
+    fn build_config_rejects_inline_and_file_system_prompt_for_one_role() {
+        let msg = expect_err(&RoleOverrides {
+            role_system_prompt: &strs(&["coder=inline"]),
+            role_system_prompt_file: &strs(&["coder=/some/path"]),
+            ..RoleOverrides::default()
+        });
+        assert!(msg.contains("more than once"), "{msg}");
+    }
+
+    #[test]
+    fn build_config_rejects_an_unreadable_system_prompt_file() {
+        let msg = expect_err(&RoleOverrides {
+            role_system_prompt_file: &strs(&["coder=/definitely/not/here.md"]),
+            ..RoleOverrides::default()
+        });
+        assert!(msg.contains("/definitely/not/here.md"), "{msg}");
+        assert!(msg.contains("coder"), "{msg}");
+    }
+
+    #[test]
+    fn build_config_rejects_malformed_and_non_object_config_json() {
+        let msg = expect_err(&RoleOverrides {
+            config: Some("{not json"),
+            ..RoleOverrides::default()
+        });
+        assert!(msg.contains("not valid JSON"), "{msg}");
+
+        for blob in ["[1,2]", "\"text\"", "7", "null"] {
+            let msg = expect_err(&RoleOverrides {
+                config: Some(blob),
+                ..RoleOverrides::default()
+            });
+            assert!(
+                msg.contains("must be a JSON object"),
+                "blob {blob} gave: {msg}"
+            );
+        }
     }
 
     #[test]

@@ -118,16 +118,41 @@ pub async fn update_status(
     Ok(row.map(Into::into))
 }
 
-pub async fn update_config(
+/// Merges `patch` into `tasks.config` (RFC 7396 JSON Merge Patch) and
+/// returns the updated task, or `None` if no task has `id`.
+///
+/// The merge happens *inside* the `UPDATE` via SQLite's `json_patch`
+/// rather than as a read-modify-write in Rust, and that is the whole
+/// point of this function. Reading the row, merging here, and writing the
+/// result back would be a lost update: two concurrent patches would each
+/// merge onto the same stale base and the second writer would silently
+/// discard the first one's keys. As a single statement there is no window
+/// to interleave — SQLite applies the merge to whatever the row holds at
+/// write time, so concurrent patches of different roles compose instead
+/// of clobbering (regression test:
+/// `concurrent_merges_of_different_roles_all_survive`).
+///
+/// `json_patch` merges objects recursively, so patching
+/// `{"roles":{"coder":{...}}}` leaves a sibling `roles.reviewer` and the
+/// task-wide `cwd` untouched. Per RFC 7396 a `null` value *removes* that
+/// key, which is how an override gets cleared.
+///
+/// `patch` must be a JSON object. A scalar or array would make
+/// `json_patch` replace the entire column rather than merge into it, so
+/// callers are responsible for rejecting that (`api::tasks::update_config`
+/// returns 400); this layer documents the requirement rather than
+/// re-checking it, matching how `create` trusts its `config` too.
+pub async fn merge_config(
     pool: &SqlitePool,
     id: &str,
-    config: Value,
+    patch: Value,
 ) -> Result<Option<Task>, sqlx::Error> {
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRow>(&format!(
-        "UPDATE tasks SET config = ?, updated_at = ? WHERE id = ? RETURNING {COLUMNS}"
+        "UPDATE tasks SET config = json_patch(config, ?), updated_at = ? \
+         WHERE id = ? RETURNING {COLUMNS}"
     ))
-    .bind(Json(config))
+    .bind(Json(patch))
     .bind(now)
     .bind(id)
     .fetch_optional(pool)
@@ -184,7 +209,7 @@ mod tests {
         assert_eq!(updated.status, "closed");
         assert!(updated.updated_at >= created.updated_at);
 
-        let reconfigured = update_config(&pool, &created.id, json!({"model": "opus"}))
+        let reconfigured = merge_config(&pool, &created.id, json!({"model": "opus"}))
             .await
             .unwrap()
             .unwrap();
@@ -192,6 +217,160 @@ mod tests {
 
         assert!(delete(&pool, &created.id).await.unwrap());
         assert!(get(&pool, &created.id).await.unwrap().is_none());
+    }
+
+    /// Seeds a task whose config is `config` and returns its id.
+    async fn seed_task_with_config(pool: &SqlitePool, config: Value) -> String {
+        let project_id = seed_project(pool).await;
+        create(
+            pool,
+            NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: "multi-role",
+                title: "T",
+                config,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// The behavior `choco task reconfigure --role-model coder=opus`
+    /// depends on: touching one role must not wipe the task-wide `cwd` or
+    /// a sibling role's settings.
+    #[tokio::test]
+    async fn merge_config_preserves_sibling_keys_and_roles() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task_with_config(
+            &pool,
+            json!({
+                "cwd": "/repo",
+                "roles": {
+                    "coder": { "cli": "claude", "model": "sonnet" },
+                    "reviewer": { "model": "sonnet" }
+                }
+            }),
+        )
+        .await;
+
+        let updated = merge_config(
+            &pool,
+            &task_id,
+            json!({ "roles": { "coder": { "model": "opus" } } }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(updated.config["roles"]["coder"]["model"], "opus");
+        // Untouched by the patch, so still present:
+        assert_eq!(updated.config["cwd"], "/repo");
+        assert_eq!(updated.config["roles"]["coder"]["cli"], "claude");
+        assert_eq!(updated.config["roles"]["reviewer"]["model"], "sonnet");
+    }
+
+    #[tokio::test]
+    async fn merge_config_creates_the_roles_key_when_the_config_is_empty() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task_with_config(&pool, json!({})).await;
+
+        let updated = merge_config(
+            &pool,
+            &task_id,
+            json!({ "roles": { "coder": { "model": "opus" } } }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(updated.config["roles"]["coder"]["model"], "opus");
+    }
+
+    /// RFC 7396: a `null` value deletes the key rather than storing null.
+    #[tokio::test]
+    async fn merge_config_removes_a_key_when_patched_with_null() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task_with_config(
+            &pool,
+            json!({ "roles": { "coder": { "cli": "claude", "model": "sonnet" } } }),
+        )
+        .await;
+
+        let updated = merge_config(
+            &pool,
+            &task_id,
+            json!({ "roles": { "coder": { "model": null } } }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(updated.config["roles"]["coder"].get("model").is_none());
+        assert_eq!(updated.config["roles"]["coder"]["cli"], "claude");
+    }
+
+    #[tokio::test]
+    async fn merge_config_on_an_unknown_id_is_none() {
+        let pool = connect_in_memory().await.unwrap();
+        assert!(
+            merge_config(&pool, "nope", json!({ "cwd": "/x" }))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Regression test for the lost-update race `merge_config`'s
+    /// single-statement `json_patch` exists to prevent. Every task patches
+    /// a *different* role concurrently, so a correct implementation ends
+    /// with all of them; a read-merge-write implementation would drop
+    /// whichever ones lost the race.
+    ///
+    /// Uses a real multi-threaded runtime and a file-backed pool, because a
+    /// single-threaded runtime plus an in-memory pool can serialize these
+    /// enough to hide the very interleaving being tested.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_merges_of_different_roles_all_survive() {
+        let dir = std::env::temp_dir().join(format!("chokofactory-merge-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::db::connect(&dir.join("db.sqlite")).await.unwrap();
+
+        let task_id = seed_task_with_config(&pool, json!({ "cwd": "/repo" })).await;
+
+        const ROLES: usize = 12;
+        let mut handles = Vec::new();
+        for i in 0..ROLES {
+            let pool = pool.clone();
+            let task_id = task_id.clone();
+            handles.push(tokio::spawn(async move {
+                merge_config(
+                    &pool,
+                    &task_id,
+                    json!({ "roles": { format!("role{i}"): { "model": format!("model{i}") } } }),
+                )
+                .await
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap().unwrap();
+        }
+
+        let task = get(&pool, &task_id).await.unwrap().unwrap();
+        for i in 0..ROLES {
+            assert_eq!(
+                task.config["roles"][format!("role{i}")]["model"],
+                format!("model{i}"),
+                "role{i} was lost — merge is not atomic. config: {}",
+                task.config
+            );
+        }
+        // The pre-existing task-wide key survived every merge too.
+        assert_eq!(task.config["cwd"], "/repo");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

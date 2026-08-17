@@ -278,4 +278,154 @@ mod tests {
         assert_eq!(reviewer.cli, "reviewer-global-cli");
         assert_eq!(reviewer.model, "reviewer-task-model");
     }
+
+    /// Writes `name` under a fresh temp dir and returns the full path. Both
+    /// loaders resolve `system_prompt_file` to an absolute path before
+    /// `resolve` ever sees it, so these tests can hand it one directly.
+    fn temp_prompt(name: &str, contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("chokofactory-sp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn global_with_prompt(role: &str, path: std::path::PathBuf) -> GlobalConfig {
+        let mut global = GlobalConfig::default();
+        global.roles.insert(
+            role.to_string(),
+            crate::global_config::GlobalRoleConfig {
+                cli: Some("cli".to_string()),
+                model: Some("model".to_string()),
+                system_prompt_file: Some(path),
+            },
+        );
+        global
+    }
+
+    /// The workflow-def file branch, previously uncovered: a definition that
+    /// pins its own prompt file beats the global default.
+    #[test]
+    fn workflow_def_system_prompt_file_beats_the_global_one() {
+        let def_path = temp_prompt("def.md", "from the workflow definition");
+        let global_path = temp_prompt("global.md", "from global config");
+        let def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(def_path),
+        };
+        let global = global_with_prompt("coder", global_path);
+
+        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into()).unwrap();
+
+        assert_eq!(
+            resolved.role_config.system_prompt.as_deref(),
+            Some("from the workflow definition")
+        );
+    }
+
+    /// The global file branch, previously uncovered.
+    #[test]
+    fn global_system_prompt_file_is_read_when_the_workflow_def_is_silent() {
+        let global_path = temp_prompt("global.md", "from global config");
+        let def = role_def(Some("cli"), Some("model"));
+        let global = global_with_prompt("coder", global_path);
+
+        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into()).unwrap();
+
+        assert_eq!(
+            resolved.role_config.system_prompt.as_deref(),
+            Some("from global config")
+        );
+    }
+
+    /// Task-level inline text outranks a workflow-def *file* — the two
+    /// system-prompt sources are different shapes, so this crossing of layers
+    /// is worth pinning separately from the `cli`/`model` precedence tests.
+    #[test]
+    fn task_level_system_prompt_beats_a_workflow_def_file() {
+        let def_path = temp_prompt("def.md", "from the workflow definition");
+        let def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(def_path),
+        };
+        let task_config = json!({ "roles": { "coder": { "system_prompt": "inline wins" } } });
+
+        let resolved = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &task_config,
+            "/cwd".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.role_config.system_prompt.as_deref(),
+            Some("inline wins")
+        );
+    }
+
+    /// #17/P2-6: two roles, each with its *own* prompt file, must resolve to
+    /// their own text. A shared-state or wrong-key bug in the file branches
+    /// would hand both roles the same prompt.
+    #[test]
+    fn two_roles_resolve_their_own_separate_system_prompt_files() {
+        let coder_def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(temp_prompt("coder-system.md", "you write code")),
+        };
+        let reviewer_def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(temp_prompt("reviewer-system.md", "you review code")),
+        };
+        let global = GlobalConfig::default();
+
+        let coder = resolve("coder", &coder_def, &global, &json!({}), "/cwd".into()).unwrap();
+        let reviewer = resolve(
+            "reviewer",
+            &reviewer_def,
+            &global,
+            &json!({}),
+            "/cwd".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            coder.role_config.system_prompt.as_deref(),
+            Some("you write code")
+        );
+        assert_eq!(
+            reviewer.role_config.system_prompt.as_deref(),
+            Some("you review code")
+        );
+    }
+
+    /// A `system_prompt_file` that vanished between load and resolve is
+    /// surfaced as an error, not silently swallowed into "no system prompt" —
+    /// a role would otherwise run unprompted and nobody would know.
+    #[test]
+    fn an_unreadable_system_prompt_file_is_an_error_not_a_silent_none() {
+        let path = temp_prompt("gone.md", "text");
+        std::fs::remove_file(&path).unwrap();
+        let def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(path),
+        };
+
+        let err = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &json!({}),
+            "/cwd".into(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, RoleConfigError::SystemPromptIo(_)), "{err:?}");
+    }
 }
