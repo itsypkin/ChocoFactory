@@ -125,7 +125,7 @@ pub struct UpdateTaskConfigRequest {
 /// would treat a scalar or array as a wholesale replacement of the column,
 /// silently wiping every role. `create` above deliberately doesn't make the
 /// same check — it *establishes* a task's config rather than merging into an
-/// existing one, so a odd shape there destroys nothing, and `resolve` reads
+/// existing one, so an odd shape there destroys nothing, and `resolve` reads
 /// through it as "no overrides"
 /// (`role_config::tests::malformed_task_config_falls_through_instead_of_erroring`).
 ///

@@ -353,15 +353,25 @@ mod tests {
                 .await
             }));
         }
+        // Collected rather than unwrapped in the loop, so a failing merge
+        // doesn't skip the cleanup below either.
+        let mut results = Vec::new();
         for handle in handles {
-            handle.await.unwrap().unwrap().unwrap();
+            results.push(handle.await);
         }
+        let task = get(&pool, &task_id).await;
 
-        let task = get(&pool, &task_id).await.unwrap().unwrap();
-
-        // Cleaned up before asserting, so a failure doesn't leak the temp dir.
+        // Cleaned up before asserting, so no failure path leaks the temp dir.
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+
+        for result in results {
+            result
+                .expect("merge task panicked")
+                .expect("merge_config failed")
+                .expect("task vanished mid-merge");
+        }
+        let task = task.unwrap().unwrap();
 
         let missing: Vec<String> = (0..ROLES)
             .filter(|i| task.config["roles"][format!("role{i}")]["model"] != format!("model{i}"))
