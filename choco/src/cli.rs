@@ -24,7 +24,13 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// `large_enum_variant`: the task variants carry every `--role-*` flag list,
+/// making them much wider than `Project`'s. Boxing to even them out would buy
+/// nothing — exactly one of these is built, once, from `argv` at startup, and
+/// then matched on and dropped. The indirection would cost a heap allocation
+/// and fight `clap`'s derive for no measurable gain.
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Task create/status/send/list/events.
     #[command(subcommand)]
@@ -58,6 +64,18 @@ pub enum TaskCmd {
         /// Status to filter by (free-form — driven by workflow definitions).
         #[arg(long)]
         status: Option<String>,
+    },
+    /// Change a task's per-role config after creation (design §5.5).
+    ///
+    /// Merges into the task's existing config, so overriding one role leaves
+    /// the task-wide `--repo` and every other role untouched. Takes effect on
+    /// the task's next turn — a session already running keeps the config it
+    /// started with.
+    Reconfigure {
+        /// Task id.
+        id: String,
+        #[command(flatten)]
+        roles: RoleOverrideArgs,
     },
     /// Show a task's recorded events (the agent conversation and tool calls).
     Events {
@@ -94,6 +112,55 @@ pub struct TaskCreateArgs {
     /// Tags this task as spawned via delegation from another task.
     #[arg(long = "parent-task")]
     pub parent_task: Option<String>,
+    #[command(flatten)]
+    pub roles: RoleOverrideArgs,
+}
+
+/// Per-role task-level config overrides (design §5.5, Q8) — shared by
+/// `task create` and `task reconfigure` via `#[command(flatten)]` so the two
+/// commands can't drift apart.
+///
+/// Every flag is `ROLE=VALUE` and repeatable, because a workflow can declare
+/// several roles (`coder`/`reviewer`) and each is configured independently.
+/// That's also why there's no bare `--model`: with more than one role it
+/// would be ambiguous which one it meant.
+#[derive(Args, Default)]
+pub struct RoleOverrideArgs {
+    /// Override a role's CLI, as `ROLE=CLI` (repeatable, e.g.
+    /// `--role-cli coder=claude`). Sets `config.roles.<ROLE>.cli`.
+    #[arg(long = "role-cli", value_name = "ROLE=CLI")]
+    pub role_cli: Vec<String>,
+    /// Override a role's model, as `ROLE=MODEL` (repeatable, e.g.
+    /// `--role-model coder=opus --role-model reviewer=sonnet`). Sets
+    /// `config.roles.<ROLE>.model`.
+    #[arg(long = "role-model", value_name = "ROLE=MODEL")]
+    pub role_model: Vec<String>,
+    /// Override a role's system prompt with literal text, as `ROLE=TEXT`
+    /// (repeatable). Sets `config.roles.<ROLE>.system_prompt`.
+    #[arg(long = "role-system-prompt", value_name = "ROLE=TEXT")]
+    pub role_system_prompt: Vec<String>,
+    /// Override a role's system prompt with a file's contents, as
+    /// `ROLE=PATH` (repeatable). `choco` reads `PATH` itself and sends the
+    /// text, so the daemon is never asked to read a path from task config.
+    #[arg(long = "role-system-prompt-file", value_name = "ROLE=PATH")]
+    pub role_system_prompt_file: Vec<String>,
+    /// Raw task-level config JSON object, applied *before* the typed
+    /// `--role-*` flags above (which win per field). The escape hatch for
+    /// agent callers and for any field the typed flags don't cover.
+    #[arg(long, value_name = "JSON")]
+    pub config: Option<String>,
+}
+
+impl RoleOverrideArgs {
+    /// True when the user supplied nothing at all — lets `task reconfigure`
+    /// reject an empty patch instead of issuing a no-op request.
+    pub fn is_empty(&self) -> bool {
+        self.role_cli.is_empty()
+            && self.role_model.is_empty()
+            && self.role_system_prompt.is_empty()
+            && self.role_system_prompt_file.is_empty()
+            && self.config.is_none()
+    }
 }
 
 #[derive(Subcommand)]

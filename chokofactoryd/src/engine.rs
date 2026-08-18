@@ -5941,4 +5941,277 @@ stages:
             "got {err}"
         );
     }
+
+    // ---- P2-6 multi-role config resolution (#17) ----
+
+    /// Like [`engine_with_adapter_and_workflows_dir`] but with a real global
+    /// config file wired in. Every other test engine passes `None` there, so
+    /// this is the only place the global layer participates end-to-end rather
+    /// than only in `role_config`'s own unit tests.
+    fn engine_with_global_config(
+        pool: SqlitePool,
+        binary: &str,
+        workflows_dir: &Path,
+        global_config_path: &Path,
+    ) -> Arc<WorkflowEngine> {
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let events_notify = Arc::new(Notify::new());
+        let session_manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::clone(&events_notify),
+        );
+        WorkflowEngine::new(
+            pool,
+            session_manager,
+            workflows_dir.to_path_buf(),
+            Some(global_config_path.to_path_buf()),
+            events_notify,
+        )
+    }
+
+    /// A two-role workflow (`coder` -> `reviewer` -> terminal) whose prompt
+    /// files live next to the definition, mirroring §5.1's `coding-task.yaml`
+    /// roles block. Each role deliberately leaves a *different* field unset so
+    /// the three layers all have something to contribute:
+    ///
+    /// - `coder`: no `cli` (falls to global), `model` set here.
+    /// - `reviewer`: no `cli` and no `model` (both fall to global).
+    fn write_two_role_workflow(workflows_dir: &Path) {
+        let prompts = workflows_dir.join("prompts");
+        fs::create_dir_all(&prompts).unwrap();
+        fs::write(prompts.join("coder-system.md"), "you write code").unwrap();
+        fs::write(prompts.join("reviewer-system.md"), "you review code").unwrap();
+        // `internal_review` isn't the entry stage, so it has no human input to
+        // fall back on and needs its own turn prompt (as §5.1's real
+        // `coding-task.yaml` gives every stage). `coding` deliberately has
+        // none, so it exercises the entry-stage initial-input path instead.
+        fs::write(prompts.join("reviewer-turn.md"), "review it").unwrap();
+        fs::write(
+            workflows_dir.join("multi-role.yaml"),
+            r#"
+name: multi-role
+roles:
+  coder:
+    model: coder-def-model
+    system_prompt_file: prompts/coder-system.md
+  reviewer:
+    system_prompt_file: prompts/reviewer-system.md
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: internal_review }
+  internal_review:
+    kind: agent_turn
+    role: reviewer
+    prompt_file: prompts/reviewer-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+    }
+
+    /// A global config supplying `cli` for both roles and a `model` for
+    /// `reviewer` only.
+    fn write_global_config(dir: &Path) -> PathBuf {
+        let path = dir.join("config.yaml");
+        fs::write(
+            &path,
+            r#"
+roles:
+  coder:
+    cli: coder-global-cli
+  reviewer:
+    cli: reviewer-global-cli
+    model: reviewer-global-model
+"#,
+        )
+        .unwrap();
+        path
+    }
+
+    /// Returns the run for `stage`, waiting for it to appear.
+    async fn wait_until_run_for_stage(
+        pool: &SqlitePool,
+        task_id: &str,
+        stage: &str,
+    ) -> chokofactory_core::models::TaskRun {
+        for _ in 0..500 {
+            let found = task_runs::list_for_task(pool, task_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.stage == stage);
+            if let Some(run) = found {
+                return run;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for a task_run for stage {stage}");
+    }
+
+    /// The headline confirmation for #17/P2-6: a workflow that actually
+    /// declares two roles resolves each of them independently, through all
+    /// three layers, on a single task.
+    ///
+    /// Every field is sourced from a *different* layer, and the two roles
+    /// disagree on every one of them, so a resolver that leaked one role's
+    /// config into the other — or that resolved once and reused the result for
+    /// the whole task — fails here rather than passing by coincidence:
+    ///
+    /// | role     | cli            | model                          | system prompt      |
+    /// |----------|----------------|--------------------------------|--------------------|
+    /// | coder    | global         | task-level (beats workflow-def) | workflow-def file  |
+    /// | reviewer | global (other) | global                         | workflow-def file  |
+    #[tokio::test]
+    async fn a_two_role_workflow_resolves_each_role_independently() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let workflows_dir = dir.join("workflows");
+        fs::create_dir_all(&workflows_dir).unwrap();
+        write_two_role_workflow(&workflows_dir);
+        let global_config_path = write_global_config(&dir);
+
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_global_config(
+            pool.clone(),
+            &fixture_binary("fake_claude_echo_args.py"),
+            &workflows_dir,
+            &global_config_path,
+        );
+
+        // Overrides for *both* roles at once — the task-level layer #17 is
+        // about being able to supply for more than one role.
+        let task = engine
+            .create_task(
+                &project_id,
+                None,
+                "multi-role",
+                "T",
+                "go",
+                json!({
+                    "roles": {
+                        "coder": { "model": "coder-task-model" },
+                        "reviewer": { "system_prompt": "inline reviewer prompt" }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Each agent_turn completes and auto-advances with "done", so the
+        // task walks coder -> reviewer -> finished on its own.
+        wait_until_stage(&pool, &task.id, "finished").await;
+
+        let coder_run = wait_until_run_for_stage(&pool, &task.id, "coding").await;
+        let reviewer_run = wait_until_run_for_stage(&pool, &task.id, "internal_review").await;
+
+        assert_eq!(coder_run.role, "coder");
+        assert_eq!(reviewer_run.role, "reviewer");
+
+        // `cli` came from the global layer, and each role got its *own* entry.
+        assert_eq!(coder_run.cli_adapter, "coder-global-cli");
+        assert_eq!(reviewer_run.cli_adapter, "reviewer-global-cli");
+
+        // `model`: coder's task-level override beat the workflow-def's
+        // `coder-def-model`; reviewer, unmentioned at the task level and
+        // silent in the workflow def, fell through to global.
+        assert_eq!(coder_run.model, "coder-task-model");
+        assert_eq!(reviewer_run.model, "reviewer-global-model");
+
+        // System prompts, read back off each subprocess's own argv: coder from
+        // the workflow-def file, reviewer from its task-level inline text.
+        wait_until_events_contain(
+            &pool,
+            &coder_run.id,
+            "model=coder-task-model|system_prompt=you write code",
+        )
+        .await;
+        wait_until_events_contain(
+            &pool,
+            &reviewer_run.id,
+            "model=reviewer-global-model|system_prompt=inline reviewer prompt",
+        )
+        .await;
+    }
+
+    /// `role_config::resolve` re-reads `task.config` on every stage entry and
+    /// caches nothing, so a `PATCH /tasks/{id}` between turns changes the
+    /// *next* role's config while leaving the already-started run alone. This
+    /// is what `choco task reconfigure` relies on.
+    #[tokio::test]
+    async fn reconfiguring_between_turns_affects_only_the_later_role() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let workflows_dir = dir.join("workflows");
+        fs::create_dir_all(&workflows_dir).unwrap();
+        // `coding` is a human_gate here so the task parks before the reviewer
+        // turn, giving the reconfigure a deterministic window instead of a
+        // race against an auto-advancing agent_turn.
+        fs::write(workflows_dir.join("reviewer-turn.md"), "review it").unwrap();
+        fs::write(
+            workflows_dir.join("gated-review.yaml"),
+            r#"
+name: gated-review
+roles:
+  reviewer:
+    cli: claude
+    model: reviewer-def-model
+stages:
+  coding:
+    kind: human_gate
+    on: { resumed: internal_review }
+  internal_review:
+    kind: agent_turn
+    role: reviewer
+    prompt_file: reviewer-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+        let global_config_path = write_global_config(&dir);
+
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_global_config(
+            pool.clone(),
+            &fixture_binary("fake_claude_echo_args.py"),
+            &workflows_dir,
+            &global_config_path,
+        );
+
+        let task = engine
+            .create_task(&project_id, None, "gated-review", "T", "go", json!({}))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task.id, "coding").await;
+
+        // Reconfigure while parked, then let the reviewer turn start.
+        tasks::merge_config(
+            &pool,
+            &task.id,
+            json!({ "roles": { "reviewer": { "model": "reviewer-patched-model" } } }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let definition =
+            Arc::new(WorkflowDefinition::load(&workflows_dir.join("gated-review.yaml")).unwrap());
+        engine
+            .advance(&task.id, &definition, "resumed")
+            .await
+            .unwrap();
+
+        let run = wait_until_run_for_stage(&pool, &task.id, "internal_review").await;
+        assert_eq!(
+            run.model, "reviewer-patched-model",
+            "the patched task config should beat the workflow def's model"
+        );
+    }
 }

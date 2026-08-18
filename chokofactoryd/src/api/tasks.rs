@@ -109,6 +109,51 @@ pub async fn get(
 }
 
 #[derive(Deserialize)]
+pub struct UpdateTaskConfigRequest {
+    pub config: Value,
+}
+
+/// Merges `config` into the task's existing config (P2-6, §5.5) — the
+/// task-level layer `role_config::resolve` reads, so this is how a role's
+/// `cli`/`model`/`system_prompt` gets changed after creation.
+///
+/// Merge rather than replace so overriding one role leaves the task-wide
+/// `cwd` and every other role alone; `db::tasks::merge_config` does it in a
+/// single statement so concurrent patches can't lose each other's keys.
+///
+/// A non-object `config` is rejected here, before the DB call: `json_patch`
+/// would treat a scalar or array as a wholesale replacement of the column,
+/// silently wiping every role. `create` above deliberately doesn't make the
+/// same check — it *establishes* a task's config rather than merging into an
+/// existing one, so an odd shape there destroys nothing, and `resolve` reads
+/// through it as "no overrides"
+/// (`role_config::tests::malformed_task_config_falls_through_instead_of_erroring`).
+///
+/// This is *not* the same check as validating what's *inside* `config.roles` —
+/// per the P1-8 LLD, an unknown role name or a wrong-typed field there
+/// deliberately means "not overridden" rather than an error, and that leniency
+/// is preserved (same test).
+///
+/// Takes effect on the task's **next** turn: `resolve` re-reads
+/// `task.config` on every `enter_agent_turn`/`send_message` and caches
+/// nothing, so an in-flight session keeps the config it started with.
+pub async fn update_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateTaskConfigRequest>,
+) -> Result<Json<Task>, ApiError> {
+    if !body.config.is_object() {
+        return Err(ApiError::BadRequest(
+            "'config' must be a JSON object".to_string(),
+        ));
+    }
+    let task = tasks::merge_config(&state.pool, &id, body.config)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;
+    Ok(Json(task))
+}
+
+#[derive(Deserialize)]
 pub struct SendMessageRequest {
     pub text: String,
 }
@@ -161,6 +206,151 @@ mod tests {
         let task = response.json();
         assert_eq!(task["workflow_def"], "chat");
         assert_eq!(task["project_id"], project_id);
+    }
+
+    /// P2-6: several roles configured independently on one task, in one
+    /// request. The daemon stores `config` verbatim, so this pins that the
+    /// role-keyed shape survives the round trip for more than one role —
+    /// `choco`'s flags and `role_config::resolve` both depend on it.
+    ///
+    /// `cwd` is `"."` rather than a made-up path because it's the directory
+    /// the agent subprocess is actually spawned in: a non-existent one fails
+    /// the spawn with a 500 and tells you nothing about config round-tripping.
+    #[tokio::test]
+    async fn create_task_round_trips_config_for_more_than_one_role() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": {
+                        "cwd": ".",
+                        "roles": {
+                            "coder": { "model": "opus" },
+                            "reviewer": { "model": "sonnet", "cli": "claude" }
+                        }
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 201, "body: {}", response.json());
+        let task = response.json();
+        assert_eq!(task["config"]["cwd"], ".");
+        assert_eq!(task["config"]["roles"]["coder"]["model"], "opus");
+        assert_eq!(task["config"]["roles"]["reviewer"]["model"], "sonnet");
+        assert_eq!(task["config"]["roles"]["reviewer"]["cli"], "claude");
+    }
+
+    /// Creates a task with two configured roles and returns its id.
+    async fn create_two_role_task(server: &TestServer, project_id: &str) -> String {
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": {
+                        "cwd": ".",
+                        "roles": {
+                            "coder": { "model": "sonnet", "cli": "claude" },
+                            "reviewer": { "model": "sonnet" }
+                        }
+                    },
+                }),
+            )
+            .await
+            .json();
+        task["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn patch_task_config_merges_rather_than_replacing() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+        let task_id = create_two_role_task(&server, &project_id).await;
+
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "model": "opus" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 200);
+        let task = response.json();
+
+        assert_eq!(task["config"]["roles"]["coder"]["model"], "opus");
+        // Everything the patch didn't mention survives.
+        assert_eq!(task["config"]["cwd"], ".");
+        assert_eq!(task["config"]["roles"]["coder"]["cli"], "claude");
+        assert_eq!(task["config"]["roles"]["reviewer"]["model"], "sonnet");
+    }
+
+    /// Two roles reconfigured in a single patch — the edit-side counterpart
+    /// to `create_task_round_trips_config_for_more_than_one_role`.
+    #[tokio::test]
+    async fn patch_task_config_can_change_more_than_one_role_at_once() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+        let task_id = create_two_role_task(&server, &project_id).await;
+
+        let task: Value = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": {
+                    "coder": { "model": "opus" },
+                    "reviewer": { "model": "haiku" }
+                } } }),
+            )
+            .await
+            .json();
+
+        assert_eq!(task["config"]["roles"]["coder"]["model"], "opus");
+        assert_eq!(task["config"]["roles"]["reviewer"]["model"], "haiku");
+        assert_eq!(task["config"]["roles"]["coder"]["cli"], "claude");
+    }
+
+    /// A scalar or array would make `json_patch` replace the whole column,
+    /// wiping every role — so it's a 400 before the DB is touched, not a
+    /// silent data loss.
+    #[tokio::test]
+    async fn patch_task_config_rejects_a_non_object_config() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+        let task_id = create_two_role_task(&server, &project_id).await;
+
+        for bad in [json!("nope"), json!([1, 2]), json!(7), json!(null)] {
+            let response = server
+                .patch(&format!("/tasks/{task_id}"), json!({ "config": bad }))
+                .await;
+            assert_eq!(response.status(), 400, "expected 400 for config {bad}");
+        }
+
+        // The rejected patches left the task untouched.
+        let task: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(task["config"]["roles"]["coder"]["model"], "sonnet");
+        assert_eq!(task["config"]["cwd"], ".");
+    }
+
+    #[tokio::test]
+    async fn patch_task_config_on_an_unknown_task_is_404() {
+        let server = TestServer::start().await;
+
+        let response = server
+            .patch("/tasks/no-such-task", json!({ "config": { "cwd": "." } }))
+            .await;
+        assert_eq!(response.status(), 404);
     }
 
     #[tokio::test]

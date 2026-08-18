@@ -108,8 +108,55 @@ pub fn task(t: &Task) -> String {
     if let Some(parent) = &t.parent_task_id {
         pairs.push(("Parent task", parent.clone()));
     }
+    if let Some(cwd) = t.config.get("cwd").and_then(Value::as_str) {
+        pairs.push(("Repo", cwd.to_string()));
+    }
+    // Without this, `task create --role-model coder=opus` and
+    // `task reconfigure` would both print nothing about the override that
+    // was just applied, leaving `--json` as the only way to confirm it.
+    for (role, settings) in role_summaries(&t.config) {
+        pairs.push(("Role", format!("{role}: {settings}")));
+    }
     pairs.push(("Created", timestamp(&t.created_at)));
     fields(&pairs)
+}
+
+/// One `field=value` summary per configured role in `config.roles`, sorted by
+/// role name so repeated runs render identically.
+///
+/// Skips anything that isn't shaped like a role object instead of erroring:
+/// `config` is free-form JSON the daemon stores verbatim (and deliberately
+/// does not validate), so a display path is the wrong place to be strict.
+fn role_summaries(config: &Value) -> Vec<(String, String)> {
+    let Some(roles) = config.get("roles").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut names: Vec<&String> = roles.keys().collect();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let settings = roles.get(name)?.as_object()?;
+            let mut keys: Vec<&String> = settings.keys().collect();
+            keys.sort();
+            let rendered: Vec<String> = keys
+                .into_iter()
+                .filter_map(|key| {
+                    let value = settings.get(key)?;
+                    Some(match value.as_str() {
+                        // A system prompt is arbitrary multi-line prose;
+                        // summarize rather than dumping it into a field list.
+                        Some(_) if key == "system_prompt" => format!("{key}=<text>"),
+                        Some(text) => format!("{key}={}", one_line(text)),
+                        // Not a string: the daemon doesn't constrain these, so
+                        // show the raw JSON rather than hiding the field.
+                        None => format!("{key}={value}"),
+                    })
+                })
+                .collect();
+            (!rendered.is_empty()).then(|| (name.clone(), rendered.join(", ")))
+        })
+        .collect()
 }
 
 pub fn tasks(list: &[Task]) -> String {
@@ -145,6 +192,18 @@ pub fn task_detail(detail: &Value) -> String {
     ];
     if let Some(parent) = detail.get("parent_task_id").and_then(Value::as_str) {
         pairs.push(("Parent task", parent.to_string()));
+    }
+    // Same per-role lines `task` renders: `task status` is where an existing
+    // task gets inspected, so leaving them out would mean `--json` was the
+    // only way to see what `task reconfigure` actually did. `TaskDetail`
+    // flattens the `Task`, so `config` is a top-level key here.
+    if let Some(config) = detail.get("config") {
+        if let Some(cwd) = config.get("cwd").and_then(Value::as_str) {
+            pairs.push(("Repo", cwd.to_string()));
+        }
+        for (role, settings) in role_summaries(config) {
+            pairs.push(("Role", format!("{role}: {settings}")));
+        }
     }
     pairs.push(("Created", timestamp_str(get("created_at"))));
 
@@ -607,6 +666,105 @@ mod tests {
         let rendered = task_detail(&detail);
         assert!(rendered.contains("has not started"), "{rendered}");
         assert!(!rendered.contains("Stage "), "{rendered}");
+    }
+
+    fn task_with_config(config: Value) -> Task {
+        Task {
+            id: "t1".to_string(),
+            project_id: "p".to_string(),
+            parent_task_id: None,
+            workflow_def: "coding-task".to_string(),
+            title: "x".to_string(),
+            status: "open".to_string(),
+            config,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// P2-6: a task can configure several roles independently, so human
+    /// output has to name each one rather than showing the first or none.
+    #[test]
+    fn task_lists_every_configured_role_and_the_repo() {
+        let rendered = task(&task_with_config(json!({
+            "cwd": "/src/app",
+            "roles": {
+                "reviewer": { "model": "sonnet" },
+                "coder": { "model": "opus", "cli": "claude" }
+            }
+        })));
+
+        assert!(rendered.contains("/src/app"), "{rendered}");
+        // Sorted by role name, so output is stable across runs.
+        let coder = rendered.find("coder: ").expect("coder missing");
+        let reviewer = rendered.find("reviewer: ").expect("reviewer missing");
+        assert!(coder < reviewer, "{rendered}");
+        assert!(rendered.contains("cli=claude, model=opus"), "{rendered}");
+        assert!(rendered.contains("reviewer: model=sonnet"), "{rendered}");
+    }
+
+    /// A long or multi-line system prompt must not be dumped into the field
+    /// list, and a non-object `roles` must not panic the renderer.
+    #[test]
+    fn task_summarizes_a_system_prompt_and_tolerates_odd_config_shapes() {
+        let rendered = task(&task_with_config(json!({
+            "roles": { "coder": { "system_prompt": "line one\nline two" } }
+        })));
+        assert!(rendered.contains("system_prompt=<text>"), "{rendered}");
+        assert!(!rendered.contains("line two"), "{rendered}");
+
+        for odd in [
+            json!({}),
+            json!({ "roles": 7 }),
+            json!({ "roles": { "coder": "nope" } }),
+            json!({ "roles": { "coder": {} } }),
+        ] {
+            let rendered = task(&task_with_config(odd.clone()));
+            assert!(rendered.contains("Workflow"), "{odd} -> {rendered}");
+        }
+    }
+
+    /// `task status` is where an existing task gets inspected, so it has to
+    /// show per-role config too — otherwise `task reconfigure`'s effect is
+    /// only visible under `--json`.
+    #[test]
+    fn task_detail_lists_every_configured_role_and_the_repo() {
+        let detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "two-role",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "config": {
+                "cwd": "/src/app",
+                "roles": {
+                    "reviewer": { "model": "sonnet" },
+                    "coder": { "model": "opus", "cli": "claude" }
+                }
+            },
+            "workflow_state": null,
+        });
+
+        let rendered = task_detail(&detail);
+
+        assert!(rendered.contains("/src/app"), "{rendered}");
+        assert!(
+            rendered.contains("coder: cli=claude, model=opus"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("reviewer: model=sonnet"), "{rendered}");
+    }
+
+    /// A task with no config at all must render exactly as before.
+    #[test]
+    fn task_detail_without_config_adds_no_role_lines() {
+        let detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+        });
+
+        let rendered = task_detail(&detail);
+
+        assert!(!rendered.contains("Role"), "{rendered}");
+        assert!(!rendered.contains("Repo"), "{rendered}");
     }
 
     fn event(event_type: EventType, payload: Value) -> Event {

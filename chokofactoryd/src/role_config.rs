@@ -233,6 +233,110 @@ mod tests {
         );
     }
 
+    /// The security invariant the whole task-config layer is designed around
+    /// (P1-8 LLD, "Deliberate omission"): there is no `system_prompt_file`
+    /// field at the task level, because task config is the least-trusted
+    /// layer — it arrives over HTTP (`POST /tasks`, and since P2-6 also
+    /// `PATCH /tasks/{id}`) — and must never make the daemon read a path off
+    /// disk. `task_level_system_prompt_is_inline_text_not_a_file` only pins
+    /// the positive half; without this, adding a task-level file branch would
+    /// reopen the path-traversal class silently.
+    #[test]
+    fn a_task_level_system_prompt_file_is_ignored_not_read() {
+        let secret = temp_prompt("secret.md", "SHOULD NEVER BE READ");
+        let def = role_def(Some("cli"), Some("model"));
+        let task_config = json!({
+            "roles": { "coder": { "system_prompt_file": secret.to_str().unwrap() } }
+        });
+
+        let resolved = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &task_config,
+            "/cwd".into(),
+        )
+        .unwrap();
+
+        // Ignored entirely: not read, and not an error either.
+        assert_eq!(resolved.role_config.system_prompt, None);
+    }
+
+    /// Same invariant, but with a lower layer also in play: the task-level
+    /// path must not win over — or be read instead of — the workflow-def file.
+    #[test]
+    fn a_task_level_system_prompt_file_cannot_override_the_workflow_def_file() {
+        let secret = temp_prompt("secret.md", "SHOULD NEVER BE READ");
+        let def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(temp_prompt("def.md", "from the workflow definition")),
+        };
+        let task_config = json!({
+            "roles": { "coder": { "system_prompt_file": secret.to_str().unwrap() } }
+        });
+
+        let resolved = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &task_config,
+            "/cwd".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.role_config.system_prompt.as_deref(),
+            Some("from the workflow definition")
+        );
+    }
+
+    /// The other half of the task-config contract (P1-8 LLD): a missing or
+    /// wrong-shaped `roles` key, an unknown role name, or a wrong-typed field
+    /// deliberately means "not overridden" and falls through to the next
+    /// layer — never a validation error. `api::tasks::update_config`'s docs
+    /// claim this leniency is preserved, so it needs pinning: `merge_config`
+    /// will happily store any of these shapes, and turning one into an error
+    /// later would wedge the task's next turn.
+    #[test]
+    fn malformed_task_config_falls_through_instead_of_erroring() {
+        let def = role_def(Some("def-cli"), Some("def-model"));
+        let cases = [
+            // No `roles` key at all.
+            json!({}),
+            // `roles` present but not an object.
+            json!({ "roles": 7 }),
+            json!({ "roles": "nope" }),
+            json!({ "roles": ["coder"] }),
+            // `roles` an object, but this role's entry isn't.
+            json!({ "roles": { "coder": 7 } }),
+            // Only *another* role is configured — resolving `coder` must not
+            // pick up `reviewer`'s settings or complain about the extra key.
+            json!({ "roles": { "reviewer": { "model": "reviewer-model" } } }),
+            // Right shape, wrong types for every field.
+            json!({ "roles": { "coder": { "cli": 1, "model": true, "system_prompt": [] } } }),
+            // Wholly non-object config (reachable: `POST /tasks` doesn't
+            // constrain the shape, and RFC 7396 lets a patch replace it).
+            json!("not a config"),
+            json!(42),
+        ];
+
+        for task_config in cases {
+            let resolved = resolve(
+                "coder",
+                &def,
+                &GlobalConfig::default(),
+                &task_config,
+                "/cwd".into(),
+            )
+            .unwrap_or_else(|err| panic!("config {task_config} should not error, got {err}"));
+
+            assert_eq!(resolved.cli, "def-cli", "config {task_config}");
+            assert_eq!(resolved.model, "def-model", "config {task_config}");
+            assert_eq!(resolved.role_config.system_prompt, None, "{task_config}");
+        }
+    }
+
     #[test]
     fn resolving_two_different_role_names_never_cross_contaminates() {
         // Directly de-risks #17: proves `resolve` reads whatever
@@ -277,5 +381,155 @@ mod tests {
         assert_eq!(coder.model, "coder-task-model");
         assert_eq!(reviewer.cli, "reviewer-global-cli");
         assert_eq!(reviewer.model, "reviewer-task-model");
+    }
+
+    /// Writes `name` under a fresh temp dir and returns the full path. Both
+    /// loaders resolve `system_prompt_file` to an absolute path before
+    /// `resolve` ever sees it, so these tests can hand it one directly.
+    fn temp_prompt(name: &str, contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("chokofactory-sp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn global_with_prompt(role: &str, path: std::path::PathBuf) -> GlobalConfig {
+        let mut global = GlobalConfig::default();
+        global.roles.insert(
+            role.to_string(),
+            crate::global_config::GlobalRoleConfig {
+                cli: Some("cli".to_string()),
+                model: Some("model".to_string()),
+                system_prompt_file: Some(path),
+            },
+        );
+        global
+    }
+
+    /// The workflow-def file branch, previously uncovered: a definition that
+    /// pins its own prompt file beats the global default.
+    #[test]
+    fn workflow_def_system_prompt_file_beats_the_global_one() {
+        let def_path = temp_prompt("def.md", "from the workflow definition");
+        let global_path = temp_prompt("global.md", "from global config");
+        let def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(def_path),
+        };
+        let global = global_with_prompt("coder", global_path);
+
+        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into()).unwrap();
+
+        assert_eq!(
+            resolved.role_config.system_prompt.as_deref(),
+            Some("from the workflow definition")
+        );
+    }
+
+    /// The global file branch, previously uncovered.
+    #[test]
+    fn global_system_prompt_file_is_read_when_the_workflow_def_is_silent() {
+        let global_path = temp_prompt("global.md", "from global config");
+        let def = role_def(Some("cli"), Some("model"));
+        let global = global_with_prompt("coder", global_path);
+
+        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into()).unwrap();
+
+        assert_eq!(
+            resolved.role_config.system_prompt.as_deref(),
+            Some("from global config")
+        );
+    }
+
+    /// Task-level inline text outranks a workflow-def *file* — the two
+    /// system-prompt sources are different shapes, so this crossing of layers
+    /// is worth pinning separately from the `cli`/`model` precedence tests.
+    #[test]
+    fn task_level_system_prompt_beats_a_workflow_def_file() {
+        let def_path = temp_prompt("def.md", "from the workflow definition");
+        let def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(def_path),
+        };
+        let task_config = json!({ "roles": { "coder": { "system_prompt": "inline wins" } } });
+
+        let resolved = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &task_config,
+            "/cwd".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.role_config.system_prompt.as_deref(),
+            Some("inline wins")
+        );
+    }
+
+    /// #17/P2-6: two roles, each with its *own* prompt file, must resolve to
+    /// their own text. A shared-state or wrong-key bug in the file branches
+    /// would hand both roles the same prompt.
+    #[test]
+    fn two_roles_resolve_their_own_separate_system_prompt_files() {
+        let coder_def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(temp_prompt("coder-system.md", "you write code")),
+        };
+        let reviewer_def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(temp_prompt("reviewer-system.md", "you review code")),
+        };
+        let global = GlobalConfig::default();
+
+        let coder = resolve("coder", &coder_def, &global, &json!({}), "/cwd".into()).unwrap();
+        let reviewer = resolve(
+            "reviewer",
+            &reviewer_def,
+            &global,
+            &json!({}),
+            "/cwd".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            coder.role_config.system_prompt.as_deref(),
+            Some("you write code")
+        );
+        assert_eq!(
+            reviewer.role_config.system_prompt.as_deref(),
+            Some("you review code")
+        );
+    }
+
+    /// A `system_prompt_file` that vanished between load and resolve is
+    /// surfaced as an error, not silently swallowed into "no system prompt" —
+    /// a role would otherwise run unprompted and nobody would know.
+    #[test]
+    fn an_unreadable_system_prompt_file_is_an_error_not_a_silent_none() {
+        let path = temp_prompt("gone.md", "text");
+        std::fs::remove_file(&path).unwrap();
+        let def = RoleDef {
+            cli: Some("cli".to_string()),
+            model: Some("model".to_string()),
+            system_prompt_file: Some(path),
+        };
+
+        let err = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &json!({}),
+            "/cwd".into(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, RoleConfigError::SystemPromptIo(_)), "{err:?}");
     }
 }

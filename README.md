@@ -202,6 +202,67 @@ $ choco --json task status <child-id> | jq -r '.workflow_state.current_stage'
 chatting
 ```
 
+### Per-role config
+
+A workflow can declare more than one role — a `coder` and a `reviewer`, say —
+and each resolves its own CLI, model and system prompt from three layers,
+most specific wins, independently per field:
+
+```
+task config (--role-* below)  >  the workflow's roles: block  >  ~/.config/chokofactory/config.yaml
+```
+
+The `--role-*` flags set the task-level layer. Each is `ROLE=VALUE` and each
+is repeatable, so several roles can be configured in one command. Using a
+two-role workflow of your own under `~/.config/chokofactory/workflows/` (the
+built-in multi-role `coding-task.yaml` is still to come):
+
+```
+$ choco task create --project acme --workflow my-coding-task \
+    --title "fix the flaky test" --prompt "see issue 41" --repo ~/src/acme \
+    --role-model coder=opus \
+    --role-model reviewer=sonnet \
+    --role-system-prompt-file reviewer=./strict-reviewer.md
+```
+
+The role names are whatever that workflow's `roles:` block declares — a name
+that isn't in it is simply not applied to anything.
+
+| Flag | Sets |
+|---|---|
+| `--role-cli ROLE=CLI` | which agent CLI that role runs |
+| `--role-model ROLE=MODEL` | that role's model |
+| `--role-system-prompt ROLE=TEXT` | that role's system prompt, inline |
+| `--role-system-prompt-file ROLE=PATH` | the same, read from a file |
+
+There is deliberately no bare `--model`: with two roles it would be
+ambiguous which one it meant.
+
+`--role-system-prompt-file` is read by `choco` itself and sent as text — the
+daemon is never handed a path from task config, which is the least-trusted
+of the three layers.
+
+`--config '<json>'` is the escape hatch, applied *before* the typed flags
+(which win per field), for agent callers and for anything the flags don't
+cover:
+
+```
+$ choco task create ... --config '{"roles":{"coder":{"model":"opus"}}}'
+```
+
+### Changing a task's config later
+
+`task reconfigure` merges into a task's existing config, so changing one
+role leaves the task-wide `--repo` and every other role alone:
+
+```
+$ choco task reconfigure <task-id> --role-model coder=haiku
+```
+
+It takes effect on the task's **next** turn: role config is re-read from the
+database on every stage entry and never cached, so a session already running
+keeps the config it started with.
+
 ### Other flags
 
 - `--repo <path>` on `task create` sets the working directory for the

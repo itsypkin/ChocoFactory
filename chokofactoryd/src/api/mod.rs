@@ -39,7 +39,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(projects::delete),
         )
         .route("/tasks", post(tasks::create).get(tasks::list))
-        .route("/tasks/{id}", get(tasks::get))
+        .route("/tasks/{id}", get(tasks::get).patch(tasks::update_config))
         .route("/tasks/{id}/messages", post(tasks::send_message))
         .route("/tasks/{id}/events", get(events::list))
         .route("/tasks/{id}/events/live", get(ws::task_events))

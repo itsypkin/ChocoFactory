@@ -104,26 +104,50 @@ impl Daemon {
              (run `cargo build --workspace --all-targets` first)"
         );
 
-        let port = free_port();
-        let mut child = Command::new(&daemon_bin)
-            .env("HOME", &home.0)
-            .env("CHOKOFACTORY_CLAUDE_BINARY", &mock_claude_bin)
-            .env("CHOKOFACTORY_PORT", port.to_string())
-            .env("RUST_LOG", "error")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("failed to spawn chokofactoryd");
-
-        let base_url = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::new();
-        wait_until_ready(&client, &base_url, &mut child).await;
 
-        Daemon {
-            child,
-            base_url,
-            _home: home,
+        // `free_port` can only *suggest* a port: it releases the port before
+        // the daemon binds it, so between those two moments another test in
+        // this suite (they run in parallel) can take it, and the daemon exits
+        // on the failed bind. Retried rather than propagated, because a lost
+        // race says nothing about the code under test — a bare `expect` here
+        // makes the whole suite flaky under load, which on this repo means a
+        // spurious failure on a push that also triggers a paid review run.
+        let mut last_status = None;
+        for _ in 0..5 {
+            let port = free_port();
+            let mut child = Command::new(&daemon_bin)
+                .env("HOME", &home.0)
+                .env("CHOKOFACTORY_CLAUDE_BINARY", &mock_claude_bin)
+                .env("CHOKOFACTORY_PORT", port.to_string())
+                .env("RUST_LOG", "error")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("failed to spawn chokofactoryd");
+
+            let base_url = format!("http://127.0.0.1:{port}");
+            match wait_until_ready(&client, &base_url, &mut child).await {
+                Ready::Yes => {
+                    return Daemon {
+                        child,
+                        base_url,
+                        _home: home,
+                    };
+                }
+                // Only an early exit is retried. A daemon that started but
+                // never answered is a real failure, and `wait_until_ready`
+                // panics on it rather than returning.
+                Ready::ExitedDuringStartup(status) => last_status = Some(status),
+            }
         }
+        panic!("chokofactoryd exited during startup on 5 different ports; last: {last_status:?}");
     }
+}
+
+/// Outcome of waiting for the daemon's first successful response.
+enum Ready {
+    Yes,
+    ExitedDuringStartup(std::process::ExitStatus),
 }
 
 impl Drop for Daemon {
@@ -132,15 +156,18 @@ impl Drop for Daemon {
     }
 }
 
-async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut Child) {
+async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut Child) -> Ready {
     for _ in 0..100 {
         if let Ok(resp) = client.get(format!("{base_url}/projects")).send().await
             && resp.status().is_success()
         {
-            return;
+            return Ready::Yes;
         }
+        // Reported back so the caller can retry on a fresh port (a lost
+        // `free_port` race looks exactly like this) instead of failing the
+        // test outright.
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("chokofactoryd exited during startup with {status:?}");
+            return Ready::ExitedDuringStartup(status);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -848,4 +875,203 @@ stages:
         assert!(entry["created_at"].is_string(), "{entry}");
     }
     assert_eq!(trail[0]["task_run_id"], serde_json::Value::Null);
+}
+
+// ---- P2-6 per-role config overrides (#17) ----
+
+/// A two-role workflow. `coding` is a `human_gate` so the task parks
+/// immediately: this test is about the config flags, and parking keeps it
+/// from depending on an agent subprocess completing.
+const TWO_ROLE_WORKFLOW_YAML: &str = r#"
+name: two-role
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: human_gate
+    on: { resumed: internal_review }
+  internal_review:
+    kind: agent_turn
+    role: reviewer
+    on: {}
+"#;
+
+/// The end-to-end shape of #17's CLI half: several roles configured
+/// independently in a single `task create`, then changed after the fact by
+/// `task reconfigure` without disturbing the rest of the config.
+#[tokio::test]
+async fn task_create_and_reconfigure_set_overrides_for_more_than_one_role() {
+    let home = TempHome::new();
+    home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
+    let daemon = Daemon::spawn(home).await;
+
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let created = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "two-role",
+            "--title",
+            "t",
+            "--prompt",
+            "hello",
+            "--repo",
+            ".",
+            "--role-model",
+            "coder=opus",
+            "--role-model",
+            "reviewer=haiku",
+            "--role-cli",
+            "reviewer=claude",
+        ],
+    )
+    .await;
+    assert_eq!(created.code, Some(0), "stderr: {}", created.stderr);
+    let task = created.json();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Both roles landed, each under its own key, alongside the task-wide cwd.
+    assert_eq!(task["config"]["roles"]["coder"]["model"], "opus");
+    assert_eq!(task["config"]["roles"]["reviewer"]["model"], "haiku");
+    assert_eq!(task["config"]["roles"]["reviewer"]["cli"], "claude");
+    assert_eq!(task["config"]["cwd"], ".");
+
+    // Reconfigure one field of one role; everything else must survive.
+    let patched = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "reconfigure",
+            &task_id,
+            "--role-model",
+            "coder=sonnet",
+        ],
+    )
+    .await;
+    assert_eq!(patched.code, Some(0), "stderr: {}", patched.stderr);
+    let patched = patched.json();
+    assert_eq!(patched["config"]["roles"]["coder"]["model"], "sonnet");
+    assert_eq!(patched["config"]["roles"]["reviewer"]["model"], "haiku");
+    assert_eq!(patched["config"]["roles"]["reviewer"]["cli"], "claude");
+    assert_eq!(patched["config"]["cwd"], ".");
+}
+
+/// Human (non-`--json`) output has to name every configured role, or an
+/// override is invisible unless the caller re-reads the raw JSON.
+#[tokio::test]
+async fn task_create_human_output_names_each_configured_role() {
+    let home = TempHome::new();
+    home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
+    let daemon = Daemon::spawn(home).await;
+
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let created = run_choco(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "two-role",
+            "--title",
+            "t",
+            "--prompt",
+            "hello",
+            "--role-model",
+            "coder=opus",
+            "--role-model",
+            "reviewer=haiku",
+        ],
+    )
+    .await;
+    assert_eq!(created.code, Some(0), "stderr: {}", created.stderr);
+    assert!(
+        created.stdout.contains("coder: model=opus"),
+        "stdout: {}",
+        created.stdout
+    );
+    assert!(
+        created.stdout.contains("reviewer: model=haiku"),
+        "stdout: {}",
+        created.stdout
+    );
+}
+
+/// A malformed flag fails before anything is created, with a message naming
+/// the offending flag — not a silently-ignored override.
+#[tokio::test]
+async fn task_create_rejects_a_malformed_role_flag_without_creating_a_task() {
+    let home = TempHome::new();
+    home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
+    let daemon = Daemon::spawn(home).await;
+
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let failed = run_choco(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "two-role",
+            "--title",
+            "t",
+            "--prompt",
+            "hello",
+            // No `=`, so there's no way to tell which role was meant.
+            "--role-model",
+            "opus",
+        ],
+    )
+    .await;
+    assert_eq!(failed.code, Some(1), "stdout: {}", failed.stdout);
+    assert!(
+        failed.stderr.contains("--role-model"),
+        "stderr: {}",
+        failed.stderr
+    );
+
+    // Nothing was created — the flags are validated before the request.
+    let listed = run_choco_json(&daemon.base_url, &["task", "list"])
+        .await
+        .json();
+    assert_eq!(listed.as_array().unwrap().len(), 0, "{listed}");
+}
+
+/// `reconfigure` with no overrides is a mistake worth reporting, not a
+/// silent no-op request.
+#[tokio::test]
+async fn task_reconfigure_without_any_overrides_is_an_error() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+
+    let failed = run_choco(&daemon.base_url, &["task", "reconfigure", "some-task"]).await;
+    assert_eq!(failed.code, Some(1), "stdout: {}", failed.stdout);
+    assert!(
+        failed.stderr.contains("nothing to change"),
+        "stderr: {}",
+        failed.stderr
+    );
 }
