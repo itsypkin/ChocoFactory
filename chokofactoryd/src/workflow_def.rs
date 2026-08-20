@@ -232,12 +232,19 @@ impl WorkflowDefinition {
             })?;
 
             for reference in references {
-                let Some(target) = self.stages.get(&reference.stage) else {
+                // `task` is always valid — it's payload the engine seeds
+                // itself in `start_task` (P2-7a), not a stage's `capture:`,
+                // so there's no stage to look up and no capture to require.
+                let referenced_stage = match reference.root {
+                    crate::template::Root::Task => continue,
+                    crate::template::Root::Stage(stage) => stage,
+                };
+                let Some(target) = self.stages.get(&referenced_stage) else {
                     return Err(WorkflowDefError::UnknownTemplateStage {
                         stage: stage_name.to_string(),
                         field,
                         placeholder: reference.placeholder,
-                        referenced: reference.stage,
+                        referenced: referenced_stage,
                     });
                 };
                 if !declares_capture(&target.kind) {
@@ -245,7 +252,7 @@ impl WorkflowDefinition {
                         stage: stage_name.to_string(),
                         field,
                         placeholder: reference.placeholder,
-                        referenced: reference.stage,
+                        referenced: referenced_stage,
                     });
                 }
             }
@@ -2100,14 +2107,14 @@ stages:
     }
 
     #[test]
-    fn rejects_a_template_reading_a_namespace_other_than_stages() {
+    fn rejects_a_template_reading_an_unknown_namespace() {
         let dir = TempDir::new();
         let yaml = r#"
 name: templated
 stages:
   report:
     kind: shell
-    command: "echo {{ task.id }}"
+    command: "echo {{ bogus.id }}"
     on: { done: finished }
   finished:
     kind: terminal
@@ -2117,6 +2124,45 @@ stages:
             matches!(&err, WorkflowDefError::InvalidTemplate { stage, .. } if stage == "report"),
             "got {err}"
         );
+    }
+
+    /// P2-7a: `task` is always a valid root — it names no stage, so it
+    /// skips both `UnknownTemplateStage` and `TemplateStageCapturesNothing`
+    /// entirely, unlike every `stages.<stage>` reference.
+    #[test]
+    fn accepts_a_template_reading_the_task_root() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: templated
+stages:
+  report:
+    kind: shell
+    command: "echo {{ task.input }} {{ task.title }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    /// Belt-and-suspenders on `Root::Task => continue`: load-time validation
+    /// doesn't inspect the field path at all for a `task` reference, so even
+    /// a field that's never `input`/`title` — which would fail at render
+    /// time (P2-7a) — is accepted here.
+    #[test]
+    fn accepts_an_unknown_task_field_at_load_time() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: templated
+stages:
+  report:
+    kind: shell
+    command: "echo {{ task.nonexistent_field }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
     }
 
     /// A `poll` command is templated on the same terms as a `shell` one —
