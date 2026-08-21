@@ -547,7 +547,7 @@ impl WorkflowEngine {
         let global = self
             .load_global_config()
             .map_err(SendMessageError::GlobalConfig)?;
-        let cwd = working_dir(&self.pool, &task, &definition).await?;
+        let cwd = working_dir(&task, &definition)?;
         let resolved = role_config::resolve(role, role_def, &global, &task.config, cwd)
             .map_err(SendMessageError::RoleConfig)?;
 
@@ -712,12 +712,23 @@ impl WorkflowEngine {
             // Forked once, before `workflow_state` exists at all, so a
             // failure here never leaves a task with a `workflow_state` row
             // pointing at an entry stage whose worktree was never created
-            // (§5.5 Q7, issue #58).
+            // (§5.5 Q7, issue #58). The `(repo, project)` pair `ensure` used
+            // is then snapshotted onto the task row — every later lookup
+            // (`working_dir`, terminal-stage removal) reads that snapshot
+            // rather than re-resolving `config.cwd`/the project's name,
+            // which can both change out from under a running task (see
+            // `worktree_creation_inputs`'s doc comment).
             if definition.worktree {
-                let (repo, project) = worktree_inputs(&self.pool, &task).await?;
+                let (repo, project) = worktree_creation_inputs(&self.pool, &task).await?;
                 worktree::ensure(&repo, &project, &task.id)
                     .await
                     .map_err(WorkingDirError::Worktree)?;
+                // `None` means the task row was deleted out from under this
+                // call (same race `tasks::get` above is exposed to) —
+                // surfaced the same way, not silently ignored.
+                tasks::set_worktree(&self.pool, &task.id, &repo.to_string_lossy(), &project)
+                    .await?
+                    .ok_or(EngineError::NoSuchTask)?;
             }
             let payload = json!({ "task": { "input": initial_input, "title": task.title } });
             let state = workflow_state::create(&self.pool, task_id, start, payload).await?;
@@ -1131,14 +1142,14 @@ impl WorkflowEngine {
                 return;
             }
         };
-        let (repo, project) = match worktree_inputs(&self.pool, &task).await {
-            Ok(inputs) => inputs,
-            Err(err) => {
-                tracing::error!(task_id, %err, "failed to resolve worktree path for removal");
-                return;
-            }
+        let Some((repo, project)) = worktree_snapshot(&task) else {
+            tracing::error!(
+                task_id,
+                "worktree-enabled task has no worktree_repo/worktree_project snapshot to remove"
+            );
+            return;
         };
-        match worktree::remove(&repo, &project, &task.id).await {
+        match worktree::remove(&repo, project, &task.id).await {
             Ok(()) => tracing::info!(task_id, "worktree removed (task closed)"),
             Err(err) => tracing::error!(
                 task_id, %err,
@@ -1171,7 +1182,7 @@ impl WorkflowEngine {
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(EngineError::NoSuchTask)?;
-        let cwd = working_dir(&self.pool, &task, definition).await?;
+        let cwd = working_dir(&task, definition)?;
 
         self.spawn_shell_runner(
             task_id.to_string(),
@@ -1446,7 +1457,7 @@ impl WorkflowEngine {
             stage: stage_name.to_string(),
             reason: err.to_string(),
         })?;
-        let cwd = working_dir(&self.pool, &task, definition).await?;
+        let cwd = working_dir(&task, definition)?;
 
         self.spawn_poll_runner(
             task_id.to_string(),
@@ -1990,7 +2001,7 @@ impl WorkflowEngine {
         let global = self
             .load_global_config()
             .map_err(EngineError::GlobalConfig)?;
-        let cwd = working_dir(&self.pool, &task, definition).await?;
+        let cwd = working_dir(&task, definition)?;
         let resolved = role_config::resolve(role, role_def, &global, &task.config, cwd)
             .map_err(EngineError::RoleConfig)?;
 
@@ -2407,13 +2418,11 @@ fn task_repo(task: &Task) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Resolving a worktree-enabled workflow's working directory (both to
-/// create it in `start_task` and to look it up again from every stage that
-/// needs a cwd) needs a repo path and a project name before
-/// `worktree::ensure`/`worktree::worktree_path` can run. Both `EngineError`
-/// and `SendMessageError` wrap this the same way they already wrap
-/// `RoleConfigError`/`GlobalConfigError`, since both entry points
-/// (`start_task`/the `enter_*` family, and `send_message`) hit the same
+/// Resolving a worktree-enabled workflow's working directory needs a repo
+/// path and a project name before `worktree::ensure`/`worktree::
+/// worktree_path` can run. Both `EngineError` and `SendMessageError` wrap
+/// this the same way they already wrap `RoleConfigError`/`GlobalConfigError`,
+/// since both entry points (`start_task`, and `send_message`) hit the same
 /// failure modes.
 #[derive(Debug)]
 pub enum WorkingDirError {
@@ -2425,6 +2434,12 @@ pub enum WorkingDirError {
     /// The workflow definition opted into `worktree: true` but the task has
     /// no `config.cwd` set — there is no repo to fork a worktree from.
     MissingCwd(String),
+    /// The workflow definition opted into `worktree: true`, but this task
+    /// has no `worktree_repo`/`worktree_project` snapshot on it yet —
+    /// `start_task` always writes one via `tasks::set_worktree` before any
+    /// stage runs, so reaching this means a stage dispatched before
+    /// `start_task` finished, not a normal task lifecycle.
+    MissingWorktreeSnapshot(String),
     Worktree(WorktreeError),
 }
 
@@ -2436,6 +2451,10 @@ impl fmt::Display for WorkingDirError {
             WorkingDirError::MissingCwd(task_id) => write!(
                 f,
                 "task '{task_id}' uses a worktree-enabled workflow but has no repo cwd configured"
+            ),
+            WorkingDirError::MissingWorktreeSnapshot(task_id) => write!(
+                f,
+                "task '{task_id}' uses a worktree-enabled workflow but has no worktree_repo/worktree_project snapshot recorded yet"
             ),
             WorkingDirError::Worktree(err) => write!(f, "{err}"),
         }
@@ -2450,10 +2469,18 @@ impl From<sqlx::Error> for WorkingDirError {
     }
 }
 
-/// The repo path and project name a worktree-enabled workflow needs, both
-/// to create the worktree (`start_task`) and to recompute the same
-/// deterministic path later (`working_dir`, and terminal-stage removal).
-async fn worktree_inputs(
+/// The repo path and project name to fork a worktree-enabled task's
+/// worktree from — read from `task.config.cwd` and the project's *current*
+/// name. Only ever called from `start_task`, right before `worktree::
+/// ensure`, whose result `start_task` then snapshots onto `task.
+/// worktree_repo`/`task.worktree_project` via `tasks::set_worktree`. Every
+/// later lookup must read that snapshot (`working_dir`, terminal-stage
+/// removal) instead of calling this again — `config.cwd` and the project's
+/// name can both change after the worktree already exists (`PATCH
+/// /tasks/{id}/config`, `PATCH /projects/{id}`), and re-deriving from their
+/// current values would let a later stage compute a path `ensure` never
+/// actually created.
+async fn worktree_creation_inputs(
     pool: &SqlitePool,
     task: &Task,
 ) -> Result<(PathBuf, String), WorkingDirError> {
@@ -2464,24 +2491,29 @@ async fn worktree_inputs(
     Ok((repo, project.name))
 }
 
+/// The `(repo, project)` `start_task` snapshotted onto this task when its
+/// worktree was created — see `worktree_creation_inputs`'s doc comment for
+/// why this, not a fresh lookup, is what every later stage must use.
+fn worktree_snapshot(task: &Task) -> Option<(PathBuf, &str)> {
+    let repo = task.worktree_repo.as_deref()?;
+    let project = task.worktree_project.as_deref()?;
+    Some((PathBuf::from(repo), project))
+}
+
 /// A task's working directory for a stage that needs one: the task's
 /// dedicated worktree if `definition.worktree` opted in, else today's
 /// `task_cwd` (the task's configured repo directly, or a sensible
-/// fallback). `worktree::worktree_path` is a pure computation (no I/O
-/// beyond validating identifiers) — recomputing it here is cheap, and by
-/// construction it matches whatever `start_task` already created via
-/// `worktree::ensure`, since both derive from the same
-/// `(repo, project, task.id)`.
-async fn working_dir(
-    pool: &SqlitePool,
-    task: &Task,
-    definition: &WorkflowDefinition,
-) -> Result<PathBuf, WorkingDirError> {
+/// fallback). No I/O — `worktree::worktree_path` is a pure computation
+/// (no filesystem access beyond validating identifiers), and the
+/// `(repo, project)` pair comes from `task`'s own already-fetched snapshot,
+/// not a fresh lookup.
+fn working_dir(task: &Task, definition: &WorkflowDefinition) -> Result<PathBuf, WorkingDirError> {
     if !definition.worktree {
         return Ok(task_cwd(task));
     }
-    let (repo, project) = worktree_inputs(pool, task).await?;
-    worktree::worktree_path(&repo, &project, &task.id).map_err(WorkingDirError::Worktree)
+    let (repo, project) = worktree_snapshot(task)
+        .ok_or_else(|| WorkingDirError::MissingWorktreeSnapshot(task.id.clone()))?;
+    worktree::worktree_path(&repo, project, &task.id).map_err(WorkingDirError::Worktree)
 }
 
 /// Largest captured value stored in `workflow_state.payload`, *per stage* —
@@ -6677,5 +6709,95 @@ stages:
             !sibling.exists(),
             "a chat-style task must never get a worktree"
         );
+    }
+
+    /// Regression test for a review finding on this PR: `task.config.cwd`
+    /// (`PATCH /tasks/{id}/config`) and a project's name (`PATCH
+    /// /projects/{id}`) can both change after a worktree-enabled task's
+    /// worktree already exists. A later stage must keep using the worktree
+    /// `start_task` actually created — recomputing the path from the
+    /// task/project's *current* values would derive a path `worktree::
+    /// ensure` never created (and, on removal, `worktree::remove` would
+    /// silently no-op against a path that was never real, leaking the
+    /// original worktree on disk while logging success).
+    #[tokio::test]
+    async fn a_worktree_enabled_task_keeps_using_its_original_worktree_after_config_or_project_changes()
+     {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+
+        let yaml = r#"
+name: worktree-snapshot-flow
+worktree: true
+stages:
+  first:
+    kind: shell
+    command: "touch marker-first"
+    on: { done: gate, error: failed }
+  gate:
+    kind: human_gate
+    on: { resumed: second }
+  second:
+    kind: shell
+    command: "touch marker-second"
+    on: { done: done, error: failed }
+  done:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: { resumed: done }
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: &def.name,
+                title: "T",
+                config: json!({ "cwd": repo.to_string_lossy() }),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "gate").await;
+
+        let original_worktree = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
+        assert!(original_worktree.join("marker-first").exists());
+
+        // Mutate both config.cwd and the project's own name while the task
+        // is parked at the gate — neither should affect where the next
+        // stage runs.
+        let other_repo = tempdir();
+        tasks::merge_config(
+            &pool,
+            &task_id,
+            json!({ "cwd": other_repo.to_string_lossy() }),
+        )
+        .await
+        .unwrap();
+        projects::rename(&pool, &project_id, "renamed")
+            .await
+            .unwrap();
+
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        wait_until_stage(&pool, &task_id, "done").await;
+
+        assert!(
+            original_worktree.join("marker-second").exists(),
+            "the second stage must still run in the worktree start_task actually created"
+        );
+
+        // Terminal removal must target that same original worktree, not
+        // one derived from the now-changed config/project.
+        wait_until_task_status(&pool, &task_id, "closed").await;
+        wait_until_path_gone(&original_worktree).await;
     }
 }
