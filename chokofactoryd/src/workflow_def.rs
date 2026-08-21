@@ -23,6 +23,11 @@ pub struct WorkflowDefinition {
     pub name: String,
     pub roles: HashMap<String, RoleDef>,
     pub stages: IndexMap<String, StageDef>,
+    /// Opt-in (§5.2, §5.5 Q7, issue #58): when set, the engine forks a
+    /// dedicated `git worktree` for each task using this definition instead
+    /// of running stages directly in the task's configured repo. `chat.yaml`
+    /// leaves this unset — a chat task has no repo to fork.
+    pub worktree: bool,
 }
 
 impl WorkflowDefinition {
@@ -91,6 +96,7 @@ impl WorkflowDefinition {
             name: raw.name,
             roles,
             stages,
+            worktree: raw.worktree,
         };
 
         definition.validate()?;
@@ -399,6 +405,8 @@ struct RawDefinition {
     roles: IndexMap<String, RawRole>,
     #[serde(deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys")]
     stages: IndexMap<String, RawStage>,
+    #[serde(default)]
+    worktree: bool,
 }
 
 #[derive(Debug, Deserialize)]
