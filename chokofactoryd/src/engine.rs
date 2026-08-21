@@ -650,8 +650,11 @@ impl WorkflowEngine {
     /// Creates `task_id`'s `workflow_state` row at `definition`'s entry
     /// stage (§5.1: the first stage declared) and enters it.
     /// `initial_input` is the human-typed message a chat-style task was
-    /// created with (§5.4) — used only if the entry stage is an
-    /// `agent_turn` with no `prompt_file`; ignored otherwise.
+    /// created with (§5.4). It's always seeded into `payload.task.input`
+    /// (P2-7a), reachable from any stage's `prompt_file`/`command` as
+    /// `{{ task.input }}` — but only used *directly*, as the turn's own
+    /// prompt, when the entry stage is an `agent_turn` with no
+    /// `prompt_file`.
     pub async fn start_task(
         self: &Arc<Self>,
         task_id: &str,
@@ -669,12 +672,22 @@ impl WorkflowEngine {
 
         let start = definition.start_stage();
         let result: Result<(), EngineError> = async {
-            // The freshly-created payload (`{}`) is what the entry stage
-            // renders its templates against — no stage has run yet, so any
-            // `{{ stages.… }}` in it is unresolvable by construction. Passing
-            // it explicitly keeps `enter_stage` off a second read of a row
-            // this call already knows the contents of.
-            let state = workflow_state::create(&self.pool, task_id, start).await?;
+            // The task's title/initial input is seeded under `payload.task`
+            // (P2-7a, §5.1) — a sibling of `merge_stage_capture`'s `stages`
+            // key, so it can never collide with a workflow's own stage
+            // names — reachable from any stage's `prompt_file` as
+            // `{{ task.input }}`/`{{ task.title }}`. It's the only thing in
+            // the entry stage's payload: no stage has run yet, so any
+            // `{{ stages.… }}` in it is unresolvable by construction.
+            // Looked up fresh here (rather than threaded in as a parameter)
+            // because `start_task` is also called directly, without going
+            // through `create_task`, wherever a task's own row already
+            // carries the title this needs.
+            let task = tasks::get(&self.pool, task_id)
+                .await?
+                .ok_or(EngineError::NoSuchTask)?;
+            let payload = json!({ "task": { "input": initial_input, "title": task.title } });
+            let state = workflow_state::create(&self.pool, task_id, start, payload).await?;
             self.enter_stage(
                 task_id,
                 definition,
@@ -3537,7 +3550,7 @@ stages:
         let pool = connect_in_memory().await.unwrap();
         let def = human_gate_chain_def();
         let task_id = seed_task(&pool, &def.name).await;
-        workflow_state::create(&pool, &task_id, "gate")
+        workflow_state::create(&pool, &task_id, "gate", json!({}))
             .await
             .unwrap();
         let task_run = task_runs::create(
@@ -3826,7 +3839,12 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
         wait_until_stage(&pool, &task_id, "finished").await;
 
-        assert_eq!(payload_of(&pool, &task_id).await, json!({}));
+        // `task` is the entry stage's only payload (P2-7a) — the stage
+        // itself writes nothing, since it declares no `capture:`.
+        assert_eq!(
+            payload_of(&pool, &task_id).await,
+            json!({"task": {"input": null, "title": "T"}})
+        );
     }
 
     #[tokio::test]
@@ -4164,7 +4182,10 @@ stages:
         // Neither the transition nor the capture was applied.
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "finished");
-        assert_eq!(state.payload, json!({}));
+        assert_eq!(
+            state.payload,
+            json!({"task": {"input": null, "title": "T"}})
+        );
     }
 
     #[test]
@@ -4570,7 +4591,7 @@ stages:
         // (and therefore skipping the task_run it would have created) —
         // simulates a task whose entry stage never actually got entered.
         let task_id = seed_task(&pool, "chat").await;
-        workflow_state::create(&pool, &task_id, "chatting")
+        workflow_state::create(&pool, &task_id, "chatting", json!({}))
             .await
             .unwrap();
 
@@ -4606,7 +4627,7 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
 
         let task_id = seed_task(&pool, "chat").await;
-        workflow_state::create(&pool, &task_id, "ghost-stage")
+        workflow_state::create(&pool, &task_id, "ghost-stage", json!({}))
             .await
             .unwrap();
 
@@ -5389,6 +5410,87 @@ stages:
         wait_until_events_contain(&pool, &run.id, "echo:fix pr 42").await;
     }
 
+    /// P2-7a: this is the gap the issue closes — a `prompt_file` entry
+    /// stage previously had no way to reach the task's own title/initial
+    /// input, only a later stage's capture.
+    #[tokio::test]
+    async fn task_input_and_title_are_templated_into_the_entry_stage_prompt() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        fs::write(
+            dir.join("coder-turn.md"),
+            "{{ task.title }}: {{ task.input }}",
+        )
+        .unwrap();
+        let yaml = r#"
+name: templated
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: {}
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine
+            .start_task(&task_id, &def, Some("fix the flaky test"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "coding").await;
+
+        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+        // `seed_task` gives the task the title "T" (§ its own definition).
+        wait_until_events_contain(&pool, &run.id, "echo:T: fix the flaky test").await;
+    }
+
+    /// `payload.task` is seeded once by `start_task` and must survive
+    /// `advance_from_stage`'s payload carry-forward — it isn't only the
+    /// entry stage's prompt that can reach it.
+    #[tokio::test]
+    async fn task_input_still_resolves_in_a_second_stage_prompt() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        fs::write(dir.join("coder-turn.md"), "{{ task.input }}").unwrap();
+        let yaml = r#"
+name: templated
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  setup:
+    kind: shell
+    command: "true"
+    on: { done: coding }
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: {}
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine
+            .start_task(&task_id, &def, Some("fix the flaky test"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "coding").await;
+
+        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+        wait_until_events_contain(&pool, &run.id, "echo:fix the flaky test").await;
+    }
+
     /// The loader can only check that the referenced stage exists and
     /// captures something; whether its captured JSON actually carries the
     /// field is a run-time question. An absent one fails the stage rather
@@ -5734,8 +5836,12 @@ stages:
         wait_until_stage(&pool, &task_id, "finished").await;
 
         // Even though the reply *was* a JSON verdict, a stage that declared
-        // no `capture:` neither stores it nor routes on it.
-        assert_eq!(payload_of(&pool, &task_id).await, json!({}));
+        // no `capture:` neither stores it nor routes on it — `task` is the
+        // only payload key present (P2-7a).
+        assert_eq!(
+            payload_of(&pool, &task_id).await,
+            json!({"task": {"input": null, "title": "T"}})
+        );
         let trail = stage_trail(&pool, &task_id).await;
         assert!(
             trail

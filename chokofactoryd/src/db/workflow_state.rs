@@ -28,21 +28,28 @@ impl From<WorkflowStateRow> for WorkflowState {
 }
 
 /// Creates the single workflow_state row for a task, seeding empty loop
-/// counters and payload (§3). The stage trail lives in the events
-/// timeline instead, as `stage_entered` entries (X-3).
+/// counters (§3) and the given `payload`. The stage trail lives in the
+/// events timeline instead, as `stage_entered` entries (X-3).
+///
+/// `payload` lets `start_task` seed `payload.task` (P2-7a: a task's title
+/// and initial input, reachable from a `prompt_file` as `{{ task.* }}`) in
+/// the same statement the row is created with, rather than a separate
+/// create-then-update — there is no window where the row exists without it.
 pub async fn create(
     pool: &SqlitePool,
     task_id: &str,
     current_stage: &str,
+    payload: Value,
 ) -> Result<WorkflowState, sqlx::Error> {
     let now = Utc::now();
     let row = sqlx::query_as::<_, WorkflowStateRow>(&format!(
         "INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, updated_at)
-         VALUES (?, ?, '{{}}', '{{}}', ?)
+         VALUES (?, ?, '{{}}', ?, ?)
          RETURNING {COLUMNS}"
     ))
     .bind(task_id)
     .bind(current_stage)
+    .bind(Json(payload))
     .bind(now)
     .fetch_one(pool)
     .await?;
@@ -123,7 +130,7 @@ mod tests {
         let pool = connect_in_memory().await.unwrap();
         let task_id = seed_task(&pool).await;
 
-        let created = create(&pool, &task_id, "coding").await.unwrap();
+        let created = create(&pool, &task_id, "coding", json!({})).await.unwrap();
         assert_eq!(created.current_stage, "coding");
         assert_eq!(created.loop_counters, json!({}));
 
@@ -153,5 +160,28 @@ mod tests {
     async fn get_missing_returns_none() {
         let pool = connect_in_memory().await.unwrap();
         assert!(get(&pool, "does-not-exist").await.unwrap().is_none());
+    }
+
+    /// `create` binds `payload` into the same `INSERT` rather than seeding
+    /// `{}` and relying on a caller to `update` it in afterwards (P2-7a) —
+    /// this is the row `start_task` needs, with `payload.task` already set.
+    #[tokio::test]
+    async fn create_persists_a_seeded_payload() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+
+        let created = create(
+            &pool,
+            &task_id,
+            "coding",
+            json!({"task": {"input": "fix the flaky test", "title": "T"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.payload["task"]["input"], "fix the flaky test");
+        assert_eq!(created.payload["task"]["title"], "T");
+
+        let fetched = get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(fetched.payload, created.payload);
     }
 }

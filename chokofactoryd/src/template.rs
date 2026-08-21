@@ -6,6 +6,11 @@
 //! `{{ stages.<name>.<field> }}` in a later stage's `command:` or
 //! `prompt_file` against that payload.
 //!
+//! A second root, `{{ task.<field> }}` (`input`/`title`), reads a sibling
+//! key seeded once by `start_task` rather than any stage's `capture:` — it's
+//! how a task's own description reaches a `prompt_file` (P2-7a). `stages`
+//! and `task` are the only two roots a template can read from.
+//!
 //! This is deliberately *only* variable substitution. There are no
 //! conditionals, no expressions, and no function calls — branching stays in
 //! `on:` maps and `outcomes:` matching (§7 non-goal). That constraint is why
@@ -25,11 +30,24 @@ use std::fmt;
 const OPEN: &str = "{{";
 const CLOSE: &str = "}}";
 
-/// The only recognised root. Reserving it — rather than resolving against
-/// the payload root — is what lets other engine-owned namespaces join
-/// `payload` later without colliding with a workflow whose stage happens to
-/// be named after one (same reasoning as `merge_stage_capture`'s).
+/// The `stages` root: a stage's own capture, reserved instead of resolving
+/// against the payload root so other engine-owned namespaces (like `task`)
+/// can join `payload` without colliding with a workflow whose stage happens
+/// to be named after one (same reasoning as `merge_stage_capture`'s).
 const NAMESPACE: &str = "stages";
+
+/// The `task` root: the task's own title/initial input (P2-7a), seeded once
+/// by `start_task` rather than any stage's `capture:`.
+const TASK_NAMESPACE: &str = "task";
+
+/// Which of the two recognised roots a reference reads from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Root {
+    /// `stages.<stage>.<path>` — a stage's capture.
+    Stage(String),
+    /// `task.<path>` — the task's own title/initial input.
+    Task,
+}
 
 /// One `{{ … }}` occurrence, parsed but not yet resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +55,10 @@ pub struct TemplateRef {
     /// The full `{{ … }}` text, kept verbatim so an error can quote back
     /// exactly what the author wrote.
     pub placeholder: String,
-    /// The stage whose capture this reads.
-    pub stage: String,
-    /// Field path *within* that stage's captured value. Empty for a bare
-    /// `{{ stages.<name> }}`, which is how a `capture: text` stage — whose
-    /// payload entry is a plain string, not an object — is referenced.
+    pub root: Root,
+    /// Field path within the root's value. Empty for a bare `{{ stages.<name> }}`
+    /// or `{{ task }}`, which is how a plain-string value — a `capture: text`
+    /// stage's payload entry — is referenced.
     pub path: Vec<String>,
 }
 
@@ -66,6 +83,14 @@ pub enum TemplateError {
         stage: String,
         field: String,
     },
+    /// The `task` root has no such field — only `input`/`title` are ever
+    /// set, unlike a stage's capture there is no "hasn't run yet" state for
+    /// it to be missing entirely (`start_task` always seeds it), so this is
+    /// the only task-side counterpart to `UnresolvedField`.
+    UnresolvedTaskField {
+        placeholder: String,
+        field: String,
+    },
     /// Resolved to something that can't be substituted into a command or a
     /// prompt as-is. Capture is for short structured signals — a verdict, an
     /// id, a url — not for splicing a blob into a shell command (§5.1).
@@ -86,8 +111,8 @@ impl fmt::Display for TemplateError {
             }
             TemplateError::UnknownNamespace { placeholder, root } => write!(
                 f,
-                "{placeholder} reads from '{root}', but '{NAMESPACE}' is the only namespace \
-                 a template can read from"
+                "{placeholder} reads from '{root}', but '{NAMESPACE}' and '{TASK_NAMESPACE}' \
+                 are the only namespaces a template can read from"
             ),
             TemplateError::UnresolvedStage { placeholder, stage } => write!(
                 f,
@@ -102,6 +127,9 @@ impl fmt::Display for TemplateError {
                 f,
                 "{placeholder} has no value: stage '{stage}' captured no '{field}'"
             ),
+            TemplateError::UnresolvedTaskField { placeholder, field } => {
+                write!(f, "{placeholder} has no value: the task has no '{field}'")
+            }
             TemplateError::NotScalar { placeholder, kind } => write!(
                 f,
                 "{placeholder} resolves to {kind}, which cannot be substituted into a command \
@@ -203,13 +231,7 @@ fn parse_reference(body: &str) -> Result<TemplateRef, TemplateError> {
     }
 
     let mut parts = path.split('.');
-    let root = parts.next().expect("split always yields at least one part");
-    if root != NAMESPACE {
-        return Err(TemplateError::UnknownNamespace {
-            placeholder,
-            root: root.to_string(),
-        });
-    }
+    let root_name = parts.next().expect("split always yields at least one part");
 
     let remainder: Vec<&str> = parts.collect();
     if remainder.iter().any(|part| part.is_empty()) {
@@ -218,39 +240,74 @@ fn parse_reference(body: &str) -> Result<TemplateRef, TemplateError> {
             reason: "it has an empty path segment".to_string(),
         });
     }
-    let Some((stage, fields)) = remainder.split_first() else {
-        return Err(TemplateError::Malformed {
-            placeholder,
-            reason: format!("it names no stage (expected `{NAMESPACE}.<stage>`)"),
-        });
-    };
 
-    Ok(TemplateRef {
-        placeholder,
-        stage: (*stage).to_string(),
-        path: fields.iter().map(|field| (*field).to_string()).collect(),
-    })
+    match root_name {
+        NAMESPACE => {
+            let Some((stage, fields)) = remainder.split_first() else {
+                return Err(TemplateError::Malformed {
+                    placeholder,
+                    reason: format!("it names no stage (expected `{NAMESPACE}.<stage>`)"),
+                });
+            };
+            Ok(TemplateRef {
+                placeholder,
+                root: Root::Stage((*stage).to_string()),
+                path: fields.iter().map(|field| (*field).to_string()).collect(),
+            })
+        }
+        // Unlike `stages`, there's no stage-name segment to peel off first —
+        // `task` resolves directly to a location (§ `resolve`), the same way
+        // `stages.<stage>` does once its own mandatory segment is consumed.
+        // A path-less `{{ task }}` is syntactically fine and simply resolves
+        // to a whole object, rejected as `NotScalar` at render time exactly
+        // like a path-less `{{ stages.<stage> }}` is.
+        TASK_NAMESPACE => Ok(TemplateRef {
+            placeholder,
+            root: Root::Task,
+            path: remainder.iter().map(|field| (*field).to_string()).collect(),
+        }),
+        other => Err(TemplateError::UnknownNamespace {
+            placeholder,
+            root: other.to_string(),
+        }),
+    }
 }
 
+// A `{{ task.… }}` reference resolves against a payload with no `task` key
+// (a row from before `start_task` seeded it, or — defensively — one that
+// somehow never got it) the same as an unresolved field under it: the field
+// loop below reports whichever field was actually asked for, instead of a
+// separate "namespace missing" error nothing else in this module has an
+// analog for (a bare `{{ task }}` falls through to `NotScalar { kind: "null" }`
+// instead, same as any other reference resolving to `null` does).
+const MISSING_TASK: Value = Value::Null;
+
 fn resolve(reference: &TemplateRef, payload: &Value) -> Result<String, TemplateError> {
-    let mut value = payload
-        .get(NAMESPACE)
-        .and_then(|stages| stages.get(&reference.stage))
-        .ok_or_else(|| TemplateError::UnresolvedStage {
-            placeholder: reference.placeholder.clone(),
-            stage: reference.stage.clone(),
-        })?;
+    let mut value = match &reference.root {
+        Root::Stage(stage) => payload
+            .get(NAMESPACE)
+            .and_then(|stages| stages.get(stage))
+            .ok_or_else(|| TemplateError::UnresolvedStage {
+                placeholder: reference.placeholder.clone(),
+                stage: stage.clone(),
+            })?,
+        Root::Task => payload.get(TASK_NAMESPACE).unwrap_or(&MISSING_TASK),
+    };
 
     for (depth, field) in reference.path.iter().enumerate() {
         // `Value::get` on a non-object is `None`, so this also covers
         // indexing into a `capture: text` stage's plain string.
-        value = value
-            .get(field)
-            .ok_or_else(|| TemplateError::UnresolvedField {
+        value = value.get(field).ok_or_else(|| match &reference.root {
+            Root::Stage(stage) => TemplateError::UnresolvedField {
                 placeholder: reference.placeholder.clone(),
-                stage: reference.stage.clone(),
+                stage: stage.clone(),
                 field: reference.path[..=depth].join("."),
-            })?;
+            },
+            Root::Task => TemplateError::UnresolvedTaskField {
+                placeholder: reference.placeholder.clone(),
+                field: reference.path[..=depth].join("."),
+            },
+        })?;
     }
 
     match value {
@@ -407,10 +464,48 @@ mod tests {
     }
 
     #[test]
-    fn a_non_stages_root_is_rejected() {
-        let err = render("{{ task.id }}", &payload()).unwrap_err();
+    fn an_unknown_root_is_rejected() {
+        let err = render("{{ bogus.id }}", &payload()).unwrap_err();
         assert!(
-            matches!(&err, TemplateError::UnknownNamespace { root, .. } if root == "task"),
+            matches!(&err, TemplateError::UnknownNamespace { root, .. } if root == "bogus"),
+            "{err}"
+        );
+    }
+
+    fn task_payload() -> Value {
+        json!({ "task": { "input": "fix the flaky test", "title": "Investigate CI" } })
+    }
+
+    #[test]
+    fn resolves_task_input_and_title() {
+        let rendered = render("Task: {{ task.title }}\n{{ task.input }}", &task_payload()).unwrap();
+        assert_eq!(rendered, "Task: Investigate CI\nfix the flaky test");
+    }
+
+    #[test]
+    fn an_unknown_task_field_is_unresolved() {
+        let err = render("{{ task.id }}", &task_payload()).unwrap_err();
+        assert!(
+            matches!(&err, TemplateError::UnresolvedTaskField { field, .. } if field == "id"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_task_field_is_unresolved_when_the_payload_has_no_task_key_at_all() {
+        // e.g. a row from before `start_task` started seeding `payload.task`.
+        let err = render("{{ task.input }}", &json!({})).unwrap_err();
+        assert!(
+            matches!(&err, TemplateError::UnresolvedTaskField { field, .. } if field == "input"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bare_task_reference_cannot_be_substituted() {
+        let err = render("{{ task }}", &task_payload()).unwrap_err();
+        assert!(
+            matches!(&err, TemplateError::NotScalar { kind, .. } if *kind == "an object"),
             "{err}"
         );
     }
@@ -462,12 +557,15 @@ mod tests {
 
     #[test]
     fn references_lists_every_placeholder_in_order() {
-        let found = references("a {{ stages.one.x }} b {{ stages.two }} c").unwrap();
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].stage, "one");
+        let found =
+            references("a {{ stages.one.x }} b {{ stages.two }} c {{ task.input }}").unwrap();
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].root, Root::Stage("one".to_string()));
         assert_eq!(found[0].path, vec!["x".to_string()]);
-        assert_eq!(found[1].stage, "two");
+        assert_eq!(found[1].root, Root::Stage("two".to_string()));
         assert!(found[1].path.is_empty());
+        assert_eq!(found[2].root, Root::Task);
+        assert_eq!(found[2].path, vec!["input".to_string()]);
     }
 
     #[test]
