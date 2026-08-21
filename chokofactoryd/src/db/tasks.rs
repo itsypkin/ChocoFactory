@@ -352,6 +352,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn set_worktree_records_the_repo_and_project_snapshot() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task_with_config(&pool, json!({ "cwd": "/repo" })).await;
+
+        let updated = set_worktree(&pool, &task_id, "/repo", "demo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.worktree_repo.as_deref(), Some("/repo"));
+        assert_eq!(updated.worktree_project.as_deref(), Some("demo"));
+
+        // `config.cwd` is untouched — the snapshot lives in its own
+        // columns, not folded into `config` (§5.5 Q7, issue #58).
+        assert_eq!(updated.config["cwd"], "/repo");
+
+        let fetched = get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(fetched, updated);
+    }
+
+    #[tokio::test]
+    async fn set_worktree_on_an_unknown_id_is_none() {
+        let pool = connect_in_memory().await.unwrap();
+        assert!(
+            set_worktree(&pool, "nope", "/repo", "demo")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// Regression test for the lost-update race `merge_config`'s
     /// single-statement `json_patch` exists to prevent. Every task patches
     /// a *different* role concurrently, so a correct implementation ends
