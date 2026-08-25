@@ -208,6 +208,20 @@ pub enum EventType {
     /// written before its own and sorts before. The inconsistency is the
     /// price of `applied` being truthful (see `engine::finish_turn`).
     TurnOutcome,
+    /// A `{{ stages.… }}`/`{{ task.… }}` placeholder in a stage's
+    /// `command:`/`prompt_file` named a value that doesn't exist — a field
+    /// the referenced stage's capture didn't carry this run, or a stage
+    /// that hasn't captured anything yet (#60). Rendered as an empty
+    /// string rather than failing the stage — the loader can only check
+    /// that the reference *parses* and names a capturing stage; whether a
+    /// captured JSON payload actually carries the field is a run-time
+    /// question. Like [`Self::StageEntered`]/[`Self::ShellOutput`] this
+    /// belongs to the *task*, not a session — rendering happens before any
+    /// `task_run` exists — so its `Event` has no `task_run_id`. Payload is
+    /// `{"stage", "placeholders"}`, where `placeholders` lists every
+    /// blanked-out reference from that one render (one event per render
+    /// call, not per placeholder).
+    TemplateUnresolved,
 }
 
 impl fmt::Display for EventType {
@@ -223,6 +237,7 @@ impl fmt::Display for EventType {
             EventType::StageEntered => "stage_entered",
             EventType::ShellOutput => "shell_output",
             EventType::TurnOutcome => "turn_outcome",
+            EventType::TemplateUnresolved => "template_unresolved",
         })
     }
 }
@@ -253,6 +268,7 @@ impl FromStr for EventType {
             "stage_entered" => Ok(EventType::StageEntered),
             "shell_output" => Ok(EventType::ShellOutput),
             "turn_outcome" => Ok(EventType::TurnOutcome),
+            "template_unresolved" => Ok(EventType::TemplateUnresolved),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -341,6 +357,7 @@ mod tests {
             EventType::StageEntered,
             EventType::ShellOutput,
             EventType::TurnOutcome,
+            EventType::TemplateUnresolved,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),
