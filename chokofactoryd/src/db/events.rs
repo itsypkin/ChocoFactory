@@ -282,7 +282,7 @@ fn ends_a_message(event_type: &str) -> bool {
         EventType::Error | EventType::SessionMeta | EventType::TurnOutcome => false,
         // Task-scoped (`task_run_id` is NULL), so unreachable from this
         // run-scoped query — classified anyway so the match stays total.
-        EventType::StageEntered | EventType::ShellOutput => false,
+        EventType::StageEntered | EventType::ShellOutput | EventType::TemplateUnresolved => false,
     }
 }
 

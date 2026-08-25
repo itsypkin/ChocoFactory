@@ -112,11 +112,21 @@ pub enum EngineError {
         stage: String,
         reason: String,
     },
-    /// A `{{ stages.… }}` reference in this stage's `command:`/`prompt_file`
-    /// that couldn't be resolved against the task's payload (P2-3, §5.1).
-    /// The loader catches unknown stage names and bad syntax, so what
-    /// reaches here is a field the referenced stage's capture didn't
-    /// actually contain, or a value that isn't a scalar.
+    /// A `{{ stages.… }}`/`{{ task.… }}` reference in this stage's
+    /// `command:`/`prompt_file` with genuinely malformed syntax (P2-3,
+    /// §5.1) — an unterminated placeholder, whitespace in the path, an
+    /// unrecognized root. A *missing value* — a field the referenced
+    /// stage's capture didn't actually carry, or a stage that hasn't
+    /// captured anything yet — is not this: `template::render`/
+    /// `render_command` substitute an empty string for that instead and
+    /// report it via `record_unresolved_template_note` (#60), since there's
+    /// no way for the loader to have caught it ahead of time. Malformed
+    /// syntax specifically *is* caught at load time
+    /// (`WorkflowDefinition::validate`), so reaching this variant at all
+    /// means a hand-built definition bypassed that check — `roles`/`stages`
+    /// are `pub` fields with no private-construction guard (§ review on PR
+    /// #35) — this stays a reported error rather than an `.expect()`
+    /// defensively, not because it's an expected run-time path.
     Template {
         stage: String,
         reason: String,
@@ -1033,14 +1043,17 @@ impl WorkflowEngine {
             self.dispatch_stage(task_id, definition, stage_name, stage_def, input, payload);
         let entered = entered.await;
 
-        // The loader settles what it can about a template, but not whether a
-        // captured payload actually carries the field — so this is *the*
-        // expected run-time failure of P2-3, and on a detached path it would
-        // otherwise leave the timeline showing a stage entered and then
-        // nothing at all, with the reason only in the daemon's log. Same
-        // reasoning as `shell_output`'s `note` and `turn_outcome`: a failure
-        // this feature expects should be visible where an operator looks.
-        // Task-scoped, since rendering happens before any `task_run` exists.
+        // A missing *value* no longer reaches here at all (#60) — it's
+        // substituted as an empty string and reported via
+        // `record_unresolved_template_note` instead, from wherever
+        // `template::render`/`render_command` actually ran. What's left is
+        // genuinely malformed syntax, which the loader already catches for
+        // anything built through it — see `EngineError::Template`'s own
+        // doc comment for why this still isn't dead code. On a detached
+        // path this would otherwise leave the timeline showing a stage
+        // entered and then nothing at all, with the reason only in the
+        // daemon's log, so it's still recorded the same way. Task-scoped,
+        // since rendering happens before any `task_run` exists.
         if let Err(EngineError::Template { stage, reason }) = &entered {
             let message = format!("stage '{stage}' could not render a template: {reason}");
             tracing::error!(task_id, stage, reason, "stage parked: {message}");
@@ -1138,15 +1151,11 @@ impl WorkflowEngine {
                 capture,
                 timeout,
             } => {
-                self.enter_shell(
-                    task_id,
-                    definition,
-                    stage_name,
-                    render_command(command, payload, stage_name)?,
-                    *capture,
-                    *timeout,
-                )
-                .await
+                let (command, unresolved) = render_command(command, payload, stage_name)?;
+                self.record_unresolved_template_note(task_id, stage_name, &unresolved)
+                    .await;
+                self.enter_shell(task_id, definition, stage_name, command, *capture, *timeout)
+                    .await
             }
             StageKind::Poll {
                 command,
@@ -1155,14 +1164,11 @@ impl WorkflowEngine {
                 timeout,
                 outcomes,
             } => {
+                let (command, unresolved) = render_command(command, payload, stage_name)?;
+                self.record_unresolved_template_note(task_id, stage_name, &unresolved)
+                    .await;
                 self.enter_poll(
-                    task_id,
-                    definition,
-                    stage_name,
-                    render_command(command, payload, stage_name)?,
-                    *capture,
-                    *interval,
-                    *timeout,
+                    task_id, definition, stage_name, command, *capture, *interval, *timeout,
                     outcomes,
                 )
                 .await
@@ -1199,6 +1205,45 @@ impl WorkflowEngine {
             Err(err) => tracing::error!(
                 task_id, %err,
                 "failed to remove worktree after entering terminal stage"
+            ),
+        }
+    }
+
+    /// Records every placeholder a stage's template fell back to an empty
+    /// string for (#60), best-effort — logged loudly on failure, never
+    /// propagated, same pattern as every other event append in this file.
+    /// No-op when nothing was unresolved, so a caller can call this
+    /// unconditionally after every render. Task-scoped (`append_for_task`,
+    /// no `task_run_id`): a template renders before any turn/session
+    /// exists, whether it's an `agent_turn`'s prompt or a `shell`/`poll`
+    /// stage's `command:`.
+    async fn record_unresolved_template_note(
+        &self,
+        task_id: &str,
+        stage_name: &str,
+        placeholders: &[String],
+    ) {
+        if placeholders.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            task_id,
+            stage = stage_name,
+            ?placeholders,
+            "stage template referenced a value that isn't there yet; rendered as empty"
+        );
+        match events::append_for_task(
+            &self.pool,
+            task_id,
+            EventType::TemplateUnresolved,
+            json!({ "stage": stage_name, "placeholders": placeholders }),
+        )
+        .await
+        {
+            Ok(_) => self.events_notify.notify_waiters(),
+            Err(err) => tracing::error!(
+                task_id, stage = stage_name, %err,
+                "failed to record a template-unresolved event"
             ),
         }
     }
@@ -2030,10 +2075,14 @@ impl WorkflowEngine {
             // message the human believes they authored.
             Some(path) => {
                 let raw = fs::read_to_string(path).map_err(EngineError::Io)?;
-                template::render(&raw, payload).map_err(|err| EngineError::Template {
-                    stage: stage_name.to_string(),
-                    reason: err.to_string(),
-                })?
+                let (rendered, unresolved) =
+                    template::render(&raw, payload).map_err(|err| EngineError::Template {
+                        stage: stage_name.to_string(),
+                        reason: err.to_string(),
+                    })?;
+                self.record_unresolved_template_note(task_id, stage_name, &unresolved)
+                    .await;
+                rendered
             }
             None => input
                 .ok_or_else(|| EngineError::MissingAgentTurnInput(stage_name.to_string()))?
@@ -2821,21 +2870,25 @@ fn capture_label(capture: Option<Capture>) -> Value {
 /// re-runs the same command on every interval, and the payload cannot change
 /// while the stage is current (captures land only on a transition), so
 /// re-rendering would do identical work and invite the two to disagree.
+/// Renders `command`'s templates, plus every placeholder that fell back to
+/// an empty string doing so (#60) — the caller is responsible for surfacing
+/// those (see `record_unresolved_template_note`), since this free function
+/// has no access to `self`/the pool to do it itself.
 fn render_command(
     command: &ShellCommand,
     payload: &Value,
     stage_name: &str,
-) -> Result<ShellCommand, EngineError> {
+) -> Result<(ShellCommand, Vec<String>), EngineError> {
     match command {
         ShellCommand::Inline(line) => {
-            let rendered =
+            let (rendered, unresolved) =
                 template::render(line, payload).map_err(|err| EngineError::Template {
                     stage: stage_name.to_string(),
                     reason: err.to_string(),
                 })?;
-            Ok(ShellCommand::Inline(rendered))
+            Ok((ShellCommand::Inline(rendered), unresolved))
         }
-        ShellCommand::ScriptFile(path) => Ok(ShellCommand::ScriptFile(path.clone())),
+        ShellCommand::ScriptFile(path) => Ok((ShellCommand::ScriptFile(path.clone()), Vec::new())),
     }
 }
 
@@ -5735,6 +5788,66 @@ stages:
         wait_until_events_contain(&pool, &run.id, "echo:fix pr 42").await;
     }
 
+    /// #60's own motivating case: the same coder prompt is entered both
+    /// before and after a review exists, referencing a reviewer's feedback
+    /// that hasn't been captured yet on this — the first — pass. Before
+    /// #60 this killed the task with `workflow_state.current_stage`
+    /// permanently stuck at `coding`; now the turn runs with the
+    /// placeholder blanked, and a note on the timeline says which one.
+    #[tokio::test]
+    async fn an_unresolved_prompt_placeholder_renders_empty_and_the_turn_still_runs() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        fs::write(
+            dir.join("coder-turn.md"),
+            "address: {{ stages.internal_review.feedback }}",
+        )
+        .unwrap();
+        let yaml = r#"
+name: templated
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: {}
+  internal_review:
+    kind: agent_turn
+    role: coder
+    capture: text
+    on: { done: coding }
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "coding").await;
+
+        // The turn ran at all — with the missing feedback blanked, not a
+        // stuck task and a dead subprocess.
+        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+        wait_until_events_contain(&pool, &run.id, "echo:address: ").await;
+
+        let note = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == EventType::TemplateUnresolved)
+            .unwrap_or_else(|| panic!("expected a template_unresolved note on the timeline"));
+        assert_eq!(note.payload["stage"], json!("coding"));
+        assert_eq!(
+            note.payload["placeholders"],
+            json!(["{{ stages.internal_review.feedback }}"])
+        );
+        assert_eq!(note.task_run_id, None);
+    }
+
     /// P2-7a: this is the gap the issue closes — a `prompt_file` entry
     /// stage previously had no way to reach the task's own title/initial
     /// input, only a later stage's capture.
@@ -5816,12 +5929,15 @@ stages:
         wait_until_events_contain(&pool, &run.id, "echo:fix the flaky test").await;
     }
 
-    /// The loader can only check that the referenced stage exists and
+    /// #60: the loader can only check that the referenced stage exists and
     /// captures something; whether its captured JSON actually carries the
-    /// field is a run-time question. An absent one fails the stage rather
-    /// than substituting an empty string into the command.
+    /// field is a run-time question. An absent one used to kill the task —
+    /// `workflow_state.current_stage` was already committed to `report`
+    /// before its command failed to render, with nothing left to ever move
+    /// it — so it now renders empty and the task proceeds instead, with the
+    /// blanked placeholder noted on the timeline rather than silently lost.
     #[tokio::test]
-    async fn an_unresolved_field_fails_the_stage_rather_than_rendering_empty() {
+    async fn an_unresolved_field_renders_empty_and_the_task_proceeds() {
         let pool = connect_in_memory().await.unwrap();
         let yaml = r#"
 name: templated
@@ -5843,44 +5959,31 @@ stages:
         let engine = engine_with_adapter(pool.clone(), "unused");
 
         engine.start_task(&task_id, &def, None).await.unwrap();
-        // The transition into `report` is already committed when its command
-        // fails to render, so the task parks there rather than reaching
-        // `finished` or running anything.
-        wait_until_stage(&pool, &task_id, "report").await;
-        tokio::time::sleep(StdDuration::from_millis(100)).await;
-        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
-        assert_eq!(state.current_stage, "report");
+        wait_until_stage(&pool, &task_id, "finished").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
 
-        let ran: Vec<Value> = events::list_for_task(&pool, &task_id)
+        // The unrenderable placeholder became an empty string rather than
+        // stopping the command from running at all.
+        let ran = wait_until_shell_event_for(&pool, &task_id, "report").await;
+        assert_eq!(ran["command"], json!("echo "));
+
+        // The reason has to be discoverable, same as before #60 — the
+        // difference is it's a note the task survives, not the whole
+        // explanation for why it died.
+        let note = events::list_for_task(&pool, &task_id)
             .await
             .unwrap()
             .into_iter()
-            .filter(|e| e.event_type == EventType::ShellOutput)
-            .map(|e| e.payload)
-            .collect();
-        assert!(
-            ran.iter()
-                .all(|p| p.get("stage").and_then(Value::as_str) != Some("report")),
-            "the unrenderable command should never have run: {ran:?}"
-        );
-
-        // And the reason has to be discoverable. This is *the* expected
-        // run-time failure of templating — the loader can't check whether a
-        // captured payload carries the field — so a timeline that showed the
-        // stage entered and then nothing would leave an operator with only
-        // the daemon's log to go on.
-        let reason = events::list_for_task(&pool, &task_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|e| e.event_type == EventType::Error)
-            .unwrap_or_else(|| panic!("expected a template failure on the timeline"));
-        let message = reason.payload["message"].as_str().unwrap();
-        assert!(message.contains("report"), "{message}");
-        assert!(message.contains("missing"), "{message}");
+            .find(|e| e.event_type == EventType::TemplateUnresolved)
+            .unwrap_or_else(|| panic!("expected a template_unresolved note on the timeline"));
+        assert_eq!(note.payload["stage"], json!("report"));
         assert_eq!(
-            reason.task_run_id, None,
-            "a template fails before any session exists, so it is task-scoped"
+            note.payload["placeholders"],
+            json!(["{{ stages.open_pr.missing }}"])
+        );
+        assert_eq!(
+            note.task_run_id, None,
+            "a template renders before any session exists, so it is task-scoped"
         );
     }
 
@@ -6347,25 +6450,41 @@ stages:
     fn render_command_substitutes_an_inline_command() {
         let payload = json!({"stages": {"open_pr": {"number": 42}}});
         let command = ShellCommand::Inline("gh pr checks {{ stages.open_pr.number }}".to_string());
-        let rendered = render_command(&command, &payload, "checks").unwrap();
+        let (rendered, unresolved) = render_command(&command, &payload, "checks").unwrap();
         assert_eq!(
             rendered,
             ShellCommand::Inline("gh pr checks 42".to_string())
         );
+        assert!(unresolved.is_empty());
     }
 
     #[test]
     fn render_command_leaves_a_script_file_alone() {
         let payload = json!({});
         let command = ShellCommand::ScriptFile(PathBuf::from("/tmp/run.sh"));
-        let rendered = render_command(&command, &payload, "run").unwrap();
+        let (rendered, unresolved) = render_command(&command, &payload, "run").unwrap();
         assert_eq!(rendered, command);
+        assert!(unresolved.is_empty());
     }
 
+    /// #60: a missing *value* renders empty and is reported back rather
+    /// than failing the whole command — `render_command`'s counterpart to
+    /// `template::render`'s own coverage of the same split.
     #[test]
-    fn render_command_reports_an_unresolvable_reference() {
+    fn render_command_substitutes_empty_for_an_unresolvable_reference() {
         let payload = json!({"stages": {"open_pr": {"number": 42}}});
         let command = ShellCommand::Inline("echo {{ stages.open_pr.missing }}".to_string());
+        let (rendered, unresolved) = render_command(&command, &payload, "report").unwrap();
+        assert_eq!(rendered, ShellCommand::Inline("echo ".to_string()));
+        assert_eq!(unresolved, vec!["{{ stages.open_pr.missing }}"]);
+    }
+
+    /// Malformed *syntax* is unaffected by #60 — still a hard error, still
+    /// classified via `EngineError::Template`.
+    #[test]
+    fn render_command_still_reports_malformed_syntax() {
+        let payload = json!({});
+        let command = ShellCommand::Inline("echo {{ stages.open_pr".to_string());
         let err = render_command(&command, &payload, "report").unwrap_err();
         assert!(
             matches!(&err, EngineError::Template { stage, .. } if stage == "report"),
