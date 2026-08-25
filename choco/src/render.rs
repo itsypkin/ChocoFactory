@@ -677,6 +677,8 @@ mod tests {
             title: "x".to_string(),
             status: "open".to_string(),
             config,
+            worktree_repo: None,
+            worktree_project: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -949,6 +951,8 @@ mod tests {
             title: "first line\nsecond line".to_string(),
             status: "open".to_string(),
             config: json!({}),
+            worktree_repo: None,
+            worktree_project: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

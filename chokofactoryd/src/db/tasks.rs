@@ -5,8 +5,8 @@ use sqlx::types::Json;
 use sqlx::{FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
-const COLUMNS: &str =
-    "id, project_id, parent_task_id, workflow_def, title, status, config, created_at, updated_at";
+const COLUMNS: &str = "id, project_id, parent_task_id, workflow_def, title, status, config, \
+     worktree_repo, worktree_project, created_at, updated_at";
 
 #[derive(FromRow)]
 struct TaskRow {
@@ -17,6 +17,8 @@ struct TaskRow {
     title: String,
     status: String,
     config: Json<Value>,
+    worktree_repo: Option<String>,
+    worktree_project: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -31,6 +33,8 @@ impl From<TaskRow> for Task {
             title: row.title,
             status: row.status,
             config: row.config.0,
+            worktree_repo: row.worktree_repo,
+            worktree_project: row.worktree_project,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -153,6 +157,32 @@ pub async fn merge_config(
          WHERE id = ? RETURNING {COLUMNS}"
     ))
     .bind(Json(patch))
+    .bind(now)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
+/// Records the repo path and project name `worktree::ensure` actually used
+/// to create this task's worktree (§5.5 Q7, issue #58). Called once, from
+/// `WorkflowEngine::start_task`, right after `ensure` succeeds — see
+/// `Task::worktree_repo`'s doc comment for why every later lookup
+/// (`engine::working_dir`, terminal-stage removal) must read this snapshot
+/// rather than re-deriving from `config.cwd`/the project's current name.
+pub async fn set_worktree(
+    pool: &SqlitePool,
+    id: &str,
+    repo: &str,
+    project: &str,
+) -> Result<Option<Task>, sqlx::Error> {
+    let now = Utc::now();
+    let row = sqlx::query_as::<_, TaskRow>(&format!(
+        "UPDATE tasks SET worktree_repo = ?, worktree_project = ?, updated_at = ? \
+         WHERE id = ? RETURNING {COLUMNS}"
+    ))
+    .bind(repo)
+    .bind(project)
     .bind(now)
     .bind(id)
     .fetch_optional(pool)
@@ -316,6 +346,37 @@ mod tests {
         let pool = connect_in_memory().await.unwrap();
         assert!(
             merge_config(&pool, "nope", json!({ "cwd": "/x" }))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_worktree_records_the_repo_and_project_snapshot() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task_with_config(&pool, json!({ "cwd": "/repo" })).await;
+
+        let updated = set_worktree(&pool, &task_id, "/repo", "demo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.worktree_repo.as_deref(), Some("/repo"));
+        assert_eq!(updated.worktree_project.as_deref(), Some("demo"));
+
+        // `config.cwd` is untouched — the snapshot lives in its own
+        // columns, not folded into `config` (§5.5 Q7, issue #58).
+        assert_eq!(updated.config["cwd"], "/repo");
+
+        let fetched = get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(fetched, updated);
+    }
+
+    #[tokio::test]
+    async fn set_worktree_on_an_unknown_id_is_none() {
+        let pool = connect_in_memory().await.unwrap();
+        assert!(
+            set_worktree(&pool, "nope", "/repo", "demo")
                 .await
                 .unwrap()
                 .is_none()

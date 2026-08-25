@@ -29,6 +29,16 @@ pub struct Task {
     /// is driven by workflow definitions, not fixed by this crate (§5.4).
     pub status: String,
     pub config: Value,
+    /// The repo path and project name `worktree::ensure` actually used to
+    /// create this task's worktree, snapshotted once at task start for a
+    /// worktree-enabled workflow (§5.5 Q7, issue #58); `None` for every
+    /// other task. Deliberately *not* derived from `config.cwd`/the
+    /// project's current name on demand — both can change after the
+    /// worktree already exists (`PATCH /tasks/{id}/config`, `PATCH
+    /// /projects/{id}`), and re-deriving from their current values would
+    /// let a later stage compute a path `ensure` never actually created.
+    pub worktree_repo: Option<String>,
+    pub worktree_project: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
