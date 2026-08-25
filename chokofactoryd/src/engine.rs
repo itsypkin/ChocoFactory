@@ -6727,6 +6727,13 @@ stages:
         let repo = tempdir();
         init_git_repo(&repo).await;
 
+        // `second` lands on a human_gate, not `terminal`, same reason as
+        // the isolation test above: entering `done` would race this test's
+        // own assertion against terminal-stage worktree removal (the
+        // engine writes `current_stage = "done"` — which the poll below
+        // observes — *before* running "done"'s own entry effects, one of
+        // which is deleting this whole directory). Terminal removal is
+        // checked separately, afterward, once this check is safely done.
         let yaml = r#"
 name: worktree-snapshot-flow
 worktree: true
@@ -6741,7 +6748,10 @@ stages:
   second:
     kind: shell
     command: "touch marker-second"
-    on: { done: done, error: failed }
+    on: { done: verified, error: failed }
+  verified:
+    kind: human_gate
+    on: { resumed: done }
   done:
     kind: terminal
   failed:
@@ -6788,7 +6798,7 @@ stages:
             .unwrap();
 
         engine.advance(&task_id, &def, "resumed").await.unwrap();
-        wait_until_stage(&pool, &task_id, "done").await;
+        wait_until_stage(&pool, &task_id, "verified").await;
 
         assert!(
             original_worktree.join("marker-second").exists(),
@@ -6796,7 +6806,10 @@ stages:
         );
 
         // Terminal removal must target that same original worktree, not
-        // one derived from the now-changed config/project.
+        // one derived from the now-changed config/project. Driven as its
+        // own transition, after the check above, so it can't race it.
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        wait_until_stage(&pool, &task_id, "done").await;
         wait_until_task_status(&pool, &task_id, "closed").await;
         wait_until_path_gone(&original_worktree).await;
     }
