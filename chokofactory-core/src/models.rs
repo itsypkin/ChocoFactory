@@ -154,9 +154,12 @@ pub struct TaskRun {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
-    /// A human-sent message being fed into a session — the initial prompt
-    /// a task was created with, or a `send_message` relay into an
-    /// already-open `agent_turn` (P1-9). This is the only variant here
+    /// A human-sent message — the initial prompt a task was created with, a
+    /// `send_message` relay into an already-open `agent_turn` (P1-9), or a
+    /// human's reply resuming a `human_gate` (#59). The first two are
+    /// session-scoped (`task_run_id` set); a `human_gate` resume has no
+    /// session to attribute it to, so that one is recorded task-scoped
+    /// instead (`task_run_id` is `None`). This is the only variant here
     /// that isn't normalized from an agent adapter's own output; without
     /// it, `events` only ever recorded the agent's half of a conversation.
     HumanMessage,

@@ -355,13 +355,15 @@ stages:
     }
     assert!(recorded, "entry stage was never recorded: {history}");
 
-    // The premise this test rests on: this workflow really is silent apart
-    // from its transitions. If a conversation event ever showed up here,
-    // the WS assertions below could pass for the wrong reason.
+    // The premise this test rests on, up to this point: no session has
+    // opened, so the only event recorded so far is the entry stage's own
+    // transition. Resuming the gate below intentionally adds a
+    // `human_message` event (#59) — checked explicitly further down —
+    // this assertion just pins that nothing *else* has snuck in first.
     let events = history["events"].as_array().unwrap();
     assert!(
         events.iter().all(|e| e["event_type"] == "stage_entered"),
-        "a human_gate-only task should produce nothing but transitions: {events:?}"
+        "a human_gate-only task should have recorded nothing but its entry transition so far: {events:?}"
     );
 
     let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", daemon.ws_url))
@@ -388,6 +390,16 @@ stages:
         )
         .await;
     assert_eq!(status, 202);
+
+    // The human's message is recorded (#59) before the resume advances the
+    // stage, so it's the first thing pushed live.
+    let human_message = next_event(&mut ws)
+        .await
+        .expect("human message was not pushed over the already-open socket");
+    assert_eq!(human_message["event_type"], "human_message");
+    assert_eq!(human_message["payload"]["text"], "go");
+    assert_eq!(human_message["task_id"], task_id.as_str());
+    assert_eq!(human_message["task_run_id"], Value::Null);
 
     let live = next_event(&mut ws)
         .await

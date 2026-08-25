@@ -211,12 +211,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stage_transition_is_pushed_live_without_any_conversation_event() {
+    async fn a_stage_transition_is_pushed_live_with_no_session_involved() {
         let server = TestServer::start().await;
         // Every stage here is a human_gate, so this task opens no agent
-        // session and produces zero conversation events for its whole life
-        // — the transitions are the only thing there is to stream. Before
-        // X-3 a subscriber would have seen nothing at all.
+        // session — no turn/session events for its whole life. Before X-3
+        // a subscriber would have seen nothing at all for a transition
+        // alone; since #59 a human_gate resume also records the human's
+        // message as a task-scoped `human_message` event (no `task_run_id`,
+        // same as the `stage_entered` it precedes), so this asserts both
+        // land on the live stream, in order.
         server.write_workflow(
             "gated-relay",
             r#"
@@ -286,6 +289,18 @@ stages:
             )
             .await;
         assert_eq!(response.status(), 202);
+
+        // The human's message is recorded (#59) before the resume advances
+        // the stage, so it's the first thing pushed live.
+        let Ok(Some(Ok(WsMessage::Text(text)))) =
+            tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+        else {
+            panic!("human message was not pushed over the already-open socket");
+        };
+        let human_message: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(human_message["event_type"], "human_message");
+        assert_eq!(human_message["payload"]["text"], "go");
+        assert_eq!(human_message["task_run_id"], Value::Null);
 
         let Ok(Some(Ok(WsMessage::Text(text)))) =
             tokio::time::timeout(Duration::from_secs(5), ws.next()).await
