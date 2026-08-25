@@ -195,6 +195,22 @@ impl WorkflowDefinition {
                 });
             }
 
+            // A human's reply is free text they typed, not a command's
+            // structured stdout (#59) — `capture: json` would either fail
+            // to parse (falling back to text with a warning nobody
+            // watching the timeline is likely to notice) or, worse,
+            // silently succeed on a reply that happens to look like JSON.
+            // Rejected at load time rather than left to degrade quietly at
+            // run time.
+            if let StageKind::HumanGate {
+                capture: Some(Capture::Json),
+            } = &stage.kind
+            {
+                return Err(WorkflowDefError::HumanGateCaptureMustBeText {
+                    stage: stage_name.clone(),
+                });
+            }
+
             self.validate_templates(stage_name, stage)?;
         }
 
@@ -354,7 +370,16 @@ pub enum StageKind {
         timeout: Option<Duration>,
         outcomes: Vec<PollOutcome>,
     },
-    HumanGate,
+    HumanGate {
+        /// Keeps the human's reply that resumed this gate under
+        /// `payload.stages.<this stage>` (#59), so a later stage — most
+        /// often the coder a loop-guard escalation routes back to — can
+        /// template `{{ stages.<gate>.… }}` and see what they said, instead
+        /// of the redirect being silently discarded. `Capture::Json` is
+        /// rejected at load time (`validate`) — a human's reply is free
+        /// text, not a command's structured stdout.
+        capture: Option<Capture>,
+    },
     Terminal,
 }
 
@@ -457,7 +482,10 @@ enum RawStageKind {
         #[serde(default)]
         outcomes: Vec<RawPollOutcome>,
     },
-    HumanGate,
+    HumanGate {
+        #[serde(default)]
+        capture: Option<Capture>,
+    },
     Terminal,
 }
 
@@ -557,7 +585,7 @@ impl RawStage {
                     })
                     .collect(),
             },
-            RawStageKind::HumanGate => StageKind::HumanGate,
+            RawStageKind::HumanGate { capture } => StageKind::HumanGate { capture },
             RawStageKind::Terminal => StageKind::Terminal,
         };
 
@@ -613,6 +641,9 @@ fn declares_capture(kind: &StageKind) -> bool {
             capture: Some(_),
             ..
         } | StageKind::Poll {
+            capture: Some(_),
+            ..
+        } | StageKind::HumanGate {
             capture: Some(_),
             ..
         }
@@ -798,6 +829,9 @@ pub enum WorkflowDefError {
     CaptureOnOpenEndedTurn {
         stage: String,
     },
+    HumanGateCaptureMustBeText {
+        stage: String,
+    },
     InvalidTemplate {
         stage: String,
         field: &'static str,
@@ -909,6 +943,11 @@ impl fmt::Display for WorkflowDefError {
                 f,
                 "agent_turn stage '{stage}' declares 'capture:' but has an empty 'on:' map, so it \
                  never concludes and the capture could never be taken"
+            ),
+            WorkflowDefError::HumanGateCaptureMustBeText { stage } => write!(
+                f,
+                "human_gate stage '{stage}' declares 'capture: json', but a human's reply is free \
+                 text, not structured data — only 'capture: text' is supported"
             ),
             WorkflowDefError::InvalidTemplate {
                 stage,
@@ -1996,6 +2035,66 @@ stages:
   report:
     kind: shell
     command: "echo pr {{ stages.open_pr.number }} at {{ stages.open_pr.url }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    #[test]
+    fn parses_capture_text_on_a_human_gate() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: gated
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::HumanGate { capture } = &def.stages["gate"].kind else {
+            panic!("expected human_gate stage");
+        };
+        assert_eq!(*capture, Some(Capture::Text));
+    }
+
+    #[test]
+    fn rejects_capture_json_on_a_human_gate() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: gated
+stages:
+  gate:
+    kind: human_gate
+    capture: json
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::HumanGateCaptureMustBeText { stage } if stage == "gate"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_template_reference_to_a_capturing_human_gate() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: gated
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+    on: { resumed: coding }
+  coding:
+    kind: shell
+    command: "echo {{ stages.gate }}"
     on: { done: finished }
   finished:
     kind: terminal

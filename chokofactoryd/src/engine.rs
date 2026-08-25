@@ -558,12 +558,14 @@ impl WorkflowEngine {
     }
 
     /// Dispatches a human message against `task_id`'s current stage to
-    /// whichever of `send_message`/`advance` it actually needs (P1-9): a
-    /// standing-open `agent_turn` relays `text` straight into its live
-    /// session via `send_message`; a `human_gate` has no session to relay
-    /// into at all — the human's `text` is the resume signal itself, so
-    /// this calls `advance(task_id, definition, "resumed")` instead. Any
-    /// other stage kind (a mid-transition `agent_turn`, `shell`, `poll`,
+    /// whichever of `send_message`/`advance_from_stage` it actually needs
+    /// (P1-9): a standing-open `agent_turn` relays `text` straight into its
+    /// live session via `send_message`; a `human_gate` has no session to
+    /// relay into at all — the human's `text` is the resume signal itself,
+    /// so this transitions it directly (§59), threading `text` through as
+    /// the gate's capture (if it declared `capture: text`) the same way a
+    /// `shell`/`poll` stage's output is threaded through today. Any other
+    /// stage kind (a mid-transition `agent_turn`, `shell`, `poll`,
     /// `terminal`) is rejected rather than guessing.
     ///
     /// This re-loads `task`/`workflow_state`/the workflow definition itself
@@ -597,10 +599,45 @@ impl WorkflowEngine {
             .ok_or_else(|| SendMessageOrResumeError::UnknownStage(current_stage.clone()))?;
 
         match &stage_def.kind {
-            StageKind::HumanGate => self
-                .advance(task_id, &definition, "resumed")
+            StageKind::HumanGate { capture } => {
+                let (captured, note) = derive_capture(
+                    *capture,
+                    text,
+                    task_id,
+                    &current_stage,
+                    "the human's message",
+                );
+
+                // Best-effort, log-and-continue — same as `send_message`'s
+                // chat-path recording just above it in this file. No
+                // `task_run` exists for a `human_gate` (it never opens a
+                // session), so this uses `append_for_task` — the same
+                // task-scoped, session-less path `dispatch_stage` already
+                // uses for `StageEntered`/`Error` — rather than `append`,
+                // which needs a `task_run_id` to derive `task_id` from.
+                let mut payload = json!({ "text": text });
+                if let Some(note) = note {
+                    payload["note"] = json!(note);
+                }
+                match events::append_for_task(&self.pool, task_id, EventType::HumanMessage, payload)
+                    .await
+                {
+                    Ok(_) => self.events_notify.notify_waiters(),
+                    Err(err) => {
+                        tracing::error!(task_id, %err, "failed to record human message event")
+                    }
+                }
+
+                self.advance_from_stage(
+                    task_id,
+                    &definition,
+                    "resumed",
+                    Some(&current_stage),
+                    captured,
+                )
                 .await
-                .map_err(SendMessageOrResumeError::Advance),
+                .map_err(SendMessageOrResumeError::Advance)
+            }
             StageKind::AgentTurn { .. } if stage_def.on.is_empty() => self
                 .send_message(task_id, text)
                 .await
@@ -720,9 +757,14 @@ impl WorkflowEngine {
     /// in that stage's `on:` map and running any `loop_guard` (§5.3) —
     /// transitions `workflow_state`, and enters whatever stage results.
     ///
-    /// Callers: the `agent_turn` completion watcher spawned by
-    /// `enter_stage` (for a plain single-shot turn's `done`), and
-    /// `send_message_or_resume`'s `human_gate` relay (its `resumed`).
+    /// The `expected_stage`/`capture`-less form of `advance_from_stage`, for
+    /// a caller with nothing to guard or thread through. Every in-process
+    /// caller that has either — the `shell`/`poll`/`agent_turn` completion
+    /// watchers spawned by `enter_stage`, and `send_message_or_resume`'s
+    /// `human_gate` relay (#59) — calls `advance_from_stage` directly
+    /// instead, so this simpler form is currently exercised only by tests;
+    /// kept `pub` as the natural entry point for a caller that genuinely
+    /// has no stage to guard against and nothing to capture.
     pub async fn advance(
         self: &Arc<Self>,
         task_id: &str,
@@ -1007,9 +1049,12 @@ impl WorkflowEngine {
                 .await
             }
             // Pauses the task with nothing further to do here; whatever
-            // relays the next human message is responsible for calling
-            // `advance(task_id, definition, "resumed")` once it arrives.
-            StageKind::HumanGate => Ok(()),
+            // relays the next human message is responsible for advancing
+            // this stage on `"resumed"` once it arrives — see
+            // `send_message_or_resume`'s `HumanGate` arm, which also
+            // threads the message through as this stage's capture (#59)
+            // if it declared one.
+            StageKind::HumanGate { .. } => Ok(()),
             StageKind::Terminal => {
                 // Best-effort, not `?`: propagating this would skip the
                 // caller's (`advance`/`start_task`) lock-eviction check for
@@ -4677,6 +4722,86 @@ stages:
 
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "done");
+    }
+
+    /// #59: a `human_gate` that declares `capture: text` keeps the human's
+    /// reply, and records it on the timeline — the two things the bug
+    /// report says today's `HumanGate` arm drops entirely.
+    fn write_capturing_human_gate_workflow(workflows_dir: &Path) {
+        std::fs::write(
+            workflows_dir.join("gated-capture.yaml"),
+            r#"
+name: gated-capture
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_message_or_resume_threads_a_human_gates_reply_through_as_its_capture() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_capturing_human_gate_workflow(&workflows_dir);
+        let def =
+            Arc::new(WorkflowDefinition::load(&workflows_dir.join("gated-capture.yaml")).unwrap());
+        let task_id = seed_task(&pool, "gated-capture").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine
+            .send_message_or_resume(&task_id, "go fix the off-by-one in the loop guard")
+            .await
+            .unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "done");
+        assert_eq!(
+            state.payload["stages"]["gate"],
+            json!("go fix the off-by-one in the loop guard")
+        );
+
+        // Recorded task-scoped (no task_run — a human_gate never opens a
+        // session), unlike the chat path's session-scoped HumanMessage.
+        let recorded = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == EventType::HumanMessage)
+            .expect("expected a HumanMessage event");
+        assert_eq!(recorded.task_run_id, None);
+        assert_eq!(
+            recorded.payload["text"],
+            json!("go fix the off-by-one in the loop guard")
+        );
+    }
+
+    /// A `human_gate` with no `capture:` declared keeps behaving exactly as
+    /// before #59 — no payload entry, just the transition.
+    #[tokio::test]
+    async fn send_message_or_resume_on_a_non_capturing_human_gate_stores_no_payload() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_human_gate_chain_workflow(&workflows_dir);
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, "gated").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine
+            .send_message_or_resume(&task_id, "ignored for a non-capturing human_gate")
+            .await
+            .unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "done");
+        assert!(state.payload.get("stages").is_none());
     }
 
     #[tokio::test]

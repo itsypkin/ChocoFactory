@@ -71,9 +71,17 @@ impl From<SendMessageOrResumeError> for ApiError {
             // the *already-transitioned* stage and finds "resumed" isn't
             // one of its outcomes (or that it's now terminal) — a benign
             // "someone already resumed this" conflict, not a server
-            // fault.
+            // fault. `StageMovedOn` joins this list as of #59: threading a
+            // `human_gate`'s capture through means this path now calls
+            // `advance_from_stage` with `expected_stage` set (so the
+            // capture lands on the stage that actually produced it), and
+            // that's the exact same race surfacing through a stronger,
+            // more specific check than `UnknownOutcome` used to catch it
+            // with.
             SendMessageOrResumeError::Advance(
-                EngineError::UnknownOutcome { .. } | EngineError::TerminalStageHasNoTransitions(_),
+                EngineError::UnknownOutcome { .. }
+                | EngineError::TerminalStageHasNoTransitions(_)
+                | EngineError::StageMovedOn { .. },
             ) => ApiError::Conflict(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
