@@ -723,3 +723,226 @@ stages:
     assert_eq!(turn[0]["payload"]["applied"], true);
     assert_eq!(turn[0]["payload"]["note"], Value::Null);
 }
+
+// ---- built-in coding-task workflow, real daemon (P2-7, issue #18) --------
+//
+// The engine-level tests in `engine.rs` already cover the loop-guard/
+// revision-routing mechanics directly against the real workflow file; what
+// this one proves instead is that the whole stack — real daemon process,
+// HTTP API, startup seeding of `coding-task.yaml` and its prompts, and the
+// worktree it opts into — actually delivers a task through it, same as the
+// other `real_binary_*` tests do for chat/poll/capture.
+
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir() -> TempDir {
+    let path = std::env::temp_dir().join(format!(
+        "chokofactoryd-e2e-coding-task-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    TempDir(path)
+}
+
+async fn git(repo: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn write_script(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+#[tokio::test]
+async fn real_binary_walks_the_coding_task_workflow_to_done() {
+    let repo = tempdir();
+    git(&repo, &["init", "-q"]).await;
+    git(&repo, &["config", "user.email", "test@example.com"]).await;
+    git(&repo, &["config", "user.name", "Test"]).await;
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    git(&repo, &["add", "."]).await;
+    git(&repo, &["commit", "-q", "-m", "init"]).await;
+    let origin = tempdir();
+    git(&origin, &["init", "-q", "--bare"]).await;
+    git(
+        &repo,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    )
+    .await;
+
+    // A stub `gh` covering exactly the three invocations
+    // `coding-task.yaml` makes, backed by real `git`/the real repo above
+    // for everything else. Scoped to just this daemon subprocess's `PATH`
+    // (passed via `spawn_with_home_and_env`'s `env`) — unlike the
+    // equivalent `engine.rs` test, this test controls the `Command` that
+    // spawns the daemon directly, so there's no need to mutate the test
+    // process's own environment to get a stub in scope.
+    let scripts_dir = tempdir();
+    write_script(
+        &scripts_dir,
+        "gh",
+        r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+    "pr create")
+        echo "https://example.test/pr/42"
+        ;;
+    "pr view")
+        if printf '%s\n' "$@" | grep -q reviewDecision; then
+            echo "APPROVED"
+        else
+            echo '{"number": 42, "url": "https://example.test/pr/42"}'
+        fi
+        ;;
+    "pr checks")
+        echo "SUCCESS"
+        ;;
+    *)
+        echo "stub gh: unhandled subcommand: $*" >&2
+        exit 1
+        ;;
+esac
+"#,
+    );
+    let path_with_stub = format!(
+        "{}:{}",
+        scripts_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // A single fake `claude` binary standing in for both `coder` and
+    // `reviewer` — `CHOKOFACTORY_CLAUDE_BINARY` is one binary for the
+    // whole daemon, same limitation `engine.rs`'s equivalent helper's doc
+    // comment explains. `adapter/claude.rs::spawn` passes `--system-prompt
+    // <text>` whenever a role resolves one, and `coder-system.md`/
+    // `reviewer-system.md` open with distinct wording — the wrapper greps
+    // its own argv for that marker.
+    let mock_claude = workspace_binary("mock-claude");
+    assert!(
+        mock_claude.exists(),
+        "mock-claude binary not found at {mock_claude:?} \
+         (run `cargo build --workspace --all-targets` first)"
+    );
+    std::fs::write(
+        scripts_dir.join("reviewer-reply.json"),
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .unwrap();
+    let claude_wrapper = write_script(
+        &scripts_dir,
+        "mock-claude-role-dispatch.sh",
+        &format!(
+            r#"#!/bin/sh
+set -eu
+role="coder"
+for arg in "$@"; do
+    case "$arg" in
+        *"reviewing agent"*) role="reviewer" ;;
+    esac
+done
+export MOCK_CLAUDE_ONESHOT=1
+if [ "$role" = "reviewer" ]; then
+    export MOCK_CLAUDE_REPLY="$(cat "{scripts_dir}/reviewer-reply.json")"
+else
+    export MOCK_CLAUDE_REPLY="did the thing"
+fi
+exec "{mock_claude}" "$@"
+"#,
+            scripts_dir = scripts_dir.to_string_lossy(),
+            mock_claude = mock_claude.display(),
+        ),
+    );
+
+    let home = TempHome::new();
+    let daemon = Daemon::spawn_with_home_and_env(
+        home,
+        &[
+            (
+                "CHOKOFACTORY_CLAUDE_BINARY",
+                &claude_wrapper.to_string_lossy(),
+            ),
+            ("PATH", &path_with_stub),
+        ],
+    )
+    .await;
+
+    let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    assert_eq!(status, 201);
+    let project_id = project["id"].as_str().unwrap();
+
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project_id,
+                "workflow_def": "coding-task",
+                "title": "Add a small feature",
+                "prompt": "Add a small feature",
+                "config": { "cwd": repo.to_string_lossy() },
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "task creation failed: {task}");
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    for _ in 0..300 {
+        let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+        if detail["workflow_state"]["current_stage"] == "done" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    assert_eq!(
+        detail["workflow_state"]["current_stage"], "done",
+        "task did not finish: {detail}"
+    );
+    assert_eq!(detail["status"], "closed");
+
+    let trail: Vec<&str> = detail["stage_trail"]
+        .as_array()
+        .expect("stage_trail missing")
+        .iter()
+        .map(|e| e["payload"]["stage"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        trail,
+        vec![
+            "coding",
+            "internal_review",
+            "open_pr",
+            "checks_polling",
+            "awaiting_human_review",
+            "done",
+        ]
+    );
+}
