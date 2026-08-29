@@ -90,9 +90,16 @@ mod tests {
             .await
             .unwrap();
         let types: Vec<EventType> = stored.iter().map(|e| e.event_type).collect();
+        // `fake_claude_oneshot.py` emits a `result` line after its reply
+        // (#70), which now normalizes to `TurnCompleted` rather than being
+        // discarded.
         assert_eq!(
             types,
-            vec![EventType::SessionMeta, EventType::AssistantMessage]
+            vec![
+                EventType::SessionMeta,
+                EventType::AssistantMessage,
+                EventType::TurnCompleted
+            ]
         );
         assert_eq!(stored[1].payload["text"], "echo:hello");
         // Both rows resolve back to the run they were captured from.

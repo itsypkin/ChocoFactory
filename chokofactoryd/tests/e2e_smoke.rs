@@ -637,9 +637,11 @@ stages:
                 "MOCK_CLAUDE_REPLY",
                 r#"{"outcome": "approved", "comments": "ship-it"}"#,
             ),
-            // A capturing stage only concludes when its run goes idle, and
-            // a reaped run deliberately does not auto-advance.
-            ("MOCK_CLAUDE_ONESHOT", "1"),
+            // Deliberately *not* MOCK_CLAUDE_ONESHOT: `mock-claude` without
+            // it stays open on stdin after replying, exactly like the real
+            // `claude --input-format stream-json` CLI (#70). A capturing
+            // single-shot turn must conclude on its own `result` line, not
+            // on the mock's test-only self-exit shortcut.
             ("MOCK_CLAUDE_TOOL_USE", "1"),
         ],
     )
@@ -845,6 +847,13 @@ esac
     // <text>` whenever a role resolves one, and `coder-system.md`/
     // `reviewer-system.md` open with distinct wording — the wrapper greps
     // its own argv for that marker.
+    //
+    // Deliberately does not set MOCK_CLAUDE_ONESHOT: every stage this
+    // workflow walks (`coding`, `internal_review`, `revising`) is a
+    // single-shot `agent_turn`, and `mock-claude` without that flag stays
+    // open on stdin after replying — exactly the real `claude
+    // --input-format stream-json` CLI's shape (#70). This is the whole
+    // multi-role workflow proving that shape doesn't wedge it.
     let mock_claude = workspace_binary("mock-claude");
     assert!(
         mock_claude.exists(),
@@ -868,7 +877,6 @@ for arg in "$@"; do
         *"reviewing agent"*) role="reviewer" ;;
     esac
 done
-export MOCK_CLAUDE_ONESHOT=1
 if [ "$role" = "reviewer" ]; then
     export MOCK_CLAUDE_REPLY="$(cat "{scripts_dir}/reviewer-reply.json")"
 else
