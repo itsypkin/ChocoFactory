@@ -7057,4 +7057,296 @@ stages:
         wait_until_task_status(&pool, &task_id, "closed").await;
         wait_until_path_gone(&original_worktree).await;
     }
+
+    // ---- built-in coding-task workflow (P2-7, issue #18) -----------------
+
+    /// Locates a sibling workspace binary next to this test binary
+    /// (`target/<profile>/deps/<test-exe>` -> `target/<profile>/<name>`),
+    /// same technique `tests/e2e_smoke.rs`'s own `workspace_binary` uses —
+    /// duplicated rather than shared, since that's a separate integration
+    /// test crate this `#[cfg(test)]` module can't import from.
+    fn workspace_binary(name: &str) -> PathBuf {
+        let mut path = std::env::current_exe().expect("test binary has no path");
+        path.pop();
+        if path.ends_with("deps") {
+            path.pop();
+        }
+        path.join(name)
+    }
+
+    /// Writes an executable script to `dir/name` with `contents`.
+    fn write_script(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    /// A single fake `claude` binary standing in for *both* `coder` and
+    /// `reviewer` — `engine_with_adapter` configures one binary for the
+    /// whole engine (`ClaudeAdapter::spawn` always uses its own fixed
+    /// `binary` field, never `RoleConfig.cli` — a role's `cli:` doesn't
+    /// pick the executable), so distinguishing the two roles has to happen
+    /// inside the script itself. `adapter/claude.rs::spawn` passes
+    /// `--system-prompt <text>` whenever a role resolves one, and
+    /// `coder-system.md`/`reviewer-system.md` open with distinct wording —
+    /// the wrapper greps its own argv for that marker. Both roles need
+    /// `MOCK_CLAUDE_ONESHOT` (neither `coding`/`revising` nor
+    /// `internal_review` is open-ended, so each only concludes once its
+    /// run goes idle); the reviewer's reply is read fresh from
+    /// `reply_path` on every invocation, so a test can set it once up
+    /// front and never needs to regenerate this script.
+    fn role_dispatch_claude(dir: &Path, mock_claude: &Path, reply_path: &Path) -> PathBuf {
+        write_script(
+            dir,
+            "mock-claude-role-dispatch.sh",
+            &format!(
+                r#"#!/bin/sh
+set -eu
+role="coder"
+for arg in "$@"; do
+    case "$arg" in
+        *"reviewing agent"*) role="reviewer" ;;
+    esac
+done
+export MOCK_CLAUDE_ONESHOT=1
+if [ "$role" = "reviewer" ]; then
+    export MOCK_CLAUDE_REPLY="$(cat "{reply_path}")"
+else
+    export MOCK_CLAUDE_REPLY="did the thing"
+fi
+exec "{mock_claude}" "$@"
+"#,
+                reply_path = reply_path.display(),
+                mock_claude = mock_claude.display(),
+            ),
+        )
+    }
+
+    /// Prepends `dir` to `PATH` for the process, restoring the original
+    /// value on drop.
+    ///
+    /// Mutating a whole test process's environment for one test is a
+    /// theoretical race against every other test running concurrently in
+    /// the same process — but this only ever prepends a stub named `gh`,
+    /// and grepping this entire crate confirms no other test anywhere
+    /// shells out to a bare `gh` command (every other `"gh ..."` string in
+    /// the test suite is loader/template text that's only ever parsed or
+    /// rendered, never executed), so the practical risk is nil. `unsafe`
+    /// per Rust 2024's `std::env::set_var`, which exists for exactly this
+    /// class of whole-process mutation.
+    struct PathPrefixGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl PathPrefixGuard {
+        fn new(dir: &Path) -> Self {
+            let original = std::env::var_os("PATH");
+            let mut new_path = std::ffi::OsString::from(dir);
+            if let Some(existing) = &original {
+                new_path.push(":");
+                new_path.push(existing);
+            }
+            // SAFETY: see struct doc comment.
+            unsafe { std::env::set_var("PATH", new_path) };
+            PathPrefixGuard { original }
+        }
+    }
+
+    impl Drop for PathPrefixGuard {
+        fn drop(&mut self) {
+            // SAFETY: see struct doc comment.
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var("PATH", value),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    /// A stub `gh` covering exactly the three invocations
+    /// `coding-task.yaml` makes (`pr create`, `pr view` — with or without
+    /// `--json reviewDecision`, `pr checks`), backed by real `git`/a real
+    /// local bare repo for everything else. Returns the directory to
+    /// prepend to `PATH`.
+    fn gh_stub_dir(dir: &Path) -> PathBuf {
+        write_script(
+            dir,
+            "gh",
+            r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+    "pr create")
+        echo "https://example.test/pr/42"
+        ;;
+    "pr view")
+        if printf '%s\n' "$@" | grep -q reviewDecision; then
+            echo "APPROVED"
+        else
+            echo '{"number": 42, "url": "https://example.test/pr/42"}'
+        fi
+        ;;
+    "pr checks")
+        echo "SUCCESS"
+        ;;
+    *)
+        echo "stub gh: unhandled subcommand: $*" >&2
+        exit 1
+        ;;
+esac
+"#,
+        );
+        dir.to_path_buf()
+    }
+
+    /// `scripts_dir` is owned by the caller, not this function — it has to
+    /// outlive the whole test (every stage re-spawns the wrapper), and a
+    /// `TempDir` created and dropped in here would delete it out from under
+    /// later stages the moment this function returns.
+    async fn seed_coding_task(
+        pool: &SqlitePool,
+        repo: &Path,
+        scripts_dir: &Path,
+        reviewer_reply: &str,
+    ) -> (String, Arc<WorkflowDefinition>, PathBuf) {
+        let def = Arc::new(
+            WorkflowDefinition::load(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../workflows/coding-task.yaml")
+                    .as_path(),
+            )
+            .expect("workflows/coding-task.yaml failed to load"),
+        );
+
+        let mock_claude = workspace_binary("mock-claude");
+        assert!(
+            mock_claude.exists(),
+            "mock-claude binary not found at {mock_claude:?} \
+             (run `cargo build --workspace --all-targets` first)"
+        );
+        let reply_path = scripts_dir.join("reviewer-reply.json");
+        fs::write(&reply_path, reviewer_reply).unwrap();
+        let claude_wrapper = role_dispatch_claude(scripts_dir, &mock_claude, &reply_path);
+
+        let project_id = projects::create(pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: &def.name,
+                title: "Add a small feature",
+                config: json!({ "cwd": repo.to_string_lossy() }),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        (task_id, def, claude_wrapper)
+    }
+
+    #[tokio::test]
+    async fn the_real_coding_task_workflow_walks_the_happy_path_to_done() {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+        let origin = tempdir();
+        git(&origin, &["init", "-q", "--bare"]).await;
+        git(
+            &repo,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        )
+        .await;
+
+        let scripts_dir = tempdir();
+        let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+
+        let (task_id, def, claude_wrapper) = seed_coding_task(
+            &pool,
+            &repo,
+            &scripts_dir,
+            r#"{"outcome": "approved", "feedback": ""}"#,
+        )
+        .await;
+        let engine = engine_with_adapter(pool.clone(), &claude_wrapper.to_string_lossy());
+
+        engine
+            .start_task(&task_id, &def, Some("Add a small feature"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "done").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        assert_eq!(
+            stage_trail(&pool, &task_id)
+                .await
+                .into_iter()
+                .map(|(stage, _)| stage)
+                .collect::<Vec<_>>(),
+            vec![
+                "coding",
+                "internal_review",
+                "open_pr",
+                "checks_polling",
+                "awaiting_human_review",
+                "done",
+            ]
+        );
+
+        // Worktree cleanup (#58) still fires for the real shipped workflow.
+        let worktree_dir = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
+        wait_until_path_gone(&worktree_dir).await;
+    }
+
+    /// The coder/reviewer loop (not just the happy path) actually wires up
+    /// end to end: every return path lands on `revising`, not `coding`
+    /// (§ planning notes on #18), and the loop guard escalates rather than
+    /// looping forever.
+    #[tokio::test]
+    async fn the_real_coding_task_workflow_escalates_after_the_loop_guard_trips() {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+        // No `origin` remote and no `gh` stub — this never reaches
+        // `open_pr`, so neither is needed.
+        let scripts_dir = tempdir();
+
+        let (task_id, def, claude_wrapper) = seed_coding_task(
+            &pool,
+            &repo,
+            &scripts_dir,
+            r#"{"outcome": "changes_requested", "feedback": "needs more tests"}"#,
+        )
+        .await;
+        let engine = engine_with_adapter(pool.clone(), &claude_wrapper.to_string_lossy());
+
+        engine
+            .start_task(&task_id, &def, Some("Add a small feature"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "escalate_to_human").await;
+
+        let trail: Vec<String> = stage_trail(&pool, &task_id)
+            .await
+            .into_iter()
+            .map(|(stage, _)| stage)
+            .collect();
+        assert_eq!(
+            trail.iter().filter(|s| s.as_str() == "coding").count(),
+            1,
+            "coding only ever runs once; every return path goes through revising: {trail:?}"
+        );
+        assert!(
+            trail.iter().filter(|s| s.as_str() == "revising").count() >= 3,
+            "expected at least 3 trips through revising before the loop guard tripped: {trail:?}"
+        );
+    }
 }

@@ -1,0 +1,99 @@
+name: coding-task
+worktree: true
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+    system_prompt_file: prompts/coder-system.md
+  reviewer:
+    cli: claude
+    model: sonnet
+    system_prompt_file: prompts/reviewer-system.md
+
+stages:
+  # First attempt at the task. Every later return path (a failed review, a
+  # human's redirect, red CI, a PR review requesting changes) lands on
+  # `revising`, not back here — see `revising`'s own comment.
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompts/coder-turn.md
+    on: { done: internal_review }
+
+  # The single landing spot for every way work comes back. The coder is an
+  # agent with tool access, so it can look up *why* it's back itself (CI
+  # logs, PR comments); only what it genuinely can't look up — a reviewer's
+  # written feedback, or a human's redirect note — gets templated in
+  # (`coder-revise.md`), and only one of those two is ever populated for a
+  # given entry (the other renders empty, #60).
+  revising:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompts/coder-revise.md
+    on: { done: internal_review }
+
+  # The reviewer replies with structured JSON (`{"outcome": ..., "feedback":
+  # ...}` — see reviewer-system.md); `capture: json` reads `on:`'s next stage
+  # straight from the reply's own `outcome` key (#45).
+  internal_review:
+    kind: agent_turn
+    role: reviewer
+    prompt_file: prompts/reviewer-turn.md
+    capture: json
+    on:
+      approved: open_pr
+      changes_requested: revising
+    loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Reached either because the coder/reviewer loop guard tripped, or
+  # because `open_pr` itself failed (see below). `capture: text` keeps the
+  # human's reply so `revising` can see what they said.
+  escalate_to_human:
+    kind: human_gate
+    capture: text
+    on: { resumed: revising }
+
+  # `gh pr create` has no `--json` flag — the PR's number/url can only be
+  # read back with a separate `gh pr view` after creating it. Earlier
+  # commands' stdout is discarded so `capture: json` sees only the last
+  # command's output.
+  open_pr:
+    kind: shell
+    command: >-
+      git push -u origin HEAD >/dev/null &&
+      gh pr create --fill >/dev/null &&
+      gh pr view --json number,url
+    capture: json
+    timeout: 5m
+    on: { done: checks_polling, error: escalate_to_human }
+
+  checks_polling:
+    kind: poll
+    command: "gh pr checks {{ stages.open_pr.number }} --json state -q '.[].state' | sort -u"
+    interval: 30s
+    timeout: 5m
+    outcomes:
+      - match: "^SUCCESS$"
+        then: green
+      - match: "FAILURE|ERROR"
+        then: red
+    on:
+      green: awaiting_human_review
+      red: revising
+      timeout: awaiting_human_review
+
+  awaiting_human_review:
+    kind: poll
+    command: "gh pr view {{ stages.open_pr.number }} --json reviewDecision -q .reviewDecision"
+    interval: 60s
+    outcomes:
+      - match: "APPROVED"
+        then: approved
+      - match: "CHANGES_REQUESTED"
+        then: changes_requested
+    on:
+      approved: done
+      changes_requested: revising
+
+  done:
+    kind: terminal
