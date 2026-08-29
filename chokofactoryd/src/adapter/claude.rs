@@ -9,8 +9,10 @@ use tokio::sync::mpsc;
 use super::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, RoleConfig};
 
 /// Wraps `claude --print --output-format=stream-json --input-format=stream-json
-/// [--resume <id>]` as a subprocess (§4). Every turn — including the
-/// first — is sent as a stream-json user-turn line over stdin, so
+/// [--permission-mode=bypassPermissions] [--resume <id>]` as a subprocess
+/// (§4) — the permission flag only when `RoleConfig.sandboxed` says `cwd`
+/// is a disposable worktree (#67). Every turn — including the first — is
+/// sent as a stream-json user-turn line over stdin, so
 /// `start`/`resume`/`AgentHandle::send` all go through the same path.
 pub struct ClaudeAdapter {
     binary: String,
@@ -72,6 +74,23 @@ fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    // `claude`'s normal permission model expects a human to approve each
+    // edit/write interactively — there is no human on the other end of
+    // this stdin pipe, ever, so without this every write stalls on an
+    // approval that can structurally never arrive (issue #67: observed
+    // live, a coder turn spent 4+ minutes and dozens of tool calls trying
+    // every workaround before giving up entirely). Only safe when `cwd`
+    // is the disposable, isolated worktree a workflow opted into
+    // (`cfg.sandboxed`, §5.5 Q7, issue #58) — exactly the "sandbox"
+    // scenario `claude --help` names as this flag's intended use;
+    // `cfg.sandboxed == false` means `cwd` is the task's real configured
+    // repo (or the daemon's own cwd, for a workflow like `chat` that has
+    // no repo at all), where bypassing every permission check would be a
+    // straightforward security regression instead of a safe default.
+    if cfg.sandboxed {
+        command.arg("--permission-mode").arg("bypassPermissions");
+    }
 
     if let Some(model) = &cfg.model {
         command.arg("--model").arg(model);
@@ -390,6 +409,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
+            sandboxed: false,
         };
         let mut handle = adapter.start("hello", &cfg).unwrap();
 
@@ -423,6 +443,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
+            sandboxed: false,
         };
         let mut handle = adapter
             .resume("fixed-session-id", "hello again", &cfg)
@@ -433,6 +454,59 @@ mod tests {
             first,
             AgentEvent::SessionMeta {
                 session_id: "fixed-session-id".to_string()
+            }
+        );
+    }
+
+    /// #67: `claude`'s normal permission model expects a human to approve
+    /// each edit interactively, which can never happen on the other end of
+    /// this stdin pipe — a sandboxed spawn (`cfg.sandboxed`, a disposable
+    /// worktree the workflow opted into, §5.5 Q7/#58) opts out of it.
+    #[tokio::test]
+    async fn a_sandboxed_spawn_bypasses_claudes_own_permission_prompts() {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+
+        handle.recv().await.unwrap(); // SessionMeta
+        let reply = handle.recv().await.unwrap();
+        assert_eq!(
+            reply,
+            AgentEvent::AssistantMessage {
+                text: "model=<unset>|system_prompt=<unset>|permission_mode=bypassPermissions"
+                    .to_string()
+            }
+        );
+    }
+
+    /// The other half of #67: a task whose workflow never opted into a
+    /// disposable worktree (`chat`, or any custom definition that omits
+    /// `worktree: true`) must keep `claude`'s own permission prompts
+    /// enabled — `cwd` there is the task's real configured repo, or the
+    /// daemon's own cwd, neither of which bypassing every edit check is
+    /// safe against.
+    #[tokio::test]
+    async fn an_unsandboxed_spawn_leaves_claudes_permission_prompts_enabled() {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: false,
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+
+        handle.recv().await.unwrap(); // SessionMeta
+        let reply = handle.recv().await.unwrap();
+        assert_eq!(
+            reply,
+            AgentEvent::AssistantMessage {
+                text: "model=<unset>|system_prompt=<unset>|permission_mode=<unset>".to_string()
             }
         );
     }

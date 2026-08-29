@@ -50,14 +50,15 @@ impl fmt::Display for RoleConfigError {
 impl std::error::Error for RoleConfigError {}
 
 /// Resolves `role_name`'s final `cli`/`model`/system prompt against the
-/// three layers, plus `cwd` (task-wide, not per-role — passed straight
-/// through, not resolved here).
+/// three layers, plus `cwd`/`sandboxed` (task-wide, not per-role — passed
+/// straight through, not resolved here).
 pub fn resolve(
     role_name: &str,
     role_def: &RoleDef,
     global: &GlobalConfig,
     task_config: &Value,
     cwd: std::path::PathBuf,
+    sandboxed: bool,
 ) -> Result<ResolvedRoleConfig, RoleConfigError> {
     let task_role = task_config.get("roles").and_then(|r| r.get(role_name));
     let global_role = global.roles.get(role_name);
@@ -104,6 +105,7 @@ pub fn resolve(
             cwd,
             model: Some(model),
             system_prompt,
+            sandboxed,
         },
     })
 }
@@ -152,9 +154,30 @@ mod tests {
         let def = role_def(Some("def-cli"), Some("def-model"));
         let task_config = json!({ "roles": { "chat": { "model": "haiku" } } });
 
-        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into()).unwrap();
+        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into(), false).unwrap();
         assert_eq!(resolved.cli, "def-cli"); // no task-level override, workflow-def wins
         assert_eq!(resolved.model, "haiku"); // task-level override wins
+    }
+
+    /// #67: `sandboxed` is passed straight through, not resolved against
+    /// any of the three layers (it's not part of `RoleDef`/task config/
+    /// global config at all — it's `definition.worktree`, a workflow-wide
+    /// property the caller already knows). `ClaudeAdapter::spawn` gates
+    /// bypassing `claude`'s own permission prompts on this field, so a
+    /// silent drop here would be a security regression, not just a lost
+    /// value.
+    #[test]
+    fn sandboxed_passes_straight_through_to_the_role_config() {
+        let def = role_def(Some("cli"), Some("model"));
+        let global = GlobalConfig::default();
+        let task_config = json!({});
+
+        let not_sandboxed =
+            resolve("chat", &def, &global, &task_config, "/cwd".into(), false).unwrap();
+        assert!(!not_sandboxed.role_config.sandboxed);
+
+        let sandboxed = resolve("chat", &def, &global, &task_config, "/cwd".into(), true).unwrap();
+        assert!(sandboxed.role_config.sandboxed);
     }
 
     #[test]
@@ -171,7 +194,7 @@ mod tests {
         let def = role_def(Some("def-cli"), None);
         let task_config = json!({});
 
-        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into()).unwrap();
+        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into(), false).unwrap();
         assert_eq!(resolved.cli, "def-cli");
         assert_eq!(resolved.model, "global-model");
     }
@@ -190,7 +213,7 @@ mod tests {
         let def = role_def(None, None);
         let task_config = json!({});
 
-        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into()).unwrap();
+        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into(), false).unwrap();
         assert_eq!(resolved.cli, "global-cli");
         assert_eq!(resolved.model, "global-model");
     }
@@ -206,6 +229,7 @@ mod tests {
             &GlobalConfig::default(),
             &task_config,
             "/cwd".into(),
+            false,
         )
         .unwrap_err();
         assert!(matches!(
@@ -225,6 +249,7 @@ mod tests {
             &GlobalConfig::default(),
             &task_config,
             "/cwd".into(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -255,6 +280,7 @@ mod tests {
             &GlobalConfig::default(),
             &task_config,
             "/cwd".into(),
+            false,
         )
         .unwrap();
 
@@ -282,6 +308,7 @@ mod tests {
             &GlobalConfig::default(),
             &task_config,
             "/cwd".into(),
+            false,
         )
         .unwrap();
 
@@ -328,6 +355,7 @@ mod tests {
                 &GlobalConfig::default(),
                 &task_config,
                 "/cwd".into(),
+                false,
             )
             .unwrap_or_else(|err| panic!("config {task_config} should not error, got {err}"));
 
@@ -367,13 +395,22 @@ mod tests {
             }
         });
 
-        let coder = resolve("coder", &coder_def, &global, &task_config, "/cwd".into()).unwrap();
+        let coder = resolve(
+            "coder",
+            &coder_def,
+            &global,
+            &task_config,
+            "/cwd".into(),
+            false,
+        )
+        .unwrap();
         let reviewer = resolve(
             "reviewer",
             &reviewer_def,
             &global,
             &task_config,
             "/cwd".into(),
+            false,
         )
         .unwrap();
 
@@ -420,7 +457,7 @@ mod tests {
         };
         let global = global_with_prompt("coder", global_path);
 
-        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into()).unwrap();
+        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into(), false).unwrap();
 
         assert_eq!(
             resolved.role_config.system_prompt.as_deref(),
@@ -435,7 +472,7 @@ mod tests {
         let def = role_def(Some("cli"), Some("model"));
         let global = global_with_prompt("coder", global_path);
 
-        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into()).unwrap();
+        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into(), false).unwrap();
 
         assert_eq!(
             resolved.role_config.system_prompt.as_deref(),
@@ -462,6 +499,7 @@ mod tests {
             &GlobalConfig::default(),
             &task_config,
             "/cwd".into(),
+            false,
         )
         .unwrap();
 
@@ -488,13 +526,22 @@ mod tests {
         };
         let global = GlobalConfig::default();
 
-        let coder = resolve("coder", &coder_def, &global, &json!({}), "/cwd".into()).unwrap();
+        let coder = resolve(
+            "coder",
+            &coder_def,
+            &global,
+            &json!({}),
+            "/cwd".into(),
+            false,
+        )
+        .unwrap();
         let reviewer = resolve(
             "reviewer",
             &reviewer_def,
             &global,
             &json!({}),
             "/cwd".into(),
+            false,
         )
         .unwrap();
 
@@ -527,6 +574,7 @@ mod tests {
             &GlobalConfig::default(),
             &json!({}),
             "/cwd".into(),
+            false,
         )
         .unwrap_err();
 
