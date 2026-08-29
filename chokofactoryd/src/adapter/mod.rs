@@ -18,6 +18,15 @@ pub struct RoleConfig {
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    /// Whether `cwd` is a disposable, isolated working copy the workflow
+    /// definition opted into (`worktree: true`, §5.5 Q7, issue #58) rather
+    /// than the task's real configured repo (or the daemon's own cwd, for
+    /// a workflow like `chat` that has no repo at all). An adapter that
+    /// bypasses its CLI's own per-edit permission prompts (#67) must only
+    /// do so when this is `true` — the disposable worktree *is* the
+    /// sandbox that makes bypassing safe; without it, bypassing would
+    /// apply unconditionally to a real, non-disposable checkout.
+    pub sandboxed: bool,
 }
 
 /// The shared, CLI-agnostic event shape (design §4.2). Carries the same

@@ -558,8 +558,15 @@ impl WorkflowEngine {
             .load_global_config()
             .map_err(SendMessageError::GlobalConfig)?;
         let cwd = working_dir(&task, &definition)?;
-        let resolved = role_config::resolve(role, role_def, &global, &task.config, cwd)
-            .map_err(SendMessageError::RoleConfig)?;
+        let resolved = role_config::resolve(
+            role,
+            role_def,
+            &global,
+            &task.config,
+            cwd,
+            definition.worktree,
+        )
+        .map_err(SendMessageError::RoleConfig)?;
 
         // Recorded *before* handing off to the live session, not after —
         // once handed off, the session's own drain task can react and
@@ -2096,8 +2103,15 @@ impl WorkflowEngine {
             .load_global_config()
             .map_err(EngineError::GlobalConfig)?;
         let cwd = working_dir(&task, definition)?;
-        let resolved = role_config::resolve(role, role_def, &global, &task.config, cwd)
-            .map_err(EngineError::RoleConfig)?;
+        let resolved = role_config::resolve(
+            role,
+            role_def,
+            &global,
+            &task.config,
+            cwd,
+            definition.worktree,
+        )
+        .map_err(EngineError::RoleConfig)?;
 
         let task_run = task_runs::create(
             &self.pool,
@@ -6675,16 +6689,18 @@ roles:
 
         // System prompts, read back off each subprocess's own argv: coder from
         // the workflow-def file, reviewer from its task-level inline text.
+        // `multi-role.yaml` doesn't opt into `worktree: true`, so neither
+        // role's spawn is sandboxed (#67) — `permission_mode` stays unset.
         wait_until_events_contain(
             &pool,
             &coder_run.id,
-            "model=coder-task-model|system_prompt=you write code",
+            "model=coder-task-model|system_prompt=you write code|permission_mode=<unset>",
         )
         .await;
         wait_until_events_contain(
             &pool,
             &reviewer_run.id,
-            "model=reviewer-global-model|system_prompt=inline reviewer prompt",
+            "model=reviewer-global-model|system_prompt=inline reviewer prompt|permission_mode=<unset>",
         )
         .await;
     }
@@ -7348,5 +7364,106 @@ esac
             trail.iter().filter(|s| s.as_str() == "revising").count() >= 3,
             "expected at least 3 trips through revising before the loop guard tripped: {trail:?}"
         );
+    }
+
+    // ---- sandboxed permission bypass threads through end to end (#67) ----
+    //
+    // Everything on either side of this seam already has its own test: a
+    // unit test hand-builds a `RoleConfig { sandboxed: true, .. }` and
+    // checks `ClaudeAdapter::spawn` reacts to it, and another checks
+    // `role_config::resolve` doesn't drop the value in between. Neither
+    // proves the seam itself — that a *real* `worktree: true` workflow,
+    // driven through the real engine, actually ends up with the flag on
+    // the actual spawned subprocess's argv. `coding-task.yaml`'s own tests
+    // exercise `worktree: true` but never assert on `--permission-mode`
+    // either way, so they'd pass identically whether this seam worked or
+    // not.
+
+    #[tokio::test]
+    async fn a_worktree_enabled_stage_sandboxes_its_spawn() {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+
+        let yaml = r#"
+name: sandboxed-flow
+worktree: true
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                parent_task_id: None,
+                workflow_def: &def.name,
+                title: "T",
+                config: json!({ "cwd": repo.to_string_lossy() }),
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude_echo_args.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+
+        let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
+        wait_until_events_contain(
+            &pool,
+            &run.id,
+            "model=sonnet|system_prompt=<unset>|permission_mode=bypassPermissions",
+        )
+        .await;
+    }
+
+    /// The other half of the seam: a task whose workflow never opted into
+    /// `worktree: true` must reach the subprocess with the flag genuinely
+    /// absent — same real-engine, real-argv proof as above, just the other
+    /// value of the one thing that differs (no `worktree: true`, no `cwd`
+    /// pointing at a real repo at all, matching how a `chat`-shaped task
+    /// actually runs).
+    #[tokio::test]
+    async fn a_non_worktree_stage_does_not_sandbox_its_spawn() {
+        let pool = connect_in_memory().await.unwrap();
+
+        let yaml = r#"
+name: unsandboxed-flow
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude_echo_args.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+
+        let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
+        wait_until_events_contain(
+            &pool,
+            &run.id,
+            "model=sonnet|system_prompt=<unset>|permission_mode=<unset>",
+        )
+        .await;
     }
 }

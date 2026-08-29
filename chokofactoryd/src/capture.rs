@@ -78,6 +78,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
+            sandboxed: false,
         };
         let mut handle = adapter.start("hello", &cfg).unwrap();
 
