@@ -480,6 +480,20 @@ fn event_summary(event: &Event) -> String {
                 _ => tool,
             }
         }
+        // `{is_error}` — the CLI's own end-of-turn marker (#70). Without
+        // this arm the catch-all's empty-object fallback renders a blank
+        // cell, which reads as missing data rather than as its own event.
+        EventType::TurnCompleted => {
+            let is_error = payload
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_error {
+                "turn complete (error)".to_string()
+            } else {
+                "turn complete".to_string()
+            }
+        }
         _ => {
             for key in ["text", "message", "session_id"] {
                 if let Some(value) = payload.get(key).and_then(Value::as_str) {
@@ -803,6 +817,16 @@ mod tests {
                 EventType::SessionMeta,
                 json!({"session_id": "abc-123"}),
                 "abc-123",
+            ),
+            (
+                EventType::TurnCompleted,
+                json!({"is_error": false}),
+                "turn complete",
+            ),
+            (
+                EventType::TurnCompleted,
+                json!({"is_error": true}),
+                "turn complete (error)",
             ),
             (EventType::Error, json!({"message": "boom"}), "boom"),
             // A stage transition carries neither text nor a session, so

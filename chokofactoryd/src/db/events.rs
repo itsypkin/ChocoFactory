@@ -277,9 +277,15 @@ fn ends_a_message(event_type: &str) -> bool {
         EventType::AssistantMessage => false,
         // Interleaved within a message, not a break in it.
         EventType::Thinking => false,
-        // Out-of-band: stderr lines, session metadata, and the engine's own
-        // bookkeeping all land on the run without interrupting what was said.
-        EventType::Error | EventType::SessionMeta | EventType::TurnOutcome => false,
+        // Out-of-band: stderr lines, session metadata, the CLI's own
+        // end-of-turn marker, and the engine's own bookkeeping all land on
+        // the run without interrupting what was said. `TurnCompleted`
+        // always arrives after the turn's reply (#70), so treating it as a
+        // boundary would erase the very reply it follows.
+        EventType::Error
+        | EventType::SessionMeta
+        | EventType::TurnCompleted
+        | EventType::TurnOutcome => false,
         // Task-scoped (`task_run_id` is NULL), so unreachable from this
         // run-scoped query — classified anyway so the match stays total.
         EventType::StageEntered | EventType::ShellOutput | EventType::TemplateUnresolved => false,
@@ -950,6 +956,35 @@ mod tests {
                 .await
                 .unwrap(),
             "approved"
+        );
+    }
+
+    /// A single-shot turn's `result` line lands *after* its reply (#70) —
+    /// were it classified as a boundary, `finish_turn` would read back an
+    /// empty string right when a `capture:` stage needs the verdict.
+    #[tokio::test]
+    async fn a_trailing_turn_completed_is_not_a_message_boundary() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": r#"{"outcome": "approved"}"# }),
+                ),
+                (EventType::TurnCompleted, json!({ "is_error": false })),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            r#"{"outcome": "approved"}"#
         );
     }
 
