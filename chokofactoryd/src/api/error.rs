@@ -54,6 +54,13 @@ impl From<CreateTaskError> for ApiError {
             CreateTaskError::Start(EngineError::MissingAgentTurnInput(_)) => {
                 ApiError::BadRequest(err.to_string())
             }
+            // The task row is written before `start_task` runs, so a cancel
+            // can land in that window and `start_task`'s guard will refuse
+            // to start it (#69). Someone cancelled the task out from under
+            // the create — a conflict, not a server fault.
+            CreateTaskError::Start(EngineError::TaskCancelled(_)) => {
+                ApiError::Conflict(err.to_string())
+            }
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -124,6 +131,11 @@ impl From<CancelTaskError> for ApiError {
             // conflict, not a 500: nothing is broken, the caller just
             // arrived in the one-call-wide window where the answer would
             // have been a lie.
+            //
+            // `cancel_task` no longer propagates this (it logs instead, so
+            // a failed kill can't strand an already-cancelled task), so
+            // this arm is unreachable today and kept only so the mapping
+            // stays right if that ever changes.
             CancelTaskError::Session(SessionError::AlreadyStarting) => {
                 ApiError::Conflict(err.to_string())
             }
