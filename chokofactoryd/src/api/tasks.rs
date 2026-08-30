@@ -65,8 +65,9 @@ pub async fn list(
 }
 
 /// A task plus its current `workflow_state` — bare `Task.status` is only
-/// ever `"open"`/`"closed"` (§5.4), so `choco task status <id>` needs
-/// `current_stage` too for this to actually be useful as a status view.
+/// ever `"open"`/`"closed"` (§5.4) or `"cancelled"` (#69), so
+/// `choco task status <id>` needs `current_stage` too for this to actually
+/// be useful as a status view.
 #[derive(Serialize)]
 pub struct TaskDetail {
     #[serde(flatten)]
@@ -168,6 +169,27 @@ pub async fn send_message(
     Json(body): Json<SendMessageRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.engine.send_message_or_resume(&id, &body.text).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Stops `id` for good (#69): marks it `cancelled`, kills whatever agent
+/// subprocess group it had running, and removes its worktree.
+///
+/// `POST …/cancel` rather than `DELETE /tasks/{id}` because this ends the
+/// task's *work*, not the task's *record* — the row, its events, and the
+/// stage it stopped in all remain readable afterwards, which is most of
+/// the point of cancelling rather than deleting.
+///
+/// `202`, not `200`: the kill is a signal. By the time this returns the
+/// task is durably un-advanceable and the signal is delivered, but the
+/// subprocess's own teardown — final events draining into the timeline,
+/// the `task_run` landing on `exited` — completes just after. Poll
+/// `GET /tasks/{id}` for the settled state.
+pub async fn cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.engine.cancel_task(&id).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -609,5 +631,118 @@ stages:
             [202, 409],
             "expected exactly one resume to win (202) and the other to conflict (409), got {statuses:?}"
         );
+    }
+
+    // ---- cancel (#69) ----
+
+    /// Creates a `chat` task with a live session and returns its id.
+    async fn chat_task(server: &TestServer) -> String {
+        server.seed_chat_workflow();
+        let project_id = create_project(server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        task["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn cancel_accepts_and_marks_the_task_cancelled() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+
+        let response = server
+            .post(&format!("/tasks/{task_id}/cancel"), json!({}))
+            .await;
+        assert_eq!(response.status(), 202);
+
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["status"], "cancelled");
+        // The stage the task stopped in is still readable — that's the
+        // difference between cancelling a task and deleting it.
+        assert_eq!(detail["workflow_state"]["current_stage"], "chatting");
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_task_is_404() {
+        let server = TestServer::start().await;
+        let response = server.post("/tasks/no-such-task/cancel", json!({})).await;
+        assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_already_cancelled_task_is_409() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+
+        assert_eq!(
+            server
+                .post(&format!("/tasks/{task_id}/cancel"), json!({}))
+                .await
+                .status(),
+            202
+        );
+        assert_eq!(
+            server
+                .post(&format!("/tasks/{task_id}/cancel"), json!({}))
+                .await
+                .status(),
+            409
+        );
+    }
+
+    /// The hole #69 closes at the HTTP layer: `chatting` is a
+    /// standing-open `agent_turn`, so before this guard existed a message
+    /// to a cancelled task would be accepted and would resume a fresh
+    /// subprocess from the persisted `session_id` — restarting the agent
+    /// the operator had just stopped.
+    #[tokio::test]
+    async fn sending_a_message_to_a_cancelled_task_is_409() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+
+        server
+            .post(&format!("/tasks/{task_id}/cancel"), json!({}))
+            .await;
+
+        let response = server
+            .post(
+                &format!("/tasks/{task_id}/messages"),
+                json!({ "text": "are you still there" }),
+            )
+            .await;
+        assert_eq!(response.status(), 409);
+    }
+
+    /// `--status cancelled` needs no DB-layer change — `tasks::list`
+    /// already filters on an arbitrary string — but nothing wrote that
+    /// value before, so this pins the round trip.
+    #[tokio::test]
+    async fn cancelled_tasks_are_filterable_by_status() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+        server
+            .post(&format!("/tasks/{task_id}/cancel"), json!({}))
+            .await;
+
+        let listed: Value = server.get("/tasks?status=cancelled").await.json();
+        let ids: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![task_id.as_str()]);
+
+        let open: Value = server.get("/tasks?status=open").await.json();
+        assert!(open.as_array().unwrap().is_empty());
     }
 }

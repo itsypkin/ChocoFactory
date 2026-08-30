@@ -946,3 +946,70 @@ exec "{mock_claude}" "$@"
         ]
     );
 }
+
+/// Cancel end to end through the real daemon binary (#69).
+///
+/// The in-process API tests already cover the status transitions; what
+/// only a real spawned daemon shows is the whole path working together —
+/// a genuinely live `mock-claude` subprocess, killed by a real signal,
+/// with the task left readable afterwards.
+#[tokio::test]
+async fn real_binary_cancels_a_live_task_and_refuses_further_work() {
+    let daemon = Daemon::spawn().await;
+
+    let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    assert_eq!(status, 201);
+    let project_id = project["id"].as_str().unwrap();
+
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project_id,
+                "workflow_def": "chat",
+                "title": "cancel me",
+                "prompt": "hello",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Wait until the session is genuinely live before cancelling — a
+    // cancel that raced the spawn would prove nothing about teardown.
+    let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", daemon.ws_url))
+        .await
+        .expect("failed to open the events websocket");
+    assert!(
+        wait_for_echo(&mut ws, "echo:hello").await,
+        "did not see the initial turn's echoed reply over the live WS"
+    );
+
+    let (status, _) = daemon
+        .post(&format!("/tasks/{task_id}/cancel"), json!({}))
+        .await;
+    assert_eq!(status, 202);
+
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    assert_eq!(detail["status"], "cancelled");
+    // Still readable, and still says where it stopped — the difference
+    // between cancelling a task and deleting it.
+    assert_eq!(detail["workflow_state"]["current_stage"], "chatting");
+
+    // A second cancel conflicts rather than silently succeeding.
+    let (status, _) = daemon
+        .post(&format!("/tasks/{task_id}/cancel"), json!({}))
+        .await;
+    assert_eq!(status, 409);
+
+    // And the task takes no further work: without the `tasks.status`
+    // guard this would be accepted and would resume a fresh subprocess
+    // from the persisted session_id.
+    let (status, _) = daemon
+        .post(
+            &format!("/tasks/{task_id}/messages"),
+            json!({ "text": "still there?" }),
+        )
+        .await;
+    assert_eq!(status, 409);
+}

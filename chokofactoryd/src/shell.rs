@@ -129,7 +129,20 @@ impl Drop for ProcessGroup {
     }
 }
 
-fn kill_group(pid: u32) {
+/// SIGKILLs the process group led by `pid`.
+///
+/// Shared with `session::SessionManager::cancel` (#69), which needs the
+/// same "signal the whole tree, not just the process we spawned" semantics
+/// for an agent subprocess that a timed-out `shell` stage needs for its
+/// command. Deliberately one implementation rather than two: the `pgid <=
+/// 0` guard below is the difference between killing a child and killing
+/// the daemon, and that is not a check worth having a second, subtly
+/// different copy of.
+///
+/// Callers must only pass the pid of a child spawned with
+/// `Command::process_group(0)` (so pgid == pid), and must not have reaped
+/// it yet — after `wait`, the pid may belong to something else entirely.
+pub(crate) fn kill_group(pid: u32) {
     let Ok(pgid) = i32::try_from(pid) else {
         return;
     };
@@ -154,13 +167,17 @@ fn kill_group(pid: u32) {
     // immediate pid reuse in the same instant; killing on `Io` is still the
     // right call, since the alternative is orphaning a command that may
     // well still be running.
+    //
+    // On the cancel path (#69) the same reasoning holds: `drain_session`
+    // owns the only `AgentHandle` and hasn't called `wait` yet, so the pid
+    // is still the agent's.
     let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
     if result != 0 {
         let err = std::io::Error::last_os_error();
         // ESRCH just means the group is already gone, which is the common
         // and entirely fine case.
         if err.raw_os_error() != Some(libc::ESRCH) {
-            tracing::warn!(pgid, %err, "failed to kill a shell command's process group");
+            tracing::warn!(pgid, %err, "failed to kill a process group");
         }
     }
 }

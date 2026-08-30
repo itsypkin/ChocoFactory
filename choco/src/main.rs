@@ -153,6 +153,13 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                  event — see `choco task events {id}`."
             )))
         }
+        Command::Task(TaskCmd::Cancel { id }) => {
+            client.cancel_task(&id).await?;
+            Ok(Output::Accepted(format!(
+                "Task {id} cancelled. Its agent process was stopped and its \
+                 worktree removed — see `choco task status {id}`."
+            )))
+        }
         Command::Task(TaskCmd::List { project, status }) => {
             // Resolved the same way as `task create`, so a name works in
             // both places rather than only where a task is born.

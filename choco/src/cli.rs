@@ -32,7 +32,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
-    /// Task create/status/send/list/events.
+    /// Task create/status/send/cancel/list/events.
     #[command(subcommand)]
     Task(TaskCmd),
     /// Project create/list.
@@ -55,6 +55,16 @@ pub enum TaskCmd {
         id: String,
         #[arg(long)]
         text: String,
+    },
+    /// Stop a task: kills its agent subprocess, marks it cancelled, and
+    /// removes its worktree.
+    ///
+    /// Ends the task's work, not its record — its events and the stage it
+    /// stopped in stay readable via `choco task status`/`events`. Cannot be
+    /// undone: a cancelled task accepts no further messages.
+    Cancel {
+        /// Task id.
+        id: String,
     },
     /// List tasks, optionally filtered by project and/or status.
     List {

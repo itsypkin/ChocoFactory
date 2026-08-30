@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chokofactory_core::models::{TaskRunEndReason, TaskRunStatus};
@@ -44,7 +45,31 @@ enum SessionSlot {
 
 struct ActiveSession {
     cmd_tx: mpsc::UnboundedSender<Command>,
+    /// The subprocess's process group id, for `cancel` to signal (#69).
+    /// `None` only if the child was already reaped between spawning and
+    /// this slot being filled, in which case there is nothing to kill.
+    pgid: Option<u32>,
+    signals: SessionSignals,
+}
+
+/// The handles a live session shares between its `sessions` map entry and
+/// the detached `drain_session` task that owns its `AgentHandle`. Held as
+/// one struct rather than passed around individually so the two sides
+/// can't drift out of step about what they share.
+#[derive(Clone)]
+struct SessionSignals {
     last_activity: Arc<Mutex<DateTime<Utc>>>,
+    /// Set by `cancel` immediately *before* it kills the group, and read
+    /// by `drain_session` once its loop ends, to record
+    /// `TaskRunEndReason::Cancelled` on the run.
+    ///
+    /// Deliberately not a `Command` on `cmd_tx`: `drain_session`'s
+    /// `select!` is `biased` toward draining events, and its own comment
+    /// concedes a continuously-emitting turn can delay `cmd_rx`
+    /// indefinitely. A cancel starved behind a chatty agent is exactly the
+    /// case cancel exists for, so the kill happens inline in `cancel` and
+    /// only the *reason* travels through shared state.
+    cancelled: Arc<AtomicBool>,
 }
 
 enum Command {
@@ -153,7 +178,7 @@ impl SessionManager {
             let sessions = self.sessions.lock().await;
             match sessions.get(task_run_id) {
                 Some(SessionSlot::Live(session)) => {
-                    *session.last_activity.lock().await = Utc::now();
+                    *session.signals.last_activity.lock().await = Utc::now();
                     session
                         .cmd_tx
                         .send(Command::Send(text.to_string()))
@@ -204,6 +229,65 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Kills `task_run_id`'s live subprocess *and everything it spawned*,
+    /// so an operator's cancel actually stops the work (#69).
+    ///
+    /// Unlike the idle reaper's `Command::Close` — which merely closes
+    /// stdin and lets the CLI wind down on its own — this is a SIGKILL to
+    /// the whole process group. An agent turn's real weight is in the
+    /// commands it starts, and a cancel that left those running would be
+    /// cancel in name only.
+    ///
+    /// Returns `Ok(())` when there is no live process to kill: a run that
+    /// already exited, or a task parked on a `human_gate`/`poll`/`terminal`
+    /// stage that never opened a session, is already in the state cancel is
+    /// trying to reach. `Establishing` is the one case that *is* an error —
+    /// another caller is mid-spawn and this call cannot see, and so cannot
+    /// kill, the process it is about to create.
+    ///
+    /// This deliberately does not touch the `task_runs` row.
+    /// `drain_session` is that row's single writer, and it records the
+    /// `Cancelled` end reason itself once the kill unwinds it; writing the
+    /// status here as well would race that write, which
+    /// `task_runs::update_status` — an unconditional `UPDATE` with no
+    /// expected-status guard — would resolve by silently letting the later
+    /// writer win.
+    pub async fn cancel(&self, task_run_id: &str) -> Result<(), SessionError> {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(task_run_id) {
+            Some(SessionSlot::Live(session)) => {
+                // Ordered before the kill, not after: killing the group
+                // closes the subprocess's pipes, which can unwind
+                // `drain_session` to its `end_reason` read on another task
+                // immediately. Setting the flag afterwards would leave that
+                // read racing this write and reporting a cancelled run as
+                // an ordinary crash.
+                session.signals.cancelled.store(true, Ordering::SeqCst);
+                match session.pgid {
+                    Some(pgid) => {
+                        tracing::info!(
+                            task_run_id,
+                            pgid,
+                            "cancelling session: killing process group"
+                        );
+                        crate::shell::kill_group(pgid);
+                    }
+                    // The child was already reaped, so there is no group
+                    // left to signal and no pid safe to signal *with* — it
+                    // may since have been reused. The flag above still
+                    // stands, so the run is recorded as cancelled.
+                    None => tracing::info!(
+                        task_run_id,
+                        "cancelling session: process already gone, nothing to kill"
+                    ),
+                }
+                Ok(())
+            }
+            Some(SessionSlot::Establishing) => Err(SessionError::AlreadyStarting),
+            None => Ok(()),
+        }
+    }
+
     /// Atomically claims `task_run_id`'s map slot for a caller about to
     /// spawn or resume a process, failing if another caller already holds
     /// it (whether `Establishing` or already `Live`).
@@ -221,13 +305,21 @@ impl SessionManager {
     /// reaches this, so the `insert` here can't race another spawn.
     async fn spawn_drain(self: &Arc<Self>, task_run_id: String, handle: AgentHandle) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let last_activity = Arc::new(Mutex::new(Utc::now()));
+        let signals = SessionSignals {
+            last_activity: Arc::new(Mutex::new(Utc::now())),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        // Read before `handle` moves into the drain task below — that task
+        // owns it exclusively from then on, and `cancel` needs the pgid
+        // without being able to reach the handle.
+        let pgid = handle.pid();
 
         self.sessions.lock().await.insert(
             task_run_id.clone(),
             SessionSlot::Live(ActiveSession {
                 cmd_tx,
-                last_activity: Arc::clone(&last_activity),
+                pgid,
+                signals: signals.clone(),
             }),
         );
 
@@ -238,7 +330,7 @@ impl SessionManager {
                 &task_run_id,
                 handle,
                 cmd_rx,
-                last_activity,
+                signals,
                 manager.idle_timeout,
                 &manager.events_notify,
             )
@@ -284,7 +376,7 @@ impl SessionManager {
                     SessionSlot::Live(session) => Some((
                         task_run_id.clone(),
                         session.cmd_tx.clone(),
-                        Arc::clone(&session.last_activity),
+                        Arc::clone(&session.signals.last_activity),
                     )),
                     SessionSlot::Establishing => None,
                 })
@@ -316,10 +408,14 @@ async fn drain_session(
     task_run_id: &str,
     mut handle: AgentHandle,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
-    last_activity: Arc<Mutex<DateTime<Utc>>>,
+    signals: SessionSignals,
     idle_timeout: chrono::Duration,
     events_notify: &Notify,
 ) {
+    let SessionSignals {
+        last_activity,
+        cancelled,
+    } = signals;
     // Once `cmd_rx` closes, `recv()` resolves to `None` immediately on
     // every poll — stop selecting on it (rather than matching `None`
     // inside the loop) so a closed channel can't spin the select! in a
@@ -432,7 +528,27 @@ async fn drain_session(
     // observe `status == Idle` while `end_reason` still holds a stale (or
     // absent) value from before this exit — that's exactly the gap that
     // would resurrect the ambiguity `end_reason` exists to close.
-    let end_reason = (clean_exit && reaped).then_some(TaskRunEndReason::Reaped);
+    //
+    // `Cancelled` is checked first and, unlike `Reaped`, without requiring
+    // a clean exit — a SIGKILLed process exits by signal, so predicating it
+    // on `clean_exit` would record every cancel as an anonymous crash. It
+    // also wins over `Reaped` when both could apply (the reaper closed
+    // stdin, then an operator cancelled before the process finished
+    // winding down): a human asked for this, which is the more useful
+    // thing for `choco task status` to say.
+    //
+    // A turn that finished cleanly in the instant before the signal landed
+    // reports `Idle` + `Cancelled`, which reads oddly but is honest, and
+    // is harmless: the engine's `tasks.status == "cancelled"` guard in
+    // `advance_from_stage`, not this row, is what actually stops a
+    // cancelled task from advancing.
+    let end_reason = if cancelled.load(Ordering::SeqCst) {
+        Some(TaskRunEndReason::Cancelled)
+    } else if clean_exit && reaped {
+        Some(TaskRunEndReason::Reaped)
+    } else {
+        None
+    };
     if let Err(err) =
         task_runs::update_status(pool, task_run_id, final_status, ended_at, end_reason).await
     {
@@ -887,5 +1003,280 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(50)).await;
         let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
         assert_eq!(run.status, TaskRunStatus::Active);
+    }
+
+    // ---- cancel (#69) ----
+
+    /// Whether `pid` still exists. `kill(pid, 0)` performs the caller's
+    /// permission checks and reports whether the target is there, without
+    /// actually delivering anything.
+    fn process_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 delivers nothing; the call only reports whether
+        // the process exists, via its return value.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    async fn wait_until_gone(pid: u32) {
+        for _ in 0..200 {
+            if !process_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for pid {pid} to exit");
+    }
+
+    /// A wrapper around `fake_claude_spawns_child.py` carrying its two
+    /// per-test paths. A generated `sh` script rather than
+    /// `std::env::set_var`, for the reason `engine.rs`'s `reply_binary`
+    /// already documents: env is process-global and these tests run in
+    /// parallel in one process.
+    fn spawns_child_binary(dir: &std::path::Path) -> (String, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let heartbeat = dir.join("heartbeat");
+        let child_pid = dir.join("child.pid");
+        let wrapper = dir.join("fake-claude-spawns-child");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nCHOKO_TEST_HEARTBEAT='{}' CHOKO_TEST_CHILD_PID='{}' exec '{}' \"$@\"\n",
+                heartbeat.display(),
+                child_pid.display(),
+                fixture_binary("fake_claude_spawns_child.py"),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (wrapper.display().to_string(), heartbeat, child_pid)
+    }
+
+    async fn read_pid_when_written(path: &std::path::Path) -> u32 {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for the fixture to report its child pid");
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("chokofactoryd-cancel-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_a_live_session_and_records_it_as_cancelled() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+        wait_until_events_len(&pool, &task_run_id, 2).await;
+
+        manager.cancel(&task_run_id).await.unwrap();
+
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Exited).await;
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        // The distinction that matters: a SIGKILLed process exits
+        // non-zero, which is indistinguishable from a crash by `status`
+        // alone. `end_reason` is what tells an operator their cancel is
+        // what stopped it.
+        assert_eq!(run.end_reason, Some(TaskRunEndReason::Cancelled));
+        assert!(run.ended_at.is_some());
+    }
+
+    /// The reason the adapter spawns into its own process group: an agent
+    /// turn's real weight is in the commands it starts, and reaping only
+    /// the process the daemon spawned would leave those running in the
+    /// task's working copy after the operator was told it stopped.
+    #[tokio::test]
+    async fn cancel_kills_the_whole_process_group_not_just_the_agent() {
+        let dir = TempDir::new();
+        let (binary, heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
+
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        manager
+            .start(&task_run_id, "go", &role_config())
+            .await
+            .unwrap();
+
+        let child_pid = read_pid_when_written(&child_pid_path).await;
+        assert!(
+            process_alive(child_pid),
+            "the fixture's child should be running before cancel"
+        );
+
+        manager.cancel(&task_run_id).await.unwrap();
+
+        // The grandchild, not just the agent: this is the assertion that
+        // would fail if `cancel` used `child.kill()` instead of `killpg`.
+        wait_until_gone(child_pid).await;
+
+        // And it really stopped working, rather than merely leaving the
+        // process table: no further heartbeats after a settling pause.
+        let after_kill = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let later = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            after_kill, later,
+            "the killed child should have stopped writing its heartbeat"
+        );
+
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Exited).await;
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(TaskRunEndReason::Cancelled));
+    }
+
+    /// A turn that ignores stdin entirely is exactly what the idle
+    /// reaper's `close_stdin` cannot stop, so cancel must not depend on
+    /// the subprocess cooperating.
+    #[tokio::test]
+    async fn cancel_stops_a_turn_that_never_reads_its_stdin() {
+        let dir = TempDir::new();
+        let (binary, _heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
+
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        manager
+            .start(&task_run_id, "go", &role_config())
+            .await
+            .unwrap();
+        read_pid_when_written(&child_pid_path).await;
+
+        manager.cancel(&task_run_id).await.unwrap();
+
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Exited).await;
+    }
+
+    /// Cancelling a run with no live process is the state cancel is trying
+    /// to reach, so it succeeds rather than erroring — otherwise the engine
+    /// would have to special-case every `human_gate`/`poll`/`terminal`
+    /// stage and every already-exited run before daring to call this.
+    #[tokio::test]
+    async fn cancel_is_a_no_op_for_a_run_with_no_live_session() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        manager.cancel(&task_run_id).await.unwrap();
+        manager.cancel("no-such-run").await.unwrap();
+    }
+
+    /// A session mid-spawn is the one case that must *not* report success:
+    /// the process doesn't exist yet and isn't reachable from the map, so
+    /// answering `Ok` would tell an operator an agent was stopped while it
+    /// was in fact just starting.
+    #[tokio::test]
+    async fn cancel_rejects_a_run_whose_session_is_still_being_established() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        manager.reserve(&task_run_id).await.unwrap();
+
+        let err = manager.cancel(&task_run_id).await.unwrap_err();
+        assert!(matches!(err, SessionError::AlreadyStarting));
+    }
+
+    /// A cancel arriving while the idle reaper had already closed stdin:
+    /// both could claim the run, and `Cancelled` must win. `Reaped` would
+    /// tell an operator their cancel didn't do anything.
+    #[tokio::test]
+    async fn cancel_wins_over_reaped_when_both_apply() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        // Zero timeout: the reaper closes this session on its first pass.
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::zero(),
+            Arc::new(Notify::new()),
+        );
+
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+        wait_until_events_len(&pool, &task_run_id, 2).await;
+
+        // Enqueue the reaper's Close, then cancel before the drain loop
+        // has necessarily finished acting on it.
+        {
+            let sessions = manager.sessions.lock().await;
+            let Some(SessionSlot::Live(session)) = sessions.get(&task_run_id) else {
+                panic!("session should be live");
+            };
+            session.cmd_tx.send(Command::Close).unwrap();
+        }
+        manager.cancel(&task_run_id).await.unwrap();
+
+        for _ in 0..200 {
+            let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+            if run.status != TaskRunStatus::Active {
+                assert_eq!(run.end_reason, Some(TaskRunEndReason::Cancelled));
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for the cancelled session to finish draining");
     }
 }

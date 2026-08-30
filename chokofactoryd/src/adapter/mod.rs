@@ -180,6 +180,18 @@ impl AgentHandle {
         self.stdin_tx = dummy_tx;
     }
 
+    /// The process group id to signal when cancelling this session (#69).
+    ///
+    /// Equal to the child's own pid: adapters spawn with
+    /// `Command::process_group(0)`, which makes the child a group leader
+    /// whose pgid is its pid. `None` once the process has been reaped —
+    /// `tokio::process::Child::id` stops reporting after `wait`, which is
+    /// exactly when signalling would be unsafe anyway, since the pid can by
+    /// then have been reused by an unrelated process.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Waits for the underlying process to exit, reaping it.
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await

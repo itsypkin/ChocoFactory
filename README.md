@@ -135,6 +135,22 @@ Message accepted for task bb93ada3-.... The reply is recorded as an event
 — see `choco task events bb93ada3-...`.
 ```
 
+Stop a task that has gone wrong. This kills its agent process — and
+anything that process started, like a test run or a dev server — marks the
+task `cancelled`, and removes its worktree:
+
+```
+$ choco task cancel bb93ada3-...
+Task bb93ada3-... cancelled. Its agent process was stopped and its
+worktree removed — see `choco task status bb93ada3-...`.
+```
+
+Cancelling ends the task's *work*, not its record: its events and the
+stage it stopped in stay readable, which is the point of cancelling rather
+than deleting. It can't be undone — a cancelled task accepts no further
+messages, and cancelling one twice (or cancelling a task that already
+finished) is a `409`.
+
 Read the conversation:
 
 ```
@@ -158,6 +174,7 @@ chat task  ed9e8a7d-e5d4-4aeb-b04c-b47d14145940  open    chat      2026-08-01 12
 
 $ choco task list --project acme          # by name or id
 $ choco task list --status open           # free-form, not a fixed enum
+$ choco task list --status cancelled      # open | closed | cancelled today
 $ choco project list
 ```
 
