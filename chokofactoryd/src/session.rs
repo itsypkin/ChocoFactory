@@ -45,10 +45,6 @@ enum SessionSlot {
 
 struct ActiveSession {
     cmd_tx: mpsc::UnboundedSender<Command>,
-    /// The subprocess's process group id, for `cancel` to signal (#69).
-    /// `None` only if the child was already reaped between spawning and
-    /// this slot being filled, in which case there is nothing to kill.
-    pgid: Option<u32>,
     signals: SessionSignals,
 }
 
@@ -59,6 +55,24 @@ struct ActiveSession {
 #[derive(Clone)]
 struct SessionSignals {
     last_activity: Arc<Mutex<DateTime<Utc>>>,
+    /// The subprocess's process group id, for `cancel` to signal (#69), or
+    /// `None` once it must not be signalled any more.
+    ///
+    /// Shared and clearable rather than a plain snapshot, because a pid is
+    /// only safe to signal until the process is reaped — after that the
+    /// number can already belong to something else, and `killpg` would
+    /// SIGKILL an unrelated process *group*. `drain_session` clears this
+    /// immediately before `handle.wait()` reaps the child, and it holds
+    /// this same lock while doing so, so `cancel` either signals a pid
+    /// that is still the agent's or finds `None` and signals nothing.
+    ///
+    /// Without that, the window is real rather than theoretical: the map
+    /// slot stays `Live` until `drain_session` has finished reaping *and*
+    /// written its status row, and for the first part of that the DB still
+    /// says `Active` — so `cancel_task`'s own check would wave a reaped pid
+    /// straight through. `shell.rs` guards the identical hazard with
+    /// `ProcessGroup::disarm`.
+    pgid: Arc<Mutex<Option<u32>>>,
     /// Set by `cancel` immediately *before* it kills the group, and read
     /// by `drain_session` once its loop ends, to record
     /// `TaskRunEndReason::Cancelled` on the run.
@@ -263,7 +277,15 @@ impl SessionManager {
                 // read racing this write and reporting a cancelled run as
                 // an ordinary crash.
                 session.signals.cancelled.store(true, Ordering::SeqCst);
-                match session.pgid {
+                // Held across the kill, and it's the same lock
+                // `drain_session` takes to clear the pgid before reaping.
+                // That mutual exclusion is what makes the pid safe to
+                // signal: either this arrives first and the child is still
+                // alive, or the clear arrives first and this sees `None`.
+                // Signalling a reaped pid would SIGKILL whatever process
+                // group has since been given that number.
+                let pgid = session.signals.pgid.lock().await;
+                match *pgid {
                     Some(pgid) => {
                         tracing::info!(
                             task_run_id,
@@ -272,10 +294,10 @@ impl SessionManager {
                         );
                         crate::shell::kill_group(pgid);
                     }
-                    // The child was already reaped, so there is no group
-                    // left to signal and no pid safe to signal *with* — it
-                    // may since have been reused. The flag above still
-                    // stands, so the run is recorded as cancelled.
+                    // Already reaped (or never had a pid): there is no
+                    // group left to signal, and no pid safe to signal
+                    // *with*. The flag above still stands, so the run is
+                    // recorded as cancelled either way.
                     None => tracing::info!(
                         task_run_id,
                         "cancelling session: process already gone, nothing to kill"
@@ -308,17 +330,17 @@ impl SessionManager {
         let signals = SessionSignals {
             last_activity: Arc::new(Mutex::new(Utc::now())),
             cancelled: Arc::new(AtomicBool::new(false)),
+            // Read before `handle` moves into the drain task below — that
+            // task owns it exclusively from then on, and `cancel` needs the
+            // pgid without being able to reach the handle. Cleared again by
+            // `drain_session` the moment the child is about to be reaped.
+            pgid: Arc::new(Mutex::new(handle.pid())),
         };
-        // Read before `handle` moves into the drain task below — that task
-        // owns it exclusively from then on, and `cancel` needs the pgid
-        // without being able to reach the handle.
-        let pgid = handle.pid();
 
         self.sessions.lock().await.insert(
             task_run_id.clone(),
             SessionSlot::Live(ActiveSession {
                 cmd_tx,
-                pgid,
                 signals: signals.clone(),
             }),
         );
@@ -415,6 +437,7 @@ async fn drain_session(
     let SessionSignals {
         last_activity,
         cancelled,
+        pgid,
     } = signals;
     // Once `cmd_rx` closes, `recv()` resolves to `None` immediately on
     // every poll — stop selecting on it (rather than matching `None`
@@ -507,6 +530,18 @@ async fn drain_session(
             }
         }
     }
+    // Retire the pid *before* reaping it, while holding the same lock
+    // `cancel` takes to read it. Once `wait` returns, the number can be
+    // handed to an unrelated process, and a `cancel` still holding it
+    // would SIGKILL that process's whole group. This is the same guard
+    // `shell.rs` spells `ProcessGroup::disarm`, and it has to happen here
+    // rather than when the map slot is dropped: the slot outlives the reap
+    // by the length of the status write below.
+    //
+    // A `cancel` that wins the race still works — it signals a live
+    // process, and the `cancelled` flag it set is read below either way.
+    *pgid.lock().await = None;
+
     // A clean exit (reaper-driven close, or a one-shot agent_turn stage
     // finishing on its own) goes to `idle`, ready to resume. A crash,
     // auth failure, or signal kill goes to `exited` instead — otherwise
@@ -1236,10 +1271,18 @@ mod tests {
     }
 
     /// A cancel arriving while the idle reaper had already closed stdin:
-    /// both could claim the run, and `Cancelled` must win. `Reaped` would
-    /// tell an operator their cancel didn't do anything.
+    /// both reasons could claim the run, and `Cancelled` must win, because
+    /// `Reaped` would tell an operator their cancel did nothing.
+    ///
+    /// Going through `cancel` would *not* pin this. Its SIGKILL makes the
+    /// exit non-clean, and `Reaped` requires `clean_exit`, so it loses on
+    /// that alone and the test would still pass with the two arms
+    /// swapped. The case where precedence actually decides is a process
+    /// that exits *cleanly* — reaper-closed stdin — with the cancel flag
+    /// also set, which is what setting the flag directly (rather than
+    /// killing) constructs here.
     #[tokio::test]
-    async fn cancel_wins_over_reaped_when_both_apply() {
+    async fn cancelled_beats_reaped_when_a_cancelled_session_still_exits_cleanly() {
         let pool = connect_in_memory().await.unwrap();
         let task_run_id = seed_task_run(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
@@ -1258,25 +1301,80 @@ mod tests {
             .unwrap();
         wait_until_events_len(&pool, &task_run_id, 2).await;
 
-        // Enqueue the reaper's Close, then cancel before the drain loop
-        // has necessarily finished acting on it.
+        // The flag without the kill: stands in for a cancel whose SIGKILL
+        // lands just after the process has already wound down on its own.
         {
             let sessions = manager.sessions.lock().await;
             let Some(SessionSlot::Live(session)) = sessions.get(&task_run_id) else {
                 panic!("session should be live");
             };
-            session.cmd_tx.send(Command::Close).unwrap();
+            session.signals.cancelled.store(true, Ordering::SeqCst);
         }
-        manager.cancel(&task_run_id).await.unwrap();
 
-        for _ in 0..200 {
-            let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
-            if run.status != TaskRunStatus::Active {
-                assert_eq!(run.end_reason, Some(TaskRunEndReason::Cancelled));
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for the cancelled session to finish draining");
+        // Now let the reaper close stdin, so the process exits cleanly and
+        // `reaped` is set too — both reasons in play at once.
+        manager
+            .run_idle_reaper_loop(
+                &IdleReaperConfig {
+                    interval: StdDuration::from_millis(1),
+                },
+                Some(1),
+            )
+            .await;
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.end_reason,
+            Some(TaskRunEndReason::Cancelled),
+            "a clean exit with both flags set must report the operator's cancel, not the reaper"
+        );
+    }
+
+    /// The pid must be retired before the child is reaped, or a `cancel`
+    /// arriving in the window between `wait()` and the map slot being
+    /// dropped would `killpg` a number the OS may have already reused —
+    /// SIGKILLing an unrelated process group.
+    #[tokio::test]
+    async fn a_reaped_sessions_pgid_is_cleared_so_cancel_cannot_signal_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
+            "fake_claude_oneshot.py",
+        )));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        // Grab the shared pgid handle while the session is live, so it can
+        // still be inspected after the map slot is gone.
+        manager
+            .start(&task_run_id, "hello", &role_config())
+            .await
+            .unwrap();
+        let pgid = {
+            let sessions = manager.sessions.lock().await;
+            let Some(SessionSlot::Live(session)) = sessions.get(&task_run_id) else {
+                panic!("session should be live");
+            };
+            assert!(
+                session.signals.pgid.lock().await.is_some(),
+                "a live session should have a pgid to signal"
+            );
+            Arc::clone(&session.signals.pgid)
+        };
+
+        // `fake_claude_oneshot.py` exits on its own, so the drain loop
+        // reaps it without any cancel involved.
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+
+        assert!(
+            pgid.lock().await.is_none(),
+            "the pgid must be cleared before the child is reaped, or a later \
+             cancel could signal a reused pid"
+        );
     }
 }

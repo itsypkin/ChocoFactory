@@ -155,9 +155,15 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         }
         Command::Task(TaskCmd::Cancel { id }) => {
             client.cancel_task(&id).await?;
+            // Deliberately doesn't claim an agent was killed or a worktree
+            // removed: a task parked on a `human_gate`, or one cancelled
+            // before it ever started, has neither, and the 202 carries no
+            // body saying which happened. Naming what is certainly true and
+            // pointing at `status` beats a confident sentence that is
+            // sometimes wrong.
             Ok(Output::Accepted(format!(
-                "Task {id} cancelled. Its agent process was stopped and its \
-                 worktree removed — see `choco task status {id}`."
+                "Task {id} cancelled. Any running agent process and worktree \
+                 have been cleaned up — see `choco task status {id}`."
             )))
         }
         Command::Task(TaskCmd::List { project, status }) => {

@@ -8,7 +8,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::engine::{
-    CancelTaskError, CreateTaskError, EngineError, ResolveError, SendMessageOrResumeError,
+    CancelTaskError, CreateTaskError, EngineError, ResolveError, SendMessageError,
+    SendMessageOrResumeError,
 };
 use crate::session::SessionError;
 
@@ -86,8 +87,22 @@ impl From<SendMessageOrResumeError> for ApiError {
             SendMessageOrResumeError::Advance(
                 EngineError::UnknownOutcome { .. }
                 | EngineError::TerminalStageHasNoTransitions(_)
-                | EngineError::StageMovedOn { .. },
+                | EngineError::StageMovedOn { .. }
+                // The same benign race as the rest of this arm, arrived at
+                // from the other direction (#69): a resume passed
+                // `send_message_or_resume`'s status check and a cancel
+                // landed before `advance_from_stage`'s guard ran under the
+                // lock. "The task was cancelled while you were resuming it"
+                // is a conflict, not a server fault — and mapping it to 500
+                // here would contradict the plain `TaskCancelled` → 409
+                // above.
+                | EngineError::TaskCancelled(_),
             ) => ApiError::Conflict(err.to_string()),
+            // Same conflict reached through the `agent_turn` branch, where
+            // `send_message` re-checks the status under the per-task lock.
+            SendMessageOrResumeError::SendMessage(SendMessageError::TaskCancelled) => {
+                ApiError::Conflict(err.to_string())
+            }
             _ => ApiError::Internal(err.to_string()),
         }
     }

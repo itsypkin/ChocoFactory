@@ -168,9 +168,12 @@ pub(crate) fn kill_group(pid: u32) {
     // right call, since the alternative is orphaning a command that may
     // well still be running.
     //
-    // On the cancel path (#69) the same reasoning holds: `drain_session`
-    // owns the only `AgentHandle` and hasn't called `wait` yet, so the pid
-    // is still the agent's.
+    // On the cancel path (#69) the caller is responsible for the same
+    // property, and `SessionManager` enforces it with a lock rather than by
+    // construction: `drain_session` clears the shared pgid while holding
+    // that lock immediately before it reaps the child, so a `cancel` either
+    // signals a pid that is still the agent's or sees `None` and signals
+    // nothing at all.
     let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
     if result != 0 {
         let err = std::io::Error::last_os_error();

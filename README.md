@@ -141,8 +141,8 @@ task `cancelled`, and removes its worktree:
 
 ```
 $ choco task cancel bb93ada3-...
-Task bb93ada3-... cancelled. Its agent process was stopped and its
-worktree removed — see `choco task status bb93ada3-...`.
+Task bb93ada3-... cancelled. Any running agent process and worktree have
+been cleaned up — see `choco task status bb93ada3-...`.
 ```
 
 Cancelling ends the task's *work*, not its record: its events and the
