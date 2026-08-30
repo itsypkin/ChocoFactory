@@ -492,7 +492,6 @@ pub enum CancelTaskError {
     /// cancel work that already finished on its own — and answering `202`
     /// to the latter would imply the daemon stopped something it didn't.
     NotCancellable(String),
-    NoWorkflowState,
     /// A session for this task's run is mid-spawn, so the process to kill
     /// doesn't exist yet and isn't reachable from here. The caller can
     /// retry once that settles.
@@ -507,7 +506,6 @@ impl fmt::Display for CancelTaskError {
             CancelTaskError::NotCancellable(status) => {
                 write!(f, "task is already '{status}' and cannot be cancelled")
             }
-            CancelTaskError::NoWorkflowState => write!(f, "task has no workflow_state row"),
             CancelTaskError::Session(err) => write!(f, "{err}"),
             CancelTaskError::Db(err) => write!(f, "{err}"),
         }
@@ -994,11 +992,16 @@ impl WorkflowEngine {
             // whose status makes every retry a 409, so nothing could ever
             // kill it.
             //
-            // Logged at `error` rather than propagated, because propagating
-            // would recreate exactly that: the status write above has
-            // already happened, so an `Err` here strands the task instead
-            // of letting an operator retry. If the lock invariant is ever
-            // broken this is the line that says so.
+            // Logged at `error` rather than propagated because this is an
+            // invariant violation, not a runtime failure an operator can
+            // act on. `AlreadyStarting` is the only error `cancel` returns,
+            // and the lock argument above says it cannot happen; returning
+            // it would dress a daemon bug up as a 409 the caller could
+            // usefully retry. It could not, in any case: the status write
+            // above has already committed, so a second cancel is refused
+            // with `NotCancellable` whether or not this call returned
+            // `Err`. If the lock invariant is ever broken this is the line
+            // that says so.
             if let Err(err) = self.session_manager.cancel(&run.id).await {
                 tracing::error!(
                     task_id, task_run_id = %run.id, %err,
@@ -1021,6 +1024,16 @@ impl WorkflowEngine {
         // session and any detached `shell`/`poll` command have been killed
         // above, so `git worktree remove --force` isn't racing a live
         // writer.
+        //
+        // The two are killed with different rigour, deliberately.
+        // `abort_detached_runners` awaits each handle, so the command's
+        // `ProcessGroup` guard is provably dropped before this line;
+        // `SessionManager::cancel` only returns once `killpg` has, without
+        // waiting for the agent to be reaped. That asymmetry is fine — a
+        // `SIGKILL`ed process runs no further user-space code, so it cannot
+        // write to the worktree after the signal lands — whereas an
+        // *aborted future* has real teardown left to run, which is exactly
+        // why that side is awaited.
         //
         // Gated on the snapshot rather than on `definition.worktree` so
         // this needs no workflow definition at all — and so a
@@ -8591,12 +8604,17 @@ stages:
         );
     }
 
-    /// A worktree-enabled task cancelled before it ever reached a stage
-    /// that called `worktree::ensure` has no snapshot, so there is nothing
-    /// to remove — and asking anyway would log an error about a worktree
-    /// that was never created.
+    /// A task cancelled before it ever reached a stage that called
+    /// `worktree::ensure` has no snapshot, so cancel's worktree step has
+    /// nothing to remove and must not fail the cancel.
+    ///
+    /// This pins the *outcome*, not the skip: `remove_worktree` only logs
+    /// and returns when there is no snapshot, so deleting the
+    /// `worktree_snapshot` gate would leave this test passing. The gate
+    /// exists to keep that error log out of a perfectly ordinary cancel,
+    /// which isn't worth asserting on a log line to prove.
     #[tokio::test]
-    async fn cancel_skips_worktree_removal_for_a_task_that_never_made_one() {
+    async fn cancel_succeeds_for_a_task_that_never_made_a_worktree() {
         let pool = connect_in_memory().await.unwrap();
         let def = human_gate_chain_def();
         let task_id = seed_task(&pool, &def.name).await;

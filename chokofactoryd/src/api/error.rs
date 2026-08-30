@@ -118,9 +118,10 @@ impl From<SendMessageOrResumeError> for ApiError {
 impl From<CancelTaskError> for ApiError {
     fn from(err: CancelTaskError) -> Self {
         match &err {
-            CancelTaskError::NoSuchTask | CancelTaskError::NoWorkflowState => {
-                ApiError::NotFound(err.to_string())
-            }
+            // A missing `workflow_state` row deliberately isn't an error
+            // here (see `cancel_task_locked`), so `NoSuchTask` is the only
+            // 404 this operation can produce.
+            CancelTaskError::NoSuchTask => ApiError::NotFound(err.to_string()),
             // Already `cancelled` or already `closed`. A conflict rather
             // than a silent `202`: answering "accepted" to a cancel of work
             // that already finished would claim the daemon stopped

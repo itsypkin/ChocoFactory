@@ -296,8 +296,16 @@ impl SessionManager {
                     }
                     // Already reaped (or never had a pid): there is no
                     // group left to signal, and no pid safe to signal
-                    // *with*. The flag above still stands, so the run is
-                    // recorded as cancelled either way.
+                    // *with*.
+                    //
+                    // The flag set above may well go unread here. The slot
+                    // isn't removed from the map until after `drain_session`
+                    // writes the run's status, so a cancel landing in that
+                    // window finds a `Live` slot whose `cancelled` read has
+                    // already happened, and the run records `Reaped`/`None`.
+                    // Harmless: the run had already finished on its own, and
+                    // `tasks.status` — which every guard keys off — is
+                    // written by `cancel_task`, not from here.
                     None => tracing::info!(
                         task_run_id,
                         "cancelling session: process already gone, nothing to kill"
