@@ -8,7 +8,7 @@ name = "choco"
 path = "src/main.rs"
 
 [dependencies]
-chokofactory-core = { path = "../chokofactory-core" }
+chocofactory-core = { path = "../chocofactory-core" }
 chrono = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }

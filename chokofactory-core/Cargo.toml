@@ -1,9 +1,0 @@
-[package]
-name = "chokofactory-core"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-chrono = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }

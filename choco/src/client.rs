@@ -1,18 +1,18 @@
-//! HTTP client for `chokofactoryd`'s API (P1-9, design §6.2). One method
+//! HTTP client for `chocofactoryd`'s API (P1-9, design §6.2). One method
 //! per endpoint; request bodies are built with `serde_json::json!()` rather
-//! than importing `chokofactoryd`'s own request structs — it's a bin-only
+//! than importing `chocofactoryd`'s own request structs — it's a bin-only
 //! crate, and depending on the daemon's internal API-layer types here would
 //! be backwards coupling.
 
 use std::fmt;
 
-use chokofactory_core::models::{Event, Project, Task};
+use chocofactory_core::models::{Event, Project, Task};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// One page of `GET /tasks/{id}/events`. Defined here rather than imported
 /// because the daemon's `EventsPage` lives in its bin-only API layer;
-/// `Event` itself does come from `chokofactory-core`.
+/// `Event` itself does come from `chocofactory-core`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventsPage {
     pub events: Vec<Event>,
@@ -50,10 +50,10 @@ impl fmt::Display for ClientError {
         match self {
             ClientError::Connect { base_url, source } => write!(
                 f,
-                "failed to connect to chokofactoryd at {base_url} (is it running?): {source}"
+                "failed to connect to chocofactoryd at {base_url} (is it running?): {source}"
             ),
             ClientError::Api(message) => write!(f, "{message}"),
-            ClientError::Decode(msg) => write!(f, "unexpected response from chokofactoryd: {msg}"),
+            ClientError::Decode(msg) => write!(f, "unexpected response from chocofactoryd: {msg}"),
             ClientError::NoSuchProject(name) => {
                 write!(f, "no project named '{name}' (try `choco project list`)")
             }
@@ -306,7 +306,7 @@ impl Client {
         // "unknown error" that gives the user nothing to act on.
         let message = match body.get("error").and_then(Value::as_str) {
             Some(message) => message.to_string(),
-            None => format!("chokofactoryd returned HTTP {status}"),
+            None => format!("chocofactoryd returned HTTP {status}"),
         };
         Err(ClientError::Api(message))
     }
@@ -426,7 +426,7 @@ impl Client {
 
     /// Returns the raw `TaskDetail` JSON (`Task` fields flattened +
     /// `workflow_state`) rather than a typed struct — `TaskDetail` isn't
-    /// exported from `chokofactory-core`, and the raw shape is exactly what
+    /// exported from `chocofactory-core`, and the raw shape is exactly what
     /// a delegating agent needs to poll `workflow_state.current_stage`.
     pub async fn get_task(&self, id: &str) -> Result<Value, ClientError> {
         let resp = self

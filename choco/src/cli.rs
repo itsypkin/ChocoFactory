@@ -1,15 +1,15 @@
 //! `choco` argument parsing (P1-10, design §6.2). Pure `clap` derive
 //! definitions — no I/O, no HTTP. `--workflow`/`--status` are plain
 //! `String`s rather than fixed enums: workflow definitions (§2.2) and task
-//! status (`chokofactory_core::models::Task::status`) are both free-form,
+//! status (`chocofactory_core::models::Task::status`) are both free-form,
 //! driven by data on disk/in the DB, not fixed by this crate.
 
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "choco", about = "HTTP client for chokofactoryd")]
+#[command(name = "choco", about = "HTTP client for chocofactoryd")]
 pub struct Cli {
-    /// Base URL of a running `chokofactoryd`. Falls back to `CHOCO_BASE_URL`,
+    /// Base URL of a running `chocofactoryd`. Falls back to `CHOCO_BASE_URL`,
     /// then `http://127.0.0.1:4141` (the daemon's default port).
     #[arg(long, env = "CHOCO_BASE_URL", default_value = "http://127.0.0.1:4141")]
     pub base_url: String,
@@ -107,7 +107,7 @@ pub struct TaskCreateArgs {
     #[arg(long)]
     pub project: String,
     /// Workflow definition name (any name under
-    /// `~/.config/chokofactory/workflows/`, not a fixed set).
+    /// `~/.config/chocofactory/workflows/`, not a fixed set).
     #[arg(long)]
     pub workflow: String,
     #[arg(long)]

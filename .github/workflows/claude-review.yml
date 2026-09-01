@@ -25,8 +25,8 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            This is ChokoFactory, a Rust workspace (chokofactoryd daemon,
-            choco CLI, chokofactory-core shared types).
+            This is ChocoFactory, a Rust workspace (chocofactoryd daemon,
+            choco CLI, chocofactory-core shared types).
 
             Start with `gh pr diff` and treat it as your primary source -
             review the changed lines themselves first. Only read other
