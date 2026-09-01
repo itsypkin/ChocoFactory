@@ -192,6 +192,22 @@ impl AgentHandle {
         self.stdin_tx = dummy_tx;
     }
 
+    /// The process group id to signal when cancelling this session (#69).
+    ///
+    /// Equal to the child's own pid: adapters spawn with
+    /// `Command::process_group(0)`, which makes the child a group leader
+    /// whose pgid is its pid. `None` once the process has been reaped.
+    ///
+    /// Callers must not cache this. It is only safe to signal until
+    /// [`Self::wait`] reaps the child, after which the number may already
+    /// belong to an unrelated process; the freshness of a stored copy is
+    /// the caller's problem, not this method's (see
+    /// `SessionSignals::pgid`, which keeps it behind a lock and clears it
+    /// before reaping for exactly that reason).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Waits for the underlying process to exit, reaping it.
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await

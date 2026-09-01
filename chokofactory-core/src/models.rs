@@ -100,6 +100,11 @@ pub enum TaskRunEndReason {
     Reaped,
     /// `SessionManager::start` failed to spawn the adapter process at all.
     StartFailed,
+    /// An operator cancelled the task, and `SessionManager::cancel` killed
+    /// this run's subprocess group (#69). Unlike every other variant this
+    /// one is *requested* rather than observed, so it takes precedence over
+    /// `Reaped` when both could apply — see `session::drain_session`.
+    Cancelled,
 }
 
 impl fmt::Display for TaskRunEndReason {
@@ -107,6 +112,7 @@ impl fmt::Display for TaskRunEndReason {
         f.write_str(match self {
             TaskRunEndReason::Reaped => "reaped",
             TaskRunEndReason::StartFailed => "start_failed",
+            TaskRunEndReason::Cancelled => "cancelled",
         })
     }
 }
@@ -129,6 +135,7 @@ impl FromStr for TaskRunEndReason {
         match s {
             "reaped" => Ok(TaskRunEndReason::Reaped),
             "start_failed" => Ok(TaskRunEndReason::StartFailed),
+            "cancelled" => Ok(TaskRunEndReason::Cancelled),
             other => Err(ParseTaskRunEndReasonError(other.to_string())),
         }
     }
@@ -338,7 +345,11 @@ mod tests {
 
     #[test]
     fn task_run_end_reason_round_trips_through_display_and_from_str() {
-        for reason in [TaskRunEndReason::Reaped, TaskRunEndReason::StartFailed] {
+        for reason in [
+            TaskRunEndReason::Reaped,
+            TaskRunEndReason::StartFailed,
+            TaskRunEndReason::Cancelled,
+        ] {
             assert_eq!(
                 reason.to_string().parse::<TaskRunEndReason>().unwrap(),
                 reason

@@ -73,6 +73,23 @@ fn spawn(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Its own process group, so `session::SessionManager::cancel` can
+        // signal the *whole tree* on cancel (#69) rather than just the
+        // `claude` the daemon spawned. An agent turn's real weight is in
+        // what it starts — a `npm test`, a dev server, a build — and
+        // killing only the parent would leave those running in the task's
+        // working copy after the operator was told the task was cancelled.
+        // Same reasoning, and the same `killpg` helper, as a `shell`
+        // stage's timeout (`shell::run`).
+        //
+        // The tradeoff is the one `shell.rs` already documents: a child in
+        // its own group no longer receives the terminal's signals, so
+        // Ctrl-C on a foreground daemon reaches the daemon but not the
+        // agent. The daemon installs no shutdown handler today, so
+        // `kill_on_drop` doesn't run on exit either and such a process
+        // already outlives it; this doesn't make that worse, and the real
+        // fix is graceful shutdown, which is not this change's to make.
+        .process_group(0)
         .kill_on_drop(true);
 
     // `claude`'s normal permission model expects a human to approve each

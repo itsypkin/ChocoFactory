@@ -27,6 +27,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chokofactory_core::models::{EventType, Task, TaskRunEndReason, TaskRunStatus};
@@ -34,6 +35,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 
 use crate::db::{events, projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
@@ -55,6 +57,30 @@ const TURN_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 /// What a completed `agent_turn` transitions on when its reply carried no
 /// verdict of its own — §5.2's "a plain single-shot turn just emits `done`".
 const TURN_DEFAULT_OUTCOME: &str = "done";
+
+/// In-flight detached `shell`/`poll` runners, keyed by task id and then by
+/// the runner id [`WorkflowEngine::reserve_runner_slot`] hands out (#69).
+///
+/// The inner `Option` is the reservation: `None` between the slot being
+/// claimed and its `JoinHandle` being attached, which is a window only the
+/// spawning caller can observe.
+type DetachedRunners = HashMap<String, HashMap<u64, Option<JoinHandle<()>>>>;
+
+/// `tasks.status` for a task that reached a `terminal` stage (§5.4).
+const TASK_STATUS_CLOSED: &str = "closed";
+
+/// `tasks.status` for a task an operator cancelled (#69) — a third value
+/// beyond §5.4's `open`/`closed`.
+///
+/// Distinct from `closed` on purpose: `closed` means the workflow reached
+/// an end it declared, and a task can only get there by traversing its
+/// graph. `cancelled` means a human stopped it somewhere it wasn't
+/// designed to stop, which is the thing an operator scanning
+/// `choco task list` most needs to be able to tell apart. It is also what
+/// every guard in this file keys off to refuse further work on the task,
+/// so collapsing the two would make "did this finish or was it killed?"
+/// unanswerable from the API.
+const TASK_STATUS_CANCELLED: &str = "cancelled";
 
 pub struct WorkflowEngine {
     pool: SqlitePool,
@@ -81,6 +107,33 @@ pub struct WorkflowEngine {
     /// this a `human_gate`-only workflow would sit silent until some
     /// unrelated event happened to arrive.
     events_notify: Arc<Notify>,
+    /// In-flight detached `shell`/`poll` runners per task, so `cancel_task`
+    /// can stop them (#69).
+    ///
+    /// Neither stage kind opens a `task_run`, so killing the task's agent
+    /// session reaches neither — yet both can be running a command for
+    /// minutes, in the task's worktree, which cancel is about to delete.
+    /// Aborting the runner drops its future mid-await, which drops
+    /// `shell::run`'s `ProcessGroup` guard, which SIGKILLs the command's
+    /// whole process group.
+    ///
+    /// A `std::sync::Mutex`, not tokio's: every critical section here is a
+    /// map insert or remove with no `await` inside, and `spawn_shell_runner`
+    /// /`spawn_poll_runner` are deliberately *synchronous* fns (they'd
+    /// otherwise reintroduce an auto-trait inference cycle — see their doc
+    /// comments), so they cannot await a lock at all.
+    ///
+    /// Entry lifecycle is the part worth getting right, since a map keyed
+    /// by task id is exactly the shape this codebase's reviews keep finding
+    /// leaks in: a slot is reserved *before* the spawn and removed by the
+    /// runner itself when it finishes, and the whole task entry is dropped
+    /// once its last runner is gone, so nothing accumulates for tasks that
+    /// are never cancelled.
+    detached_runners: std::sync::Mutex<DetachedRunners>,
+    /// Source of the ids keying `detached_runners`' inner maps. Only needs
+    /// to be unique per task, but a single global counter is simpler than
+    /// per-task numbering and just as correct.
+    next_runner_id: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -99,6 +152,11 @@ pub enum EngineError {
         expected: String,
         actual: String,
     },
+    /// An operator cancelled the task while a detached runner was still in
+    /// flight (#69), so its outcome was discarded rather than advancing a
+    /// task that is meant to have stopped. Expected, not a fault — a cancel
+    /// races whatever was already running by definition.
+    TaskCancelled(String),
     TerminalStageHasNoTransitions(String),
     MissingAgentTurnInput(String),
     UnknownRole {
@@ -157,6 +215,9 @@ impl fmt::Display for EngineError {
                 f,
                 "task left stage '{expected}' (now in '{actual}') before its outcome could be applied"
             ),
+            EngineError::TaskCancelled(task_id) => {
+                write!(f, "task '{task_id}' was cancelled and cannot be advanced")
+            }
             EngineError::TerminalStageHasNoTransitions(stage) => {
                 write!(f, "stage '{stage}' is terminal and cannot be advanced")
             }
@@ -302,6 +363,10 @@ pub enum SendMessageError {
     /// for it (e.g. `create_task`'s `start_task` failed before spawning
     /// one).
     NoOpenRun(String),
+    /// The task was cancelled (#69). Detected under the per-task lock, so
+    /// unlike `send_message_or_resume`'s own earlier check this one cannot
+    /// be raced by a concurrent `cancel_task`.
+    TaskCancelled,
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     RoleConfig(RoleConfigError),
@@ -332,6 +397,9 @@ impl fmt::Display for SendMessageError {
             ),
             SendMessageError::NoOpenRun(stage) => {
                 write!(f, "stage '{stage}' has no task_run recorded for it yet")
+            }
+            SendMessageError::TaskCancelled => {
+                write!(f, "task was cancelled and accepts no further messages")
             }
             SendMessageError::Resolve(err) => write!(f, "{err}"),
             SendMessageError::WorkflowDef(err) => write!(f, "{err}"),
@@ -371,6 +439,9 @@ pub enum SendMessageOrResumeError {
     /// `human_gate` — e.g. `shell`/`poll`/`terminal`, or an `agent_turn`
     /// that can itself transition (not yet a case this dispatch handles).
     UnsupportedStageKind(String),
+    /// The task was cancelled (#69), so it accepts no further messages or
+    /// resume signals regardless of what stage it stopped in.
+    TaskCancelled,
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     Db(sqlx::Error),
@@ -392,6 +463,9 @@ impl fmt::Display for SendMessageOrResumeError {
                 f,
                 "stage '{stage}' cannot accept a message or resume signal here"
             ),
+            SendMessageOrResumeError::TaskCancelled => {
+                write!(f, "task was cancelled and accepts no further messages")
+            }
             SendMessageOrResumeError::Resolve(err) => write!(f, "{err}"),
             SendMessageOrResumeError::WorkflowDef(err) => write!(f, "{err}"),
             SendMessageOrResumeError::Db(err) => write!(f, "{err}"),
@@ -406,6 +480,43 @@ impl std::error::Error for SendMessageOrResumeError {}
 impl From<sqlx::Error> for SendMessageOrResumeError {
     fn from(err: sqlx::Error) -> Self {
         SendMessageOrResumeError::Db(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum CancelTaskError {
+    NoSuchTask,
+    /// Already cancelled, or already `closed` by reaching a terminal stage.
+    /// Both are 409s rather than silent no-ops: a second cancel is either a
+    /// duplicate request the caller should know about, or an attempt to
+    /// cancel work that already finished on its own — and answering `202`
+    /// to the latter would imply the daemon stopped something it didn't.
+    NotCancellable(String),
+    /// A session for this task's run is mid-spawn, so the process to kill
+    /// doesn't exist yet and isn't reachable from here. The caller can
+    /// retry once that settles.
+    Session(SessionError),
+    Db(sqlx::Error),
+}
+
+impl fmt::Display for CancelTaskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CancelTaskError::NoSuchTask => write!(f, "no such task"),
+            CancelTaskError::NotCancellable(status) => {
+                write!(f, "task is already '{status}' and cannot be cancelled")
+            }
+            CancelTaskError::Session(err) => write!(f, "{err}"),
+            CancelTaskError::Db(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for CancelTaskError {}
+
+impl From<sqlx::Error> for CancelTaskError {
+    fn from(err: sqlx::Error) -> Self {
+        CancelTaskError::Db(err)
     }
 }
 
@@ -424,6 +535,8 @@ impl WorkflowEngine {
             workflows_dir,
             global_config_path,
             events_notify,
+            detached_runners: std::sync::Mutex::new(HashMap::new()),
+            next_runner_id: AtomicU64::new(0),
         })
     }
 
@@ -512,9 +625,65 @@ impl WorkflowEngine {
         task_id: &str,
         text: &str,
     ) -> Result<(), SendMessageError> {
+        // Takes the same per-task lock `start_task`/`advance` use, so that
+        // *every* path which can establish an agent session for a task
+        // holds it (#69). This one is the odd one out historically: the
+        // others reach `SessionManager` through `enter_agent_turn` inside
+        // the lock, while this resumes a session directly without it.
+        //
+        // That mattered once `cancel_task` existed. Cancel holds this lock
+        // and then asks `SessionManager` to kill the task's run; if a
+        // resume could be mid-spawn at that moment, cancel would see
+        // `Establishing`, fail *after* having already marked the task
+        // cancelled, and leave a live agent attached to a task whose
+        // status now makes every retry a 409 — an agent nothing could ever
+        // kill. Holding the lock here makes that interleaving impossible
+        // rather than merely unlikely.
+        //
+        // Not re-entrant with `send_message_or_resume`: that function
+        // doesn't hold the lock when it delegates here (its `human_gate`
+        // branch takes the other path, into `advance_from_stage`), and
+        // nothing in this function calls `advance`. `tokio::sync::Mutex`
+        // is not reentrant, so that separation is load-bearing — see this
+        // module's header.
+        let lock = self.lock_for_task(task_id).await;
+        let result = {
+            let _guard = lock.lock().await;
+            self.send_message_locked(task_id, text).await
+        };
+        self.evict_task_lock_if_unshared(task_id, &lock).await;
+        result
+    }
+
+    /// The body of [`Self::send_message`], run under that function's
+    /// per-task lock. Split out so the guard's scope is a single
+    /// statement rather than the whole function.
+    async fn send_message_locked(
+        self: &Arc<Self>,
+        task_id: &str,
+        text: &str,
+    ) -> Result<(), SendMessageError> {
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(SendMessageError::NoSuchTask)?;
+
+        // Re-checked here, under the lock, and not only in
+        // `send_message_or_resume` (#69). That caller reads `status`
+        // before taking any lock and then does real work — resolving a
+        // workflow path, loading and parsing its YAML — so a cancel can
+        // easily land in between. The window is not theoretical: for a
+        // chat task whose turn has finished, the run is `idle`, so
+        // `cancel_task` finds nothing to kill and returns having only
+        // written the status. Without this check the send would then
+        // resume a *fresh* subprocess from the persisted `session_id` —
+        // spawning an agent for a task the operator already cancelled,
+        // and one that no retry could kill, since every later cancel is a
+        // 409. The `human_gate` branch is safe only because
+        // `advance_from_stage` re-checks under this same lock; this is
+        // the matching check for the branch that resumes a session.
+        if task.status == TASK_STATUS_CANCELLED {
+            return Err(SendMessageError::TaskCancelled);
+        }
 
         let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
             .map_err(SendMessageError::Resolve)?;
@@ -622,6 +791,18 @@ impl WorkflowEngine {
             .await?
             .ok_or(SendMessageOrResumeError::NoSuchTask)?;
 
+        // A cancelled task accepts nothing further (#69). Without this the
+        // dispatch below would still match on *stage kind* — which cancel
+        // deliberately leaves untouched — and a task parked in a
+        // standing-open `agent_turn` would take the message, find no live
+        // session (cancel killed it), and resume a fresh subprocess from
+        // the persisted `session_id`: restarting the very process the
+        // operator just stopped. `tasks.status` is the only thing that
+        // distinguishes that task from a healthy one here.
+        if task.status == TASK_STATUS_CANCELLED {
+            return Err(SendMessageOrResumeError::TaskCancelled);
+        }
+
         let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
             .map_err(SendMessageOrResumeError::Resolve)?;
         let definition = Arc::new(
@@ -685,6 +866,317 @@ impl WorkflowEngine {
             _ => Err(SendMessageOrResumeError::UnsupportedStageKind(
                 current_stage,
             )),
+        }
+    }
+
+    /// Stops `task_id` for good at an operator's request (#69): marks it
+    /// `cancelled`, kills whatever subprocess group it has running, and
+    /// removes its worktree.
+    ///
+    /// The ordering below is the whole design, so it is worth stating why.
+    /// It is arranged around one rule — **nothing that can fail happens
+    /// after the status write** — which is what lets both of the properties
+    /// this function needs hold at once:
+    ///
+    /// 1. The two fallible *reads* (`workflow_state`, the current
+    ///    `task_run`) come first, so a DB error here returns having changed
+    ///    nothing at all and a retry starts clean.
+    /// 2. `tasks.status` is written **second**, still inside the per-task
+    ///    lock. Every guard that makes cancel stick — `advance_from_stage`,
+    ///    `send_message`, `run_poll_stage` — reads that column, so it has
+    ///    to land before this function releases the lock. Taking the same
+    ///    lock `advance` takes means an in-flight transition either
+    ///    completes entirely before this write or observes it; it cannot
+    ///    interleave. A crash immediately after leaves a task that is
+    ///    genuinely cancelled and will never run another stage.
+    /// 3. Everything that actually stops work — the session kill, the
+    ///    detached-runner abort, the worktree removal — comes **last**,
+    ///    because none of it can fail in a way that should abort the
+    ///    cancel. Doing any of it before the write would reintroduce the
+    ///    window this ordering exists to close: a killed agent attached to
+    ///    a task the engine still believes is `open`, which a later
+    ///    `task send` would happily resume from the persisted
+    ///    `session_id`.
+    /// 4. Within that last group the worktree goes after the kills. `git
+    ///    worktree remove --force` against a directory an agent is still
+    ///    writing to is a race, and killing first shrinks it to nothing.
+    ///
+    /// An earlier revision of this function killed first and wrote second,
+    /// on the reasoning that a failed kill should not leave a task marked
+    /// cancelled. That is the wrong trade: a cancel that half-succeeded and
+    /// left the status unwritten is indistinguishable from a healthy task,
+    /// whereas a cancelled task whose kill failed is at least visibly
+    /// stopped. Making the reads fallible-first gets the good half of both.
+    ///
+    /// Cancelling does not walk the workflow to a terminal stage.
+    /// `current_stage` deliberately stays where it was, so
+    /// `choco task status` can still say *where* a task was cancelled;
+    /// `tasks.status` alone carries the "don't run this any more" signal.
+    pub async fn cancel_task(self: &Arc<Self>, task_id: &str) -> Result<(), CancelTaskError> {
+        let lock = self.lock_for_task(task_id).await;
+        let result = {
+            let _guard = lock.lock().await;
+
+            // Read inside the lock, not before it: two concurrent cancels
+            // would otherwise both see `open`, both pass the check, and
+            // both proceed to kill and remove the worktree.
+            let task = tasks::get(&self.pool, task_id)
+                .await?
+                .ok_or(CancelTaskError::NoSuchTask)?;
+            if task.status == TASK_STATUS_CANCELLED || task.status == TASK_STATUS_CLOSED {
+                Err(CancelTaskError::NotCancellable(task.status))
+            } else {
+                self.cancel_task_locked(&task).await
+            }
+        };
+        self.evict_task_lock_if_unshared(task_id, &lock).await;
+        result
+    }
+
+    /// The body of [`Self::cancel_task`], split out only so the per-task
+    /// lock guard's scope stays obvious at the call site above.
+    async fn cancel_task_locked(self: &Arc<Self>, task: &Task) -> Result<(), CancelTaskError> {
+        let task_id = &task.id;
+
+        // Step 1 — the fallible reads, before anything is written or
+        // killed, so a DB error here returns having changed nothing.
+        //
+        // A missing `workflow_state` row is *not* an error: a task whose
+        // `start_task` died between `worktree::ensure` and
+        // `workflow_state::create` never reached a stage, so it has no
+        // session to kill — which is precisely the state cancel wants. It
+        // may still own a worktree, and treating this as an error would
+        // mark the task cancelled, skip the removal below, and then refuse
+        // every retry with a 409, leaking that worktree permanently.
+        let state = workflow_state::get(&self.pool, task_id).await?;
+        let run = match &state {
+            Some(state) => {
+                task_runs::get_current_for_stage(&self.pool, task_id, &state.current_stage).await?
+            }
+            None => None,
+        };
+
+        // Step 2 — the write every guard keys off, and the last thing here
+        // that can fail. After this the task is durably cancelled: no stage
+        // will advance, no message will be accepted, and a crash on the
+        // very next line leaves a task that is visibly stopped rather than
+        // one that silently looks healthy.
+        tasks::update_status(&self.pool, task_id, TASK_STATUS_CANCELLED)
+            .await?
+            // `None` means the row vanished between this function's own
+            // read and this write — impossible while the lock is held, but
+            // surfaced rather than discarded, the same way `start_task`
+            // treats it.
+            .ok_or(CancelTaskError::NoSuchTask)?;
+        tracing::info!(task_id, "task cancelled");
+
+        // Step 3 — stop the work. Nothing below is allowed to fail the
+        // cancel: the task is already cancelled, and returning an error now
+        // would strand it behind a permanent 409 with no way to retry the
+        // very cleanup that failed.
+        if let Some(run) = run
+            && run.status == TaskRunStatus::Active
+        {
+            // The only error `SessionManager::cancel` can return is
+            // `AlreadyStarting` — a session mid-spawn, which this call can
+            // neither see nor kill. It is unreachable from here, and
+            // deliberately so: every path that establishes a session for a
+            // task (`start_task`, `advance` → `enter_agent_turn`, and
+            // `send_message`) holds the same per-task lock this function
+            // holds, so no spawn for this task can be in flight right now.
+            //
+            // `send_message` only started taking that lock as part of this
+            // change, and this is why. Without it the interleaving was: a
+            // resume reserves the slot, cancel marks the task `cancelled`
+            // and then fails here — leaving a live agent attached to a task
+            // whose status makes every retry a 409, so nothing could ever
+            // kill it.
+            //
+            // Logged at `error` rather than propagated because this is an
+            // invariant violation, not a runtime failure an operator can
+            // act on. `AlreadyStarting` is the only error `cancel` returns,
+            // and the lock argument above says it cannot happen; returning
+            // it would dress a daemon bug up as a 409 the caller could
+            // usefully retry. It could not, in any case: the status write
+            // above has already committed, so a second cancel is refused
+            // with `NotCancellable` whether or not this call returned
+            // `Err`. If the lock invariant is ever broken this is the line
+            // that says so.
+            if let Err(err) = self.session_manager.cancel(&run.id).await {
+                tracing::error!(
+                    task_id, task_run_id = %run.id, %err,
+                    "cancelled task's session could not be killed; a live agent may have been left running"
+                );
+            }
+        }
+
+        // An `agent_turn` is not the only thing that can be running. A
+        // `shell` or `poll` stage runs detached, owns no `task_run` row,
+        // and — for a `worktree: true` workflow — has the worktree as its
+        // cwd. Aborting the runner drops the future mid-await, which drops
+        // `shell::run`'s `ProcessGroup` guard, which SIGKILLs the
+        // command's whole group. Without this, cancel would leave a `make
+        // && npm test` running and then delete the directory out from
+        // under it.
+        self.abort_detached_runners(task_id).await;
+
+        // The worktree last, once nothing is writing to it: both the agent
+        // session and any detached `shell`/`poll` command have been killed
+        // above, so `git worktree remove --force` isn't racing a live
+        // writer.
+        //
+        // The two are killed with different rigour, deliberately.
+        // `abort_detached_runners` awaits each handle, so the command's
+        // `ProcessGroup` guard is provably dropped before this line;
+        // `SessionManager::cancel` only returns once `killpg` has, without
+        // waiting for the agent to be reaped. That asymmetry is fine — a
+        // `SIGKILL`ed process runs no further user-space code, so it cannot
+        // write to the worktree after the signal lands — whereas an
+        // *aborted future* has real teardown left to run, which is exactly
+        // why that side is awaited.
+        //
+        // Gated on the snapshot rather than on `definition.worktree` so
+        // this needs no workflow definition at all — and so a
+        // worktree-enabled task cancelled before it ever reached a stage
+        // that called `worktree::ensure` doesn't trip `remove_worktree`'s
+        // "no snapshot to remove" error log for a worktree that was never
+        // created.
+        if worktree_snapshot(task).is_some() {
+            self.remove_worktree(task_id).await;
+        }
+        Ok(())
+    }
+
+    /// Claims an id for a detached `shell`/`poll` runner about to be
+    /// spawned for `task_id` (#69).
+    ///
+    /// Reserved *before* `tokio::spawn`, not after, and that ordering is
+    /// the point: if the slot were only created once the handle existed, a
+    /// runner that finished in between would call [`Self::finish_runner`]
+    /// for an id not yet present, and the later insert would then leak an
+    /// entry for a task that has nothing running.
+    ///
+    /// Callers must hold the task's `task_locks` entry across the
+    /// reserve/spawn/attach sequence — every one does today, since the only
+    /// callers are reached from `enter_stage`, which runs inside
+    /// `advance`/`start_task`'s guard. That is load-bearing rather than
+    /// incidental: `cancel_task` holds the same lock, so it cannot observe
+    /// a half-built slot. A runner spawned outside the lock could have its
+    /// reservation aborted (and dropped) between the reserve and the
+    /// attach, at which point the attach silently no-ops and the runner is
+    /// left with nothing able to stop it.
+    fn reserve_runner_slot(&self, task_id: &str) -> u64 {
+        let id = self.next_runner_id.fetch_add(1, Ordering::Relaxed);
+        self.detached_runners
+            .lock()
+            .expect("detached_runners mutex poisoned")
+            .entry(task_id.to_string())
+            .or_default()
+            .insert(id, None);
+        id
+    }
+
+    /// Fills in the handle for a slot [`Self::reserve_runner_slot`]
+    /// claimed. A slot that has already been removed means the runner
+    /// finished first, so there is deliberately nothing to do — inserting
+    /// it back would be the leak the reservation exists to avoid.
+    fn attach_runner_handle(&self, task_id: &str, id: u64, handle: JoinHandle<()>) {
+        let mut runners = self
+            .detached_runners
+            .lock()
+            .expect("detached_runners mutex poisoned");
+        if let Some(slot) = runners.get_mut(task_id).and_then(|task| task.get_mut(&id)) {
+            *slot = Some(handle);
+        }
+    }
+
+    /// Drops a finished runner's slot, and the task's whole entry once its
+    /// last runner is gone, so the map doesn't grow without bound for
+    /// tasks nobody ever cancels.
+    fn finish_runner(&self, task_id: &str, id: u64) {
+        let mut runners = self
+            .detached_runners
+            .lock()
+            .expect("detached_runners mutex poisoned");
+        if let Some(task) = runners.get_mut(task_id) {
+            task.remove(&id);
+            if task.is_empty() {
+                runners.remove(task_id);
+            }
+        }
+    }
+
+    /// Aborts every detached `shell`/`poll` runner in flight for `task_id`
+    /// (#69), killing the command each one is running.
+    ///
+    /// Abort drops the runner's future at its current await point, which
+    /// drops `shell::run`'s `ProcessGroup` guard, whose `Drop` SIGKILLs the
+    /// command's whole process group — the same teardown a `timeout:`
+    /// already relies on. A runner that has already finished aborts
+    /// harmlessly.
+    ///
+    /// The entry is removed wholesale: an aborted runner never reaches its
+    /// own `finish_runner` call, so nothing else would clean it up.
+    async fn abort_detached_runners(&self, task_id: &str) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut runners = self
+                .detached_runners
+                .lock()
+                .expect("detached_runners mutex poisoned");
+            runners
+                .remove(task_id)
+                .map(|task| task.into_values().flatten().collect())
+                .unwrap_or_default()
+        };
+        if handles.is_empty() {
+            return;
+        }
+        tracing::info!(
+            task_id,
+            runners = handles.len(),
+            "cancelling task: aborting its in-flight shell/poll runners"
+        );
+        // `abort` only *schedules* the task to be dropped, and the SIGKILL
+        // happens in that drop — so awaiting each handle afterwards is what
+        // makes this deterministic rather than hopeful. A cancelled
+        // `JoinHandle` resolves once the future has actually been dropped,
+        // which is precisely the point the command's process group has been
+        // killed. Without the await, the caller could go on to
+        // `git worktree remove --force` the directory those commands are
+        // still running in.
+        for handle in handles {
+            handle.abort();
+            // The expected outcome is `Err(JoinError::Cancelled)`. `Ok` is
+            // a runner that finished on its own just before the abort, and
+            // a panicked runner is already reported by its own task — so
+            // neither is worth handling here, only waiting for.
+            let _ = handle.await;
+        }
+    }
+
+    /// Whether `task_id` has been cancelled (#69).
+    ///
+    /// Advisory helper for long-running detached work — see
+    /// `run_poll_stage`. A `true` here is authoritative (the column is only
+    /// ever set one way), but a `false` can go stale the moment it's read,
+    /// so this must never be the *only* thing standing between a cancelled
+    /// task and a transition. `advance_from_stage`'s check, taken inside
+    /// the per-task lock, is what actually enforces it.
+    ///
+    /// A failed read answers `false` — "keep going" — matching
+    /// `still_in_stage`'s handling of the same case: a transient DB error
+    /// should not silently abandon a task's in-flight work.
+    async fn is_cancelled(&self, task_id: &str) -> bool {
+        match tasks::get(&self.pool, task_id).await {
+            Ok(Some(task)) => task.status == TASK_STATUS_CANCELLED,
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    task_id, %err,
+                    "could not check whether a task was cancelled; assuming it was not"
+                );
+                false
+            }
         }
     }
 
@@ -763,6 +1255,15 @@ impl WorkflowEngine {
             let task = tasks::get(&self.pool, task_id)
                 .await?
                 .ok_or(EngineError::NoSuchTask)?;
+            // The same guard `advance_from_stage` has, for the same reason
+            // and under the same lock (#69). `create_task` writes the task
+            // row and only then calls this, so a cancel can land in that
+            // window; without this check, starting would go on to create a
+            // worktree and spawn an agent for a task already marked
+            // `cancelled` — one that every later cancel refuses with a 409.
+            if task.status == TASK_STATUS_CANCELLED {
+                return Err(EngineError::TaskCancelled(task_id.to_string()));
+            }
             // Forked once, before `workflow_state` exists at all, so a
             // failure here never leaves a task with a `workflow_state` row
             // pointing at an entry stage whose worktree was never created
@@ -877,6 +1378,26 @@ impl WorkflowEngine {
         // whether it just became terminal without a second query.
         let result: Result<String, EngineError> =
             async {
+                // The authoritative cancel guard (#69). Every detached
+                // runner in this file — the turn watcher, the shell runner,
+                // the poll runner — funnels its outcome through here, so
+                // one check inside the per-task lock stops all of them
+                // rather than each having to remember to look.
+                //
+                // Placed inside the lock for the same reason
+                // `expected_stage` is, and the reason it can't just be read
+                // in `cancel_task` and cached: `cancel_task` takes this same
+                // lock and writes `tasks.status` under it, so a read here
+                // either sees that write or is ordered entirely before it.
+                // Outside the lock, a turn finishing at the same instant as
+                // a cancel could read `open`, then advance a task the
+                // operator had already stopped.
+                if let Some(task) = tasks::get(&self.pool, task_id).await?
+                    && task.status == TASK_STATUS_CANCELLED
+                {
+                    return Err(EngineError::TaskCancelled(task_id.to_string()));
+                }
+
                 let state = workflow_state::get(&self.pool, task_id)
                     .await?
                     .ok_or(EngineError::NoWorkflowState)?;
@@ -1130,7 +1651,9 @@ impl WorkflowEngine {
                 // safely check whether any other overlapping caller still
                 // references it (`evict_task_lock_if_unshared`) — this
                 // function has no access to that `Arc`.
-                if let Err(err) = tasks::update_status(&self.pool, task_id, "closed").await {
+                if let Err(err) =
+                    tasks::update_status(&self.pool, task_id, TASK_STATUS_CLOSED).await
+                {
                     tracing::error!(
                         task_id, %err,
                         "failed to mark task closed after entering a terminal stage"
@@ -1145,9 +1668,8 @@ impl WorkflowEngine {
                 // Same best-effort reasoning as `update_status` above (§5.5
                 // Q7, issue #58): the task is already closed regardless of
                 // whether this succeeds, and `worktree::remove` is itself
-                // idempotent — a future task-cancellation path (out of
-                // scope today, see the issue) can safely retry this exact
-                // removal if it raced this one.
+                // idempotent — `cancel_task` (#69) can safely retry this
+                // exact removal if it raced this one.
                 if definition.worktree {
                     self.remove_worktree(task_id).await;
                 }
@@ -1184,10 +1706,19 @@ impl WorkflowEngine {
     }
 
     /// Removes `task_id`'s worktree, best-effort — logged loudly on
-    /// failure, never propagated (§5.5 Q7, issue #58). Called only from
-    /// `dispatch_stage`'s `StageKind::Terminal` arm, after the task is
-    /// already durably marked closed, so there is nothing left here that a
-    /// returned error could still roll back.
+    /// failure, never propagated (§5.5 Q7, issue #58).
+    ///
+    /// Called from `dispatch_stage`'s `StageKind::Terminal` arm and from
+    /// `cancel_task` (#69) — §5.5's "removed on reaching `done` (or task
+    /// cancellation)". Both call it only *after* the task is already
+    /// durably `closed`/`cancelled`, so there is nothing left here that a
+    /// returned error could still roll back. `worktree::remove` is
+    /// idempotent, so the two paths racing each other is safe.
+    ///
+    /// Callers are responsible for having checked that a worktree should
+    /// exist at all — the terminal arm via `definition.worktree`,
+    /// `cancel_task` via `worktree_snapshot` — since this logs an error
+    /// when a task it is asked to clean up carries no snapshot.
     async fn remove_worktree(self: &Arc<Self>, task_id: &str) {
         let task = match tasks::get(&self.pool, task_id).await {
             Ok(Some(task)) => task,
@@ -1312,7 +1843,12 @@ impl WorkflowEngine {
         cwd: PathBuf,
     ) {
         let engine = Arc::clone(self);
-        tokio::spawn(async move {
+        // Registered so `cancel_task` can abort this runner and kill the
+        // command it's running (#69) — a `shell` stage has no `task_run`,
+        // so killing the task's agent session would not reach it.
+        let runner_id = self.reserve_runner_slot(&task_id);
+        let registered_task_id = task_id.clone();
+        let handle = tokio::spawn(async move {
             engine
                 .run_shell_stage(
                     &task_id,
@@ -1324,7 +1860,9 @@ impl WorkflowEngine {
                     cwd,
                 )
                 .await;
+            engine.finish_runner(&task_id, runner_id);
         });
+        self.attach_runner_handle(&registered_task_id, runner_id, handle);
     }
 
     /// Runs the command, records what it did on the task's timeline, and
@@ -1516,6 +2054,17 @@ impl WorkflowEngine {
                 outcome,
                 "discarded a shell stage's outcome: the task had already left that stage"
             ),
+            // Expected, not a wedge: an operator cancelled mid-command and
+            // the guard in `advance_from_stage` refused the transition, so
+            // the task is stopped on purpose and nothing is waiting on it.
+            // Matched ahead of the catch-all below so a routine cancel
+            // isn't reported at `error` as a task needing rescue.
+            Err(EngineError::TaskCancelled(_)) => tracing::info!(
+                task_id,
+                stage = stage_name,
+                outcome,
+                "discarded a shell stage's outcome: the task was cancelled"
+            ),
             // Anything else — a transient DB failure in `advance`, say —
             // leaves the task stuck in a stage whose work is already done,
             // with nothing that will retry it. Distinguished from the park
@@ -1586,11 +2135,21 @@ impl WorkflowEngine {
         run: PollRun,
     ) {
         let engine = Arc::clone(self);
-        tokio::spawn(async move {
+        // Same registration as `spawn_shell_runner`, and more load-bearing
+        // here: a `poll` holds its window open for minutes or hours, so
+        // without this a cancelled task keeps firing its command every
+        // interval until the deadline. The advisory `is_cancelled` check in
+        // `run_poll_stage` only fires *between* attempts; this stops one
+        // already in flight.
+        let runner_id = self.reserve_runner_slot(&task_id);
+        let registered_task_id = task_id.clone();
+        let handle = tokio::spawn(async move {
             engine
                 .run_poll_stage(&task_id, &definition, &stage_name, run)
                 .await;
+            engine.finish_runner(&task_id, runner_id);
         });
+        self.attach_runner_handle(&registered_task_id, runner_id, handle);
     }
 
     /// Runs the command on `interval` until an outcome matches or the
@@ -1636,6 +2195,23 @@ impl WorkflowEngine {
                     stage = stage_name,
                     attempts = attempt,
                     "abandoned a poll: the task had already left that stage"
+                );
+                return;
+            }
+
+            // Cancel needs its own check here, and can't ride on
+            // `still_in_stage` above: cancelling deliberately leaves
+            // `current_stage` where it was, so a cancelled poll is still
+            // "in its stage" and would keep firing its command every
+            // interval — an hour of `gh pr checks` on a task the operator
+            // already stopped. Advisory, exactly like the check above; the
+            // authoritative refusal is in `advance_from_stage`.
+            if attempt > 0 && self.is_cancelled(task_id).await {
+                tracing::info!(
+                    task_id,
+                    stage = stage_name,
+                    attempts = attempt,
+                    "abandoned a poll: the task was cancelled"
                 );
                 return;
             }
@@ -2039,6 +2615,15 @@ impl WorkflowEngine {
                 outcome,
                 "discarded a poll stage's outcome: the task had already left that stage"
             ),
+            // Squarely reachable: a poll's advisory cancel check only runs
+            // between attempts, so an outcome resolving in the same window
+            // as a cancel lands here.
+            Err(EngineError::TaskCancelled(_)) => tracing::info!(
+                task_id,
+                stage = stage_name,
+                outcome,
+                "discarded a poll stage's outcome: the task was cancelled"
+            ),
             Err(err) => tracing::error!(
                 task_id, stage = stage_name, outcome, %err,
                 "task wedged: its poll stage resolved but the transition failed"
@@ -2245,6 +2830,24 @@ impl WorkflowEngine {
                     // from a turn finishing on its own by `status` alone,
                     // so `end_reason` is what actually decides whether
                     // this was a real completion.
+                    // Ordered ahead of every status arm below, because it
+                    // is the one reason that decides the outcome on its own
+                    // (#69): a cancelled run lands on `Exited` normally, but
+                    // a turn that finished cleanly in the instant before
+                    // the kill landed lands on `Idle` — and the `Idle` arm
+                    // below would `break` and advance a task the operator
+                    // had already stopped. `advance_from_stage`'s guard
+                    // would still refuse that transition, so this is the
+                    // early, quiet exit rather than the thing that makes
+                    // cancel correct.
+                    Ok(Some(run)) if run.end_reason == Some(TaskRunEndReason::Cancelled) => {
+                        tracing::info!(
+                            task_id,
+                            task_run_id,
+                            "task run was cancelled; not auto-advancing"
+                        );
+                        return;
+                    }
                     Ok(Some(run))
                         if run.status == TaskRunStatus::Idle
                             && run.end_reason == Some(TaskRunEndReason::Reaped) =>
@@ -2409,6 +3012,19 @@ impl WorkflowEngine {
                 Some(format!(
                     "not applied: the task had already left '{expected}' for '{actual}'"
                 ))
+            }
+            // A turn that completed in the same instant it was cancelled.
+            // The note goes on the `turn_outcome` event, so the timeline
+            // says why the verdict wasn't applied rather than leaving a
+            // reader to infer it from the task's status.
+            Err(EngineError::TaskCancelled(_)) => {
+                tracing::info!(
+                    task_id,
+                    stage = stage_name,
+                    outcome,
+                    "discarded a turn's outcome: the task was cancelled"
+                );
+                Some("not applied: the task was cancelled".to_string())
             }
             Err(err) => {
                 tracing::error!(
@@ -7538,5 +8154,554 @@ stages:
             "model=sonnet|system_prompt=<unset>|permission_mode=<unset>",
         )
         .await;
+    }
+
+    // ---- cancel (#69) ----
+
+    /// A single-shot `agent_turn` that would auto-advance to a terminal
+    /// stage the moment its turn completes.
+    fn cancellable_turn_def() -> Arc<WorkflowDefinition> {
+        let yaml = r#"
+name: cancellable
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap())
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_the_task_cancelled_and_kills_its_run() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = cancellable_turn_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
+
+        engine.cancel_task(&task_id).await.unwrap();
+
+        assert_eq!(
+            tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+            "cancelled"
+        );
+        for _ in 0..200 {
+            let run = task_runs::get(&pool, &run.id).await.unwrap().unwrap();
+            if run.end_reason == Some(TaskRunEndReason::Cancelled) {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for the run to be recorded as cancelled");
+    }
+
+    /// Cancel deliberately leaves `current_stage` alone, so an operator can
+    /// still see *where* a task was stopped. Collapsing it to a terminal
+    /// stage would throw that away, and would also fire the terminal
+    /// stage's own effects (`closed`, its `stage_entered` event) for a task
+    /// that never actually got there.
+    #[tokio::test]
+    async fn cancel_leaves_the_task_in_the_stage_it_was_cancelled_in() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = cancellable_turn_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_run_for_stage(&pool, &task_id, "coding").await;
+
+        engine.cancel_task(&task_id).await.unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "coding");
+    }
+
+    /// End-to-end: a single-shot turn that completes after a cancel must
+    /// not carry the task on to `finished`/`closed`.
+    ///
+    /// Note which layer this actually pins down. Two independent things
+    /// stop it — the turn watcher's `Cancelled` arm, which returns before
+    /// `finish_turn`, and `advance_from_stage`'s guard behind it — and the
+    /// watcher wins the race in this scenario, so removing the guard alone
+    /// does *not* make this test fail. That's deliberate defense in depth,
+    /// not redundancy: the guard covers the ordering this test can't
+    /// reproduce on demand, where a turn completes and `finish_turn` is
+    /// already past the watcher when the cancel lands.
+    /// `advance_refuses_a_cancelled_task` is what pins the guard itself,
+    /// and it does fail without it.
+    #[tokio::test]
+    async fn a_cancelled_task_does_not_advance_when_its_turn_completes() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = cancellable_turn_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude_oneshot.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_run_for_stage(&pool, &task_id, "coding").await;
+
+        engine.cancel_task(&task_id).await.unwrap();
+
+        // Long enough for the watcher (100ms poll) to have seen the turn
+        // finish and tried to advance several times over.
+        tokio::time::sleep(StdDuration::from_millis(600)).await;
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(
+            task.status, "cancelled",
+            "a cancelled task must stay cancelled"
+        );
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(
+            state.current_stage, "coding",
+            "the completed turn must not have advanced a cancelled task"
+        );
+    }
+
+    /// Directly exercises the guard, independent of subprocess timing: an
+    /// `advance` on a cancelled task is refused rather than transitioning.
+    #[tokio::test]
+    async fn advance_refuses_a_cancelled_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.cancel_task(&task_id).await.unwrap();
+
+        let err = engine.advance(&task_id, &def, "resumed").await.unwrap_err();
+        assert!(matches!(err, EngineError::TaskCancelled(_)));
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "gate");
+    }
+
+    /// The hole this closes: `send_message_or_resume` dispatches on stage
+    /// *kind*, which cancel deliberately doesn't change. Without the
+    /// `tasks.status` check, resuming this `human_gate` would advance a
+    /// cancelled task; for a standing-open `agent_turn` it would go further
+    /// and spawn a fresh subprocess from the persisted `session_id`,
+    /// restarting the very process cancel just killed.
+    #[tokio::test]
+    async fn a_cancelled_task_refuses_further_messages() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let dir = tempdir();
+        fs::write(
+            dir.join("gated.yaml"),
+            r#"
+name: gated
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &dir,
+        );
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.cancel_task(&task_id).await.unwrap();
+
+        let err = engine
+            .send_message_or_resume(&task_id, "carry on")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendMessageOrResumeError::TaskCancelled));
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "gate");
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_already_cancelled_task_is_rejected() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.cancel_task(&task_id).await.unwrap();
+
+        let err = engine.cancel_task(&task_id).await.unwrap_err();
+        assert!(matches!(err, CancelTaskError::NotCancellable(status) if status == "cancelled"));
+    }
+
+    /// A task that already reached its terminal stage finished on its own.
+    /// Reporting success would claim the daemon stopped something it
+    /// didn't, and would re-run the worktree removal for no reason.
+    #[tokio::test]
+    async fn cancelling_a_closed_task_is_rejected() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        let err = engine.cancel_task(&task_id).await.unwrap_err();
+        assert!(matches!(err, CancelTaskError::NotCancellable(status) if status == "closed"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_task_is_rejected() {
+        let pool = connect_in_memory().await.unwrap();
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        let err = engine.cancel_task("no-such-task").await.unwrap_err();
+        assert!(matches!(err, CancelTaskError::NoSuchTask));
+    }
+
+    /// Two operators (or a double-clicked button) cancelling at once: the
+    /// per-task lock plus the status re-read *inside* it mean exactly one
+    /// wins and the other gets a conflict — rather than both passing the
+    /// check and both going on to kill and remove the worktree.
+    #[tokio::test]
+    async fn concurrent_cancels_of_the_same_task_leave_exactly_one_winner() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let engine = Arc::clone(&engine);
+            let task_id = task_id.clone();
+            handles.push(tokio::spawn(
+                async move { engine.cancel_task(&task_id).await },
+            ));
+        }
+
+        let mut ok = 0;
+        let mut conflicts = 0;
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(()) => ok += 1,
+                Err(CancelTaskError::NotCancellable(_)) => conflicts += 1,
+                Err(err) => panic!("unexpected error: {err}"),
+            }
+        }
+        assert_eq!(ok, 1, "exactly one cancel should have taken effect");
+        assert_eq!(conflicts, 3);
+    }
+
+    /// §5.5's "removed on reaching `done` (or task cancellation)" — the
+    /// half that was never implemented until #69.
+    #[tokio::test]
+    async fn cancel_removes_a_worktree_enabled_tasks_worktree() {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+
+        let yaml = r#"
+name: wt-cancellable
+worktree: true
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &repo).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_run_for_stage(&pool, &task_id, "coding").await;
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        let (wt_repo, wt_project) = worktree_snapshot(&task).expect("worktree snapshot recorded");
+        let path = worktree::worktree_path(&wt_repo, wt_project, &task_id).unwrap();
+        assert!(path.exists(), "the worktree should exist before cancelling");
+
+        engine.cancel_task(&task_id).await.unwrap();
+
+        wait_until_path_gone(&path).await;
+    }
+
+    /// Regression test for the interleaving that made `send_message` take
+    /// the per-task lock.
+    ///
+    /// `send_message` resumes a session directly, without going through
+    /// `enter_agent_turn`. While it did that outside the lock, a resume
+    /// could be mid-spawn (`SessionSlot::Establishing`) exactly when a
+    /// cancel ran: cancel would mark the task `cancelled`, then fail with
+    /// `AlreadyStarting` — leaving a live agent attached to a task whose
+    /// status makes every retry a 409, so nothing could ever kill it.
+    ///
+    /// Racing the two by scheduling doesn't reproduce it — the spawn
+    /// window is a few microseconds wide and such a test passes either way
+    /// — so this pins the *property* that closes it instead, the way
+    /// `session.rs` pins its own ordering bugs by driving internals
+    /// directly rather than hoping the scheduler cooperates: while a
+    /// task's lock is held, `send_message` must wait for it.
+    ///
+    /// That is exactly what makes `Establishing` unreachable from
+    /// `cancel_task`, and it fails without the fix — `send_message` sails
+    /// past a held lock and reserves a session slot underneath the cancel.
+    #[tokio::test]
+    async fn send_message_waits_for_the_per_task_lock_a_cancel_holds() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: chat
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#;
+        fs::write(dir.join("chat.yaml"), yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &dir,
+        );
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_run_for_stage(&pool, &task_id, "chatting").await;
+
+        // Stands in for a cancel mid-flight: it holds exactly this lock
+        // across its status write and its call into `SessionManager`.
+        let lock = engine.lock_for_task(&task_id).await;
+        let guard = lock.lock().await;
+
+        let sender = {
+            let engine = Arc::clone(&engine);
+            let task_id = task_id.clone();
+            tokio::spawn(async move { engine.send_message(&task_id, "again").await })
+        };
+
+        tokio::time::sleep(StdDuration::from_millis(150)).await;
+        assert!(
+            !sender.is_finished(),
+            "send_message established a session while a cancel held the task lock — \
+             the interleaving that strands an unkillable agent"
+        );
+
+        drop(guard);
+        sender.await.unwrap().unwrap();
+    }
+
+    /// A `poll` holds its stage open for minutes or hours, and cancel
+    /// deliberately leaves `current_stage` alone — so a cancelled task must
+    /// not keep firing its command every interval until the deadline. The
+    /// marker file counts attempts by appending to it.
+    ///
+    /// Two mechanisms stop it, as with
+    /// `a_cancelled_task_does_not_advance_when_its_turn_completes`: the
+    /// runner abort (which kills the loop outright) and the advisory
+    /// `is_cancelled` check in `run_poll_stage` (which ends it at the next
+    /// attempt). The abort alone is enough, so deleting the advisory check
+    /// would not fail this test. The check still earns its place for a
+    /// runner the registry somehow doesn't hold — and this test does fail
+    /// if *both* are removed, which is the property that matters.
+    #[tokio::test]
+    async fn a_cancelled_task_stops_polling() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let marker = dir.join("attempts");
+        let def = parsed_poll_def(
+            &format!("printf x >> {} && echo PENDING", marker.display()),
+            GREEN_OR_RED,
+        );
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        // Let at least one attempt land, so the loop is genuinely running.
+        for _ in 0..500 {
+            if fs::metadata(&marker).is_ok_and(|m| m.len() >= 1) {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(fs::metadata(&marker).is_ok(), "the poll never ran at all");
+
+        engine.cancel_task(&task_id).await.unwrap();
+        let at_cancel = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+
+        // Several intervals' worth: a still-running loop would add attempts.
+        tokio::time::sleep(StdDuration::from_millis(2500)).await;
+        let later = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            at_cancel, later,
+            "a cancelled task kept polling: {at_cancel} attempts at cancel, {later} after"
+        );
+    }
+
+    /// A `shell` stage owns no `task_run`, so killing the task's agent
+    /// session doesn't reach it. Cancel has to abort the detached runner —
+    /// otherwise the command keeps running in a worktree cancel is about
+    /// to delete.
+    #[tokio::test]
+    async fn cancel_kills_a_running_shell_stages_command() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let marker = dir.join("ticks");
+        // Runs far longer than the test, appending as it goes, so "did it
+        // actually stop?" is observable rather than inferred.
+        let yaml = format!(
+            r#"
+name: long-shell
+stages:
+  building:
+    kind: shell
+    command: "for i in $(seq 1 200); do printf x >> {} ; sleep 0.05; done"
+    on: {{ done: finished, error: finished }}
+  finished:
+    kind: terminal
+"#,
+            marker.display()
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        for _ in 0..500 {
+            if fs::metadata(&marker).is_ok_and(|m| m.len() >= 2) {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(
+            fs::metadata(&marker).is_ok(),
+            "the shell command never started"
+        );
+
+        engine.cancel_task(&task_id).await.unwrap();
+        // The kill happens when the aborted future drops; give it a beat.
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+        let at_cancel = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        let later = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            at_cancel, later,
+            "a cancelled task's shell command kept running: {at_cancel} ticks at cancel, {later} after"
+        );
+    }
+
+    /// The registry backing that abort is keyed by task id, which is the
+    /// shape this codebase's reviews keep finding leaks in — so a runner
+    /// that finishes normally must drop its own entry rather than waiting
+    /// for a cancel that may never come.
+    #[tokio::test]
+    async fn a_finished_shell_runner_leaves_no_entry_behind() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: quick-shell
+stages:
+  building:
+    kind: shell
+    command: "true"
+    on: { done: finished, error: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        for _ in 0..200 {
+            let empty = engine
+                .detached_runners
+                .lock()
+                .expect("detached_runners mutex poisoned")
+                .is_empty();
+            if empty {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("a finished shell runner left its registry entry behind");
+    }
+
+    /// `start_task` needs the same guard `advance_from_stage` has:
+    /// `create_task` writes the task row and only then starts it, so a
+    /// cancel can land in between — and starting anyway would create a
+    /// worktree and spawn an agent for a task already marked cancelled.
+    #[tokio::test]
+    async fn start_task_refuses_a_task_that_was_already_cancelled() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        // Cancel before the task ever started: no workflow_state row yet,
+        // which must not be an error (it's the "nothing to kill" case).
+        engine.cancel_task(&task_id).await.unwrap();
+
+        let err = engine.start_task(&task_id, &def, None).await.unwrap_err();
+        assert!(matches!(err, EngineError::TaskCancelled(_)));
+        assert!(
+            workflow_state::get(&pool, &task_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a cancelled task must not have been started"
+        );
+    }
+
+    /// A task cancelled before it ever reached a stage that called
+    /// `worktree::ensure` has no snapshot, so cancel's worktree step has
+    /// nothing to remove and must not fail the cancel.
+    ///
+    /// This pins the *outcome*, not the skip: `remove_worktree` only logs
+    /// and returns when there is no snapshot, so deleting the
+    /// `worktree_snapshot` gate would leave this test passing. The gate
+    /// exists to keep that error log out of a perfectly ordinary cancel,
+    /// which isn't worth asserting on a log line to prove.
+    #[tokio::test]
+    async fn cancel_succeeds_for_a_task_that_never_made_a_worktree() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_gate_chain_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert!(worktree_snapshot(&task).is_none());
+
+        engine.cancel_task(&task_id).await.unwrap();
+
+        assert_eq!(
+            tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+            "cancelled"
+        );
     }
 }

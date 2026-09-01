@@ -1075,3 +1075,102 @@ async fn task_reconfigure_without_any_overrides_is_an_error() {
         failed.stderr
     );
 }
+
+/// `task cancel` end to end through the real binaries (#69).
+#[tokio::test]
+async fn task_cancel_confirms_in_human_mode_and_stays_silent_under_json() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let make_task = || async {
+        run_choco_json(
+            &daemon.base_url,
+            &[
+                "task",
+                "create",
+                "--project",
+                &project_id,
+                "--workflow",
+                "chat",
+                "--title",
+                "t",
+                "--prompt",
+                "hello",
+            ],
+        )
+        .await
+        .json()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let task_id = make_task().await;
+    let cancelled = run_choco(&daemon.base_url, &["task", "cancel", &task_id]).await;
+    assert_eq!(cancelled.code, Some(0), "stderr: {}", cancelled.stderr);
+    assert!(
+        cancelled.stdout.contains("cancelled"),
+        "human mode should confirm the cancel landed: {:?}",
+        cancelled.stdout
+    );
+
+    let status = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
+        .await
+        .json();
+    assert_eq!(status["status"], "cancelled");
+
+    // 202 with no body, so `--json` emits nothing rather than a courtesy
+    // message that would break `| jq` — same contract as `task send`.
+    let other = make_task().await;
+    let cancelled = run_choco_json(&daemon.base_url, &["task", "cancel", &other]).await;
+    assert_eq!(cancelled.code, Some(0), "stderr: {}", cancelled.stderr);
+    assert_eq!(cancelled.stdout, "");
+}
+
+/// A cancelled task is a dead end, and the CLI should say so rather than
+/// appearing to accept a message the daemon dropped.
+#[tokio::test]
+async fn sending_to_a_cancelled_task_fails_with_a_clear_message() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let task_id = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "chat",
+            "--title",
+            "t",
+            "--prompt",
+            "hello",
+        ],
+    )
+    .await
+    .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    run_choco(&daemon.base_url, &["task", "cancel", &task_id]).await;
+
+    let failed = run_choco(
+        &daemon.base_url,
+        &["task", "send", &task_id, "--text", "hello?"],
+    )
+    .await;
+    assert_eq!(failed.code, Some(1), "stdout: {}", failed.stdout);
+    assert!(
+        failed.stderr.contains("cancelled"),
+        "stderr should explain the task was cancelled: {}",
+        failed.stderr
+    );
+}

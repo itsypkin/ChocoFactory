@@ -7,7 +7,11 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use crate::engine::{CreateTaskError, EngineError, ResolveError, SendMessageOrResumeError};
+use crate::engine::{
+    CancelTaskError, CreateTaskError, EngineError, ResolveError, SendMessageError,
+    SendMessageOrResumeError,
+};
+use crate::session::SessionError;
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -50,6 +54,13 @@ impl From<CreateTaskError> for ApiError {
             CreateTaskError::Start(EngineError::MissingAgentTurnInput(_)) => {
                 ApiError::BadRequest(err.to_string())
             }
+            // The task row is written before `start_task` runs, so a cancel
+            // can land in that window and `start_task`'s guard will refuse
+            // to start it (#69). Someone cancelled the task out from under
+            // the create — a conflict, not a server fault.
+            CreateTaskError::Start(EngineError::TaskCancelled(_)) => {
+                ApiError::Conflict(err.to_string())
+            }
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -61,9 +72,11 @@ impl From<SendMessageOrResumeError> for ApiError {
             SendMessageOrResumeError::NoSuchTask | SendMessageOrResumeError::NoWorkflowState => {
                 ApiError::NotFound(err.to_string())
             }
-            SendMessageOrResumeError::UnsupportedStageKind(_) => {
-                ApiError::Conflict(err.to_string())
-            }
+            SendMessageOrResumeError::UnsupportedStageKind(_)
+            // A cancelled task refusing further input is the same shape of
+            // conflict as a terminal one (#69): the request was
+            // well-formed, the task just isn't in a state that can take it.
+            | SendMessageOrResumeError::TaskCancelled => ApiError::Conflict(err.to_string()),
             // A `human_gate`'s `resumed` relay lost a race with another
             // caller resuming the same task concurrently (P1-9 review):
             // `advance()`'s own per-task lock means `workflow_state` is
@@ -81,8 +94,52 @@ impl From<SendMessageOrResumeError> for ApiError {
             SendMessageOrResumeError::Advance(
                 EngineError::UnknownOutcome { .. }
                 | EngineError::TerminalStageHasNoTransitions(_)
-                | EngineError::StageMovedOn { .. },
+                | EngineError::StageMovedOn { .. }
+                // The same benign race as the rest of this arm, arrived at
+                // from the other direction (#69): a resume passed
+                // `send_message_or_resume`'s status check and a cancel
+                // landed before `advance_from_stage`'s guard ran under the
+                // lock. "The task was cancelled while you were resuming it"
+                // is a conflict, not a server fault — and mapping it to 500
+                // here would contradict the plain `TaskCancelled` → 409
+                // above.
+                | EngineError::TaskCancelled(_),
             ) => ApiError::Conflict(err.to_string()),
+            // Same conflict reached through the `agent_turn` branch, where
+            // `send_message` re-checks the status under the per-task lock.
+            SendMessageOrResumeError::SendMessage(SendMessageError::TaskCancelled) => {
+                ApiError::Conflict(err.to_string())
+            }
+            _ => ApiError::Internal(err.to_string()),
+        }
+    }
+}
+
+impl From<CancelTaskError> for ApiError {
+    fn from(err: CancelTaskError) -> Self {
+        match &err {
+            // A missing `workflow_state` row deliberately isn't an error
+            // here (see `cancel_task_locked`), so `NoSuchTask` is the only
+            // 404 this operation can produce.
+            CancelTaskError::NoSuchTask => ApiError::NotFound(err.to_string()),
+            // Already `cancelled` or already `closed`. A conflict rather
+            // than a silent `202`: answering "accepted" to a cancel of work
+            // that already finished would claim the daemon stopped
+            // something it didn't.
+            CancelTaskError::NotCancellable(_) => ApiError::Conflict(err.to_string()),
+            // A session for this task is mid-spawn, so there was no process
+            // to kill *yet* — retrying once it settles will find one. A
+            // conflict, not a 500: nothing is broken, the caller just
+            // arrived in the one-call-wide window where the answer would
+            // have been a lie.
+            //
+            // `cancel_task` no longer propagates this (it logs instead, so
+            // a failed kill can't strand an already-cancelled task), so
+            // this arm is unreachable today and kept only so the mapping
+            // stays right if that ever changes.
+            CancelTaskError::Session(SessionError::AlreadyStarting) => {
+                ApiError::Conflict(err.to_string())
+            }
             _ => ApiError::Internal(err.to_string()),
         }
     }

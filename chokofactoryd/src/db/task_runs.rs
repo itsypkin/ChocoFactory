@@ -35,10 +35,27 @@ impl From<TaskRunRow> for TaskRun {
                 .status
                 .parse()
                 .expect("task_runs.status holds a value written by this module"),
-            end_reason: row.end_reason.map(|reason| {
-                reason
-                    .parse()
-                    .expect("task_runs.end_reason holds a value written by this module")
+            // Lenient where `status` above is not, and deliberately so
+            // (#69). `status` is load-bearing — a run whose state can't be
+            // read is not something to guess at — but `end_reason` is
+            // explanatory metadata that is already `None` for most rows, so
+            // an unrecognized value degrades to "no specific reason"
+            // instead of panicking on a row read.
+            //
+            // That difference matters the moment a variant is added, as
+            // `Cancelled` just was: a DB written by a newer daemon and then
+            // read by an older one is otherwise a crash on `SELECT`, in a
+            // `From` impl that runs for every row, with no way back short
+            // of editing the database by hand.
+            end_reason: row.end_reason.and_then(|reason| match reason.parse() {
+                Ok(reason) => Some(reason),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "ignoring an unrecognized task_runs.end_reason — written by a newer daemon?"
+                    );
+                    None
+                }
             }),
             started_at: row.started_at,
             ended_at: row.ended_at,

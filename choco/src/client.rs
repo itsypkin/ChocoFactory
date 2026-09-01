@@ -481,6 +481,20 @@ impl Client {
         self.check_status(resp).await?;
         Ok(())
     }
+
+    /// Cancels a task (#69). No request body — the task id in the path is
+    /// the entire request — and the daemon answers `202` with no body, so
+    /// there is nothing to decode.
+    pub async fn cancel_task(&self, id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .send(
+                self.http
+                    .post(format!("{}/tasks/{id}/cancel", self.base_url)),
+            )
+            .await?;
+        self.check_status(resp).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
