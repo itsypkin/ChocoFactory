@@ -2,9 +2,9 @@
 //! --input-format=stream-json [--resume <id>]` to stand in for the real
 //! `claude` CLI (design §4, issue #42). `ClaudeAdapter::with_binary`
 //! points at this instead of the real, billable `claude` subprocess for
-//! e2e tests and manual smoke testing (`CHOKOFACTORY_CLAUDE_BINARY`).
+//! e2e tests and manual smoke testing (`CHOCOFACTORY_CLAUDE_BINARY`).
 //!
-//! Protocol matches `chokofactoryd/tests/fixtures/fake_claude.py` (the
+//! Protocol matches `chocofactoryd/tests/fixtures/fake_claude.py` (the
 //! Python fixture this promotes to a first-class, interpreter-free
 //! binary): every turn is echoed back as `echo:{text}` by default, or a
 //! fixed string from `MOCK_CLAUDE_REPLY` if that's set. `--resume <id>`

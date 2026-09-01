@@ -1,4 +1,4 @@
-//! `choco` (P1-10, design §6.2): a thin HTTP client against `chokofactoryd`'s
+//! `choco` (P1-10, design §6.2): a thin HTTP client against `chocofactoryd`'s
 //! API, covering task create/status/send/list/events and project
 //! create/list, with `--parent-task` support for delegation.
 
@@ -8,7 +8,7 @@ mod render;
 
 use std::process::ExitCode;
 
-use chokofactory_core::models::{Project, Task};
+use chocofactory_core::models::{Project, Task};
 use clap::Parser;
 use cli::{Cli, Command, ProjectCmd, RoleOverrideArgs, TaskCmd};
 use client::{Client, ClientError, CreateTaskParams, EventsPage, RoleOverrides, build_task_config};

@@ -237,7 +237,7 @@ dependencies = [
 name = "choco"
 version = "0.1.0"
 dependencies = [
- "chokofactory-core",
+ "chocofactory-core",
  "chrono",
  "clap",
  "reqwest",
@@ -247,7 +247,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "chokofactory-core"
+name = "chocofactory-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -256,12 +256,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "chokofactoryd"
+name = "chocofactoryd"
 version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
- "chokofactory-core",
+ "chocofactory-core",
  "chrono",
  "futures-util",
  "indexmap",

@@ -2,7 +2,7 @@
 
 Two binaries:
 
-- **`chokofactoryd`** — the daemon. Owns the SQLite database, the workflow
+- **`chocofactoryd`** — the daemon. Owns the SQLite database, the workflow
   engine, and an HTTP/WS API on `127.0.0.1:4141`.
 - **`choco`** — a thin CLI client against that API (create/inspect/message
   tasks and projects).
@@ -17,38 +17,38 @@ Binaries land in `target/debug/`.
 
 ## Running the daemon
 
-> **`chokofactoryd` spawns the real `claude` CLI by default** — running the
+> **`chocofactoryd` spawns the real `claude` CLI by default** — running the
 > daemon will hit the real, billable `claude` unless you point it at a
 > stand-in first.
 
 For manual testing, use the bundled `mock-claude` stand-in:
 
 ```
-CHOKOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude ./target/debug/chokofactoryd
+CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude ./target/debug/chocofactoryd
 ```
 
 `mock-claude` echoes back whatever it's sent (`echo:{text}`); set
 `MOCK_CLAUDE_REPLY=<text>` to get a fixed reply instead. Point
-`CHOKOFACTORY_CLAUDE_BINARY` at the real `claude` binary only when you
+`CHOCOFACTORY_CLAUDE_BINARY` at the real `claude` binary only when you
 specifically mean to exercise the real CLI.
 
 The daemon stores its database and workflow definitions under
-`~/.config/chokofactory/`. On first start it seeds the built-in `chat`
-workflow into `~/.config/chokofactory/workflows/` (existing files are never
+`~/.config/chocofactory/`. On first start it seeds the built-in `chat`
+workflow into `~/.config/chocofactory/workflows/` (existing files are never
 overwritten). To keep a test run fully isolated from your real state,
 override `HOME`:
 
 ```
-HOME=$(mktemp -d) CHOKOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude \
-  ./target/debug/chokofactoryd
+HOME=$(mktemp -d) CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude \
+  ./target/debug/chocofactoryd
 ```
 
 ### Daemon environment variables
 
 | Variable | Purpose |
 |---|---|
-| `CHOKOFACTORY_CLAUDE_BINARY` | Path to the agent CLI. Unset = the real, billable `claude`. |
-| `CHOKOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. |
+| `CHOCOFACTORY_CLAUDE_BINARY` | Path to the agent CLI. Unset = the real, billable `claude`. |
+| `CHOCOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. |
 | `MOCK_CLAUDE_REPLY` | Read by `mock-claude` only — reply with this fixed text instead of echoing. |
 | `RUST_LOG` | Log filter, e.g. `error` to quiet startup, `debug` for detail. |
 
@@ -83,7 +83,7 @@ Created  2026-08-01 12:33:37 UTC
 Create a task in it. `--project` takes **either the project name or its
 id** — a name is resolved against `project list`, and is rejected naming
 the candidates if it matches more than one project (names aren't unique).
-`--workflow` names any definition in `~/.config/chokofactory/workflows/`
+`--workflow` names any definition in `~/.config/chocofactory/workflows/`
 (`chat` ships built in):
 
 ```
@@ -226,12 +226,12 @@ and each resolves its own CLI, model and system prompt from three layers,
 most specific wins, independently per field:
 
 ```
-task config (--role-* below)  >  the workflow's roles: block  >  ~/.config/chokofactory/config.yaml
+task config (--role-* below)  >  the workflow's roles: block  >  ~/.config/chocofactory/config.yaml
 ```
 
 The `--role-*` flags set the task-level layer. Each is `ROLE=VALUE` and each
 is repeatable, so several roles can be configured in one command. Using a
-two-role workflow of your own under `~/.config/chokofactory/workflows/` (the
+two-role workflow of your own under `~/.config/chocofactory/workflows/` (the
 built-in multi-role `coding-task.yaml` is still to come):
 
 ```
@@ -286,7 +286,7 @@ keeps the config it started with.
   task's agent subprocess (stored as `config.cwd`). Defaults to the
   daemon's own working directory.
 - `--base-url <url>` targets a daemon on a non-default port, e.g. one
-  started with `CHOKOFACTORY_PORT=41500`.
+  started with `CHOCOFACTORY_PORT=41500`.
 
 ## Tests
 

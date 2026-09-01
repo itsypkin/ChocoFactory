@@ -1,12 +1,12 @@
 //! Integration tests for the `choco` binary (P1-10, design §6.2). Spawns
-//! the *real* `chokofactoryd` binary as a subprocess — the same pattern
-//! `chokofactoryd/tests/e2e_smoke.rs` established for issue #42 —
-//! with `CHOKOFACTORY_CLAUDE_BINARY` pointed at the real `mock-claude`
+//! the *real* `chocofactoryd` binary as a subprocess — the same pattern
+//! `chocofactoryd/tests/e2e_smoke.rs` established for issue #42 —
+//! with `CHOCOFACTORY_CLAUDE_BINARY` pointed at the real `mock-claude`
 //! fixture binary so no real, billable `claude` CLI is ever spawned, and
 //! the real `choco` binary against it, asserting on stdout/stderr/exit
 //! code. `choco`'s whole job is being an HTTP client for that daemon, so
 //! this is the most realistic test available, and needs zero changes to
-//! `chokofactoryd` itself.
+//! `chocofactoryd` itself.
 //!
 //! The `workspace_binary`/`free_port`/`TempHome`/`wait_until_ready` helpers
 //! below are deliberately duplicated from `e2e_smoke.rs` rather than
@@ -40,7 +40,7 @@ impl TempHome {
     /// absent (`create_new`, never overwrites), so this is untouched by
     /// startup.
     fn write_workflow(&self, name: &str, yaml: &str) {
-        let dir = self.0.join(".config/chokofactory/workflows");
+        let dir = self.0.join(".config/chocofactory/workflows");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
     }
@@ -82,7 +82,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Drives the real `chokofactoryd` binary as a subprocess.
+/// Drives the real `chocofactoryd` binary as a subprocess.
 struct Daemon {
     child: Child,
     base_url: String,
@@ -91,11 +91,11 @@ struct Daemon {
 
 impl Daemon {
     async fn spawn(home: TempHome) -> Self {
-        let daemon_bin = workspace_binary("chokofactoryd");
+        let daemon_bin = workspace_binary("chocofactoryd");
         let mock_claude_bin = workspace_binary("mock-claude");
         assert!(
             daemon_bin.exists(),
-            "chokofactoryd binary not found at {daemon_bin:?} \
+            "chocofactoryd binary not found at {daemon_bin:?} \
              (run `cargo build --workspace --all-targets` first)"
         );
         assert!(
@@ -118,12 +118,12 @@ impl Daemon {
             let port = free_port();
             let mut child = Command::new(&daemon_bin)
                 .env("HOME", &home.0)
-                .env("CHOKOFACTORY_CLAUDE_BINARY", &mock_claude_bin)
-                .env("CHOKOFACTORY_PORT", port.to_string())
+                .env("CHOCOFACTORY_CLAUDE_BINARY", &mock_claude_bin)
+                .env("CHOCOFACTORY_PORT", port.to_string())
                 .env("RUST_LOG", "error")
                 .kill_on_drop(true)
                 .spawn()
-                .expect("failed to spawn chokofactoryd");
+                .expect("failed to spawn chocofactoryd");
 
             let base_url = format!("http://127.0.0.1:{port}");
             match wait_until_ready(&client, &base_url, &mut child).await {
@@ -140,7 +140,7 @@ impl Daemon {
                 Ready::ExitedDuringStartup(status) => last_status = Some(status),
             }
         }
-        panic!("chokofactoryd exited during startup on 5 different ports; last: {last_status:?}");
+        panic!("chocofactoryd exited during startup on 5 different ports; last: {last_status:?}");
     }
 }
 
@@ -171,7 +171,7 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut 
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("chokofactoryd did not become ready within 5s");
+    panic!("chocofactoryd did not become ready within 5s");
 }
 
 struct ChocoOutput {
@@ -473,7 +473,7 @@ async fn reports_a_clear_error_when_the_daemon_is_unreachable() {
     assert_eq!(out.stdout, "");
     assert!(
         out.stderr.starts_with(&format!(
-            "error: failed to connect to chokofactoryd at {base_url} (is it running?): "
+            "error: failed to connect to chocofactoryd at {base_url} (is it running?): "
         )),
         "stderr: {}",
         out.stderr

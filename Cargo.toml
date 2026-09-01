@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "chokofactoryd",
+    "chocofactoryd",
     "choco",
-    "chokofactory-core",
+    "chocofactory-core",
     "mock-claude",
 ]
 
@@ -14,7 +14,7 @@ edition = "2024"
 [workspace.dependencies]
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
-chokofactory-core = { path = "chokofactory-core" }
+chocofactory-core = { path = "chocofactory-core" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"

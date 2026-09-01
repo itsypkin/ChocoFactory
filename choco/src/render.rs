@@ -3,7 +3,7 @@
 //! is the machine half). No colour/ANSI: output is routinely piped, and
 //! this repo ships no terminal-styling dependency.
 
-use chokofactory_core::models::{Event, EventType, Project, Task};
+use chocofactory_core::models::{Event, EventType, Project, Task};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
