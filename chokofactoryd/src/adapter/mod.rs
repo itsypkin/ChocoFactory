@@ -58,6 +58,14 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    /// The CLI's `result` line: this turn is over and the process is now
+    /// only waiting on stdin EOF to exit — it never exits on its own (#70).
+    /// `is_error` mirrors the `result` message's own flag, so a caller that
+    /// only wants to treat a *clean* finish as completion (§5.2, a
+    /// single-shot `agent_turn`) doesn't have to re-inspect the raw JSON.
+    TurnCompleted {
+        is_error: bool,
+    },
 }
 
 impl AgentEvent {
@@ -69,6 +77,7 @@ impl AgentEvent {
             AgentEvent::Thinking { .. } => EventType::Thinking,
             AgentEvent::SessionMeta { .. } => EventType::SessionMeta,
             AgentEvent::Error { .. } => EventType::Error,
+            AgentEvent::TurnCompleted { .. } => EventType::TurnCompleted,
         }
     }
 
@@ -100,6 +109,9 @@ impl AgentEvent {
                 serde_json::json!({ "session_id": session_id })
             }
             AgentEvent::Error { message } => serde_json::json!({ "message": message }),
+            AgentEvent::TurnCompleted { is_error } => {
+                serde_json::json!({ "is_error": is_error })
+            }
         }
     }
 }

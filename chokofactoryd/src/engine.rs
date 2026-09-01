@@ -41,7 +41,7 @@ use crate::db::{events, projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
 use crate::poll;
 use crate::role_config::{self, RoleConfigError};
-use crate::session::{SessionError, SessionManager};
+use crate::session::{SessionError, SessionKind, SessionManager};
 use crate::shell;
 use crate::template;
 use crate::workflow_def::{
@@ -2735,9 +2735,21 @@ impl WorkflowEngine {
             tracing::error!(task_run_id = %task_run.id, %err, "failed to record human message event");
         }
 
+        // A stage with an empty `on:` map (chat, §5.4) never concludes — it
+        // just keeps accepting further live messages into the same session
+        // indefinitely. Everything else is single-shot: the CLI's own
+        // end-of-turn marker both completes the session (#70) and is what
+        // the watcher below waits for — computed once here rather than at
+        // each site separately, so the two decisions can't diverge.
+        let session_kind = if stage_def.on.is_empty() {
+            SessionKind::Standing
+        } else {
+            SessionKind::SingleShot
+        };
+
         if let Err(err) = self
             .session_manager
-            .start(&task_run.id, &prompt, &resolved.role_config)
+            .start(&task_run.id, &prompt, &resolved.role_config, session_kind)
             .await
         {
             // The task_run row was just created `Active` above; without
@@ -2773,12 +2785,10 @@ impl WorkflowEngine {
             return Err(EngineError::Session(err));
         }
 
-        // A stage with an empty `on:` map (chat, §5.4) never concludes —
-        // it just keeps accepting further live messages into the same
-        // session indefinitely, so there's no outcome to ever watch for.
+        // A standing-open session (chat) has no outcome to ever watch for.
         // This is also why the loader rejects `capture:` on such a stage:
         // with no watcher there is no moment at which it could be taken.
-        if !stage_def.on.is_empty() {
+        if session_kind == SessionKind::SingleShot {
             self.spawn_turn_watcher(
                 task_id.to_string(),
                 Arc::clone(definition),
@@ -4411,6 +4421,51 @@ stages:
         );
     }
 
+    /// Regression test for #70. `fake_claude_oneshot.py` above self-exits
+    /// after one turn, which already worked before this fix — the bug is
+    /// specifically that the real `claude --input-format stream-json` CLI
+    /// never exits on its own. `fake_claude.py` reproduces that shape (it
+    /// loops on stdin until EOF), so this hangs — `wait_until_stage` times
+    /// out — without the fix, and passes once a single-shot turn completes
+    /// on the CLI's own `result` line instead of on process exit.
+    #[tokio::test]
+    async fn a_single_shot_agent_turn_auto_advances_against_a_cli_that_never_exits_on_its_own() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("coder-turn.md"), "do the thing").unwrap();
+        let yaml = r#"
+name: coding-task
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_stage(&pool, &task_id, "finished").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        assert_eq!(
+            stage_trail(&pool, &task_id).await,
+            vec![
+                ("coding".to_string(), Value::Null),
+                ("finished".to_string(), json!("done")),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn a_crashed_single_shot_turn_does_not_auto_advance() {
         // Drives an actually-crashing subprocess (exit code 1, not a
@@ -5386,9 +5441,21 @@ stages:
         engine.send_message(&task.id, "again").await.unwrap();
         wait_until_events_contain(&pool, &runs[0].id, "echo:again").await;
 
-        let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
-            .await
-            .unwrap();
+        // `wait_until_events_contain` above only guarantees the reply
+        // itself has landed, not the `turn_completed` line that follows it
+        // in the same drain loop (#70) — wait for the full expected count
+        // too, so this doesn't race a read against that still-pending
+        // append.
+        let mut events = Vec::new();
+        for _ in 0..200 {
+            events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+                .await
+                .unwrap();
+            if events.len() >= 7 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
         let kinds_and_text: Vec<(String, Option<&str>)> = events
             .iter()
             .map(|e| {
@@ -5404,14 +5471,20 @@ stages:
         // precedes session_meta/the reply — same for the "again" relay
         // against its own reply. The human's own messages now show up in
         // their correct chronological place, not just the agent's replies.
+        // `fake_claude.py` emits a `result` line after every turn, exactly
+        // like the real CLI (#70) — normalized to `turn_completed` (chat
+        // is a `Standing` session, so it's recorded but nothing acts on
+        // it) rather than discarded.
         assert_eq!(
             kinds_and_text,
             vec![
                 ("human_message".to_string(), Some("hello")),
                 ("session_meta".to_string(), None),
                 ("assistant_message".to_string(), Some("echo:hello")),
+                ("turn_completed".to_string(), None),
                 ("human_message".to_string(), Some("again")),
                 ("assistant_message".to_string(), Some("echo:again")),
+                ("turn_completed".to_string(), None),
             ]
         );
     }

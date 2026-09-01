@@ -176,6 +176,13 @@ pub enum EventType {
     Thinking,
     Error,
     SessionMeta,
+    /// The CLI's `result` line arrived: this turn is over and the process is
+    /// now only waiting on stdin EOF to exit — it never exits on its own
+    /// (#70). Always follows that turn's `AssistantMessage` row(s) in the
+    /// timeline. Payload is `{"is_error"}` — the reply itself is already in
+    /// `AssistantMessage`, and any `capture:` verdict lands separately in
+    /// [`Self::TurnOutcome`].
+    TurnCompleted,
     /// The task entered a workflow stage (X-3). Unlike every other variant
     /// this describes the *task*, not an agent session — `human_gate` and
     /// `terminal` stages never open one — so its `Event` has no
@@ -241,6 +248,7 @@ impl fmt::Display for EventType {
             EventType::Thinking => "thinking",
             EventType::Error => "error",
             EventType::SessionMeta => "session_meta",
+            EventType::TurnCompleted => "turn_completed",
             EventType::StageEntered => "stage_entered",
             EventType::ShellOutput => "shell_output",
             EventType::TurnOutcome => "turn_outcome",
@@ -272,6 +280,7 @@ impl FromStr for EventType {
             "thinking" => Ok(EventType::Thinking),
             "error" => Ok(EventType::Error),
             "session_meta" => Ok(EventType::SessionMeta),
+            "turn_completed" => Ok(EventType::TurnCompleted),
             "stage_entered" => Ok(EventType::StageEntered),
             "shell_output" => Ok(EventType::ShellOutput),
             "turn_outcome" => Ok(EventType::TurnOutcome),
@@ -365,6 +374,7 @@ mod tests {
             EventType::Thinking,
             EventType::Error,
             EventType::SessionMeta,
+            EventType::TurnCompleted,
             EventType::StageEntered,
             EventType::ShellOutput,
             EventType::TurnOutcome,

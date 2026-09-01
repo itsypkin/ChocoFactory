@@ -43,6 +43,19 @@ enum SessionSlot {
     Live(ActiveSession),
 }
 
+/// Whether a session's owning `agent_turn` stage can conclude on its own
+/// (a plain single-shot turn, or one with `capture:` — §5.2) or stays open
+/// indefinitely for further live messages (`on: {}`, chat, §5.4). Threaded
+/// down to `drain_session` because closing stdin on the CLI's own
+/// end-of-turn marker (#70) is only safe for the former: doing it
+/// unconditionally would cut a standing-open chat session off after its
+/// very first reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    SingleShot,
+    Standing,
+}
+
 struct ActiveSession {
     cmd_tx: mpsc::UnboundedSender<Command>,
     signals: SessionSignals,
@@ -157,11 +170,15 @@ impl SessionManager {
     /// draining its events (§4.1 step 1). The caller is responsible for
     /// having already created the `task_runs` row (it's created `active`
     /// by `task_runs::create`).
+    ///
+    /// `kind` decides how `drain_session` reacts to the CLI's own
+    /// end-of-turn marker (#70) — see [`SessionKind`].
     pub async fn start(
         self: &Arc<Self>,
         task_run_id: &str,
         prompt: &str,
         cfg: &RoleConfig,
+        kind: SessionKind,
     ) -> Result<(), SessionError> {
         self.reserve(task_run_id).await?;
 
@@ -174,7 +191,8 @@ impl SessionManager {
             }
         };
         tracing::info!(task_run_id, "session started");
-        self.spawn_drain(task_run_id.to_string(), handle).await;
+        self.spawn_drain(task_run_id.to_string(), handle, kind)
+            .await;
         Ok(())
     }
 
@@ -239,7 +257,12 @@ impl SessionManager {
             return Err(SessionError::Db(err));
         }
         tracing::info!(task_run_id, "session resumed");
-        self.spawn_drain(task_run_id.to_string(), handle).await;
+        // Only reachable for an open-ended stage: `send_message_or_resume`
+        // routes a single-shot `agent_turn` elsewhere before this can ever
+        // be called (`engine.rs`'s `stage_def.on.is_empty()` check), so a
+        // resumed session is always standing-open (chat-shaped).
+        self.spawn_drain(task_run_id.to_string(), handle, SessionKind::Standing)
+            .await;
         Ok(())
     }
 
@@ -333,7 +356,12 @@ impl SessionManager {
     /// Promotes `task_run_id`'s reserved slot to `Live` and spawns the
     /// task that drains `handle`. Only the caller that won `reserve`
     /// reaches this, so the `insert` here can't race another spawn.
-    async fn spawn_drain(self: &Arc<Self>, task_run_id: String, handle: AgentHandle) {
+    async fn spawn_drain(
+        self: &Arc<Self>,
+        task_run_id: String,
+        handle: AgentHandle,
+        kind: SessionKind,
+    ) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let signals = SessionSignals {
             last_activity: Arc::new(Mutex::new(Utc::now())),
@@ -359,6 +387,7 @@ impl SessionManager {
                 &manager.pool,
                 &task_run_id,
                 handle,
+                kind,
                 cmd_rx,
                 signals,
                 manager.idle_timeout,
@@ -433,10 +462,21 @@ impl SessionManager {
 /// until the subprocess exits, then flips the run to `idle` — matching
 /// §4.1 step 2 whether that exit was reaper-triggered or the CLI ending
 /// its own one-shot turn.
+///
+/// For a [`SessionKind::SingleShot`] session, a clean `TurnCompleted` is
+/// itself treated as completion (#70): the underlying CLI never exits on
+/// its own after answering, so waiting for `handle.wait()` to resolve
+/// would wait forever. `Idle` is persisted the moment the marker arrives,
+/// and stdin is closed to let the process exit and be reaped in the
+/// background. A [`SessionKind::Standing`] session (chat) ignores the
+/// marker entirely — it may see one per turn, and closing stdin after the
+/// first would kill the conversation.
+#[allow(clippy::too_many_arguments)]
 async fn drain_session(
     pool: &SqlitePool,
     task_run_id: &str,
     mut handle: AgentHandle,
+    kind: SessionKind,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     signals: SessionSignals,
     idle_timeout: chrono::Duration,
@@ -458,6 +498,13 @@ async fn drain_session(
     // genuinely finished on its own, which look identical from `status`
     // alone (§ review on PR #35).
     let mut reaped = false;
+    // Set once a `SingleShot` turn's completion has already been persisted
+    // immediately below, rather than waiting for the tail's `handle.wait()`
+    // (#70). Guards the tail from writing a second, stale status, and
+    // guards the reaper from ever relabelling an already-completed run as
+    // `Reaped` — both would resurrect exactly the ambiguity `end_reason`
+    // exists to close (§ review on PR #35).
+    let mut completed = false;
     loop {
         tokio::select! {
             // Biased so a pending `handle.recv()` result is always
@@ -491,12 +538,59 @@ async fn drain_session(
                         {
                             tracing::error!(task_run_id, %err, "failed to persist session_id");
                         }
-                        match events::append(pool, task_run_id, event.event_type(), event.payload()).await {
-                            Ok(event) => {
-                                tracing::debug!(task_run_id, event_type = %event.event_type, "appended event");
+                        let event_type = event.event_type();
+                        match events::append(pool, task_run_id, event_type, event.payload()).await {
+                            Ok(appended) => {
+                                tracing::debug!(task_run_id, event_type = %appended.event_type, "appended event");
                                 events_notify.notify_waiters();
                             }
                             Err(err) => tracing::error!(task_run_id, %err, "failed to append event"),
+                        }
+                        // The CLI's own end-of-turn marker (#70). It never
+                        // exits on its own once it's answered, so a
+                        // `SingleShot` turn's completion is recorded here,
+                        // not left to the tail's `handle.wait()` below,
+                        // which would otherwise never resolve. Only a
+                        // clean finish counts: an errored turn falls
+                        // through to the tail, which records the real
+                        // exit and lets the watcher park it rather than
+                        // auto-advancing on a failed reply. A `Standing`
+                        // session (chat, `on: {}`) ignores this entirely —
+                        // it may see one per turn, and closing stdin after
+                        // the first would end the conversation.
+                        if let AgentEvent::TurnCompleted { is_error } = event
+                            && kind == SessionKind::SingleShot
+                        {
+                            if !is_error {
+                                match task_runs::update_status(
+                                    pool,
+                                    task_run_id,
+                                    TaskRunStatus::Idle,
+                                    None,
+                                    None,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        completed = true;
+                                        tracing::info!(
+                                            task_run_id,
+                                            "single-shot turn completed on the CLI's own result; not waiting for process exit"
+                                        );
+                                    }
+                                    Err(err) => tracing::error!(
+                                        task_run_id, %err,
+                                        "failed to persist immediate turn completion; \
+                                         falling back to the tail write once the process exits"
+                                    ),
+                                }
+                            }
+                            // Unconditional, even on a failed write above:
+                            // the CLI still needs EOF to ever exit, and if
+                            // `completed` stayed false the tail write below
+                            // will record whatever the real exit turns out
+                            // to be.
+                            handle.close_stdin();
                         }
                         // Any drained output counts as activity, not just
                         // inbound `Send`s — broader than §4.1's "no input"
@@ -518,7 +612,14 @@ async fn drain_session(
                         }
                         *last_activity.lock().await = Utc::now();
                     }
-                    Some(Command::Close) => {
+                    // A `Close` that lands after the turn already completed
+                    // is a no-op: stdin is already closed (or on its way
+                    // to being closed), and `reaped` must never become
+                    // true here — the tail below already skips its write
+                    // once `completed` is set, but this keeps `reaped`
+                    // itself from ever describing a run that in fact
+                    // finished cleanly.
+                    Some(Command::Close) if !completed => {
                         // Re-check freshness at the moment this is
                         // actually processed, not when the reaper decided
                         // it: a `Send` (and its last_activity bump) can
@@ -531,6 +632,7 @@ async fn drain_session(
                             reaped = true;
                         }
                     }
+                    Some(Command::Close) => {}
                     None => {
                         cmd_open = false;
                     }
@@ -548,18 +650,43 @@ async fn drain_session(
     //
     // A `cancel` that wins the race still works — it signals a live
     // process, and the `cancelled` flag it set is read below either way.
+    //
+    // This also covers the `completed` path #70 added: that returns early,
+    // so clearing the pid any further down would leave a completed-but-not
+    // -yet-reaped run signallable with a stale number.
     *pgid.lock().await = None;
 
-    // A clean exit (reaper-driven close, or a one-shot agent_turn stage
-    // finishing on its own) goes to `idle`, ready to resume. A crash,
-    // auth failure, or signal kill goes to `exited` instead — otherwise
-    // a deterministic failure would just get resumed into the same
-    // crash forever, never reaching a terminal state.
+    // Always reap, `completed` or not — a `SingleShot` turn's stdin was
+    // closed above precisely so the process would exit and not linger as
+    // a zombie, but the exit itself carries no new information once
+    // `completed` is true: the status it would produce was already
+    // decided and recorded from the CLI's own `result`, not from this
+    // exit code.
     let exit_status = handle.wait().await;
     let clean_exit = matches!(&exit_status, Ok(status) if status.success());
     if let Err(err) = &exit_status {
         tracing::error!(task_run_id, %err, "failed to reap subprocess");
     }
+    if completed {
+        // Surprising but not actionable: the CLI said it was done, and
+        // that's already recorded. Overwriting it here would risk
+        // clobbering whatever the engine's watcher has since done with
+        // that completion (§ review on PR #35's `end_reason` reasoning
+        // applies equally to a second, later write).
+        if !clean_exit {
+            tracing::warn!(
+                task_run_id,
+                "subprocess exited non-zero after its single-shot turn had \
+                 already completed and been recorded as idle"
+            );
+        }
+        return;
+    }
+    // A clean exit (reaper-driven close, or a one-shot agent_turn stage
+    // finishing on its own) goes to `idle`, ready to resume. A crash,
+    // auth failure, or signal kill goes to `exited` instead — otherwise
+    // a deterministic failure would just get resumed into the same
+    // crash forever, never reaching a terminal state.
     let (final_status, ended_at) = if clean_exit {
         (TaskRunStatus::Idle, None)
     } else {
@@ -581,10 +708,21 @@ async fn drain_session(
     // thing for `choco task status` to say.
     //
     // A turn that finished cleanly in the instant before the signal landed
-    // reports `Idle` + `Cancelled`, which reads oddly but is honest, and
-    // is harmless: the engine's `tasks.status == "cancelled"` guard in
-    // `advance_from_stage`, not this row, is what actually stops a
-    // cancelled task from advancing.
+    // reports `Idle` + `Cancelled`, which reads oddly but is honest.
+    //
+    // The mirror case reaches the opposite answer, and deliberately: once
+    // #70's `completed` path has fired, the early return above means this
+    // block never runs, so a cancel landing after the CLI reported its own
+    // `result` records no `end_reason` at all. That is the right trade —
+    // re-writing the row here would clobber a status the engine's watcher
+    // may already have acted on, which is precisely what that early return
+    // exists to prevent.
+    //
+    // Both are harmless for the same reason: the engine's
+    // `tasks.status == "cancelled"` guard in `advance_from_stage`, not this
+    // row, is what actually stops a cancelled task from advancing. This
+    // row is a record of what happened to a *process*, not the authority
+    // on what happens to the task.
     let end_reason = if cancelled.load(Ordering::SeqCst) {
         Some(TaskRunEndReason::Cancelled)
     } else if clean_exit && reaped {
@@ -702,7 +840,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
 
@@ -727,7 +865,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
 
@@ -753,7 +891,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         wait_until_events_len(&pool, &task_run_id, 2).await;
@@ -763,8 +901,11 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = wait_until_events_len(&pool, &task_run_id, 3).await;
-        assert_eq!(stored[2].payload["text"], "echo:again");
+        // SessionMeta, AssistantMessage("echo:hello"), TurnCompleted (#70:
+        // fake_claude.py's `result` line, no longer discarded),
+        // AssistantMessage("echo:again").
+        let stored = wait_until_events_len(&pool, &task_run_id, 4).await;
+        assert_eq!(stored[3].payload["text"], "echo:again");
     }
 
     #[tokio::test]
@@ -816,7 +957,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         wait_until_events_len(&pool, &task_run_id, 2).await;
@@ -838,8 +979,11 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = wait_until_events_len(&pool, &task_run_id, 3).await;
-        assert_eq!(stored[2].payload["text"], "echo:again");
+        // SessionMeta, AssistantMessage("echo:hello"), TurnCompleted (#70:
+        // fake_claude.py's `result` line, no longer discarded),
+        // AssistantMessage("echo:again").
+        let stored = wait_until_events_len(&pool, &task_run_id, 4).await;
+        assert_eq!(stored[3].payload["text"], "echo:again");
     }
 
     #[tokio::test]
@@ -921,7 +1065,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         wait_until_events_len(&pool, &task_run_id, 2).await;
@@ -941,10 +1085,12 @@ mod tests {
             .await
             .unwrap();
 
-        // The resumed process is a fresh subprocess too, so it emits its
+        // Turn 1: SessionMeta, AssistantMessage("echo:hello"), TurnCompleted
+        // (#70: fake_claude.py's `result` line, no longer discarded). Then
+        // the resumed process is a fresh subprocess too, so it emits its
         // own SessionMeta (event 3) before the AssistantMessage (event 4).
-        let stored = wait_until_events_len(&pool, &task_run_id, 4).await;
-        assert_eq!(stored[3].payload["text"], "echo:again");
+        let stored = wait_until_events_len(&pool, &task_run_id, 5).await;
+        assert_eq!(stored[4].payload["text"], "echo:again");
         let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
         assert_eq!(run.status, TaskRunStatus::Active);
     }
@@ -964,7 +1110,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         wait_until_events_len(&pool, &task_run_id, 2).await;
@@ -1004,13 +1150,57 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
 
         wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
         let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
         assert_eq!(run.end_reason, None);
+    }
+
+    /// Regression test for #70: `fake_claude.py` never exits on its own —
+    /// exactly the real `claude --input-format stream-json` CLI's shape —
+    /// so this hangs (times out waiting for `Idle`) without the fix, which
+    /// used to wait for `handle.wait()` to resolve. A `SingleShot` session
+    /// must instead complete the moment the fixture's `result` line
+    /// arrives, and close stdin itself so the process actually exits.
+    #[tokio::test]
+    async fn a_single_shot_session_completes_and_closes_stdin_against_a_stay_open_fixture() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        manager
+            .start(
+                &task_run_id,
+                "hello",
+                &role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+
+        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.end_reason, None,
+            "a real completion must not look reaped"
+        );
+
+        // SessionMeta, AssistantMessage, TurnCompleted.
+        let stored = wait_until_events_len(&pool, &task_run_id, 3).await;
+        assert_eq!(
+            stored[2].event_type,
+            chokofactory_core::models::EventType::TurnCompleted
+        );
     }
 
     #[tokio::test]
@@ -1027,7 +1217,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         wait_until_events_len(&pool, &task_run_id, 2).await;
@@ -1137,7 +1327,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         wait_until_events_len(&pool, &task_run_id, 2).await;
@@ -1174,7 +1364,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "go", &role_config())
+            .start(&task_run_id, "go", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
 
@@ -1224,7 +1414,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "go", &role_config())
+            .start(&task_run_id, "go", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         read_pid_when_written(&child_pid_path).await;
@@ -1304,7 +1494,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         wait_until_events_len(&pool, &task_run_id, 2).await;
@@ -1360,7 +1550,7 @@ mod tests {
         // Grab the shared pgid handle while the session is live, so it can
         // still be inspected after the map slot is gone.
         manager
-            .start(&task_run_id, "hello", &role_config())
+            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         let pgid = {

@@ -300,20 +300,30 @@ fn normalize_user(value: &Value, tool_names: &HashMap<String, String>) -> Vec<Ag
     out
 }
 
+// A `result` line always means the same thing regardless of `is_error`: the
+// CLI is done with this turn and is now only waiting on stdin EOF to
+// exit — it never exits on its own (#70). Both outcomes therefore emit
+// `TurnCompleted`, so a single-shot turn's stdin gets closed either way;
+// only a clean finish (`is_error: false`) also counts as *completion* for
+// `drain_session`'s purposes, which is why the flag rides along rather than
+// being collapsed here.
 fn normalize_result(value: &Value) -> Vec<AgentEvent> {
     let is_error = value
         .get("is_error")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if !is_error {
-        return Vec::new();
+        return vec![AgentEvent::TurnCompleted { is_error: false }];
     }
     let message = value
         .get("result")
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| "agent run ended with an error".to_string());
-    vec![AgentEvent::Error { message }]
+    vec![
+        AgentEvent::Error { message },
+        AgentEvent::TurnCompleted { is_error: true },
+    ]
 }
 
 #[cfg(test)]
@@ -386,21 +396,27 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_successful_result_to_no_events() {
+    fn normalizes_successful_result_to_turn_completed() {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"pong","session_id":"9bf8db32-b723-41f6-8963-ea3ece07cb1a"}"#;
         let mut tool_names = HashMap::new();
-        assert_eq!(normalize(&parse(line), &mut tool_names), Vec::new());
+        assert_eq!(
+            normalize(&parse(line), &mut tool_names),
+            vec![AgentEvent::TurnCompleted { is_error: false }]
+        );
     }
 
     #[test]
-    fn normalizes_error_result_to_error_event() {
+    fn normalizes_error_result_to_error_event_then_turn_completed() {
         let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","session_id":"abc"}"#;
         let mut tool_names = HashMap::new();
         assert_eq!(
             normalize(&parse(line), &mut tool_names),
-            vec![AgentEvent::Error {
-                message: "boom".to_string()
-            }]
+            vec![
+                AgentEvent::Error {
+                    message: "boom".to_string()
+                },
+                AgentEvent::TurnCompleted { is_error: true },
+            ]
         );
     }
 
@@ -441,10 +457,16 @@ mod tests {
             }
         );
 
-        handle.send("again").unwrap();
+        // fake_claude.py emits a `result` line after every reply, exactly
+        // like the real CLI (#70) — normalized to `TurnCompleted` rather
+        // than discarded.
         let third = handle.recv().await.unwrap();
+        assert_eq!(third, AgentEvent::TurnCompleted { is_error: false });
+
+        handle.send("again").unwrap();
+        let fourth = handle.recv().await.unwrap();
         assert_eq!(
-            third,
+            fourth,
             AgentEvent::AssistantMessage {
                 text: "echo:again".to_string()
             }
