@@ -38,6 +38,36 @@ pub enum Command {
     /// Project create/list.
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Serves the `report_outcome` MCP tool over stdio (issue #73): a
+    /// stage's agent turn calls it to state its outcome explicitly instead
+    /// of leaving the engine to infer one from prose. `chocofactoryd` spawns
+    /// this itself via `--mcp-config` as part of every agent turn; it isn't
+    /// meant to be run by hand, hence hidden from `--help`.
+    #[command(hide = true)]
+    McpServe(McpServeArgs),
+}
+
+#[derive(Args)]
+pub struct McpServeArgs {
+    /// One of the current stage's `on:` edge names; repeat for each one.
+    /// Determines both the tool's `outcome` schema (an `enum` of exactly
+    /// these values) and whether a report routes the workflow at all —
+    /// omitted entirely means the stage has no edges to route on, so
+    /// `outcome` is left free-form and purely informational.
+    ///
+    /// A repeatable flag rather than one comma-joined value (review, #75):
+    /// an `on:` edge name is an arbitrary YAML string key and could itself
+    /// contain a comma, which a `value_delimiter` would misparse on both
+    /// ends of the round trip.
+    ///
+    /// `allow_hyphen_values` (review, #75 round 2): an edge name starting
+    /// with `-` (e.g. `-needs-work`) would otherwise make clap treat it as
+    /// an unrecognised flag rather than this one's value, failing the whole
+    /// subcommand — which would silently degrade every turn on that stage to
+    /// the text-fallback path, recreating #73's original bug through a new
+    /// door.
+    #[arg(long = "outcome", allow_hyphen_values = true)]
+    pub outcomes: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -182,4 +212,73 @@ pub enum ProjectCmd {
     },
     /// List all projects.
     List,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--outcome` is repeatable, not a single comma-joined flag (review,
+    /// #75) — this is what `ClaudeAdapter::spawn` (issue #73) actually emits
+    /// into `--mcp-config`'s `args`, so a mismatch here would silently make
+    /// every routing stage's tool free-form. Repeatable also means an `on:`
+    /// edge name containing a comma round-trips intact.
+    #[test]
+    fn mcp_serve_collects_repeated_outcome_flags() {
+        let cli = Cli::parse_from([
+            "choco",
+            "mcp-serve",
+            "--outcome",
+            "approved",
+            "--outcome",
+            "changes_requested",
+        ]);
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(args.outcomes, vec!["approved", "changes_requested"]);
+    }
+
+    /// A comma inside an outcome name is just a character — the whole reason
+    /// this is a repeatable flag rather than one comma-joined value.
+    #[test]
+    fn mcp_serve_outcome_with_an_embedded_comma_round_trips_intact() {
+        let cli = Cli::parse_from(["choco", "mcp-serve", "--outcome", "needs, more, work"]);
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(args.outcomes, vec!["needs, more, work"]);
+    }
+
+    /// Review, #75 round 2: without `allow_hyphen_values`, clap treats a
+    /// leading `-` as the start of a new (unrecognised) flag rather than
+    /// this one's value, and `try_parse_from` — the shape `main()` actually
+    /// calls — fails the whole subcommand rather than panicking, which
+    /// would silently degrade every turn on a stage with an edge like this
+    /// to the text-fallback path.
+    #[test]
+    fn mcp_serve_outcome_starting_with_a_hyphen_parses() {
+        let cli = Cli::try_parse_from(["choco", "mcp-serve", "--outcome", "-needs-work"])
+            .expect("a leading hyphen in an outcome name must still parse");
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(args.outcomes, vec!["-needs-work"]);
+    }
+
+    #[test]
+    fn mcp_serve_with_no_outcomes_flag_is_empty() {
+        let cli = Cli::parse_from(["choco", "mcp-serve"]);
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert!(args.outcomes.is_empty());
+    }
+
+    /// `#[command(hide = true)]` hides it from `--help` text; it must not
+    /// also make the subcommand itself unparseable.
+    #[test]
+    fn mcp_serve_is_hidden_but_still_parses() {
+        assert!(Cli::try_parse_from(["choco", "mcp-serve"]).is_ok());
+    }
 }

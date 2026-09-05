@@ -11,7 +11,7 @@ The reply comes from a *file* named by an env var, rather than from the env
 var itself, because tests set it via a generated wrapper script — process-wide
 `set_var` isn't safe to use from tests that run in parallel in one process.
 
-Two directives may appear on the file's first line:
+Three directives may appear on the file's first line:
 
 - `BLOCKS` — the remainder is split on a literal `|` and each part is emitted
   as its own assistant text block of one message, covering a reply the capture
@@ -20,11 +20,21 @@ Two directives may appear on the file's first line:
   only then the reply as a second assistant message. This is what a real
   agent's turn looks like whenever it uses a tool, and it is the case where
   concatenating everything the agent said would corrupt the capture.
+- `REPORT <outcome>[,<outcome>...]` (issue #73) — before the final assistant
+  message, emit one `mcp__chocofactory__report_outcome` tool_use/tool_result
+  pair per comma-separated outcome, in order, each carrying
+  `{"outcome": <outcome>, "summary": ""}`. More than one outcome exercises
+  "the last call wins" (a model correcting itself, or retrying after the
+  tool rejected its first attempt). The tool name is hardcoded here rather
+  than imported, since this is a standalone script — it must match
+  `chocofactory_core::mcp::qualified_report_outcome_tool_name()`.
 """
 import json
 import os
 import sys
 import uuid
+
+REPORT_OUTCOME_TOOL = "mcp__chocofactory__report_outcome"
 
 
 def emit(obj):
@@ -49,6 +59,11 @@ def main():
     uses_tool = reply.startswith("TOOL\n")
     if uses_tool:
         reply = reply[len("TOOL\n") :]
+
+    report_outcomes = []
+    if reply.startswith("REPORT "):
+        first_line, _, reply = reply.partition("\n")
+        report_outcomes = first_line[len("REPORT ") :].split(",")
 
     if reply.startswith("BLOCKS\n"):
         blocks = reply[len("BLOCKS\n") :].split("|")
@@ -85,6 +100,40 @@ def main():
                             "type": "tool_result",
                             "tool_use_id": "toolu_1",
                             "content": "fn main() {}",
+                        }
+                    ]
+                },
+                "session_id": session_id,
+            }
+        )
+
+    for i, outcome in enumerate(report_outcomes):
+        tool_use_id = f"toolu_report_{i}"
+        emit(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": REPORT_OUTCOME_TOOL,
+                            "input": {"outcome": outcome, "summary": ""},
+                        }
+                    ]
+                },
+                "session_id": session_id,
+            }
+        )
+        emit(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": f"Recorded outcome '{outcome}'.",
                         }
                     ]
                 },

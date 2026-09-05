@@ -794,6 +794,7 @@ mod tests {
             model: None,
             system_prompt: None,
             sandboxed: false,
+            report_outcomes: Vec::new(),
         }
     }
 

@@ -862,7 +862,7 @@ esac
     );
     std::fs::write(
         scripts_dir.join("reviewer-reply.json"),
-        r#"{"outcome": "approved", "feedback": ""}"#,
+        r#"{"outcome": "approved", "summary": ""}"#,
     )
     .unwrap();
     let claude_wrapper = write_script(

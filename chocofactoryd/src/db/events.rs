@@ -1,3 +1,4 @@
+use chocofactory_core::mcp::qualified_report_outcome_tool_name;
 use chocofactory_core::models::{Event, EventType};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -249,6 +250,49 @@ pub async fn final_assistant_text_for_run(
     }
     blocks.reverse();
     Ok(blocks.concat())
+}
+
+/// The agent's **last call** to `report_outcome` (issue #73) in a run — the
+/// verdict it stated explicitly through a tool, preferred over parsing its
+/// final reply's text (`final_assistant_text_for_run`) when both exist,
+/// since a tool call is unambiguous where a reply is guesswork.
+///
+/// No adapter change was needed to capture this: `normalize_assistant`
+/// already turns *any* `tool_use` content block into a `ToolCall` event
+/// generically, and an MCP tool call from the model's point of view is an
+/// ordinary tool call — this only has to recognise it back off the timeline
+/// by name.
+///
+/// Filtered by tool name, and to the one newest match, in SQL via
+/// `json_extract` (review, #75) — this runs on *every* agent turn's
+/// completion, including an ordinary coding turn with dozens of `Read`/
+/// `Write`/`Bash` calls before it ever reports anything, so fetching and
+/// decoding every `tool_call` row just to keep one is real, avoidable cost
+/// on the common case rather than the rare one.
+///
+/// Scoped to one run, for the same reason `final_assistant_text_for_run` is:
+/// each stage entry opens a fresh `task_run` (`enter_agent_turn`), so a run
+/// is exactly one turn's worth of tool calls.
+pub async fn last_report_outcome_for_run(
+    pool: &SqlitePool,
+    task_run_id: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    let tool_call = EventType::ToolCall.to_string();
+    let tool_name = qualified_report_outcome_tool_name();
+    let payload: Option<Json<Value>> = sqlx::query_scalar(
+        "SELECT payload FROM events
+         WHERE task_run_id = ? AND event_type = ?
+           AND json_extract(payload, '$.tool') = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(task_run_id)
+    .bind(&tool_call)
+    .bind(&tool_name)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(payload.and_then(|payload| payload.0.get("input").cloned()))
 }
 
 /// Whether an event marks the end of the message before it — i.e. whether
@@ -1080,6 +1124,118 @@ mod tests {
                 .await
                 .unwrap(),
             "answer two"
+        );
+    }
+
+    fn report_outcome_call(outcome: &str) -> (EventType, Value) {
+        let tool = qualified_report_outcome_tool_name();
+        (
+            EventType::ToolCall,
+            json!({
+                "tool_use_id": "toolu_1",
+                "tool": tool,
+                "input": { "outcome": outcome, "summary": "" },
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn last_report_outcome_for_run_reads_the_tool_calls_input() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "reviewing now" }),
+                ),
+                report_outcome_call("approved"),
+            ],
+        )
+        .await;
+
+        let report = last_report_outcome_for_run(&pool, &task_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["outcome"], "approved");
+    }
+
+    /// The *last* call wins, same as `final_assistant_text_for_run`'s "last
+    /// thing said" rule — a model that calls the tool twice (a correction,
+    /// or a retry after a validation error) should have its final word taken
+    /// as the verdict, not its first.
+    #[tokio::test]
+    async fn last_report_outcome_for_run_prefers_the_most_recent_call() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                report_outcome_call("changes_requested"),
+                report_outcome_call("approved"),
+            ],
+        )
+        .await;
+
+        let report = last_report_outcome_for_run(&pool, &task_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["outcome"], "approved");
+    }
+
+    /// A tool call to something else entirely (a coder reading a file, say)
+    /// must not be mistaken for a verdict.
+    #[tokio::test]
+    async fn last_report_outcome_for_run_ignores_other_tool_calls() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[(
+                EventType::ToolCall,
+                json!({
+                    "tool_use_id": "toolu_1",
+                    "tool": "Read",
+                    "input": { "path": "a.rs" },
+                }),
+            )],
+        )
+        .await;
+
+        assert_eq!(
+            last_report_outcome_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn last_report_outcome_for_run_is_none_when_the_tool_was_never_called() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[(EventType::AssistantMessage, json!({ "text": "approved" }))],
+        )
+        .await;
+
+        assert_eq!(
+            last_report_outcome_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            None
         );
     }
 }

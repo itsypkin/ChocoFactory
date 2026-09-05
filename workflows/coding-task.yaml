@@ -23,7 +23,7 @@ stages:
   # The single landing spot for every way work comes back. The coder is an
   # agent with tool access, so it can look up *why* it's back itself (CI
   # logs, PR comments); only what it genuinely can't look up — a reviewer's
-  # written feedback, or a human's redirect note — gets templated in
+  # own summary, or a human's redirect note — gets templated in
   # (`coder-revise.md`), and only one of those two is ever populated for a
   # given entry (the other renders empty, #60).
   revising:
@@ -32,9 +32,10 @@ stages:
     prompt_file: prompts/coder-revise.md
     on: { done: internal_review }
 
-  # The reviewer replies with structured JSON (`{"outcome": ..., "feedback":
-  # ...}` — see reviewer-system.md); `capture: json` reads `on:`'s next stage
-  # straight from the reply's own `outcome` key (#45).
+  # The reviewer states its verdict by calling `report_outcome(outcome,
+  # summary)` (#73) rather than replying with structured JSON; `capture: json`
+  # reads `on:`'s next stage straight from the call's `outcome` argument, with
+  # a same-shaped-JSON-reply fallback for a turn that never calls the tool.
   internal_review:
     kind: agent_turn
     role: reviewer

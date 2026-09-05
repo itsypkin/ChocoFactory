@@ -502,6 +502,27 @@ scripting runtime (see §7 non-goal):
   channel. This is what §5.2 previously left as undefined "kind-specific
   rules".
 
+  **(#73) The primary signal is now a tool call, not the reply's text.**
+  Every agent turn is launched with an MCP tool, `report_outcome`, whose
+  allowed `outcome` values are that stage's `on:` keys — computed the
+  same way for every stage, since "reviewer" is just a role name and a
+  `StageKind::AgentTurn` plus its `on:` map is the whole routing
+  contract. Reading the reply's text back and parsing it, as described
+  above, is now the *fallback* for a turn that never calls the tool, not
+  the primary path: the engine records every `tool_use` block generically
+  as a `ToolCall` event already, so it reads the verdict off that same
+  timeline it reads a reply from, preferring the tool call when both
+  exist. This exists because reverse-engineering a routing decision out
+  of free prose is inherently guesswork — a reviewer that writes one
+  sentence before its JSON verdict discarded that verdict entirely and
+  parked the task dead (#73's original report) — where a tool call is
+  unambiguous, and a malformed one can be rejected with an error the
+  model can act on and retry, which a reply parse can't offer. The tool
+  is present on a stage with no `capture: json` too, but never routes
+  there; a report made anyway is still recorded on the timeline rather
+  than silently discarded, so an agent reporting `blocked` on a stage
+  that doesn't route on it is still visible.
+
   Capture is *only* taken when asked for. A stage with no `capture:`
   stores nothing, exactly as for `shell`/`poll`; without that rule a chat
   stage would rewrite its whole transcript into `workflow_state` on every

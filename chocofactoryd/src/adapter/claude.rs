@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 
-use serde_json::Value;
+use chocofactory_core::mcp::MCP_SERVER_NAME;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -9,19 +10,23 @@ use tokio::sync::mpsc;
 use super::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, RoleConfig};
 
 /// Wraps `claude --print --output-format=stream-json --input-format=stream-json
-/// [--permission-mode=bypassPermissions] [--resume <id>]` as a subprocess
-/// (§4) — the permission flag only when `RoleConfig.sandboxed` says `cwd`
-/// is a disposable worktree (#67). Every turn — including the first — is
-/// sent as a stream-json user-turn line over stdin, so
+/// [--permission-mode=bypassPermissions] --mcp-config <...> [--append-system-prompt <...>]
+/// [--resume <id>]` as a subprocess (§4) — the permission flag only when
+/// `RoleConfig.sandboxed` says `cwd` is a disposable worktree (#67), the mcp
+/// config always (issue #73's `report_outcome` tool), the append-prompt only
+/// when the stage has outcomes to route on. Every turn — including the
+/// first — is sent as a stream-json user-turn line over stdin, so
 /// `start`/`resume`/`AgentHandle::send` all go through the same path.
 pub struct ClaudeAdapter {
     binary: String,
+    choco_binary: String,
 }
 
 impl ClaudeAdapter {
     pub fn new() -> Self {
         Self {
             binary: "claude".to_string(),
+            choco_binary: default_choco_binary(),
         }
     }
 
@@ -30,8 +35,35 @@ impl ClaudeAdapter {
     pub fn with_binary(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            choco_binary: default_choco_binary(),
         }
     }
+
+    /// Overrides the `choco` binary path used to build `--mcp-config`'s
+    /// stdio command (issue #73), mirroring `with_binary`'s override of
+    /// `claude` itself. Used by the daemon's `CHOCOFACTORY_CHOCO_BINARY` env
+    /// override, and by tests that want a deterministic path to assert
+    /// against rather than whatever `default_choco_binary` resolves to in a
+    /// given build layout.
+    pub fn with_choco_binary(mut self, choco_binary: impl Into<String>) -> Self {
+        self.choco_binary = choco_binary.into();
+        self
+    }
+}
+
+/// Locates `choco` as `current_exe()`'s sibling — the layout both
+/// `target/debug/` (cargo) and an installed `bin/` directory share, and the
+/// same trick `choco/tests/cli.rs`'s `workspace_binary` already uses to find
+/// its own sibling binaries. Falls back to the bare name, resolved via
+/// `PATH` when the command actually runs, if the running executable's own
+/// path can't be read — an embedding unusual enough that this daemon
+/// doesn't otherwise support it either.
+fn default_choco_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("choco")))
+        .and_then(|path| path.to_str().map(str::to_string))
+        .unwrap_or_else(|| "choco".to_string())
 }
 
 impl Default for ClaudeAdapter {
@@ -42,7 +74,7 @@ impl Default for ClaudeAdapter {
 
 impl AgentAdapter for ClaudeAdapter {
     fn start(&self, prompt: &str, cfg: &RoleConfig) -> Result<AgentHandle, AdapterError> {
-        spawn(&self.binary, cfg, None, prompt)
+        spawn(&self.binary, &self.choco_binary, cfg, None, prompt)
     }
 
     fn resume(
@@ -51,12 +83,19 @@ impl AgentAdapter for ClaudeAdapter {
         prompt: &str,
         cfg: &RoleConfig,
     ) -> Result<AgentHandle, AdapterError> {
-        spawn(&self.binary, cfg, Some(session_id), prompt)
+        spawn(
+            &self.binary,
+            &self.choco_binary,
+            cfg,
+            Some(session_id),
+            prompt,
+        )
     }
 }
 
 fn spawn(
     binary: &str,
+    choco_binary: &str,
     cfg: &RoleConfig,
     resume_session_id: Option<&str>,
     initial_prompt: &str,
@@ -107,6 +146,52 @@ fn spawn(
     // straightforward security regression instead of a safe default.
     if cfg.sandboxed {
         command.arg("--permission-mode").arg("bypassPermissions");
+    }
+
+    // Issue #73: the `report_outcome` tool is available on *every* agent
+    // turn, not something wired in only for a reviewer-shaped stage — a
+    // "reviewer" is just a role name, and `StageDef.on` is the whole
+    // contract. `cfg.report_outcomes` (the current stage's `on:` edge names)
+    // decides only what `--outcome`s the tool is launched with, not whether
+    // it exists; an empty list still serves the tool, just with a free-form,
+    // non-routing `outcome`.
+    //
+    // One `--outcome <name>` per edge, not one comma-joined flag (review,
+    // #75): an `on:` edge name is an arbitrary YAML string and could itself
+    // contain a comma, which no single delimiter-joined value can
+    // round-trip unambiguously.
+    let mut mcp_args = vec!["mcp-serve".to_string()];
+    for outcome in &cfg.report_outcomes {
+        mcp_args.push("--outcome".to_string());
+        mcp_args.push(outcome.clone());
+    }
+    let mcp_config = json!({
+        "mcpServers": {
+            (MCP_SERVER_NAME): {
+                "type": "stdio",
+                "command": choco_binary,
+                "args": mcp_args,
+            }
+        }
+    })
+    .to_string();
+    command.arg("--mcp-config").arg(mcp_config);
+    // Deliberately no `--strict-mcp-config`: that would silently drop
+    // whatever MCP servers the operator configured for every coder turn and
+    // every chat session. Reproducibility of a turn's tool surface is a
+    // separate decision from fixing #73's parked-task bug, and ours is added
+    // alongside the operator's configuration, not in place of it.
+
+    // Only when the stage actually routes on the report: a stage with no
+    // outcomes must not be told it can drive a transition it cannot. Built
+    // from the exact same list the tool's own schema uses (§ `mcp.rs`), so
+    // this instruction can never name an outcome the tool would reject.
+    if !cfg.report_outcomes.is_empty() {
+        command.arg("--append-system-prompt").arg(format!(
+            "Before ending your turn, call `report_outcome` to report this stage's outcome. \
+             It must be one of: {}.",
+            cfg.report_outcomes.join(", ")
+        ));
     }
 
     if let Some(model) = &cfg.model {
@@ -443,6 +528,7 @@ mod tests {
             model: None,
             system_prompt: None,
             sandboxed: false,
+            report_outcomes: Vec::new(),
         };
         let mut handle = adapter.start("hello", &cfg).unwrap();
 
@@ -483,6 +569,7 @@ mod tests {
             model: None,
             system_prompt: None,
             sandboxed: false,
+            report_outcomes: Vec::new(),
         };
         let mut handle = adapter
             .resume("fixed-session-id", "hello again", &cfg)
@@ -509,17 +596,20 @@ mod tests {
             model: None,
             system_prompt: None,
             sandboxed: true,
+            report_outcomes: Vec::new(),
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
 
         handle.recv().await.unwrap(); // SessionMeta
         let reply = handle.recv().await.unwrap();
-        assert_eq!(
-            reply,
-            AgentEvent::AssistantMessage {
-                text: "model=<unset>|system_prompt=<unset>|permission_mode=bypassPermissions"
-                    .to_string()
-            }
+        let AgentEvent::AssistantMessage { text } = reply else {
+            panic!("expected an assistant message, got {reply:?}");
+        };
+        assert!(
+            text.starts_with(
+                "model=<unset>|system_prompt=<unset>|permission_mode=bypassPermissions"
+            ),
+            "got {text}"
         );
     }
 
@@ -537,16 +627,115 @@ mod tests {
             model: None,
             system_prompt: None,
             sandboxed: false,
+            report_outcomes: Vec::new(),
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
 
         handle.recv().await.unwrap(); // SessionMeta
         let reply = handle.recv().await.unwrap();
+        let AgentEvent::AssistantMessage { text } = reply else {
+            panic!("expected an assistant message, got {reply:?}");
+        };
+        assert!(
+            text.starts_with("model=<unset>|system_prompt=<unset>|permission_mode=<unset>"),
+            "got {text}"
+        );
+    }
+
+    /// Issue #73: the tool is present on *every* turn, whether or not the
+    /// stage routes on it — `--mcp-config` is unconditional, and never paired
+    /// with `--strict-mcp-config`, so an operator's own MCP servers stay
+    /// available to a coder turn just as they do today. With no outcomes to
+    /// route on, nothing is appended to the system prompt: a stage that
+    /// cannot route must not gain an instruction implying it can.
+    #[tokio::test]
+    async fn a_turn_with_no_outcomes_still_gets_the_tool_but_no_routing_instruction() {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: false,
+            report_outcomes: Vec::new(),
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+
+        handle.recv().await.unwrap(); // SessionMeta
+        let reply = handle.recv().await.unwrap();
+        let AgentEvent::AssistantMessage { text } = reply else {
+            panic!("expected an assistant message, got {reply:?}");
+        };
+        assert!(
+            text.contains("mcp_config=") && !text.contains("mcp_config=<unset>"),
+            "got {text}"
+        );
+        assert!(text.contains("strict_mcp_config=false"), "got {text}");
+        assert!(text.contains("append_system_prompt=<unset>"), "got {text}");
+    }
+
+    /// The routing half of the same wiring: a stage with `on:` edges gets a
+    /// generated system-prompt instruction naming them, built from the exact
+    /// same list the tool's own schema uses, so the two can never disagree.
+    ///
+    /// Parses `mcp_config` and `append_system_prompt` out of the reply
+    /// separately and checks each on its own terms (review, #75 round 2):
+    /// a loose "does 'approved' appear anywhere in the whole reply" check
+    /// could pass even if the tool's own `--outcome` argv were wrong, since
+    /// `append_system_prompt`'s prose also names both outcomes.
+    #[tokio::test]
+    async fn a_turn_with_outcomes_gets_a_routing_instruction_naming_them() {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: false,
+            report_outcomes: vec!["approved".to_string(), "changes_requested".to_string()],
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+
+        handle.recv().await.unwrap(); // SessionMeta
+        let reply = handle.recv().await.unwrap();
+        let AgentEvent::AssistantMessage { text } = reply else {
+            panic!("expected an assistant message, got {reply:?}");
+        };
+
+        // `--outcome` is repeatable (review, #75 round 1's comma-safety
+        // fix), so this pins the actual argv shape, not a joined string.
+        let mcp_config_json = text
+            .split("|mcp_config=")
+            .nth(1)
+            .and_then(|rest| rest.split("|strict_mcp_config=").next())
+            .expect("mcp_config field");
+        let mcp_config: Value = serde_json::from_str(mcp_config_json).unwrap();
+        let args: Vec<&str> = mcp_config["mcpServers"]["chocofactory"]["args"]
+            .as_array()
+            .expect("args array")
+            .iter()
+            .map(|a| a.as_str().expect("string arg"))
+            .collect();
         assert_eq!(
-            reply,
-            AgentEvent::AssistantMessage {
-                text: "model=<unset>|system_prompt=<unset>|permission_mode=<unset>".to_string()
-            }
+            args,
+            vec![
+                "mcp-serve",
+                "--outcome",
+                "approved",
+                "--outcome",
+                "changes_requested"
+            ],
+            "got {args:?}"
+        );
+        assert!(text.contains("strict_mcp_config=false"), "got {text}");
+
+        let append_system_prompt = text
+            .split("|append_system_prompt=")
+            .nth(1)
+            .expect("append_system_prompt field");
+        assert_ne!(append_system_prompt, "<unset>", "got {text}");
+        assert!(append_system_prompt.contains("approved"), "got {text}");
+        assert!(
+            append_system_prompt.contains("changes_requested"),
+            "got {text}"
         );
     }
 }

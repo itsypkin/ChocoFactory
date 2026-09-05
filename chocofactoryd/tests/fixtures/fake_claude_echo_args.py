@@ -4,7 +4,7 @@
 Like fake_claude_oneshot.py it runs a single turn and exits, so an
 `agent_turn` stage using it completes and auto-advances. Unlike the other
 fixtures, its reply is not an echo of the input but a summary of its own
-argv: `model=<--model>|system_prompt=<--system-prompt>|permission_mode=<--permission-mode>`.
+argv: `model=<--model>|system_prompt=<--system-prompt>|permission_mode=<--permission-mode>|mcp_config=<--mcp-config>|strict_mcp_config=<present?>|append_system_prompt=<--append-system-prompt>`.
 
 That makes the *resolved role config* observable from the events table.
 `task_runs` persists a run's `cli_adapter`/`model` columns, but nothing
@@ -43,10 +43,13 @@ def main():
     # exactly as it would against the real CLI.
     sys.stdin.readline()
 
-    reply = "model={}|system_prompt={}|permission_mode={}".format(
+    reply = "model={}|system_prompt={}|permission_mode={}|mcp_config={}|strict_mcp_config={}|append_system_prompt={}".format(
         flag(args, "--model"),
         flag(args, "--system-prompt"),
         flag(args, "--permission-mode"),
+        flag(args, "--mcp-config"),
+        "true" if "--strict-mcp-config" in args else "false",
+        flag(args, "--append-system-prompt"),
     )
 
     emit(

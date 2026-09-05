@@ -4,6 +4,7 @@
 
 mod cli;
 mod client;
+mod mcp;
 mod render;
 
 use std::process::ExitCode;
@@ -30,6 +31,23 @@ fn role_overrides(args: &RoleOverrideArgs) -> RoleOverrides<'_> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Handled before `Client::new` and outside the `Output`/`run` path
+    // entirely: serving the MCP tool must never depend on `chocofactoryd`
+    // being reachable, and its stdio framing is its own protocol, not
+    // something the `--json`/human-readable split applies to.
+    if let Command::McpServe(args) = &cli.command {
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        return match mcp::serve(&args.outcomes, stdin.lock(), stdout.lock()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let client = Client::new(cli.base_url);
 
     match run(&client, cli.command).await {
@@ -181,5 +199,9 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         Command::Task(TaskCmd::Events { id, limit, after }) => Ok(Output::Events(
             client.list_events(&id, limit, after.as_deref()).await?,
         )),
+        // `main` returns before ever constructing a `Client`/calling `run`
+        // when `cli.command` is `McpServe` — reachable only if that early
+        // return is ever removed without updating this arm too.
+        Command::McpServe(_) => unreachable!("McpServe is handled in main() before run()"),
     }
 }

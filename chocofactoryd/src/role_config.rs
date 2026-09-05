@@ -50,8 +50,8 @@ impl fmt::Display for RoleConfigError {
 impl std::error::Error for RoleConfigError {}
 
 /// Resolves `role_name`'s final `cli`/`model`/system prompt against the
-/// three layers, plus `cwd`/`sandboxed` (task-wide, not per-role — passed
-/// straight through, not resolved here).
+/// three layers, plus `cwd`/`sandboxed`/`report_outcomes` (stage- or
+/// task-wide, not per-role — passed straight through, not resolved here).
 pub fn resolve(
     role_name: &str,
     role_def: &RoleDef,
@@ -59,6 +59,7 @@ pub fn resolve(
     task_config: &Value,
     cwd: std::path::PathBuf,
     sandboxed: bool,
+    report_outcomes: Vec<String>,
 ) -> Result<ResolvedRoleConfig, RoleConfigError> {
     let task_role = task_config.get("roles").and_then(|r| r.get(role_name));
     let global_role = global.roles.get(role_name);
@@ -106,6 +107,7 @@ pub fn resolve(
             model: Some(model),
             system_prompt,
             sandboxed,
+            report_outcomes,
         },
     })
 }
@@ -154,7 +156,16 @@ mod tests {
         let def = role_def(Some("def-cli"), Some("def-model"));
         let task_config = json!({ "roles": { "chat": { "model": "haiku" } } });
 
-        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into(), false).unwrap();
+        let resolved = resolve(
+            "chat",
+            &def,
+            &global,
+            &task_config,
+            "/cwd".into(),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(resolved.cli, "def-cli"); // no task-level override, workflow-def wins
         assert_eq!(resolved.model, "haiku"); // task-level override wins
     }
@@ -172,11 +183,28 @@ mod tests {
         let global = GlobalConfig::default();
         let task_config = json!({});
 
-        let not_sandboxed =
-            resolve("chat", &def, &global, &task_config, "/cwd".into(), false).unwrap();
+        let not_sandboxed = resolve(
+            "chat",
+            &def,
+            &global,
+            &task_config,
+            "/cwd".into(),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
         assert!(!not_sandboxed.role_config.sandboxed);
 
-        let sandboxed = resolve("chat", &def, &global, &task_config, "/cwd".into(), true).unwrap();
+        let sandboxed = resolve(
+            "chat",
+            &def,
+            &global,
+            &task_config,
+            "/cwd".into(),
+            true,
+            Vec::new(),
+        )
+        .unwrap();
         assert!(sandboxed.role_config.sandboxed);
     }
 
@@ -194,7 +222,16 @@ mod tests {
         let def = role_def(Some("def-cli"), None);
         let task_config = json!({});
 
-        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into(), false).unwrap();
+        let resolved = resolve(
+            "chat",
+            &def,
+            &global,
+            &task_config,
+            "/cwd".into(),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(resolved.cli, "def-cli");
         assert_eq!(resolved.model, "global-model");
     }
@@ -213,7 +250,16 @@ mod tests {
         let def = role_def(None, None);
         let task_config = json!({});
 
-        let resolved = resolve("chat", &def, &global, &task_config, "/cwd".into(), false).unwrap();
+        let resolved = resolve(
+            "chat",
+            &def,
+            &global,
+            &task_config,
+            "/cwd".into(),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(resolved.cli, "global-cli");
         assert_eq!(resolved.model, "global-model");
     }
@@ -230,6 +276,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -250,6 +297,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -281,6 +329,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap();
 
@@ -309,6 +358,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap();
 
@@ -356,6 +406,7 @@ mod tests {
                 &task_config,
                 "/cwd".into(),
                 false,
+                Vec::new(),
             )
             .unwrap_or_else(|err| panic!("config {task_config} should not error, got {err}"));
 
@@ -402,6 +453,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap();
         let reviewer = resolve(
@@ -411,6 +463,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap();
 
@@ -457,7 +510,16 @@ mod tests {
         };
         let global = global_with_prompt("coder", global_path);
 
-        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into(), false).unwrap();
+        let resolved = resolve(
+            "coder",
+            &def,
+            &global,
+            &json!({}),
+            "/cwd".into(),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             resolved.role_config.system_prompt.as_deref(),
@@ -472,7 +534,16 @@ mod tests {
         let def = role_def(Some("cli"), Some("model"));
         let global = global_with_prompt("coder", global_path);
 
-        let resolved = resolve("coder", &def, &global, &json!({}), "/cwd".into(), false).unwrap();
+        let resolved = resolve(
+            "coder",
+            &def,
+            &global,
+            &json!({}),
+            "/cwd".into(),
+            false,
+            Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             resolved.role_config.system_prompt.as_deref(),
@@ -500,6 +571,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap();
 
@@ -533,6 +605,7 @@ mod tests {
             &json!({}),
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap();
         let reviewer = resolve(
@@ -542,6 +615,7 @@ mod tests {
             &json!({}),
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap();
 
@@ -575,6 +649,7 @@ mod tests {
             &json!({}),
             "/cwd".into(),
             false,
+            Vec::new(),
         )
         .unwrap_err();
 

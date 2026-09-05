@@ -5,7 +5,7 @@ Task: {{ task.title }}
 You're revising your earlier work on this task. There are a few reasons
 you might be back here — check what applies:
 
-Reviewer feedback (empty if this isn't why you're back): {{ stages.internal_review.feedback }}
+Reviewer feedback (empty if this isn't why you're back): {{ stages.internal_review.summary }}
 
 A note from a human (empty if this isn't why you're back): {{ stages.escalate_to_human }}
 

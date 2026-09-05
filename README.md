@@ -48,9 +48,44 @@ HOME=$(mktemp -d) CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude \
 | Variable | Purpose |
 |---|---|
 | `CHOCOFACTORY_CLAUDE_BINARY` | Path to the agent CLI. Unset = the real, billable `claude`. |
+| `CHOCOFACTORY_CHOCO_BINARY` | Path to `choco`, used to serve every agent turn's `report_outcome` tool (see below). Unset = the daemon's own sibling `choco` binary. |
 | `CHOCOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. |
 | `MOCK_CLAUDE_REPLY` | Read by `mock-claude` only — reply with this fixed text instead of echoing. |
 | `RUST_LOG` | Log filter, e.g. `error` to quiet startup, `debug` for detail. |
+
+### Writing a workflow: how a stage routes on an agent's verdict
+
+Every agent turn is launched with an MCP tool, `report_outcome`, that lets
+the agent state its verdict explicitly instead of the engine trying to guess
+one from its reply's text. The whole rule a workflow author needs is one
+sentence:
+
+> A stage routes on the agent's own verdict **if and only if** it declares
+> `capture: json`. Its `on:` keys are the allowed verdicts.
+
+That's it — nothing about the tool belongs in a prompt file. Given
+
+```yaml
+internal_review:
+  kind: agent_turn
+  role: reviewer
+  capture: json
+  on: { approved: open_pr, changes_requested: revising }
+```
+
+the daemon derives, from `on:`'s keys alone: the tool's allowed `outcome`
+values, its description, and (via `--append-system-prompt`) the instruction
+telling the agent to call it before ending its turn. There is no second copy
+of `approved`/`changes_requested` to keep in sync — change the `on:` map and
+every agent-facing part of the contract changes with it.
+
+The tool is present on *every* agent turn, not only ones that route — a
+stage with no `on:` edges (or none matching `capture: json`) still offers
+`report_outcome`, just with a free-form, non-routing `outcome`: useful for a
+coder to note it's `blocked`, visible on the task's event timeline, but never
+able to park a stage that has always advanced unconditionally. An agent that
+never calls the tool still works: the engine falls back to parsing the
+turn's final reply as JSON, same as before this existed.
 
 ## Using the `choco` CLI
 

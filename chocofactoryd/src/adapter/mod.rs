@@ -27,6 +27,15 @@ pub struct RoleConfig {
     /// sandbox that makes bypassing safe; without it, bypassing would
     /// apply unconditionally to a real, non-disposable checkout.
     pub sandboxed: bool,
+    /// The current stage's `on:` edge names (issue #73), i.e. the outcomes
+    /// this turn is allowed to report through `choco mcp-serve`'s
+    /// `report_outcome` tool. Empty when the stage declares no edges (a
+    /// standing session like chat, or a plain `agent_turn` that always
+    /// advances on `done`) — the tool is still offered, but as an optional,
+    /// free-form status report rather than a routing decision. Stage-derived,
+    /// like `sandboxed`, so it is passed straight through by
+    /// `role_config::resolve` rather than layered from config.
+    pub report_outcomes: Vec<String>,
 }
 
 /// The shared, CLI-agnostic event shape (design §4.2). Carries the same

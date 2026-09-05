@@ -46,6 +46,15 @@ fn claude_binary_override() -> Option<String> {
     std::env::var("CHOCOFACTORY_CLAUDE_BINARY").ok()
 }
 
+/// Overrides the `choco` binary path the adapter embeds in every agent
+/// turn's `--mcp-config` (issue #73). Unset in normal use, where
+/// `ClaudeAdapter`'s sibling-of-`current_exe()` lookup applies unchanged;
+/// set by the e2e test suite, which spawns `chocofactoryd` from a location
+/// where that lookup wouldn't find the freshly built `choco` binary.
+fn choco_binary_override() -> Option<String> {
+    std::env::var("CHOCOFACTORY_CHOCO_BINARY").ok()
+}
+
 /// §4.1 leaves the idle-session timeout as "configurable, default TBD in
 /// plan" — this is that default, hardcoded until a config surface for it
 /// exists.
@@ -82,10 +91,14 @@ async fn main() {
     tracing::info!(recovered, "recovered stale active task runs");
 
     let events_notify = Arc::new(Notify::new());
-    let adapter: Arc<dyn AgentAdapter> = match claude_binary_override() {
-        Some(binary) => Arc::new(ClaudeAdapter::with_binary(binary)),
-        None => Arc::new(ClaudeAdapter::new()),
+    let mut claude_adapter = match claude_binary_override() {
+        Some(binary) => ClaudeAdapter::with_binary(binary),
+        None => ClaudeAdapter::new(),
     };
+    if let Some(choco_binary) = choco_binary_override() {
+        claude_adapter = claude_adapter.with_choco_binary(choco_binary);
+    }
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(claude_adapter);
     let session_manager = SessionManager::new(
         pool.clone(),
         adapter,
