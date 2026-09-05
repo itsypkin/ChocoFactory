@@ -676,6 +676,12 @@ mod tests {
     /// The routing half of the same wiring: a stage with `on:` edges gets a
     /// generated system-prompt instruction naming them, built from the exact
     /// same list the tool's own schema uses, so the two can never disagree.
+    ///
+    /// Parses `mcp_config` and `append_system_prompt` out of the reply
+    /// separately and checks each on its own terms (review, #75 round 2):
+    /// a loose "does 'approved' appear anywhere in the whole reply" check
+    /// could pass even if the tool's own `--outcome` argv were wrong, since
+    /// `append_system_prompt`'s prose also names both outcomes.
     #[tokio::test]
     async fn a_turn_with_outcomes_gets_a_routing_instruction_naming_them() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
@@ -693,10 +699,43 @@ mod tests {
         let AgentEvent::AssistantMessage { text } = reply else {
             panic!("expected an assistant message, got {reply:?}");
         };
-        assert!(text.contains("mcp_config="), "got {text}");
+
+        // `--outcome` is repeatable (review, #75 round 1's comma-safety
+        // fix), so this pins the actual argv shape, not a joined string.
+        let mcp_config_json = text
+            .split("|mcp_config=")
+            .nth(1)
+            .and_then(|rest| rest.split("|strict_mcp_config=").next())
+            .expect("mcp_config field");
+        let mcp_config: Value = serde_json::from_str(mcp_config_json).unwrap();
+        let args: Vec<&str> = mcp_config["mcpServers"]["chocofactory"]["args"]
+            .as_array()
+            .expect("args array")
+            .iter()
+            .map(|a| a.as_str().expect("string arg"))
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "mcp-serve",
+                "--outcome",
+                "approved",
+                "--outcome",
+                "changes_requested"
+            ],
+            "got {args:?}"
+        );
         assert!(text.contains("strict_mcp_config=false"), "got {text}");
-        assert!(!text.contains("append_system_prompt=<unset>"), "got {text}");
-        assert!(text.contains("approved"), "got {text}");
-        assert!(text.contains("changes_requested"), "got {text}");
+
+        let append_system_prompt = text
+            .split("|append_system_prompt=")
+            .nth(1)
+            .expect("append_system_prompt field");
+        assert_ne!(append_system_prompt, "<unset>", "got {text}");
+        assert!(append_system_prompt.contains("approved"), "got {text}");
+        assert!(
+            append_system_prompt.contains("changes_requested"),
+            "got {text}"
+        );
     }
 }

@@ -19,9 +19,10 @@
 //!   MCP SDK. `serde_json` is already a dependency; a crate for one tool
 //!   would not be.
 //!
-//! The allowed `outcome` values are passed in with `--outcomes` and come from
-//! the stage's `on:` map, so this binary has no idea what a "reviewer" is —
-//! every agent turn gets the same tool, and only the list differs.
+//! The allowed `outcome` values are passed in with repeated `--outcome`
+//! flags and come from the stage's `on:` map, so this binary has no idea
+//! what a "reviewer" is — every agent turn gets the same tool, and only the
+//! list differs.
 
 use std::io::{BufRead, Write};
 
@@ -164,6 +165,18 @@ fn call_tool(outcomes: &[String], params: Option<&Value>) -> Result<Value, CallE
              of those.",
             allowed_clause(outcomes)
         )));
+    }
+
+    // Review, #75: `tool_definition` documents `summary` as required (may be
+    // empty, but always present, so a template reading it never renders
+    // empty because the field is simply missing) — but nothing enforced
+    // that until now. The MCP `inputSchema`'s own `"required"` array is a
+    // hint to the model, not something this server validates on its
+    // behalf; skip this check and the doc comment's promise is false.
+    if arguments.get("summary").and_then(Value::as_str).is_none() {
+        return Ok(tool_error(
+            "'summary' is required and must be a string (it may be empty).",
+        ));
     }
 
     Ok(json!({
@@ -424,6 +437,34 @@ mod tests {
     #[test]
     fn an_empty_outcome_is_a_tool_error() {
         let result = call(&outcomes(), json!({ "outcome": "   ", "summary": "" }));
+        assert_eq!(result["isError"], true, "got {result}");
+    }
+
+    /// Review, #75: `tool_definition` documents `summary` as always present
+    /// on a successful call (required, though it may be empty) — this pins
+    /// that the server actually enforces it, not just that its schema hints
+    /// it. Without this, a model calling `report_outcome({"outcome": "x"})`
+    /// with no `summary` at all succeeded, and the daemon would later merge
+    /// a captured object with no `summary` key — reproducing #73's original
+    /// symptom (`coder-revise.md`'s `{{ stages.internal_review.summary }}`
+    /// rendering empty) through the *primary* tool path, not just the
+    /// text-fallback one.
+    #[test]
+    fn a_missing_summary_is_a_tool_error() {
+        let result = call(&outcomes(), json!({ "outcome": "approved" }));
+        assert_eq!(result["isError"], true, "got {result}");
+    }
+
+    /// `summary` may be empty — only its *presence* (and type) is required.
+    #[test]
+    fn an_empty_summary_is_accepted() {
+        let result = call(&outcomes(), json!({ "outcome": "approved", "summary": "" }));
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    #[test]
+    fn a_non_string_summary_is_a_tool_error() {
+        let result = call(&outcomes(), json!({ "outcome": "approved", "summary": 7 }));
         assert_eq!(result["isError"], true, "got {result}");
     }
 

@@ -211,11 +211,19 @@ pub enum EventType {
     /// no `capture: json` and so doesn't route on it at all. Payload is
     /// `{"stage", "capture", "outcome", "applied", "note", "source"}`.
     ///
-    /// `source` is `"tool"` when the outcome came from a `report_outcome`
-    /// call, `"reply"` when it came from parsing the turn's final text (the
-    /// fallback for an agent that never calls the tool), or `null` when
-    /// neither applies (a non-capturing stage's turn, when no report was
-    /// made — the common case, and today's only case before #73).
+    /// `source` is `"tool"` when the outcome *actually came from* a
+    /// `report_outcome` call, `"reply"` when it came from parsing the turn's
+    /// final text (the fallback for an agent that never calls the tool, and
+    /// also what a `capture: text` stage's outcome always comes from — see
+    /// below), or `null` when neither applies: a non-capturing stage's turn
+    /// (the common case, and today's only case before #73), whether or not
+    /// a report happened to be made alongside it. A `capture: text` stage
+    /// with a report is the same as no `capture:` with one — a report only
+    /// routes a `capture: json` stage, so on any other stage `source`
+    /// reflects where the *outcome actually taken* came from, and `"tool"`
+    /// there would claim a report drove something it never touched. Either
+    /// way the report itself isn't lost: `note` says one was made and this
+    /// stage doesn't route on it.
     ///
     /// `applied` says whether the transition was actually taken: an outcome
     /// can be computed and then deliberately not applied, which is what a

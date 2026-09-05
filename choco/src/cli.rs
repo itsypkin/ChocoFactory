@@ -59,7 +59,14 @@ pub struct McpServeArgs {
     /// an `on:` edge name is an arbitrary YAML string key and could itself
     /// contain a comma, which a `value_delimiter` would misparse on both
     /// ends of the round trip.
-    #[arg(long = "outcome")]
+    ///
+    /// `allow_hyphen_values` (review, #75 round 2): an edge name starting
+    /// with `-` (e.g. `-needs-work`) would otherwise make clap treat it as
+    /// an unrecognised flag rather than this one's value, failing the whole
+    /// subcommand — which would silently degrade every turn on that stage to
+    /// the text-fallback path, recreating #73's original bug through a new
+    /// door.
+    #[arg(long = "outcome", allow_hyphen_values = true)]
     pub outcomes: Vec<String>,
 }
 
@@ -241,6 +248,22 @@ mod tests {
             panic!("expected McpServe");
         };
         assert_eq!(args.outcomes, vec!["needs, more, work"]);
+    }
+
+    /// Review, #75 round 2: without `allow_hyphen_values`, clap treats a
+    /// leading `-` as the start of a new (unrecognised) flag rather than
+    /// this one's value, and `try_parse_from` — the shape `main()` actually
+    /// calls — fails the whole subcommand rather than panicking, which
+    /// would silently degrade every turn on a stage with an edge like this
+    /// to the text-fallback path.
+    #[test]
+    fn mcp_serve_outcome_starting_with_a_hyphen_parses() {
+        let cli = Cli::try_parse_from(["choco", "mcp-serve", "--outcome", "-needs-work"])
+            .expect("a leading hyphen in an outcome name must still parse");
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(args.outcomes, vec!["-needs-work"]);
     }
 
     #[test]

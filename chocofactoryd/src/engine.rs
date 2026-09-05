@@ -3014,21 +3014,29 @@ impl WorkflowEngine {
             // would have done before #73 — and if a report was made but
             // ignored, note that rather than let it vanish.
             None => {
+                // Review, #75 round 2: `source` describes where the
+                // *outcome* came from (models.rs's own doc on
+                // `EventType::TurnOutcome`) — and here it never comes from
+                // the report, whether or not one was made: a no-`capture:`
+                // stage always advances on `done`, and a `capture: text`
+                // stage always reads its own reply. Recording `"tool"`
+                // anyway (as this used to) would claim the report drove an
+                // outcome it never touched; the note below already says a
+                // report existed and was ignored, which is the fact worth
+                // recording.
                 let unroutable_note =
                     (capture != Some(Capture::Json) && report.is_some()).then(|| {
                         "a report_outcome call was made, but this stage does not route on it \
                          (it declares no 'capture: json')"
                             .to_string()
                     });
-                let unroutable_source =
-                    (capture != Some(Capture::Json) && report.is_some()).then_some("tool");
 
                 match capture {
                     None => (
                         None,
                         TURN_DEFAULT_OUTCOME.to_string(),
                         unroutable_note,
-                        unroutable_source,
+                        None,
                     ),
                     // `capture: text` (or a `capture: json` stage with no
                     // report at all) still reads its own turn back off the
@@ -3056,7 +3064,7 @@ impl WorkflowEngine {
                                     .collect::<Vec<_>>()
                                     .join("; ");
                                 let note = (!note.is_empty()).then_some(note);
-                                (captured, outcome, note, unroutable_source.or(Some("reply")))
+                                (captured, outcome, note, Some("reply"))
                             }
                             // Nothing to capture and no basis for a verdict,
                             // so this does not fall through to a default
@@ -3558,7 +3566,7 @@ fn derive_capture(
 }
 
 /// `derive_capture`, but for a `capture: json` agent turn's own reply only
-/// (issue #73 review): additionally tries to recover the last balanced
+/// (issue #73 review): additionally tries to recover the sole balanced
 /// top-level `{…}` from a reply that isn't pure JSON — the fix for #73's
 /// original repro, a reviewer that writes a sentence of preamble before its
 /// verdict object.
@@ -3588,27 +3596,29 @@ fn derive_agent_reply_capture(
 
     match serde_json::from_str::<Value>(trimmed) {
         Ok(value) => (Some(value), None),
-        Err(whole_err) => match last_json_object(trimmed).map(serde_json::from_str::<Value>) {
-            Some(Ok(value)) => (
-                Some(value),
-                Some(format!(
-                    "the reply was not valid JSON on its own ({whole_err}); recovered the last \
-                     '{{...}}' object in it"
-                )),
-            ),
-            _ => {
-                tracing::warn!(
-                    task_id, stage = stage_name, %whole_err,
-                    "stage output was not valid JSON; captured as text"
-                );
-                (
-                    Some(Value::String(trimmed.to_string())),
+        Err(whole_err) => {
+            match sole_top_level_json_object(trimmed).map(serde_json::from_str::<Value>) {
+                Some(Ok(value)) => (
+                    Some(value),
                     Some(format!(
-                        "the reply was not valid JSON ({whole_err}); captured as text"
+                        "the reply was not valid JSON on its own ({whole_err}); recovered the sole \
+                     '{{...}}' object in it"
                     )),
-                )
+                ),
+                _ => {
+                    tracing::warn!(
+                        task_id, stage = stage_name, %whole_err,
+                        "stage output was not valid JSON; captured as text"
+                    );
+                    (
+                        Some(Value::String(trimmed.to_string())),
+                        Some(format!(
+                            "the reply was not valid JSON ({whole_err}); captured as text"
+                        )),
+                    )
+                }
             }
-        },
+        }
     }
 }
 
@@ -3636,7 +3646,13 @@ fn turn_outcome(capture: Capture, captured: Option<&Value>) -> (String, Option<S
         return (TURN_DEFAULT_OUTCOME.to_string(), None);
     }
     match captured.and_then(|value| value.get("outcome")) {
-        Some(Value::String(outcome)) if !outcome.is_empty() => (outcome.clone(), None),
+        // Trimmed for the same reason `outcome_from_report` trims (review,
+        // #75 round 2): a reply's `on: {" approved ": ...}` would otherwise
+        // match nothing `advance_from_stage` declares, parking a stage over
+        // whitespace a human skimming the reply would never notice.
+        Some(Value::String(outcome)) if !outcome.trim().is_empty() => {
+            (outcome.trim().to_string(), None)
+        }
         Some(Value::String(_)) => (
             TURN_DEFAULT_OUTCOME.to_string(),
             Some(format!(
@@ -3748,18 +3764,35 @@ fn unwrap_code_fence(reply: &str) -> &str {
     body.trim()
 }
 
-/// The last complete, top-level `{...}` span in `text`, or `None` if it
-/// contains no balanced object at depth 0 (issue #73).
+/// The one top-level `{...}` span in `text` that parses as valid JSON, or
+/// `None` if there is no such span, *or more than one* (issue #73; narrowed
+/// further on review, #75 round 2).
 ///
-/// The fallback `derive_capture` reaches for when the whole reply doesn't
-/// parse as JSON — prose before or after an otherwise well-formed object,
-/// the shape a reviewer's non-compliant reply took in #73's original report.
-/// Narrow and deterministic, the same kind of concession `unwrap_code_fence`
-/// already makes for a reply wrapped in a fence: this looks only for a brace
-/// that opens *outside* any other object, never inside one, and returns the
-/// text between it and its matching close — it does not itself parse or
-/// validate that span as JSON, which is `derive_capture`'s job once this
-/// returns.
+/// The fallback `derive_agent_reply_capture` reaches for when the whole
+/// reply doesn't parse as JSON — prose before or after an otherwise
+/// well-formed object, the shape a reviewer's non-compliant reply took in
+/// #73's original report. Narrow and deterministic, the same kind of
+/// concession `unwrap_code_fence` already makes for a reply wrapped in a
+/// fence: this looks only for braces that open *outside* any other object,
+/// never inside one.
+///
+/// Unlike the rest of this function's scan, validating each candidate as
+/// JSON (rather than just checking its braces balance) happens here, not in
+/// the caller: a brace-balanced span that *isn't* valid JSON — `{a}` in "the
+/// diff touches {a}, then {"outcome": "approved"}" — is prose that merely
+/// looks like an object, not a competing candidate, and must not make an
+/// otherwise-unambiguous verdict un-recoverable.
+///
+/// Requiring exactly one *valid* candidate, rather than taking the last of
+/// however many are found, is what actually closes the gap a plain "last
+/// object wins" rule leaves open: a reviewer that illustrates an example
+/// verdict before stating its real one (`"a rejected reply looks like
+/// {"outcome": ...}. My verdict: {"outcome": "approved", ...}"`) produces
+/// two equally well-formed objects, and nothing about their shape says
+/// which one is real. Two or more valid candidates means the reply is
+/// ambiguous, not that the later one wins; `derive_agent_reply_capture`
+/// falls through to capturing the reply as plain text in that case, same as
+/// finding none at all.
 ///
 /// Tracks string literals and backslash escapes while scanning so a `{` or
 /// `}` inside a JSON string value (a reviewer's own feedback text, say)
@@ -3768,13 +3801,14 @@ fn unwrap_code_fence(reply: &str) -> &str {
 /// is single-byte ASCII, and no UTF-8 continuation byte can equal one of
 /// them, so every slice boundary this produces still lands on a char
 /// boundary.
-fn last_json_object(text: &str) -> Option<&str> {
+fn sole_top_level_json_object(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
     let mut start = None;
-    let mut last_span = None;
+    let mut valid: Option<(usize, usize)> = None;
+    let mut ambiguous = false;
 
     for (i, &b) in bytes.iter().enumerate() {
         if in_string {
@@ -3799,15 +3833,22 @@ fn last_json_object(text: &str) -> Option<&str> {
                 depth -= 1;
                 if depth == 0
                     && let Some(s) = start
+                    && serde_json::from_str::<Value>(&text[s..i + 1]).is_ok()
                 {
-                    last_span = Some((s, i + 1));
+                    if valid.is_some() {
+                        ambiguous = true;
+                    }
+                    valid = Some((s, i + 1));
                 }
             }
             _ => {}
         }
     }
 
-    last_span.map(|(s, e)| &text[s..e])
+    if ambiguous {
+        return None;
+    }
+    valid.map(|(s, e)| &text[s..e])
 }
 
 fn json_type_of(value: &Value) -> &'static str {
@@ -7430,7 +7471,11 @@ stages:
         let event = wait_until_turn_outcome_event(&pool, &task_id).await;
         assert_eq!(event["outcome"], "done", "got {event}");
         assert_eq!(event["applied"], true, "got {event}");
-        assert_eq!(event["source"], "tool", "got {event}");
+        // `source` is null, not `"tool"`: the report never drove this
+        // outcome (it's the same hardcoded `done` the stage would have
+        // taken with no report at all) — the fact a report was made is
+        // `note`'s job, not `source`'s (review, #75 round 2).
+        assert!(event["source"].is_null(), "got {event}");
         assert!(
             event["note"]
                 .as_str()
@@ -7486,7 +7531,11 @@ stages:
         let event = wait_until_turn_outcome_event(&pool, &task_id).await;
         assert_eq!(event["outcome"], "done", "got {event}");
         assert_eq!(event["applied"], true, "got {event}");
-        assert_eq!(event["source"], "tool", "got {event}");
+        // `source` is `"reply"`, not `"tool"`: a `capture: text` stage's
+        // outcome always comes from parsing its own reply (it's always
+        // `done`), never from the report — the report only earns a `note`
+        // here, not credit for the outcome (review, #75 round 2).
+        assert_eq!(event["source"], "reply", "got {event}");
         assert!(
             event["note"]
                 .as_str()
@@ -7654,6 +7703,17 @@ stages:
         assert!(note.is_none());
     }
 
+    /// Symmetric with `outcome_from_report`'s trim (review, #75 round 2):
+    /// the report path and the reply path should treat a whitespace-padded
+    /// `outcome` the same way, not park one and route the other.
+    #[test]
+    fn turn_outcome_trims_whitespace_before_matching() {
+        let captured = json!({"outcome": " approved \n"});
+        let (outcome, note) = turn_outcome(Capture::Json, Some(&captured));
+        assert_eq!(outcome, "approved");
+        assert!(note.is_none());
+    }
+
     #[test]
     fn turn_outcome_falls_back_for_a_non_string_or_missing_outcome() {
         for captured in [
@@ -7731,63 +7791,72 @@ stages:
     /// dogfood run against #50 that first surfaced this bug — prose, a blank
     /// line, then a well-formed verdict.
     #[test]
-    fn last_json_object_recovers_hash_73s_original_repro() {
+    fn sole_top_level_json_object_recovers_hash_73s_original_repro() {
         let reply = "No PR opened yet, that's fine — my scope is reviewing the diff. The\n\
                       implementation is correct, faithful to the issue's proposed fix, compiles\n\
                       cleanly, passes fmt/clippy/tests, and is applied symmetrically to both files\n\
                       as requested.\n\n\
                       {\"outcome\": \"approved\", \"feedback\": \"\"}";
-        let found = last_json_object(reply).unwrap();
+        let found = sole_top_level_json_object(reply).unwrap();
         let parsed: Value = serde_json::from_str(found).unwrap();
         assert_eq!(parsed["outcome"], "approved");
     }
 
     #[test]
-    fn last_json_object_finds_an_object_after_prose_too() {
+    fn sole_top_level_json_object_finds_an_object_after_prose_too() {
         assert_eq!(
-            last_json_object("{\"outcome\": \"approved\"} — done reviewing"),
+            sole_top_level_json_object("{\"outcome\": \"approved\"} — done reviewing"),
             Some("{\"outcome\": \"approved\"}")
         );
     }
 
+    /// `{a}` is brace-balanced but not valid JSON (`a` is a bareword) — it
+    /// must be recognised as prose that merely looks like an object, not a
+    /// second candidate that makes the real verdict ambiguous.
     #[test]
-    fn last_json_object_ignores_braces_inside_string_values() {
+    fn sole_top_level_json_object_ignores_a_brace_balanced_non_json_span() {
         let reply = "prose {a} more prose {\"outcome\": \"approved\", \"note\": \"uses {braces}\"}";
-        let found = last_json_object(reply).unwrap();
+        let found = sole_top_level_json_object(reply).unwrap();
         let parsed: Value = serde_json::from_str(found).unwrap();
         assert_eq!(parsed["outcome"], "approved");
         assert_eq!(parsed["note"], "uses {braces}");
     }
 
     #[test]
-    fn last_json_object_handles_escaped_quotes_and_backslashes() {
+    fn sole_top_level_json_object_handles_escaped_quotes_and_backslashes() {
         // A JSON string containing an escaped quote and an escaped
         // backslash — both must not be mistaken for the string's own end.
         let reply = r#"see {"outcome": "approved", "note": "she said \"ok\" then \\"}"#;
-        let found = last_json_object(reply).unwrap();
+        let found = sole_top_level_json_object(reply).unwrap();
         let parsed: Value = serde_json::from_str(found).unwrap();
         assert_eq!(parsed["outcome"], "approved");
     }
 
+    /// Review, #75 round 2 (finding #7): two *equally valid* JSON objects —
+    /// unlike the brace-balanced-but-invalid case above — must not be
+    /// resolved by picking the last one. An illustrative example verdict
+    /// followed by the real one is exactly this shape, and nothing about an
+    /// object's contents (from this function's point of view) says which one
+    /// is real.
     #[test]
-    fn last_json_object_prefers_the_last_complete_object_when_there_are_two() {
+    fn sole_top_level_json_object_is_none_when_two_valid_objects_compete() {
         assert_eq!(
-            last_json_object("first {\"a\": 1} then {\"outcome\": \"approved\"}"),
-            Some("{\"outcome\": \"approved\"}")
+            sole_top_level_json_object("first {\"a\": 1} then {\"outcome\": \"approved\"}"),
+            None
         );
     }
 
     #[test]
-    fn last_json_object_returns_none_for_no_object_or_an_unbalanced_one() {
+    fn sole_top_level_json_object_returns_none_for_no_object_or_an_unbalanced_one() {
         for reply in ["plain text", "", "unbalanced { still open", "closed } only"] {
-            assert_eq!(last_json_object(reply), None, "for {reply:?}");
+            assert_eq!(sole_top_level_json_object(reply), None, "for {reply:?}");
         }
     }
 
     #[test]
-    fn last_json_object_ignores_nested_objects_and_returns_the_whole_outer_one() {
+    fn sole_top_level_json_object_ignores_nested_objects_and_returns_the_whole_outer_one() {
         let reply = "{\"outcome\": \"approved\", \"nested\": {\"a\": 1}}";
-        assert_eq!(last_json_object(reply), Some(reply));
+        assert_eq!(sole_top_level_json_object(reply), Some(reply));
     }
 
     /// A `capture: text` stage that routes correctly gets no lecture...
