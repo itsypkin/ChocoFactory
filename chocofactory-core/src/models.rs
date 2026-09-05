@@ -202,15 +202,28 @@ pub enum EventType {
     /// failed command would route through `on: error` with the reason
     /// nowhere in the API.
     ShellOutput,
-    /// A capture-bearing `agent_turn` concluded (#45): what its `capture:`
+    /// A capture-bearing `agent_turn` concluded (#45), or a turn on *any*
+    /// stage called the `report_outcome` MCP tool (#73): what its `capture:`
     /// asked for, the outcome it transitioned on, and an optional `"note"`
     /// when those two didn't line up — a reply that wasn't valid JSON under
-    /// `capture: json`, or that carried no usable `outcome` key and so fell
-    /// back to `done`. Payload is `{"stage", "capture", "outcome", "note"}`.
+    /// `capture: json`, a reply or a report that carried no usable `outcome`
+    /// and so fell back to `done`, or a report made on a stage that declares
+    /// no `capture: json` and so doesn't route on it at all. Payload is
+    /// `{"stage", "capture", "outcome", "applied", "note", "source"}`.
+    ///
+    /// `source` is `"tool"` when the outcome came from a `report_outcome`
+    /// call, `"reply"` when it came from parsing the turn's final text (the
+    /// fallback for an agent that never calls the tool), or `null` when
+    /// neither applies (a non-capturing stage's turn, when no report was
+    /// made — the common case, and today's only case before #73).
     ///
     /// `applied` says whether the transition was actually taken: an outcome
     /// can be computed and then deliberately not applied, which is what a
-    /// reviewer stage declaring no `done` edge relies on.
+    /// reviewer stage declaring no `done` edge relies on. For a report made
+    /// on a stage without `capture: json`, `applied` reflects whatever that
+    /// stage's normal (uncaptured) transition did — the report itself never
+    /// drives routing there; only the `note` says the report was made and
+    /// this stage doesn't route on it.
     ///
     /// Unlike [`Self::StageEntered`]/[`Self::ShellOutput`] this one *does*
     /// belong to a session — a turn has a `task_run` — so it carries a

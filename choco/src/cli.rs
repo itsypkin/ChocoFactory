@@ -38,6 +38,24 @@ pub enum Command {
     /// Project create/list.
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Serves the `report_outcome` MCP tool over stdio (issue #73): a
+    /// stage's agent turn calls it to state its outcome explicitly instead
+    /// of leaving the engine to infer one from prose. `chocofactoryd` spawns
+    /// this itself via `--mcp-config` as part of every agent turn; it isn't
+    /// meant to be run by hand, hence hidden from `--help`.
+    #[command(hide = true)]
+    McpServe(McpServeArgs),
+}
+
+#[derive(Args)]
+pub struct McpServeArgs {
+    /// The current stage's `on:` edge names, comma-separated. Determines
+    /// both the tool's `outcome` schema (an `enum` of exactly these values)
+    /// and whether a report routes the workflow at all — omitted or empty
+    /// means the stage has no edges to route on, so `outcome` is left
+    /// free-form and purely informational.
+    #[arg(long, value_delimiter = ',')]
+    pub outcomes: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -182,4 +200,43 @@ pub enum ProjectCmd {
     },
     /// List all projects.
     List,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--outcomes` is a single comma-separated flag, not a repeatable one —
+    /// this is what `ClaudeAdapter::spawn` (issue #73) actually emits into
+    /// `--mcp-config`'s `args`, so a mismatch here would silently make every
+    /// routing stage's tool free-form.
+    #[test]
+    fn mcp_serve_splits_outcomes_on_commas() {
+        let cli = Cli::parse_from([
+            "choco",
+            "mcp-serve",
+            "--outcomes",
+            "approved,changes_requested",
+        ]);
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(args.outcomes, vec!["approved", "changes_requested"]);
+    }
+
+    #[test]
+    fn mcp_serve_with_no_outcomes_flag_is_empty() {
+        let cli = Cli::parse_from(["choco", "mcp-serve"]);
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert!(args.outcomes.is_empty());
+    }
+
+    /// `#[command(hide = true)]` hides it from `--help` text; it must not
+    /// also make the subcommand itself unparseable.
+    #[test]
+    fn mcp_serve_is_hidden_but_still_parses() {
+        assert!(Cli::try_parse_from(["choco", "mcp-serve"]).is_ok());
+    }
 }
