@@ -152,13 +152,18 @@ fn spawn(
     // turn, not something wired in only for a reviewer-shaped stage — a
     // "reviewer" is just a role name, and `StageDef.on` is the whole
     // contract. `cfg.report_outcomes` (the current stage's `on:` edge names)
-    // decides only what `--outcomes` the tool is launched with, not whether
+    // decides only what `--outcome`s the tool is launched with, not whether
     // it exists; an empty list still serves the tool, just with a free-form,
     // non-routing `outcome`.
+    //
+    // One `--outcome <name>` per edge, not one comma-joined flag (review,
+    // #75): an `on:` edge name is an arbitrary YAML string and could itself
+    // contain a comma, which no single delimiter-joined value can
+    // round-trip unambiguously.
     let mut mcp_args = vec!["mcp-serve".to_string()];
-    if !cfg.report_outcomes.is_empty() {
-        mcp_args.push("--outcomes".to_string());
-        mcp_args.push(cfg.report_outcomes.join(","));
+    for outcome in &cfg.report_outcomes {
+        mcp_args.push("--outcome".to_string());
+        mcp_args.push(outcome.clone());
     }
     let mcp_config = json!({
         "mcpServers": {

@@ -263,11 +263,12 @@ pub async fn final_assistant_text_for_run(
 /// ordinary tool call — this only has to recognise it back off the timeline
 /// by name.
 ///
-/// Filtered by tool name in Rust rather than in SQL: nothing else in this
-/// module reaches into a JSON payload with `json_extract` (turning that on
-/// is a bigger decision than one query), and a turn has at most a handful of
-/// tool calls, so fetching every `tool_call` row for the run costs nothing at
-/// this scale.
+/// Filtered by tool name, and to the one newest match, in SQL via
+/// `json_extract` (review, #75) — this runs on *every* agent turn's
+/// completion, including an ordinary coding turn with dozens of `Read`/
+/// `Write`/`Bash` calls before it ever reports anything, so fetching and
+/// decoding every `tool_call` row just to keep one is real, avoidable cost
+/// on the common case rather than the rare one.
 ///
 /// Scoped to one run, for the same reason `final_assistant_text_for_run` is:
 /// each stage entry opens a fresh `task_run` (`enter_agent_turn`), so a run
@@ -277,21 +278,21 @@ pub async fn last_report_outcome_for_run(
     task_run_id: &str,
 ) -> Result<Option<Value>, sqlx::Error> {
     let tool_call = EventType::ToolCall.to_string();
-    let payloads: Vec<Json<Value>> = sqlx::query_scalar(
+    let tool_name = qualified_report_outcome_tool_name();
+    let payload: Option<Json<Value>> = sqlx::query_scalar(
         "SELECT payload FROM events
          WHERE task_run_id = ? AND event_type = ?
-         ORDER BY created_at, id",
+           AND json_extract(payload, '$.tool') = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
     )
     .bind(task_run_id)
     .bind(&tool_call)
-    .fetch_all(pool)
+    .bind(&tool_name)
+    .fetch_optional(pool)
     .await?;
 
-    let tool_name = qualified_report_outcome_tool_name();
-    Ok(payloads
-        .into_iter()
-        .rfind(|payload| payload.0.get("tool").and_then(Value::as_str) == Some(tool_name.as_str()))
-        .and_then(|payload| payload.0.get("input").cloned()))
+    Ok(payload.and_then(|payload| payload.0.get("input").cloned()))
 }
 
 /// Whether an event marks the end of the message before it — i.e. whether

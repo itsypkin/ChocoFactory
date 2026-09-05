@@ -2964,29 +2964,30 @@ impl WorkflowEngine {
                 }
             };
 
-        let (captured, outcome, note, source) = match capture {
-            None => {
-                // Routing is untouched here: a stage with no `capture:`
-                // always advances on `done`, whether or not a report exists,
-                // exactly as before #73. A report is still worth a note —
-                // an agent reporting `blocked` on a stage that can't route
-                // on it should be visible, not vanish.
-                let note = report.is_some().then(|| {
-                    "a report_outcome call was made, but this stage does not route on it \
-                     (it declares no 'capture: json')"
-                        .to_string()
-                });
-                let source = report.is_some().then_some("tool");
-                (None, TURN_DEFAULT_OUTCOME.to_string(), note, source)
-            }
-            Some(capture) => match &report {
+        // Issue #73/review: a report only *routes* when the stage declares
+        // `capture: json` — that's the one rule this whole feature promises
+        // ("a stage routes on the agent's own verdict iff it declares
+        // `capture: json`"). `capture: text` and no-`capture:` stages must
+        // treat an agent's report exactly like `capture: None` already did
+        // before this match existed: worth a note, never a transition.
+        // Without this gate, a `capture: text` stage whose agent calls the
+        // tool anyway would be routed — or parked — on a verdict its `on:`
+        // map was never meant to receive.
+        let routing_report = match capture {
+            Some(Capture::Json) => report.as_ref(),
+            _ => None,
+        };
+
+        let (captured, outcome, note, source) = match routing_report {
+            Some(report) => {
+                let serialized = report.to_string();
                 // The same `MAX_CAPTURE_BYTES` ceiling `derive_capture`
                 // applies to a reply, and the same response to going over
                 // it: don't store an oversized value, and don't trust
                 // reading an outcome out of it either — fall back to `done`
                 // rather than keep only half the safety net.
-                Some(report) if report.to_string().len() > MAX_CAPTURE_BYTES => {
-                    let bytes = report.to_string().len();
+                if serialized.len() > MAX_CAPTURE_BYTES {
+                    let bytes = serialized.len();
                     tracing::warn!(
                         task_id,
                         stage = stage_name,
@@ -3002,65 +3003,99 @@ impl WorkflowEngine {
                         )),
                         Some("tool"),
                     )
-                }
-                Some(report) => {
+                } else {
                     let (outcome, note) = outcome_from_report(report);
                     (Some(report.clone()), outcome, note, Some("tool"))
                 }
-                // No report: the same text-parse path as before #73, for an
-                // agent that never calls the tool (or an adapter, like a
-                // future ACP one, that has no tool-call channel at all).
-                //
-                // The turn's text isn't held anywhere in memory: the adapter
-                // stream is drained straight into `events` by `drain_session`
-                // and dropped, and this watcher only ever sees `task_runs`
-                // rows. So the reply is read back from the timeline.
-                None => match events::final_assistant_text_for_run(&self.pool, task_run_id).await {
-                    Ok(reply) => {
-                        let reply = unwrap_code_fence(reply.trim());
-                        let (captured, capture_note) =
-                            derive_capture(Some(capture), reply, task_id, stage_name, "the reply");
-                        let (outcome, outcome_note) = turn_outcome(capture, captured.as_ref());
-                        (
-                            captured,
-                            outcome,
-                            capture_note.or(outcome_note),
-                            Some("reply"),
-                        )
+            }
+            // No routing report: either there's no report at all, or there
+            // is one but this stage doesn't route on it (`capture: text`, or
+            // no `capture:`). Either way, fall through to what the stage
+            // would have done before #73 — and if a report was made but
+            // ignored, note that rather than let it vanish.
+            None => {
+                let unroutable_note =
+                    (capture != Some(Capture::Json) && report.is_some()).then(|| {
+                        "a report_outcome call was made, but this stage does not route on it \
+                         (it declares no 'capture: json')"
+                            .to_string()
+                    });
+                let unroutable_source =
+                    (capture != Some(Capture::Json) && report.is_some()).then_some("tool");
+
+                match capture {
+                    None => (
+                        None,
+                        TURN_DEFAULT_OUTCOME.to_string(),
+                        unroutable_note,
+                        unroutable_source,
+                    ),
+                    // `capture: text` (or a `capture: json` stage with no
+                    // report at all) still reads its own turn back off the
+                    // timeline — the same text-parse path as before #73, for
+                    // an agent that never calls the tool (or an adapter,
+                    // like a future ACP one, that has no tool-call channel
+                    // at all).
+                    //
+                    // The turn's text isn't held anywhere in memory: the
+                    // adapter stream is drained straight into `events` by
+                    // `drain_session` and dropped, and this watcher only
+                    // ever sees `task_runs` rows. So the reply is read back
+                    // from the timeline.
+                    Some(capture) => {
+                        match events::final_assistant_text_for_run(&self.pool, task_run_id).await {
+                            Ok(reply) => {
+                                let reply = unwrap_code_fence(reply.trim());
+                                let (captured, capture_note) =
+                                    derive_agent_reply_capture(capture, reply, task_id, stage_name);
+                                let (outcome, outcome_note) =
+                                    turn_outcome(capture, captured.as_ref());
+                                let note = [capture_note.or(outcome_note), unroutable_note]
+                                    .into_iter()
+                                    .flatten()
+                                    .collect::<Vec<_>>()
+                                    .join("; ");
+                                let note = (!note.is_empty()).then_some(note);
+                                (captured, outcome, note, unroutable_source.or(Some("reply")))
+                            }
+                            // Nothing to capture and no basis for a verdict,
+                            // so this does not fall through to a default
+                            // outcome — a task that can't read its own turn
+                            // back parks for a human.
+                            Err(err) => {
+                                tracing::error!(
+                                    task_id, task_run_id, stage = stage_name, %err,
+                                    "could not read a turn's reply back to capture it; not \
+                                     auto-advancing"
+                                );
+                                let note = [
+                                    Some(format!("the turn's reply could not be read back: {err}")),
+                                    unroutable_note,
+                                    report_fetch_note,
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                                self.append_turn_outcome_event(
+                                    task_id,
+                                    task_run_id,
+                                    json!({
+                                        "stage": stage_name,
+                                        "capture": capture_label(Some(capture)),
+                                        "outcome": Value::Null,
+                                        "applied": false,
+                                        "note": note,
+                                        "source": Value::Null,
+                                    }),
+                                )
+                                .await;
+                                return;
+                            }
+                        }
                     }
-                    // Nothing to capture and no basis for a verdict, so this
-                    // does not fall through to a default outcome — a task
-                    // that can't read its own turn back parks for a human.
-                    Err(err) => {
-                        tracing::error!(
-                            task_id, task_run_id, stage = stage_name, %err,
-                            "could not read a turn's reply back to capture it; not auto-advancing"
-                        );
-                        let note = [
-                            Some(format!("the turn's reply could not be read back: {err}")),
-                            report_fetch_note,
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                        self.append_turn_outcome_event(
-                            task_id,
-                            task_run_id,
-                            json!({
-                                "stage": stage_name,
-                                "capture": capture_label(Some(capture)),
-                                "outcome": Value::Null,
-                                "applied": false,
-                                "note": note,
-                                "source": Value::Null,
-                            }),
-                        )
-                        .await;
-                        return;
-                    }
-                },
-            },
+                }
+            }
         };
 
         // `expected_stage` below catches a task that has *left* this stage,
@@ -3506,32 +3541,73 @@ fn derive_capture(
         Capture::Text => (Some(Value::String(trimmed.to_string())), None),
         Capture::Json => match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => (Some(value), None),
-            // Issue #73: the whole reply isn't a document, but it might
-            // still contain one — a reviewer that writes a sentence before
-            // its verdict is the common case a tool call now prevents (§
-            // `mcp.rs`), but an agent can always end a turn without calling
-            // the tool, so this fallback stays.
-            Err(whole_err) => match last_json_object(trimmed).map(serde_json::from_str::<Value>) {
-                Some(Ok(value)) => (
-                    Some(value),
+            Err(err) => {
+                tracing::warn!(
+                    task_id, stage = stage_name, %err,
+                    "stage output was not valid JSON; captured as text"
+                );
+                (
+                    Some(Value::String(trimmed.to_string())),
                     Some(format!(
-                        "{source} was not valid JSON on its own ({whole_err}); recovered the \
-                         last '{{...}}' object in it"
+                        "{source} was not valid JSON ({err}); captured as text"
                     )),
-                ),
-                _ => {
-                    tracing::warn!(
-                        task_id, stage = stage_name, %whole_err,
-                        "stage output was not valid JSON; captured as text"
-                    );
-                    (
-                        Some(Value::String(trimmed.to_string())),
-                        Some(format!(
-                            "{source} was not valid JSON ({whole_err}); captured as text"
-                        )),
-                    )
-                }
-            },
+                )
+            }
+        },
+    }
+}
+
+/// `derive_capture`, but for a `capture: json` agent turn's own reply only
+/// (issue #73 review): additionally tries to recover the last balanced
+/// top-level `{…}` from a reply that isn't pure JSON — the fix for #73's
+/// original repro, a reviewer that writes a sentence of preamble before its
+/// verdict object.
+///
+/// Kept out of `derive_capture` itself, which a `shell`/`poll` stage's
+/// stdout and a `human_gate`'s message also go through: those have no
+/// comparable guarantee that a trailing `{…}` is the real verdict rather
+/// than incidental JSON-shaped text the command printed or the human pasted,
+/// so widening the recovery to them would trade a narrow, deterministic fix
+/// for a much larger surface of "what looks like the answer."
+fn derive_agent_reply_capture(
+    capture: Capture,
+    reply: &str,
+    task_id: &str,
+    stage_name: &str,
+) -> (Option<Value>, Option<String>) {
+    if capture != Capture::Json {
+        return derive_capture(Some(capture), reply, task_id, stage_name, "the reply");
+    }
+
+    let trimmed = reply.trim();
+    if trimmed.len() > MAX_CAPTURE_BYTES {
+        // Same oversized handling `derive_capture` gives every other
+        // capturing stage kind.
+        return derive_capture(Some(capture), reply, task_id, stage_name, "the reply");
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => (Some(value), None),
+        Err(whole_err) => match last_json_object(trimmed).map(serde_json::from_str::<Value>) {
+            Some(Ok(value)) => (
+                Some(value),
+                Some(format!(
+                    "the reply was not valid JSON on its own ({whole_err}); recovered the last \
+                     '{{...}}' object in it"
+                )),
+            ),
+            _ => {
+                tracing::warn!(
+                    task_id, stage = stage_name, %whole_err,
+                    "stage output was not valid JSON; captured as text"
+                );
+                (
+                    Some(Value::String(trimmed.to_string())),
+                    Some(format!(
+                        "the reply was not valid JSON ({whole_err}); captured as text"
+                    )),
+                )
+            }
         },
     }
 }
@@ -3590,16 +3666,29 @@ fn turn_outcome(capture: Capture, captured: Option<&Value>) -> (String, Option<S
 /// report's `input` isn't wrapped in a `Capture` the way a reply's parsed
 /// JSON is.
 ///
+/// Trims `outcome` before matching it against a stage's `on:` edges, for the
+/// same reason `choco mcp-serve`'s own validation does (`call_tool`): the
+/// `ToolCall` event this reads back records the model's argument verbatim,
+/// untrimmed, and the tool already told the model its (trimmed) value was
+/// accepted. Without the same trim here, `" approved "` would come back off
+/// the timeline as a string `advance_from_stage` can't match against the
+/// `approved` edge — parking a stage the tool just confirmed as routable.
+///
 /// `choco mcp-serve`'s own validation already rejects an off-list or empty
-/// `outcome` with a tool error the model can act on and retry — but the
-/// `ToolCall` event this reads back records whatever the model *sent*,
-/// regardless of whether the tool then accepted it. A model that gave up
-/// after one rejection, rather than retrying, is exactly what this leniency
-/// is for: fall back to `done` rather than pass a malformed value straight
-/// into `advance_from_stage`.
+/// `outcome` with a tool error the model can act on and retry — but a model
+/// that gave up after one rejection, rather than retrying, leaves that
+/// off-list value as the last thing on the timeline. This function has no
+/// stage-specific allow-list to check it against (only `advance_from_stage`
+/// does), so an off-list value is passed through as-is here and left for
+/// `advance_from_stage` to reject as an `UnknownOutcome` — the same park a
+/// bad reply-JSON `outcome` produces today, not a silent `done`. Only a
+/// missing, non-string, or (after trimming) empty `outcome` falls back to
+/// `done`, mirroring `turn_outcome`'s leniency for the same shapes.
 fn outcome_from_report(report: &Value) -> (String, Option<String>) {
     match report.get("outcome") {
-        Some(Value::String(outcome)) if !outcome.is_empty() => (outcome.clone(), None),
+        Some(Value::String(outcome)) if !outcome.trim().is_empty() => {
+            (outcome.trim().to_string(), None)
+        }
         Some(Value::String(_)) => (
             TURN_DEFAULT_OUTCOME.to_string(),
             Some(format!(
@@ -7359,6 +7448,60 @@ stages:
         );
     }
 
+    /// Critical review finding (#75): a `capture: text` stage's report must
+    /// not route the workflow either — only `capture: json` earns that.
+    /// Mirrors the no-`capture:` case above, but for a stage that *does*
+    /// capture (the reply's own text), to prove the routing gate checks the
+    /// capture *kind*, not just whether the stage captures at all. The
+    /// report's outcome, `approved`, isn't even a declared `on:` edge here —
+    /// if it were allowed to route, the stage would park instead of ever
+    /// reaching `finished`.
+    #[tokio::test]
+    async fn a_report_on_a_capture_text_stage_is_recorded_but_does_not_route() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: texty
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = reply_binary(&dir, "REPORT approved\nlooks good to me");
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        assert_eq!(event["outcome"], "done", "got {event}");
+        assert_eq!(event["applied"], true, "got {event}");
+        assert_eq!(event["source"], "tool", "got {event}");
+        assert!(
+            event["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("does not route")),
+            "got {event}"
+        );
+        // Unlike a no-`capture:` stage, `capture: text` still keeps the
+        // reply's text — the report only opts the stage out of *routing*,
+        // not out of its own declared capture.
+        assert_eq!(
+            payload_of(&pool, &task_id).await["stages"]["coding"],
+            "looks good to me"
+        );
+    }
+
     /// The tool is the primary path, but an agent can always end a turn
     /// without calling it — #73's own repro (prose before a JSON verdict)
     /// must still route via the text fallback.
@@ -7557,6 +7700,31 @@ stages:
             assert_eq!(outcome, "done", "for {report}");
             assert!(note.is_some(), "for {report}");
         }
+    }
+
+    /// Review, #75: `choco mcp-serve` trims `outcome` before confirming
+    /// success to the model (`call_tool`), but the `ToolCall` event this
+    /// reads back records the model's argument verbatim. Without a matching
+    /// trim here, a whitespace-padded outcome the tool accepted would come
+    /// back off the timeline as a string `advance_from_stage` can't match
+    /// against the `on:` edge it names — parking a stage the tool just told
+    /// the model was routable.
+    #[test]
+    fn outcome_from_report_trims_whitespace_before_matching() {
+        let report = json!({"outcome": " approved \n", "summary": ""});
+        let (outcome, note) = outcome_from_report(&report);
+        assert_eq!(outcome, "approved");
+        assert!(note.is_none());
+    }
+
+    /// Whitespace-only, though non-empty before trimming, is the same as no
+    /// verdict at all — not a value to hand `advance_from_stage`.
+    #[test]
+    fn outcome_from_report_treats_whitespace_only_as_empty() {
+        let report = json!({"outcome": "   ", "summary": ""});
+        let (outcome, note) = outcome_from_report(&report);
+        assert_eq!(outcome, "done");
+        assert!(note.is_some());
     }
 
     /// #73's own repro, verbatim: the reviewer's exact reply from the

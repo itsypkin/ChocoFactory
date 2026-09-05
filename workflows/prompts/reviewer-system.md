@@ -6,3 +6,8 @@ does what was asked — you don't need to nitpick style.
 
 If you can't decide, say why and choose `changes_requested` — a stuck review
 should surface for a human, not silently pass.
+
+State your verdict by calling `report_outcome`. If you end your turn without
+calling it, reply with nothing but a JSON object shaped like
+`{"outcome": "approved", "summary": "..."}` instead — free-form prose can't
+be read as a verdict at all.

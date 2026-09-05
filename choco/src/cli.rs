@@ -49,12 +49,17 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct McpServeArgs {
-    /// The current stage's `on:` edge names, comma-separated. Determines
-    /// both the tool's `outcome` schema (an `enum` of exactly these values)
-    /// and whether a report routes the workflow at all — omitted or empty
-    /// means the stage has no edges to route on, so `outcome` is left
-    /// free-form and purely informational.
-    #[arg(long, value_delimiter = ',')]
+    /// One of the current stage's `on:` edge names; repeat for each one.
+    /// Determines both the tool's `outcome` schema (an `enum` of exactly
+    /// these values) and whether a report routes the workflow at all —
+    /// omitted entirely means the stage has no edges to route on, so
+    /// `outcome` is left free-form and purely informational.
+    ///
+    /// A repeatable flag rather than one comma-joined value (review, #75):
+    /// an `on:` edge name is an arbitrary YAML string key and could itself
+    /// contain a comma, which a `value_delimiter` would misparse on both
+    /// ends of the round trip.
+    #[arg(long = "outcome")]
     pub outcomes: Vec<String>,
 }
 
@@ -206,22 +211,36 @@ pub enum ProjectCmd {
 mod tests {
     use super::*;
 
-    /// `--outcomes` is a single comma-separated flag, not a repeatable one —
-    /// this is what `ClaudeAdapter::spawn` (issue #73) actually emits into
-    /// `--mcp-config`'s `args`, so a mismatch here would silently make every
-    /// routing stage's tool free-form.
+    /// `--outcome` is repeatable, not a single comma-joined flag (review,
+    /// #75) — this is what `ClaudeAdapter::spawn` (issue #73) actually emits
+    /// into `--mcp-config`'s `args`, so a mismatch here would silently make
+    /// every routing stage's tool free-form. Repeatable also means an `on:`
+    /// edge name containing a comma round-trips intact.
     #[test]
-    fn mcp_serve_splits_outcomes_on_commas() {
+    fn mcp_serve_collects_repeated_outcome_flags() {
         let cli = Cli::parse_from([
             "choco",
             "mcp-serve",
-            "--outcomes",
-            "approved,changes_requested",
+            "--outcome",
+            "approved",
+            "--outcome",
+            "changes_requested",
         ]);
         let Command::McpServe(args) = cli.command else {
             panic!("expected McpServe");
         };
         assert_eq!(args.outcomes, vec!["approved", "changes_requested"]);
+    }
+
+    /// A comma inside an outcome name is just a character — the whole reason
+    /// this is a repeatable flag rather than one comma-joined value.
+    #[test]
+    fn mcp_serve_outcome_with_an_embedded_comma_round_trips_intact() {
+        let cli = Cli::parse_from(["choco", "mcp-serve", "--outcome", "needs, more, work"]);
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(args.outcomes, vec!["needs, more, work"]);
     }
 
     #[test]
