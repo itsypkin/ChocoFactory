@@ -3708,7 +3708,9 @@ fn last_json_object(text: &str) -> Option<&str> {
             }
             b'}' if depth > 0 => {
                 depth -= 1;
-                if depth == 0 && let Some(s) = start {
+                if depth == 0
+                    && let Some(s) = start
+                {
                     last_span = Some((s, i + 1));
                 }
             }
@@ -7425,6 +7427,49 @@ stages:
         assert_eq!(
             payload_of(&pool, &task_id).await["stages"]["review"]["outcome"],
             "approved"
+        );
+    }
+
+    /// The same `MAX_CAPTURE_BYTES` ceiling `derive_capture` applies to a
+    /// reply also applies to a `report_outcome` call: an oversized report
+    /// must not be stored, and the stage must fall back to `done` rather
+    /// than trust reading an outcome out of a value that was never captured.
+    #[tokio::test]
+    async fn an_oversized_report_is_dropped_and_the_stage_falls_back_to_done() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        // `capturing_turn_yaml`'s `review` stage has a `done` edge, so an
+        // oversized report's fallback to `TURN_DEFAULT_OUTCOME` still routes
+        // — the point being proven is that the oversized value itself never
+        // reaches the payload, not that the stage parks.
+        let huge_outcome = "x".repeat(MAX_CAPTURE_BYTES + 1);
+        let binary = reply_binary(&dir, &format!("REPORT {huge_outcome}\n"));
+        let engine = engine_with_adapter(pool.clone(), &binary);
+
+        engine
+            .start_task(&task_id, &def, Some("review this"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let event = wait_until_turn_outcome_event(&pool, &task_id).await;
+        assert_eq!(event["outcome"], "done", "got {event}");
+        assert_eq!(event["applied"], true, "got {event}");
+        assert_eq!(event["source"], "tool", "got {event}");
+        assert!(
+            event["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("exceeds")),
+            "got {event}"
+        );
+        assert!(
+            payload_of(&pool, &task_id)
+                .await
+                .get("stages")
+                .is_none_or(|stages| stages.get("review").is_none()),
+            "an oversized report must not be captured into the payload"
         );
     }
 
