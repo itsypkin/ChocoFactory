@@ -53,6 +53,12 @@ jobs:
             The PR branch is already checked out in the current working
             directory.
 
+            Never write `/approve` or `/request-changes` as the whole
+            of a line. Those are the markers `coding-task`'s
+            `awaiting_human_review` stage reads as a human's verdict on
+            the PR (see the README), and a review that quotes one on its
+            own line would cast a vote. Refer to them inline instead.
+
             Use `gh pr comment` for top-level feedback.
             Use `mcp__github_inline_comment__create_inline_comment` (with
             `confirmed: true`) to highlight specific lines.

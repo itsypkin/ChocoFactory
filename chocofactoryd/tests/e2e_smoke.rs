@@ -811,21 +811,54 @@ async fn real_binary_walks_the_coding_task_workflow_to_done() {
     write_script(
         &scripts_dir,
         "gh",
-        r#"#!/bin/sh
+        &format!(
+            r#"#!/bin/sh
 set -eu
-case "$1 $2" in
-    "pr create")
-        echo "https://example.test/pr/42"
-        ;;
-    "pr view")
-        if printf '%s\n' "$@" | grep -q reviewDecision; then
-            echo "APPROVED"
+created="{dir}/pr-created"
+case "$1" in
+    api)
+        # `awaiting_human_review` makes two `gh api` calls: the head
+        # commit's date, then the comment list its filter runs over. The
+        # stub answers the second from a file the test owns — which means
+        # it stands in for the *whole* query, jq filter included. That
+        # filter is covered separately and directly by
+        # `verdict_filter_*` in `tests/verdict_filter.rs`; what these
+        # workflow tests cover is the routing either side of it.
+        if printf '%s\n' "$@" | grep -q '/comments'; then
+            cat "{dir}/verdict" 2>/dev/null || true
         else
-            echo '{"number": 42, "url": "https://example.test/pr/42"}'
+            echo "2020-01-01T00:00:00Z"
         fi
         ;;
-    "pr checks")
-        echo "SUCCESS"
+    pr)
+        case "$2" in
+            create)
+                echo created >> "$created"
+                echo "https://example.test/pr/42"
+                ;;
+            list)
+                # `open_pr`'s probe and its read-back, both scoped to open
+                # PRs. Empty until `pr create` has run, so the first lap
+                # creates and every later lap reuses.
+                if [ -s "$created" ]; then
+                    if printf '%s\n' "$@" | grep -q url; then
+                        echo '{{"number": 42, "url": "https://example.test/pr/42"}}'
+                    else
+                        echo 42
+                    fi
+                fi
+                ;;
+            view)
+                echo "0000000000000000000000000000000000000000"
+                ;;
+            checks)
+                echo "SUCCESS"
+                ;;
+            *)
+                echo "stub gh: unhandled pr subcommand: $*" >&2
+                exit 1
+                ;;
+        esac
         ;;
     *)
         echo "stub gh: unhandled subcommand: $*" >&2
@@ -833,6 +866,8 @@ case "$1 $2" in
         ;;
 esac
 "#,
+            dir = scripts_dir.to_string_lossy(),
+        ),
     );
     let path_with_stub = format!(
         "{}:{}",
@@ -865,6 +900,9 @@ esac
         r#"{"outcome": "approved", "summary": ""}"#,
     )
     .unwrap();
+    // The token `awaiting_human_review`'s filter emits for an approval;
+    // the stub stands in for the query that would derive it.
+    std::fs::write(scripts_dir.join("verdict"), "APPROVE\n").unwrap();
     let claude_wrapper = write_script(
         &scripts_dir,
         "mock-claude-role-dispatch.sh",

@@ -87,6 +87,74 @@ able to park a stage that has always advanced unconditionally. An agent that
 never calls the tool still works: the engine falls back to parsing the
 turn's final reply as JSON, same as before this existed.
 
+### Reviewing a `coding-task` PR
+
+When a `coding-task` reaches `awaiting_human_review` it has already pushed
+a branch, opened a PR and waited for CI. What it wants from you is a
+verdict — and it reads that from the PR's **comments**, not from GitHub's
+formal review (the green *Review changes* button).
+
+That is deliberate rather than a shortcut. `open_pr` pushes under whatever
+identity the daemon inherited, so on a solo repo the PR belongs to the same
+account that would review it, and GitHub refuses a formal review from a
+PR's own author:
+
+```
+failed to create review: GraphQL: Review Can not request changes on your
+own pull request (addPullRequestReview)
+```
+
+Commenting on your own PR is allowed, so the verdict lives in a comment.
+Leave an ordinary PR comment containing one of these markers, **alone on
+its own line**:
+
+| Marker             | Effect                          |
+| ------------------ | ------------------------------- |
+| `/approve`         | the task moves to `done`        |
+| `/request-changes` | the task goes back to `revising` |
+
+The rest of the comment is yours to write however you like — put the marker
+on the last line and your review above it. A comment that reads "Two
+findings, one worth fixing before merge." followed by your prose, and then
+a final line containing only `/request-changes`, sends the coder back round
+with your review already on the PR for it to read.
+
+Five things worth knowing:
+
+- **Only comments newer than the newest commit count.** Once the coder
+  pushes a fix your previous verdict stops counting on its own, so there is
+  nothing to clear between rounds. The flip side: if a `revising` lap ends
+  without producing a commit, your old verdict is still the newest thing on
+  the PR and will be read again.
+- **Prose does not retract a verdict.** Only the markers are read, so a
+  follow-up comment saying "wait, hold off" does not undo an `/approve` —
+  and `/approve` moves the task to `done` within a minute. To change your
+  mind, post the other marker.
+- **Editing an earlier comment to add the marker works.** The check is on
+  a comment's last-edited time, not the time it was first posted, so
+  appending `/approve` to the review you already wrote counts.
+- **The marker must be the whole line.** It is compared by equality once
+  trailing spaces are stripped, so `> /approve` (GitHub's quote-reply
+  prefix), `use /approve to vote` and `/approved` are all *not* verdicts.
+  A typo is silently not a verdict either; the task just keeps waiting.
+  One thing this does not exempt is a fenced code block — GitHub's API
+  returns raw markdown, so a bare marker line inside triple backticks
+  still votes. Indent it, or break it up, when you are quoting the
+  convention rather than using it.
+- **Only people with standing in the repo can vote.** A comment counts
+  only if GitHub reports its author as `OWNER`, `MEMBER` or `COLLABORATOR`
+  — this repo is public, so without that fence any passer-by could
+  `/approve` a task to `done`, or burn a coder+reviewer lap at a time with
+  `/request-changes`. Comments from `[bot]` accounts are skipped on top of
+  that, so a CI reviewer is never mistaken for your verdict. Neither fence
+  distinguishes *you* from an agent acting as you: anything commenting
+  under your account counts as you.
+
+If no verdict arrives within six hours the task stops waiting and parks at
+`escalate_to_human`, where `choco task send <id> "<note>"` resumes it into
+`revising`. Three `/request-changes` rounds park it the same way instead of
+looping.
+
 ## Using the `choco` CLI
 
 With a daemon running, in a second shell:
