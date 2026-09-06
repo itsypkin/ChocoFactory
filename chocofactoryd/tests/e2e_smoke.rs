@@ -8,10 +8,12 @@
 
 use std::net::TcpListener as StdTcpListener;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -85,6 +87,10 @@ struct Daemon {
     _home: TempHome,
 }
 
+/// Bounds the `free_port`-race retry (see `Daemon::spawn_with_home_and_env`)
+/// so a run that keeps losing doesn't loop forever.
+const MAX_SPAWN_ATTEMPTS: u32 = 5;
+
 impl Daemon {
     async fn spawn() -> Self {
         Self::spawn_with_home(TempHome::new()).await
@@ -116,33 +122,74 @@ impl Daemon {
              (run `cargo build --workspace --all-targets` first)"
         );
 
-        let port = free_port();
-
-        let mut command = Command::new(&daemon_bin);
-        command
-            .env("HOME", &home.0)
-            .env("CHOCOFACTORY_CLAUDE_BINARY", &mock_claude_bin)
-            .env("CHOCOFACTORY_PORT", port.to_string())
-            .env("RUST_LOG", "error")
-            .kill_on_drop(true);
-        for (key, value) in env {
-            command.env(key, value);
-        }
-        let mut child = command.spawn().expect("failed to spawn chocofactoryd");
-
-        let base_url = format!("http://127.0.0.1:{port}");
-        let ws_url = format!("ws://127.0.0.1:{port}");
         let client = reqwest::Client::new();
 
-        wait_until_ready(&client, &base_url, &mut child).await;
+        // `free_port` can only *suggest* a port: it releases the port before
+        // the daemon binds it, so between those two moments another test in
+        // this suite (they run in parallel), another worktree's `cargo test`,
+        // or a developer's own daemon can take it, and this one exits on the
+        // failed bind. That's retried on a fresh port rather than propagated,
+        // because a lost race says nothing about the code under test.
+        //
+        // Only a confirmed bind failure is retried, though: a blanket retry
+        // on any startup exit would silently paper over a real crash (e.g. a
+        // broken migration), so the child's stderr is piped and checked for
+        // the daemon's own bind-failure message before looping.
+        let mut last_failure = None;
+        for _ in 0..MAX_SPAWN_ATTEMPTS {
+            let port = free_port();
 
-        Daemon {
-            child,
-            base_url,
-            ws_url,
-            client,
-            _home: home,
+            let mut command = Command::new(&daemon_bin);
+            command
+                .env("HOME", &home.0)
+                .env("CHOCOFACTORY_CLAUDE_BINARY", &mock_claude_bin)
+                .env("CHOCOFACTORY_PORT", port.to_string())
+                .env("RUST_LOG", "error")
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            for (key, value) in env {
+                command.env(key, value);
+            }
+            let mut child = command.spawn().expect("failed to spawn chocofactoryd");
+
+            let base_url = format!("http://127.0.0.1:{port}");
+            let ws_url = format!("ws://127.0.0.1:{port}");
+
+            match wait_until_ready(&client, &base_url, &mut child).await {
+                Ready::Yes => {
+                    // Stderr was piped (not inherited) so a failed startup
+                    // could be inspected for the bind-failure message above;
+                    // now that startup succeeded, drain it for the rest of
+                    // the daemon's life so its output still reaches the test
+                    // log (as it would if inherited) and so an undrained
+                    // pipe can never fill and deadlock the daemon.
+                    spawn_stderr_forwarder(&mut child);
+                    return Daemon {
+                        child,
+                        base_url,
+                        ws_url,
+                        client,
+                        _home: home,
+                    };
+                }
+                // Only an early exit is retried, and only when it's actually
+                // a lost port race. A daemon that started but never answered
+                // is a real failure, and `wait_until_ready` panics on it
+                // rather than returning.
+                Ready::ExitedDuringStartup(status) => {
+                    let stderr = read_stderr_to_string(&mut child).await;
+                    if !stderr_says_bind_failed(&stderr) {
+                        panic!("chocofactoryd exited during startup with {status:?}: {stderr}");
+                    }
+                    last_failure = Some((status, stderr));
+                }
+            }
         }
+        let (status, stderr) = last_failure.expect("loop above runs at least once");
+        panic!(
+            "chocofactoryd lost the free_port race {MAX_SPAWN_ATTEMPTS} times in a row; \
+             last exit {status:?}: {stderr}"
+        );
     }
 
     async fn get(&self, path: &str) -> Value {
@@ -178,19 +225,64 @@ impl Drop for Daemon {
     }
 }
 
-async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut Child) {
+/// Outcome of waiting for the daemon's first successful response.
+enum Ready {
+    Yes,
+    ExitedDuringStartup(std::process::ExitStatus),
+}
+
+async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut Child) -> Ready {
     for _ in 0..100 {
         if let Ok(resp) = client.get(format!("{base_url}/projects")).send().await
             && resp.status().is_success()
         {
-            return;
+            return Ready::Yes;
         }
+        // Reported back so the caller can retry on a fresh port (a lost
+        // `free_port` race looks exactly like this) instead of failing the
+        // test outright.
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("chocofactoryd exited during startup with {status:?}");
+            return Ready::ExitedDuringStartup(status);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Not retried: a hang is a genuine bug, not a lost port race.
     panic!("chocofactoryd did not become ready within 5s");
+}
+
+/// Forwards a live daemon's stderr, line by line, to the test process's own
+/// stderr (`cargo test` captures and prints that per-test on failure), and
+/// keeps the pipe drained so the daemon can never block on a full pipe
+/// buffer. Only called once the daemon is confirmed up, so `child.stderr`
+/// is still `Some` here.
+fn spawn_stderr_forwarder(child: &mut Child) {
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[chocofactoryd] {line}");
+            }
+        });
+    }
+}
+
+/// Reads a since-exited child's piped stderr to completion. Only called
+/// after `try_wait` has already observed the exit, so this can't block on
+/// a still-running process.
+async fn read_stderr_to_string(child: &mut Child) -> String {
+    let mut buf = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut buf).await;
+    }
+    buf
+}
+
+/// Distinguishes a lost `free_port` race (safe to retry on a fresh port)
+/// from any other startup failure (a real bug that must surface, not be
+/// retried into silence). Matches the daemon's own `.expect` message at
+/// `chocofactoryd/src/main.rs`'s `TcpListener::bind` call.
+fn stderr_says_bind_failed(stderr: &str) -> bool {
+    stderr.contains("chocofactoryd: failed to bind 127.0.0.1")
 }
 
 /// Reads the next WS frame as a parsed event, or `None` on timeout.
