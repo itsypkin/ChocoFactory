@@ -16,10 +16,12 @@
 
 use std::net::TcpListener as StdTcpListener;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 struct TempHome(PathBuf);
@@ -108,12 +110,19 @@ impl Daemon {
 
         // `free_port` can only *suggest* a port: it releases the port before
         // the daemon binds it, so between those two moments another test in
-        // this suite (they run in parallel) can take it, and the daemon exits
-        // on the failed bind. Retried rather than propagated, because a lost
-        // race says nothing about the code under test — a bare `expect` here
-        // makes the whole suite flaky under load, which on this repo means a
+        // this suite (they run in parallel), another worktree's `cargo test`,
+        // or a developer's own daemon can take it, and this one exits on the
+        // failed bind. Retried rather than propagated, because a lost race
+        // says nothing about the code under test — a bare `expect` here makes
+        // the whole suite flaky under load, which on this repo means a
         // spurious failure on a push that also triggers a paid review run.
-        let mut last_status = None;
+        //
+        // Gated specifically on the daemon's own bind-failure message
+        // (requires piping its stderr), not on any startup exit: a blanket
+        // retry would silently paper over a real crash — e.g. a broken
+        // migration — retrying it five times and reporting late instead of
+        // failing fast.
+        let mut last_failure = None;
         for _ in 0..5 {
             let port = free_port();
             let mut child = Command::new(&daemon_bin)
@@ -121,6 +130,7 @@ impl Daemon {
                 .env("CHOCOFACTORY_CLAUDE_BINARY", &mock_claude_bin)
                 .env("CHOCOFACTORY_PORT", port.to_string())
                 .env("RUST_LOG", "error")
+                .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
                 .expect("failed to spawn chocofactoryd");
@@ -134,13 +144,23 @@ impl Daemon {
                         _home: home,
                     };
                 }
-                // Only an early exit is retried. A daemon that started but
-                // never answered is a real failure, and `wait_until_ready`
-                // panics on it rather than returning.
-                Ready::ExitedDuringStartup(status) => last_status = Some(status),
+                // A daemon that started but never answered is a real
+                // failure — `wait_until_ready` panics on a timeout rather
+                // than returning here, so a hang is never retried, only an
+                // immediate exit.
+                Ready::ExitedDuringStartup(status) => {
+                    let stderr = child_stderr(&mut child).await;
+                    if stderr.contains("failed to bind") {
+                        last_failure = Some((status, stderr));
+                        continue;
+                    }
+                    panic!("chocofactoryd exited during startup with {status:?}, stderr: {stderr}");
+                }
             }
         }
-        panic!("chocofactoryd exited during startup on 5 different ports; last: {last_status:?}");
+        panic!(
+            "chocofactoryd lost the free_port race 5 times in a row; last failure: {last_failure:?}"
+        );
     }
 }
 
@@ -148,6 +168,17 @@ impl Daemon {
 enum Ready {
     Yes,
     ExitedDuringStartup(std::process::ExitStatus),
+}
+
+/// Drains a child's piped stderr to a string. Only meaningful after the
+/// child has already exited (as in the `ExitedDuringStartup` case above) —
+/// reading to EOF on a still-running child would block.
+async fn child_stderr(child: &mut Child) -> String {
+    let mut buf = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut buf).await;
+    }
+    buf
 }
 
 impl Drop for Daemon {
