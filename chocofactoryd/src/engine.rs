@@ -2398,7 +2398,17 @@ impl WorkflowEngine {
                     // timeline: two attempts differing only in trailing
                     // whitespace would otherwise record two entries a reader
                     // can't tell apart.
-                    outcome.stdout.trim().to_string(),
+                    //
+                    // Keyed on the exit code as well as the output. A poll
+                    // whose command prints nothing on success — #78's
+                    // verdict poll is exactly that, empty until someone
+                    // reviews — makes "no verdict yet" and "`gh` has been
+                    // failing for an hour" the same empty string, so on
+                    // output alone the failure records nothing after the
+                    // first attempt and the stage looks like patient
+                    // waiting right up to its timeout. The exit code is
+                    // what tells them apart.
+                    format!("{}\0exit:{:?}", outcome.stdout.trim(), outcome.exit_code),
                     json!({
                         "stage": stage_name,
                         "command": described,
@@ -2488,6 +2498,11 @@ impl WorkflowEngine {
     /// keeps the useful signal — the moment the output flips — while
     /// collapsing the noise, and the first attempt always reports because
     /// it has nothing to be the same as.
+    ///
+    /// "Changed" is whatever key the caller passes, not the output alone —
+    /// `run_poll_stage` folds the exit code in, so a command that starts
+    /// failing without changing what it prints is still a change worth a
+    /// timeline entry.
     async fn record_poll_attempt(
         &self,
         task_id: &str,
@@ -8621,24 +8636,58 @@ exec "{mock_claude}" "$@"
         )
     }
 
+    /// Serialises every test that installs a `gh` stub on `PATH`.
+    ///
+    /// There is more than one such test now (#78 added the
+    /// changes-requested lap alongside the happy path), and each points
+    /// `PATH` at its *own* stub directory. Without this they interleave:
+    /// the second test's `set_var` replaces the first's, so the first
+    /// test's `gh` resolves to the second's stub — reading the wrong
+    /// `verdict` file and appending to the wrong `pr-created` log. That
+    /// shows up as the two failures this lock exists to prevent: a happy
+    /// path that never reaches `done`, and a create counted twice.
+    static PATH_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Prepends `dir` to `PATH` for the process, restoring the original
     /// value on drop.
     ///
-    /// Mutating a whole test process's environment for one test is a
-    /// theoretical race against every other test running concurrently in
-    /// the same process — but this only ever prepends a stub named `gh`,
-    /// and grepping this entire crate confirms no other test anywhere
-    /// shells out to a bare `gh` command (every other `"gh ..."` string in
-    /// the test suite is loader/template text that's only ever parsed or
-    /// rendered, never executed), so the practical risk is nil. `unsafe`
-    /// per Rust 2024's `std::env::set_var`, which exists for exactly this
-    /// class of whole-process mutation.
+    /// Mutating a whole test process's environment for one test is a race
+    /// against every other test running concurrently in the same process.
+    /// `PATH_GUARD_LOCK` above makes the `gh` tests take turns with each
+    /// other, and grepping this crate confirms no *other* test shells out
+    /// to a bare `gh` (every other `"gh ..."` string in the suite is
+    /// loader/template text that's only ever parsed or rendered, never
+    /// executed) — so in practice no test observes a `PATH` it didn't
+    /// install.
+    ///
+    /// Be clear about what that does and doesn't buy. Rust 2024's
+    /// `set_var` contract is "no other thread concurrently accesses the
+    /// environment", and libc's `getenv` — reached from tokio, sqlx, the
+    /// TLS stack — does not take this lock. The lock removes the
+    /// cross-test interference that actually bites; it does not discharge
+    /// the `unsafe`. Threading a per-command env override through
+    /// `shell::run` would, and is the real fix if this grows a third
+    /// caller.
     struct PathPrefixGuard {
         original: Option<std::ffi::OsString>,
+        /// Held for the guard's whole life, not just `new`: the exclusion
+        /// has to cover the test *body*, which is when the stub actually
+        /// runs, not merely the moment `PATH` is written.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl PathPrefixGuard {
         fn new(dir: &Path) -> Self {
+            // Poisoning is irrelevant: the guarded data is `()`, and a
+            // test that panicked while holding this must not stop every
+            // later one from running.
+            let _lock = PATH_GUARD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Read under the lock, never before it: reading first could
+            // capture a `PATH` another such test had already prefixed and
+            // then "restore" that on drop, leaking a dead directory into
+            // every later test's `PATH`.
             let original = std::env::var_os("PATH");
             let mut new_path = std::ffi::OsString::from(dir);
             if let Some(existing) = &original {
@@ -8647,7 +8696,7 @@ exec "{mock_claude}" "$@"
             }
             // SAFETY: see struct doc comment.
             unsafe { std::env::set_var("PATH", new_path) };
-            PathPrefixGuard { original }
+            PathPrefixGuard { original, _lock }
         }
     }
 
@@ -8663,30 +8712,75 @@ exec "{mock_claude}" "$@"
         }
     }
 
-    /// A stub `gh` covering exactly the three invocations
-    /// `coding-task.yaml` makes (`pr create`, `pr view` — with or without
-    /// `--json reviewDecision`, `pr checks`), backed by real `git`/a real
-    /// local bare repo for everything else. Returns the directory to
-    /// prepend to `PATH`.
+    /// A stub `gh` covering exactly the invocations `coding-task.yaml`
+    /// makes: `pr create`, `pr checks`, `pr list` (`open_pr`'s existence
+    /// probe and its number/url read-back), `pr view` (the head SHA), and
+    /// `gh api` (the head commit's date, then the comment list). Backed by
+    /// real `git`/a real local bare repo for everything else. Returns the
+    /// directory to prepend to `PATH`.
+    ///
+    /// Stateful on purpose, because that is the behaviour #78's fixes turn
+    /// on: `pr create` records that it ran so the probe can find nothing
+    /// before it and something after, and the comments call reads a
+    /// `verdict` file the test owns.
+    ///
+    /// What it deliberately does *not* model: PR state (so the
+    /// `--state open` scoping has no regression test here), and the jq
+    /// filter (the `verdict` file supplies the filter's output token, not
+    /// a comment body). `tests/verdict_filter.rs` covers the filter
+    /// directly against the shipped YAML.
     fn gh_stub_dir(dir: &Path) -> PathBuf {
         write_script(
             dir,
             "gh",
-            r#"#!/bin/sh
+            &format!(
+                r#"#!/bin/sh
 set -eu
-case "$1 $2" in
-    "pr create")
-        echo "https://example.test/pr/42"
-        ;;
-    "pr view")
-        if printf '%s\n' "$@" | grep -q reviewDecision; then
-            echo "APPROVED"
+created="{dir}/pr-created"
+case "$1" in
+    api)
+        # `awaiting_human_review` makes two `gh api` calls: the head
+        # commit's date, then the comment list its filter runs over. The
+        # stub answers the second from a file the test owns — which means
+        # it stands in for the *whole* query, jq filter included. That
+        # filter is covered separately and directly by
+        # `verdict_filter_*` in `tests/verdict_filter.rs`; what these
+        # workflow tests cover is the routing either side of it.
+        if printf '%s\n' "$@" | grep -q '/comments'; then
+            cat "{dir}/verdict" 2>/dev/null || true
         else
-            echo '{"number": 42, "url": "https://example.test/pr/42"}'
+            echo "2020-01-01T00:00:00Z"
         fi
         ;;
-    "pr checks")
-        echo "SUCCESS"
+    pr)
+        case "$2" in
+            create)
+                echo created >> "$created"
+                echo "https://example.test/pr/42"
+                ;;
+            list)
+                # `open_pr`'s probe and its read-back, both scoped to open
+                # PRs. Empty until `pr create` has run, so the first lap
+                # creates and every later lap reuses.
+                if [ -s "$created" ]; then
+                    if printf '%s\n' "$@" | grep -q url; then
+                        echo '{{"number": 42, "url": "https://example.test/pr/42"}}'
+                    else
+                        echo 42
+                    fi
+                fi
+                ;;
+            view)
+                echo "0000000000000000000000000000000000000000"
+                ;;
+            checks)
+                echo "SUCCESS"
+                ;;
+            *)
+                echo "stub gh: unhandled pr subcommand: $*" >&2
+                exit 1
+                ;;
+        esac
         ;;
     *)
         echo "stub gh: unhandled subcommand: $*" >&2
@@ -8694,6 +8788,8 @@ case "$1 $2" in
         ;;
 esac
 "#,
+                dir = dir.to_string_lossy(),
+            ),
         );
         dir.to_path_buf()
     }
@@ -8745,21 +8841,38 @@ esac
         (task_id, def, claude_wrapper)
     }
 
+    /// A bare repo for `open_pr`'s `git push` to push into.
+    ///
+    /// Returned rather than dropped here: `TempDir` removes the directory
+    /// on drop, so a caller that ignores this gets an `origin` remote
+    /// pointing at nothing.
+    #[must_use]
+    async fn add_bare_origin(repo: &Path) -> TempDir {
+        let origin = tempdir();
+        git(&origin, &["init", "-q", "--bare"]).await;
+        git(
+            repo,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        )
+        .await;
+        origin
+    }
+
     #[tokio::test]
     async fn the_real_coding_task_workflow_walks_the_happy_path_to_done() {
         let pool = connect_in_memory().await.unwrap();
         let repo = tempdir();
         init_git_repo(&repo).await;
-        let origin = tempdir();
-        git(&origin, &["init", "-q", "--bare"]).await;
-        git(
-            &repo,
-            &["remote", "add", "origin", &origin.to_string_lossy()],
-        )
-        .await;
+        let _origin = add_bare_origin(&repo).await;
 
         let scripts_dir = tempdir();
         let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+        // The token `awaiting_human_review`'s filter *emits* for an
+        // approval — not the `/approve` marker a human types. The stub
+        // stands in for the whole query, jq filter included, so what a
+        // comment body has to look like to produce this token is covered
+        // in `tests/verdict_filter.rs` rather than here.
+        fs::write(scripts_dir.join("verdict"), "APPROVE\n").unwrap();
 
         let (task_id, def, claude_wrapper) = seed_coding_task(
             &pool,
@@ -8796,6 +8909,80 @@ esac
         // Worktree cleanup (#58) still fires for the real shipped workflow.
         let worktree_dir = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
         wait_until_path_gone(&worktree_dir).await;
+    }
+
+    /// A `/request-changes` verdict routes back through `revising` *and*
+    /// survives the return trip through `open_pr` (#78).
+    ///
+    /// Both halves of #78 meet here and neither is provable alone. The
+    /// verdict half: `awaiting_human_review` reads a marker line out of a
+    /// PR comment, so a route to `revising` exists at all — before the fix
+    /// it polled `reviewDecision`, which nothing on a solo repo can set.
+    /// The `open_pr` half: that route immediately re-enters `open_pr`,
+    /// where the old unconditional `gh pr create` failed on "a PR already
+    /// exists" and diverted the task into `escalate_to_human` — so the
+    /// changes-requested edge was unreachable *twice over*, and fixing
+    /// only the poll would have swapped one dead end for another.
+    ///
+    /// The verdict file never changes, so every lap requests changes
+    /// again and the task ends where it should: parked at the loop guard,
+    /// not spinning. `pr create` having run exactly once is the assertion
+    /// that pins the second-lap fix specifically.
+    #[tokio::test]
+    async fn the_real_coding_task_workflow_reopens_the_same_pr_when_changes_are_requested() {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+        let _origin = add_bare_origin(&repo).await;
+        let scripts_dir = tempdir();
+        let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+        fs::write(scripts_dir.join("verdict"), "REQUEST_CHANGES\n").unwrap();
+
+        let (task_id, def, claude_wrapper) = seed_coding_task(
+            &pool,
+            &repo,
+            &scripts_dir,
+            r#"{"outcome": "approved", "feedback": ""}"#,
+        )
+        .await;
+        let engine = engine_with_adapter(pool.clone(), &claude_wrapper.to_string_lossy());
+
+        engine
+            .start_task(&task_id, &def, Some("Add a small feature"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "escalate_to_human").await;
+
+        let trail: Vec<String> = stage_trail(&pool, &task_id)
+            .await
+            .into_iter()
+            .map(|(stage, _)| stage)
+            .collect();
+        assert!(
+            trail.iter().filter(|s| s.as_str() == "open_pr").count() >= 2,
+            "the changes-requested route must come back through open_pr at \
+             least once more: {trail:?}"
+        );
+        assert!(
+            trail.iter().filter(|s| s.as_str() == "revising").count() >= 2,
+            "a /request-changes verdict must route to revising: {trail:?}"
+        );
+        assert_eq!(
+            trail.iter().filter(|s| s.as_str() == "coding").count(),
+            1,
+            "coding still only ever runs once: {trail:?}"
+        );
+
+        // The load-bearing one: a second `gh pr create` is exactly the
+        // failure #78's second half describes, and it would have shown up
+        // above only as an early `escalate_to_human` that looks like a
+        // tripped loop guard.
+        let creates = fs::read_to_string(scripts_dir.join("pr-created")).unwrap();
+        assert_eq!(
+            creates.lines().count(),
+            1,
+            "gh pr create must run once and later laps reuse the open PR: {creates:?}"
+        );
     }
 
     /// The coder/reviewer loop (not just the happy path) actually wires up

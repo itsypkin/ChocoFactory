@@ -58,12 +58,36 @@ stages:
   # read back with a separate `gh pr view` after creating it. Earlier
   # commands' stdout is discarded so `capture: json` sees only the last
   # command's output.
+  # `gh pr create` fails outright when a PR for the branch already
+  # exists, which every lap after the first hits: `revising` pushes more
+  # commits to the same branch and comes back through here. The `||`
+  # makes the create conditional on the probe finding nothing, so a
+  # second lap re-pushes and reuses the open PR instead of taking the
+  # `error` edge into `escalate_to_human` (#78).
+  #
+  # `gh pr list --state open` rather than `gh pr view`: branch resolution
+  # in `gh pr view` matches a *closed or merged* PR too (its underlying
+  # query passes `states: null`). That would make the probe succeed on a
+  # branch whose PR a human already merged, skip the create, and hand
+  # every later stage a dead PR number to poll — checks and comments on a
+  # merged PR, for six hours. Reachable by the ordinary route: escalate,
+  # merge by hand, `choco task send`, `revising`. Both calls need the
+  # scope, the read-back as much as the probe.
+  #
+  # The trailing `grep .` is the fail-closed half: an empty read-back
+  # would otherwise hand `capture: json` a bare `null` and the failure
+  # would surface much later as a template error on `{{ stages.open_pr.
+  # number }}`. Failing here takes the `error` edge instead.
   open_pr:
     kind: shell
     command: >-
       git push -u origin HEAD >/dev/null &&
-      gh pr create --fill >/dev/null &&
-      gh pr view --json number,url
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)" &&
+      (gh pr list --head "$BRANCH" --state open --json number
+      -q '.[0].number // empty' | grep -q . ||
+      gh pr create --fill >/dev/null) &&
+      gh pr list --head "$BRANCH" --state open --json number,url
+      -q '.[0] // empty' | grep .
     capture: json
     timeout: 5m
     on: { done: checks_polling, error: escalate_to_human }
@@ -83,18 +107,92 @@ stages:
       red: revising
       timeout: awaiting_human_review
 
+  # Watches the PR's *comments*, not its `reviewDecision`. GitHub refuses
+  # a formal review from the account that opened the PR, and `open_pr`
+  # pushes under whatever identity the daemon inherited — on a solo repo
+  # that's the same person, so `reviewDecision` stays empty forever
+  # (#78). Commenting on your own PR is allowed, so the verdict is a
+  # marker line in a comment: `/approve` or `/request-changes`.
+  #
+  # Only comments newer than the head commit count. That's what keeps a
+  # verdict from being re-read on the next lap: `revising` pushes a new
+  # commit, which moves `SINCE` past every existing comment, so last
+  # round's `/request-changes` stops matching without anything having to
+  # clear it. `[created_at, updated_at] | max` rather than `created_at`
+  # alone, so *editing* an earlier comment to add the marker counts —
+  # which is the move a reviewer who already wrote their prose reaches
+  # for first.
+  #
+  # Both halves of that bound are read the long way round on purpose.
+  # `gh pr view --json commits,comments` caps each at the first 100 with
+  # no pagination, so on a long PR `.commits | last` is not the head (a
+  # stale `SINCE` re-admits verdicts already acted on) and a verdict
+  # posted as comment 101 is invisible. Hence `headRefOid` plus the
+  # commits API for the date, and `--paginate` for the comments.
+  #
+  # Residual, accepted: `committedDate` comes from the daemon's clock
+  # while `created_at` comes from GitHub's, so a daemon running more than
+  # a few minutes slow can re-admit one already-consumed verdict. The
+  # loop guard below bounds that at three laps rather than a spin.
+  #
+  # The filter resolves the verdict itself and prints one token, so the
+  # engine's regexes match `^APPROVE$`/`^REQUEST_CHANGES$` rather than
+  # picking a marker out of free text. `/request-changes` is tested
+  # first: a comment carrying both markers must never resolve to
+  # "merge it".
+  #
+  # Two author fences, because on a *public* repo the comment box is open
+  # to the whole internet and this stage spends money. `authorAssociation`
+  # is the real boundary — only someone with standing in the repo can vote
+  # — without which any passer-by could `/approve` a task to `done`, or
+  # burn a coder+reviewer lap at a time with `/request-changes`. The
+  # `[bot]` check is the narrower one on top: it keeps the CI reviewer
+  # from ever being read as the human's verdict, even if it is granted
+  # write access later. Note neither fence distinguishes *you* from an
+  # agent acting as you — anything commenting under your account counts.
+  #
+  # A marker counts only as a whole line (compared by equality after
+  # trailing whitespace and CR are stripped, not by substring). That is
+  # what makes quoting safe: GitHub prefixes quoted lines with "> ", so
+  # quoting an earlier verdict can't re-trigger it, and an inline
+  # mention can't either. It does *not* exempt fenced code blocks — the
+  # API returns raw markdown, so a marker alone on a line inside a fence
+  # still votes.
   awaiting_human_review:
     kind: poll
-    command: "gh pr view {{ stages.open_pr.number }} --json reviewDecision -q .reviewDecision"
+    command: >-
+      SINCE="$(gh api
+      "repos/{owner}/{repo}/commits/$(gh pr view {{ stages.open_pr.number }}
+      --json headRefOid -q .headRefOid)" -q .commit.committer.date)" &&
+      export SINCE &&
+      gh api --paginate
+      "repos/{owner}/{repo}/issues/{{ stages.open_pr.number }}/comments?per_page=100"
+      -q '.[] | select(([.created_at, .updated_at] | max) > $ENV.SINCE)
+      | select(.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+      | select((.user.login // "") | endswith("[bot]") | not)
+      | (.body // "") | split("\n") | map(sub("[ \t\r]+$"; ""))
+      | if index("/request-changes") then "REQUEST_CHANGES"
+      elif index("/approve") then "APPROVE" else empty end'
+      | tail -n 1
     interval: 60s
+    timeout: 6h
     outcomes:
-      - match: "APPROVED"
-        then: approved
-      - match: "CHANGES_REQUESTED"
+      - match: '^REQUEST_CHANGES$'
         then: changes_requested
+      - match: '^APPROVE$'
+        then: approved
     on:
       approved: done
       changes_requested: revising
+      # Nobody reviewed in 6h. `done` would claim an approval that never
+      # happened and `revising` would loop the coder on no feedback, so
+      # this parks the task where a human can pick it up deliberately.
+      timeout: escalate_to_human
+    # A verdict stays newer than the head commit until the coder pushes,
+    # so a `revising` lap that produces no commit — or a slow daemon
+    # clock — would re-read the same `/request-changes` and spin. Same
+    # bound `internal_review` uses.
+    loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
 
   done:
     kind: terminal
