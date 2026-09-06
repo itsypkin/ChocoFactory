@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -157,6 +157,13 @@ impl Daemon {
 
             match wait_until_ready(&client, &base_url, &mut child).await {
                 Ready::Yes => {
+                    // Stderr was piped (not inherited) so a failed startup
+                    // could be inspected for the bind-failure message above;
+                    // now that startup succeeded, drain it for the rest of
+                    // the daemon's life so its output still reaches the test
+                    // log (as it would if inherited) and so an undrained
+                    // pipe can never fill and deadlock the daemon.
+                    spawn_stderr_forwarder(&mut child);
                     return Daemon {
                         child,
                         base_url,
@@ -241,6 +248,22 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut 
     }
     // Not retried: a hang is a genuine bug, not a lost port race.
     panic!("chocofactoryd did not become ready within 5s");
+}
+
+/// Forwards a live daemon's stderr, line by line, to the test process's own
+/// stderr (`cargo test` captures and prints that per-test on failure), and
+/// keeps the pipe drained so the daemon can never block on a full pipe
+/// buffer. Only called once the daemon is confirmed up, so `child.stderr`
+/// is still `Some` here.
+fn spawn_stderr_forwarder(child: &mut Child) {
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[chocofactoryd] {line}");
+            }
+        });
+    }
 }
 
 /// Reads a since-exited child's piped stderr to completion. Only called
