@@ -191,22 +191,43 @@ fn spawn_stderr_forwarder(child: &mut Child) {
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[chocofactoryd] {line}");
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => eprintln!("[chocofactoryd] {line}"),
+                    Ok(None) => break,
+                    // Said out loud rather than treated as EOF: breaking
+                    // closes the read end, so the daemon's further stderr
+                    // writes fail and its output from here on is lost.
+                    Err(err) => {
+                        eprintln!("[chocofactoryd] stopped forwarding stderr: read failed: {err}");
+                        break;
+                    }
+                }
             }
         });
     }
 }
 
-/// Reads a since-exited child's piped stderr to completion. Only called
-/// after `try_wait` has already observed the exit, so this can't block on
-/// a still-running process.
+/// Reads an exited (or just-killed) child's piped stderr to EOF. Bounded,
+/// since anything else still holding the pipe's write end would otherwise
+/// keep it open indefinitely; whatever was read before the deadline is
+/// still returned, and a read error or timeout is noted in the output
+/// rather than dropped.
 async fn read_stderr_to_string(child: &mut Child) -> String {
-    let mut buf = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut buf).await;
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), stderr.read_to_end(&mut buf)).await;
+    let mut out = String::from_utf8_lossy(&buf).into_owned();
+    match read {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => out.push_str(&format!("\n[failed to read chocofactoryd stderr: {err}]")),
+        Err(_) => {
+            out.push_str("\n[chocofactoryd stderr still open after 2s; output may be truncated]")
+        }
     }
-    buf
+    out
 }
 
 /// Distinguishes a lost `free_port` race (safe to retry on a fresh port)
@@ -224,8 +245,17 @@ impl Drop for Daemon {
 }
 
 async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut Child) -> Ready {
-    for _ in 0..100 {
-        if let Ok(resp) = client.get(format!("{base_url}/projects")).send().await
+    // A wall-clock deadline plus a per-probe timeout, so a daemon that
+    // accepts the connection but never answers (e.g. blocked writing to a
+    // full stderr pipe) still reaches the kill-and-report path below
+    // instead of hanging the test.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client
+            .get(format!("{base_url}/projects"))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
             && resp.status().is_success()
         {
             return Ready::Yes;
@@ -238,7 +268,19 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut 
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("chocofactoryd did not become ready within 5s");
+    // Checked once more so an exit during the final sleep is still
+    // reported as one (and retried if it was a lost race), not as a hang.
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ready::ExitedDuringStartup(status);
+    }
+    // Not retried: a hang is a genuine bug, not a lost port race. Killed
+    // first so its stderr pipe reaches EOF and the panic carries whatever the
+    // daemon said — including when it hung because that undrained pipe filled.
+    if let Err(err) = child.start_kill() {
+        eprintln!("failed to kill unresponsive chocofactoryd: {err}");
+    }
+    let stderr = read_stderr_to_string(child).await;
+    panic!("chocofactoryd did not become ready within 5s: {stderr}");
 }
 
 struct ChocoOutput {
