@@ -105,9 +105,6 @@ pub fn task(t: &Task) -> String {
         ("Workflow", t.workflow_def.clone()),
         ("Status", t.status.clone()),
     ];
-    if let Some(parent) = &t.parent_task_id {
-        pairs.push(("Parent task", parent.clone()));
-    }
     if let Some(cwd) = t.config.get("cwd").and_then(Value::as_str) {
         pairs.push(("Repo", cwd.to_string()));
     }
@@ -190,9 +187,6 @@ pub fn task_detail(detail: &Value) -> String {
         ("Workflow", get("workflow_def").to_string()),
         ("Status", get("status").to_string()),
     ];
-    if let Some(parent) = detail.get("parent_task_id").and_then(Value::as_str) {
-        pairs.push(("Parent task", parent.to_string()));
-    }
     // Same per-role lines `task` renders: `task status` is where an existing
     // task gets inspected, so leaving them out would mean `--json` was the
     // only way to see what `task reconfigure` actually did. `TaskDetail`
@@ -686,7 +680,6 @@ mod tests {
         Task {
             id: "t1".to_string(),
             project_id: "p".to_string(),
-            parent_task_id: None,
             workflow_def: "coding-task".to_string(),
             title: "x".to_string(),
             status: "open".to_string(),
@@ -970,7 +963,6 @@ mod tests {
         let task = Task {
             id: "t1".to_string(),
             project_id: "p1".to_string(),
-            parent_task_id: None,
             workflow_def: "chat".to_string(),
             title: "first line\nsecond line".to_string(),
             status: "open".to_string(),

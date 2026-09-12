@@ -64,7 +64,6 @@ mod tests {
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),

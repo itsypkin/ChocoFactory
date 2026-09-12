@@ -464,7 +464,6 @@ mod tests {
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
@@ -538,7 +537,6 @@ mod tests {
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
@@ -582,7 +580,6 @@ mod tests {
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
@@ -655,7 +652,6 @@ mod tests {
         let project_id = projects::create(&pool, "demo").await.unwrap().id;
         let new_task = |title: &'static str| tasks::NewTask {
             project_id: &project_id,
-            parent_task_id: None,
             workflow_def: "chat",
             title,
             config: json!({}),
@@ -694,7 +690,6 @@ mod tests {
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
@@ -738,7 +733,6 @@ mod tests {
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
@@ -793,7 +787,6 @@ mod tests {
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),

@@ -21,10 +21,6 @@ pub struct CreateTaskRequest {
     pub prompt: String,
     #[serde(default)]
     pub config: Option<Value>,
-    /// Tags this task as spawned via delegation (§6.2's
-    /// `choco task create --parent-task <id>`).
-    #[serde(default)]
-    pub parent_task_id: Option<String>,
 }
 
 pub async fn create(
@@ -35,7 +31,6 @@ pub async fn create(
         .engine
         .create_task(
             &body.project_id,
-            body.parent_task_id.as_deref(),
             &body.workflow_def,
             &body.title,
             &body.prompt,

@@ -331,7 +331,6 @@ stages:
             server.pool(),
             crate::db::tasks::NewTask {
                 project_id: &project.id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "t",
                 config: json!({}),

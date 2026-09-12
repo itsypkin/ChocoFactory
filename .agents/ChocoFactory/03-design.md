@@ -732,15 +732,14 @@ arms.
 Both human-scriptable and agent-callable (Q12) — an HTTP client against
 `chocofactoryd`'s API, e.g.:
 
-- `choco task create --project <p> --workflow chat|coding_task --repo <path> --prompt <text> [--parent-task <id>]`
+- `choco task create --project <p> --workflow chat|coding_task --repo <path> --prompt <text>`
 - `choco task status <id>`
 - `choco task send <id> --text <text>`
 - `choco task list [--project <p>] [--status <s>]`
 
-`--parent-task` supports delegation: an agent running inside task A calls
-this CLI to spawn task B, tagging B's `tasks.parent_task_id` so the UI
-can show composition, and A can poll B's status the same way any external
-script would.
+Only the external-automation half of Q12 remains. The agent-to-agent half
+— `--parent-task`, which tagged `tasks.parent_task_id` so the UI could
+show composition — was removed; see §7.
 
 ## 7. Deferred / explicitly out of scope for this design
 
@@ -754,6 +753,19 @@ script would.
 - **Cross-task shared project memory** (Q2 follow-up) — open question,
   not designed here. Tracked so it doesn't get silently dropped:
   [issue #40](https://github.com/itsypkin/ChocoFactory/issues/40).
+- **Agent-to-agent delegation** (the agent-callable half of Q12) — shipped
+  as plumbing in P1-10 (`--parent-task`, `tasks.parent_task_id`) and never
+  usable: the daemon tells an agent subprocess nothing about its own task,
+  so an agent could never supply the id. Validating it end-to-end
+  ([#19](https://github.com/itsypkin/ChocoFactory/issues/19)) was closed
+  undone and the surface removed in
+  [#83](https://github.com/itsypkin/ChocoFactory/issues/83). If it returns
+  it needs a mechanism that carries task identity into the turn — most
+  plausibly an MCP tool alongside `report_outcome`
+  ([#73](https://github.com/itsypkin/ChocoFactory/issues/73)), since the
+  daemon already builds a per-turn `--mcp-config`. The
+  external-automation half of Q12 (scripts/CI driving `choco`) is
+  unaffected.
 - **General scripting/expression language for stage outcomes** — the
   workflow engine (§5) is intentionally an interpreter over a fixed set
   of stage kinds, not a Turing-complete workflow scripting system. Adding

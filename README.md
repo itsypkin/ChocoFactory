@@ -296,32 +296,6 @@ review
 `task send` returns 202 with no body, so under `--json` it prints nothing
 at all rather than a message that would break a pipe.
 
-### Delegation
-
-`--parent-task <id>` tags a new task as spawned from an existing one, so an
-agent working inside task A can spin up task B and poll it:
-
-```
-$ choco task create --project acme --workflow chat \
-    --title "subtask" --prompt "do the thing" --parent-task bb93ada3-...
-Title        subtask
-ID           e94b3293-c547-4dce-a31a-71dccffe8f3c
-Project      7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
-Workflow     chat
-Status       open
-Parent task  bb93ada3-2910-4b94-911d-f6e8aab426dd
-Created      2026-08-01 12:33:37 UTC
-```
-
-The parent id round-trips through `choco task status <child-id>`, and the
-child is polled with that same call — which is why the delegating agent
-wants `--json`:
-
-```
-$ choco --json task status <child-id> | jq -r '.workflow_state.current_stage'
-chatting
-```
-
 ### Per-role config
 
 A workflow can declare more than one role — a `coder` and a `reviewer`, say —
