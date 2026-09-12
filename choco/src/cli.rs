@@ -96,12 +96,24 @@ pub enum TaskCmd {
         /// Task id.
         id: String,
     },
+    /// Re-run a stuck task's current stage (X-4, issue #61).
+    ///
+    /// Reopens the task and re-enters whatever stage it stopped in from
+    /// scratch — not a replay of the outcome that got it stuck, since the
+    /// daemon never persisted one. Only works on a task whose status is
+    /// `stuck`; see `choco task status` for the reason.
+    Retry {
+        /// Task id.
+        id: String,
+    },
     /// List tasks, optionally filtered by project and/or status.
     List {
         /// Project name or id to filter by.
         #[arg(long)]
         project: Option<String>,
-        /// Status to filter by (free-form — driven by workflow definitions).
+        /// Status to filter by — free-form (driven by workflow
+        /// definitions), but the daemon itself writes one of `open`,
+        /// `closed`, `cancelled`, or `stuck`.
         #[arg(long)]
         status: Option<String>,
     },

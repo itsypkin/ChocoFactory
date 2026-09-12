@@ -495,6 +495,20 @@ impl Client {
         self.check_status(resp).await?;
         Ok(())
     }
+
+    /// Re-runs a stuck task's current stage (X-4, issue #61). Shaped like
+    /// `cancel_task`: no request body, and the daemon answers `202` with no
+    /// body.
+    pub async fn retry_task(&self, id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .send(
+                self.http
+                    .post(format!("{}/tasks/{id}/retry", self.base_url)),
+            )
+            .await?;
+        self.check_status(resp).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

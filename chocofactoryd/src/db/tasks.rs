@@ -6,7 +6,7 @@ use sqlx::{FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
 const COLUMNS: &str = "id, project_id, parent_task_id, workflow_def, title, status, config, \
-     worktree_repo, worktree_project, created_at, updated_at";
+     worktree_repo, worktree_project, stuck_reason, created_at, updated_at";
 
 #[derive(FromRow)]
 struct TaskRow {
@@ -19,6 +19,7 @@ struct TaskRow {
     config: Json<Value>,
     worktree_repo: Option<String>,
     worktree_project: Option<String>,
+    stuck_reason: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -35,6 +36,7 @@ impl From<TaskRow> for Task {
             config: row.config.0,
             worktree_repo: row.worktree_repo,
             worktree_project: row.worktree_project,
+            stuck_reason: row.stuck_reason,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -105,6 +107,12 @@ pub async fn list(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Sets `tasks.status` unconditionally and clears `stuck_reason` (X-4,
+/// issue #61): `mark_stuck` is the only writer of a non-null reason, so any
+/// other status change — closing, cancelling, or reopening via this
+/// function — clears whatever reason a previous `stuck` carried, rather
+/// than leaving a stale explanation attached to a task that isn't stuck any
+/// more.
 pub async fn update_status(
     pool: &SqlitePool,
     id: &str,
@@ -112,9 +120,49 @@ pub async fn update_status(
 ) -> Result<Option<Task>, sqlx::Error> {
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRow>(&format!(
-        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? RETURNING {COLUMNS}"
+        "UPDATE tasks SET status = ?, stuck_reason = NULL, updated_at = ? \
+         WHERE id = ? RETURNING {COLUMNS}"
     ))
     .bind(status)
+    .bind(now)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
+/// Marks `id` `stuck` with `reason`, but only if it is currently `open`
+/// (X-4, issue #61) — a single conditional `UPDATE`, not a read-then-write,
+/// so a late failure can never clobber a task a human already `cancelled`
+/// or that reached `closed`/`stuck` through some other path in the
+/// meantime. Returns whether a row actually changed: `false` means the task
+/// was no longer `open` when this ran, which callers treat as "nothing to
+/// do" rather than an error.
+pub async fn mark_stuck(pool: &SqlitePool, id: &str, reason: &str) -> Result<bool, sqlx::Error> {
+    let now = Utc::now();
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'stuck', stuck_reason = ?, updated_at = ? \
+         WHERE id = ? AND status = 'open'",
+    )
+    .bind(reason)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Reopens a `stuck` task so its current stage can be retried (X-4, issue
+/// #61) — the compare-and-set counterpart to `mark_stuck`: `SET
+/// status='open', stuck_reason=NULL ... WHERE status='stuck'`. `None` means
+/// the row wasn't `stuck` (already reopened, cancelled, or unknown), which
+/// `WorkflowEngine::retry_task` maps to `NotStuck`.
+pub async fn reopen_stuck(pool: &SqlitePool, id: &str) -> Result<Option<Task>, sqlx::Error> {
+    let now = Utc::now();
+    let row = sqlx::query_as::<_, TaskRow>(&format!(
+        "UPDATE tasks SET status = 'open', stuck_reason = NULL, updated_at = ? \
+         WHERE id = ? AND status = 'stuck' RETURNING {COLUMNS}"
+    ))
     .bind(now)
     .bind(id)
     .fetch_optional(pool)
@@ -521,5 +569,124 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(child.parent_task_id, Some(parent.id));
+    }
+
+    // ---- stuck_reason / mark_stuck / reopen_stuck (X-4, #61) ----
+
+    async fn seed_open_task(pool: &SqlitePool) -> String {
+        seed_task_with_config(pool, json!({})).await
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_transitions_an_open_task_and_sets_the_reason() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_open_task(&pool).await;
+
+        let changed = mark_stuck(&pool, &task_id, "stage 'run': it broke")
+            .await
+            .unwrap();
+        assert!(changed);
+
+        let task = get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        assert_eq!(task.stuck_reason.as_deref(), Some("stage 'run': it broke"));
+    }
+
+    /// The compare-and-set at the heart of X-4: a late failure racing a
+    /// cancel must never overwrite it. Tested at the db level directly
+    /// against a `cancelled` row, without going through the engine.
+    #[tokio::test]
+    async fn mark_stuck_never_overwrites_a_cancelled_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_open_task(&pool).await;
+        update_status(&pool, &task_id, "cancelled").await.unwrap();
+
+        let changed = mark_stuck(&pool, &task_id, "too late").await.unwrap();
+        assert!(!changed);
+
+        let task = get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+        assert_eq!(task.stuck_reason, None);
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_does_not_apply_to_a_closed_or_already_stuck_task() {
+        let pool = connect_in_memory().await.unwrap();
+
+        let closed_id = seed_open_task(&pool).await;
+        update_status(&pool, &closed_id, "closed").await.unwrap();
+        assert!(!mark_stuck(&pool, &closed_id, "x").await.unwrap());
+
+        let stuck_id = seed_open_task(&pool).await;
+        assert!(mark_stuck(&pool, &stuck_id, "first").await.unwrap());
+        assert!(!mark_stuck(&pool, &stuck_id, "second").await.unwrap());
+        assert_eq!(
+            get(&pool, &stuck_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .stuck_reason
+                .as_deref(),
+            Some("first"),
+            "a rejected mark_stuck must not clobber the existing reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_stuck_on_an_unknown_id_is_false() {
+        let pool = connect_in_memory().await.unwrap();
+        assert!(!mark_stuck(&pool, "nope", "x").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reopen_stuck_clears_the_reason_and_reopens_the_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_open_task(&pool).await;
+        mark_stuck(&pool, &task_id, "stage 'run': it broke")
+            .await
+            .unwrap();
+
+        let reopened = reopen_stuck(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(reopened.status, "open");
+        assert_eq!(reopened.stuck_reason, None);
+
+        let fetched = get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(fetched, reopened);
+    }
+
+    #[tokio::test]
+    async fn reopen_stuck_on_a_non_stuck_task_is_none() {
+        let pool = connect_in_memory().await.unwrap();
+        let open_id = seed_open_task(&pool).await;
+        assert!(reopen_stuck(&pool, &open_id).await.unwrap().is_none());
+
+        let closed_id = seed_open_task(&pool).await;
+        update_status(&pool, &closed_id, "closed").await.unwrap();
+        assert!(reopen_stuck(&pool, &closed_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reopen_stuck_on_an_unknown_id_is_none() {
+        let pool = connect_in_memory().await.unwrap();
+        assert!(reopen_stuck(&pool, "nope").await.unwrap().is_none());
+    }
+
+    /// `update_status` clears any reason a previous `stuck` left behind —
+    /// otherwise a task cancelled (or closed, or reopened) out of `stuck`
+    /// would keep showing a stale explanation for a status it no longer has.
+    #[tokio::test]
+    async fn update_status_clears_a_stuck_reason() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_open_task(&pool).await;
+        mark_stuck(&pool, &task_id, "stage 'run': it broke")
+            .await
+            .unwrap();
+
+        let updated = update_status(&pool, &task_id, "cancelled")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "cancelled");
+        assert_eq!(updated.stuck_reason, None);
     }
 }

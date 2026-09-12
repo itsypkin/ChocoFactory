@@ -1283,3 +1283,130 @@ async fn sending_to_a_cancelled_task_fails_with_a_clear_message() {
         failed.stderr
     );
 }
+
+/// `task retry` end to end through the real binaries (X-4, issue #61): a
+/// shell stage with no `error` edge gets stuck on a missing marker file,
+/// retrying after creating it re-runs the same command and lets it finish.
+#[tokio::test]
+async fn task_retry_reruns_a_stuck_tasks_current_stage() {
+    let home = TempHome::new();
+    let marker = home.0.join("marker");
+    home.write_workflow(
+        "retry-flow",
+        &format!(
+            r#"
+name: retry-flow
+stages:
+  run:
+    kind: shell
+    command: "test -f {}"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+            marker.display()
+        ),
+    );
+    let daemon = Daemon::spawn(home).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let task_id = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "retry-flow",
+            "--title",
+            "t",
+            "--prompt",
+            "hello",
+        ],
+    )
+    .await
+    .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut status = Value::Null;
+    for _ in 0..100 {
+        status = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
+            .await
+            .json();
+        if status["status"] == "stuck" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        status["status"], "stuck",
+        "task never got stuck: {status:?}"
+    );
+    assert!(
+        status["stuck_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("run")),
+        "{status:?}"
+    );
+
+    std::fs::write(&marker, "").unwrap();
+    let retried = run_choco(&daemon.base_url, &["task", "retry", &task_id]).await;
+    assert_eq!(retried.code, Some(0), "stderr: {}", retried.stderr);
+
+    let mut status = Value::Null;
+    for _ in 0..100 {
+        status = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
+            .await
+            .json();
+        if status["status"] == "closed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status["status"], "closed", "task never closed: {status:?}");
+    assert!(status["stuck_reason"].is_null());
+}
+
+/// `task retry` against a task that isn't stuck surfaces the daemon's 409
+/// as a clear message rather than a bare exit code.
+#[tokio::test]
+async fn task_retry_on_a_non_stuck_task_surfaces_a_clear_409() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let task_id = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "chat",
+            "--title",
+            "t",
+            "--prompt",
+            "hello",
+        ],
+    )
+    .await
+    .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let failed = run_choco(&daemon.base_url, &["task", "retry", &task_id]).await;
+    assert_eq!(failed.code, Some(1), "stdout: {}", failed.stdout);
+    assert!(
+        failed.stderr.contains("stuck"),
+        "stderr should explain the task isn't stuck: {}",
+        failed.stderr
+    );
+}

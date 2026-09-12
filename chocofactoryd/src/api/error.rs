@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::engine::{
-    CancelTaskError, CreateTaskError, EngineError, ResolveError, SendMessageError,
+    CancelTaskError, CreateTaskError, EngineError, ResolveError, RetryTaskError, SendMessageError,
     SendMessageOrResumeError,
 };
 use crate::session::SessionError;
@@ -76,7 +76,11 @@ impl From<SendMessageOrResumeError> for ApiError {
             // A cancelled task refusing further input is the same shape of
             // conflict as a terminal one (#69): the request was
             // well-formed, the task just isn't in a state that can take it.
-            | SendMessageOrResumeError::TaskCancelled => ApiError::Conflict(err.to_string()),
+            | SendMessageOrResumeError::TaskCancelled
+            // Same shape again, for a `stuck` task (X-4, issue #61): well
+            // formed request, wrong state — `choco task retry` is what
+            // fixes it, not a different request shape.
+            | SendMessageOrResumeError::TaskStuck(_) => ApiError::Conflict(err.to_string()),
             // A `human_gate`'s `resumed` relay lost a race with another
             // caller resuming the same task concurrently (P1-9 review):
             // `advance()`'s own per-task lock means `workflow_state` is
@@ -107,9 +111,9 @@ impl From<SendMessageOrResumeError> for ApiError {
             ) => ApiError::Conflict(err.to_string()),
             // Same conflict reached through the `agent_turn` branch, where
             // `send_message` re-checks the status under the per-task lock.
-            SendMessageOrResumeError::SendMessage(SendMessageError::TaskCancelled) => {
-                ApiError::Conflict(err.to_string())
-            }
+            SendMessageOrResumeError::SendMessage(
+                SendMessageError::TaskCancelled | SendMessageError::TaskStuck(_),
+            ) => ApiError::Conflict(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -138,6 +142,32 @@ impl From<CancelTaskError> for ApiError {
             // this arm is unreachable today and kept only so the mapping
             // stays right if that ever changes.
             CancelTaskError::Session(SessionError::AlreadyStarting) => {
+                ApiError::Conflict(err.to_string())
+            }
+            _ => ApiError::Internal(err.to_string()),
+        }
+    }
+}
+
+impl From<RetryTaskError> for ApiError {
+    fn from(err: RetryTaskError) -> Self {
+        match &err {
+            RetryTaskError::NoSuchTask => ApiError::NotFound(err.to_string()),
+            // The task isn't `stuck`, has no `workflow_state`, its
+            // `current_stage` names a stage the definition no longer
+            // declares, or its stage's run is still active — every one of
+            // these is "well-formed request, task isn't in a retryable
+            // state right now", the same conflict shape `CancelTaskError`
+            // uses for its own state-mismatch cases.
+            RetryTaskError::NotStuck(_)
+            | RetryTaskError::NoWorkflowState
+            | RetryTaskError::UnknownStage(_)
+            | RetryTaskError::RunStillActive(_) => ApiError::Conflict(err.to_string()),
+            // The workflow file backing this task's `workflow_def` is gone,
+            // so the retry cannot happen — a conflict with the task's own
+            // state, not a request the caller could reasonably have made
+            // differently, and not a server fault either.
+            RetryTaskError::Resolve(ResolveError::NotFound(_)) => {
                 ApiError::Conflict(err.to_string())
             }
             _ => ApiError::Internal(err.to_string()),
