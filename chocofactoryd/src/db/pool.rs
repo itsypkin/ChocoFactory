@@ -197,6 +197,106 @@ INSERT INTO workflow_state (task_id, current_stage, loop_counters, stage_history
         );
     }
 
+    /// 0005 drops `tasks.parent_task_id` (#83) with `ALTER TABLE ... DROP
+    /// COLUMN` rather than the create-copy-drop-rename rebuild 0003 used on
+    /// `events`, because `tasks` is the *target* of foreign keys from
+    /// `task_runs`, `workflow_state` and `events` — `DROP TABLE tasks` fails
+    /// against those rows, and `PRAGMA foreign_keys` can't be turned off
+    /// inside the transaction sqlx runs each migration in. This asserts what
+    /// that choice has to preserve: the task rows themselves, and the
+    /// dependants still pointing at them.
+    #[tokio::test]
+    async fn dropping_parent_task_id_preserves_tasks_and_their_dependants() {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        // Everything up to (not including) 0005, so the fixture below can be
+        // written with the column still present.
+        for sql in [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_task_run_end_reason.sql"),
+            include_str!("../../migrations/0003_stage_transition_events.sql"),
+            include_str!("../../migrations/0004_task_worktree_snapshot.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+
+        // A delegating pair — the only rows the dropped column ever had a
+        // use for — plus the dependants whose foreign keys rule the rebuild
+        // out.
+        sqlx::raw_sql(
+            r#"
+INSERT INTO projects (id, name, created_at)
+    VALUES ('p1', 'demo', '2026-01-01T00:00:00Z');
+INSERT INTO tasks (id, project_id, parent_task_id, workflow_def, title, created_at, updated_at)
+    VALUES ('t1', 'p1', NULL, 'chat', 'Parent', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+           ('t2', 'p1', 't1', 'chat', 'Child',  '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+INSERT INTO task_runs (id, task_id, stage, role, cli_adapter, model, status, started_at)
+    VALUES ('r1', 't1', 'chatting', 'chat', 'claude', 'sonnet', 'idle', '2026-01-01T00:00:00Z');
+INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, updated_at)
+    VALUES ('t1', 'chatting', '{}', '{}', '2026-01-01T00:00:00Z');
+"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0005_drop_task_parent_task_id.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Both tasks survive, including the one that was a child.
+        let titles: Vec<(String,)> = sqlx::query_as("SELECT title FROM tasks ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles.into_iter().map(|(t,)| t).collect::<Vec<_>>(),
+            vec!["Parent".to_string(), "Child".to_string()]
+        );
+        assert!(
+            sqlx::query("SELECT parent_task_id FROM tasks")
+                .fetch_optional(&pool)
+                .await
+                .is_err(),
+            "parent_task_id should no longer exist"
+        );
+
+        // The dependants are still attached...
+        let (runs,): (i64,) = sqlx::query_as("SELECT count(*) FROM task_runs WHERE task_id = 't1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1);
+        // ...and `task_runs.task_id` still resolves against `tasks` and
+        // rejects an orphan. The constraint is declared on `task_runs`, which
+        // this migration never touches — what's under test is that rewriting
+        // `tasks` out from under it left the reference intact.
+        let orphan = sqlx::query(
+            "INSERT INTO task_runs (id, task_id, stage, role, cli_adapter, model, status, started_at)
+             VALUES ('r2', 'no-such-task', 's', 'r', 'claude', 'sonnet', 'idle', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await;
+        // The error is matched, not just its existence: the identical column
+        // list inserts fine for 'r1' above, so anything *other* than an FK
+        // violation here would mean the assertion had stopped testing the FK.
+        let err = orphan.expect_err("task_runs.task_id FK should still be enforced");
+        assert!(
+            err.to_string().contains("FOREIGN KEY"),
+            "expected a foreign-key violation, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn connect_creates_file_and_is_idempotent() {
         let dir = tempdir();

@@ -79,7 +79,6 @@ pub struct CreateTaskParams<'a> {
     /// Already-assembled task config, or `None` to send no config at all.
     /// Build it with [`build_task_config`].
     pub config: Option<Value>,
-    pub parent_task_id: Option<&'a str>,
 }
 
 /// Assembles the task-level `config` object (design §5.5) from the CLI's
@@ -399,7 +398,6 @@ impl Client {
                 "title": params.title,
                 "prompt": params.prompt,
                 "config": params.config,
-                "parent_task_id": params.parent_task_id,
             }))
     }
 
@@ -505,14 +503,13 @@ mod tests {
         Client::new("http://127.0.0.1:4141".to_string())
     }
 
-    fn params<'a>(config: Option<Value>, parent_task_id: Option<&'a str>) -> CreateTaskParams<'a> {
+    fn params(config: Option<Value>) -> CreateTaskParams<'static> {
         CreateTaskParams {
             project_id: "p",
             workflow_def: "chat",
             title: "t",
             prompt: "hi",
             config,
-            parent_task_id,
         }
     }
 
@@ -529,7 +526,7 @@ mod tests {
     #[test]
     fn create_task_includes_config_cwd_when_repo_is_given() {
         let config = build_task_config(&RoleOverrides::default(), Some("/repo")).unwrap();
-        let body = body_of(client().create_task_request(&params(config, None)));
+        let body = body_of(client().create_task_request(&params(config)));
         assert_eq!(body["config"]["cwd"], "/repo");
     }
 
@@ -537,14 +534,8 @@ mod tests {
     fn create_task_sends_null_config_when_repo_is_absent() {
         let config = build_task_config(&RoleOverrides::default(), None).unwrap();
         assert!(config.is_none());
-        let body = body_of(client().create_task_request(&params(config, None)));
+        let body = body_of(client().create_task_request(&params(config)));
         assert!(body["config"].is_null());
-    }
-
-    #[test]
-    fn create_task_includes_parent_task_id_when_given() {
-        let body = body_of(client().create_task_request(&params(None, Some("parent-1"))));
-        assert_eq!(body["parent_task_id"], "parent-1");
     }
 
     #[test]

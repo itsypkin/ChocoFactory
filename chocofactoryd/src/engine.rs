@@ -315,9 +315,6 @@ pub enum CreateTaskError {
     /// produces — the same care `db::projects::delete`'s own caller
     /// already takes for the opposite direction of that same FK.
     NoSuchProject(String),
-    /// `parent_task_id` was supplied but doesn't reference an existing
-    /// task — same reasoning as `NoSuchProject`.
-    NoSuchParentTask(String),
     Db(sqlx::Error),
     Start(EngineError),
 }
@@ -328,7 +325,6 @@ impl fmt::Display for CreateTaskError {
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
             CreateTaskError::NoSuchProject(id) => write!(f, "no such project '{id}'"),
-            CreateTaskError::NoSuchParentTask(id) => write!(f, "no such parent task '{id}'"),
             CreateTaskError::Db(err) => write!(f, "{err}"),
             CreateTaskError::Start(err) => write!(f, "{err}"),
         }
@@ -559,16 +555,9 @@ impl WorkflowEngine {
     /// `workflow_def_name` is resolved and the definition freshly loaded
     /// on every call, not cached (P1-8 LLD §4.5) — the same file `WorkflowEngine`
     /// would otherwise have to invalidate a cache entry for.
-    ///
-    /// `parent_task_id` tags this task as spawned via delegation (§6.2's
-    /// `choco task create --parent-task <id>`) — purely a label for the UI
-    /// and for a parent task to poll; it has no effect on how this task's
-    /// own workflow runs.
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_task(
         self: &Arc<Self>,
         project_id: &str,
-        parent_task_id: Option<&str>,
         workflow_def_name: &str,
         title: &str,
         initial_input: &str,
@@ -580,25 +569,18 @@ impl WorkflowEngine {
             Arc::new(WorkflowDefinition::load(&path).map_err(CreateTaskError::WorkflowDef)?);
 
         // Checked explicitly rather than left to surface as a raw FK
-        // violation from the `INSERT` below (P1-9 review): both columns
-        // are foreign keys (`tasks.project_id`/`tasks.parent_task_id`),
-        // and `db::pool::connect` enables `foreign_keys`, so a bad id
-        // would otherwise fail as an opaque `sqlx::Error` instead of a
-        // reported, specific error the API layer can map to 404.
+        // violation from the `INSERT` below (P1-9 review): `tasks.project_id`
+        // is a foreign key and `db::pool::connect` enables `foreign_keys`, so
+        // a bad id would otherwise fail as an opaque `sqlx::Error` instead of
+        // a reported, specific error the API layer can map to 404.
         if projects::get(&self.pool, project_id).await?.is_none() {
             return Err(CreateTaskError::NoSuchProject(project_id.to_string()));
-        }
-        if let Some(parent_id) = parent_task_id
-            && tasks::get(&self.pool, parent_id).await?.is_none()
-        {
-            return Err(CreateTaskError::NoSuchParentTask(parent_id.to_string()));
         }
 
         let task = tasks::create(
             &self.pool,
             tasks::NewTask {
                 project_id,
-                parent_task_id,
                 workflow_def: workflow_def_name,
                 title,
                 config,
@@ -4035,7 +4017,6 @@ mod tests {
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def,
                 title: "T",
                 config: json!({}),
@@ -5202,7 +5183,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": dir.to_string_lossy() }),
@@ -5382,7 +5362,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": dir.to_string_lossy() }),
@@ -5700,7 +5679,6 @@ stages:
         let task = engine
             .create_task(
                 &project_id,
-                None,
                 "chat",
                 "flaky test",
                 "hey, look into it",
@@ -5725,7 +5703,7 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
 
         let err = engine
-            .create_task(&project_id, None, "ghost", "t", "hi", json!({}))
+            .create_task(&project_id, "ghost", "t", "hi", json!({}))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -5742,37 +5720,12 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
 
         let err = engine
-            .create_task("no-such-project", None, "chat", "t", "hi", json!({}))
+            .create_task("no-such-project", "chat", "t", "hi", json!({}))
             .await
             .unwrap_err();
         assert!(matches!(
             err,
             CreateTaskError::NoSuchProject(id) if id == "no-such-project"
-        ));
-    }
-
-    #[tokio::test]
-    async fn create_task_with_a_nonexistent_parent_task_id_is_a_reported_error() {
-        let pool = connect_in_memory().await.unwrap();
-        let workflows_dir = tempdir();
-        write_chat_workflow(&workflows_dir);
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
-        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
-
-        let err = engine
-            .create_task(
-                &project_id,
-                Some("no-such-task"),
-                "chat",
-                "t",
-                "hi",
-                json!({}),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CreateTaskError::NoSuchParentTask(id) if id == "no-such-task"
         ));
     }
 
@@ -5789,7 +5742,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .create_task(&project_id, "chat", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -5841,7 +5794,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .create_task(&project_id, "chat", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -5934,7 +5887,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "templated", "t", "ignored", json!({}))
+            .create_task(&project_id, "templated", "t", "ignored", json!({}))
             .await
             .unwrap();
 
@@ -5982,7 +5935,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "has-outcome", "t", "hello", json!({}))
+            .create_task(&project_id, "has-outcome", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -6185,7 +6138,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .create_task(&project_id, "chat", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -6326,7 +6279,6 @@ stages:
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def,
                 title: "T",
                 config: json!({ "cwd": cwd.to_string_lossy() }),
@@ -8144,7 +8096,6 @@ roles:
         let task = engine
             .create_task(
                 &project_id,
-                None,
                 "multi-role",
                 "T",
                 "go",
@@ -8243,7 +8194,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "gated-review", "T", "go", json!({}))
+            .create_task(&project_id, "gated-review", "T", "go", json!({}))
             .await
             .unwrap();
         wait_until_stage(&pool, &task.id, "coding").await;
@@ -8347,7 +8298,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -8402,7 +8352,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -8441,7 +8390,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -8516,7 +8464,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -8828,7 +8775,6 @@ esac
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "Add a small feature",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -9069,7 +9015,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),

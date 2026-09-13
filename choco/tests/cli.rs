@@ -357,11 +357,11 @@ async fn project_create_and_list_round_trip() {
     );
 }
 
-/// Also proves the `--workflow` correction (design §6.2 vs. §2.2): a
-/// custom, non-builtin workflow name is accepted and started, not
-/// rejected by a `chat|coding_task` enum.
+/// Proves the `--workflow` correction (design §6.2 vs. §2.2): a custom,
+/// non-builtin workflow name is accepted and started, not rejected by a
+/// `chat|coding_task` enum.
 #[tokio::test]
-async fn task_create_with_a_custom_workflow_and_parent_task_tags_delegation() {
+async fn task_create_accepts_a_custom_workflow_name() {
     let home = TempHome::new();
     home.write_workflow("echo-workflow", ECHO_WORKFLOW_YAML);
     let daemon = Daemon::spawn(home).await;
@@ -371,7 +371,7 @@ async fn task_create_with_a_custom_workflow_and_parent_task_tags_delegation() {
         .json();
     let project_id = project["id"].as_str().unwrap().to_string();
 
-    let parent = run_choco_json(
+    let created = run_choco_json(
         &daemon.base_url,
         &[
             "task",
@@ -381,42 +381,20 @@ async fn task_create_with_a_custom_workflow_and_parent_task_tags_delegation() {
             "--workflow",
             "echo-workflow",
             "--title",
-            "parent",
+            "custom",
             "--prompt",
             "hello",
         ],
     )
     .await;
-    assert_eq!(parent.code, Some(0), "stderr: {}", parent.stderr);
-    let parent_id = parent.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(created.code, Some(0), "stderr: {}", created.stderr);
+    let task = created.json();
+    assert_eq!(task["workflow_def"], "echo-workflow");
+    let task_id = task["id"].as_str().unwrap().to_string();
 
-    let child = run_choco_json(
-        &daemon.base_url,
-        &[
-            "task",
-            "create",
-            "--project",
-            &project_id,
-            "--workflow",
-            "echo-workflow",
-            "--title",
-            "child",
-            "--prompt",
-            "hi",
-            "--parent-task",
-            &parent_id,
-        ],
-    )
-    .await;
-    assert_eq!(child.code, Some(0), "stderr: {}", child.stderr);
-    let child_task = child.json();
-    assert_eq!(child_task["parent_task_id"], parent_id);
-    let child_id = child_task["id"].as_str().unwrap().to_string();
-
-    let status = run_choco_json(&daemon.base_url, &["task", "status", &child_id]).await;
+    let status = run_choco_json(&daemon.base_url, &["task", "status", &task_id]).await;
     assert_eq!(status.code, Some(0), "stderr: {}", status.stderr);
     let detail = status.json();
-    assert_eq!(detail["parent_task_id"], parent_id);
     assert_eq!(detail["workflow_state"]["current_stage"], "chatting");
 }
 

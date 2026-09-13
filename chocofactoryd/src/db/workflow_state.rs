@@ -114,7 +114,6 @@ mod tests {
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "coding_task",
                 title: "T",
                 config: json!({}),
