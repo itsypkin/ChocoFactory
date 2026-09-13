@@ -114,8 +114,10 @@ only, no auth (Q15).
 
 Implement the `choco` binary (§6.2) as a thin HTTP client against the
 daemon: `task create`, `task status`, `task send`, `task list`, `project
-create`/`list`. Support `--parent-task <id>` to tag `tasks.parent_task_id`
-for delegation.
+create`/`list`. (Shipped with `--parent-task <id>` to tag
+`tasks.parent_task_id` for delegation; that flag and its column were
+removed again in [#83](https://github.com/itsypkin/ChocoFactory/issues/83)
+— see P2-8 below and design §7.)
 
 - Design ref: §6.2
 - Depends on: P1-9
@@ -227,15 +229,23 @@ from the tasks above.
 - Design ref: §5.1, §5.5
 - Depends on: P2-1, P2-2, P2-3, P2-4, P2-5, P2-6
 
-### P2-8. Task delegation end-to-end
+### P2-8. Task delegation end-to-end — dropped, not built
 
-Validate that an agent running inside a task can call `choco task create
---parent-task <id>` from within its subprocess environment and poll the
-child task's status (§6.2), exercised against a real coding-task run
-(P2-7) to confirm the composition story works, not just the chat case
-from Phase 1.
+Originally: validate that an agent running inside a task can call `choco
+task create --parent-task <id>` from within its subprocess environment and
+poll the child task's status (§6.2), exercised against a real coding-task
+run (P2-7).
 
-- Design ref: §6.2
+Never implementable as written. The daemon tells an agent subprocess
+nothing about its own task, so an agent could never supply the id —
+validation would first have had to build the mechanism. With no use case
+for a task spawning a child task,
+[#19](https://github.com/itsypkin/ChocoFactory/issues/19) was closed undone
+and the surface removed in
+[#83](https://github.com/itsypkin/ChocoFactory/issues/83). Design §7
+records what a future attempt would need.
+
+- Design ref: §6.2, §7
 - Depends on: P1-10, P2-7
 
 ## Additive — not gated by phase
@@ -351,6 +361,6 @@ Milestones: [Phase 1 — Chat MVP](https://github.com/itsypkin/ChocoFactory/mile
 | P2-5  | [#16](https://github.com/itsypkin/ChocoFactory/issues/16) |
 | P2-6  | [#17](https://github.com/itsypkin/ChocoFactory/issues/17) |
 | P2-7  | [#18](https://github.com/itsypkin/ChocoFactory/issues/18) |
-| P2-8  | [#19](https://github.com/itsypkin/ChocoFactory/issues/19) |
+| P2-8  | [#19](https://github.com/itsypkin/ChocoFactory/issues/19) (closed undone; surface removed in [#83](https://github.com/itsypkin/ChocoFactory/issues/83)) |
 | X-1   | [#32](https://github.com/itsypkin/ChocoFactory/issues/32) |
 | X-2   | [#42](https://github.com/itsypkin/ChocoFactory/issues/42) |

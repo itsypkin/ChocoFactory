@@ -21,8 +21,6 @@ pub struct Project {
 pub struct Task {
     pub id: String,
     pub project_id: String,
-    /// Set when this task was spawned via delegation from another task (§6.2).
-    pub parent_task_id: Option<String>,
     pub workflow_def: String,
     pub title: String,
     /// Free-form for now (e.g. "open", "closed") — the full set of values

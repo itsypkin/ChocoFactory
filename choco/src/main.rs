@@ -1,6 +1,6 @@
 //! `choco` (P1-10, design §6.2): a thin HTTP client against `chocofactoryd`'s
 //! API, covering task create/status/send/list/events and project
-//! create/list, with `--parent-task` support for delegation.
+//! create/list.
 
 mod cli;
 mod client;
@@ -139,7 +139,6 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                     title: &args.title,
                     prompt: &args.prompt,
                     config,
-                    parent_task_id: args.parent_task.as_deref(),
                 })
                 .await?;
             Ok(Output::Task(task))

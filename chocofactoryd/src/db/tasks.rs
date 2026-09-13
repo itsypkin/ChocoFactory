@@ -5,14 +5,13 @@ use sqlx::types::Json;
 use sqlx::{FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
-const COLUMNS: &str = "id, project_id, parent_task_id, workflow_def, title, status, config, \
+const COLUMNS: &str = "id, project_id, workflow_def, title, status, config, \
      worktree_repo, worktree_project, stuck_reason, created_at, updated_at";
 
 #[derive(FromRow)]
 struct TaskRow {
     id: String,
     project_id: String,
-    parent_task_id: Option<String>,
     workflow_def: String,
     title: String,
     status: String,
@@ -29,7 +28,6 @@ impl From<TaskRow> for Task {
         Task {
             id: row.id,
             project_id: row.project_id,
-            parent_task_id: row.parent_task_id,
             workflow_def: row.workflow_def,
             title: row.title,
             status: row.status,
@@ -45,7 +43,6 @@ impl From<TaskRow> for Task {
 
 pub struct NewTask<'a> {
     pub project_id: &'a str,
-    pub parent_task_id: Option<&'a str>,
     pub workflow_def: &'a str,
     pub title: &'a str,
     pub config: Value,
@@ -55,13 +52,12 @@ pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::E
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRow>(&format!(
-        "INSERT INTO tasks (id, project_id, parent_task_id, workflow_def, title, status, config, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
+        "INSERT INTO tasks (id, project_id, workflow_def, title, status, config, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'open', ?, ?, ?)
          RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(new.project_id)
-    .bind(new.parent_task_id)
     .bind(new.workflow_def)
     .bind(new.title)
     .bind(Json(new.config))
@@ -265,7 +261,6 @@ mod tests {
             &pool,
             NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "Investigate flaky test",
                 config: json!({"model": "sonnet"}),
@@ -304,7 +299,6 @@ mod tests {
             pool,
             NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: "multi-role",
                 title: "T",
                 config,
@@ -506,7 +500,6 @@ mod tests {
             &pool,
             NewTask {
                 project_id: &project_a,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "A1",
                 config: json!({}),
@@ -518,7 +511,6 @@ mod tests {
             &pool,
             NewTask {
                 project_id: &project_b,
-                parent_task_id: None,
                 workflow_def: "chat",
                 title: "B1",
                 config: json!({}),
@@ -538,37 +530,6 @@ mod tests {
 
         let all = list(&pool, None, None).await.unwrap();
         assert_eq!(all.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn parent_task_id_round_trips() {
-        let pool = connect_in_memory().await.unwrap();
-        let project_id = seed_project(&pool).await;
-        let parent = create(
-            &pool,
-            NewTask {
-                project_id: &project_id,
-                parent_task_id: None,
-                workflow_def: "coding_task",
-                title: "Parent",
-                config: json!({}),
-            },
-        )
-        .await
-        .unwrap();
-        let child = create(
-            &pool,
-            NewTask {
-                project_id: &project_id,
-                parent_task_id: Some(&parent.id),
-                workflow_def: "chat",
-                title: "Child",
-                config: json!({}),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(child.parent_task_id, Some(parent.id));
     }
 
     // ---- stuck_reason / mark_stuck / reopen_stuck (X-4, #61) ----

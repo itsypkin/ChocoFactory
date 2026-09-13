@@ -48,9 +48,7 @@ impl From<CreateTaskError> for ApiError {
             CreateTaskError::Resolve(ResolveError::NotFound(_)) => {
                 ApiError::NotFound(err.to_string())
             }
-            CreateTaskError::NoSuchProject(_) | CreateTaskError::NoSuchParentTask(_) => {
-                ApiError::NotFound(err.to_string())
-            }
+            CreateTaskError::NoSuchProject(_) => ApiError::NotFound(err.to_string()),
             CreateTaskError::Start {
                 source: EngineError::MissingAgentTurnInput(_),
                 ..

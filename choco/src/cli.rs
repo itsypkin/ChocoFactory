@@ -161,9 +161,6 @@ pub struct TaskCreateArgs {
     /// `config.cwd`.
     #[arg(long)]
     pub repo: Option<String>,
-    /// Tags this task as spawned via delegation from another task.
-    #[arg(long = "parent-task")]
-    pub parent_task: Option<String>,
     #[command(flatten)]
     pub roles: RoleOverrideArgs,
 }

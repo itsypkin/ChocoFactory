@@ -330,9 +330,6 @@ pub enum CreateTaskError {
     /// produces — the same care `db::projects::delete`'s own caller
     /// already takes for the opposite direction of that same FK.
     NoSuchProject(String),
-    /// `parent_task_id` was supplied but doesn't reference an existing
-    /// task — same reasoning as `NoSuchProject`.
-    NoSuchParentTask(String),
     Db(sqlx::Error),
     /// `start_task` failed for the task row this call just wrote (X-4,
     /// issue #61). Carries `task_id` — the caller only ever sees this
@@ -352,7 +349,6 @@ impl fmt::Display for CreateTaskError {
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
             CreateTaskError::NoSuchProject(id) => write!(f, "no such project '{id}'"),
-            CreateTaskError::NoSuchParentTask(id) => write!(f, "no such parent task '{id}'"),
             CreateTaskError::Db(err) => write!(f, "{err}"),
             CreateTaskError::Start { task_id, source } => {
                 write!(f, "task '{task_id}' failed to start: {source}")
@@ -394,14 +390,15 @@ pub enum SendMessageError {
     /// be raced by a concurrent `cancel_task`.
     TaskCancelled,
     /// The task is `stuck` (X-4, issue #61) — detected under the per-task
-    /// lock, the same way `TaskCancelled` is. Carries the task's
-    /// `stuck_reason`, and `can_retry` — whether the task even has a
-    /// `workflow_state` row for `retry_task` to re-enter. A task marked
-    /// stuck before one was ever created (`create_task`'s `start_task`
-    /// failing before `workflow_state::create` runs) can only ever be
-    /// cancelled; pointing its operator at `task retry` would just trade
-    /// one 409 for another.
+    /// lock, the same way `TaskCancelled` is. Carries the task's own `id`
+    /// (so the hint below can name it), its `stuck_reason`, and
+    /// `can_retry` — whether the task even has a `workflow_state` row for
+    /// `retry_task` to re-enter. A task marked stuck before one was ever
+    /// created (`create_task`'s `start_task` failing before
+    /// `workflow_state::create` runs) can only ever be cancelled; pointing
+    /// its operator at `task retry` would just trade one 409 for another.
     TaskStuck {
+        task_id: String,
         reason: String,
         can_retry: bool,
     },
@@ -439,14 +436,20 @@ impl fmt::Display for SendMessageError {
             SendMessageError::TaskCancelled => {
                 write!(f, "task was cancelled and accepts no further messages")
             }
-            SendMessageError::TaskStuck { reason, can_retry } => {
+            SendMessageError::TaskStuck {
+                task_id,
+                reason,
+                can_retry,
+            } => {
                 if *can_retry {
-                    write!(f, "task is stuck: {reason}; run 'choco task retry <id>'")
+                    write!(
+                        f,
+                        "task is stuck: {reason}; run 'choco task retry {task_id}'"
+                    )
                 } else {
                     write!(
                         f,
-                        "task is stuck: {reason}; it never reached a stage, so it cannot be \
-                         retried — run 'choco task cancel <id>'"
+                        "task is stuck: {reason}; run 'choco task cancel {task_id}'"
                     )
                 }
             }
@@ -493,9 +496,10 @@ pub enum SendMessageOrResumeError {
     TaskCancelled,
     /// The task is `stuck` (X-4, issue #61), so it accepts no further
     /// messages or resume signals until `retry_task` reopens it. Carries
-    /// the `stuck_reason` and `can_retry`, same as `SendMessageError::
-    /// TaskStuck`.
+    /// the task's `id`, `stuck_reason`, and `can_retry`, same as
+    /// `SendMessageError::TaskStuck`.
     TaskStuck {
+        task_id: String,
         reason: String,
         can_retry: bool,
     },
@@ -523,14 +527,20 @@ impl fmt::Display for SendMessageOrResumeError {
             SendMessageOrResumeError::TaskCancelled => {
                 write!(f, "task was cancelled and accepts no further messages")
             }
-            SendMessageOrResumeError::TaskStuck { reason, can_retry } => {
+            SendMessageOrResumeError::TaskStuck {
+                task_id,
+                reason,
+                can_retry,
+            } => {
                 if *can_retry {
-                    write!(f, "task is stuck: {reason}; run 'choco task retry <id>'")
+                    write!(
+                        f,
+                        "task is stuck: {reason}; run 'choco task retry {task_id}'"
+                    )
                 } else {
                     write!(
                         f,
-                        "task is stuck: {reason}; it never reached a stage, so it cannot be \
-                         retried — run 'choco task cancel <id>'"
+                        "task is stuck: {reason}; run 'choco task cancel {task_id}'"
                     )
                 }
             }
@@ -688,16 +698,9 @@ impl WorkflowEngine {
     /// `workflow_def_name` is resolved and the definition freshly loaded
     /// on every call, not cached (P1-8 LLD §4.5) — the same file `WorkflowEngine`
     /// would otherwise have to invalidate a cache entry for.
-    ///
-    /// `parent_task_id` tags this task as spawned via delegation (§6.2's
-    /// `choco task create --parent-task <id>`) — purely a label for the UI
-    /// and for a parent task to poll; it has no effect on how this task's
-    /// own workflow runs.
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_task(
         self: &Arc<Self>,
         project_id: &str,
-        parent_task_id: Option<&str>,
         workflow_def_name: &str,
         title: &str,
         initial_input: &str,
@@ -709,25 +712,18 @@ impl WorkflowEngine {
             Arc::new(WorkflowDefinition::load(&path).map_err(CreateTaskError::WorkflowDef)?);
 
         // Checked explicitly rather than left to surface as a raw FK
-        // violation from the `INSERT` below (P1-9 review): both columns
-        // are foreign keys (`tasks.project_id`/`tasks.parent_task_id`),
-        // and `db::pool::connect` enables `foreign_keys`, so a bad id
-        // would otherwise fail as an opaque `sqlx::Error` instead of a
-        // reported, specific error the API layer can map to 404.
+        // violation from the `INSERT` below (P1-9 review): `tasks.project_id`
+        // is a foreign key and `db::pool::connect` enables `foreign_keys`, so
+        // a bad id would otherwise fail as an opaque `sqlx::Error` instead of
+        // a reported, specific error the API layer can map to 404.
         if projects::get(&self.pool, project_id).await?.is_none() {
             return Err(CreateTaskError::NoSuchProject(project_id.to_string()));
-        }
-        if let Some(parent_id) = parent_task_id
-            && tasks::get(&self.pool, parent_id).await?.is_none()
-        {
-            return Err(CreateTaskError::NoSuchParentTask(parent_id.to_string()));
         }
 
         let task = tasks::create(
             &self.pool,
             tasks::NewTask {
                 project_id,
-                parent_task_id,
                 workflow_def: workflow_def_name,
                 title,
                 config,
@@ -886,6 +882,7 @@ impl WorkflowEngine {
                 }
             };
             return Err(SendMessageError::TaskStuck {
+                task_id: task.id.clone(),
                 reason: task.stuck_reason.clone().unwrap_or_default(),
                 can_retry,
             });
@@ -1032,6 +1029,7 @@ impl WorkflowEngine {
                 }
             };
             return Err(SendMessageOrResumeError::TaskStuck {
+                task_id: task.id.clone(),
                 reason: task.stuck_reason.clone().unwrap_or_default(),
                 can_retry,
             });
@@ -4649,7 +4647,6 @@ mod tests {
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def,
                 title: "T",
                 config: json!({}),
@@ -5835,7 +5832,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": dir.to_string_lossy() }),
@@ -6022,7 +6018,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": dir.to_string_lossy() }),
@@ -6340,7 +6335,6 @@ stages:
         let task = engine
             .create_task(
                 &project_id,
-                None,
                 "chat",
                 "flaky test",
                 "hey, look into it",
@@ -6365,7 +6359,7 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
 
         let err = engine
-            .create_task(&project_id, None, "ghost", "t", "hi", json!({}))
+            .create_task(&project_id, "ghost", "t", "hi", json!({}))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -6382,37 +6376,12 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
 
         let err = engine
-            .create_task("no-such-project", None, "chat", "t", "hi", json!({}))
+            .create_task("no-such-project", "chat", "t", "hi", json!({}))
             .await
             .unwrap_err();
         assert!(matches!(
             err,
             CreateTaskError::NoSuchProject(id) if id == "no-such-project"
-        ));
-    }
-
-    #[tokio::test]
-    async fn create_task_with_a_nonexistent_parent_task_id_is_a_reported_error() {
-        let pool = connect_in_memory().await.unwrap();
-        let workflows_dir = tempdir();
-        write_chat_workflow(&workflows_dir);
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
-        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
-
-        let err = engine
-            .create_task(
-                &project_id,
-                Some("no-such-task"),
-                "chat",
-                "t",
-                "hi",
-                json!({}),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            CreateTaskError::NoSuchParentTask(id) if id == "no-such-task"
         ));
     }
 
@@ -6429,7 +6398,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .create_task(&project_id, "chat", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -6481,7 +6450,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .create_task(&project_id, "chat", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -6574,7 +6543,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "templated", "t", "ignored", json!({}))
+            .create_task(&project_id, "templated", "t", "ignored", json!({}))
             .await
             .unwrap();
 
@@ -6622,7 +6591,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "has-outcome", "t", "hello", json!({}))
+            .create_task(&project_id, "has-outcome", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -6825,7 +6794,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "chat", "t", "hello", json!({}))
+            .create_task(&project_id, "chat", "t", "hello", json!({}))
             .await
             .unwrap();
 
@@ -6966,7 +6935,6 @@ stages:
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def,
                 title: "T",
                 config: json!({ "cwd": cwd.to_string_lossy() }),
@@ -8802,7 +8770,6 @@ roles:
         let task = engine
             .create_task(
                 &project_id,
-                None,
                 "multi-role",
                 "T",
                 "go",
@@ -8901,7 +8868,7 @@ stages:
         );
 
         let task = engine
-            .create_task(&project_id, None, "gated-review", "T", "go", json!({}))
+            .create_task(&project_id, "gated-review", "T", "go", json!({}))
             .await
             .unwrap();
         wait_until_stage(&pool, &task.id, "coding").await;
@@ -9005,7 +8972,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -9060,7 +9026,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -9099,7 +9064,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -9174,7 +9138,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -9486,7 +9449,6 @@ esac
             pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "Add a small feature",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -9727,7 +9689,6 @@ stages:
             &pool,
             tasks::NewTask {
                 project_id: &project_id,
-                parent_task_id: None,
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
@@ -10459,7 +10420,7 @@ stages:
         );
 
         let err = engine
-            .create_task(&project_id, None, "broken", "t", "hello", json!({}))
+            .create_task(&project_id, "broken", "t", "hello", json!({}))
             .await
             .unwrap_err();
 
@@ -10646,7 +10607,7 @@ stages:
         );
 
         engine
-            .create_task(&project_id, None, "broken", "t", "hello", json!({}))
+            .create_task(&project_id, "broken", "t", "hello", json!({}))
             .await
             .unwrap_err();
         let tasks = tasks::list(&pool, Some(&project_id), None).await.unwrap();
@@ -10765,7 +10726,7 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
 
         let err = engine
-            .create_task(&project_id, None, "worktree-entry", "t", "hello", json!({}))
+            .create_task(&project_id, "worktree-entry", "t", "hello", json!({}))
             .await
             .unwrap_err();
 
