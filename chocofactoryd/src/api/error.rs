@@ -51,16 +51,18 @@ impl From<CreateTaskError> for ApiError {
             CreateTaskError::NoSuchProject(_) | CreateTaskError::NoSuchParentTask(_) => {
                 ApiError::NotFound(err.to_string())
             }
-            CreateTaskError::Start(EngineError::MissingAgentTurnInput(_)) => {
-                ApiError::BadRequest(err.to_string())
-            }
+            CreateTaskError::Start {
+                source: EngineError::MissingAgentTurnInput(_),
+                ..
+            } => ApiError::BadRequest(err.to_string()),
             // The task row is written before `start_task` runs, so a cancel
             // can land in that window and `start_task`'s guard will refuse
             // to start it (#69). Someone cancelled the task out from under
             // the create — a conflict, not a server fault.
-            CreateTaskError::Start(EngineError::TaskCancelled(_)) => {
-                ApiError::Conflict(err.to_string())
-            }
+            CreateTaskError::Start {
+                source: EngineError::TaskCancelled(_),
+                ..
+            } => ApiError::Conflict(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -80,7 +82,7 @@ impl From<SendMessageOrResumeError> for ApiError {
             // Same shape again, for a `stuck` task (X-4, issue #61): well
             // formed request, wrong state — `choco task retry` is what
             // fixes it, not a different request shape.
-            | SendMessageOrResumeError::TaskStuck(_) => ApiError::Conflict(err.to_string()),
+            | SendMessageOrResumeError::TaskStuck { .. } => ApiError::Conflict(err.to_string()),
             // A `human_gate`'s `resumed` relay lost a race with another
             // caller resuming the same task concurrently (P1-9 review):
             // `advance()`'s own per-task lock means `workflow_state` is
@@ -112,7 +114,7 @@ impl From<SendMessageOrResumeError> for ApiError {
             // Same conflict reached through the `agent_turn` branch, where
             // `send_message` re-checks the status under the per-task lock.
             SendMessageOrResumeError::SendMessage(
-                SendMessageError::TaskCancelled | SendMessageError::TaskStuck(_),
+                SendMessageError::TaskCancelled | SendMessageError::TaskStuck { .. },
             ) => ApiError::Conflict(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }

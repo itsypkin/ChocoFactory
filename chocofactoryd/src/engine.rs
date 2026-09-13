@@ -334,7 +334,16 @@ pub enum CreateTaskError {
     /// task — same reasoning as `NoSuchProject`.
     NoSuchParentTask(String),
     Db(sqlx::Error),
-    Start(EngineError),
+    /// `start_task` failed for the task row this call just wrote (X-4,
+    /// issue #61). Carries `task_id` — the caller only ever sees this
+    /// `Err`, never the `Task` `start_task` was trying to start, so
+    /// without it there'd be no way to find the now-`stuck` (or, per
+    /// `create_task`'s own `TaskCancelled` carve-out, still-`open`) row
+    /// this error is about.
+    Start {
+        task_id: String,
+        source: EngineError,
+    },
 }
 
 impl fmt::Display for CreateTaskError {
@@ -345,7 +354,9 @@ impl fmt::Display for CreateTaskError {
             CreateTaskError::NoSuchProject(id) => write!(f, "no such project '{id}'"),
             CreateTaskError::NoSuchParentTask(id) => write!(f, "no such parent task '{id}'"),
             CreateTaskError::Db(err) => write!(f, "{err}"),
-            CreateTaskError::Start(err) => write!(f, "{err}"),
+            CreateTaskError::Start { task_id, source } => {
+                write!(f, "task '{task_id}' failed to start: {source}")
+            }
         }
     }
 }
@@ -384,9 +395,16 @@ pub enum SendMessageError {
     TaskCancelled,
     /// The task is `stuck` (X-4, issue #61) — detected under the per-task
     /// lock, the same way `TaskCancelled` is. Carries the task's
-    /// `stuck_reason` so the error message can point at `task retry`
-    /// without a second lookup.
-    TaskStuck(String),
+    /// `stuck_reason`, and `can_retry` — whether the task even has a
+    /// `workflow_state` row for `retry_task` to re-enter. A task marked
+    /// stuck before one was ever created (`create_task`'s `start_task`
+    /// failing before `workflow_state::create` runs) can only ever be
+    /// cancelled; pointing its operator at `task retry` would just trade
+    /// one 409 for another.
+    TaskStuck {
+        reason: String,
+        can_retry: bool,
+    },
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     RoleConfig(RoleConfigError),
@@ -421,8 +439,16 @@ impl fmt::Display for SendMessageError {
             SendMessageError::TaskCancelled => {
                 write!(f, "task was cancelled and accepts no further messages")
             }
-            SendMessageError::TaskStuck(reason) => {
-                write!(f, "task is stuck: {reason}; run 'choco task retry <id>'")
+            SendMessageError::TaskStuck { reason, can_retry } => {
+                if *can_retry {
+                    write!(f, "task is stuck: {reason}; run 'choco task retry <id>'")
+                } else {
+                    write!(
+                        f,
+                        "task is stuck: {reason}; it never reached a stage, so it cannot be \
+                         retried — run 'choco task cancel <id>'"
+                    )
+                }
             }
             SendMessageError::Resolve(err) => write!(f, "{err}"),
             SendMessageError::WorkflowDef(err) => write!(f, "{err}"),
@@ -467,8 +493,12 @@ pub enum SendMessageOrResumeError {
     TaskCancelled,
     /// The task is `stuck` (X-4, issue #61), so it accepts no further
     /// messages or resume signals until `retry_task` reopens it. Carries
-    /// the `stuck_reason`.
-    TaskStuck(String),
+    /// the `stuck_reason` and `can_retry`, same as `SendMessageError::
+    /// TaskStuck`.
+    TaskStuck {
+        reason: String,
+        can_retry: bool,
+    },
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     Db(sqlx::Error),
@@ -493,8 +523,16 @@ impl fmt::Display for SendMessageOrResumeError {
             SendMessageOrResumeError::TaskCancelled => {
                 write!(f, "task was cancelled and accepts no further messages")
             }
-            SendMessageOrResumeError::TaskStuck(reason) => {
-                write!(f, "task is stuck: {reason}; run 'choco task retry <id>'")
+            SendMessageOrResumeError::TaskStuck { reason, can_retry } => {
+                if *can_retry {
+                    write!(f, "task is stuck: {reason}; run 'choco task retry <id>'")
+                } else {
+                    write!(
+                        f,
+                        "task is stuck: {reason}; it never reached a stage, so it cannot be \
+                         retried — run 'choco task cancel <id>'"
+                    )
+                }
             }
             SendMessageOrResumeError::Resolve(err) => write!(f, "{err}"),
             SendMessageOrResumeError::WorkflowDef(err) => write!(f, "{err}"),
@@ -710,10 +748,45 @@ impl WorkflowEngine {
             // moving the task forward, so it's reported the same way any
             // other stage-entry failure is.
             if !matches!(err, EngineError::TaskCancelled(_)) {
-                self.mark_stuck(&task.id, &format!("failed to start: {err}"))
-                    .await;
+                // `start_task` writes `workflow_state` before it ever calls
+                // `enter_stage` (review, X-4 round 2). A failure that
+                // happens *before* that — `worktree::ensure` erroring on a
+                // `worktree: true` workflow with no `config.cwd`, chiefly —
+                // leaves no stage at all for `retry_task` to re-enter, so
+                // the reason says so up front instead of pointing an
+                // operator at a `choco task retry` that can only ever 409.
+                let has_workflow_state = match workflow_state::get(&self.pool, &task.id).await {
+                    Ok(state) => state.is_some(),
+                    Err(db_err) => {
+                        tracing::error!(
+                            task_id = %task.id, %db_err,
+                            "failed to check for a workflow_state row while recording why a \
+                             task failed to start; assuming one exists"
+                        );
+                        true
+                    }
+                };
+                let reason = if has_workflow_state {
+                    format!("failed to start: {err}")
+                } else {
+                    format!(
+                        "failed to start before reaching a stage: {err}; cannot be retried, \
+                         cancel it"
+                    )
+                };
+                // `enter_stage` already appends its own `Error` event for a
+                // template failure — see `mark_stuck`'s doc comment.
+                self.mark_stuck(
+                    &task.id,
+                    &reason,
+                    matches!(err, EngineError::Template { .. }),
+                )
+                .await;
             }
-            return Err(CreateTaskError::Start(err));
+            return Err(CreateTaskError::Start {
+                task_id: task.id.clone(),
+                source: err,
+            });
         }
 
         Ok(task)
@@ -793,11 +866,29 @@ impl WorkflowEngine {
         // Same reasoning as the cancelled check above, for the same reason
         // (X-4, issue #61): a stuck task has no live session worth resuming
         // a message into, and `choco task retry` is how it's expected to
-        // move again.
+        // move again — unless it never reached a stage at all, in which
+        // case only `choco task cancel` can (see `TaskStuck::can_retry`).
         if task.status == TASK_STATUS_STUCK {
-            return Err(SendMessageError::TaskStuck(
-                task.stuck_reason.clone().unwrap_or_default(),
-            ));
+            // Best-effort, like the identical check in `create_task`: this
+            // only decides which hint the error carries, so a transient DB
+            // failure here must not turn an honest 409 into a 500 — the
+            // task genuinely is stuck either way. Defaults to `true` (the
+            // common case) rather than failing closed.
+            let can_retry = match workflow_state::get(&self.pool, task_id).await {
+                Ok(state) => state.is_some(),
+                Err(err) => {
+                    tracing::error!(
+                        task_id, %err,
+                        "failed to check for a workflow_state row while reporting a stuck \
+                         task; assuming it can be retried"
+                    );
+                    true
+                }
+            };
+            return Err(SendMessageError::TaskStuck {
+                reason: task.stuck_reason.clone().unwrap_or_default(),
+                can_retry,
+            });
         }
 
         let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
@@ -923,11 +1014,27 @@ impl WorkflowEngine {
         // Same reasoning, for the same reason (X-4, issue #61): a stuck
         // task's stage has already given up, so there's no live session or
         // waiting `human_gate` to resume — only `choco task retry` moves it
-        // again.
+        // again, unless it never reached a stage at all (see
+        // `TaskStuck::can_retry`).
         if task.status == TASK_STATUS_STUCK {
-            return Err(SendMessageOrResumeError::TaskStuck(
-                task.stuck_reason.clone().unwrap_or_default(),
-            ));
+            // Best-effort, same as `send_message_locked`'s identical check:
+            // a transient DB failure here must not turn an honest 409 into
+            // a 500 over a hint that's purely cosmetic.
+            let can_retry = match workflow_state::get(&self.pool, task_id).await {
+                Ok(state) => state.is_some(),
+                Err(err) => {
+                    tracing::error!(
+                        task_id, %err,
+                        "failed to check for a workflow_state row while reporting a stuck \
+                         task; assuming it can be retried"
+                    );
+                    true
+                }
+            };
+            return Err(SendMessageOrResumeError::TaskStuck {
+                reason: task.stuck_reason.clone().unwrap_or_default(),
+                can_retry,
+            });
         }
 
         let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
@@ -1185,10 +1292,21 @@ impl WorkflowEngine {
     /// only an `open` task actually changes — so a late failure racing a
     /// concurrent `cancel_task`/`retry_task` can never clobber whatever
     /// status that other caller already settled on.
-    async fn mark_stuck(&self, task_id: &str, reason: &str) {
+    ///
+    /// `event_already_recorded` is `true` only when the caller is forwarding
+    /// an `EngineError::Template` it got back from `enter_stage`: that path
+    /// already appends its own stage-scoped `Error` event before returning
+    /// the error (review, X-4 round 2), so appending a second one here with
+    /// `stuck: true` would double the same failure up on the timeline. The
+    /// status write below still happens either way — only the event is
+    /// skipped.
+    async fn mark_stuck(&self, task_id: &str, reason: &str, event_already_recorded: bool) {
         match tasks::mark_stuck(&self.pool, task_id, reason).await {
             Ok(true) => {
                 tracing::error!(task_id, reason, "task stuck: {reason}");
+                if event_already_recorded {
+                    return;
+                }
                 let stage = match workflow_state::get(&self.pool, task_id).await {
                     Ok(Some(state)) => json!(state.current_stage),
                     Ok(None) => Value::Null,
@@ -1227,6 +1345,40 @@ impl WorkflowEngine {
                 task_id, reason, %err,
                 "failed to mark task stuck"
             ),
+        }
+    }
+
+    /// The stage a catch-all transition failure should be blamed on and
+    /// retried against (X-4 review, round 2).
+    ///
+    /// `advance_from_stage` commits `workflow_state.current_stage` to the
+    /// *next* stage, via `workflow_state::update`, strictly before it calls
+    /// `enter_stage` on that next stage — so when `enter_stage` then fails
+    /// (a session that won't start, chief among them), the task is already
+    /// sitting in a stage different from the one whose `finish_*` caller is
+    /// reporting the failure. Naming `from_stage` in that reason would point
+    /// `choco task status` and a retry at the wrong stage: the one that
+    /// finished cleanly, not the one that never started.
+    ///
+    /// Reads `workflow_state` back to tell the two cases apart: unchanged
+    /// (or unreadable) means the failure was in the transition itself, so
+    /// `from_stage` is still right; a different value means the *next*
+    /// stage is the one that failed to start, and that's what gets blamed.
+    /// The read failing degrades to `from_stage` rather than blocking
+    /// `mark_stuck` — this only decides which stage name goes in the
+    /// reason, and a stale-but-present reason beats none at all.
+    async fn stage_to_blame(&self, task_id: &str, from_stage: &str) -> String {
+        match workflow_state::get(&self.pool, task_id).await {
+            Ok(Some(state)) => state.current_stage,
+            Ok(None) => from_stage.to_string(),
+            Err(err) => {
+                tracing::warn!(
+                    task_id, from_stage, %err,
+                    "could not read workflow_state to find which stage a transition failure \
+                     belongs to; blaming the stage that just finished"
+                );
+                from_stage.to_string()
+            }
         }
     }
 
@@ -1307,10 +1459,19 @@ impl WorkflowEngine {
         // `None` means the status changed under us since step 1's read —
         // impossible while this function holds the per-task lock unless
         // that invariant is broken, but reported as `NotStuck` rather than
-        // assumed unreachable.
-        tasks::reopen_stuck(&self.pool, task_id)
-            .await?
-            .ok_or_else(|| RetryTaskError::NotStuck(TASK_STATUS_STUCK.to_string()))?;
+        // assumed unreachable. Re-reads the task for its *actual* current
+        // status rather than reusing the stale `"stuck"` this function
+        // already knows is wrong (that would render as the
+        // self-contradictory "task is 'stuck', not 'stuck', so it cannot
+        // be retried"). If the row is gone entirely, that's `NoSuchTask` —
+        // the same error step 1 would have returned had it read this late —
+        // rather than a fabricated status no `Task` ever actually has.
+        if tasks::reopen_stuck(&self.pool, task_id).await?.is_none() {
+            return Err(match tasks::get(&self.pool, task_id).await? {
+                Some(t) => RetryTaskError::NotStuck(t.status),
+                None => RetryTaskError::NoSuchTask,
+            });
+        }
 
         // Step 3 — work out a prompt_file-less agent_turn's input the same
         // way `start_task`/`advance_from_stage` do (P2-7a's
@@ -1343,9 +1504,12 @@ impl WorkflowEngine {
             )
             .await
         {
+            // `enter_stage` already appends its own `Error` event for a
+            // template failure — see `mark_stuck`'s doc comment.
             self.mark_stuck(
                 task_id,
                 &format!("stage '{current_stage}': retry failed: {err}"),
+                matches!(err, EngineError::Template { .. }),
             )
             .await;
             return Err(RetryTaskError::Enter(err));
@@ -2357,6 +2521,7 @@ impl WorkflowEngine {
                         "stage '{stage}': command finished with outcome '{outcome}' but the \
                          stage has no 'on:' edge for it"
                     ),
+                    false,
                 )
                 .await;
             }
@@ -2394,11 +2559,26 @@ impl WorkflowEngine {
                     task_id, stage = stage_name, outcome, %err,
                     "task wedged: its shell stage completed but the transition failed"
                 );
+                // `stage_to_blame` names whichever stage actually failed:
+                // `stage_name` itself if the transition failed outright, or
+                // the *next* stage if `stage_name` completed fine but that
+                // next stage couldn't be entered.
+                let blamed = self.stage_to_blame(task_id, stage_name).await;
+                let reason = if blamed == stage_name {
+                    format!(
+                        "stage '{stage_name}': command completed but the transition failed: {err}"
+                    )
+                } else {
+                    format!(
+                        "stage '{blamed}': could not be entered after '{stage_name}' completed: {err}"
+                    )
+                };
+                // `enter_stage` already appends its own `Error` event for a
+                // template failure — see `mark_stuck`'s doc comment.
                 self.mark_stuck(
                     task_id,
-                    &format!(
-                        "stage '{stage_name}': command completed but the transition failed: {err}"
-                    ),
+                    &reason,
+                    matches!(err, EngineError::Template { .. }),
                 )
                 .await;
             }
@@ -2957,6 +3137,7 @@ impl WorkflowEngine {
                         "stage '{stage}': command finished with outcome '{outcome}' but the \
                          stage has no 'on:' edge for it"
                     ),
+                    false,
                 )
                 .await;
             }
@@ -2989,11 +3170,23 @@ impl WorkflowEngine {
                     task_id, stage = stage_name, outcome, %err,
                     "task wedged: its poll stage resolved but the transition failed"
                 );
+                // See `finish_shell_stage`'s identical catch-all for why
+                // this blames whichever stage actually failed rather than
+                // always `stage_name`.
+                let blamed = self.stage_to_blame(task_id, stage_name).await;
+                let reason = if blamed == stage_name {
+                    format!(
+                        "stage '{stage_name}': command completed but the transition failed: {err}"
+                    )
+                } else {
+                    format!(
+                        "stage '{blamed}': could not be entered after '{stage_name}' completed: {err}"
+                    )
+                };
                 self.mark_stuck(
                     task_id,
-                    &format!(
-                        "stage '{stage_name}': command completed but the transition failed: {err}"
-                    ),
+                    &reason,
+                    matches!(err, EngineError::Template { .. }),
                 )
                 .await;
             }
@@ -3255,6 +3448,7 @@ impl WorkflowEngine {
                                     "stage '{stage_name}': the agent turn was force-closed by \
                                      the idle reaper before completing"
                                 ),
+                                false,
                             )
                             .await;
                         return;
@@ -3273,6 +3467,7 @@ impl WorkflowEngine {
                                     "stage '{stage_name}': the agent process exited without \
                                      completing its turn"
                                 ),
+                                false,
                             )
                             .await;
                         return;
@@ -3299,6 +3494,7 @@ impl WorkflowEngine {
                                 &format!(
                                     "stage '{stage_name}': lost track of the agent turn: {err}"
                                 ),
+                                false,
                             )
                             .await;
                         return;
@@ -3499,6 +3695,7 @@ impl WorkflowEngine {
                                         "stage '{stage_name}': the turn's reply could not be \
                                          read back: {err}"
                                     ),
+                                    false,
                                 )
                                 .await;
                                 return;
@@ -3572,7 +3769,7 @@ impl WorkflowEngine {
                     ),
                     None => format!("stage '{stage}': turn outcome '{outcome}' has no 'on:' edge"),
                 };
-                self.mark_stuck(task_id, &reason).await;
+                self.mark_stuck(task_id, &reason, false).await;
                 Some(format!(
                     "parked: stage '{stage}' has no 'on:' edge for '{outcome}'"
                 ))
@@ -3607,11 +3804,21 @@ impl WorkflowEngine {
                     task_id, stage = stage_name, outcome, %err,
                     "task wedged: its turn completed but the transition failed"
                 );
+                // See `finish_shell_stage`'s identical catch-all for why
+                // this blames whichever stage actually failed rather than
+                // always `stage_name`.
+                let blamed = self.stage_to_blame(task_id, stage_name).await;
+                let reason = if blamed == stage_name {
+                    format!("stage '{stage_name}': turn completed but the transition failed: {err}")
+                } else {
+                    format!(
+                        "stage '{blamed}': could not be entered after '{stage_name}' completed: {err}"
+                    )
+                };
                 self.mark_stuck(
                     task_id,
-                    &format!(
-                        "stage '{stage_name}': turn completed but the transition failed: {err}"
-                    ),
+                    &reason,
+                    matches!(err, EngineError::Template { .. }),
                 )
                 .await;
                 Some(format!("not applied: {err}"))
@@ -5394,9 +5601,20 @@ stages:
             task_run.id.clone(),
         );
 
-        tokio::time::sleep(StdDuration::from_millis(150)).await;
+        // Also marks the task stuck (X-4, issue #61; review round 2): the
+        // idle reaper closing a turn mid-flight is exactly the kind of
+        // giving-up this feature exists to surface, not just log.
+        wait_until_task_status(&pool, &task_id, "stuck").await;
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "gate");
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert!(
+            task.stuck_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("chatting") && r.contains("idle reaper")),
+            "{:?}",
+            task.stuck_reason
+        );
     }
 
     #[tokio::test]
@@ -10196,13 +10414,18 @@ stages:
             "workflow_state must already name the stage that failed to start"
         );
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-        // The reason names `run` — the shell stage whose *transition*
-        // failed — not `coding`, since that's the stage `finish_shell_stage`
-        // was told about; the session error itself is folded in verbatim.
+        // The reason names `coding` — the stage that actually failed to
+        // start — not `run`, which completed fine (review, X-4 round 2).
+        // `workflow_state.current_stage` already reads `coding` by the time
+        // `finish_shell_stage`'s catch-all runs, so that's also the stage
+        // `retry_task` would re-enter; naming `run` here would point a
+        // human (and a retry) at the wrong place.
         assert!(
             task.stuck_reason
                 .as_deref()
-                .is_some_and(|r| r.contains("run") && r.contains("transition failed")),
+                .is_some_and(|r| r.contains("coding")
+                    && r.contains("run")
+                    && r.contains("could not be entered")),
             "{:?}",
             task.stuck_reason
         );
@@ -10239,7 +10462,6 @@ stages:
             .create_task(&project_id, None, "broken", "t", "hello", json!({}))
             .await
             .unwrap_err();
-        assert!(matches!(err, CreateTaskError::Start(_)), "{err:?}");
 
         let tasks = tasks::list(&pool, Some(&project_id), None).await.unwrap();
         assert_eq!(
@@ -10247,6 +10469,14 @@ stages:
             1,
             "create_task must still have written the task row"
         );
+        // Review, X-4 round 2: the caller never sees the `Task` `start_task`
+        // was trying to start, only this `Err` — so `CreateTaskError::Start`
+        // must carry the id itself, or there'd be no way to find the
+        // now-`stuck` row from the error alone.
+        match &err {
+            CreateTaskError::Start { task_id, .. } => assert_eq!(task_id, &tasks[0].id),
+            other => panic!("expected CreateTaskError::Start, got {other:?}"),
+        }
         assert_eq!(tasks[0].status, "stuck");
         assert!(tasks[0].stuck_reason.is_some());
     }
@@ -10298,6 +10528,299 @@ stages:
         wait_until_task_status(&pool, &task_id, "stuck").await;
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
         assert!(task.stuck_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn retry_task_reruns_a_stuck_agent_turn_stage_and_it_can_succeed() {
+        // Review, X-4 round 2: every other retry test drives a `shell`
+        // stage; this is the case the issue names first — a stuck
+        // `agent_turn` whose session failed to start.
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("coder-turn.md"), "do the thing").unwrap();
+        let yaml = r#"
+name: shell-then-turn
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  run:
+    kind: shell
+    command: "true"
+    on: { done: coding }
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        // `retry_task` re-resolves the workflow from `workflows_dir` by
+        // name (unlike `start_task`, which is handed the already-parsed
+        // `def`), so the file has to actually be on disk for it to find.
+        std::fs::write(dir.join("shell-then-turn.yaml"), yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+
+        // A binary that can't be spawned at all, so `coding` never starts.
+        let broken_engine =
+            engine_with_adapter_and_workflows_dir(pool.clone(), "/no/such/binary-3f6c9a", &dir);
+        broken_engine
+            .start_task(&task_id, &def, None)
+            .await
+            .unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        assert_eq!(
+            workflow_state::get(&pool, &task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_stage,
+            "coding"
+        );
+
+        // `retry_task` doesn't have to come from the same engine instance
+        // that got the task stuck — only the pool and workflows_dir need to
+        // agree — so this models "the operator fixed whatever was wrong"
+        // (here: a working binary) between the failure and the retry.
+        let fixed_engine =
+            engine_with_adapter_and_workflows_dir(pool.clone(), &reply_binary(&dir, "ok"), &dir);
+        fixed_engine.retry_task(&task_id).await.unwrap();
+
+        wait_until_task_status(&pool, &task_id, "closed").await;
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.stuck_reason, None);
+
+        let trail = stage_trail(&pool, &task_id).await;
+        assert!(
+            trail
+                .iter()
+                .any(|(stage, outcome)| stage == "coding" && outcome == &json!("retry")),
+            "expected a stage_entered event with outcome 'retry': {trail:?}"
+        );
+        let runs: Vec<_> = task_runs::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.stage == "coding")
+            .collect();
+        assert_eq!(
+            runs.len(),
+            2,
+            "expected the failed session-start attempt's task_run and the retry's own"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_task_that_fails_synchronously_returns_enter_error_and_re_marks_stuck() {
+        // Review, X-4 round 2: the other "fails again" test fails
+        // asynchronously inside the spawned shell runner, so it never
+        // exercises `retry_task_locked`'s own `Err(err) => { mark_stuck; ...
+        // }` arm — this does, by re-entering an `agent_turn` whose session
+        // start fails synchronously, inside `enter_stage` itself.
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        std::fs::write(
+            workflows_dir.join("broken.yaml"),
+            r#"
+name: broken
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#,
+        )
+        .unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            "/no/such/binary-3f6c9a",
+            &workflows_dir,
+        );
+
+        engine
+            .create_task(&project_id, None, "broken", "t", "hello", json!({}))
+            .await
+            .unwrap_err();
+        let tasks = tasks::list(&pool, Some(&project_id), None).await.unwrap();
+        let task_id = tasks[0].id.clone();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+
+        // Same broken binary is still all this engine has, so re-entering
+        // `chatting` fails the same way, synchronously, inside `enter_stage`
+        // — before `retry_task_locked` ever returns to its caller.
+        let err = engine.retry_task(&task_id).await.unwrap_err();
+        assert!(matches!(err, RetryTaskError::Enter(_)), "{err:?}");
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        assert!(
+            task.stuck_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("chatting") && r.contains("retry failed")),
+            "{:?}",
+            task.stuck_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn a_template_failure_marks_the_task_stuck_with_exactly_one_error_event() {
+        // Review, X-4 round 2: `enter_stage` already appends its own
+        // `Error` event for a template failure before returning it; the
+        // catch-all `mark_stuck` used to append a *second* one for the
+        // same failure. This drives that path end to end and checks the
+        // event count, not just the reason text.
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let prompt_path = dir.join("coder-turn.md");
+        std::fs::write(&prompt_path, "do the thing").unwrap();
+        let yaml = r#"
+name: shell-then-turn
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  run:
+    kind: shell
+    command: "true"
+    on: { done: coding }
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        // Valid at parse time — the loader validates the prompt file's
+        // template syntax against *this* content. The rewrite below only
+        // changes what `enter_agent_turn` reads back at runtime, once
+        // `run` has already finished and advancing into `coding` tries to
+        // render it.
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        std::fs::write(&prompt_path, "do the thing {{ task.input").unwrap();
+
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert!(
+            task.stuck_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("coding") && r.contains("template")),
+            "{:?}",
+            task.stuck_reason
+        );
+
+        let error_events: Vec<_> = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::Error)
+            .collect();
+        assert_eq!(
+            error_events.len(),
+            1,
+            "a template failure must record exactly one Error event, not one from \
+             `enter_stage` and a second from `mark_stuck`: {error_events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_that_fails_before_reaching_a_stage_cannot_be_retried() {
+        // Review, X-4 round 2: `start_task` writes `workflow_state` before
+        // it ever calls `enter_stage` — a failure before that point (a
+        // `worktree: true` workflow with no `config.cwd`, here) leaves no
+        // stage for `retry_task` to re-enter. The reason, and every
+        // `TaskStuck` hint, must say so rather than pointing at a retry
+        // that can only ever 409.
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        std::fs::write(
+            workflows_dir.join("worktree-entry.yaml"),
+            r#"
+name: worktree-entry
+worktree: true
+stages:
+  run:
+    kind: shell
+    command: "true"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
+
+        let err = engine
+            .create_task(&project_id, None, "worktree-entry", "t", "hello", json!({}))
+            .await
+            .unwrap_err();
+
+        let tasks = tasks::list(&pool, Some(&project_id), None).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        let task_id = tasks[0].id.clone();
+        match &err {
+            CreateTaskError::Start { task_id: id, .. } => assert_eq!(id, &task_id),
+            other => panic!("expected CreateTaskError::Start, got {other:?}"),
+        }
+        assert_eq!(tasks[0].status, "stuck");
+        assert!(
+            tasks[0]
+                .stuck_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("cannot be retried")),
+            "{:?}",
+            tasks[0].stuck_reason
+        );
+        assert!(
+            workflow_state::get(&pool, &task_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "start_task must have failed before workflow_state was ever created"
+        );
+
+        let retry_err = engine.retry_task(&task_id).await.unwrap_err();
+        assert!(
+            matches!(retry_err, RetryTaskError::NoWorkflowState),
+            "{retry_err:?}"
+        );
+
+        let msg_err = engine
+            .send_message_or_resume(&task_id, "hello")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                msg_err,
+                SendMessageOrResumeError::TaskStuck {
+                    can_retry: false,
+                    ..
+                }
+            ),
+            "{msg_err:?}"
+        );
+        assert!(
+            msg_err.to_string().contains("choco task cancel"),
+            "{msg_err}"
+        );
+        assert!(
+            !msg_err.to_string().contains("choco task retry"),
+            "{msg_err}"
+        );
     }
 
     #[tokio::test]
@@ -10373,10 +10896,19 @@ stages:
             .send_message_or_resume(&task_id, "hello")
             .await
             .unwrap_err();
+        // This task reached a real stage (`run`) before getting stuck, so
+        // `retry_task` can re-enter it — the hint should say so.
         assert!(
-            matches!(err, SendMessageOrResumeError::TaskStuck(_)),
+            matches!(
+                err,
+                SendMessageOrResumeError::TaskStuck {
+                    can_retry: true,
+                    ..
+                }
+            ),
             "{err:?}"
         );
+        assert!(err.to_string().contains("choco task retry"), "{err}");
     }
 
     #[tokio::test]
