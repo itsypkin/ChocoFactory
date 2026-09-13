@@ -59,10 +59,11 @@ pub async fn list(
     Ok(Json(tasks))
 }
 
-/// A task plus its current `workflow_state` — bare `Task.status` is only
-/// ever `"open"`/`"closed"` (§5.4) or `"cancelled"` (#69), so
-/// `choco task status <id>` needs `current_stage` too for this to actually
-/// be useful as a status view.
+/// A task plus its current `workflow_state` — bare `Task.status` is
+/// `"open"`/`"closed"` (§5.4), `"cancelled"` (#69), or `"stuck"` (X-4,
+/// issue #61, which also carries a `stuck_reason` via `Task`'s own flattened
+/// fields), so `choco task status <id>` needs `current_stage` too for this
+/// to actually be useful as a status view.
 #[derive(Serialize)]
 pub struct TaskDetail {
     #[serde(flatten)]
@@ -185,6 +186,21 @@ pub async fn cancel(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state.engine.cancel_task(&id).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Re-runs `id`'s current stage from scratch (X-4, issue #61): reopens a
+/// `stuck` task and re-enters whatever stage it stopped in.
+///
+/// `202`, not `200`, for the same reason `cancel` is: by the time this
+/// returns the stage has been re-entered, but a `shell`/`poll`/`agent_turn`
+/// stage's actual work — the command running, the turn's session starting —
+/// continues detached. Poll `GET /tasks/{id}` for the settled state.
+pub async fn retry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.engine.retry_task(&id).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -739,5 +755,102 @@ stages:
 
         let open: Value = server.get("/tasks?status=open").await.json();
         assert!(open.as_array().unwrap().is_empty());
+    }
+
+    // ---- X-4: stuck tasks and retry (#61) ----
+
+    #[tokio::test]
+    async fn retrying_an_unknown_task_is_404() {
+        let server = TestServer::start().await;
+        let response = server.post("/tasks/no-such-task/retry", json!({})).await;
+        assert_eq!(response.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn retrying_a_non_stuck_task_is_409() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+
+        let response = server
+            .post(&format!("/tasks/{task_id}/retry"), json!({}))
+            .await;
+        assert_eq!(response.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn retrying_a_stuck_task_is_202() {
+        let server = TestServer::start().await;
+        // A `human_gate` entry stage rather than `chat_task`'s agent_turn:
+        // it opens no `task_run`, so `retry_task`'s defensive
+        // `RunStillActive` check can't trip on a session this test never
+        // stopped — the point here is only the HTTP status mapping.
+        server.write_workflow(
+            "gate-only",
+            r#"
+name: gate-only
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#,
+        );
+        let project_id = create_project(&server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "gate-only",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
+        crate::db::tasks::mark_stuck(server.pool(), &task_id, "stage 'gate': it broke")
+            .await
+            .unwrap();
+
+        let response = server
+            .post(&format!("/tasks/{task_id}/retry"), json!({}))
+            .await;
+        assert_eq!(response.status(), 202, "body: {}", response.json());
+
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["status"], "open");
+        assert!(detail["stuck_reason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn get_task_includes_the_stuck_reason() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+        crate::db::tasks::mark_stuck(server.pool(), &task_id, "stage 'chatting': it broke")
+            .await
+            .unwrap();
+
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["status"], "stuck");
+        assert_eq!(detail["stuck_reason"], "stage 'chatting': it broke");
+    }
+
+    #[tokio::test]
+    async fn sending_a_message_to_a_stuck_task_is_409() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+        crate::db::tasks::mark_stuck(server.pool(), &task_id, "stage 'chatting': it broke")
+            .await
+            .unwrap();
+
+        let response = server
+            .post(
+                &format!("/tasks/{task_id}/messages"),
+                json!({ "text": "hello?" }),
+            )
+            .await;
+        assert_eq!(response.status(), 409);
     }
 }

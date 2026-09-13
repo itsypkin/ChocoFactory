@@ -37,6 +37,14 @@ pub struct Task {
     /// let a later stage compute a path `ensure` never actually created.
     pub worktree_repo: Option<String>,
     pub worktree_project: Option<String>,
+    /// Why this task is `status == "stuck"` (X-4, issue #61) — the engine
+    /// gave up moving it forward on its own, e.g. a stage's outcome has no
+    /// `on:` edge, a transition failed, or an agent turn's session never
+    /// started. `None` for every other status: `update_status` clears it on
+    /// any write, so it only ever holds a value alongside `"stuck"`, set by
+    /// `db::tasks::mark_stuck`. `choco task retry <id>` re-runs the current
+    /// stage and clears it via `db::tasks::reopen_stuck`.
+    pub stuck_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

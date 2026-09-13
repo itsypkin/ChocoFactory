@@ -254,6 +254,52 @@ than deleting. It can't be undone — a cancelled task accepts no further
 messages, and cancelling one twice (or cancelling a task that already
 finished) is a `409`.
 
+### Stuck tasks
+
+Sometimes the engine itself can't move a task forward — a stage's outcome
+has no `on:` edge to route through, a transition failed, an agent turn's
+session never started, or a run was force-closed before it finished. When
+that happens the task is marked `stuck` rather than silently staying
+`open`, with a human-readable reason attached.
+
+Find them:
+
+```
+$ choco task list --status stuck
+```
+
+Read the reason:
+
+```
+$ choco task status bb93ada3-...
+Title   t
+ID      bb93ada3-...
+...
+Status  stuck
+Stuck   stage 'run': command finished with outcome 'error' but the stage
+        has no 'on:' edge for it
+...
+```
+
+Recover with a retry, which re-runs the task's current stage from scratch —
+not a replay of whatever happened before, since the daemon never persisted
+an outcome to replay:
+
+```
+$ choco task retry bb93ada3-...
+Task bb93ada3-... is retrying its current stage — see
+`choco task status bb93ada3-...`.
+```
+
+Or give up on it the same way as any other task:
+
+```
+$ choco task cancel bb93ada3-...
+```
+
+A stuck task accepts no messages (`choco task send` is a `409`, the same
+shape as sending to a cancelled task) until a retry reopens it.
+
 Read the conversation:
 
 ```
@@ -277,7 +323,7 @@ chat task  ed9e8a7d-e5d4-4aeb-b04c-b47d14145940  open    chat      2026-08-01 12
 
 $ choco task list --project acme          # by name or id
 $ choco task list --status open           # free-form, not a fixed enum
-$ choco task list --status cancelled      # open | closed | cancelled today
+$ choco task list --status cancelled      # open | closed | cancelled | stuck today
 $ choco project list
 ```
 

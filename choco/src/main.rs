@@ -72,6 +72,13 @@ async fn main() -> ExitCode {
 /// A command's result, held in typed form so it can be rendered either as
 /// the daemon's raw JSON (`--json`, for agents and scripts) or as a
 /// human-readable summary (the default).
+///
+/// `large_enum_variant`: `Task`'s `stuck_reason` field (X-4, issue #61)
+/// pushed this over clippy's size-difference threshold against `Accepted`'s
+/// bare `String`. Same reasoning as `cli::Command`'s identical allow: one of
+/// these is built, once, from a single response and then matched on and
+/// dropped — boxing would cost an allocation to save nothing measurable.
+#[allow(clippy::large_enum_variant)]
 enum Output {
     Project(Project),
     Projects(Vec<Project>),
@@ -181,6 +188,13 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             Ok(Output::Accepted(format!(
                 "Task {id} cancelled. Any running agent process and worktree \
                  have been cleaned up — see `choco task status {id}`."
+            )))
+        }
+        Command::Task(TaskCmd::Retry { id }) => {
+            client.retry_task(&id).await?;
+            Ok(Output::Accepted(format!(
+                "Task {id} is retrying its current stage — see \
+                 `choco task status {id}`."
             )))
         }
         Command::Task(TaskCmd::List { project, status }) => {

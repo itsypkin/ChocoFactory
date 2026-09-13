@@ -105,6 +105,13 @@ pub fn task(t: &Task) -> String {
         ("Workflow", t.workflow_def.clone()),
         ("Status", t.status.clone()),
     ];
+    // Right after Status, so the reason for a stuck task (X-4, #61) reads
+    // next to the status value that explains it needs one.
+    if t.status == "stuck"
+        && let Some(reason) = &t.stuck_reason
+    {
+        pairs.push(("Stuck", single_line(reason)));
+    }
     if let Some(cwd) = t.config.get("cwd").and_then(Value::as_str) {
         pairs.push(("Repo", cwd.to_string()));
     }
@@ -187,6 +194,13 @@ pub fn task_detail(detail: &Value) -> String {
         ("Workflow", get("workflow_def").to_string()),
         ("Status", get("status").to_string()),
     ];
+    // Right after Status, so the reason for a stuck task (X-4, #61) reads
+    // next to the status value that explains it needs one.
+    if get("status") == "stuck"
+        && let Some(reason) = detail.get("stuck_reason").and_then(Value::as_str)
+    {
+        pairs.push(("Stuck", single_line(reason)));
+    }
     // Same per-role lines `task` renders: `task status` is where an existing
     // task gets inspected, so leaving them out would mean `--json` was the
     // only way to see what `task reconfigure` actually did. `TaskDetail`
@@ -686,9 +700,26 @@ mod tests {
             config,
             worktree_repo: None,
             worktree_project: None,
+            stuck_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// X-4 (#61): the single-task view renders `Stuck` only when the
+    /// status is actually `stuck` and a reason is present.
+    #[test]
+    fn task_renders_the_stuck_line_only_when_stuck() {
+        let mut stuck = task_with_config(json!({}));
+        stuck.status = "stuck".to_string();
+        stuck.stuck_reason = Some("stage 'run': it broke".to_string());
+        let rendered = task(&stuck);
+        assert!(rendered.contains("Stuck"), "{rendered}");
+        assert!(rendered.contains("stage 'run': it broke"), "{rendered}");
+
+        let open = task_with_config(json!({}));
+        let rendered = task(&open);
+        assert!(!rendered.contains("Stuck"), "{rendered}");
     }
 
     /// P2-6: a task can configure several roles independently, so human
@@ -759,6 +790,30 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("reviewer: model=sonnet"), "{rendered}");
+    }
+
+    /// X-4 (#61): `task_detail` renders the `Stuck` line only when the
+    /// status is actually `stuck` and a reason is present.
+    #[test]
+    fn task_detail_renders_the_stuck_line_only_when_stuck() {
+        let stuck = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "stuck", "stuck_reason": "stage 'run': it broke",
+            "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+        });
+        let rendered = task_detail(&stuck);
+        assert!(rendered.contains("Stuck"), "{rendered}");
+        assert!(rendered.contains("stage 'run': it broke"), "{rendered}");
+
+        // An open task with no stuck_reason at all gets no such line.
+        let open = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+        });
+        let rendered = task_detail(&open);
+        assert!(!rendered.contains("Stuck"), "{rendered}");
     }
 
     /// A task with no config at all must render exactly as before.
@@ -969,6 +1024,7 @@ mod tests {
             config: json!({}),
             worktree_repo: None,
             worktree_project: None,
+            stuck_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
