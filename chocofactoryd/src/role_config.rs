@@ -108,6 +108,9 @@ pub fn resolve(
             system_prompt,
             sandboxed,
             report_outcomes,
+            // Straight from the workflow definition, never layered: task
+            // config and global config must not be able to loosen it (#90).
+            isolation: role_def.isolation.clone(),
         },
     })
 }
@@ -139,6 +142,7 @@ mod tests {
             cli: cli.map(str::to_string),
             model: model.map(str::to_string),
             system_prompt_file: None,
+            isolation: crate::adapter::Isolation::default(),
         }
     }
 
@@ -168,6 +172,39 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.cli, "def-cli"); // no task-level override, workflow-def wins
         assert_eq!(resolved.model, "haiku"); // task-level override wins
+    }
+
+    /// #90: isolation comes from the workflow definition alone. A task's
+    /// own config is HTTP input, and letting it set
+    /// `inherit_operator_config` would let any task creator hand an agent
+    /// the operator's whole CLI setup.
+    #[test]
+    fn isolation_comes_from_the_workflow_definition_not_task_or_global_config() {
+        let mut def = role_def(Some("cli"), Some("model"));
+        def.isolation = crate::adapter::Isolation::Isolated {
+            skills: vec!["run-tests".to_string()],
+            memory: false,
+        };
+        let task_config = json!({
+            "roles": { "coder": {
+                "inherit_operator_config": true,
+                "isolation": "inherit",
+                "skills": ["everything"],
+                "memory": true,
+            } }
+        });
+
+        let resolved = resolve(
+            "coder",
+            &def,
+            &GlobalConfig::default(),
+            &task_config,
+            "/cwd".into(),
+            true,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(resolved.role_config.isolation, def.isolation);
     }
 
     /// #67: `sandboxed` is passed straight through, not resolved against
@@ -346,6 +383,7 @@ mod tests {
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(temp_prompt("def.md", "from the workflow definition")),
+            isolation: crate::adapter::Isolation::default(),
         };
         let task_config = json!({
             "roles": { "coder": { "system_prompt_file": secret.to_str().unwrap() } }
@@ -507,6 +545,7 @@ mod tests {
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(def_path),
+            isolation: crate::adapter::Isolation::default(),
         };
         let global = global_with_prompt("coder", global_path);
 
@@ -561,6 +600,7 @@ mod tests {
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(def_path),
+            isolation: crate::adapter::Isolation::default(),
         };
         let task_config = json!({ "roles": { "coder": { "system_prompt": "inline wins" } } });
 
@@ -590,11 +630,13 @@ mod tests {
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(temp_prompt("coder-system.md", "you write code")),
+            isolation: crate::adapter::Isolation::default(),
         };
         let reviewer_def = RoleDef {
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(temp_prompt("reviewer-system.md", "you review code")),
+            isolation: crate::adapter::Isolation::default(),
         };
         let global = GlobalConfig::default();
 
@@ -640,6 +682,7 @@ mod tests {
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(path),
+            isolation: crate::adapter::Isolation::default(),
         };
 
         let err = resolve(

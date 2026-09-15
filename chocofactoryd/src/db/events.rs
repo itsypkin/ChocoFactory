@@ -179,6 +179,12 @@ pub async fn list_for_task_run(
 /// far larger than the reply and is only needed here as a boundary marker, so
 /// the query selects its type and discards its payload in SQL.
 ///
+/// Two kinds of row on the run are skipped outright rather than scanned
+/// (#90): a sub-agent's own events (`parent_tool_use_id` set), which are not
+/// the main agent speaking even though the CLI streams them on the same
+/// stdout, and anything flagged `after_completion`, which arrived after the
+/// turn had already reported and ended and so can't be part of its answer.
+///
 /// Scoped to one run, which on this path is one turn: a stage that captures
 /// has a non-empty `on:` map, and `send_message` only accepts stages whose
 /// `on:` is empty, so no second turn can be added to this run. A future
@@ -208,6 +214,8 @@ pub async fn final_assistant_text_for_run(
                 CASE WHEN event_type = ? THEN payload END AS text_payload
          FROM events
          WHERE task_run_id = ?
+           AND json_extract(payload, '$.parent_tool_use_id') IS NULL
+           AND json_extract(payload, '$.after_completion') IS NULL
          ORDER BY created_at, id",
     )
     .bind(&assistant)
@@ -270,6 +278,14 @@ pub async fn final_assistant_text_for_run(
 /// decoding every `tool_call` row just to keep one is real, avoidable cost
 /// on the common case rather than the rare one.
 ///
+/// Only calls that count are considered (#90), the same ones
+/// `session::drain_session` accepts as the turn reporting it's done: made by
+/// the main agent rather than a sub-agent (no `parent_tool_use_id`), made
+/// before the turn completed (no `after_completion`), and not rejected by the
+/// tool (no `tool_result` for that call with `is_error: true`). Without the
+/// last condition, an agent that reported a valid outcome and then retried
+/// with an invalid one would complete on the first and route on the second.
+///
 /// Scoped to one run, for the same reason `final_assistant_text_for_run` is:
 /// each stage entry opens a fresh `task_run` (`enter_agent_turn`), so a run
 /// is exactly one turn's worth of tool calls.
@@ -278,17 +294,29 @@ pub async fn last_report_outcome_for_run(
     task_run_id: &str,
 ) -> Result<Option<Value>, sqlx::Error> {
     let tool_call = EventType::ToolCall.to_string();
+    let tool_result = EventType::ToolResult.to_string();
     let tool_name = qualified_report_outcome_tool_name();
     let payload: Option<Json<Value>> = sqlx::query_scalar(
-        "SELECT payload FROM events
-         WHERE task_run_id = ? AND event_type = ?
-           AND json_extract(payload, '$.tool') = ?
-         ORDER BY created_at DESC, id DESC
+        "SELECT call.payload FROM events AS call
+         WHERE call.task_run_id = ? AND call.event_type = ?
+           AND json_extract(call.payload, '$.tool') = ?
+           AND json_extract(call.payload, '$.parent_tool_use_id') IS NULL
+           AND json_extract(call.payload, '$.after_completion') IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM events AS result
+             WHERE result.task_run_id = call.task_run_id
+               AND result.event_type = ?
+               AND json_extract(result.payload, '$.tool_use_id')
+                   = json_extract(call.payload, '$.tool_use_id')
+               AND json_extract(result.payload, '$.is_error') = 1
+           )
+         ORDER BY call.created_at DESC, call.id DESC
          LIMIT 1",
     )
     .bind(task_run_id)
     .bind(&tool_call)
     .bind(&tool_name)
+    .bind(&tool_result)
     .fetch_optional(pool)
     .await?;
 
@@ -330,6 +358,12 @@ fn ends_a_message(event_type: &str) -> bool {
         | EventType::SessionMeta
         | EventType::TurnCompleted
         | EventType::TurnOutcome => false,
+        // The daemon's own intervention (#90). A nudge is a new prompt to
+        // the agent, exactly like `HumanMessage`, so whatever it answered
+        // before the nudge isn't part of the answer that follows it. The
+        // other kinds (a no-report give-up, a lingering kill) park the run,
+        // so no capture ever reads past them.
+        EventType::SessionNote => true,
         // Task-scoped (`task_run_id` is NULL), so unreachable from this
         // run-scoped query — classified anyway so the match stays total.
         EventType::StageEntered | EventType::ShellOutput | EventType::TemplateUnresolved => false,
@@ -1229,6 +1263,192 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    /// #90: a sub-agent's report is not the stage's verdict. The CLI streams
+    /// sub-agent tool calls on the same stdout, marked with the id of the
+    /// `Agent` call that spawned them, and a delegated helper calling
+    /// `report_outcome` must not end or route the main agent's stage.
+    #[tokio::test]
+    async fn last_report_outcome_for_run_ignores_a_sub_agents_report() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let tool = qualified_report_outcome_tool_name();
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                report_outcome_call("changes_requested"),
+                (
+                    EventType::ToolCall,
+                    json!({
+                        "tool_use_id": "toolu_sub",
+                        "tool": tool,
+                        "input": { "outcome": "approved", "summary": "" },
+                        "parent_tool_use_id": "toolu_agent",
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+        let report = last_report_outcome_for_run(&pool, &task_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["outcome"], "changes_requested");
+    }
+
+    /// #90: a call the tool rejected (an outcome not on the stage's list)
+    /// doesn't count, so an agent that reported a valid outcome and then
+    /// retried with a bad one still routes on the one that was accepted.
+    #[tokio::test]
+    async fn last_report_outcome_for_run_ignores_a_rejected_call() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let tool = qualified_report_outcome_tool_name();
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::ToolCall,
+                    json!({
+                        "tool_use_id": "toolu_ok",
+                        "tool": tool,
+                        "input": { "outcome": "approved", "summary": "" },
+                    }),
+                ),
+                (
+                    EventType::ToolResult,
+                    json!({ "tool_use_id": "toolu_ok", "tool": tool, "output": "ok", "is_error": false }),
+                ),
+                (
+                    EventType::ToolCall,
+                    json!({
+                        "tool_use_id": "toolu_bad",
+                        "tool": tool,
+                        "input": { "outcome": "lgtm", "summary": "" },
+                    }),
+                ),
+                (
+                    EventType::ToolResult,
+                    json!({ "tool_use_id": "toolu_bad", "tool": tool, "output": "not allowed", "is_error": true }),
+                ),
+            ],
+        )
+        .await;
+
+        let report = last_report_outcome_for_run(&pool, &task_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["outcome"], "approved");
+    }
+
+    /// #90: a report that arrives after the turn already completed can't
+    /// change the verdict the completion was decided on.
+    #[tokio::test]
+    async fn last_report_outcome_for_run_ignores_a_call_after_completion() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+        let tool = qualified_report_outcome_tool_name();
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                report_outcome_call("approved"),
+                (
+                    EventType::ToolCall,
+                    json!({
+                        "tool_use_id": "toolu_late",
+                        "tool": tool,
+                        "input": { "outcome": "changes_requested", "summary": "" },
+                        "after_completion": true,
+                    }),
+                ),
+            ],
+        )
+        .await;
+
+        let report = last_report_outcome_for_run(&pool, &task_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["outcome"], "approved");
+    }
+
+    /// #90: in the #88 incident a background sub-agent's narration landed as
+    /// ordinary assistant messages on the coder's run. Those, and anything
+    /// said after the turn completed, are not the main agent's answer.
+    #[tokio::test]
+    async fn the_final_message_skips_sub_agent_and_post_completion_text() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "the verdict" }),
+                ),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "Now the CLI side.", "parent_tool_use_id": "toolu_agent" }),
+                ),
+                (EventType::TurnCompleted, json!({ "is_error": false })),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "one more thing", "after_completion": true }),
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            "the verdict"
+        );
+    }
+
+    /// #90: a daemon nudge is a new prompt, so the answer before it isn't
+    /// part of the answer after it.
+    #[tokio::test]
+    async fn a_nudge_ends_the_previous_answer() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_run_id = seed_task_run(&pool).await;
+
+        append_all(
+            &pool,
+            &task_run_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "still waiting" }),
+                ),
+                (EventType::TurnCompleted, json!({ "is_error": false })),
+                (
+                    EventType::SessionNote,
+                    json!({ "kind": "nudge", "message": "asked the agent to report" }),
+                ),
+                (EventType::AssistantMessage, json!({ "text": "all done" })),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            final_assistant_text_for_run(&pool, &task_run_id)
+                .await
+                .unwrap(),
+            "all done"
         );
     }
 }

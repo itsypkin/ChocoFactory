@@ -7,14 +7,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, RoleConfig};
+use super::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, Isolation, RoleConfig};
 
 /// Wraps `claude --print --output-format=stream-json --input-format=stream-json
-/// [--permission-mode=bypassPermissions] --mcp-config <...> [--append-system-prompt <...>]
-/// [--resume <id>]` as a subprocess (§4) — the permission flag only when
-/// `RoleConfig.sandboxed` says `cwd` is a disposable worktree (#67), the mcp
-/// config always (issue #73's `report_outcome` tool), the append-prompt only
-/// when the stage has outcomes to route on. Every turn — including the
+/// [--permission-mode=bypassPermissions] --mcp-config <...> [isolation flags]
+/// [--append-system-prompt <...>] [--resume <id>]` as a subprocess (§4) — the
+/// permission flag only when `RoleConfig.sandboxed` says `cwd` is a disposable
+/// worktree (#67), the mcp config always (issue #73's `report_outcome` tool),
+/// the isolation flags unless the role inherits the operator's setup (#90),
+/// the append-prompt only when the stage has outcomes to report. Every turn — including the
 /// first — is sent as a stream-json user-turn line over stdin, so
 /// `start`/`resume`/`AgentHandle::send` all go through the same path.
 pub struct ClaudeAdapter {
@@ -165,33 +166,69 @@ fn spawn(
         mcp_args.push("--outcome".to_string());
         mcp_args.push(outcome.clone());
     }
+    // `alwaysLoad` (#90): without it the CLI lists `report_outcome` as a
+    // *deferred* tool whose schema has to be fetched with `ToolSearch` before
+    // it can be called. Probed against Claude Code 2.1.272: even with ours as
+    // the only MCP server the tool was deferred, and in #61 two reviewers
+    // never loaded it at all. A single-shot turn now can't complete without
+    // this call, so it has to be in the tool list from the first token.
     let mcp_config = json!({
         "mcpServers": {
             (MCP_SERVER_NAME): {
                 "type": "stdio",
                 "command": choco_binary,
                 "args": mcp_args,
+                "alwaysLoad": true,
             }
         }
     })
     .to_string();
     command.arg("--mcp-config").arg(mcp_config);
-    // Deliberately no `--strict-mcp-config`: that would silently drop
-    // whatever MCP servers the operator configured for every coder turn and
-    // every chat session. Reproducibility of a turn's tool surface is a
-    // separate decision from fixing #73's parked-task bug, and ours is added
-    // alongside the operator's configuration, not in place of it.
 
-    // Only when the stage actually routes on the report: a stage with no
-    // outcomes must not be told it can drive a transition it cannot. Built
-    // from the exact same list the tool's own schema uses (§ `mcp.rs`), so
-    // this instruction can never name an outcome the tool would reject.
+    // #90: what the turn may pick up from the operator's own machine. Each
+    // flag was checked against a real session (Claude Code 2.1.272): with
+    // all of them, the `init` line reported no plugins, the default output
+    // style and only our MCP server, the transcript loaded only the task
+    // repo's `CLAUDE.md`, and no hooks ran.
+    //
+    // - `--setting-sources project,local` skips user settings, which is
+    //   where plugins, hooks and the output style are enabled, and also
+    //   skips `~/.claude/CLAUDE.md`. The task repo's own settings and
+    //   `CLAUDE.md` still apply: those belong to the code being worked on.
+    // - `--strict-mcp-config` drops the operator's MCP servers, leaving only
+    //   ours.
+    // - `ReportFindings` is a built-in verdict tool that reviewers reached
+    //   for instead of `report_outcome` (#61).
+    // - With no skills allowed, the `Skill` tool is removed outright; with
+    //   some, the allowlist is sent on stdin below.
+    let initialize = match &cfg.isolation {
+        Isolation::InheritOperatorConfig => None,
+        Isolation::Isolated { skills, memory } => {
+            command
+                .arg("--setting-sources")
+                .arg("project,local")
+                .arg("--strict-mcp-config");
+            let mut disallowed = vec!["ReportFindings"];
+            if skills.is_empty() {
+                disallowed.push("Skill");
+            }
+            command.arg("--disallowedTools").arg(disallowed.join(","));
+            if !memory {
+                command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
+            }
+            Some(initialize_line(skills))
+        }
+    };
+
+    // Only a stage that can conclude on its own gets outcomes (the engine
+    // passes none for a standing session like chat), and every such stage
+    // now has to report to complete (#90). Built from the exact same list the
+    // tool's own schema uses (§ `mcp.rs`), so this instruction can never name
+    // an outcome the tool would reject.
     if !cfg.report_outcomes.is_empty() {
-        command.arg("--append-system-prompt").arg(format!(
-            "Before ending your turn, call `report_outcome` to report this stage's outcome. \
-             It must be one of: {}.",
-            cfg.report_outcomes.join(", ")
-        ));
+        command
+            .arg("--append-system-prompt")
+            .arg(report_instruction(&cfg.report_outcomes));
     }
 
     if let Some(model) = &cfg.model {
@@ -221,17 +258,61 @@ fn spawn(
         .send(initial_prompt.to_string())
         .expect("stdin_rx not yet dropped");
 
-    tokio::spawn(run_stdin_writer(stdin, stdin_rx));
+    tokio::spawn(run_stdin_writer(stdin, initialize, stdin_rx));
     tokio::spawn(run_stderr_reader(stderr, events_tx.clone()));
-    tokio::spawn(run_stdout_reader(stdout, events_tx));
+    tokio::spawn(run_stdout_reader(
+        stdout,
+        events_tx,
+        cfg.isolation.describe(),
+    ));
 
     Ok(AgentHandle::new(child, events_rx, stdin_tx))
 }
 
+/// The instruction appended to a single-shot turn's system prompt (#90).
+///
+/// Says what completion *is* rather than only asking for a verdict: a turn
+/// that ends without the call is treated as still working (and eventually
+/// nudged), which is what lets an agent wait on its own background work
+/// without the daemon mistaking that pause for "done".
+fn report_instruction(outcomes: &[String]) -> String {
+    format!(
+        "When all of your work for this stage is finished (including anything you started \
+         in the background, which you must wait for), call `report_outcome` to report the \
+         stage's outcome. It must be one of: {}. Calling it is how this stage completes: \
+         ending your turn without calling it means you are still working. If \
+         `report_outcome` is listed as a deferred tool, load it with ToolSearch first.",
+        outcomes.join(", ")
+    )
+}
+
+/// The stream-json `initialize` control request carrying the turn's skills
+/// allowlist (#90). This is the message the Claude Agent SDK sends for its
+/// `skills` option; probed against Claude Code 2.1.272, a session given
+/// `["allowed-skill"]` listed only that skill to the model. An empty list
+/// allows none, which `--disallowedTools Skill` also enforces from the
+/// command line.
+fn initialize_line(skills: &[String]) -> String {
+    let request = json!({
+        "type": "control_request",
+        "request_id": "chocofactory-initialize",
+        "request": { "subtype": "initialize", "skills": skills },
+    });
+    format!("{request}\n")
+}
+
 async fn run_stdin_writer(
     mut stdin: tokio::process::ChildStdin,
+    initialize: Option<String>,
     mut stdin_rx: mpsc::UnboundedReceiver<String>,
 ) {
+    // Ahead of the first user turn, so the allowlist is in force before the
+    // model ever sees a skill listing.
+    if let Some(line) = initialize
+        && stdin.write_all(line.as_bytes()).await.is_err()
+    {
+        return;
+    }
     while let Some(text) = stdin_rx.recv().await {
         let line = user_turn_line(&text);
         if stdin.write_all(line.as_bytes()).await.is_err() {
@@ -258,6 +339,7 @@ async fn run_stderr_reader(
 async fn run_stdout_reader(
     stdout: tokio::process::ChildStdout,
     events_tx: mpsc::UnboundedSender<AgentEvent>,
+    isolation: Value,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let mut tool_names: HashMap<String, String> = HashMap::new();
@@ -268,7 +350,14 @@ async fn run_stdout_reader(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        for event in normalize(&value, &mut tool_names) {
+        for mut event in normalize(&value, &mut tool_names) {
+            if let AgentEvent::SessionMeta {
+                details: Value::Object(details),
+                ..
+            } = &mut event
+            {
+                details.insert("isolation".to_string(), isolation.clone());
+            }
             if events_tx.send(event).is_err() {
                 return;
             }
@@ -289,20 +378,78 @@ fn user_turn_line(text: &str) -> String {
 /// back to the tool name from its matching `tool_use` block, since the
 /// result block only carries the call's id.
 fn normalize(value: &Value, tool_names: &mut HashMap<String, String>) -> Vec<AgentEvent> {
-    match value.get("type").and_then(Value::as_str) {
+    let events = match value.get("type").and_then(Value::as_str) {
         Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
             let session_id = value
                 .get("session_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            vec![AgentEvent::SessionMeta { session_id }]
+            vec![AgentEvent::SessionMeta {
+                session_id,
+                details: json!({ "init": init_summary(value) }),
+            }]
         }
         Some("assistant") => normalize_assistant(value, tool_names),
         Some("user") => normalize_user(value, tool_names),
         Some("result") => normalize_result(value),
+        Some("control_response") => normalize_control_response(value),
         _ => Vec::new(),
+    };
+    // A sub-agent's messages carry the id of the `Agent` call that spawned
+    // it (#90, confirmed against a real session). Wrapped here, at the one
+    // place that sees the raw line, so nothing downstream can mistake a
+    // delegated helper's tool call or reply for the main agent's.
+    match value.get("parent_tool_use_id").and_then(Value::as_str) {
+        Some(parent) => events
+            .into_iter()
+            .map(|event| AgentEvent::Subagent {
+                parent_tool_use_id: parent.to_string(),
+                event: Box::new(event),
+            })
+            .collect(),
+        None => events,
     }
+}
+
+/// The parts of the CLI's `system/init` line worth keeping on the timeline
+/// (#90): enough to see what a turn actually ran with, so the next time the
+/// tool surface shifts under a workflow it shows up in `session_meta`
+/// instead of having to be dug out of the CLI's own transcript. Key names are
+/// the CLI's own, as seen on a real 2.1.272 `init` line.
+fn init_summary(init: &Value) -> Value {
+    const KEYS: [&str; 9] = [
+        "claude_code_version",
+        "model",
+        "permissionMode",
+        "output_style",
+        "tools",
+        "mcp_servers",
+        "plugins",
+        "skills",
+        "agents",
+    ];
+    let summary = KEYS
+        .iter()
+        .filter_map(|key| init.get(*key).map(|value| (key.to_string(), value.clone())))
+        .collect::<serde_json::Map<_, _>>();
+    Value::Object(summary)
+}
+
+/// The CLI's answer to our `initialize` request. Success is silent; a
+/// failure means the skills allowlist may not be in force, which must not
+/// pass unnoticed, so it becomes an `error` event on the run.
+fn normalize_control_response(value: &Value) -> Vec<AgentEvent> {
+    if value.pointer("/response/subtype").and_then(Value::as_str) != Some("error") {
+        return Vec::new();
+    }
+    let detail = value
+        .pointer("/response/error")
+        .and_then(Value::as_str)
+        .unwrap_or("no detail");
+    vec![AgentEvent::Error {
+        message: format!("the CLI rejected the session's initialize request: {detail}"),
+    }]
 }
 
 fn normalize_assistant(value: &Value, tool_names: &mut HashMap<String, String>) -> Vec<AgentEvent> {
@@ -386,12 +533,11 @@ fn normalize_user(value: &Value, tool_names: &HashMap<String, String>) -> Vec<Ag
 }
 
 // A `result` line always means the same thing regardless of `is_error`: the
-// CLI is done with this turn and is now only waiting on stdin EOF to
-// exit — it never exits on its own (#70). Both outcomes therefore emit
-// `TurnCompleted`, so a single-shot turn's stdin gets closed either way;
-// only a clean finish (`is_error: false`) also counts as *completion* for
-// `drain_session`'s purposes, which is why the flag rides along rather than
-// being collapsed here.
+// CLI has ended this turn and is waiting for more input or stdin EOF — it
+// never exits on its own (#70). Both outcomes therefore emit
+// `TurnCompleted`. Whether that turn *completed* is `drain_session`'s call:
+// only a clean finish after a `report_outcome` call does (#90), which is why
+// the flag rides along rather than being collapsed here.
 fn normalize_result(value: &Value) -> Vec<AgentEvent> {
     let is_error = value
         .get("is_error")
@@ -431,7 +577,8 @@ mod tests {
         assert_eq!(
             events,
             vec![AgentEvent::SessionMeta {
-                session_id: "9bf8db32-b723-41f6-8963-ea3ece07cb1a".to_string()
+                session_id: "9bf8db32-b723-41f6-8963-ea3ece07cb1a".to_string(),
+                details: json!({ "init": { "tools": ["Bash"], "model": "claude-sonnet-5" } }),
             }]
         );
     }
@@ -520,6 +667,18 @@ mod tests {
             .into_owned()
     }
 
+    /// The first `AssistantMessage` the handle yields, skipping everything
+    /// before it: the session's `SessionMeta`, and the `report_outcome` call
+    /// a single-shot fixture makes before replying (#90).
+    async fn next_assistant_message(handle: &mut AgentHandle) -> AgentEvent {
+        loop {
+            let event = handle.recv().await.expect("stream ended before a reply");
+            if matches!(event, AgentEvent::AssistantMessage { .. }) {
+                return event;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn start_spawns_process_and_streams_events() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
@@ -529,6 +688,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("hello", &cfg).unwrap();
 
@@ -570,18 +730,17 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter
             .resume("fixed-session-id", "hello again", &cfg)
             .unwrap();
 
         let first = handle.recv().await.unwrap();
-        assert_eq!(
-            first,
-            AgentEvent::SessionMeta {
-                session_id: "fixed-session-id".to_string()
-            }
-        );
+        let AgentEvent::SessionMeta { session_id, .. } = first else {
+            panic!("expected session_meta, got {first:?}");
+        };
+        assert_eq!(session_id, "fixed-session-id");
     }
 
     /// #67: `claude`'s normal permission model expects a human to approve
@@ -597,11 +756,11 @@ mod tests {
             system_prompt: None,
             sandboxed: true,
             report_outcomes: Vec::new(),
+            isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
 
-        handle.recv().await.unwrap(); // SessionMeta
-        let reply = handle.recv().await.unwrap();
+        let reply = next_assistant_message(&mut handle).await;
         let AgentEvent::AssistantMessage { text } = reply else {
             panic!("expected an assistant message, got {reply:?}");
         };
@@ -628,11 +787,11 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
 
-        handle.recv().await.unwrap(); // SessionMeta
-        let reply = handle.recv().await.unwrap();
+        let reply = next_assistant_message(&mut handle).await;
         let AgentEvent::AssistantMessage { text } = reply else {
             panic!("expected an assistant message, got {reply:?}");
         };
@@ -643,11 +802,11 @@ mod tests {
     }
 
     /// Issue #73: the tool is present on *every* turn, whether or not the
-    /// stage routes on it — `--mcp-config` is unconditional, and never paired
-    /// with `--strict-mcp-config`, so an operator's own MCP servers stay
-    /// available to a coder turn just as they do today. With no outcomes to
-    /// route on, nothing is appended to the system prompt: a stage that
-    /// cannot route must not gain an instruction implying it can.
+    /// stage routes on it — `--mcp-config` is unconditional. A role that
+    /// inherits the operator's setup (#90) doesn't get `--strict-mcp-config`,
+    /// so the operator's own MCP servers stay available to it. With no
+    /// outcomes, nothing is appended to the system prompt: a standing
+    /// session is never told to report.
     #[tokio::test]
     async fn a_turn_with_no_outcomes_still_gets_the_tool_but_no_routing_instruction() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
@@ -657,11 +816,11 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
 
-        handle.recv().await.unwrap(); // SessionMeta
-        let reply = handle.recv().await.unwrap();
+        let reply = next_assistant_message(&mut handle).await;
         let AgentEvent::AssistantMessage { text } = reply else {
             panic!("expected an assistant message, got {reply:?}");
         };
@@ -691,11 +850,11 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: vec!["approved".to_string(), "changes_requested".to_string()],
+            isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
 
-        handle.recv().await.unwrap(); // SessionMeta
-        let reply = handle.recv().await.unwrap();
+        let reply = next_assistant_message(&mut handle).await;
         let AgentEvent::AssistantMessage { text } = reply else {
             panic!("expected an assistant message, got {reply:?}");
         };
@@ -737,5 +896,180 @@ mod tests {
             append_system_prompt.contains("changes_requested"),
             "got {text}"
         );
+    }
+
+    /// The `key=value` fields of `fake_claude_echo_args.py`'s reply. None of
+    /// the values these tests pass contain a `|`.
+    fn echo_fields(text: &str) -> HashMap<String, String> {
+        text.split('|')
+            .filter_map(|field| field.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    async fn echo_args_for(isolation: Isolation) -> HashMap<String, String> {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: vec!["done".to_string()],
+            isolation,
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        let AgentEvent::AssistantMessage { text } = next_assistant_message(&mut handle).await
+        else {
+            unreachable!()
+        };
+        echo_fields(&text)
+    }
+
+    /// #90's default: a role that says nothing about isolation gets none of
+    /// the operator's settings, plugins, hooks, output style, MCP servers,
+    /// skills or memory, and no `ReportFindings`.
+    #[tokio::test]
+    async fn an_isolated_spawn_drops_the_operators_setup() {
+        let fields = echo_args_for(Isolation::default()).await;
+        assert_eq!(fields["setting_sources"], "project,local");
+        assert_eq!(fields["strict_mcp_config"], "true");
+        assert_eq!(fields["disallowed_tools"], "ReportFindings,Skill");
+        assert_eq!(fields["disable_auto_memory"], "1");
+        let initialize: Value = serde_json::from_str(&fields["initialize"]).unwrap();
+        assert_eq!(initialize, json!({ "subtype": "initialize", "skills": [] }));
+    }
+
+    #[tokio::test]
+    async fn an_isolated_spawn_allows_the_listed_skills_and_memory() {
+        let fields = echo_args_for(Isolation::Isolated {
+            skills: vec!["run-tests".to_string()],
+            memory: true,
+        })
+        .await;
+        assert_eq!(fields["disallowed_tools"], "ReportFindings");
+        assert_eq!(fields["disable_auto_memory"], "<unset>");
+        let initialize: Value = serde_json::from_str(&fields["initialize"]).unwrap();
+        assert_eq!(
+            initialize,
+            json!({ "subtype": "initialize", "skills": ["run-tests"] })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spawn_that_inherits_the_operators_setup_gets_no_isolation_flags() {
+        let fields = echo_args_for(Isolation::InheritOperatorConfig).await;
+        assert_eq!(fields["setting_sources"], "<unset>");
+        assert_eq!(fields["strict_mcp_config"], "false");
+        assert_eq!(fields["disallowed_tools"], "<unset>");
+        assert_eq!(fields["disable_auto_memory"], "<unset>");
+        assert_eq!(fields["initialize"], "<unset>");
+    }
+
+    /// #90: without `alwaysLoad` the CLI defers `report_outcome` behind
+    /// `ToolSearch`, and a turn that can't find its completion call can't
+    /// complete. Every spawn sets it, isolated or not.
+    #[tokio::test]
+    async fn every_spawn_loads_report_outcome_up_front_and_is_told_how_to_complete() {
+        for isolation in [Isolation::default(), Isolation::InheritOperatorConfig] {
+            let fields = echo_args_for(isolation).await;
+            let mcp_config: Value = serde_json::from_str(&fields["mcp_config"]).unwrap();
+            assert_eq!(
+                mcp_config["mcpServers"]["chocofactory"]["alwaysLoad"], true,
+                "got {mcp_config}"
+            );
+            let instruction = &fields["append_system_prompt"];
+            assert!(instruction.contains("done"), "got {instruction}");
+            assert!(
+                instruction.contains("Calling it is how this stage completes"),
+                "got {instruction}"
+            );
+        }
+    }
+
+    /// #90: a sub-agent's lines carry the id of the `Agent` call that spawned
+    /// it (as seen on a real 2.1.272 stream) and are wrapped, so they can
+    /// never pass for the main agent's.
+    #[test]
+    fn a_sub_agents_lines_are_wrapped_with_their_parent_tool_use_id() {
+        let line = r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"content":[{"type":"tool_use","id":"toolu_sub","name":"Bash","input":{"command":"echo hi"}},{"type":"text","text":"ran it"}]},"session_id":"s"}"#;
+        let mut tool_names = HashMap::new();
+        let events = normalize(&parse(line), &mut tool_names);
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::Subagent {
+                    parent_tool_use_id: "toolu_agent".to_string(),
+                    event: Box::new(AgentEvent::ToolCall {
+                        tool_use_id: "toolu_sub".to_string(),
+                        tool: "Bash".to_string(),
+                        input: json!({ "command": "echo hi" }),
+                    }),
+                },
+                AgentEvent::Subagent {
+                    parent_tool_use_id: "toolu_agent".to_string(),
+                    event: Box::new(AgentEvent::AssistantMessage {
+                        text: "ran it".to_string(),
+                    }),
+                },
+            ]
+        );
+        let payload = events[1].payload();
+        assert_eq!(payload["text"], "ran it");
+        assert_eq!(payload["parent_tool_use_id"], "toolu_agent");
+    }
+
+    #[test]
+    fn a_main_agent_line_with_a_null_parent_is_not_wrapped() {
+        let line = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"hi"}]},"session_id":"s"}"#;
+        let mut tool_names = HashMap::new();
+        assert_eq!(
+            normalize(&parse(line), &mut tool_names),
+            vec![AgentEvent::AssistantMessage {
+                text: "hi".to_string()
+            }]
+        );
+    }
+
+    /// The `init` fields worth keeping, as the real CLI names them, and none
+    /// of the rest (the socket path, analytics flags, and so on).
+    #[test]
+    fn init_keeps_the_sessions_real_environment() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"s","claude_code_version":"2.1.272","model":"claude-haiku-4-5","permissionMode":"bypassPermissions","output_style":"default","tools":["Bash","mcp__chocofactory__report_outcome"],"mcp_servers":[{"name":"chocofactory","status":"connected"}],"plugins":[],"skills":["allowed-skill"],"agents":["general-purpose"],"messaging_socket_path":"/tmp/x","analytics_disabled":false}"#;
+        let mut tool_names = HashMap::new();
+        let events = normalize(&parse(line), &mut tool_names);
+        let AgentEvent::SessionMeta { details, .. } = &events[0] else {
+            panic!("expected session_meta, got {events:?}");
+        };
+        assert_eq!(
+            details["init"],
+            json!({
+                "claude_code_version": "2.1.272",
+                "model": "claude-haiku-4-5",
+                "permissionMode": "bypassPermissions",
+                "output_style": "default",
+                "tools": ["Bash", "mcp__chocofactory__report_outcome"],
+                "mcp_servers": [{ "name": "chocofactory", "status": "connected" }],
+                "plugins": [],
+                "skills": ["allowed-skill"],
+                "agents": ["general-purpose"],
+            })
+        );
+    }
+
+    /// If the CLI refuses the `initialize` carrying the skills allowlist, the
+    /// allowlist may not be in force; that must reach the timeline.
+    #[test]
+    fn a_rejected_initialize_is_an_error_event() {
+        let rejected = r#"{"type":"control_response","response":{"subtype":"error","request_id":"chocofactory-initialize","error":"unknown field"}}"#;
+        let accepted = r#"{"type":"control_response","response":{"subtype":"success","request_id":"chocofactory-initialize","response":{}}}"#;
+        let mut tool_names = HashMap::new();
+        assert_eq!(
+            normalize(&parse(rejected), &mut tool_names),
+            vec![AgentEvent::Error {
+                message: "the CLI rejected the session's initialize request: unknown field"
+                    .to_string()
+            }]
+        );
+        assert_eq!(normalize(&parse(accepted), &mut tool_names), Vec::new());
     }
 }

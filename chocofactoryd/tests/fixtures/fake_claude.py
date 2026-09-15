@@ -10,6 +10,8 @@ import json
 import sys
 import uuid
 
+from fake_common import auto_report, iter_turns
+
 
 def main():
     args = sys.argv[1:]
@@ -20,13 +22,11 @@ def main():
 
     emit({"type": "system", "subtype": "init", "session_id": session_id})
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    for line in iter_turns(sys.stdin):
         turn = json.loads(line)
         text = turn["message"]["content"][0]["text"]
         reply = f"echo:{text}"
+        auto_report(args, session_id)
         emit(
             {
                 "type": "assistant",

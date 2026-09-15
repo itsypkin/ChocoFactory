@@ -3,6 +3,10 @@ roles:
   chat:
     cli: claude
     model: sonnet
+    # A conversation with the operator, so it keeps the operator's own Claude
+    # setup (CLAUDE.md, plugins, MCP servers, skills, memory). Workflow roles
+    # are isolated from all of that by default (#90).
+    inherit_operator_config: true
 
 stages:
   chatting:

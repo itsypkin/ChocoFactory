@@ -383,6 +383,30 @@ pub fn events(page: &EventsPage) -> String {
 /// this view. The engine's own task-scoped events (`stage_entered`,
 /// `shell_output`) are composed for the same reason.
 fn event_summary(event: &Event) -> String {
+    let summary = event_summary_body(event);
+    // #90: output from a sub-agent, or arriving after the turn had already
+    // completed, is recorded on the same run as the main agent's. Marked so a
+    // reader of the timeline can't take either for the turn's own answer.
+    let mut markers = String::new();
+    if event
+        .payload
+        .get("parent_tool_use_id")
+        .is_some_and(|v| !v.is_null())
+    {
+        markers.push_str("[sub-agent] ");
+    }
+    if event
+        .payload
+        .get("after_completion")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        markers.push_str("[late] ");
+    }
+    format!("{markers}{summary}")
+}
+
+fn event_summary_body(event: &Event) -> String {
     let payload = &event.payload;
 
     match event.event_type {
@@ -501,6 +525,17 @@ fn event_summary(event: &Event) -> String {
             } else {
                 "turn complete".to_string()
             }
+        }
+        // `{kind, message}` (#90): the daemon nudged, gave up on, or killed
+        // an agent turn. The kind leads, so a scan of the timeline can tell a
+        // routine nudge apart from the kill that parked the task.
+        EventType::SessionNote => {
+            let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("?");
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            one_line(&format!("[{kind}] {message}"))
         }
         _ => {
             for key in ["text", "message", "session_id"] {
@@ -877,6 +912,26 @@ mod tests {
                 "turn complete (error)",
             ),
             (EventType::Error, json!({"message": "boom"}), "boom"),
+            (
+                EventType::SessionNote,
+                json!({"kind": "nudge", "message": "asked the agent to report"}),
+                "[nudge] asked the agent to report",
+            ),
+            (
+                EventType::AssistantMessage,
+                json!({"text": "Now the CLI side.", "parent_tool_use_id": "toolu_agent"}),
+                "[sub-agent] Now the CLI side.",
+            ),
+            (
+                EventType::AssistantMessage,
+                json!({"text": "one more thing", "after_completion": true}),
+                "[late] one more thing",
+            ),
+            (
+                EventType::AssistantMessage,
+                json!({"text": "hi", "parent_tool_use_id": null}),
+                "hi",
+            ),
             // A stage transition carries neither text nor a session, so
             // without its own arm it would render as raw JSON.
             (

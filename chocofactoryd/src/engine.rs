@@ -1110,9 +1110,9 @@ impl WorkflowEngine {
     /// after the status write** — which is what lets both of the properties
     /// this function needs hold at once:
     ///
-    /// 1. The two fallible *reads* (`workflow_state`, the current
-    ///    `task_run`) come first, so a DB error here returns having changed
-    ///    nothing at all and a retry starts clean.
+    /// 1. The one fallible *read* (every `task_run` the task has had) comes
+    ///    first, so a DB error here returns having changed nothing at all and
+    ///    a retry starts clean.
     /// 2. `tasks.status` is written **second**, still inside the per-task
     ///    lock. Every guard that makes cancel stick — `advance_from_stage`,
     ///    `send_message`, `run_poll_stage` — reads that column, so it has
@@ -1170,23 +1170,17 @@ impl WorkflowEngine {
     async fn cancel_task_locked(self: &Arc<Self>, task: &Task) -> Result<(), CancelTaskError> {
         let task_id = &task.id;
 
-        // Step 1 — the fallible reads, before anything is written or
+        // Step 1 — the fallible read, before anything is written or
         // killed, so a DB error here returns having changed nothing.
         //
-        // A missing `workflow_state` row is *not* an error: a task whose
-        // `start_task` died between `worktree::ensure` and
-        // `workflow_state::create` never reached a stage, so it has no
-        // session to kill — which is precisely the state cancel wants. It
-        // may still own a worktree, and treating this as an error would
-        // mark the task cancelled, skip the removal below, and then refuse
-        // every retry with a 409, leaking that worktree permanently.
-        let state = workflow_state::get(&self.pool, task_id).await?;
-        let run = match &state {
-            Some(state) => {
-                task_runs::get_current_for_stage(&self.pool, task_id, &state.current_stage).await?
-            }
-            None => None,
-        };
+        // Every run the task has had, not just the current stage's (#90). A
+        // run's process can outlive the stage that started it — in #88 a
+        // coder's CLI kept a background sub-agent running after its run was
+        // recorded done and the task had moved on — and `SessionManager` finds
+        // a live process by run id, whatever that run's recorded status.
+        // A task that never reached a stage simply has no runs, which is the
+        // state cancel wants; it may still own a worktree, removed below.
+        let runs = task_runs::list_for_task(&self.pool, task_id).await?;
 
         // Step 2 — the write every guard keys off, and the last thing here
         // that can fail. After this the task is durably cancelled: no stage
@@ -1206,9 +1200,7 @@ impl WorkflowEngine {
         // cancel: the task is already cancelled, and returning an error now
         // would strand it behind a permanent 409 with no way to retry the
         // very cleanup that failed.
-        if let Some(run) = run
-            && run.status == TaskRunStatus::Active
-        {
+        for run in &runs {
             // The only error `SessionManager::cancel` can return is
             // `AlreadyStarting` — a session mid-spawn, which this call can
             // neither see nor kill. It is unreachable from here, and
@@ -3255,18 +3247,24 @@ impl WorkflowEngine {
         // routing itself doesn't care about order.
         //
         // Gated on `capture: json`, the same marker that means "this stage
-        // routes on the agent's own verdict" (see `finish_turn`): `coding`/
-        // `revising` declare `on: {done: ...}` with no `capture:` and always
-        // advance on `done` regardless of what the agent says, so they get
-        // an empty list here — the tool stays present but free-form, and no
-        // routing instruction is appended to their system prompt. Without
-        // this gate every ordinary `on:` edge (present on nearly every
-        // agent_turn) would turn into a routing instruction the stage can't
-        // actually honor.
+        // routes on the agent's own verdict" (see `finish_turn`): only then do
+        // the `on:` keys become reportable outcomes. Without this gate every
+        // ordinary `on:` edge (present on nearly every agent_turn) would turn
+        // into a verdict the stage can't actually honor.
+        //
+        // #90: every *other* stage that can conclude on its own gets `done`
+        // (`coding`/`revising` declare `on: {done: ...}` with no `capture:`).
+        // A single-shot turn now completes only once it reports (see
+        // `session::drain_session`), and `done` is the one outcome such a
+        // stage ever advances on, so it's also the only one the tool should
+        // accept. A standing stage (empty `on:`, chat) never concludes, so it
+        // gets nothing and no instruction to report.
         let report_outcomes: Vec<String> = if capture == Some(Capture::Json) {
             stage_def.on.keys().cloned().collect()
-        } else {
+        } else if stage_def.on.is_empty() {
             Vec::new()
+        } else {
+            vec![TURN_DEFAULT_OUTCOME.to_string()]
         };
         let resolved = role_config::resolve(
             role,
@@ -3318,10 +3316,10 @@ impl WorkflowEngine {
 
         // A stage with an empty `on:` map (chat, §5.4) never concludes — it
         // just keeps accepting further live messages into the same session
-        // indefinitely. Everything else is single-shot: the CLI's own
-        // end-of-turn marker both completes the session (#70) and is what
-        // the watcher below waits for — computed once here rather than at
-        // each site separately, so the two decisions can't diverge.
+        // indefinitely. Everything else is single-shot: it completes once the
+        // agent reports and its turn ends (#90), which is what the watcher
+        // below waits for — computed once here rather than at each site
+        // separately, so the two decisions can't diverge.
         let session_kind = if stage_def.on.is_empty() {
             SessionKind::Standing
         } else {
@@ -3430,10 +3428,10 @@ impl WorkflowEngine {
                         );
                         return;
                     }
-                    Ok(Some(run))
-                        if run.status == TaskRunStatus::Idle
-                            && run.end_reason == Some(TaskRunEndReason::Reaped) =>
-                    {
+                    // Either status: a reaper-closed turn that exited cleanly
+                    // is `Idle`, one whose process then had to be killed is
+                    // `Exited` (#90).
+                    Ok(Some(run)) if run.end_reason == Some(TaskRunEndReason::Reaped) => {
                         tracing::warn!(
                             task_id,
                             task_run_id,
@@ -3452,6 +3450,53 @@ impl WorkflowEngine {
                         return;
                     }
                     Ok(Some(run)) if run.status == TaskRunStatus::Idle => break,
+                    // #90: the two ways `drain_session` ends a single-shot
+                    // turn it could not treat as complete. Each gets its own
+                    // reason, since "exited without completing" would send a
+                    // human looking for a crash that never happened.
+                    Ok(Some(run))
+                        if run.status == TaskRunStatus::Exited
+                            && run.end_reason == Some(TaskRunEndReason::NoReport) =>
+                    {
+                        tracing::warn!(
+                            task_id,
+                            task_run_id,
+                            "task run ended without reporting its outcome; not auto-advancing"
+                        );
+                        engine
+                            .mark_stuck(
+                                &task_id,
+                                &format!(
+                                    "stage '{stage_name}': the agent's turn ended without \
+                                     calling report_outcome"
+                                ),
+                                false,
+                            )
+                            .await;
+                        return;
+                    }
+                    Ok(Some(run))
+                        if run.status == TaskRunStatus::Exited
+                            && run.end_reason == Some(TaskRunEndReason::Lingered) =>
+                    {
+                        tracing::warn!(
+                            task_id,
+                            task_run_id,
+                            "task run's process kept running after its turn ended and was killed; not auto-advancing"
+                        );
+                        engine
+                            .mark_stuck(
+                                &task_id,
+                                &format!(
+                                    "stage '{stage_name}': the agent process kept running after \
+                                     its turn ended and was killed; work it started may be \
+                                     incomplete"
+                                ),
+                                false,
+                            )
+                            .await;
+                        return;
+                    }
                     Ok(Some(run)) if run.status == TaskRunStatus::Exited => {
                         tracing::warn!(
                             task_id,
@@ -3567,6 +3612,20 @@ impl WorkflowEngine {
             _ => None,
         };
 
+        // A report made on a stage that doesn't route on it. #90 made every
+        // single-shot stage report `done` to complete, so that call is the
+        // expected one and not worth a note; only a report of some *other*
+        // outcome — one the stage can't act on — is.
+        let unroutable_note = (capture != Some(Capture::Json)
+            && report.as_ref().is_some_and(|report| {
+                report.get("outcome").and_then(Value::as_str) != Some(TURN_DEFAULT_OUTCOME)
+            }))
+        .then(|| {
+            "a report_outcome call was made, but this stage does not route on it \
+             (it declares no 'capture: json')"
+                .to_string()
+        });
+
         let (captured, outcome, note, source) = match routing_report {
             Some(report) => {
                 let serialized = report.to_string();
@@ -3613,18 +3672,11 @@ impl WorkflowEngine {
                 // outcome it never touched; the note below already says a
                 // report existed and was ignored, which is the fact worth
                 // recording.
-                let unroutable_note =
-                    (capture != Some(Capture::Json) && report.is_some()).then(|| {
-                        "a report_outcome call was made, but this stage does not route on it \
-                         (it declares no 'capture: json')"
-                            .to_string()
-                    });
-
                 match capture {
                     None => (
                         None,
                         TURN_DEFAULT_OUTCOME.to_string(),
-                        unroutable_note,
+                        unroutable_note.clone(),
                         None,
                     ),
                     // `capture: text` (or a `capture: json` stage with no
@@ -3647,7 +3699,7 @@ impl WorkflowEngine {
                                     derive_agent_reply_capture(capture, reply, task_id, stage_name);
                                 let (outcome, outcome_note) =
                                     turn_outcome(capture, captured.as_ref());
-                                let note = [capture_note.or(outcome_note), unroutable_note]
+                                let note = [capture_note.or(outcome_note), unroutable_note.clone()]
                                     .into_iter()
                                     .flatten()
                                     .collect::<Vec<_>>()
@@ -3667,7 +3719,7 @@ impl WorkflowEngine {
                                 );
                                 let note = [
                                     Some(format!("the turn's reply could not be read back: {err}")),
-                                    unroutable_note,
+                                    unroutable_note.clone(),
                                     report_fetch_note,
                                 ]
                                 .into_iter()
@@ -3843,7 +3895,12 @@ impl WorkflowEngine {
         // write this event; without `report_fetch_note.is_some()` here, a
         // report-lookup failure on a no-capture stage would reach nothing
         // but the log.
-        if capture.is_some() || report.is_some() || report_fetch_note.is_some() {
+        //
+        // #90 narrowed "received a report" to "received a report it can't act
+        // on": every single-shot stage now reports `done` to complete, and a
+        // `turn_outcome` for each of those would say nothing the stage trail
+        // doesn't.
+        if capture.is_some() || unroutable_note.is_some() || report_fetch_note.is_some() {
             // Only added when the stage actually parked: an author whose
             // `capture: text` turn routed fine through `on: { done: … }`
             // doesn't need to be told about `capture: json`. Added *here*
@@ -7442,6 +7499,86 @@ stages:
         panic!("timed out waiting for a turn_outcome event");
     }
 
+    /// Finishes a `review` (`capture: json`) stage from its recorded reply
+    /// alone, with no `report_outcome` call, by running `finish_turn`
+    /// directly against a run that already went idle.
+    ///
+    /// Since #90 no live turn gets here without reporting: a single-shot
+    /// turn completes only once it calls `report_outcome`, and a `capture:
+    /// json` stage then routes on that report. Parsing the verdict out of the
+    /// reply is still `finish_turn`'s fallback — when the report can't be
+    /// read back, or for an adapter with no tool channel — so the tests that
+    /// pin how a reply is parsed drive that path directly rather than through
+    /// a session that would now sit waiting to be nudged.
+    ///
+    /// `reply` takes the same directives as `fake_claude_reply.py`: a leading
+    /// `TOOL\n` narrates and makes a tool call first, and `BLOCKS\n` splits
+    /// the rest on `|` into separate text blocks.
+    async fn finish_review_turn_from_reply(
+        pool: &SqlitePool,
+        engine: &Arc<WorkflowEngine>,
+        def: &Arc<WorkflowDefinition>,
+        task_id: &str,
+        reply: &str,
+    ) {
+        workflow_state::create(pool, task_id, "review", json!({}))
+            .await
+            .unwrap();
+        let run_id = task_runs::create(
+            pool,
+            task_runs::NewTaskRun {
+                task_id,
+                stage: "review",
+                role: "reviewer",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        let (uses_tool, reply) = match reply.strip_prefix("TOOL\n") {
+            Some(rest) => (true, rest),
+            None => (false, reply),
+        };
+        let blocks: Vec<&str> = match reply.strip_prefix("BLOCKS\n") {
+            Some(rest) => rest.split('|').collect(),
+            None => vec![reply],
+        };
+        let mut recorded = Vec::new();
+        if uses_tool {
+            recorded.push((
+                EventType::AssistantMessage,
+                json!({ "text": "I'll read the diff first." }),
+            ));
+            recorded.push((
+                EventType::ToolCall,
+                json!({ "tool_use_id": "toolu_1", "tool": "Read", "input": { "path": "a.rs" } }),
+            ));
+            recorded.push((
+                EventType::ToolResult,
+                json!({ "tool_use_id": "toolu_1", "tool": "Read", "output": "fn main() {}", "is_error": false }),
+            ));
+        }
+        for block in blocks {
+            recorded.push((EventType::AssistantMessage, json!({ "text": block })));
+        }
+        recorded.push((EventType::TurnCompleted, json!({ "is_error": false })));
+        for (event_type, payload) in recorded {
+            events::append(pool, &run_id, event_type, payload)
+                .await
+                .unwrap();
+        }
+        task_runs::update_status(pool, &run_id, TaskRunStatus::Idle, None, None)
+            .await
+            .unwrap();
+
+        engine
+            .finish_turn(task_id, def, "review", Some(Capture::Json), &run_id)
+            .await;
+    }
+
     /// The end-to-end shape §5.1 exists for: one stage captures, a later
     /// stage's `command:` reads a field out of that capture.
     #[tokio::test]
@@ -7748,13 +7885,15 @@ stages:
 "#;
         let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
-        let binary = reply_binary(&dir, r#"{"outcome": "approved", "comments": "ship-it"}"#);
-        let engine = engine_with_adapter(pool.clone(), &binary);
-
-        engine
-            .start_task(&task_id, &def, Some("review this"))
-            .await
-            .unwrap();
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        finish_review_turn_from_reply(
+            &pool,
+            &engine,
+            &def,
+            &task_id,
+            r#"{"outcome": "approved", "comments": "ship-it"}"#,
+        )
+        .await;
         wait_until_stage(&pool, &task_id, "finished").await;
 
         // Captured under the stage that produced it...
@@ -7786,13 +7925,15 @@ stages:
         let dir = tempdir();
         let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
-        let binary = reply_binary(&dir, "TOOL\n{\"outcome\": \"approved\", \"n\": 1}");
-        let engine = engine_with_adapter(pool.clone(), &binary);
-
-        engine
-            .start_task(&task_id, &def, Some("review this"))
-            .await
-            .unwrap();
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        finish_review_turn_from_reply(
+            &pool,
+            &engine,
+            &def,
+            &task_id,
+            "TOOL\n{\"outcome\": \"approved\", \"n\": 1}",
+        )
+        .await;
         wait_until_stage(&pool, &task_id, "finished").await;
 
         let payload = payload_of(&pool, &task_id).await;
@@ -7818,13 +7959,15 @@ stages:
         let dir = tempdir();
         let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
-        let binary = reply_binary(&dir, "```json\n{\"outcome\": \"approved\"}\n```");
-        let engine = engine_with_adapter(pool.clone(), &binary);
-
-        engine
-            .start_task(&task_id, &def, Some("review this"))
-            .await
-            .unwrap();
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        finish_review_turn_from_reply(
+            &pool,
+            &engine,
+            &def,
+            &task_id,
+            "```json\n{\"outcome\": \"approved\"}\n```",
+        )
+        .await;
         wait_until_stage(&pool, &task_id, "finished").await;
 
         let payload = payload_of(&pool, &task_id).await;
@@ -7839,13 +7982,15 @@ stages:
         let dir = tempdir();
         let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
-        let binary = reply_binary(&dir, "BLOCKS\n{\"outcome\": \"approved\",| \"n\": 1}");
-        let engine = engine_with_adapter(pool.clone(), &binary);
-
-        engine
-            .start_task(&task_id, &def, Some("review this"))
-            .await
-            .unwrap();
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        finish_review_turn_from_reply(
+            &pool,
+            &engine,
+            &def,
+            &task_id,
+            "BLOCKS\n{\"outcome\": \"approved\",| \"n\": 1}",
+        )
+        .await;
         wait_until_stage(&pool, &task_id, "finished").await;
 
         let payload = payload_of(&pool, &task_id).await;
@@ -7862,13 +8007,9 @@ stages:
         let dir = tempdir();
         let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
-        let binary = reply_binary(&dir, "sorry, I could not do it");
-        let engine = engine_with_adapter(pool.clone(), &binary);
-
-        engine
-            .start_task(&task_id, &def, Some("review this"))
-            .await
-            .unwrap();
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        finish_review_turn_from_reply(&pool, &engine, &def, &task_id, "sorry, I could not do it")
+            .await;
         wait_until_stage(&pool, &task_id, "finished").await;
 
         let payload = payload_of(&pool, &task_id).await;
@@ -7893,13 +8034,15 @@ stages:
         let dir = tempdir();
         let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
-        let binary = reply_binary(&dir, r#"{"comments": "no verdict here"}"#);
-        let engine = engine_with_adapter(pool.clone(), &binary);
-
-        engine
-            .start_task(&task_id, &def, Some("review this"))
-            .await
-            .unwrap();
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        finish_review_turn_from_reply(
+            &pool,
+            &engine,
+            &def,
+            &task_id,
+            r#"{"comments": "no verdict here"}"#,
+        )
+        .await;
         wait_until_stage(&pool, &task_id, "finished").await;
 
         // Still captured — the payload is useful even without a verdict.
@@ -7940,13 +8083,8 @@ stages:
 "#;
         let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
-        let binary = reply_binary(&dir, "not json at all");
-        let engine = engine_with_adapter(pool.clone(), &binary);
-
-        engine
-            .start_task(&task_id, &def, Some("review this"))
-            .await
-            .unwrap();
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        finish_review_turn_from_reply(&pool, &engine, &def, &task_id, "not json at all").await;
 
         let event = wait_until_turn_outcome_event(&pool, &task_id).await;
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
@@ -8192,26 +8330,25 @@ stages:
         );
     }
 
-    /// The tool is the primary path, but an agent can always end a turn
-    /// without calling it — #73's own repro (prose before a JSON verdict)
-    /// must still route via the text fallback.
+    /// The tool is the primary path, but the reply is still the fallback
+    /// when no report can be read — #73's own repro (prose before a JSON
+    /// verdict) must still route via the text fallback.
     #[tokio::test]
     async fn prose_then_json_still_routes_via_the_text_fallback() {
         let pool = connect_in_memory().await.unwrap();
         let dir = tempdir();
         let def = Arc::new(WorkflowDefinition::parse(capturing_turn_yaml(), &dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
-        let binary = reply_binary(
-            &dir,
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        finish_review_turn_from_reply(
+            &pool,
+            &engine,
+            &def,
+            &task_id,
             "Looks correct to me, compiles and passes tests.\n\n\
              {\"outcome\": \"approved\", \"feedback\": \"\"}",
-        );
-        let engine = engine_with_adapter(pool.clone(), &binary);
-
-        engine
-            .start_task(&task_id, &def, Some("review this"))
-            .await
-            .unwrap();
+        )
+        .await;
         wait_until_stage(&pool, &task_id, "finished").await;
 
         let event = wait_until_turn_outcome_event(&pool, &task_id).await;
@@ -9246,6 +9383,7 @@ done
 export MOCK_CLAUDE_ONESHOT=1
 if [ "$role" = "reviewer" ]; then
     export MOCK_CLAUDE_REPLY="$(cat "{reply_path}")"
+    export MOCK_CLAUDE_REPORT="$(cat "{reply_path}")"
 else
     export MOCK_CLAUDE_REPLY="did the thing"
 fi
@@ -10888,5 +11026,313 @@ stages:
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "cancelled");
         assert_eq!(task.stuck_reason, None);
+    }
+
+    // ---- turn completion, isolation and cancel (#90) ----
+
+    fn engine_with_turn_timers(
+        pool: SqlitePool,
+        binary: &str,
+        timers: crate::session::TurnTimers,
+    ) -> Arc<WorkflowEngine> {
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let events_notify = Arc::new(Notify::new());
+        let session_manager = SessionManager::with_turn_timers(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::clone(&events_notify),
+            timers,
+        );
+        WorkflowEngine::new(
+            pool,
+            session_manager,
+            PathBuf::from("."),
+            None,
+            events_notify,
+        )
+    }
+
+    fn fast_turn_timers() -> crate::session::TurnTimers {
+        crate::session::TurnTimers {
+            grace: StdDuration::from_millis(400),
+            nudge_after: StdDuration::from_millis(150),
+            max_nudges: 1,
+        }
+    }
+
+    /// A `fake_claude_script.py` wrapper following `steps`.
+    fn script_binary(dir: &Path, steps: Value) -> String {
+        let script = dir.join("script.json");
+        fs::write(&script, steps.to_string()).unwrap();
+        write_script(
+            dir,
+            "fake-claude-script",
+            &format!(
+                "#!/bin/sh\nFAKE_CLAUDE_SCRIPT='{}' exec '{}' \"$@\"\n",
+                script.display(),
+                fixture_binary("fake_claude_script.py"),
+            ),
+        )
+        .display()
+        .to_string()
+    }
+
+    fn single_turn_yaml() -> &'static str {
+        r#"
+name: single
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#
+    }
+
+    /// #88's failure, end to end: the coder ends its turn without reporting
+    /// (it was waiting on a background sub-agent). The workflow must not
+    /// advance on that `result`; once nudging runs out, the task parks.
+    #[tokio::test]
+    async fn a_turn_that_never_reports_parks_the_task_instead_of_advancing() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = script_binary(
+            &dir,
+            json!([
+                {"op": "read_turn"},
+                {"op": "text", "text": "delegated it to a background agent"},
+                {"op": "result"},
+                {"op": "answer_every_turn", "text": "still waiting"},
+            ]),
+        );
+        let engine = engine_with_turn_timers(pool.clone(), &binary, fast_turn_timers());
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "coding");
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert!(
+            task.stuck_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("without calling report_outcome")),
+            "{:?}",
+            task.stuck_reason
+        );
+    }
+
+    /// The turn reported and ended, but its process kept going. The stage
+    /// must not advance while it runs, and once it's killed the task parks
+    /// rather than moving past work that may still have been landing.
+    #[tokio::test]
+    async fn a_turn_whose_process_lingers_after_reporting_parks_the_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = script_binary(
+            &dir,
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "emit_forever", "text": "still writing files"},
+            ]),
+        );
+        let engine = engine_with_turn_timers(pool.clone(), &binary, fast_turn_timers());
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+
+        let trail = stage_trail(&pool, &task_id).await;
+        assert!(
+            trail.iter().all(|(stage, _)| stage != "finished"),
+            "must never advance past a turn whose process was still running: {trail:?}"
+        );
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert!(
+            task.stuck_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("kept running")),
+            "{:?}",
+            task.stuck_reason
+        );
+    }
+
+    /// A single-shot stage with no `capture: json` may only report `done`,
+    /// the one outcome it advances on; a standing stage isn't told to report.
+    #[tokio::test]
+    async fn a_plain_single_shot_stage_may_report_only_done() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude_echo_args.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
+        let reply = events::final_assistant_text_for_run(&pool, &run.id)
+            .await
+            .unwrap();
+        let mcp_config = reply
+            .split("|mcp_config=")
+            .nth(1)
+            .and_then(|rest| rest.split("|strict_mcp_config=").next())
+            .expect("mcp_config field");
+        let mcp_config: Value = serde_json::from_str(mcp_config).unwrap();
+        assert_eq!(
+            mcp_config["mcpServers"]["chocofactory"]["args"],
+            json!(["mcp-serve", "--outcome", "done"])
+        );
+    }
+
+    /// The seam from workflow YAML to the spawned process's argv: a role's
+    /// `skills:` and default memory setting reach the real subprocess.
+    #[tokio::test]
+    async fn a_roles_isolation_reaches_the_spawned_process() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: isolated
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+    skills: [run-tests]
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude_echo_args.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
+        let reply = events::final_assistant_text_for_run(&pool, &run.id)
+            .await
+            .unwrap();
+        for expected in [
+            "|setting_sources=project,local|",
+            "|strict_mcp_config=true|",
+            "|disallowed_tools=ReportFindings|",
+            "|disable_auto_memory=1|",
+            r#"|initialize={"skills":["run-tests"],"subtype":"initialize"}|"#,
+        ] {
+            assert!(reply.contains(expected), "missing {expected} in {reply}");
+        }
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 delivers nothing; the call only reports whether
+        // the process exists, via its return value.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// #90's cancel half: in #88 an earlier stage's run was already recorded
+    /// done, but its process (and the sub-agent inside it) was still alive,
+    /// and cancel only looked at the current stage's active run. Every live
+    /// process of the task has to die.
+    #[tokio::test]
+    async fn cancel_kills_every_live_session_of_the_task_not_just_the_current_one() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        // Each launch gets its own directory, so the two sessions' grandchild
+        // pids land in separate files.
+        let wrapper = write_script(
+            &dir,
+            "fake-claude-spawns-child",
+            &format!(
+                "#!/bin/sh\nd=$(mktemp -d '{}/run.XXXXXX')\n\
+                 CHOCO_TEST_HEARTBEAT=\"$d/heartbeat\" CHOCO_TEST_CHILD_PID=\"$d/child.pid\" \
+                 exec '{}' \"$@\"\n",
+                dir.display(),
+                fixture_binary("fake_claude_spawns_child.py"),
+            ),
+        );
+        let engine = engine_with_adapter(pool.clone(), &wrapper.display().to_string());
+        let task_id = seed_task(&pool, "single").await;
+        let cfg = crate::adapter::RoleConfig {
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: false,
+            report_outcomes: Vec::new(),
+            isolation: crate::adapter::Isolation::InheritOperatorConfig,
+        };
+
+        for stage in ["coding", "internal_review"] {
+            let run_id = task_runs::create(
+                &pool,
+                task_runs::NewTaskRun {
+                    task_id: &task_id,
+                    stage,
+                    role: "coder",
+                    cli_adapter: "claude",
+                    model: "sonnet",
+                },
+            )
+            .await
+            .unwrap()
+            .id;
+            engine
+                .session_manager
+                .start(&run_id, "go", &cfg, SessionKind::Standing)
+                .await
+                .unwrap();
+            // The earlier stage's run is recorded as finished, exactly as
+            // #88's coding run was, while its process is still alive.
+            if stage == "coding" {
+                task_runs::update_status(&pool, &run_id, TaskRunStatus::Idle, None, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut pids = Vec::new();
+        for _ in 0..1000 {
+            pids = fs::read_dir(&*dir)
+                .unwrap()
+                .filter_map(|entry| fs::read_to_string(entry.ok()?.path().join("child.pid")).ok())
+                .filter_map(|text| text.trim().parse::<u32>().ok())
+                .collect();
+            if pids.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert_eq!(pids.len(), 2, "both sessions should have started a child");
+        assert!(pids.iter().all(|pid| process_alive(*pid)));
+
+        engine.cancel_task(&task_id).await.unwrap();
+
+        for pid in pids {
+            let mut gone = false;
+            for _ in 0..500 {
+                if !process_alive(pid) {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+            assert!(gone, "pid {pid} survived cancel");
+        }
     }
 }

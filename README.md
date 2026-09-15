@@ -51,6 +51,7 @@ HOME=$(mktemp -d) CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude \
 | `CHOCOFACTORY_CHOCO_BINARY` | Path to `choco`, used to serve every agent turn's `report_outcome` tool (see below). Unset = the daemon's own sibling `choco` binary. |
 | `CHOCOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. |
 | `MOCK_CLAUDE_REPLY` | Read by `mock-claude` only — reply with this fixed text instead of echoing. |
+| `MOCK_CLAUDE_REPORT` | Read by `mock-claude` only — the JSON input of the `report_outcome` call a single-shot turn makes (default `{"outcome": "done"}`). |
 | `RUST_LOG` | Log filter, e.g. `error` to quiet startup, `debug` for detail. |
 
 ### Writing a workflow: how a stage routes on an agent's verdict
@@ -79,13 +80,58 @@ telling the agent to call it before ending its turn. There is no second copy
 of `approved`/`changes_requested` to keep in sync — change the `on:` map and
 every agent-facing part of the contract changes with it.
 
-The tool is present on *every* agent turn, not only ones that route — a
-stage with no `on:` edges (or none matching `capture: json`) still offers
-`report_outcome`, just with a free-form, non-routing `outcome`: useful for a
-coder to note it's `blocked`, visible on the task's event timeline, but never
-able to park a stage that has always advanced unconditionally. An agent that
-never calls the tool still works: the engine falls back to parsing the
-turn's final reply as JSON, same as before this existed.
+The tool is present on *every* agent turn, and every stage that can finish
+on its own (anything but a standing `on: {}` session like chat) has to call
+it to finish. A stage without `capture: json` may only report `done`, the
+one outcome it advances on.
+
+That's because the CLI's end-of-turn line doesn't mean the work is done: an
+agent waiting on a background sub-agent or a long test run ends its turn and
+is woken when that finishes. So the daemon treats a turn as complete only
+when it ends *after* the agent called `report_outcome`:
+
+- A turn that ends without reporting is left open. After 5 minutes with no
+  output it's nudged (up to 3 times); after that it's closed, and the task is
+  marked `stuck`.
+- Once a turn has reported and ended, its process has 30 seconds to exit. If
+  it's still running, its whole process group is killed and the task is
+  marked `stuck`, rather than advancing past work that may still be landing.
+- Output that arrives after a turn completed stays on the timeline, flagged
+  `after_completion`. Nudges and kills appear as `session_note` events.
+
+A sub-agent calling `report_outcome` doesn't count, and neither does a call
+the tool rejected.
+
+### Writing a workflow: what an agent inherits from your Claude setup
+
+By default an agent role runs isolated from the operator's own Claude Code
+setup: no `~/.claude/CLAUDE.md`, no user plugins, hooks or output style, no
+MCP servers other than the daemon's, no skills, no auto-memory, and no
+built-in `ReportFindings` tool. The task repo's own `CLAUDE.md` and
+`.claude/settings.json` still apply, including any hooks or plugins that
+repo enables: they belong to the code being worked on. A role can loosen the
+rest in the workflow file:
+
+```yaml
+roles:
+  coder:
+    skills: [run-tests]   # skills it may invoke; omitted = none
+    memory: true          # use auto-memory; omitted = no
+  chat:
+    inherit_operator_config: true   # your full setup, as before
+```
+
+`skills`/`memory` can't be combined with `inherit_operator_config`. None of
+these can be set from task config (`--config`, `--role-*`) or the global
+config file: only a workflow definition can loosen what its agents see. The
+built-in `chat` workflow inherits your setup; `coding-task` is isolated. The
+daemon never overwrites a workflow already seeded into
+`~/.config/chocofactory/workflows/`, so an existing `chat.yaml` there needs
+`inherit_operator_config: true` added by hand to keep its old behaviour.
+
+Each session's `session_meta` event records what it actually ran with: the
+CLI version, model, tools, MCP servers, plugins, skills, and the isolation
+it was launched under.
 
 ### Reviewing a `coding-task` PR
 
@@ -258,7 +304,9 @@ finished) is a `409`.
 
 Sometimes the engine itself can't move a task forward — a stage's outcome
 has no `on:` edge to route through, a transition failed, an agent turn's
-session never started, or a run was force-closed before it finished. When
+session never started, a run was force-closed before it finished, an agent
+never reported its outcome, or an agent's process kept running after its turn
+ended. When
 that happens the task is marked `stuck` rather than silently staying
 `open`, with a human-readable reason attached.
 
