@@ -28,6 +28,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Hashes a task's resolved workflow file (issue #88) — already in the tree
+# transitively via sqlx, so this pulls in nothing new.
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "sqlite",

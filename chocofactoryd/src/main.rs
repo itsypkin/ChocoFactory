@@ -73,9 +73,14 @@ async fn main() {
     // into this binary and are seeded out to the user's own workflows
     // directory only if not already present (§2.2) — never overwritten on
     // a later version's startup.
-    config_root::seed_builtin_workflows(&workflows_dir)
+    let seed_report = config_root::seed_builtin_workflows(&workflows_dir)
         .expect("chocofactoryd: failed to seed builtin workflow definitions");
-    tracing::info!(dir = %workflows_dir.display(), "seeded builtin workflows");
+    tracing::info!(
+        dir = %workflows_dir.display(),
+        created = seed_report.created.len(),
+        existing = seed_report.existing.len(),
+        "seeded builtin workflows"
+    );
 
     let db_path = root.join("chocofactory.db");
     let pool = db::connect(&db_path)

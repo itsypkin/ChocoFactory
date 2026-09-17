@@ -75,6 +75,34 @@ pub struct TaskDetail {
     /// to filter out of `GET /tasks/:id/events` so `choco task status`
     /// stays one request and can't show a page-truncated trail.
     pub stage_trail: Vec<Event>,
+    /// Whether `task.workflow_path`'s contents still match the recorded
+    /// `workflow_sha256` (issue #88) — `"unchanged"`, `"changed"`, or
+    /// `"missing"` when the file can't be re-read right now (deleted,
+    /// permissions, ...; any I/O error collapses to this rather than
+    /// failing the whole request). `None` when the task has no
+    /// `workflow_path` at all (a legacy task, predating this column).
+    /// Computed fresh on every request by re-hashing the file — not cached,
+    /// same as every other "resolved right now" value this API serves.
+    pub workflow_file_status: Option<&'static str>,
+}
+
+/// Computes [`TaskDetail::workflow_file_status`] for `task`. A pure
+/// function of the file on disk right now — re-hashes it and compares
+/// against `task.workflow_sha256` — so it's unit-testable without a running
+/// server.
+fn workflow_file_status(task: &Task) -> Option<&'static str> {
+    let path = task.workflow_path.as_deref()?;
+    let status = match std::fs::read(path) {
+        Ok(bytes) => {
+            if Some(crate::engine::sha256_hex(&bytes).as_str()) == task.workflow_sha256.as_deref() {
+                "unchanged"
+            } else {
+                "changed"
+            }
+        }
+        Err(_) => "missing",
+    };
+    Some(status)
 }
 
 /// Three separate reads, deliberately not one transaction: a transition
@@ -98,10 +126,12 @@ pub async fn get(
         .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;
     let workflow_state = workflow_state::get(&state.pool, &id).await?;
     let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
+    let workflow_file_status = workflow_file_status(&task);
     Ok(Json(TaskDetail {
         task,
         workflow_state,
         stage_trail,
+        workflow_file_status,
     }))
 }
 

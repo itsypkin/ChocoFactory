@@ -12,7 +12,10 @@ use std::process::ExitCode;
 use chocofactory_core::models::{Project, Task};
 use clap::Parser;
 use cli::{Cli, Command, ProjectCmd, RoleOverrideArgs, TaskCmd};
-use client::{Client, ClientError, CreateTaskParams, EventsPage, RoleOverrides, build_task_config};
+use client::{
+    Client, ClientError, CreateTaskParams, EventsPage, InitWorkflowsResult, RoleOverrides,
+    build_task_config,
+};
 use serde_json::Value;
 
 /// Borrows the parsed `--role-*`/`--config` flags in the shape
@@ -26,6 +29,23 @@ fn role_overrides(args: &RoleOverrideArgs) -> RoleOverrides<'_> {
         role_system_prompt_file: &args.role_system_prompt_file,
         config: args.config.as_deref(),
     }
+}
+
+/// Resolves a `--repo`/`project create --repo` value to an absolute,
+/// existing directory (issue #88), client-side — the daemon's own cwd
+/// differs from the user's, so canonicalizing there would resolve the wrong
+/// path entirely. A relative path, including `.`, works, since
+/// `std::fs::canonicalize` resolves against *this process's* cwd.
+fn canonicalize_repo(path: &str) -> Result<String, ClientError> {
+    let canonical = std::fs::canonicalize(path).map_err(|err| {
+        ClientError::InvalidRepoPath(format!("--repo '{path}' could not be resolved: {err}"))
+    })?;
+    if !canonical.is_dir() {
+        return Err(ClientError::InvalidRepoPath(format!(
+            "--repo '{path}' is not a directory"
+        )));
+    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 #[tokio::main]
@@ -89,6 +109,8 @@ enum Output {
     /// a delegating agent polling `workflow_state.current_stage` wants.
     TaskDetail(Value),
     Events(EventsPage),
+    /// `choco project init-workflows`'s result (issue #88).
+    InitWorkflows(InitWorkflowsResult),
     /// A 202-with-no-body call. Human mode still confirms it landed;
     /// `--json` stays silent so nothing has to parse a courtesy message.
     Accepted(String),
@@ -103,6 +125,7 @@ impl Output {
             Output::Tasks(t) => serde_json::to_string(t),
             Output::TaskDetail(d) => serde_json::to_string(d),
             Output::Events(e) => serde_json::to_string(e),
+            Output::InitWorkflows(r) => serde_json::to_string(r),
             Output::Accepted(_) => return None,
         };
         Some(value.expect("API models are always serializable"))
@@ -116,6 +139,7 @@ impl Output {
             Output::Tasks(t) => render::tasks(t),
             Output::TaskDetail(d) => render::task_detail(d),
             Output::Events(e) => render::events(e),
+            Output::InitWorkflows(r) => render::init_workflows(r),
             Output::Accepted(msg) => msg.clone(),
         })
     }
@@ -123,10 +147,50 @@ impl Output {
 
 async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
     match command {
-        Command::Project(ProjectCmd::Create { name }) => {
-            Ok(Output::Project(client.create_project(&name).await?))
+        Command::Project(ProjectCmd::Create { name, repo }) => {
+            let repo_path = repo.as_deref().map(canonicalize_repo).transpose()?;
+            Ok(Output::Project(
+                client.create_project(&name, repo_path.as_deref()).await?,
+            ))
+        }
+        Command::Project(ProjectCmd::Update {
+            project,
+            name,
+            repo,
+            no_repo,
+        }) => {
+            if name.is_none() && repo.is_none() && !no_repo {
+                return Err(ClientError::InvalidConfig(
+                    "nothing to change — pass at least one of --name/--repo/--no-repo".to_string(),
+                ));
+            }
+            // `--repo`/`--no-repo` conflict (clap), so at most one of these
+            // produces `Some`.
+            let repo_path: Option<Option<String>> = if no_repo {
+                Some(None)
+            } else {
+                repo.as_deref()
+                    .map(canonicalize_repo)
+                    .transpose()?
+                    .map(Some)
+            };
+            let project_id = client.resolve_project(&project).await?;
+            let updated = client
+                .update_project(
+                    &project_id,
+                    name.as_deref(),
+                    repo_path.as_ref().map(|p| p.as_deref()),
+                )
+                .await?;
+            Ok(Output::Project(updated))
         }
         Command::Project(ProjectCmd::List) => Ok(Output::Projects(client.list_projects().await?)),
+        Command::Project(ProjectCmd::InitWorkflows { project }) => {
+            let project_id = client.resolve_project(&project).await?;
+            Ok(Output::InitWorkflows(
+                client.init_workflows(&project_id).await?,
+            ))
+        }
         Command::Task(TaskCmd::Create(args)) => {
             // Built before resolving the project so a malformed flag fails
             // immediately, without a lookup request first.

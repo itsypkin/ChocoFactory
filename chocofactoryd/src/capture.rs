@@ -31,7 +31,7 @@ mod tests {
     use crate::db::{connect_in_memory, projects, task_runs, tasks};
 
     async fn seed_task_run(pool: &SqlitePool) -> String {
-        let project_id = projects::create(pool, "demo").await.unwrap().id;
+        let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             pool,
             tasks::NewTask {
@@ -39,6 +39,8 @@ mod tests {
                 workflow_def: "coding_task",
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await

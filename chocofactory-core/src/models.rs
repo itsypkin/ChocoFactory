@@ -5,7 +5,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A grouping label for related tasks. Holds no repo/path itself (design §3).
+/// A grouping label for related tasks (design §3). May optionally carry a
+/// repo path (issue #88): when set, a task created under this project
+/// defaults its own `--repo`/`config.cwd` to it, and workflow resolution
+/// looks in `<repo_path>/.chocofactory/workflows/` before the global
+/// `~/.config/chocofactory/workflows/` directory — see `engine::
+/// resolve_task_workflow`. `None` is today's behaviour: a project with no
+/// repo of its own, every task under it configuring its own `--repo`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     /// UUID (v4), stored as text. Kept as a plain `String` rather than a
@@ -13,6 +19,7 @@ pub struct Project {
     /// later without touching every struct that carries an id.
     pub id: String,
     pub name: String,
+    pub repo_path: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -45,6 +52,33 @@ pub struct Task {
     /// `db::tasks::mark_stuck`. `choco task retry <id>` re-runs the current
     /// stage and clears it via `db::tasks::reopen_stuck`.
     pub stuck_reason: Option<String>,
+    /// The canonical, absolute path of the workflow file this task actually
+    /// runs (issue #88) — resolved once at `create_task` time from either
+    /// the project's own `.chocofactory/workflows/<workflow_def>.yaml` or
+    /// the global `~/.config/chocofactory/workflows/<workflow_def>.yaml`
+    /// (see `engine::resolve_task_workflow`). This, not `workflow_def`
+    /// re-resolved by name, is *the* authority for which file every later
+    /// reload of this task's workflow loads — `engine::WorkflowEngine::
+    /// load_task_workflow` reads this path directly rather than searching
+    /// again, so editing or deleting the global/repo copy after the task
+    /// started can never change which file a running task uses. `None`
+    /// only for a task created before this column existed, which falls
+    /// back to a fresh name lookup exactly as it always has.
+    ///
+    /// A future iteration may repoint this at a different file mid-task
+    /// (e.g. a task whose own stage generates a workflow for a later
+    /// stage to run) — nothing here assumes it is fixed for the task's
+    /// whole lifetime, only that it is always the single source of truth
+    /// for "what runs next".
+    pub workflow_path: Option<String>,
+    /// SHA-256 of `workflow_path`'s contents (lowercase hex), hashed from
+    /// the same read that parsed the file (`engine::load_workflow_file`) so
+    /// the recorded digest can never describe a different file than the one
+    /// that ran. Used only to detect drift for display (`choco task
+    /// status`'s "changed since task start") — a workflow file changing
+    /// after a task starts is allowed, not refused, and reloading never
+    /// checks this hash. `None` alongside `workflow_path: None`.
+    pub workflow_sha256: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

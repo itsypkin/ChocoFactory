@@ -82,6 +82,7 @@ pub fn project(p: &Project) -> String {
     fields(&[
         ("Name", single_line(&p.name)),
         ("ID", p.id.clone()),
+        ("Repo", p.repo_path.as_deref().unwrap_or("-").to_string()),
         ("Created", timestamp(&p.created_at)),
     ])
 }
@@ -92,9 +93,32 @@ pub fn projects(list: &[Project]) -> String {
     }
     let rows: Vec<Vec<String>> = list
         .iter()
-        .map(|p| vec![one_line(&p.name), p.id.clone(), timestamp(&p.created_at)])
+        .map(|p| {
+            vec![
+                one_line(&p.name),
+                p.id.clone(),
+                p.repo_path.as_deref().unwrap_or("-").to_string(),
+                timestamp(&p.created_at),
+            ]
+        })
         .collect();
-    table(&["NAME", "ID", "CREATED"], &rows)
+    table(&["NAME", "ID", "REPO", "CREATED"], &rows)
+}
+
+/// `choco project init-workflows`'s result (issue #88).
+pub fn init_workflows(result: &crate::client::InitWorkflowsResult) -> String {
+    let mut out = format!("Seeded {}\n", result.dir);
+    for path in &result.created {
+        out.push_str(&format!("  created   {path}\n"));
+    }
+    for path in &result.existing {
+        out.push_str(&format!("  existing  {path}\n"));
+    }
+    out.push_str(
+        "\nCommit this directory so the team shares it: \
+         git add .chocofactory/ && git commit",
+    );
+    out
 }
 
 pub fn task(t: &Task) -> String {
@@ -192,8 +216,26 @@ pub fn task_detail(detail: &Value) -> String {
         ("ID", get("id").to_string()),
         ("Project", get("project_id").to_string()),
         ("Workflow", get("workflow_def").to_string()),
-        ("Status", get("status").to_string()),
     ];
+    // Only present for a task created after issue #88 — a legacy task
+    // (`workflow_path: null`) shows no such line, exactly as if this field
+    // didn't exist. Where the file changed or has gone missing since the
+    // task started, that's appended right onto this line rather than as a
+    // separate one — it's a qualifier on *this* fact, not a fact of its
+    // own.
+    if let Some(path) = detail.get("workflow_path").and_then(Value::as_str) {
+        let mut line = path.to_string();
+        match detail.get("workflow_file_status").and_then(Value::as_str) {
+            Some("changed") => line.push_str(" (changed since task start)"),
+            Some("missing") => line.push_str(" (missing)"),
+            _ => {}
+        }
+        if let Some(sha) = detail.get("workflow_sha256").and_then(Value::as_str) {
+            line.push_str(&format!("  [{}]", &sha[..sha.len().min(12)]));
+        }
+        pairs.push(("Workflow file", line));
+    }
+    pairs.push(("Status", get("status").to_string()));
     // Right after Status, so the reason for a stuck task (X-4, #61) reads
     // next to the status value that explains it needs one.
     if get("status") == "stuck"
@@ -736,6 +778,8 @@ mod tests {
             worktree_repo: None,
             worktree_project: None,
             stuck_reason: None,
+            workflow_path: None,
+            workflow_sha256: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1080,6 +1124,8 @@ mod tests {
             worktree_repo: None,
             worktree_project: None,
             stuck_reason: None,
+            workflow_path: None,
+            workflow_sha256: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

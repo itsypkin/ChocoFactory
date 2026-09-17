@@ -6,7 +6,8 @@ use sqlx::{FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
 const COLUMNS: &str = "id, project_id, workflow_def, title, status, config, \
-     worktree_repo, worktree_project, stuck_reason, created_at, updated_at";
+     worktree_repo, worktree_project, stuck_reason, workflow_path, workflow_sha256, \
+     created_at, updated_at";
 
 #[derive(FromRow)]
 struct TaskRow {
@@ -19,6 +20,8 @@ struct TaskRow {
     worktree_repo: Option<String>,
     worktree_project: Option<String>,
     stuck_reason: Option<String>,
+    workflow_path: Option<String>,
+    workflow_sha256: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -35,6 +38,8 @@ impl From<TaskRow> for Task {
             worktree_repo: row.worktree_repo,
             worktree_project: row.worktree_project,
             stuck_reason: row.stuck_reason,
+            workflow_path: row.workflow_path,
+            workflow_sha256: row.workflow_sha256,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -46,14 +51,25 @@ pub struct NewTask<'a> {
     pub workflow_def: &'a str,
     pub title: &'a str,
     pub config: Value,
+    /// The canonical, absolute path of the workflow file this task was
+    /// created from (issue #88) — `None` only for a task created before
+    /// this column existed. See `Task::workflow_path`'s doc comment for why
+    /// every later reload of this task's workflow must use this path
+    /// rather than a fresh name lookup.
+    pub workflow_path: Option<&'a str>,
+    /// SHA-256 (lowercase hex) of `workflow_path`'s contents at creation
+    /// time, so `choco task status` can say whether the file has changed
+    /// since.
+    pub workflow_sha256: Option<&'a str>,
 }
 
 pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRow>(&format!(
-        "INSERT INTO tasks (id, project_id, workflow_def, title, status, config, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'open', ?, ?, ?)
+        "INSERT INTO tasks (id, project_id, workflow_def, title, status, config, \
+         workflow_path, workflow_sha256, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
          RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -61,6 +77,8 @@ pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::E
     .bind(new.workflow_def)
     .bind(new.title)
     .bind(Json(new.config))
+    .bind(new.workflow_path)
+    .bind(new.workflow_sha256)
     .bind(now)
     .bind(now)
     .fetch_one(pool)
@@ -249,7 +267,7 @@ mod tests {
     use serde_json::json;
 
     async fn seed_project(pool: &SqlitePool) -> String {
-        projects::create(pool, "demo").await.unwrap().id
+        projects::create(pool, "demo", None).await.unwrap().id
     }
 
     #[tokio::test]
@@ -264,6 +282,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "Investigate flaky test",
                 config: json!({"model": "sonnet"}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -302,6 +322,8 @@ mod tests {
                 workflow_def: "multi-role",
                 title: "T",
                 config,
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -392,6 +414,67 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// #88: `workflow_path`/`workflow_sha256` round-trip through `create`
+    /// the same way every other column does — `WorkflowEngine::create_task`
+    /// is the only writer, but the DB layer owns the round trip.
+    #[tokio::test]
+    async fn create_round_trips_workflow_path_and_sha256() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = seed_project(&pool).await;
+
+        let created = create(
+            &pool,
+            NewTask {
+                project_id: &project_id,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+                workflow_path: Some("/home/user/.config/chocofactory/workflows/chat.yaml"),
+                workflow_sha256: Some(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created.workflow_path.as_deref(),
+            Some("/home/user/.config/chocofactory/workflows/chat.yaml")
+        );
+        assert_eq!(
+            created.workflow_sha256.as_deref(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+
+        let fetched = get(&pool, &created.id).await.unwrap().unwrap();
+        assert_eq!(fetched, created);
+    }
+
+    /// A task created without a workflow file recorded (the legacy shape,
+    /// or a `create` call that passes `None`) round-trips as `None`, not an
+    /// empty string.
+    #[tokio::test]
+    async fn create_without_a_workflow_path_leaves_it_null() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = seed_project(&pool).await;
+
+        let created = create(
+            &pool,
+            NewTask {
+                project_id: &project_id,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(created.workflow_path.is_none());
+        assert!(created.workflow_sha256.is_none());
     }
 
     #[tokio::test]
@@ -503,6 +586,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "A1",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -514,6 +599,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "B1",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
