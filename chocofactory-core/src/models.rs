@@ -111,6 +111,16 @@ pub enum TaskRunEndReason {
     /// one is *requested* rather than observed, so it takes precedence over
     /// `Reaped` when both could apply — see `session::drain_session`.
     Cancelled,
+    /// A single-shot turn had reported its outcome and ended (#90), but its
+    /// process group was still alive once the post-completion grace period
+    /// ran out, so `session::drain_session` killed it. Something the turn
+    /// started kept running after it said it was done, so the task parks
+    /// rather than advancing past work that may still be landing.
+    Lingered,
+    /// A single-shot turn ended without ever calling `report_outcome`
+    /// (#90), even after the daemon's nudges, so it was closed rather than
+    /// treated as complete.
+    NoReport,
 }
 
 impl fmt::Display for TaskRunEndReason {
@@ -119,6 +129,8 @@ impl fmt::Display for TaskRunEndReason {
             TaskRunEndReason::Reaped => "reaped",
             TaskRunEndReason::StartFailed => "start_failed",
             TaskRunEndReason::Cancelled => "cancelled",
+            TaskRunEndReason::Lingered => "lingered",
+            TaskRunEndReason::NoReport => "no_report",
         })
     }
 }
@@ -142,6 +154,8 @@ impl FromStr for TaskRunEndReason {
             "reaped" => Ok(TaskRunEndReason::Reaped),
             "start_failed" => Ok(TaskRunEndReason::StartFailed),
             "cancelled" => Ok(TaskRunEndReason::Cancelled),
+            "lingered" => Ok(TaskRunEndReason::Lingered),
+            "no_report" => Ok(TaskRunEndReason::NoReport),
             other => Err(ParseTaskRunEndReasonError(other.to_string())),
         }
     }
@@ -263,6 +277,14 @@ pub enum EventType {
     /// blanked-out reference from that one render (one event per render
     /// call, not per placeholder).
     TemplateUnresolved,
+    /// The daemon itself acted on an agent session (#90): it nudged a turn
+    /// that ended without calling `report_outcome`, gave up on one that
+    /// never did, or killed a process that kept running after its turn had
+    /// completed. Session-scoped (`task_run_id` set). Payload is
+    /// `{"kind", "message"}`, where `kind` is `"nudge"`, `"no_report"` or
+    /// `"lingered"`. Without it those interventions would only be visible
+    /// in the daemon's logs and in the run's `end_reason`.
+    SessionNote,
 }
 
 impl fmt::Display for EventType {
@@ -280,6 +302,7 @@ impl fmt::Display for EventType {
             EventType::ShellOutput => "shell_output",
             EventType::TurnOutcome => "turn_outcome",
             EventType::TemplateUnresolved => "template_unresolved",
+            EventType::SessionNote => "session_note",
         })
     }
 }
@@ -312,6 +335,7 @@ impl FromStr for EventType {
             "shell_output" => Ok(EventType::ShellOutput),
             "turn_outcome" => Ok(EventType::TurnOutcome),
             "template_unresolved" => Ok(EventType::TemplateUnresolved),
+            "session_note" => Ok(EventType::SessionNote),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -376,6 +400,8 @@ mod tests {
             TaskRunEndReason::Reaped,
             TaskRunEndReason::StartFailed,
             TaskRunEndReason::Cancelled,
+            TaskRunEndReason::Lingered,
+            TaskRunEndReason::NoReport,
         ] {
             assert_eq!(
                 reason.to_string().parse::<TaskRunEndReason>().unwrap(),
@@ -406,6 +432,7 @@ mod tests {
             EventType::ShellOutput,
             EventType::TurnOutcome,
             EventType::TemplateUnresolved,
+            EventType::SessionNote,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),

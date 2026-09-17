@@ -26,6 +26,17 @@
 //!   concatenates everything the agent said rather than taking its final
 //!   message.
 //!
+//! - `MOCK_CLAUDE_REPORT` — the JSON input of the `report_outcome` call a
+//!   single-shot turn makes before replying (#90). A single-shot turn is one
+//!   the adapter passed `--append-system-prompt` to, which is how the real
+//!   CLI is told it must report to complete; without this knob the mock
+//!   reports `{"outcome": "done"}`, or the first `--outcome` in its
+//!   `--mcp-config` when `done` isn't one of them. A standing session (chat)
+//!   never reports.
+//!
+//! A stream-json `control_request` on stdin (the skills allowlist the adapter
+//! sends ahead of the first turn, #90) is skipped, not treated as a turn.
+//!
 //! Every other flag (`--print`, `--input-format`, `--output-format`,
 //! `--verbose`, `--model`, `--system-prompt`) is accepted but ignored —
 //! this binary only needs to *emit* valid stream-json, not validate the
@@ -48,6 +59,7 @@ fn main() {
         return;
     }
 
+    let report = single_shot_report(&args);
     let reply_override = std::env::var("MOCK_CLAUDE_REPLY").ok();
     let oneshot = std::env::var_os("MOCK_CLAUDE_ONESHOT").is_some();
     let uses_tool = std::env::var_os("MOCK_CLAUDE_TOOL_USE").is_some();
@@ -60,6 +72,9 @@ fn main() {
         }
         let turn: Value = serde_json::from_str(line)
             .unwrap_or_else(|err| panic!("received a non-JSON stdin turn ({err}): {line}"));
+        if turn.get("type").and_then(Value::as_str) == Some("control_request") {
+            continue;
+        }
         let text = turn
             .pointer("/message/content/0/text")
             .and_then(Value::as_str)
@@ -96,6 +111,31 @@ fn main() {
             }
         }
 
+        if let Some(report) = &report {
+            let called = emit(&json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "tool_use", "id": "toolu_report",
+                      "name": "mcp__chocofactory__report_outcome", "input": report },
+                ]},
+                "session_id": session_id,
+            }));
+            if !called {
+                return;
+            }
+            let recorded = emit(&json!({
+                "type": "user",
+                "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_report",
+                      "content": "Recorded outcome." },
+                ]},
+                "session_id": session_id,
+            }));
+            if !recorded {
+                return;
+            }
+        }
+
         let assistant_ok = emit(&json!({
             "type": "assistant",
             "message": { "content": [{ "type": "text", "text": reply }] },
@@ -120,6 +160,57 @@ fn main() {
             return;
         }
     }
+}
+
+/// The `report_outcome` input a single-shot turn reports with, or `None` for
+/// a standing session. See the module docs' `MOCK_CLAUDE_REPORT`.
+fn single_shot_report(args: &[String]) -> Option<Value> {
+    if !args.iter().any(|a| a == "--append-system-prompt") {
+        return None;
+    }
+    if let Ok(raw) = std::env::var("MOCK_CLAUDE_REPORT") {
+        return Some(
+            serde_json::from_str(&raw)
+                .unwrap_or_else(|err| panic!("MOCK_CLAUDE_REPORT is not JSON ({err}): {raw}")),
+        );
+    }
+    let outcomes = allowed_outcomes(args);
+    let outcome = if outcomes.is_empty() || outcomes.iter().any(|o| o == "done") {
+        "done".to_string()
+    } else {
+        outcomes[0].clone()
+    };
+    Some(json!({ "outcome": outcome, "summary": "" }))
+}
+
+/// The `--outcome` values in the adapter's `--mcp-config` server args.
+fn allowed_outcomes(args: &[String]) -> Vec<String> {
+    let Some(raw) = args
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .and_then(|i| args.get(i + 1))
+    else {
+        return Vec::new();
+    };
+    let Ok(config) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let mut outcomes = Vec::new();
+    if let Some(servers) = config.get("mcpServers").and_then(Value::as_object) {
+        for server in servers.values() {
+            let server_args: Vec<&str> = server
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            for pair in server_args.windows(2) {
+                if pair[0] == "--outcome" {
+                    outcomes.push(pair[1].to_string());
+                }
+            }
+        }
+    }
+    outcomes
 }
 
 /// Extracts the value following a `--resume` flag, if present.

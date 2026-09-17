@@ -13,6 +13,8 @@ use indexmap::IndexMap;
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::adapter::Isolation;
+
 /// A parsed, validated workflow definition. `stages` preserves the YAML
 /// file's declaration order because that order carries meaning: the first
 /// stage declared is the graph's entry point (the format has no separate
@@ -62,6 +64,7 @@ impl WorkflowDefinition {
             .roles
             .into_iter()
             .map(|(name, role)| -> Result<_, WorkflowDefError> {
+                let isolation = role.isolation(&name)?;
                 let system_prompt_file = role
                     .system_prompt_file
                     .map(|rel| {
@@ -74,6 +77,7 @@ impl WorkflowDefinition {
                         cli: role.cli,
                         model: role.model,
                         system_prompt_file,
+                        isolation,
                     },
                 ))
             })
@@ -327,6 +331,12 @@ pub struct RoleDef {
     pub cli: Option<String>,
     pub model: Option<String>,
     pub system_prompt_file: Option<PathBuf>,
+    /// What this role's turns inherit from the operator's own CLI setup
+    /// (#90). Unlike `cli`/`model`/the system prompt this is *not* one of
+    /// the three resolution layers: only a workflow definition can set it,
+    /// never task-level config or global config, because every setting it
+    /// has loosens what an agent is exposed to.
+    pub isolation: Isolation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -442,6 +452,43 @@ struct RawRole {
     model: Option<String>,
     #[serde(default)]
     system_prompt_file: Option<String>,
+    /// Run this role's turns with the operator's full CLI setup (#90).
+    #[serde(default)]
+    inherit_operator_config: bool,
+    /// Skills an isolated role may invoke (#90). Absent means none.
+    #[serde(default)]
+    skills: Option<Vec<String>>,
+    /// Whether an isolated role may use auto-memory (#90). Absent means no.
+    #[serde(default)]
+    memory: Option<bool>,
+}
+
+impl RawRole {
+    /// `skills`/`memory` only describe an *isolated* role. Next to
+    /// `inherit_operator_config: true` — where every skill and the memory are
+    /// already available — either would be silently meaningless, and a role
+    /// author who wrote `skills: []` expecting it to restrict something would
+    /// never find out it didn't. Rejected instead.
+    fn isolation(&self, role: &str) -> Result<Isolation, WorkflowDefError> {
+        if self.inherit_operator_config {
+            for (field, set) in [
+                ("skills", self.skills.is_some()),
+                ("memory", self.memory.is_some()),
+            ] {
+                if set {
+                    return Err(WorkflowDefError::IsolationFieldWithInheritedConfig {
+                        role: role.to_string(),
+                        field,
+                    });
+                }
+            }
+            return Ok(Isolation::InheritOperatorConfig);
+        }
+        Ok(Isolation::Isolated {
+            skills: self.skills.clone().unwrap_or_default(),
+            memory: self.memory.unwrap_or(false),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -857,6 +904,10 @@ pub enum WorkflowDefError {
         placeholder: String,
         referenced: String,
     },
+    IsolationFieldWithInheritedConfig {
+        role: String,
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for WorkflowDefError {
@@ -985,6 +1036,12 @@ impl fmt::Display for WorkflowDefError {
                 "stage '{stage}' has {placeholder} in its {field}, but stage '{referenced}' \
                  declares no 'capture:' so it stores nothing to reference"
             ),
+            WorkflowDefError::IsolationFieldWithInheritedConfig { role, field } => write!(
+                f,
+                "role '{role}' sets '{field}' alongside 'inherit_operator_config: true', which \
+                 already gives it the operator's full setup; '{field}' only applies to an \
+                 isolated role"
+            ),
         }
     }
 }
@@ -1077,6 +1134,98 @@ stages:
         let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
         assert_eq!(def.roles["chat"].cli, None);
         assert_eq!(def.roles["chat"].model, None);
+    }
+
+    /// #90: a role that says nothing about isolation gets the strict default
+    /// — no skills, no memory — rather than the operator's setup.
+    #[test]
+    fn a_role_is_isolated_with_no_skills_or_memory_by_default() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: plain
+roles:
+  coder: {}
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: {}
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        assert_eq!(def.roles["coder"].isolation, Isolation::default());
+    }
+
+    #[test]
+    fn a_role_can_allow_skills_and_memory() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: plain
+roles:
+  coder:
+    skills: [run-tests, write-migration]
+    memory: true
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: {}
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        assert_eq!(
+            def.roles["coder"].isolation,
+            Isolation::Isolated {
+                skills: vec!["run-tests".to_string(), "write-migration".to_string()],
+                memory: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_role_can_inherit_the_operators_config() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: chat
+roles:
+  chat:
+    inherit_operator_config: true
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        assert_eq!(
+            def.roles["chat"].isolation,
+            Isolation::InheritOperatorConfig
+        );
+    }
+
+    #[test]
+    fn skills_or_memory_next_to_inherit_operator_config_is_rejected() {
+        for extra in ["skills: []", "memory: false"] {
+            let dir = TempDir::new();
+            let yaml = format!(
+                r#"
+name: chat
+roles:
+  chat:
+    inherit_operator_config: true
+    {extra}
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {{}}
+"#
+            );
+            let err = WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err();
+            let field = extra.split(':').next().unwrap();
+            assert!(
+                matches!(&err, WorkflowDefError::IsolationFieldWithInheritedConfig { role, field: f } if role == "chat" && *f == field),
+                "for {extra}: got {err}"
+            );
+        }
     }
 
     fn coding_task_yaml() -> &'static str {

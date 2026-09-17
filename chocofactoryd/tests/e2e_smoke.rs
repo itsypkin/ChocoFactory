@@ -725,17 +725,16 @@ stages:
 }
 
 /// The whole P2-3/#45 feature through the shipped binary: a reviewer turn
-/// captures its reply as JSON, the graph routes on that reply's `outcome`
-/// key, and a later stage templates a *different* field of the same capture
-/// into its own command.
+/// captures its verdict as JSON, the graph routes on its `outcome` key, and a
+/// later stage templates a *different* field of the same capture into its own
+/// command. Since #90 the verdict arrives through the `report_outcome` call
+/// every single-shot turn makes to complete (#73's tool), not the reply text.
 ///
 /// The in-process engine tests cover each half, but only this one proves the
 /// wiring that exists solely in `main.rs` and the real adapter — and it runs
 /// the mock with `MOCK_CLAUDE_TOOL_USE`, so the agent narrates and calls a
-/// tool before answering. That is what every real turn touching a tool looks
-/// like, and a capture that concatenated everything the agent said would fail
-/// to parse here, fall back to `done`, and never reach `report` with a
-/// verdict at all.
+/// tool before answering, which is what every real turn touching a tool looks
+/// like.
 #[tokio::test]
 async fn real_binary_routes_a_turn_on_its_captured_verdict_and_templates_it_onward() {
     let home = TempHome::new();
@@ -768,6 +767,13 @@ stages:
         &[
             (
                 "MOCK_CLAUDE_REPLY",
+                r#"{"outcome": "approved", "comments": "ship-it"}"#,
+            ),
+            // The verdict goes through `report_outcome`, the way every
+            // single-shot turn has to complete since #90, and a `capture:
+            // json` stage routes on and captures that call's input.
+            (
+                "MOCK_CLAUDE_REPORT",
                 r#"{"outcome": "approved", "comments": "ship-it"}"#,
             ),
             // Deliberately *not* MOCK_CLAUDE_ONESHOT: `mock-claude` without
@@ -1050,6 +1056,7 @@ for arg in "$@"; do
 done
 if [ "$role" = "reviewer" ]; then
     export MOCK_CLAUDE_REPLY="$(cat "{scripts_dir}/reviewer-reply.json")"
+    export MOCK_CLAUDE_REPORT="$(cat "{scripts_dir}/reviewer-reply.json")"
 else
     export MOCK_CLAUDE_REPLY="did the thing"
 fi

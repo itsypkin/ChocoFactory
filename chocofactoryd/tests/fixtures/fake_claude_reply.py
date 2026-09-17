@@ -25,20 +25,20 @@ Three directives may appear on the file's first line:
   pair per comma-separated outcome, in order, each carrying
   `{"outcome": <outcome>, "summary": ""}`. More than one outcome exercises
   "the last call wins" (a model correcting itself, or retrying after the
-  tool rejected its first attempt). The tool name is hardcoded here rather
-  than imported, since this is a standalone script — it must match
+  tool rejected its first attempt). The tool name comes from
+  `fake_common.py` and must match
   `chocofactory_core::mcp::qualified_report_outcome_tool_name()`.
+
+Without `REPORT`, a single-shot turn still reports, the way a compliant agent
+does (#90): `done` if the stage allows it, otherwise its first allowed
+outcome (see `fake_common.auto_report`).
 """
 import json
 import os
 import sys
 import uuid
 
-REPORT_OUTCOME_TOOL = "mcp__chocofactory__report_outcome"
-
-
-def emit(obj):
-    print(json.dumps(obj), flush=True)
+from fake_common import REPORT_OUTCOME_TOOL, auto_report, emit, read_turn
 
 
 def main():
@@ -51,7 +51,7 @@ def main():
     emit({"type": "system", "subtype": "init", "session_id": session_id})
 
     # Consume the turn so the daemon's write side doesn't see a broken pipe.
-    sys.stdin.readline()
+    read_turn(sys.stdin)
 
     with open(os.environ["FAKE_CLAUDE_REPLY_FILE"], encoding="utf-8") as handle:
         reply = handle.read()
@@ -106,6 +106,10 @@ def main():
                 "session_id": session_id,
             }
         )
+
+    if not report_outcomes:
+        # No explicit `REPORT`: complete the way a compliant agent would.
+        auto_report(args, session_id)
 
     for i, outcome in enumerate(report_outcomes):
         tool_use_id = f"toolu_report_{i}"

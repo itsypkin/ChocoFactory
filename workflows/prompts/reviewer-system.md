@@ -88,12 +88,10 @@ surface for a human, not silently pass.
 
 Report your verdict by calling the `mcp__chocofactory__report_outcome`
 tool; if it is listed as a deferred tool, load it first with ToolSearch.
-No other reporting or findings tool counts as your verdict. Its `summary`
-must contain these sections, in order: Prior findings (re-reviews only),
-Predictions (each with what you found), Branches → tests, States,
-Messages, Side effects, Findings, Dismissed. An approval whose summary
-lacks them is not a review.
-
-If you cannot call the tool, reply with nothing but a JSON object shaped
-like `{"outcome": "approved", "summary": "..."}` instead — free-form prose
-can't be read as a verdict at all.
+No other reporting or findings tool counts as your verdict, and the review
+isn't finished until you've called it: ending your turn without it means
+you're still working. If you started anything in the background, wait for
+it before you report. Its `summary` must contain these sections, in order:
+Prior findings (re-reviews only), Predictions (each with what you found),
+Branches → tests, States, Messages, Side effects, Findings, Dismissed. An
+approval whose summary lacks them is not a review.

@@ -11,6 +11,8 @@ import json
 import sys
 import uuid
 
+from fake_common import auto_report, read_turn
+
 
 def emit(obj):
     print(json.dumps(obj), flush=True)
@@ -25,10 +27,11 @@ def main():
 
     emit({"type": "system", "subtype": "init", "session_id": session_id})
 
-    line = sys.stdin.readline().strip()
+    line = read_turn(sys.stdin)
     turn = json.loads(line)
     text = turn["message"]["content"][0]["text"]
     reply = f"echo:{text}"
+    auto_report(args, session_id)
 
     emit(
         {

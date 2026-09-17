@@ -12,4 +12,5 @@ A note from a human (empty if this isn't why you're back): {{ stages.escalate_to
 If both of those are empty, you're probably back because a CI check failed
 or a human requested changes on the open PR itself — run `gh pr checks` and
 `gh pr view --comments` (or equivalent) to see why before making further
-changes. Commit your revisions when you're done.
+changes. Commit your revisions, then call `report_outcome` with outcome
+`done` once everything is committed.

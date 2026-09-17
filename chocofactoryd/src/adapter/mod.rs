@@ -36,6 +36,66 @@ pub struct RoleConfig {
     /// like `sandboxed`, so it is passed straight through by
     /// `role_config::resolve` rather than layered from config.
     pub report_outcomes: Vec<String>,
+    /// How much of the operator's own CLI setup this turn inherits (#90).
+    /// Role-derived, from the workflow definition only — never task config
+    /// or global config — because every setting here can only *loosen* what
+    /// a workflow agent is exposed to.
+    pub isolation: Isolation,
+}
+
+/// What a workflow agent's CLI process is allowed to pick up from the
+/// operator's machine (#90).
+///
+/// Left alone, `claude` loads the operator's `~/.claude/CLAUDE.md`, user
+/// plugins (with their agents, skills, hooks and MCP tools), output style,
+/// MCP servers and auto-memory into every turn. In #88 that steered a coder
+/// into delegating its whole job to a background sub-agent and ending its
+/// turn with nothing done, and in #61 it narrowed a reviewer's risk list to
+/// whatever the operator's memory happened to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Isolation {
+    /// The turn runs with the operator's full setup, as every turn did
+    /// before #90. Meant for a conversational role like `chat`, where the
+    /// operator is the one talking to the agent.
+    InheritOperatorConfig,
+    /// Only the task repo's own settings and `CLAUDE.md`, only the daemon's
+    /// MCP server, no `ReportFindings`, and no auto-memory unless `memory`.
+    Isolated {
+        /// The skills this turn may invoke. Empty means none: the `Skill`
+        /// tool itself is removed.
+        skills: Vec<String>,
+        /// Whether the turn may read and write the operator's auto-memory.
+        memory: bool,
+    },
+}
+
+impl Default for Isolation {
+    /// Isolated, with no skills and no memory: the setting a role gets when
+    /// its workflow definition says nothing.
+    fn default() -> Self {
+        Isolation::Isolated {
+            skills: Vec::new(),
+            memory: false,
+        }
+    }
+}
+
+impl Isolation {
+    /// The isolation this turn actually ran with, for `session_meta` — the
+    /// CLI's own `init` line lists every installed skill regardless of the
+    /// session allowlist, so the allowlist has to be recorded from our side.
+    pub fn describe(&self) -> Value {
+        match self {
+            Isolation::InheritOperatorConfig => {
+                serde_json::json!({ "inherit_operator_config": true })
+            }
+            Isolation::Isolated { skills, memory } => serde_json::json!({
+                "inherit_operator_config": false,
+                "skills": skills,
+                "memory": memory,
+            }),
+        }
+    }
 }
 
 /// The shared, CLI-agnostic event shape (design §4.2). Carries the same
@@ -61,8 +121,14 @@ pub enum AgentEvent {
     Thinking {
         text: String,
     },
+    /// The CLI's `system/init` line. It arrives once per CLI turn, so a
+    /// turn woken by a background job's notification sends another (#90).
+    /// `details` is whatever the adapter can say about the session's real
+    /// environment (its tools, MCP servers, version, model, and the
+    /// isolation it was launched with), merged into the persisted payload.
     SessionMeta {
         session_id: String,
+        details: Value,
     },
     Error {
         message: String,
@@ -74,6 +140,16 @@ pub enum AgentEvent {
     /// single-shot `agent_turn`) doesn't have to re-inspect the raw JSON.
     TurnCompleted {
         is_error: bool,
+    },
+    /// Something a sub-agent did, rather than the main agent (#90). The CLI
+    /// streams a sub-agent's tool calls and results on the same stdout as
+    /// the main agent's, marked with the id of the `Agent` tool call that
+    /// spawned it. Kept distinct so nothing that decides a turn's outcome
+    /// (its `report_outcome` call, its final reply) can be taken from a
+    /// delegated helper by mistake.
+    Subagent {
+        parent_tool_use_id: String,
+        event: Box<AgentEvent>,
     },
 }
 
@@ -87,6 +163,7 @@ impl AgentEvent {
             AgentEvent::SessionMeta { .. } => EventType::SessionMeta,
             AgentEvent::Error { .. } => EventType::Error,
             AgentEvent::TurnCompleted { .. } => EventType::TurnCompleted,
+            AgentEvent::Subagent { event, .. } => event.event_type(),
         }
     }
 
@@ -114,12 +191,34 @@ impl AgentEvent {
                 "is_error": is_error,
             }),
             AgentEvent::Thinking { text } => serde_json::json!({ "text": text }),
-            AgentEvent::SessionMeta { session_id } => {
-                serde_json::json!({ "session_id": session_id })
+            AgentEvent::SessionMeta {
+                session_id,
+                details,
+            } => {
+                let mut payload = serde_json::json!({ "session_id": session_id });
+                if let (Value::Object(payload), Value::Object(details)) = (&mut payload, details) {
+                    for (key, value) in details {
+                        payload.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+                payload
             }
             AgentEvent::Error { message } => serde_json::json!({ "message": message }),
             AgentEvent::TurnCompleted { is_error } => {
                 serde_json::json!({ "is_error": is_error })
+            }
+            AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } => {
+                let mut payload = event.payload();
+                if let Value::Object(map) = &mut payload {
+                    map.insert(
+                        "parent_tool_use_id".to_string(),
+                        Value::String(parent_tool_use_id.clone()),
+                    );
+                }
+                payload
             }
         }
     }
