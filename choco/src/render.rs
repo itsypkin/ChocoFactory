@@ -895,6 +895,64 @@ mod tests {
         assert!(!rendered.contains("Stuck"), "{rendered}");
     }
 
+    /// Issue #88: `task status` shows the "Workflow file" line only when
+    /// `workflow_path` is present, appends the drift suffix from
+    /// `workflow_file_status`, and includes a short hash prefix.
+    #[test]
+    fn task_detail_renders_the_workflow_file_line_with_status_and_hash() {
+        let base = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+            "workflow_path": "/repo/.chocofactory/workflows/chat.yaml",
+            "workflow_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
+        });
+
+        // unchanged: the path and short hash show, with no drift suffix.
+        let mut unchanged = base.clone();
+        unchanged["workflow_file_status"] = json!("unchanged");
+        let rendered = task_detail(&unchanged);
+        assert!(
+            rendered.contains("Workflow file"),
+            "expected a Workflow file line: {rendered}"
+        );
+        assert!(
+            rendered.contains("/repo/.chocofactory/workflows/chat.yaml"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[0123456789ab]"), "{rendered}");
+        assert!(!rendered.contains("changed since task start"), "{rendered}");
+        assert!(!rendered.contains("(missing)"), "{rendered}");
+
+        // changed: the drift suffix is appended to the same line.
+        let mut changed = base.clone();
+        changed["workflow_file_status"] = json!("changed");
+        let rendered = task_detail(&changed);
+        assert!(rendered.contains("changed since task start"), "{rendered}");
+
+        // missing: a different suffix, not "changed since task start".
+        let mut missing = base.clone();
+        missing["workflow_file_status"] = json!("missing");
+        let rendered = task_detail(&missing);
+        assert!(rendered.contains("(missing)"), "{rendered}");
+        assert!(!rendered.contains("changed since task start"), "{rendered}");
+    }
+
+    /// A legacy task (predating issue #88) has `workflow_path: null` and no
+    /// `workflow_file_status` at all — no "Workflow file" line at all,
+    /// exactly as if the field didn't exist.
+    #[test]
+    fn task_detail_omits_the_workflow_file_line_for_a_legacy_task() {
+        let detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+            "workflow_path": null,
+        });
+        let rendered = task_detail(&detail);
+        assert!(!rendered.contains("Workflow file"), "{rendered}");
+    }
+
     /// A task with no config at all must render exactly as before.
     #[test]
     fn task_detail_without_config_adds_no_role_lines() {
