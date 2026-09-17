@@ -1006,21 +1006,26 @@ impl WorkflowEngine {
 
         let path = resolve_task_workflow(&self.workflows_dir, &project, workflow_def_name)
             .map_err(CreateTaskError::Resolve)?;
-        let (definition, workflow_sha256) =
-            load_workflow_file(&path).map_err(CreateTaskError::WorkflowDef)?;
-        let definition = Arc::new(definition);
 
-        // The canonical, absolute path — not whatever `path` happens to be
-        // (e.g. relative to the daemon's cwd if `workflows_dir` was
-        // configured as one) — so a later `load_task_workflow` reload never
-        // depends on the daemon's current working directory at the moment
-        // this ran.
+        // Canonicalize *before* loading (issue #88 review, F2): if `path`
+        // is itself a symlink — a per-repo dotfile link, or a repo
+        // deliberately linking a shared workflow file — resolving prompt
+        // files against the link's parent here and recording the target's
+        // canonical parent for every later reload would mean the file this
+        // stage actually parsed prompts relative to isn't the file the
+        // recorded `workflow_path` describes. Canonicalizing first makes
+        // `load_workflow_file`'s `path.parent()` the exact same directory
+        // `load_task_workflow` resolves against on every subsequent reload.
         let workflow_path =
             std::fs::canonicalize(&path).map_err(|source| CreateTaskError::Canonicalize {
                 path: path.clone(),
                 source,
             })?;
         let workflow_path_str = workflow_path.to_string_lossy().into_owned();
+
+        let (definition, workflow_sha256) =
+            load_workflow_file(&workflow_path).map_err(CreateTaskError::WorkflowDef)?;
+        let definition = Arc::new(definition);
 
         // An explicit `--repo`/`config.cwd` always wins; this only fills in
         // the project's own repo when the caller didn't already say where
@@ -6698,6 +6703,43 @@ stages:
         ));
     }
 
+    /// `resolve_task_workflow` has its own `is_valid_workflow_name` check
+    /// (engine.rs, issue #88 review, F1) — `create_task` calls it instead of
+    /// `resolve_workflow_path`, and the only test of the allowlist,
+    /// `resolve_workflow_path_only_accepts_a_safe_allowlisted_name`, exercises
+    /// the *other* function. Without a direct test here, deleting the check
+    /// (or moving it after the repo/global joins) would still pass the rest
+    /// of the suite while reopening path traversal at `POST /tasks`, since
+    /// the name is now joined onto a caller-controlled `project.repo_path`
+    /// as well as the global directory.
+    #[test]
+    fn resolve_task_workflow_only_accepts_a_safe_allowlisted_name() {
+        let workflows_dir = tempdir();
+        std::fs::write(workflows_dir.join("chat.yaml"), "irrelevant").unwrap();
+        let repo = tempdir();
+        write_repo_workflow(&repo, "chat", "irrelevant");
+        let project = Project {
+            id: "p1".to_string(),
+            name: "demo".to_string(),
+            repo_path: Some(repo.display().to_string()),
+            created_at: chrono::Utc::now(),
+        };
+
+        assert!(resolve_task_workflow(&workflows_dir, &project, "chat").is_ok());
+        assert!(matches!(
+            resolve_task_workflow(&workflows_dir, &project, "").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+        assert!(matches!(
+            resolve_task_workflow(&workflows_dir, &project, "../etc/passwd").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+        assert!(matches!(
+            resolve_task_workflow(&workflows_dir, &project, "chat/../../etc").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+    }
+
     fn write_chat_workflow(workflows_dir: &Path) {
         std::fs::write(
             workflows_dir.join("chat.yaml"),
@@ -6763,6 +6805,28 @@ stages:
             panic!("expected Resolve(NotFound), got {err:?}");
         };
         assert!(message.contains("ghost"), "{message}");
+    }
+
+    /// `create_task` itself must reject an invalid workflow name before it
+    /// ever tries to search for it (issue #88 review, F1) — a unit test on
+    /// `resolve_task_workflow` alone wouldn't catch a regression where
+    /// `create_task` stopped calling it, or called it after building the
+    /// repo/global candidate paths instead of before.
+    #[tokio::test]
+    async fn create_task_with_an_invalid_workflow_name_is_rejected_before_any_lookup() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
+
+        let err = engine
+            .create_task(&project_id, "../etc/passwd", "t", "hi", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CreateTaskError::Resolve(ResolveError::InvalidName(_))
+        ));
     }
 
     #[tokio::test]

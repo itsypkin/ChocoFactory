@@ -90,6 +90,13 @@ pub struct TaskDetail {
 /// function of the file on disk right now — re-hashes it and compares
 /// against `task.workflow_sha256` — so it's unit-testable without a running
 /// server.
+///
+/// Any read error collapses to `"missing"` so a stale/deleted file never
+/// fails the whole `GET /tasks/{id}` request, but the error itself is still
+/// logged with the task id and path (issue #88 review, F3) — silently
+/// discarding it would violate this repo's own rule that every I/O failure
+/// is propagated or logged with context, and would print a misleading
+/// "(missing)" for a file that actually exists but, say, hit `EACCES`.
 fn workflow_file_status(task: &Task) -> Option<&'static str> {
     let path = task.workflow_path.as_deref()?;
     let status = match std::fs::read(path) {
@@ -100,7 +107,14 @@ fn workflow_file_status(task: &Task) -> Option<&'static str> {
                 "changed"
             }
         }
-        Err(_) => "missing",
+        Err(err) => {
+            tracing::warn!(
+                task_id = %task.id, %path, %err,
+                "failed to re-read a task's recorded workflow file for workflow_file_status; \
+                 reporting \"missing\""
+            );
+            "missing"
+        }
     };
     Some(status)
 }
@@ -433,6 +447,32 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), 404);
+    }
+
+    /// A `workflow_def` outside the allowlist must be rejected as a 400,
+    /// not silently joined onto the project's repo and global workflow
+    /// directories and searched for as if it were a normal name (issue #88
+    /// review, F1) — `resolve_task_workflow`'s allowlist check is the only
+    /// thing standing between this endpoint and path traversal now that the
+    /// name is joined onto a caller-controlled `project.repo_path` as well
+    /// as the global directory.
+    #[tokio::test]
+    async fn create_task_with_an_invalid_workflow_name_is_400() {
+        let server = TestServer::start().await;
+        let project_id = create_project(&server).await;
+
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "../etc/passwd",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 400);
     }
 
     #[tokio::test]
