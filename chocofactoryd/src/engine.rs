@@ -30,7 +30,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chocofactory_core::models::{EventType, Task, TaskRunEndReason, TaskRunStatus};
+use chocofactory_core::models::{
+    EventType, RetryMode, RetryOutcome, Task, TaskRun, TaskRunEndReason, TaskRunStatus,
+};
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -623,6 +625,12 @@ pub enum RetryTaskError {
     /// Re-entering the stage itself failed. `retry_task` marks the task
     /// stuck again before returning this.
     Enter(EngineError),
+    /// `RetryMode::Resume` was asked for, and this stage's last run cannot
+    /// be resumed (#92). Carries why. Reported rather than quietly started
+    /// fresh: an operator who typed `--resume` is making a claim about what
+    /// happened, and silently doing the other thing would hide that the
+    /// claim was wrong.
+    NotResumable(String),
 }
 
 impl fmt::Display for RetryTaskError {
@@ -647,11 +655,74 @@ impl fmt::Display for RetryTaskError {
             RetryTaskError::WorkflowDef(err) => write!(f, "{err}"),
             RetryTaskError::Db(err) => write!(f, "{err}"),
             RetryTaskError::Enter(err) => write!(f, "{err}"),
+            RetryTaskError::NotResumable(why) => {
+                write!(f, "this stage's last run cannot be resumed: {why}")
+            }
         }
     }
 }
 
 impl std::error::Error for RetryTaskError {}
+
+/// How many times in a row one interrupted session may be picked up again
+/// before a retry insists on a fresh start (#92).
+///
+/// A resumed turn that is interrupted again is resumable again — which is
+/// right for a usage limit that has since reset, and wrong for anything
+/// that keeps interrupting a session the moment it wakes. Three attempts is
+/// enough for the first and short enough that the second is noticed. The
+/// chain resets whenever a stage starts a fresh session.
+const MAX_CONSECUTIVE_RESUMES: usize = 3;
+
+/// What the daemon says to a turn it has just resumed (#92).
+///
+/// Deliberately short, and deliberately not the stage's prompt: the agent
+/// still has that, and everything it did before the interruption, in the
+/// session being resumed. What it cannot know is that it was interrupted at
+/// all — from inside the transcript, the limit message is simply the last
+/// thing that happened — so this says what stopped it, that its work is
+/// still on disk, and that the turn still ends the way #90 requires.
+fn resume_prompt(resume: &ResumeSession) -> String {
+    format!(
+        "Your previous turn on this stage was interrupted before you could finish: {}. \
+         Nothing you did was rolled back — your working tree still holds it. Check `git status` \
+         and `git diff` to see where you got to, continue from there rather than starting over, \
+         and finish the stage by calling `report_outcome` as instructed.",
+        resume.describe()
+    )
+}
+
+/// The interrupted agent session a re-entered stage should continue rather
+/// than replace (#92).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeSession {
+    /// The CLI session to resume, as recorded by the previous run.
+    session_id: String,
+    /// That run, so the new one can point back at it (`resumed_from`) and
+    /// the timeline can name it.
+    previous_run_id: String,
+    /// Why that run's turn ended — the thing that made it resumable, and
+    /// what the resumed turn is told about its own interruption.
+    end_reason: TaskRunEndReason,
+}
+
+impl ResumeSession {
+    /// How the interruption is described to the agent being resumed and to
+    /// whoever reads the timeline.
+    fn describe(&self) -> &'static str {
+        match self.end_reason {
+            TaskRunEndReason::Interrupted => "your account hit a usage limit",
+            TaskRunEndReason::Reaped => {
+                "the daemon closed it after it went quiet for longer than its idle timeout"
+            }
+            // Unreachable: `resumable_session` admits no other reason. A
+            // plain sentence rather than an `unreachable!()`, because this
+            // only feeds a prompt and a note — nothing here is worth
+            // panicking a live daemon over.
+            _ => "it was interrupted",
+        }
+    }
+}
 
 impl From<sqlx::Error> for RetryTaskError {
     fn from(err: sqlx::Error) -> Self {
@@ -1386,11 +1457,15 @@ impl WorkflowEngine {
     /// a consistent snapshot, and the write that reopens the task has to be
     /// ordered against a concurrent `cancel_task`/another `retry_task`
     /// without either racing the other.
-    pub async fn retry_task(self: &Arc<Self>, task_id: &str) -> Result<(), RetryTaskError> {
+    pub async fn retry_task(
+        self: &Arc<Self>,
+        task_id: &str,
+        mode: RetryMode,
+    ) -> Result<RetryOutcome, RetryTaskError> {
         let lock = self.lock_for_task(task_id).await;
         let result = {
             let _guard = lock.lock().await;
-            self.retry_task_locked(task_id).await
+            self.retry_task_locked(task_id, mode).await
         };
         self.evict_task_lock_if_unshared(task_id, &lock).await;
         result
@@ -1399,7 +1474,11 @@ impl WorkflowEngine {
     /// The body of [`Self::retry_task`], split out only so the guard's
     /// scope stays obvious at the call site above — the same split
     /// `cancel_task`/`cancel_task_locked` use.
-    async fn retry_task_locked(self: &Arc<Self>, task_id: &str) -> Result<(), RetryTaskError> {
+    async fn retry_task_locked(
+        self: &Arc<Self>,
+        task_id: &str,
+        mode: RetryMode,
+    ) -> Result<RetryOutcome, RetryTaskError> {
         // Step 1 — every fallible read, before anything is written. A
         // failure here returns having changed nothing, so a retry of the
         // retry starts clean.
@@ -1431,12 +1510,35 @@ impl WorkflowEngine {
         // freshly re-entered one. Checked anyway rather than assumed,
         // since re-entering over a live run would start a second one
         // alongside it instead of replacing it.
-        if let Some(run) =
-            task_runs::get_current_for_stage(&self.pool, task_id, &current_stage).await?
+        let last_run =
+            task_runs::get_current_for_stage(&self.pool, task_id, &current_stage).await?;
+        if let Some(run) = &last_run
             && run.status == TaskRunStatus::Active
         {
             return Err(RetryTaskError::RunStillActive(current_stage));
         }
+
+        // Still step 1: decide resume-or-fresh from reads only, so a
+        // `NotResumable` below returns before anything has been written.
+        // The whole decision — the run's end reason and how long its resume
+        // chain already is — is read under the per-task lock this function
+        // holds, and the run it describes is terminal by now (the check
+        // above rejects an active one), so nothing can move under it
+        // between deciding and re-entering the stage.
+        let resumable = match mode {
+            RetryMode::Fresh => Err("a fresh start was asked for".to_string()),
+            RetryMode::Auto | RetryMode::Resume => {
+                self.resumable_session(stage_def, last_run.as_ref()).await?
+            }
+        };
+        let (resume, fresh_reason) = match (mode, resumable) {
+            (RetryMode::Resume, Err(why)) => return Err(RetryTaskError::NotResumable(why)),
+            (_, Err(why)) => {
+                tracing::info!(task_id, stage = %current_stage, why, "retrying with a fresh session");
+                (None, Some(why))
+            }
+            (_, Ok(resume)) => (Some(resume), None),
+        };
 
         // Step 2 — the reopen, which must land *before* the re-entry below.
         // A re-entered shell/turn can fail again quickly, and `mark_stuck`'s
@@ -1483,14 +1585,19 @@ impl WorkflowEngine {
             _ => None,
         };
 
+        let entered_via = match &resume {
+            Some(_) => "retry_resume",
+            None => "retry",
+        };
         if let Err(err) = self
             .enter_stage(
                 task_id,
                 &definition,
                 &current_stage,
                 input.as_deref(),
-                Some("retry"),
+                Some(entered_via),
                 &state.payload,
+                resume.as_ref(),
             )
             .await
         {
@@ -1504,7 +1611,88 @@ impl WorkflowEngine {
             .await;
             return Err(RetryTaskError::Enter(err));
         }
-        Ok(())
+        Ok(RetryOutcome {
+            stage: current_stage,
+            resumed: resume.is_some(),
+            session_id: resume.map(|resume| resume.session_id),
+            fresh_reason,
+        })
+    }
+
+    /// Whether the stuck stage's last run can be picked up where it left
+    /// off (#92), or a sentence saying why not.
+    ///
+    /// Resumable means all of: the stage is an `agent_turn` that can
+    /// conclude on its own (nothing else has a turn to resume — a standing
+    /// chat session is picked up by sending it a message instead), the run
+    /// recorded a `session_id`, its turn ended for a reason that describes
+    /// something done *to* it — a usage limit, or the idle reaper's close —
+    /// and it has not already been resumed [`MAX_CONSECUTIVE_RESUMES`]
+    /// times in a row.
+    ///
+    /// Everything else starts fresh, and deliberately so: `no_report`,
+    /// `lingered` and a plain crash are the agent's own failure, and
+    /// resuming those is precisely the "resumed straight back into the same
+    /// crash" loop that `SessionError::NotResumable` exists to prevent.
+    async fn resumable_session(
+        &self,
+        stage_def: &StageDef,
+        last_run: Option<&TaskRun>,
+    ) -> Result<Result<ResumeSession, String>, RetryTaskError> {
+        if !matches!(stage_def.kind, StageKind::AgentTurn { .. }) {
+            return Ok(Err(
+                "it is not an agent turn, so it has no session".to_string()
+            ));
+        }
+        // A standing stage (empty `on:`, chat) never has a turn to resume:
+        // its session stays open for further live messages, and
+        // `send_message_or_resume` is what picks it up again. Resuming one
+        // here would also hand it a prompt telling it to `report_outcome`,
+        // which such a stage has no outcomes for. Unreachable today — a
+        // standing stage gets no turn watcher and so is never marked stuck
+        // by one — and checked anyway, since the cost of being wrong is a
+        // turn instructed to do something it cannot do.
+        if stage_def.on.is_empty() {
+            return Ok(Err(
+                "it is a standing session, which is resumed by sending it a message \
+                 rather than by retrying"
+                    .to_string(),
+            ));
+        }
+        let Some(run) = last_run else {
+            return Ok(Err("the stage has no previous run".to_string()));
+        };
+        let end_reason = match run.end_reason {
+            Some(reason @ (TaskRunEndReason::Interrupted | TaskRunEndReason::Reaped)) => reason,
+            Some(other) => {
+                return Ok(Err(format!(
+                    "its turn ended '{other}', which is the agent's own failure rather than an \
+                     interruption"
+                )));
+            }
+            None => {
+                return Ok(Err(
+                    "its process exited without saying why, so the session may be broken"
+                        .to_string(),
+                ));
+            }
+        };
+        let Some(session_id) = run.session_id.clone() else {
+            return Ok(Err("it never reported a session to resume".to_string()));
+        };
+        let resumes =
+            task_runs::resume_chain_len(&self.pool, &run.id, MAX_CONSECUTIVE_RESUMES).await?;
+        if resumes >= MAX_CONSECUTIVE_RESUMES {
+            return Ok(Err(format!(
+                "its session has already been resumed {resumes} times in a row; starting over is \
+                 the only way out of an interruption that keeps repeating"
+            )));
+        }
+        Ok(Ok(ResumeSession {
+            session_id,
+            previous_run_id: run.id.clone(),
+            end_reason,
+        }))
     }
 
     /// Claims an id for a detached `shell`/`poll` runner about to be
@@ -1754,6 +1942,7 @@ impl WorkflowEngine {
                 initial_input,
                 None,
                 &state.payload,
+                None,
             )
             .await
         }
@@ -1940,6 +2129,7 @@ impl WorkflowEngine {
                     None,
                     Some(outcome),
                     &updated.payload,
+                    None,
                 )
                 .await?;
                 Ok(next_stage)
@@ -1979,6 +2169,7 @@ impl WorkflowEngine {
     /// authoritative value: re-reading here would be a second query for the
     /// same row, and — worse — would invite a future caller to render
     /// against state some other writer had moved on from.
+    #[allow(clippy::too_many_arguments)]
     async fn enter_stage(
         self: &Arc<Self>,
         task_id: &str,
@@ -1987,6 +2178,10 @@ impl WorkflowEngine {
         input: Option<&str>,
         entered_via: Option<&str>,
         payload: &Value,
+        // Set only by `retry_task_locked`, and only for an `agent_turn`
+        // whose last run was interrupted from outside (#92): every other
+        // way into a stage starts a session of its own.
+        resume: Option<&ResumeSession>,
     ) -> Result<(), EngineError> {
         let stage_def = definition
             .stages
@@ -2027,8 +2222,9 @@ impl WorkflowEngine {
             ),
         }
 
-        let entered =
-            self.dispatch_stage(task_id, definition, stage_name, stage_def, input, payload);
+        let entered = self.dispatch_stage(
+            task_id, definition, stage_name, stage_def, input, payload, resume,
+        );
         let entered = entered.await;
 
         // A missing *value* no longer reaches here at all (#60) — it's
@@ -2065,6 +2261,7 @@ impl WorkflowEngine {
 
     /// The per-kind behavior half of `enter_stage`, split out so the caller
     /// can act on the result once rather than at five `return` sites.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_stage(
         self: &Arc<Self>,
         task_id: &str,
@@ -2073,6 +2270,7 @@ impl WorkflowEngine {
         stage_def: &StageDef,
         input: Option<&str>,
         payload: &Value,
+        resume: Option<&ResumeSession>,
     ) -> Result<(), EngineError> {
         match &stage_def.kind {
             StageKind::AgentTurn {
@@ -2090,6 +2288,7 @@ impl WorkflowEngine {
                     *capture,
                     input,
                     payload,
+                    resume,
                 )
                 .await
             }
@@ -3195,6 +3394,7 @@ impl WorkflowEngine {
         capture: Option<Capture>,
         input: Option<&str>,
         payload: &Value,
+        resume: Option<&ResumeSession>,
     ) -> Result<(), EngineError> {
         // `WorkflowDefinition::parse`/`load` reject an agent_turn stage
         // with an unknown role, but `roles`/`stages` are `pub` fields with
@@ -3210,14 +3410,22 @@ impl WorkflowEngine {
                 role: role.to_string(),
             })?;
 
-        let prompt = match prompt_file {
+        // A resumed turn is already holding the stage's prompt: it read it,
+        // worked on it, and was cut off mid-way (#92). Sending the same
+        // prompt again would read as a second, identical assignment, so it
+        // is told what happened to it instead. Everything else about the
+        // turn — role, isolation, the `report_outcome` instruction the
+        // adapter appends — resolves exactly as for a fresh one, so #90's
+        // completion contract is unchanged.
+        let prompt = match (resume, prompt_file) {
+            (Some(resume), _) => resume_prompt(resume),
             // A workflow-authored prompt is templated against earlier stages'
             // captures (P2-3, §5.1) — this is how a reviewer's verdict
             // reaches the coder's next turn. Live human input is not: it's
             // what a person typed, and quietly rewriting parts of it would be
             // both surprising and a way to smuggle payload contents into a
             // message the human believes they authored.
-            Some(path) => {
+            (None, Some(path)) => {
                 let raw = fs::read_to_string(path).map_err(EngineError::Io)?;
                 let (rendered, unresolved) =
                     template::render(&raw, payload).map_err(|err| EngineError::Template {
@@ -3228,7 +3436,7 @@ impl WorkflowEngine {
                     .await;
                 rendered
             }
-            None => input
+            (None, None) => input
                 .ok_or_else(|| EngineError::MissingAgentTurnInput(stage_name.to_string()))?
                 .to_string(),
         };
@@ -3277,17 +3485,55 @@ impl WorkflowEngine {
         )
         .map_err(EngineError::RoleConfig)?;
 
-        let task_run = task_runs::create(
-            &self.pool,
-            task_runs::NewTaskRun {
-                task_id,
-                stage: stage_name,
-                role,
-                cli_adapter: &resolved.cli,
-                model: &resolved.model,
-            },
-        )
-        .await?;
+        let new_run = task_runs::NewTaskRun {
+            task_id,
+            stage: stage_name,
+            role,
+            cli_adapter: &resolved.cli,
+            model: &resolved.model,
+        };
+        // A resume still opens its own run (#92): the attempt history stays
+        // one row per attempt, and `resumed_from` is what records that this
+        // attempt continued the previous one's conversation rather than
+        // starting another.
+        let task_run = match resume {
+            Some(resume) => {
+                task_runs::create_resumed(
+                    &self.pool,
+                    new_run,
+                    task_runs::ResumedFrom {
+                        run_id: &resume.previous_run_id,
+                        session_id: &resume.session_id,
+                    },
+                )
+                .await?
+            }
+            None => task_runs::create(&self.pool, new_run).await?,
+        };
+
+        // Recorded before the session starts, for the same ordering reason
+        // as the human message below: this is the one line on the timeline
+        // that says the turn picked up where an earlier one left off.
+        if let Some(resume) = resume {
+            let message = format!(
+                "resuming session {} from run {}, whose turn was interrupted because {}",
+                resume.session_id,
+                resume.previous_run_id,
+                resume.describe()
+            );
+            if let Err(err) = events::append(
+                &self.pool,
+                &task_run.id,
+                EventType::SessionNote,
+                json!({ "kind": "resume", "message": message }),
+            )
+            .await
+            {
+                tracing::error!(task_run_id = %task_run.id, %err, "failed to record a resume note");
+            } else {
+                self.events_notify.notify_waiters();
+            }
+        }
 
         // Recorded *before* starting the session, not after — once
         // started, the drain task can react and append its own events
@@ -3303,6 +3549,7 @@ impl WorkflowEngine {
         // Best-effort: a transient DB failure here shouldn't block
         // starting the turn.
         if prompt_file.is_none()
+            && resume.is_none()
             && let Err(err) = events::append(
                 &self.pool,
                 &task_run.id,
@@ -3326,11 +3573,25 @@ impl WorkflowEngine {
             SessionKind::SingleShot
         };
 
-        if let Err(err) = self
-            .session_manager
-            .start(&task_run.id, &prompt, &resolved.role_config, session_kind)
-            .await
-        {
+        let started = match resume {
+            Some(resume) => {
+                self.session_manager
+                    .resume(
+                        &task_run.id,
+                        &resume.session_id,
+                        &prompt,
+                        &resolved.role_config,
+                        session_kind,
+                    )
+                    .await
+            }
+            None => {
+                self.session_manager
+                    .start(&task_run.id, &prompt, &resolved.role_config, session_kind)
+                    .await
+            }
+        };
+        if let Err(err) = started {
             // The task_run row was just created `Active` above; without
             // this, a spawn failure here leaves it Active forever (nothing
             // else in this module ever transitions it), wedging the task
@@ -3442,7 +3703,33 @@ impl WorkflowEngine {
                                 &task_id,
                                 &format!(
                                     "stage '{stage_name}': the agent turn was force-closed by \
-                                     the idle reaper before completing"
+                                     the idle reaper before completing; 'choco task retry' will \
+                                     resume it"
+                                ),
+                                false,
+                            )
+                            .await;
+                        return;
+                    }
+                    // #92: the turn was cut off from outside, not by
+                    // anything the agent did. Parked like any other
+                    // incomplete turn, but named as what it is, because
+                    // this is the one stuck reason whose recovery is
+                    // different: retry continues the session instead of
+                    // starting another one over the same worktree.
+                    Ok(Some(run)) if run.end_reason == Some(TaskRunEndReason::Interrupted) => {
+                        tracing::warn!(
+                            task_id,
+                            task_run_id,
+                            "task run was interrupted by a usage limit; not auto-advancing"
+                        );
+                        engine
+                            .mark_stuck(
+                                &task_id,
+                                &format!(
+                                    "stage '{stage_name}': the agent's turn was interrupted by a \
+                                     usage limit before it could report; 'choco task retry' will \
+                                     resume it"
                                 ),
                                 false,
                             )
@@ -10593,7 +10880,7 @@ stages:
         wait_until_task_status(&pool, &task_id, "stuck").await;
 
         std::fs::write(&marker, "").unwrap();
-        engine.retry_task(&task_id).await.unwrap();
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
 
         wait_until_task_status(&pool, &task_id, "closed").await;
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
@@ -10620,7 +10907,7 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
         wait_until_task_status(&pool, &task_id, "stuck").await;
 
-        engine.retry_task(&task_id).await.unwrap();
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
 
         // The reopen lands immediately; the re-run of the same failing
         // command lands the task back on stuck a moment later.
@@ -10686,7 +10973,10 @@ stages:
         // (here: a working binary) between the failure and the retry.
         let fixed_engine =
             engine_with_adapter_and_workflows_dir(pool.clone(), &reply_binary(&dir, "ok"), &dir);
-        fixed_engine.retry_task(&task_id).await.unwrap();
+        fixed_engine
+            .retry_task(&task_id, RetryMode::Auto)
+            .await
+            .unwrap();
 
         wait_until_task_status(&pool, &task_id, "closed").await;
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
@@ -10709,6 +10999,511 @@ stages:
             runs.len(),
             2,
             "expected the failed session-start attempt's task_run and the retry's own"
+        );
+    }
+
+    // ---- #92: retry resumes an interrupted session ----
+
+    /// Writes a `fake_claude_script.py` wrapper, named so several can exist
+    /// side by side in one test — a retry drives a *different* script than
+    /// the run it is retrying.
+    fn named_script_binary(dir: &Path, name: &str, steps: Value) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join(format!("{name}.json"));
+        fs::write(&script, steps.to_string()).unwrap();
+        let wrapper = dir.join(name);
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_SCRIPT='{}' exec '{}' \"$@\"\n",
+                script.display(),
+                fixture_binary("fake_claude_script.py"),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        wrapper.display().to_string()
+    }
+
+    /// A one-`agent_turn` workflow on disk, so `retry_task` can re-resolve
+    /// it by name the way it does for a real task.
+    fn coding_workflow(dir: &Path) -> Arc<WorkflowDefinition> {
+        let yaml = r#"
+name: coding-only
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        fs::write(dir.join("coder-turn.md"), "implement the thing").unwrap();
+        fs::write(dir.join("coding-only.yaml"), yaml).unwrap();
+        Arc::new(WorkflowDefinition::parse(yaml, dir).unwrap())
+    }
+
+    /// Runs `coding` until a usage limit interrupts it, leaving the task
+    /// stuck with one `interrupted` run — #88's situation, reproduced.
+    async fn task_stuck_on_an_interrupted_turn(
+        pool: &SqlitePool,
+        dir: &Path,
+    ) -> (String, Arc<WorkflowDefinition>) {
+        let def = coding_workflow(dir);
+        let task_id = seed_task(pool, &def.name).await;
+        let binary = named_script_binary(
+            dir,
+            "fake-claude-interrupted",
+            json!([
+                {"op": "read_turn"},
+                {"op": "text", "text": "editing files"},
+                {"op": "usage_limit"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_task_status(pool, &task_id, "stuck").await;
+        (task_id, def)
+    }
+
+    async fn runs_for_stage(pool: &SqlitePool, task_id: &str, stage: &str) -> Vec<TaskRun> {
+        task_runs::list_for_task(pool, task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.stage == stage)
+            .collect()
+    }
+
+    /// The stage's run that isn't `earlier` — i.e. the one a retry just
+    /// opened. Picked by id rather than by position: `list_for_task` orders
+    /// by a random uuid, which says nothing about which run came first.
+    async fn run_after(
+        pool: &SqlitePool,
+        task_id: &str,
+        stage: &str,
+        earlier: &TaskRun,
+    ) -> TaskRun {
+        let runs = runs_for_stage(pool, task_id, stage).await;
+        assert_eq!(runs.len(), 2, "expected exactly two runs: {runs:?}");
+        runs.into_iter()
+            .find(|r| r.id != earlier.id)
+            .expect("the earlier run is one of the two")
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_turn_marks_the_task_stuck_saying_so() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let (task_id, _def) = task_stuck_on_an_interrupted_turn(&pool, &dir).await;
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        let reason = task.stuck_reason.unwrap();
+        assert!(
+            reason.contains("interrupted by a usage limit") && reason.contains("retry"),
+            "the stuck reason should name the interruption and the way out: {reason}"
+        );
+        let runs = runs_for_stage(&pool, &task_id, "coding").await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].end_reason, Some(TaskRunEndReason::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn retry_resumes_the_session_a_usage_limit_interrupted() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let (task_id, _def) = task_stuck_on_an_interrupted_turn(&pool, &dir).await;
+        let interrupted_run = runs_for_stage(&pool, &task_id, "coding").await[0].clone();
+
+        // The resumed turn repeats back what it was sent, then finishes.
+        let resumed_binary = named_script_binary(
+            &dir,
+            "fake-claude-resumed",
+            json!([
+                {"op": "echo_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &resumed_binary, &dir);
+        let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            RetryOutcome {
+                stage: "coding".to_string(),
+                resumed: true,
+                session_id: interrupted_run.session_id.clone(),
+                fresh_reason: None,
+            }
+        );
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        // A second run, pointing at the first, and continuing its session:
+        // the fake takes its session id from `--resume`, so these matching
+        // is proof the flag was actually passed.
+        let resumed_run = run_after(&pool, &task_id, "coding", &interrupted_run).await;
+        assert_eq!(
+            resumed_run.resumed_from.as_deref(),
+            Some(interrupted_run.id.as_str())
+        );
+        assert_eq!(resumed_run.session_id, interrupted_run.session_id);
+
+        // And it was told it had been interrupted, rather than handed the
+        // stage's prompt for a second time.
+        let echoed = events::list_for_task_run(&pool, &resumed_run.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.payload["text"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            echoed.contains("interrupted") && echoed.contains("git status"),
+            "the resumed turn should be told what happened: {echoed}"
+        );
+        assert!(
+            !echoed.contains("implement the thing"),
+            "the stage prompt should not be sent again: {echoed}"
+        );
+
+        // The timeline says a resume happened, and names what it resumed.
+        let trail = stage_trail(&pool, &task_id).await;
+        assert!(
+            trail
+                .iter()
+                .any(|(stage, via)| stage == "coding" && via == &json!("retry_resume")),
+            "expected a retry_resume transition: {trail:?}"
+        );
+        let notes: Vec<String> = events::list_for_task_run(&pool, &resumed_run.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::SessionNote)
+            .map(|e| {
+                e.payload["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            notes.iter().any(|note| note.contains(&interrupted_run.id)),
+            "expected a resume note naming the previous run: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_fresh_starts_a_new_session_even_when_one_could_be_resumed() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let (task_id, _def) = task_stuck_on_an_interrupted_turn(&pool, &dir).await;
+        let interrupted_run = runs_for_stage(&pool, &task_id, "coding").await[0].clone();
+
+        let binary = named_script_binary(
+            &dir,
+            "fake-claude-fresh",
+            json!([
+                {"op": "echo_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+        let outcome = engine.retry_task(&task_id, RetryMode::Fresh).await.unwrap();
+
+        assert!(!outcome.resumed);
+        assert_eq!(outcome.session_id, None);
+        assert_eq!(
+            outcome.fresh_reason.as_deref(),
+            Some("a fresh start was asked for")
+        );
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        let fresh_run = run_after(&pool, &task_id, "coding", &interrupted_run).await;
+        assert_eq!(fresh_run.resumed_from, None);
+        assert_ne!(
+            fresh_run.session_id, interrupted_run.session_id,
+            "a fresh start is a new session"
+        );
+        // And it got the stage's own prompt back, not a resume message.
+        let echoed = events::list_for_task_run(&pool, &fresh_run.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.payload["text"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(echoed.contains("implement the thing"), "{echoed}");
+    }
+
+    #[tokio::test]
+    async fn retry_starts_fresh_when_the_turn_failed_on_its_own() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let task_id = seed_task(&pool, &def.name).await;
+        // Ends its turn without ever reporting: the agent's own failure,
+        // not an interruption, so there is nothing safe to resume.
+        let binary = named_script_binary(
+            &dir,
+            "fake-claude-silent",
+            json!([
+                {"op": "read_turn"},
+                {"op": "text", "text": "hmm"},
+                {"op": "result"},
+                {"op": "exit"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        assert_eq!(
+            runs_for_stage(&pool, &task_id, "coding").await[0].end_reason,
+            Some(TaskRunEndReason::NoReport)
+        );
+
+        let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        assert!(!outcome.resumed, "a no_report run must not be resumed");
+        // And the operator is told why, rather than left to infer it.
+        let why = outcome.fresh_reason.unwrap();
+        assert!(why.contains("no_report"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn retry_resume_refuses_rather_than_quietly_starting_fresh() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let task_id = seed_task(&pool, &def.name).await;
+        let binary = named_script_binary(
+            &dir,
+            "fake-claude-silent",
+            json!([
+                {"op": "read_turn"},
+                {"op": "text", "text": "hmm"},
+                {"op": "result"},
+                {"op": "exit"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+
+        let err = engine
+            .retry_task(&task_id, RetryMode::Resume)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, RetryTaskError::NotResumable(why) if why.contains("no_report")),
+            "expected a NotResumable naming the end reason: {err}"
+        );
+        // And nothing was written: the task is still stuck, with one run.
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        assert_eq!(runs_for_stage(&pool, &task_id, "coding").await.len(), 1);
+    }
+
+    /// The resume decision itself, over the cases a live run can reach —
+    /// driven against the rows directly, since three interruptions in a row
+    /// is a lot of subprocess to spend on a rule this narrow.
+    #[tokio::test]
+    async fn only_an_outside_interruption_with_a_session_is_resumable() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let task_id = seed_task(&pool, &def.name).await;
+        let coding = &def.stages["coding"];
+        let finished = &def.stages["finished"];
+
+        // One ended run per case, so they can't interfere with each other.
+        let ended = async |session: Option<&str>, reason: Option<TaskRunEndReason>| -> TaskRun {
+            let run = task_runs::create(
+                &pool,
+                task_runs::NewTaskRun {
+                    task_id: &task_id,
+                    stage: "coding",
+                    role: "coder",
+                    cli_adapter: "claude",
+                    model: "sonnet",
+                },
+            )
+            .await
+            .unwrap();
+            if let Some(session) = session {
+                task_runs::set_session_id(&pool, &run.id, session)
+                    .await
+                    .unwrap();
+            }
+            task_runs::update_status(
+                &pool,
+                &run.id,
+                TaskRunStatus::Exited,
+                Some(Utc::now()),
+                reason,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+
+        let interrupted = ended(Some("session-a"), Some(TaskRunEndReason::Interrupted)).await;
+        assert_eq!(
+            engine
+                .resumable_session(coding, Some(&interrupted))
+                .await
+                .unwrap(),
+            Ok(ResumeSession {
+                session_id: "session-a".to_string(),
+                previous_run_id: interrupted.id.clone(),
+                end_reason: TaskRunEndReason::Interrupted,
+            })
+        );
+
+        // The reaper closing a session is the other thing done *to* a turn.
+        let reaped = ended(Some("session-b"), Some(TaskRunEndReason::Reaped)).await;
+        assert!(
+            engine
+                .resumable_session(coding, Some(&reaped))
+                .await
+                .unwrap()
+                .is_ok(),
+            "a reaper-closed turn is resumable too"
+        );
+
+        // The agent's own failures, and a crash, are not.
+        for reason in [
+            Some(TaskRunEndReason::NoReport),
+            Some(TaskRunEndReason::Lingered),
+            Some(TaskRunEndReason::Cancelled),
+            Some(TaskRunEndReason::StartFailed),
+            None,
+        ] {
+            let run = ended(Some("session-c"), reason).await;
+            assert!(
+                engine
+                    .resumable_session(coding, Some(&run))
+                    .await
+                    .unwrap()
+                    .is_err(),
+                "{reason:?} must not be resumable"
+            );
+        }
+
+        // Interrupted, but with no session recorded: nothing to resume.
+        let sessionless = ended(None, Some(TaskRunEndReason::Interrupted)).await;
+        assert!(
+            engine
+                .resumable_session(coding, Some(&sessionless))
+                .await
+                .unwrap()
+                .is_err()
+        );
+
+        // A stage with no session at all, and a stage with no run yet.
+        assert!(
+            engine
+                .resumable_session(finished, Some(&interrupted))
+                .await
+                .unwrap()
+                .is_err(),
+            "a terminal stage has no session to resume"
+        );
+        assert!(
+            engine
+                .resumable_session(coding, None)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_resumed_too_many_times_in_a_row_has_to_start_over() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let task_id = seed_task(&pool, &def.name).await;
+        let coding = &def.stages["coding"];
+
+        let new_run = || task_runs::NewTaskRun {
+            task_id: &task_id,
+            stage: "coding",
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        };
+        let interrupt = async |run: &TaskRun| {
+            task_runs::update_status(
+                &pool,
+                &run.id,
+                TaskRunStatus::Exited,
+                Some(Utc::now()),
+                Some(TaskRunEndReason::Interrupted),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+
+        // The original interrupted run, then a chain of resumes of it, each
+        // interrupted again.
+        let mut previous = task_runs::create(&pool, new_run()).await.unwrap();
+        task_runs::set_session_id(&pool, &previous.id, "session-a")
+            .await
+            .unwrap();
+        previous = interrupt(&previous).await;
+
+        // Three resumes are allowed; the fourth is where the cap bites.
+        for resume in 1..=MAX_CONSECUTIVE_RESUMES + 1 {
+            let decision = engine
+                .resumable_session(coding, Some(&previous))
+                .await
+                .unwrap();
+            if resume <= MAX_CONSECUTIVE_RESUMES {
+                assert!(decision.is_ok(), "resume {resume} should still be allowed");
+            } else {
+                let why = decision.expect_err("the cap should have been reached");
+                assert!(
+                    why.contains("already been resumed"),
+                    "the refusal should say why: {why}"
+                );
+                break;
+            }
+            let run = task_runs::create_resumed(
+                &pool,
+                new_run(),
+                task_runs::ResumedFrom {
+                    run_id: &previous.id,
+                    session_id: "session-a",
+                },
+            )
+            .await
+            .unwrap();
+            previous = interrupt(&run).await;
+        }
+
+        // A fresh start clears it: the next interruption is resumable again.
+        let fresh = task_runs::create(&pool, new_run()).await.unwrap();
+        task_runs::set_session_id(&pool, &fresh.id, "session-b")
+            .await
+            .unwrap();
+        let fresh = interrupt(&fresh).await;
+        assert!(
+            engine
+                .resumable_session(coding, Some(&fresh))
+                .await
+                .unwrap()
+                .is_ok(),
+            "a session that has not been resumed before is not near the cap"
         );
     }
 
@@ -10755,7 +11550,10 @@ stages:
         // Same broken binary is still all this engine has, so re-entering
         // `chatting` fails the same way, synchronously, inside `enter_stage`
         // — before `retry_task_locked` ever returns to its caller.
-        let err = engine.retry_task(&task_id).await.unwrap_err();
+        let err = engine
+            .retry_task(&task_id, RetryMode::Auto)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RetryTaskError::Enter(_)), "{err:?}");
 
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
@@ -10892,7 +11690,10 @@ stages:
             "start_task must have failed before workflow_state was ever created"
         );
 
-        let retry_err = engine.retry_task(&task_id).await.unwrap_err();
+        let retry_err = engine
+            .retry_task(&task_id, RetryMode::Auto)
+            .await
+            .unwrap_err();
         assert!(
             matches!(retry_err, RetryTaskError::NoWorkflowState),
             "{retry_err:?}"
@@ -10930,7 +11731,10 @@ stages:
         let engine = engine_with_adapter(pool.clone(), "unused");
         engine.start_task(&task_id, &def, None).await.unwrap();
 
-        let err = engine.retry_task(&task_id).await.unwrap_err();
+        let err = engine
+            .retry_task(&task_id, RetryMode::Auto)
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, RetryTaskError::NotStuck(status) if status == "open"),
             "{err:?}"
@@ -10949,7 +11753,10 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
         wait_until_task_status(&pool, &task_id, "closed").await;
 
-        let err = engine.retry_task(&task_id).await.unwrap_err();
+        let err = engine
+            .retry_task(&task_id, RetryMode::Auto)
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, RetryTaskError::NotStuck(status) if status == "closed"),
             "{err:?}"
@@ -10965,7 +11772,10 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
         engine.cancel_task(&task_id).await.unwrap();
 
-        let err = engine.retry_task(&task_id).await.unwrap_err();
+        let err = engine
+            .retry_task(&task_id, RetryMode::Auto)
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, RetryTaskError::NotStuck(status) if status == "cancelled"),
             "{err:?}"
@@ -10976,7 +11786,10 @@ stages:
     async fn retry_task_on_an_unknown_id_is_no_such_task() {
         let pool = connect_in_memory().await.unwrap();
         let engine = engine_with_adapter(pool.clone(), "unused");
-        let err = engine.retry_task("does-not-exist").await.unwrap_err();
+        let err = engine
+            .retry_task("does-not-exist", RetryMode::Auto)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RetryTaskError::NoSuchTask), "{err:?}");
     }
 
@@ -11062,20 +11875,9 @@ stages:
     }
 
     /// A `fake_claude_script.py` wrapper following `steps`.
+    /// The single-script case: one fake per test directory.
     fn script_binary(dir: &Path, steps: Value) -> String {
-        let script = dir.join("script.json");
-        fs::write(&script, steps.to_string()).unwrap();
-        write_script(
-            dir,
-            "fake-claude-script",
-            &format!(
-                "#!/bin/sh\nFAKE_CLAUDE_SCRIPT='{}' exec '{}' \"$@\"\n",
-                script.display(),
-                fixture_binary("fake_claude_script.py"),
-            ),
-        )
-        .display()
-        .to_string()
+        named_script_binary(dir, "fake-claude-script", steps)
     }
 
     fn single_turn_yaml() -> &'static str {

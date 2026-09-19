@@ -9,7 +9,7 @@ mod render;
 
 use std::process::ExitCode;
 
-use chocofactory_core::models::{Project, Task};
+use chocofactory_core::models::{Project, RetryMode, RetryOutcome, Task};
 use clap::Parser;
 use cli::{Cli, Command, ProjectCmd, RoleOverrideArgs, TaskCmd};
 use client::{Client, ClientError, CreateTaskParams, EventsPage, RoleOverrides, build_task_config};
@@ -92,6 +92,11 @@ enum Output {
     /// A 202-with-no-body call. Human mode still confirms it landed;
     /// `--json` stays silent so nothing has to parse a courtesy message.
     Accepted(String),
+    /// `task retry`'s own `202`, which does carry a body: whether the stage
+    /// resumed its interrupted session or started a fresh one (#92). The
+    /// task id rides along only so the human rendering can point at
+    /// `choco task status` the way every other accepted call does.
+    Retried(String, RetryOutcome),
 }
 
 impl Output {
@@ -104,6 +109,7 @@ impl Output {
             Output::TaskDetail(d) => serde_json::to_string(d),
             Output::Events(e) => serde_json::to_string(e),
             Output::Accepted(_) => return None,
+            Output::Retried(_, r) => serde_json::to_string(r),
         };
         Some(value.expect("API models are always serializable"))
     }
@@ -117,6 +123,7 @@ impl Output {
             Output::TaskDetail(d) => render::task_detail(d),
             Output::Events(e) => render::events(e),
             Output::Accepted(msg) => msg.clone(),
+            Output::Retried(id, r) => render::retried(id, r),
         })
     }
 }
@@ -190,12 +197,16 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                  have been cleaned up — see `choco task status {id}`."
             )))
         }
-        Command::Task(TaskCmd::Retry { id }) => {
-            client.retry_task(&id).await?;
-            Ok(Output::Accepted(format!(
-                "Task {id} is retrying its current stage — see \
-                 `choco task status {id}`."
-            )))
+        Command::Task(TaskCmd::Retry { id, resume, fresh }) => {
+            let mode = match (resume, fresh) {
+                (true, false) => RetryMode::Resume,
+                (false, true) => RetryMode::Fresh,
+                // `clap`'s `conflicts_with` rules out both being set, so
+                // this is only the "neither was given" case.
+                _ => RetryMode::Auto,
+            };
+            let outcome = client.retry_task(&id, mode).await?;
+            Ok(Output::Retried(id, outcome))
         }
         Command::Task(TaskCmd::List { project, status }) => {
             // Resolved the same way as `task create`, so a name works in

@@ -98,13 +98,27 @@ pub enum TaskCmd {
     },
     /// Re-run a stuck task's current stage (X-4, issue #61).
     ///
-    /// Reopens the task and re-enters whatever stage it stopped in from
-    /// scratch — not a replay of the outcome that got it stuck, since the
-    /// daemon never persisted one. Only works on a task whose status is
-    /// `stuck`; see `choco task status` for the reason.
+    /// Reopens the task and re-enters whatever stage it stopped in — not a
+    /// replay of the outcome that got it stuck, since the daemon never
+    /// persisted one. Only works on a task whose status is `stuck`; see
+    /// `choco task status` for the reason.
+    ///
+    /// When the stage's last agent turn was cut off from outside — a usage
+    /// limit, or the daemon closing an idle session — the retry continues
+    /// that session instead of starting a new one over a working tree full
+    /// of work it knows nothing about (#92). Anything the agent itself did
+    /// wrong starts fresh.
     Retry {
         /// Task id.
         id: String,
+        /// Resume the interrupted session, and fail if it cannot be resumed
+        /// rather than quietly starting a fresh one.
+        #[arg(long, conflicts_with = "fresh")]
+        resume: bool,
+        /// Start a fresh session even if the interrupted one could be
+        /// resumed — the way out of a turn that keeps failing on resume.
+        #[arg(long)]
+        fresh: bool,
     },
     /// List tasks, optionally filtered by project and/or status.
     List {
@@ -226,6 +240,32 @@ pub enum ProjectCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #92: `--resume` and `--fresh` are opposites, so asking for both is
+    /// a parse error rather than one of them silently winning.
+    #[test]
+    fn retry_rejects_asking_to_resume_and_start_fresh_at_once() {
+        let both = Cli::try_parse_from(["choco", "task", "retry", "t1", "--resume", "--fresh"]);
+        assert!(both.is_err(), "both flags at once must not parse");
+
+        let neither = Cli::parse_from(["choco", "task", "retry", "t1"]);
+        let Command::Task(TaskCmd::Retry { resume, fresh, .. }) = neither.command else {
+            panic!("expected a retry command");
+        };
+        assert!(!resume && !fresh, "neither flag means the daemon decides");
+
+        let resumed = Cli::parse_from(["choco", "task", "retry", "t1", "--resume"]);
+        let Command::Task(TaskCmd::Retry { resume, fresh, .. }) = resumed.command else {
+            panic!("expected a retry command");
+        };
+        assert!(resume && !fresh);
+
+        let forced_fresh = Cli::parse_from(["choco", "task", "retry", "t1", "--fresh"]);
+        let Command::Task(TaskCmd::Retry { resume, fresh, .. }) = forced_fresh.command else {
+            panic!("expected a retry command");
+        };
+        assert!(!resume && fresh);
+    }
 
     /// `--outcome` is repeatable, not a single comma-joined flag (review,
     /// #75) — this is what `ClaudeAdapter::spawn` (issue #73) actually emits

@@ -133,6 +133,22 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    /// The turn was cut off from outside: the CLI reported that the account
+    /// hit a usage/rate limit (#92). Recorded as an ordinary `Error` on the
+    /// timeline — it *is* an error for the turn — but carried as its own
+    /// variant so `session::drain_session` can end the run
+    /// `TaskRunEndReason::Interrupted` and `retry` can resume the session
+    /// rather than starting a fresh one over a worktree full of work.
+    ///
+    /// `detected_by` names the rule that fired, and is persisted, because
+    /// one of those rules matches the CLI's message text (see
+    /// `adapter::claude::usage_limit_text`): a timeline that says which rule
+    /// fired is what makes the brittle one safe to delete once the
+    /// structured markers are confirmed against a real session.
+    Interrupted {
+        message: String,
+        detected_by: InterruptionEvidence,
+    },
     /// The CLI's `result` line: this turn is over and the process is now
     /// only waiting on stdin EOF to exit — it never exits on its own (#70).
     /// `is_error` mirrors the `result` message's own flag, so a caller that
@@ -153,6 +169,30 @@ pub enum AgentEvent {
     },
 }
 
+/// Which of the claude adapter's rules recognised a usage limit (#92) —
+/// see `assistant_interruption`, `normalize_rate_limit_event` and
+/// `usage_limit_text` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptionEvidence {
+    /// A field the CLI emits for machines: an assistant message's
+    /// `error: "rate_limit"`/`apiErrorStatus: 429`, or a `rate_limit_event`
+    /// line whose `rate_limit_info.status` is `rejected`.
+    Structured,
+    /// The `result` line's own human-readable text. Deliberately last, and
+    /// deliberately labelled: the CLI's wording is not an interface, so a
+    /// run recognised this way is one to check before trusting.
+    MessageText,
+}
+
+impl InterruptionEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InterruptionEvidence::Structured => "structured",
+            InterruptionEvidence::MessageText => "message_text",
+        }
+    }
+}
+
 impl AgentEvent {
     pub fn event_type(&self) -> EventType {
         match self {
@@ -161,7 +201,7 @@ impl AgentEvent {
             AgentEvent::ToolResult { .. } => EventType::ToolResult,
             AgentEvent::Thinking { .. } => EventType::Thinking,
             AgentEvent::SessionMeta { .. } => EventType::SessionMeta,
-            AgentEvent::Error { .. } => EventType::Error,
+            AgentEvent::Error { .. } | AgentEvent::Interrupted { .. } => EventType::Error,
             AgentEvent::TurnCompleted { .. } => EventType::TurnCompleted,
             AgentEvent::Subagent { event, .. } => event.event_type(),
         }
@@ -204,6 +244,14 @@ impl AgentEvent {
                 payload
             }
             AgentEvent::Error { message } => serde_json::json!({ "message": message }),
+            AgentEvent::Interrupted {
+                message,
+                detected_by,
+            } => serde_json::json!({
+                "message": message,
+                "interrupted": "usage_limit",
+                "detected_by": detected_by.as_str(),
+            }),
             AgentEvent::TurnCompleted { is_error } => {
                 serde_json::json!({ "is_error": is_error })
             }
