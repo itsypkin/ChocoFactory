@@ -1622,11 +1622,13 @@ impl WorkflowEngine {
     /// Whether the stuck stage's last run can be picked up where it left
     /// off (#92), or a sentence saying why not.
     ///
-    /// Resumable means all of: the stage is an `agent_turn` (nothing else
-    /// has a session), the run recorded a `session_id`, its turn ended for a
-    /// reason that describes something done *to* it — a usage limit, or the
-    /// idle reaper's close — and it has not already been resumed
-    /// [`MAX_CONSECUTIVE_RESUMES`] times in a row.
+    /// Resumable means all of: the stage is an `agent_turn` that can
+    /// conclude on its own (nothing else has a turn to resume — a standing
+    /// chat session is picked up by sending it a message instead), the run
+    /// recorded a `session_id`, its turn ended for a reason that describes
+    /// something done *to* it — a usage limit, or the idle reaper's close —
+    /// and it has not already been resumed [`MAX_CONSECUTIVE_RESUMES`]
+    /// times in a row.
     ///
     /// Everything else starts fresh, and deliberately so: `no_report`,
     /// `lingered` and a plain crash are the agent's own failure, and
@@ -1652,7 +1654,8 @@ impl WorkflowEngine {
         // turn instructed to do something it cannot do.
         if stage_def.on.is_empty() {
             return Ok(Err(
-                "it is a standing session, which is resumed by sending it a message rather than                  by retrying"
+                "it is a standing session, which is resumed by sending it a message \
+                 rather than by retrying"
                     .to_string(),
             ));
         }

@@ -259,6 +259,12 @@ mod tests {
             panic!("expected a retry command");
         };
         assert!(resume && !fresh);
+
+        let forced_fresh = Cli::parse_from(["choco", "task", "retry", "t1", "--fresh"]);
+        let Command::Task(TaskCmd::Retry { resume, fresh, .. }) = forced_fresh.command else {
+            panic!("expected a retry command");
+        };
+        assert!(!resume && fresh);
     }
 
     /// `--outcome` is repeatable, not a single comma-joined flag (review,

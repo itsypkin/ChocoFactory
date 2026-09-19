@@ -1335,12 +1335,17 @@ stages:
     std::fs::write(&marker, "").unwrap();
     let retried = run_choco(&daemon.base_url, &["task", "retry", &task_id]).await;
     assert_eq!(retried.code, Some(0), "stderr: {}", retried.stderr);
-    // #92: a shell stage has no session, so this says it started over —
-    // the same line would name the resumed session if one had been.
-    assert!(
-        retried.stdout.contains("fresh session"),
-        "retry should say what it did: {}",
-        retried.stdout
+    // #92: a shell stage has no session, so this says it started over and
+    // why — the same line would name the resumed session if one had been.
+    // Pinned in full rather than by keyword: this exact sentence is quoted
+    // in the README, and a keyword match would let the two drift apart.
+    assert_eq!(
+        retried.stdout.trim(),
+        format!(
+            "Retrying stage 'run' from scratch, in a fresh session: it is not an agent turn, \
+             so it has no session. See `choco task status {task_id}`."
+        ),
+        "retry should say what it did, and why"
     );
 
     let mut status = Value::Null;
