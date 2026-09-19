@@ -264,18 +264,19 @@ mod tests {
         let (_, after_marker) = system_prompt
             .split_once(marker)
             .unwrap_or_else(|| panic!("reviewer-system.md no longer says {marker:?}"));
-        // The sentence runs to its full stop; the list is line-wrapped, so
-        // it can't be read as a single line.
-        let (canonical_list, _) = after_marker
-            .split_once(". ")
-            .expect("the canonical section list should end in a full stop");
-        // The prompt is hard-wrapped, so a two-word section name can span
-        // a line break ("Old\nbehaviour"). Compared with whitespace
-        // collapsed, the way the tool compares headings.
-        let canonical_list = canonical_list
+        // Collapsed *before* the sentence is cut out, not after (review of
+        // #95, round 3): the prompt is hard-wrapped, so a two-word section
+        // name can span a line break ("Old\nbehaviour"), and a sentence
+        // ending a paragraph has its full stop followed by a newline
+        // rather than a space — which made the split below either panic
+        // with a misleading message or swallow the next sentence whole.
+        let after_marker = after_marker
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        let (canonical_list, _) = after_marker
+            .split_once(". ")
+            .expect("the canonical section list should end in a full stop");
 
         let mut searched_from = 0;
         for section in report_sections {

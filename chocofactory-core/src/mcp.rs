@@ -34,9 +34,9 @@ pub fn qualified_report_outcome_tool_name() -> String {
 /// - Leading `#`, `>`, backticks, quotes and paired emphasis markers go.
 /// - A leading ordered-list marker (`1.`, `2)`) goes, so a model that
 ///   numbers the sections it was handed as an ordered list still matches.
-/// - A leading bullet (`- `, `* `, `+ `) goes. Whether a bullet may head a
-///   section at all is `choco`'s decision, not this function's — see
-///   `mcp::heading_for` there, which asks [`starts_a_bullet`] separately.
+/// - A leading bullet (`- `, `* `, `+ `) goes, like any other decoration:
+///   `choco`'s matcher holds a bulleted heading to the same rule as a
+///   `##` one, having tried a stricter rule and withdrawn it.
 /// - A hyphen *between* word characters becomes a space, so `Side-effects`
 ///   matches `Side effects` — but `->` survives, because its `-` is not
 ///   between two word characters.
@@ -57,13 +57,10 @@ pub fn normalize_report_heading(text: &str) -> String {
 /// Whether `text` is a bullet — `- `, `* ` or `+ ` at the front, before any
 /// other decoration.
 ///
-/// [`normalize_report_heading`] strips the marker like any other, so this
-/// is how a caller that cares can still tell. `choco`'s tool server does:
-/// a bullet inside a findings list is much more often a finding that
-/// happens to start with a section's name ("- Side effects of the retry
-/// are untested") than the heading of a new section, so it only accepts a
-/// bullet as a heading when the name is the whole of it.
-pub fn starts_a_bullet(text: &str) -> bool {
+/// Only [`strip_leading_markers`] needs this, to take the marker off
+/// without mistaking the `-` of `-> tests` for one. Nothing outside this
+/// module distinguishes a bulleted heading from any other kind.
+fn starts_a_bullet(text: &str) -> bool {
     let trimmed = text.trim_start();
     let mut chars = trimmed.chars();
     matches!(chars.next(), Some('-' | '*' | '+')) && chars.next().is_some_and(char::is_whitespace)
@@ -180,8 +177,7 @@ mod tests {
         assert_eq!(normalize("## Side-effects"), "side effects");
     }
 
-    /// The marker itself is decoration like any other; whether a bullet
-    /// may *head* a section is the caller's call, via `starts_a_bullet`.
+    /// The marker is decoration like any other.
     #[test]
     fn a_bullet_marker_is_decoration() {
         assert_eq!(normalize("- Findings"), "findings");

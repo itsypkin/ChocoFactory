@@ -283,14 +283,25 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
             continue;
         }
         // Content is whatever follows the heading on its own line, plus
-        // every line after it up to the next required section's heading.
-        // A report that writes "Findings: none" on one line and one that
-        // writes "Findings" with "none" beneath it both count.
+        // every line after it up to the next heading. A report that writes
+        // "Findings: none" on one line and one that writes "Findings" with
+        // "none" beneath it both count.
+        //
+        // "Next heading" means a heading for a section not yet accounted
+        // for (review of #95, round 3). A terse line inside a section —
+        // "Old behaviour preserved" under Dismissed — reads as a heading
+        // for a walk written earlier in the report, and treating it as a
+        // boundary left Dismissed looking empty: the report was rejected
+        // for a section plainly there with content under it, which is the
+        // one failure this rule must not produce.
         let has_content = !rest_of_line.trim().is_empty()
             || lines[index + 1..]
                 .iter()
                 .zip(&headings[index + 1..])
-                .take_while(|(_, heading)| heading.is_none())
+                .take_while(|(_, heading)| match heading {
+                    Some((other, _)) => *other == *section || satisfied[*other],
+                    None => true,
+                })
                 .any(|(line, _)| !line.trim().is_empty());
         satisfied[*section] = has_content;
     }
@@ -371,6 +382,13 @@ fn heading_for(line: &str, normalized_names: &[String]) -> Option<(usize, String
 /// commit writes). Two or more words of prose is a sentence that happens
 /// to open with a section's name, and those are findings, not headings.
 fn heads_a_section(rest: &str) -> bool {
+    // Before the trim, so that a space still counts as a boundary and a
+    // letter doesn't: `Findings` must not be credited by a line reading
+    // `Findingsomething`. Round 3 of #95's review caught the one-word rule
+    // below quietly dropping this, with the doc comment still promising it.
+    if rest.starts_with(char::is_alphanumeric) {
+        return false;
+    }
     let rest = rest.trim();
     if rest.is_empty() {
         return true;
@@ -920,6 +938,45 @@ mod tests {
         let result = call(
             &with_sections(&["Reviewed"]),
             json!({ "outcome": "approved", "summary": "## Reviewed 30161d9\n" }),
+        );
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    /// The suffix direction of the same guard — `Prior findings` is the
+    /// prefix case, covered above. Round 3 of #95's review found the
+    /// one-word rule had dropped this while the doc comment still
+    /// promised it, and no test looked.
+    #[test]
+    fn a_word_that_merely_begins_with_a_section_name_is_not_a_heading() {
+        for (summary, section) in [
+            ("Findingsomething", "Findings"),
+            ("Statesman", "States"),
+            ("MessagesController.rs", "Messages"),
+        ] {
+            let result = call(
+                &with_sections(&[section]),
+                json!({ "outcome": "approved", "summary": summary }),
+            );
+            assert_eq!(
+                result["isError"], true,
+                "{summary:?} should not satisfy {section:?}: {result}"
+            );
+        }
+    }
+
+    /// A terse line inside a section can read as the heading of a walk
+    /// written earlier in the report. Treating it as a boundary left the
+    /// enclosing section looking empty, so a report was rejected for a
+    /// section plainly there with content under it (review of #95, round
+    /// 3) — the one failure this rule must never produce.
+    #[test]
+    fn a_line_naming_an_earlier_section_does_not_empty_the_one_it_sits_in() {
+        let result = call(
+            &with_sections(&["Old behaviour", "Findings", "Dismissed"]),
+            json!({
+                "outcome": "approved",
+                "summary": "## Old behaviour\nNothing stops being observable.\n\n                            ## Findings\nnone blocking\n\n                            ## Dismissed\nOld behaviour preserved\n",
+            }),
         );
         assert_eq!(result["isError"], false, "got {result}");
     }
