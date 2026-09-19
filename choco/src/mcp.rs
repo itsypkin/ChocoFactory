@@ -34,9 +34,7 @@
 
 use std::io::{BufRead, Write};
 
-use chocofactory_core::mcp::{
-    MCP_SERVER_NAME, REPORT_OUTCOME_TOOL_NAME, normalize_report_heading, starts_a_bullet,
-};
+use chocofactory_core::mcp::{MCP_SERVER_NAME, REPORT_OUTCOME_TOOL_NAME, normalize_report_heading};
 use serde_json::{Value, json};
 
 /// The MCP protocol version answered with when a client doesn't name one.
@@ -322,10 +320,16 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
 ///   one both satisfied a section nobody wrote and cut the enclosing
 ///   section's content short, so a report with the section plainly there
 ///   was rejected as missing it.
-/// - A bullet is held to the stricter rule still: only `- Findings` on its
-///   own, never `- Findings F1 is resolved`. Seven bullets under "Prior
-///   findings", each naming a section, otherwise satisfied every
-///   requirement at once — on the re-review lap this issue is about.
+/// - Seven bullets under "Prior findings", each naming a section
+///   ("- Findings F1 resolved at engine.rs:329"), are findings about those
+///   walks, not the walks — the same rule catches them, because what
+///   follows the name is prose.
+///
+/// A bullet is *not* held to a stricter rule than that. Round 2 of #95's
+/// own review tried it, and `- **Side effects:** one INSERT` — the format
+/// `reviewer-system.md` itself lists the walks in — then matched nothing
+/// at all, so a reviewer was told all ten sections were missing while
+/// looking at all ten it had written.
 ///
 /// The character after the name must also not be alphanumeric, so
 /// `Findings` doesn't match a sentence starting "Findingsomething", and
@@ -333,14 +337,13 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
 /// required `Findings`.
 fn heading_for(line: &str, normalized_names: &[String]) -> Option<(usize, String)> {
     let normalized_line = normalize_report_heading(line);
-    let bullet = starts_a_bullet(line);
     let (index, name) = normalized_names
         .iter()
         .enumerate()
         .filter(|(_, name)| {
             normalized_line
                 .strip_prefix(name.as_str())
-                .is_some_and(|rest| heads_a_section(rest, bullet))
+                .is_some_and(heads_a_section)
         })
         // Longest match wins, so a stage that requires both `Findings` and
         // `Findings (blocking)` can't have the shorter one swallow the
@@ -361,17 +364,21 @@ fn heading_for(line: &str, normalized_names: &[String]) -> Option<(usize, String
 
 /// Whether `rest` — what a line has left after a section's name — leaves
 /// the line reading as that section's heading.
-fn heads_a_section(rest: &str, bullet: bool) -> bool {
+///
+/// Three shapes count: nothing at all (`## Findings`), punctuation
+/// (`Findings:`, `Findings (defects)`, `Side effects — one INSERT`), and a
+/// single bare word (`Reviewed 30161d9`, which is what a report naming its
+/// commit writes). Two or more words of prose is a sentence that happens
+/// to open with a section's name, and those are findings, not headings.
+fn heads_a_section(rest: &str) -> bool {
     let rest = rest.trim();
     if rest.is_empty() {
         return true;
     }
-    // A bullet naming a section and then saying something about it is a
-    // list item, not a heading. Nothing may follow.
-    if bullet {
-        return false;
+    if rest.starts_with([':', '(', '[', '{', '—', '–', '-', ',', '.', '/', '*', '#']) {
+        return true;
     }
-    rest.starts_with([':', '(', '[', '{', '—', '–', '-', ',', '.', '/', '*', '#'])
+    !rest.contains(char::is_whitespace)
 }
 
 /// The tool error a report with missing sections comes back with.
@@ -789,7 +796,7 @@ mod tests {
                 "summary": "## branches -> TESTS\n- resolve_task_workflow: covered\n\n\
                             **Side effects**\nOne INSERT, recorded once.\n\n\
                             Messages: the NotFound text is accurate.\n\n\
-                            - Findings\n  nothing to report\n",
+                            - Findings (none blocking)\n  nothing to report\n",
             }),
         );
         assert_eq!(result["isError"], false, "got {result}");
@@ -865,14 +872,54 @@ mod tests {
         }
     }
 
-    /// A bullet may still *be* a heading when the name is the whole of it —
-    /// a report that lists its sections as bullets is following the rule,
-    /// not evading it.
+    /// A bulleted heading counts, including with its content on the same
+    /// line — the format `reviewer-system.md` lists the walks in, and so
+    /// the one a reviewer mirrors. Round 2 of #95's review caught an
+    /// earlier bullet rule rejecting every section of a report written
+    /// this way, while telling it the sections were missing.
     #[test]
-    fn a_bare_bullet_heading_still_counts() {
+    fn bulleted_headings_count_with_or_without_inline_content() {
+        for summary in [
+            "- Findings\n  nothing blocking\n",
+            "- **Findings:** none blocking\n",
+            "- Findings: none blocking\n",
+            "* **Findings.** none blocking\n",
+        ] {
+            let result = call(
+                &with_sections(&["Findings"]),
+                json!({ "outcome": "approved", "summary": summary }),
+            );
+            assert_eq!(
+                result["isError"], false,
+                "summary {summary:?} gave {result}"
+            );
+        }
+    }
+
+    /// A report that mixes `##` headings with bulleted walks is still one
+    /// report; no section may fall out over how it was written.
+    #[test]
+    fn a_report_mixing_heading_styles_is_accepted() {
         let result = call(
-            &with_sections(&["Findings"]),
-            json!({ "outcome": "approved", "summary": "- Findings\n  nothing blocking\n" }),
+            &with_sections(&["Reviewed", "Side effects", "Findings"]),
+            json!({
+                "outcome": "approved",
+                "summary": "## Reviewed\n30161d9\n\n\
+                            - **Side effects:** one INSERT, recorded once.\n\n\
+                            ## Findings\nnone blocking\n",
+            }),
+        );
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    /// `Reviewed <sha>` is exactly what the prompt asks for, and a bare sha
+    /// is not punctuation — one trailing word is content, two or more are
+    /// prose that merely opens with the name.
+    #[test]
+    fn a_one_word_remainder_is_content_not_prose() {
+        let result = call(
+            &with_sections(&["Reviewed"]),
+            json!({ "outcome": "approved", "summary": "## Reviewed 30161d9\n" }),
         );
         assert_eq!(result["isError"], false, "got {result}");
     }

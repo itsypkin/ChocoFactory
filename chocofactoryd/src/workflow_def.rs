@@ -225,7 +225,12 @@ impl WorkflowDefinition {
                 }
                 let mut seen: Vec<String> = Vec::new();
                 for section in report_sections {
-                    if section.trim().is_empty() {
+                    // Normalized, not merely trimmed (review of #95): a
+                    // name like "##" or "1." is all decoration to the
+                    // tool, leaving a section whose heading no report can
+                    // ever carry.
+                    let key = chocofactory_core::mcp::normalize_report_heading(section);
+                    if key.is_empty() {
                         return Err(WorkflowDefError::EmptyReportSection {
                             stage: stage_name.clone(),
                         });
@@ -237,7 +242,6 @@ impl WorkflowDefinition {
                     // section whose heading can only ever be credited to
                     // one of them — rejecting every review it ever runs,
                     // for a section the reviewer did write.
-                    let key = chocofactory_core::mcp::normalize_report_heading(section);
                     if seen.contains(&key) {
                         return Err(WorkflowDefError::DuplicateReportSection {
                             stage: stage_name.clone(),

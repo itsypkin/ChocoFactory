@@ -122,7 +122,8 @@ it before you report.
 
 Its `summary` must contain these sections, in order: Prior findings
 (re-reviews only), Reviewed, Predictions (each with what you found),
-Branches → tests, States, Messages, Side effects, Findings, Dismissed. The
+Branches → tests, States, Messages, Side effects, Resources and work, Old
+behaviour, Findings, Dismissed. The
 tool checks for them and sends back a report that leaves one out, so write
 the summary in full before you settle on the outcome; a section with
 genuinely nothing in it says "none". A verdict whose summary lacks the

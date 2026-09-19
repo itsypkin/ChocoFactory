@@ -249,13 +249,45 @@ mod tests {
             "internal_review must require report sections"
         );
 
+        // Anchored to the sentence the reviewer actually follows, not to
+        // the file as a whole (review of #95, round 2). "Resources and
+        // work" and "Old behaviour" appear elsewhere in the prompt as
+        // step-3 walks, so a file-wide `contains` passed while that
+        // sentence was two sections short — costing two rejections on
+        // every single review, which is the failure this test exists to
+        // prevent. Order is checked too: the tool asks for these in order,
+        // and a list that drifts out of order teaches the reviewer to
+        // write them in an order its own summary section contradicts.
         let system_prompt =
             std::fs::read_to_string(dir.path.join("prompts/reviewer-system.md")).unwrap();
+        let marker = "must contain these sections, in order:";
+        let (_, after_marker) = system_prompt
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("reviewer-system.md no longer says {marker:?}"));
+        // The sentence runs to its full stop; the list is line-wrapped, so
+        // it can't be read as a single line.
+        let (canonical_list, _) = after_marker
+            .split_once(". ")
+            .expect("the canonical section list should end in a full stop");
+        // The prompt is hard-wrapped, so a two-word section name can span
+        // a line break ("Old\nbehaviour"). Compared with whitespace
+        // collapsed, the way the tool compares headings.
+        let canonical_list = canonical_list
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let mut searched_from = 0;
         for section in report_sections {
-            assert!(
-                system_prompt.contains(section.as_str()),
-                "reviewer-system.md never mentions the required section '{section}'"
-            );
+            let found = canonical_list[searched_from..]
+                .find(section.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "reviewer-system.md's canonical section list is missing '{section}', or \
+                         lists it out of `report_sections:` order: {canonical_list:?}"
+                    )
+                });
+            searched_from += found + section.len();
         }
     }
 }

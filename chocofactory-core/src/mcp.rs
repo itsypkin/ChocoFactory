@@ -74,14 +74,22 @@ fn strip_leading_markers(text: &str) -> &str {
     let mut rest = text.trim_start();
     loop {
         let before = rest;
-        rest = rest.trim_start_matches(['#', '>', '`', '"', '_']);
+        // `*` is here as well as in the `**` case below: round 2 of #95's
+        // review found `*Findings*` matching nothing while `_Findings_`
+        // worked, which is arbitrary from the model's side. Safe because
+        // bullet detection reads the *raw* line, not this one.
+        rest = rest.trim_start_matches(['#', '>', '`', '"', '_', '*']);
         // `**bold**` is emphasis, and a lone `*`/`-`/`+` before a space is
         // a bullet; both are decoration around the heading text.
         while let Some(stripped) = rest.strip_prefix("**") {
             rest = stripped;
         }
         if starts_a_bullet(rest) {
-            rest = &rest[1..];
+            // Sliced from the marker, not from byte 0: `rest` may still
+            // carry leading whitespace (`## - Findings`), where cutting
+            // one byte off the front removes the space rather than the
+            // bullet. The loop recovered on its next pass, by accident.
+            rest = &rest.trim_start()[1..];
         }
         rest = strip_ordered_list_marker(rest);
         rest = rest.trim_start();
@@ -137,6 +145,7 @@ mod tests {
             "Findings",
             "## Findings",
             "**Findings**",
+            "*Findings*",
             "  ###   findings  ",
             "> `Findings`",
         ] {
