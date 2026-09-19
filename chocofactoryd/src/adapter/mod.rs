@@ -36,6 +36,12 @@ pub struct RoleConfig {
     /// like `sandboxed`, so it is passed straight through by
     /// `role_config::resolve` rather than layered from config.
     pub report_outcomes: Vec<String>,
+    /// The sections this stage requires the turn's report to carry (issue
+    /// #95), from the stage's `report_sections:`. Empty — every stage that
+    /// hasn't opted in — leaves the report unchecked beyond its `outcome`.
+    /// Stage-derived and passed straight through, exactly like
+    /// `report_outcomes`.
+    pub report_sections: Vec<String>,
     /// How much of the operator's own CLI setup this turn inherits (#90).
     /// Role-derived, from the workflow definition only — never task config
     /// or global config — because every setting here can only *loosen* what

@@ -79,6 +79,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: crate::adapter::Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("hello", &cfg).unwrap();

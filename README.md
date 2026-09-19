@@ -85,6 +85,37 @@ on its own (anything but a standing `on: {}` session like chat) has to call
 it to finish. A stage without `capture: json` may only report `done`, the
 one outcome it advances on.
 
+A stage can also require the report itself to carry named sections:
+
+```yaml
+internal_review:
+  kind: agent_turn
+  role: reviewer
+  capture: json
+  report_sections: [Branches → tests, States, Findings, Dismissed]
+  on: { approved: open_pr, changes_requested: revising }
+```
+
+Each name must appear as a heading in the report's `summary`, with
+something under it (`Findings: none` counts). Headings are matched
+forgivingly — `## Findings`, `**Findings**`, `- Findings`, `1. Findings`
+and `Findings:` are the same thing, `->` and `→` are interchangeable, and
+a bullet that merely *starts* with a section's name ("- Side effects of
+the retry are untested") is a list item, not a heading. A report that
+leaves a section out is rejected with an error the agent can act on and
+call again.
+
+The list reaches the agent through the tool's own schema, so a stage that
+opts in needs no prompt changes to work. A prompt that explains the
+sections anyway — `coding-task`'s reviewer does — is a second copy of the
+list, and a test keeps the two from drifting.
+
+This is how a verdict is kept from being cheaper than the work behind it: a
+reviewer that stops at its first blocking finding has no walk to write down
+(#95). Because parking a turn costs a human, the rule bends before it
+breaks — after two rejections the report is recorded as it stands, with the
+missing sections named in the tool's reply on the task's timeline.
+
 That's because the CLI's end-of-turn line doesn't mean the work is done: an
 agent waiting on a background sub-agent or a long test run ends its turn and
 is woken when that finishes. So the daemon treats a turn as complete only

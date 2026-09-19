@@ -1010,7 +1010,7 @@ impl WorkflowEngine {
             &task.config,
             cwd,
             definition.worktree,
-            Vec::new(),
+            role_config::StageReport::default(),
         )
         .map_err(SendMessageError::RoleConfig)?;
 
@@ -2277,6 +2277,7 @@ impl WorkflowEngine {
                 role,
                 prompt_file,
                 capture,
+                report_sections,
             } => {
                 self.enter_agent_turn(
                     task_id,
@@ -2286,6 +2287,7 @@ impl WorkflowEngine {
                     role,
                     prompt_file.as_deref(),
                     *capture,
+                    report_sections,
                     input,
                     payload,
                     resume,
@@ -3392,6 +3394,7 @@ impl WorkflowEngine {
         role: &str,
         prompt_file: Option<&std::path::Path>,
         capture: Option<Capture>,
+        report_sections: &[String],
         input: Option<&str>,
         payload: &Value,
         resume: Option<&ResumeSession>,
@@ -3481,7 +3484,14 @@ impl WorkflowEngine {
             &task.config,
             cwd,
             definition.worktree,
-            report_outcomes,
+            role_config::StageReport {
+                outcomes: report_outcomes,
+                // #95: straight from the stage definition, like the
+                // outcomes above. Enforcement lives in the tool the turn
+                // calls, so nothing downstream of here — routing,
+                // `finish_turn`, the capture — changes shape.
+                sections: report_sections.to_vec(),
+            },
         )
         .map_err(EngineError::RoleConfig)?;
 
@@ -11999,6 +12009,65 @@ stages:
         );
     }
 
+    /// #95's seam, end to end: a stage's `report_sections:` reach the
+    /// spawned process's `--mcp-config` argv, so the tool that turn calls
+    /// actually enforces what the workflow asked for. Without this the
+    /// engine could pass an empty list and every other test would still
+    /// pass — the workflow would say the sections are required and nothing
+    /// would require them.
+    #[tokio::test]
+    async fn a_stages_report_sections_reach_the_spawned_process() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  internal_review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    report_sections: ["Branches → tests", "Findings"]
+    on: { approved: finished, changes_requested: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude_echo_args.py"));
+
+        engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let run = wait_until_run_for_stage(&pool, &task_id, "internal_review").await;
+        let reply = events::final_assistant_text_for_run(&pool, &run.id)
+            .await
+            .unwrap();
+        let mcp_config = reply
+            .split("|mcp_config=")
+            .nth(1)
+            .and_then(|rest| rest.split("|strict_mcp_config=").next())
+            .expect("mcp_config field");
+        let mcp_config: Value = serde_json::from_str(mcp_config).unwrap();
+        assert_eq!(
+            mcp_config["mcpServers"]["chocofactory"]["args"],
+            json!([
+                "mcp-serve",
+                "--outcome",
+                "approved",
+                "--outcome",
+                "changes_requested",
+                "--require-section",
+                "Branches → tests",
+                "--require-section",
+                "Findings",
+            ])
+        );
+    }
+
     /// The seam from workflow YAML to the spawned process's argv: a role's
     /// `skills:` and default memory setting reach the real subprocess.
     #[tokio::test]
@@ -12077,6 +12146,7 @@ stages:
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: crate::adapter::Isolation::InheritOperatorConfig,
         };
 

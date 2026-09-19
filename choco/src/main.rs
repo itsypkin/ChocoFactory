@@ -39,7 +39,11 @@ async fn main() -> ExitCode {
     if let Command::McpServe(args) = &cli.command {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
-        return match mcp::serve(&args.outcomes, stdin.lock(), stdout.lock()) {
+        let stage = mcp::StageReport {
+            outcomes: args.outcomes.clone(),
+            required_sections: args.required_sections.clone(),
+        };
+        return match mcp::serve(&stage, stdin.lock(), stdout.lock()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");

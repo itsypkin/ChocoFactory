@@ -49,9 +49,21 @@ impl fmt::Display for RoleConfigError {
 
 impl std::error::Error for RoleConfigError {}
 
+/// What the current stage asks of this turn's report: the outcomes it can
+/// route on (#73) and the sections the report must carry (#95).
+///
+/// Passed as one value rather than two `Vec<String>` parameters side by
+/// side, where a caller swapping them would compile and then quietly teach
+/// the tool the wrong vocabulary.
+#[derive(Debug, Default, Clone)]
+pub struct StageReport {
+    pub outcomes: Vec<String>,
+    pub sections: Vec<String>,
+}
+
 /// Resolves `role_name`'s final `cli`/`model`/system prompt against the
-/// three layers, plus `cwd`/`sandboxed`/`report_outcomes` (stage- or
-/// task-wide, not per-role — passed straight through, not resolved here).
+/// three layers, plus `cwd`/`sandboxed`/`report` (stage- or task-wide, not
+/// per-role — passed straight through, not resolved here).
 pub fn resolve(
     role_name: &str,
     role_def: &RoleDef,
@@ -59,7 +71,7 @@ pub fn resolve(
     task_config: &Value,
     cwd: std::path::PathBuf,
     sandboxed: bool,
-    report_outcomes: Vec<String>,
+    report: StageReport,
 ) -> Result<ResolvedRoleConfig, RoleConfigError> {
     let task_role = task_config.get("roles").and_then(|r| r.get(role_name));
     let global_role = global.roles.get(role_name);
@@ -107,7 +119,8 @@ pub fn resolve(
             model: Some(model),
             system_prompt,
             sandboxed,
-            report_outcomes,
+            report_outcomes: report.outcomes,
+            report_sections: report.sections,
             // Straight from the workflow definition, never layered: task
             // config and global config must not be able to loosen it (#90).
             isolation: role_def.isolation.clone(),
@@ -167,7 +180,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         assert_eq!(resolved.cli, "def-cli"); // no task-level override, workflow-def wins
@@ -201,7 +214,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             true,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         assert_eq!(resolved.role_config.isolation, def.isolation);
@@ -227,7 +240,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         assert!(!not_sandboxed.role_config.sandboxed);
@@ -239,7 +252,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             true,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         assert!(sandboxed.role_config.sandboxed);
@@ -266,7 +279,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         assert_eq!(resolved.cli, "def-cli");
@@ -294,7 +307,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         assert_eq!(resolved.cli, "global-cli");
@@ -313,7 +326,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -334,7 +347,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         assert_eq!(
@@ -366,7 +379,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
 
@@ -396,7 +409,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
 
@@ -444,7 +457,7 @@ mod tests {
                 &task_config,
                 "/cwd".into(),
                 false,
-                Vec::new(),
+                StageReport::default(),
             )
             .unwrap_or_else(|err| panic!("config {task_config} should not error, got {err}"));
 
@@ -491,7 +504,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         let reviewer = resolve(
@@ -501,7 +514,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
 
@@ -556,7 +569,7 @@ mod tests {
             &json!({}),
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
 
@@ -580,7 +593,7 @@ mod tests {
             &json!({}),
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
 
@@ -611,7 +624,7 @@ mod tests {
             &task_config,
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
 
@@ -647,7 +660,7 @@ mod tests {
             &json!({}),
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
         let reviewer = resolve(
@@ -657,7 +670,7 @@ mod tests {
             &json!({}),
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap();
 
@@ -692,7 +705,7 @@ mod tests {
             &json!({}),
             "/cwd".into(),
             false,
-            Vec::new(),
+            StageReport::default(),
         )
         .unwrap_err();
 
