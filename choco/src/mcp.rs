@@ -294,6 +294,19 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
         // boundary left Dismissed looking empty: the report was rejected
         // for a section plainly there with content under it, which is the
         // one failure this rule must not produce.
+        //
+        // A repeat of *this* section's own heading is walked past but
+        // never counted as its content (round 4): a heading line is never
+        // blank, so without that exclusion `## States` written twice, with
+        // nothing under either, satisfied States — a cheaper way to fake a
+        // walk than the empty heading this whole check exists to catch.
+        //
+        // Accepted residual: an empty section followed by a repeat of a
+        // *different*, already-satisfied heading is still credited. At
+        // this level that is the same line as the terse-line case above —
+        // "Old behaviour preserved" is both a heading for an earlier walk
+        // and legitimate Dismissed content — and rejecting it would put
+        // back the false rejection that is worse.
         let has_content = !rest_of_line.trim().is_empty()
             || lines[index + 1..]
                 .iter()
@@ -302,7 +315,10 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
                     Some((other, _)) => *other == *section || satisfied[*other],
                     None => true,
                 })
-                .any(|(line, _)| !line.trim().is_empty());
+                .any(|(line, heading)| {
+                    !matches!(heading, Some((other, _)) if *other == *section)
+                        && !line.trim().is_empty()
+                });
         satisfied[*section] = has_content;
     }
 
@@ -800,6 +816,22 @@ mod tests {
         assert_eq!(result["isError"], true, "got {result}");
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("'States'"), "got {text}");
+    }
+
+    /// Round 4 of #95's review: the heading line the scan walks past is
+    /// never blank, so a section heading written twice with nothing under
+    /// either satisfied it — a cheaper way to fake a walk than the single
+    /// empty heading `a_required_section_with_no_content_is_missing`
+    /// pins, and invisible to that test because it writes one heading.
+    #[test]
+    fn a_section_heading_repeated_with_no_content_is_still_missing() {
+        for summary in ["## States\n\n## States\n", &"## States\n".repeat(200)] {
+            let result = call(
+                &with_sections(&["States"]),
+                json!({ "outcome": "approved", "summary": summary }),
+            );
+            assert_eq!(result["isError"], true, "summary {summary:?} gave {result}");
+        }
     }
 
     /// Reports in the wild write headings every which way — `## Findings`,
