@@ -295,11 +295,15 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
         // for a section plainly there with content under it, which is the
         // one failure this rule must not produce.
         //
-        // A repeat of *this* section's own heading is walked past but
-        // never counted as its content (round 4): a heading line is never
-        // blank, so without that exclusion `## States` written twice, with
-        // nothing under either, satisfied States — a cheaper way to fake a
-        // walk than the empty heading this whole check exists to catch.
+        // A repeat of *this* section's own heading ends the scan like any
+        // other heading (rounds 4 and 5): a heading line is never blank,
+        // so a scan that ran past it counted it as content, and `## States`
+        // written twice with nothing under either satisfied States — a
+        // cheaper way to fake a walk than the empty heading this whole
+        // check exists to catch. Walking past it and then declining to
+        // count it fixed that but cost `any`'s short-circuit, making the
+        // pass quadratic on a document of repeated headings (22s on 50k
+        // of them, against 0.15s before). Ending the scan is both.
         //
         // Accepted residual: an empty section followed by a repeat of a
         // *different*, already-satisfied heading is still credited. At
@@ -312,13 +316,10 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
                 .iter()
                 .zip(&headings[index + 1..])
                 .take_while(|(_, heading)| match heading {
-                    Some((other, _)) => *other == *section || satisfied[*other],
+                    Some((other, _)) => satisfied[*other],
                     None => true,
                 })
-                .any(|(line, heading)| {
-                    !matches!(heading, Some((other, _)) if *other == *section)
-                        && !line.trim().is_empty()
-                });
+                .any(|(line, _)| !line.trim().is_empty());
         satisfied[*section] = has_content;
     }
 
@@ -392,27 +393,28 @@ fn heading_for(line: &str, normalized_names: &[String]) -> Option<(usize, String
 /// Whether `rest` — what a line has left after a section's name — leaves
 /// the line reading as that section's heading.
 ///
-/// Three shapes count: nothing at all (`## Findings`), punctuation
-/// (`Findings:`, `Findings (defects)`, `Side effects — one INSERT`), and a
-/// single bare word (`Reviewed 30161d9`, which is what a report naming its
-/// commit writes). Two or more words of prose is a sentence that happens
-/// to open with a section's name, and those are findings, not headings.
+/// Two shapes count: nothing at all (`## Findings`) and punctuation
+/// (`Findings:`, `Findings (defects)`, `Side effects — one INSERT`).
+/// Anything else is a sentence that happens to open with a section's
+/// name, and those are findings, not headings.
+///
+/// A single bare word was allowed for a while, so that `Reviewed 30161d9`
+/// — the commit line the prompt asks for — counted. It was withdrawn:
+/// `- Findings resolved.` under "Prior findings" is the same shape, and
+/// on a re-review lap that credited the findings walk to a line about the
+/// *previous* lap's findings. The prompt asks for `Reviewed: <sha>`
+/// instead, and a report that writes the bare form is told once that
+/// Reviewed is missing, which it can fix on the retry.
 fn heads_a_section(rest: &str) -> bool {
-    // Before the trim, so that a space still counts as a boundary and a
-    // letter doesn't: `Findings` must not be credited by a line reading
-    // `Findingsomething`. Round 3 of #95's review caught the one-word rule
-    // below quietly dropping this, with the doc comment still promising it.
+    // `Findings` must not be credited by a line reading
+    // `Findingsomething`: a letter straight after the name means the name
+    // is only the start of a longer word.
     if rest.starts_with(char::is_alphanumeric) {
         return false;
     }
     let rest = rest.trim();
-    if rest.is_empty() {
-        return true;
-    }
-    if rest.starts_with([':', '(', '[', '{', '—', '–', '-', ',', '.', '/', '*', '#']) {
-        return true;
-    }
-    !rest.contains(char::is_whitespace)
+    rest.is_empty()
+        || rest.starts_with([':', '(', '[', '{', '—', '–', '-', ',', '.', '/', '*', '#'])
 }
 
 /// The tool error a report with missing sections comes back with.
@@ -834,6 +836,24 @@ mod tests {
         }
     }
 
+    /// The scan must stay linear. An earlier fix for the doubled-heading
+    /// case walked past a repeat of the section's own heading and then
+    /// declined to count it, which removed `any`'s short-circuit and made
+    /// a document of repeated headings quadratic — 50,000 of them went
+    /// from 0.15s to 22s, and a summary is allowed to be a megabyte.
+    #[test]
+    fn a_document_of_repeated_headings_stays_linear() {
+        let summary = "## States\n".repeat(20_000);
+        let started = std::time::Instant::now();
+        let missing = missing_sections(&summary, &["States".to_string()]);
+        assert_eq!(missing, vec!["States".to_string()]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "20k repeated headings took {:?}; the scan has gone quadratic again",
+            started.elapsed()
+        );
+    }
+
     /// Reports in the wild write headings every which way — `## Findings`,
     /// `**Side effects**`, `Messages:` with the content on the same line,
     /// `Branches -> tests` with an ASCII arrow. All of them did the walk.
@@ -962,16 +982,37 @@ mod tests {
         assert_eq!(result["isError"], false, "got {result}");
     }
 
-    /// `Reviewed <sha>` is exactly what the prompt asks for, and a bare sha
-    /// is not punctuation — one trailing word is content, two or more are
-    /// prose that merely opens with the name.
+    /// The commit line the prompt asks for, written with the colon the
+    /// prompt shows. The bare `Reviewed 30161d9` form counted for a
+    /// while; the test below says why it no longer does.
     #[test]
-    fn a_one_word_remainder_is_content_not_prose() {
+    fn the_commit_line_counts_as_the_reviewed_section() {
+        for summary in ["## Reviewed: 30161d9\n", "## Reviewed\n30161d9\n"] {
+            let result = call(
+                &with_sections(&["Reviewed"]),
+                json!({ "outcome": "approved", "summary": summary }),
+            );
+            assert_eq!(
+                result["isError"], false,
+                "summary {summary:?} gave {result}"
+            );
+        }
+    }
+
+    /// A terse one-word remainder used to count as content, so that a bare
+    /// `Reviewed 30161d9` would match. On a re-review that credited whole
+    /// walks to lines about the *previous* lap: "- Findings resolved."
+    /// under "Prior findings" is the same shape as a commit line.
+    #[test]
+    fn a_terse_line_about_a_previous_lap_does_not_satisfy_a_walk() {
         let result = call(
-            &with_sections(&["Reviewed"]),
-            json!({ "outcome": "approved", "summary": "## Reviewed 30161d9\n" }),
+            &with_sections(&["Findings", "States"]),
+            json!({
+                "outcome": "approved",
+                "summary": "## Prior findings\n- Findings resolved.\n- States reworked.\n",
+            }),
         );
-        assert_eq!(result["isError"], false, "got {result}");
+        assert_eq!(result["isError"], true, "got {result}");
     }
 
     /// The suffix direction of the same guard — `Prior findings` is the
