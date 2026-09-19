@@ -217,6 +217,42 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Starts a subprocess for `task_run_id` that *continues* `session_id`
+    /// rather than opening a fresh session (#92), and begins draining it.
+    /// The caller has already created the `task_runs` row, as for
+    /// [`Self::start`]; `session_id` comes from the earlier run whose turn
+    /// was interrupted, and the new row keeps its own status.
+    ///
+    /// Separate from [`Self::send_message`]'s resume path on purpose. That
+    /// one resumes *the same run* — it refuses an `Exited` row, flips the
+    /// row back to `Active`, and always drains as
+    /// [`SessionKind::Standing`], because the only thing that ever resumed
+    /// before this was a chat session. A retry resumes an interrupted
+    /// single-shot turn into a *new* run, so none of those three apply.
+    pub async fn resume(
+        self: &Arc<Self>,
+        task_run_id: &str,
+        session_id: &str,
+        prompt: &str,
+        cfg: &RoleConfig,
+        kind: SessionKind,
+    ) -> Result<(), SessionError> {
+        self.reserve(task_run_id).await?;
+
+        let handle = match self.adapter.resume(session_id, prompt, cfg) {
+            Ok(handle) => handle,
+            Err(err) => {
+                self.sessions.lock().await.remove(task_run_id);
+                tracing::error!(task_run_id, session_id, %err, "failed to resume session");
+                return Err(SessionError::Adapter(err));
+            }
+        };
+        tracing::info!(task_run_id, session_id, "session resumed into a new run");
+        self.spawn_drain(task_run_id.to_string(), handle, kind)
+            .await;
+        Ok(())
+    }
+
     /// Sends a message to `task_run_id`. If the run has a live subprocess
     /// in memory, forwards straight to its stdin. Otherwise resumes a
     /// fresh process from the persisted `session_id` (§4.1 step 3) and
@@ -897,6 +933,10 @@ struct SingleShotTurn {
     lingered: bool,
     /// A `result` with `is_error` ended the turn.
     errored: bool,
+    /// The CLI reported a usage limit for this turn (#92): it was cut off
+    /// from outside, so the run is resumable rather than a failure of the
+    /// agent's own.
+    interrupted: bool,
 }
 
 impl Default for SingleShotTurn {
@@ -914,6 +954,7 @@ impl Default for SingleShotTurn {
             kill_settle_deadline: None,
             lingered: false,
             errored: false,
+            interrupted: false,
         }
     }
 }
@@ -942,6 +983,14 @@ enum TurnStep {
 impl SingleShotTurn {
     /// Folds one drained event into the turn's state.
     fn observe(&mut self, event: &AgentEvent) -> TurnStep {
+        // Recorded before the guard below, not after: the CLI reports a
+        // usage limit on the assistant line *and* on the `result` that ends
+        // the turn (#92), and the second of those arrives once `errored` is
+        // already set. Either one is enough to know the turn was cut off
+        // from outside rather than by anything the agent did.
+        if let AgentEvent::Interrupted { .. } = event {
+            self.interrupted = true;
+        }
         if self.completed || self.errored || self.gave_up {
             return TurnStep::Continue;
         }
@@ -1040,7 +1089,7 @@ fn final_run_state(
     reaped: bool,
     cancelled: bool,
 ) -> (TaskRunStatus, Option<TaskRunEndReason>) {
-    use TaskRunEndReason::{Cancelled, Lingered, NoReport, Reaped};
+    use TaskRunEndReason::{Cancelled, Interrupted, Lingered, NoReport, Reaped};
     use TaskRunStatus::{Exited, Idle};
     match kind {
         // A clean exit (reaper-driven close, or a one-shot process finishing on
@@ -1078,7 +1127,20 @@ fn final_run_state(
             } else if turn.completed {
                 (Idle, None)
             } else if clean_exit && !turn.errored {
+                // Ahead of the interruption arm below on purpose: a turn
+                // that saw a limit, carried on, and then ended its turn
+                // cleanly without reporting was not stopped by the limit —
+                // it is the #90 case, and resuming it would resume a turn
+                // that has nothing to say.
                 (Exited, Some(NoReport))
+            } else if turn.interrupted {
+                // #92. Last of the named reasons, because every one above
+                // describes something more specific — what the daemon did
+                // to this run, or how the turn itself ended. What this arm
+                // claims is only what they all leave anonymous today: a
+                // turn that was working and was cut off by a usage limit,
+                // which `retry` can resume rather than restart.
+                (Exited, Some(Interrupted))
             } else {
                 (Exited, None)
             }
@@ -1167,6 +1229,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: crate::adapter::Isolation::InheritOperatorConfig,
         }
     }
@@ -1176,6 +1239,7 @@ mod tests {
     fn single_shot_role_config() -> RoleConfig {
         RoleConfig {
             report_outcomes: vec!["done".to_string()],
+            report_sections: Vec::new(),
             ..role_config()
         }
     }
@@ -2127,6 +2191,90 @@ mod tests {
         );
     }
 
+    /// #92's case: the turn was working, the account hit its usage limit,
+    /// and the CLI ended the turn. Not a crash, and not the agent's own
+    /// failure — the run says so, which is what lets `retry` resume it.
+    #[tokio::test]
+    async fn a_usage_limit_ends_the_run_as_interrupted() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "text", "text": "editing files"},
+                {"op": "usage_limit"},
+            ]),
+        );
+        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+
+        let run = wait_until_final(&pool, &task_run_id).await;
+        assert_eq!(run.status, TaskRunStatus::Exited);
+        assert_eq!(run.end_reason, Some(TaskRunEndReason::Interrupted));
+
+        // And the timeline says which rule recognised it, so a run
+        // recognised only by the CLI's wording is visible as such.
+        let detections: Vec<String> = events::list_for_task_run(&pool, &task_run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| {
+                e.payload["detected_by"]
+                    .as_str()
+                    .map(|detected| detected.to_string())
+            })
+            .collect();
+        assert_eq!(detections, vec!["structured", "message_text"]);
+    }
+
+    /// The same limit as seen by a daemon whose CLI puts nothing structured
+    /// on the stream: the `result` line's text is all there is, and it is
+    /// still recognised — labelled as the weaker evidence it is.
+    #[tokio::test]
+    async fn a_usage_limit_is_still_recognised_from_its_text_alone() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "usage_limit", "structured": false},
+            ]),
+        );
+        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+
+        let run = wait_until_final(&pool, &task_run_id).await;
+        assert_eq!(run.end_reason, Some(TaskRunEndReason::Interrupted));
+
+        let detections: Vec<String> = events::list_for_task_run(&pool, &task_run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.payload["detected_by"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(detections, vec!["message_text"]);
+    }
+
+    /// A limit that lands *after* the turn reported and ended is not an
+    /// interruption: there is nothing left to resume, and the stage's
+    /// outcome is already in.
+    #[tokio::test]
+    async fn a_limit_after_a_completed_turn_does_not_reopen_it() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "usage_limit"},
+            ]),
+        );
+        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+
+        let run = wait_until_final(&pool, &task_run_id).await;
+        assert_eq!(run.status, TaskRunStatus::Idle);
+        assert_eq!(run.end_reason, None);
+    }
+
     /// A report the tool rejected is not a report.
     #[tokio::test]
     async fn a_rejected_report_does_not_complete_the_turn() {
@@ -2314,7 +2462,7 @@ mod tests {
     #[test]
     fn final_run_state_precedence() {
         use SessionKind::{SingleShot, Standing};
-        use TaskRunEndReason::{Cancelled, Lingered, NoReport, Reaped};
+        use TaskRunEndReason::{Cancelled, Interrupted, Lingered, NoReport, Reaped};
         use TaskRunStatus::{Exited, Idle};
 
         let silent = SingleShotTurn::default;
@@ -2341,6 +2489,19 @@ mod tests {
         };
         let killed = || turn_with(|t| t.lingered = true);
         let waiting = || turn_with(|t| t.waiting_for_report = true);
+        let interrupted = || {
+            turn_with(|t| {
+                t.interrupted = true;
+                t.errored = true;
+            })
+        };
+        let interrupted_then_killed = || {
+            turn_with(|t| {
+                t.interrupted = true;
+                t.errored = true;
+                t.lingered = true;
+            })
+        };
 
         let cases = vec![
             Case {
@@ -2486,6 +2647,47 @@ mod tests {
                 reaped: false,
                 cancelled: true,
                 expected: (Idle, Some(Cancelled)),
+            },
+            Case {
+                name: "interrupted by a usage limit",
+                kind: SingleShot,
+                turn: interrupted(),
+                clean_exit: false,
+                reaped: false,
+                cancelled: false,
+                expected: (Exited, Some(Interrupted)),
+            },
+            Case {
+                // The kill is the more specific thing that happened, and
+                // the one a human has to look at: something the turn
+                // started was still running when it was killed.
+                name: "lingered beats interrupted",
+                kind: SingleShot,
+                turn: interrupted_then_killed(),
+                clean_exit: false,
+                reaped: false,
+                cancelled: false,
+                expected: (Exited, Some(Lingered)),
+            },
+            Case {
+                // Saw a limit, kept going, then ended its turn cleanly with
+                // nothing reported: #90's case, not an interruption.
+                name: "recovered from a limit, then never reported",
+                kind: SingleShot,
+                turn: turn_with(|t| t.interrupted = true),
+                clean_exit: true,
+                reaped: false,
+                cancelled: false,
+                expected: (Exited, Some(NoReport)),
+            },
+            Case {
+                name: "cancelled beats interrupted",
+                kind: SingleShot,
+                turn: interrupted(),
+                clean_exit: false,
+                reaped: false,
+                cancelled: true,
+                expected: (Exited, Some(Cancelled)),
             },
             Case {
                 name: "standing, clean exit",

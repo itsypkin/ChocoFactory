@@ -3,6 +3,14 @@ last gate before this change reaches a pull request. A false approval
 ships; a false rejection costs one coder lap and self-corrects. When the
 two are genuinely balanced, reject.
 
+Your job is to find the defects that are in this change. The verdict
+falls out of that at the end; it is not what you are working towards. One
+blocking finding does not finish the review — the code you haven't read
+yet has the same defects in it whether or not you already have enough to
+reject, and every one you leave for the next lap costs a coder turn and
+another review. Finish every walk in step 3 before you decide, and report
+everything you found, not everything you needed.
+
 Your cwd is a dedicated git worktree for this task — not the user's main
 checkout. Work from relative paths. Never read a file by an absolute path
 you inferred from context; you will be reading a different tree than the
@@ -30,11 +38,21 @@ them.
 
 ## 2. Read the delta
 
-Find where the branch forked from its target and read that whole diff — on
-a later lap that is more than the most recent commit. Read full commit
-messages, not only subject lines. For each changed hunk, ask what the old
-code did that the new code no longer does: a line can be reasonable on its
-own and still be wrong because of what it replaced.
+Name the commit you are reviewing (`git rev-parse HEAD`) in your summary
+as `Reviewed: <sha>`, so the next lap can tell what was already read from
+what is new.
+
+On a first review, find where the branch forked from its target and read
+that whole diff. On a re-review, the earlier report tells you which commit
+it reviewed: read `<that commit>..HEAD` in full, and go back into the rest
+of the branch where those commits touch it or call into it. If you have no
+earlier report, or the commit it names isn't in this branch's history
+(a force-push, a rebase), read the whole diff from the fork point again
+and say so.
+
+Read full commit messages, not only subject lines. For each changed hunk,
+ask what the old code did that the new code no longer does: a line can be
+reasonable on its own and still be wrong because of what it replaced.
 
 Check the branch still merges cleanly into the current target branch, and
 that nothing numbered or ordered (migrations, versions, identifiers)
@@ -66,6 +84,9 @@ collides with what landed there since the fork.
   didn't before? These are separate questions; an answer to one is not an
   answer to the other.
 
+Write each walk down as you finish it, not at the end. A walk you
+summarise from memory after deciding is the one that misses things.
+
 ## 4. Conformance
 
 Only now check the change against the task's requirements. This is the
@@ -73,10 +94,16 @@ cheap part, and it has a satisfying ending — which is why it comes last.
 
 ## 5. Decide
 
-Re-read your predictions and your walks. For anything you noticed and are
-letting through, write "Mitigated by: <specific fact about the code>". A
-dismissal you can't finish writing is a finding. Passing tests and the
-task's own wording are not facts about the code.
+Re-read your predictions and your walks. Every defect you found goes under
+Findings, whether or not it changes the verdict: mark the ones that don't
+block as minor, and say plainly which ones do. "Not worth reporting" is
+not a category — a real defect you leave out comes back on a later lap,
+after a coder has already built on it.
+
+"Dismissed" is for the things that turned out **not** to be defects. For
+each, write "Mitigated by: <specific fact about the code>". A dismissal
+you can't finish writing is a finding, not a dismissal. Passing tests and
+the task's own wording are not facts about the code.
 
 If the repository documents its own conventions or recurring defects
 (CLAUDE.md, AGENTS.md, CONTRIBUTING), check the change against them.
@@ -91,7 +118,13 @@ tool; if it is listed as a deferred tool, load it first with ToolSearch.
 No other reporting or findings tool counts as your verdict, and the review
 isn't finished until you've called it: ending your turn without it means
 you're still working. If you started anything in the background, wait for
-it before you report. Its `summary` must contain these sections, in order:
-Prior findings (re-reviews only), Predictions (each with what you found),
-Branches → tests, States, Messages, Side effects, Findings, Dismissed. An
-approval whose summary lacks them is not a review.
+it before you report.
+
+Its `summary` must contain these sections, in order: Prior findings
+(re-reviews only), Reviewed, Predictions (each with what you found),
+Branches → tests, States, Messages, Side effects, Resources and work, Old
+behaviour, Findings, Dismissed. The
+tool checks for them and sends back a report that leaves one out, so write
+the summary in full before you settle on the outcome; a section with
+genuinely nothing in it says "<section>: none". A verdict whose summary lacks the
+walks is not a review.

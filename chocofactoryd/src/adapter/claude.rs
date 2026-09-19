@@ -7,7 +7,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, Isolation, RoleConfig};
+use super::{
+    AdapterError, AgentAdapter, AgentEvent, AgentHandle, InterruptionEvidence, Isolation,
+    RoleConfig,
+};
 
 /// Wraps `claude --print --output-format=stream-json --input-format=stream-json
 /// [--permission-mode=bypassPermissions] --mcp-config <...> [isolation flags]
@@ -165,6 +168,14 @@ fn spawn(
     for outcome in &cfg.report_outcomes {
         mcp_args.push("--outcome".to_string());
         mcp_args.push(outcome.clone());
+    }
+    // Issue #95: the sections this stage's report must carry, one flag each
+    // for the same round-tripping reason as `--outcome`. The tool rejects a
+    // report that leaves one out, so a reviewer can't file a verdict
+    // without also filing the walks it rests on.
+    for section in &cfg.report_sections {
+        mcp_args.push("--require-section".to_string());
+        mcp_args.push(section.clone());
     }
     // `alwaysLoad` (#90): without it the CLI lists `report_outcome` as a
     // *deferred* tool whose schema has to be fetched with `ToolSearch` before
@@ -394,8 +405,24 @@ fn normalize(value: &Value, tool_names: &mut HashMap<String, String>) -> Vec<Age
         Some("user") => normalize_user(value, tool_names),
         Some("result") => normalize_result(value),
         Some("control_response") => normalize_control_response(value),
+        Some("rate_limit_event") => normalize_rate_limit_event(value),
         _ => Vec::new(),
     };
+    // A usage limit ends the turn from outside, and the CLI says so on the
+    // assistant line that carries the limit's own text (#92) as well as in
+    // the `result` that follows. Appended rather than replacing the line's
+    // own events: the limit message is a real assistant message, and it is
+    // what a human reading the timeline wants to see next to the marker.
+    // Both lines reporting it is fine — each records which rule recognised
+    // it, so seeing the structured one fire is the evidence that retires
+    // the text-matching one.
+    let mut events = events;
+    if let Some((message, detected_by)) = assistant_interruption(value) {
+        events.push(AgentEvent::Interrupted {
+            message,
+            detected_by,
+        });
+    }
     // A sub-agent's messages carry the id of the `Agent` call that spawned
     // it (#90, confirmed against a real session). Wrapped here, at the one
     // place that sees the raw line, so nothing downstream can mistake a
@@ -551,16 +578,93 @@ fn normalize_result(value: &Value) -> Vec<AgentEvent> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| "agent run ended with an error".to_string());
-    vec![
-        AgentEvent::Error { message },
-        AgentEvent::TurnCompleted { is_error: true },
-    ]
+    // The one place the CLI's own wording is read (#92). Everything else
+    // here keys off structure; this rule exists because the `result` line is
+    // the only thing the daemon is *known* to receive on a usage limit —
+    // #88's whole timeline of one is `assistant`, then this. It runs last,
+    // so a structured marker on the same line would have decided already.
+    let first = match usage_limit_text(&message) {
+        true => AgentEvent::Interrupted {
+            message,
+            detected_by: InterruptionEvidence::MessageText,
+        },
+        false => AgentEvent::Error { message },
+    };
+    vec![first, AgentEvent::TurnCompleted { is_error: true }]
+}
+
+/// The CLI's `rate_limit_event` line (#92). `allowed` is the ordinary
+/// heartbeat and is ignored, as this adapter ignored the whole line before;
+/// `rejected` is the status the real 2026-09-17 limit carried in its
+/// `quotaLimits`, and means the request was refused rather than merely
+/// nearing a cap.
+fn normalize_rate_limit_event(value: &Value) -> Vec<AgentEvent> {
+    if value
+        .pointer("/rate_limit_info/status")
+        .and_then(Value::as_str)
+        != Some("rejected")
+    {
+        return Vec::new();
+    }
+    vec![AgentEvent::Interrupted {
+        message: "the CLI reported that the account's usage limit is exhausted".to_string(),
+        detected_by: InterruptionEvidence::Structured,
+    }]
+}
+
+/// The machine-readable markers an assistant line carries when the API
+/// refused the request for a usage limit (#92), as recorded in the CLI's own
+/// transcript of the #88 turn: `"error": "rate_limit"` alongside
+/// `"isApiErrorMessage": true` and `"apiErrorStatus": 429`. They sit beside
+/// `message`, not inside it, so they survive whatever the message says.
+fn assistant_interruption(value: &Value) -> Option<(String, InterruptionEvidence)> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let rate_limited = value.get("error").and_then(Value::as_str) == Some("rate_limit")
+        || value.get("apiErrorStatus").and_then(Value::as_i64) == Some(429);
+    if !rate_limited {
+        return None;
+    }
+    // The limit's own text when there is one (it names when the limit
+    // resets, which is the useful part), and a plain statement when there
+    // isn't — never a silent marker with no message.
+    let message = value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| {
+            blocks.iter().find_map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+        .unwrap_or("the CLI reported that the account's usage limit is exhausted")
+        .to_string();
+    Some((message, InterruptionEvidence::Structured))
+}
+
+/// Whether an error message reads like a usage limit rather than a failure
+/// the agent caused. Matched case-insensitively against the phrasings seen
+/// on a real limit (`You've hit your session limit · resets 3:40pm`) and the
+/// API's own wording. Brittle by construction — see `normalize_result`.
+fn usage_limit_text(message: &str) -> bool {
+    const PHRASES: [&str; 4] = [
+        "session limit",
+        "usage limit",
+        "rate limit",
+        "rate_limit_error",
+    ];
+    let message = message.to_lowercase();
+    PHRASES.iter().any(|phrase| message.contains(phrase))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    use chocofactory_core::models::EventType;
 
     fn parse(line: &str) -> Value {
         serde_json::from_str(line).unwrap()
@@ -653,6 +757,117 @@ mod tests {
     }
 
     #[test]
+    fn an_assistant_line_flagged_rate_limit_is_an_interruption() {
+        // The shape the CLI recorded for #88's interrupted turn: the limit's
+        // own text in the message, and `error`/`apiErrorStatus` beside it.
+        let line = r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 3:40pm (Europe/Berlin)"}]},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"session_id":"s"}"#;
+        assert_eq!(
+            normalize(&parse(line), &mut HashMap::new()),
+            vec![
+                AgentEvent::AssistantMessage {
+                    text: "You've hit your session limit · resets 3:40pm (Europe/Berlin)"
+                        .to_string(),
+                },
+                AgentEvent::Interrupted {
+                    message: "You've hit your session limit · resets 3:40pm (Europe/Berlin)"
+                        .to_string(),
+                    detected_by: InterruptionEvidence::Structured,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_429_assistant_line_without_text_still_says_what_happened() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[]},"apiErrorStatus":429,"session_id":"s"}"#;
+        assert_eq!(
+            normalize(&parse(line), &mut HashMap::new()),
+            vec![AgentEvent::Interrupted {
+                message: "the CLI reported that the account's usage limit is exhausted".to_string(),
+                detected_by: InterruptionEvidence::Structured,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_ordinary_assistant_line_is_not_an_interruption() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on it"}]},"session_id":"s"}"#;
+        assert_eq!(
+            normalize(&parse(line), &mut HashMap::new()),
+            vec![AgentEvent::AssistantMessage {
+                text: "working on it".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_rejected_rate_limit_event_is_an_interruption() {
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1789652400},"session_id":"abc"}"#;
+        assert_eq!(
+            normalize(&parse(line), &mut HashMap::new()),
+            vec![AgentEvent::Interrupted {
+                message: "the CLI reported that the account's usage limit is exhausted".to_string(),
+                detected_by: InterruptionEvidence::Structured,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_error_result_naming_a_limit_is_an_interruption_by_its_text() {
+        // The only part of #88's timeline the daemon is *known* to have
+        // received. Recognised by text, and labelled as such.
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"You've hit your session limit · resets 3:40pm (Europe/Berlin)","session_id":"abc"}"#;
+        assert_eq!(
+            normalize(&parse(line), &mut HashMap::new()),
+            vec![
+                AgentEvent::Interrupted {
+                    message: "You've hit your session limit · resets 3:40pm (Europe/Berlin)"
+                        .to_string(),
+                    detected_by: InterruptionEvidence::MessageText,
+                },
+                AgentEvent::TurnCompleted { is_error: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sub_agents_limit_line_stays_the_sub_agents() {
+        // Wrapped like everything else a sub-agent emits (#90), so a
+        // delegated helper's failure can't end the main turn's run as an
+        // interruption on its own. The main agent's own `result` reports it
+        // again when the limit really does stop the turn.
+        let line = r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"role":"assistant","content":[]},"error":"rate_limit","session_id":"s"}"#;
+        assert_eq!(
+            normalize(&parse(line), &mut HashMap::new()),
+            vec![AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_agent".to_string(),
+                event: Box::new(AgentEvent::Interrupted {
+                    message: "the CLI reported that the account's usage limit is exhausted"
+                        .to_string(),
+                    detected_by: InterruptionEvidence::Structured,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_interruption_payload_records_which_rule_recognised_it() {
+        let event = AgentEvent::Interrupted {
+            message: "You've hit your session limit".to_string(),
+            detected_by: InterruptionEvidence::MessageText,
+        };
+        assert_eq!(event.event_type(), EventType::Error);
+        assert_eq!(
+            event.payload(),
+            json!({
+                "message": "You've hit your session limit",
+                "interrupted": "usage_limit",
+                "detected_by": "message_text",
+            })
+        );
+    }
+
+    #[test]
     fn ignores_rate_limit_events() {
         let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"},"session_id":"abc"}"#;
         let mut tool_names = HashMap::new();
@@ -688,6 +903,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("hello", &cfg).unwrap();
@@ -730,6 +946,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter
@@ -756,6 +973,7 @@ mod tests {
             system_prompt: None,
             sandboxed: true,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
@@ -787,6 +1005,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
@@ -816,6 +1035,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
@@ -850,6 +1070,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: vec!["approved".to_string(), "changes_requested".to_string()],
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
@@ -898,6 +1119,56 @@ mod tests {
         );
     }
 
+    /// #95: a stage's `report_sections:` reach the tool as repeated
+    /// `--require-section` argv, after the outcomes and in the order the
+    /// workflow declared them. Without this, enforcement would be
+    /// configured in the workflow and silently absent at the tool, and the
+    /// only symptom would be reviewers going on reporting thin.
+    #[tokio::test]
+    async fn a_turn_with_report_sections_passes_them_to_the_tool() {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: false,
+            report_outcomes: vec!["approved".to_string()],
+            report_sections: vec!["Branches → tests".to_string(), "Findings".to_string()],
+            isolation: Isolation::InheritOperatorConfig,
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+
+        let reply = next_assistant_message(&mut handle).await;
+        let AgentEvent::AssistantMessage { text } = reply else {
+            panic!("expected an assistant message, got {reply:?}");
+        };
+        let mcp_config_json = text
+            .split("|mcp_config=")
+            .nth(1)
+            .and_then(|rest| rest.split("|strict_mcp_config=").next())
+            .expect("mcp_config field");
+        let mcp_config: Value = serde_json::from_str(mcp_config_json).unwrap();
+        let args: Vec<&str> = mcp_config["mcpServers"]["chocofactory"]["args"]
+            .as_array()
+            .expect("args array")
+            .iter()
+            .map(|a| a.as_str().expect("string arg"))
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "mcp-serve",
+                "--outcome",
+                "approved",
+                "--require-section",
+                "Branches → tests",
+                "--require-section",
+                "Findings",
+            ],
+            "got {args:?}"
+        );
+    }
+
     /// The `key=value` fields of `fake_claude_echo_args.py`'s reply. None of
     /// the values these tests pass contain a `|`.
     fn echo_fields(text: &str) -> HashMap<String, String> {
@@ -915,6 +1186,7 @@ mod tests {
             system_prompt: None,
             sandboxed: true,
             report_outcomes: vec!["done".to_string()],
+            report_sections: Vec::new(),
             isolation,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
