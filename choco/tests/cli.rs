@@ -1335,6 +1335,13 @@ stages:
     std::fs::write(&marker, "").unwrap();
     let retried = run_choco(&daemon.base_url, &["task", "retry", &task_id]).await;
     assert_eq!(retried.code, Some(0), "stderr: {}", retried.stderr);
+    // #92: a shell stage has no session, so this says it started over —
+    // the same line would name the resumed session if one had been.
+    assert!(
+        retried.stdout.contains("fresh session"),
+        "retry should say what it did: {}",
+        retried.stdout
+    );
 
     let mut status = Value::Null;
     for _ in 0..100 {

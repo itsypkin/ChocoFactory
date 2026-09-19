@@ -4,7 +4,7 @@ use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
 const COLUMNS: &str = "id, task_id, stage, role, cli_adapter, model, session_id, status, \
-     end_reason, started_at, ended_at";
+     end_reason, resumed_from, started_at, ended_at";
 
 #[derive(FromRow)]
 struct TaskRunRow {
@@ -17,6 +17,7 @@ struct TaskRunRow {
     session_id: Option<String>,
     status: String,
     end_reason: Option<String>,
+    resumed_from: Option<String>,
     started_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
 }
@@ -57,6 +58,7 @@ impl From<TaskRunRow> for TaskRun {
                     None
                 }
             }),
+            resumed_from: row.resumed_from,
             started_at: row.started_at,
             ended_at: row.ended_at,
         }
@@ -72,11 +74,40 @@ pub struct NewTaskRun<'a> {
 }
 
 pub async fn create(pool: &SqlitePool, new: NewTaskRun<'_>) -> Result<TaskRun, sqlx::Error> {
+    create_inner(pool, new, None).await
+}
+
+/// The earlier run whose agent session a new run continues (#92).
+#[derive(Debug, Clone, Copy)]
+pub struct ResumedFrom<'a> {
+    pub run_id: &'a str,
+    pub session_id: &'a str,
+}
+
+/// [`create`] for a run that resumes `from`'s session instead of opening
+/// its own (#92). The new row starts out carrying that `session_id`, so a
+/// cancel or a crash before the CLI's first `init` line still has something
+/// to point at; `set_session_id` overwrites it with whatever session the
+/// CLI actually continued into.
+pub async fn create_resumed(
+    pool: &SqlitePool,
+    new: NewTaskRun<'_>,
+    from: ResumedFrom<'_>,
+) -> Result<TaskRun, sqlx::Error> {
+    create_inner(pool, new, Some(from)).await
+}
+
+async fn create_inner(
+    pool: &SqlitePool,
+    new: NewTaskRun<'_>,
+    from: Option<ResumedFrom<'_>>,
+) -> Result<TaskRun, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRunRow>(&format!(
-        "INSERT INTO task_runs (id, task_id, stage, role, cli_adapter, model, status, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO task_runs (id, task_id, stage, role, cli_adapter, model, session_id, status, \
+         resumed_from, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -85,11 +116,48 @@ pub async fn create(pool: &SqlitePool, new: NewTaskRun<'_>) -> Result<TaskRun, s
     .bind(new.role)
     .bind(new.cli_adapter)
     .bind(new.model)
+    .bind(from.map(|from| from.session_id))
     .bind(TaskRunStatus::Active.to_string())
+    .bind(from.map(|from| from.run_id))
     .bind(now)
     .fetch_one(pool)
     .await?;
     Ok(row.into())
+}
+
+/// How many consecutive resumes led to `run_id` — 0 for a run that opened
+/// its own session, 1 for one that resumed such a run, and so on (#92).
+///
+/// Walks the `resumed_from` chain rather than counting rows for the stage:
+/// what needs bounding is how many times *one* interrupted session has been
+/// picked up again, and a fresh start in between deliberately resets that.
+/// The walk stops at `limit` (the caller's cap) instead of following the
+/// chain to its root — the answer is only ever compared against that cap,
+/// and stopping there also means a `resumed_from` cycle, which no writer
+/// here can create, could not spin this forever.
+///
+/// A run id with no row is 0, not an error: the only caller passes a run it
+/// has just read under the task's lock, so a missing row means the task was
+/// deleted underneath it, and the writes that follow fail loudly on their
+/// own foreign key rather than needing this to speak for them.
+pub async fn resume_chain_len(
+    pool: &SqlitePool,
+    run_id: &str,
+    limit: usize,
+) -> Result<usize, sqlx::Error> {
+    let mut current = run_id.to_string();
+    for walked in 0..limit {
+        let parent: Option<Option<String>> =
+            sqlx::query_scalar("SELECT resumed_from FROM task_runs WHERE id = ?")
+                .bind(&current)
+                .fetch_optional(pool)
+                .await?;
+        match parent.flatten() {
+            Some(parent) => current = parent,
+            None => return Ok(walked),
+        }
+    }
+    Ok(limit)
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<TaskRun>, sqlx::Error> {
@@ -246,6 +314,58 @@ mod tests {
         .await
         .unwrap()
         .id
+    }
+
+    /// #92: a resumed run records the run it continued and starts out
+    /// carrying its session, and the chain it forms is what bounds how many
+    /// times one session can be picked up again.
+    #[tokio::test]
+    async fn a_resumed_run_points_back_at_the_run_it_continued() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+        let new_run = || NewTaskRun {
+            task_id: &task_id,
+            stage: "coding",
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        };
+
+        let first = create(&pool, new_run()).await.unwrap();
+        assert_eq!(first.resumed_from, None);
+        assert_eq!(resume_chain_len(&pool, &first.id, 3).await.unwrap(), 0);
+
+        let second = create_resumed(
+            &pool,
+            new_run(),
+            ResumedFrom {
+                run_id: &first.id,
+                session_id: "sess-123",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.resumed_from.as_deref(), Some(first.id.as_str()));
+        assert_eq!(second.session_id.as_deref(), Some("sess-123"));
+        assert_eq!(second.status, TaskRunStatus::Active);
+        assert_eq!(resume_chain_len(&pool, &second.id, 3).await.unwrap(), 1);
+
+        let third = create_resumed(
+            &pool,
+            new_run(),
+            ResumedFrom {
+                run_id: &second.id,
+                session_id: "sess-123",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resume_chain_len(&pool, &third.id, 3).await.unwrap(), 2);
+        // The walk stops at the caller's limit rather than following the
+        // whole chain.
+        assert_eq!(resume_chain_len(&pool, &third.id, 1).await.unwrap(), 1);
+        // And a run that doesn't exist has no chain rather than an error.
+        assert_eq!(resume_chain_len(&pool, "nope", 3).await.unwrap(), 0);
     }
 
     #[tokio::test]

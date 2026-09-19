@@ -4,7 +4,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use chocofactory_core::models::{Event, Task, WorkflowState};
+use chocofactory_core::models::{Event, RetryMode, RetryOutcome, Task, WorkflowState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -196,12 +196,23 @@ pub async fn cancel(
 /// returns the stage has been re-entered, but a `shell`/`poll`/`agent_turn`
 /// stage's actual work — the command running, the turn's session starting —
 /// continues detached. Poll `GET /tasks/{id}` for the settled state.
+/// The body carries the retry's `mode` (#92). Optional, and absent means
+/// `auto`, so a caller that predates the flag — or one that has no opinion —
+/// keeps posting `{}` and gets resume-when-safe.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RetryBody {
+    mode: RetryMode,
+}
+
 pub async fn retry(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    state.engine.retry_task(&id).await?;
-    Ok(StatusCode::ACCEPTED)
+    body: Option<Json<RetryBody>>,
+) -> Result<(StatusCode, Json<RetryOutcome>), ApiError> {
+    let mode = body.map(|Json(body)| body.mode).unwrap_or_default();
+    let outcome = state.engine.retry_task(&id, mode).await?;
+    Ok((StatusCode::ACCEPTED, Json(outcome)))
 }
 
 #[cfg(test)]
@@ -818,10 +829,62 @@ stages:
             .post(&format!("/tasks/{task_id}/retry"), json!({}))
             .await;
         assert_eq!(response.status(), 202, "body: {}", response.json());
+        // #92: the body says what the retry did. A `human_gate` has no
+        // session, so this one started fresh.
+        let outcome = response.json();
+        assert_eq!(outcome["stage"], "gate");
+        assert_eq!(outcome["resumed"], false);
+        assert!(outcome["session_id"].is_null());
 
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert_eq!(detail["status"], "open");
         assert!(detail["stuck_reason"].is_null());
+    }
+
+    /// #92: `--resume` against a task whose stage has nothing resumable is
+    /// refused, rather than quietly doing the other thing. The task stays
+    /// stuck, so the operator can decide.
+    #[tokio::test]
+    async fn retrying_with_resume_when_nothing_can_be_resumed_is_409() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+        crate::db::tasks::mark_stuck(server.pool(), &task_id, "stage 'chatting': it broke")
+            .await
+            .unwrap();
+
+        let response = server
+            .post(
+                &format!("/tasks/{task_id}/retry"),
+                json!({ "mode": "resume" }),
+            )
+            .await;
+        assert_eq!(response.status(), 409, "body: {}", response.json());
+
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["status"], "stuck");
+    }
+
+    /// A body with no `mode` means `auto`, so a caller that predates the
+    /// flag keeps working — the same `{}` every other retry test posts.
+    #[tokio::test]
+    async fn an_unknown_retry_mode_is_rejected_rather_than_treated_as_auto() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+        crate::db::tasks::mark_stuck(server.pool(), &task_id, "stage 'chatting': it broke")
+            .await
+            .unwrap();
+
+        let response = server
+            .post(
+                &format!("/tasks/{task_id}/retry"),
+                json!({ "mode": "sideways" }),
+            )
+            .await;
+        let status = response.status();
+        assert!(
+            (400..500).contains(&status),
+            "a misspelled mode must not silently fall back: {status}"
+        );
     }
 
     #[tokio::test]

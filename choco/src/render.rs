@@ -3,7 +3,7 @@
 //! is the machine half). No colour/ANSI: output is routinely piped, and
 //! this repo ships no terminal-styling dependency.
 
-use chocofactory_core::models::{Event, EventType, Project, Task};
+use chocofactory_core::models::{Event, EventType, Project, RetryOutcome, Task};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -180,6 +180,32 @@ pub fn tasks(list: &[Task]) -> String {
         })
         .collect();
     table(&["TITLE", "ID", "STATUS", "WORKFLOW", "CREATED"], &rows)
+}
+
+/// Says which of the two things `task retry` did (#92). Named in the first
+/// sentence rather than left to the timeline: resuming a session and
+/// starting a new one lead to very different next few minutes, and an
+/// operator who asked for one and got the other should not have to go
+/// looking for that.
+pub fn retried(outcome: &RetryOutcome) -> String {
+    match &outcome.session_id {
+        Some(session_id) if outcome.resumed => format!(
+            "Retrying stage '{}' by resuming its interrupted session ({session_id}) — it picks \
+             up where it left off, with its working tree untouched.",
+            outcome.stage
+        ),
+        // `resumed` without a session id is not something the daemon
+        // produces; reported plainly rather than claiming a session that
+        // isn't named.
+        _ if outcome.resumed => format!(
+            "Retrying stage '{}' by resuming its interrupted session.",
+            outcome.stage
+        ),
+        _ => format!(
+            "Retrying stage '{}' from scratch, in a fresh session.",
+            outcome.stage
+        ),
+    }
 }
 
 /// Renders the daemon's `TaskDetail` (a `Task` flattened alongside
@@ -584,6 +610,27 @@ fn one_line(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn retried_says_whether_the_session_was_resumed() {
+        let resumed = super::retried(&RetryOutcome {
+            stage: "coding".to_string(),
+            resumed: true,
+            session_id: Some("sess-123".to_string()),
+        });
+        assert!(
+            resumed.contains("coding") && resumed.contains("sess-123"),
+            "{resumed}"
+        );
+        assert!(resumed.contains("resuming"), "{resumed}");
+
+        let fresh = super::retried(&RetryOutcome {
+            stage: "coding".to_string(),
+            resumed: false,
+            session_id: None,
+        });
+        assert!(fresh.contains("fresh session"), "{fresh}");
+    }
     use serde_json::json;
 
     use super::*;

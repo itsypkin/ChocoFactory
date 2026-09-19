@@ -121,6 +121,14 @@ pub enum TaskRunEndReason {
     /// (#90), even after the daemon's nudges, so it was closed rather than
     /// treated as complete.
     NoReport,
+    /// The turn was cut off from outside rather than by anything the agent
+    /// did (#92): the CLI reported a usage/rate limit for the account and
+    /// ended the turn. The session's transcript is intact and the work was
+    /// healthy, so `retry` resumes it instead of starting from scratch —
+    /// unlike a crash, which would only be resumed straight back into
+    /// itself. Detected by `adapter::claude`'s structured markers (see
+    /// `AgentEvent::Interrupted`), never by the engine.
+    Interrupted,
 }
 
 impl fmt::Display for TaskRunEndReason {
@@ -131,6 +139,7 @@ impl fmt::Display for TaskRunEndReason {
             TaskRunEndReason::Cancelled => "cancelled",
             TaskRunEndReason::Lingered => "lingered",
             TaskRunEndReason::NoReport => "no_report",
+            TaskRunEndReason::Interrupted => "interrupted",
         })
     }
 }
@@ -156,9 +165,41 @@ impl FromStr for TaskRunEndReason {
             "cancelled" => Ok(TaskRunEndReason::Cancelled),
             "lingered" => Ok(TaskRunEndReason::Lingered),
             "no_report" => Ok(TaskRunEndReason::NoReport),
+            "interrupted" => Ok(TaskRunEndReason::Interrupted),
             other => Err(ParseTaskRunEndReasonError(other.to_string())),
         }
     }
+}
+
+/// What `choco task retry` should do with the agent session a stuck stage
+/// left behind (#92). Shared between the CLI and the daemon so the request
+/// body has one definition rather than a hand-built JSON object on one side
+/// and a parser on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryMode {
+    /// Resume the stage's interrupted session when it is safe to, and
+    /// otherwise start a fresh one. The default: which of the two applies
+    /// is something the daemon knows and the operator usually doesn't.
+    #[default]
+    Auto,
+    /// Resume, or fail saying why it can't be resumed.
+    Resume,
+    /// Always start a fresh session, whatever ended the last one.
+    Fresh,
+}
+
+/// What a retry did (#92) — the body of the daemon's `202`, so an operator
+/// is told whether the stage picked up where it left off or started over,
+/// rather than having to infer it from the timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryOutcome {
+    /// The stage that was re-entered.
+    pub stage: String,
+    /// Whether the stuck stage's agent session was resumed.
+    pub resumed: bool,
+    /// The session that was resumed, when one was.
+    pub session_id: Option<String>,
 }
 
 /// One row per underlying agent subprocess session a task has had (§3).
@@ -173,6 +214,11 @@ pub struct TaskRun {
     pub session_id: Option<String>,
     pub status: TaskRunStatus,
     pub end_reason: Option<TaskRunEndReason>,
+    /// The run whose agent session this one continued (#92), set when
+    /// `retry` resumed an interrupted turn instead of starting a fresh
+    /// session. `None` for a run that opened its own session, which is
+    /// every run that isn't a resume.
+    pub resumed_from: Option<String>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
 }
@@ -402,6 +448,7 @@ mod tests {
             TaskRunEndReason::Cancelled,
             TaskRunEndReason::Lingered,
             TaskRunEndReason::NoReport,
+            TaskRunEndReason::Interrupted,
         ] {
             assert_eq!(
                 reason.to_string().parse::<TaskRunEndReason>().unwrap(),

@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use chocofactory_core::models::{Event, Project, Task};
+use chocofactory_core::models::{Event, Project, RetryMode, RetryOutcome, Task};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -494,18 +494,22 @@ impl Client {
         Ok(())
     }
 
-    /// Re-runs a stuck task's current stage (X-4, issue #61). Shaped like
-    /// `cancel_task`: no request body, and the daemon answers `202` with no
-    /// body.
-    pub async fn retry_task(&self, id: &str) -> Result<(), ClientError> {
+    /// Re-runs a stuck task's current stage (X-4, issue #61), resuming its
+    /// interrupted agent session when `mode` allows and the daemon finds
+    /// one worth resuming (#92). The `202` carries a `RetryOutcome` saying
+    /// which of the two happened.
+    pub async fn retry_task(&self, id: &str, mode: RetryMode) -> Result<RetryOutcome, ClientError> {
         let resp = self
             .send(
                 self.http
-                    .post(format!("{}/tasks/{id}/retry", self.base_url)),
+                    .post(format!("{}/tasks/{id}/retry", self.base_url))
+                    .json(&json!({ "mode": mode })),
             )
             .await?;
-        self.check_status(resp).await?;
-        Ok(())
+        let resp = self.check_status(resp).await?;
+        resp.json()
+            .await
+            .map_err(|err| ClientError::Decode(err.to_string()))
     }
 }
 

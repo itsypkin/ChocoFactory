@@ -18,6 +18,12 @@ Steps, run in order:
 - `{"op": "report", "outcome": "done", "parent": "toolu_x"?, "is_error": false?}`
   — a `report_outcome` tool_use/tool_result pair.
 - `{"op": "result", "is_error": false?}` — the CLI's end-of-turn line.
+- `{"op": "echo_turn"}` — wait for the next user turn and repeat it back as
+  an assistant message, so a test can assert what the daemon actually sent.
+- `{"op": "usage_limit", "structured": true?}` — the account hitting its
+  usage limit (#92): the limit message, then an error `result`. With
+  `structured` (the default) the message also carries the CLI's own
+  `error`/`apiErrorStatus` fields; without it, only the text says so.
 - `{"op": "answer_every_turn", "text": "..."}` — from here on, reply to each
   turn (a nudge, say) with `text` and a `result`, never reporting, until EOF.
 - `{"op": "spawn_child", "heartbeat": path, "pid_file": path, "detach": false?}`
@@ -52,6 +58,41 @@ def assistant_text(session_id, text, parent=None):
     if parent is not None:
         message["parent_tool_use_id"] = parent
     emit(message)
+
+
+LIMIT_TEXT = "You've hit your session limit \u00b7 resets 3:40pm (Europe/Berlin)"
+
+
+def usage_limit(session_id, structured=True):
+    """The shape a real turn took when the account ran out of usage (#92).
+
+    `structured` mirrors the fields the CLI recorded in its own transcript
+    for that turn; without them only the `result` line's text says what
+    happened, which is the case the text-matching fallback covers.
+    """
+    message = {
+        "type": "assistant",
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "content": [{"type": "text", "text": LIMIT_TEXT}],
+        },
+        "session_id": session_id,
+    }
+    if structured:
+        message["error"] = "rate_limit"
+        message["isApiErrorMessage"] = True
+        message["apiErrorStatus"] = 429
+    emit(message)
+    emit(
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": LIMIT_TEXT,
+            "session_id": session_id,
+        }
+    )
 
 
 def result(session_id, is_error=False):
@@ -99,6 +140,13 @@ def main():
             )
         elif op == "result":
             result(session_id, step.get("is_error", False))
+        elif op == "echo_turn":
+            turn = read_turn(sys.stdin)
+            if turn is None:
+                return
+            assistant_text(session_id, "turn text: {}".format(turn))
+        elif op == "usage_limit":
+            usage_limit(session_id, step.get("structured", True))
         elif op == "answer_every_turn":
             while read_turn(sys.stdin) is not None:
                 assistant_text(session_id, step["text"])

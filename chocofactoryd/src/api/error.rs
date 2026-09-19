@@ -162,7 +162,12 @@ impl From<RetryTaskError> for ApiError {
             RetryTaskError::NotStuck(_)
             | RetryTaskError::NoWorkflowState
             | RetryTaskError::UnknownStage(_)
-            | RetryTaskError::RunStillActive(_) => ApiError::Conflict(err.to_string()),
+            | RetryTaskError::RunStillActive(_)
+            // Same shape: `--resume` was asked for and this task's last run
+            // is not one that can be resumed (#92). The caller could retry
+            // without it, so it is the task's state that conflicts, not the
+            // request that is malformed.
+            | RetryTaskError::NotResumable(_) => ApiError::Conflict(err.to_string()),
             // The workflow file backing this task's `workflow_def` is gone,
             // so the retry cannot happen — a conflict with the task's own
             // state, not a request the caller could reasonably have made

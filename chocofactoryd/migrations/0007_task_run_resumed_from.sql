@@ -1,0 +1,13 @@
+-- The run whose interrupted agent session this one continued (#92).
+--
+-- `choco task retry` re-enters a stuck stage. When the previous run was cut
+-- off from outside — a usage limit, or the idle reaper — the new run resumes
+-- that run's `session_id` (`claude --resume`) instead of opening a fresh
+-- session against a worktree full of work it knows nothing about. A new row
+-- either way, so the attempt history stays honest; this column is what
+-- records that the two are the same conversation, and what bounds how many
+-- times a stage may be resumed before a fresh start is forced.
+--
+-- NULL for every run that started its own session, which is all of them
+-- before this migration.
+ALTER TABLE task_runs ADD COLUMN resumed_from TEXT REFERENCES task_runs (id);
