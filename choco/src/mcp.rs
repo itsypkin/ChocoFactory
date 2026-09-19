@@ -408,7 +408,11 @@ fn heading_for(line: &str, normalized_names: &[String]) -> Option<(usize, String
 fn heads_a_section(rest: &str) -> bool {
     // `Findings` must not be credited by a line reading
     // `Findingsomething`: a letter straight after the name means the name
-    // is only the start of a longer word.
+    // is only the start of a longer word. Redundant with the punctuation
+    // rule below as that rule stands today, and kept anyway: it fires
+    // *before* whatever clause a later change adds, and a later clause
+    // silently dropping this guard is what round 3 of #95's own review
+    // found. Delete either one and the hole comes back.
     if rest.starts_with(char::is_alphanumeric) {
         return false;
     }
@@ -426,7 +430,7 @@ fn heads_a_section(rest: &str) -> bool {
 fn missing_sections_message(missing: &[String], required: &[String]) -> String {
     format!(
         "Your report's 'summary' is missing {}: each required section needs a heading line with \
-         something under it (write 'none' when there is genuinely nothing). Required sections, in \
+         something under it (a section with genuinely nothing in it says \"<section>: none\"). Required sections, in \
          order: {}. Finish the walks you skipped, then call this tool again with the complete \
          report.",
         quoted_list(missing),
@@ -535,7 +539,7 @@ fn tool_definition(stage: &StageReport) -> Value {
         } else {
             format!(
                 " This stage requires these sections, each with a heading line and something \
-                 under it (write 'none' when there is genuinely nothing): {}. Write them in that \
+                 under it — a section with genuinely nothing in it says \"<section>: none\": {}. Write in that \
                  order. A report missing any of them is rejected and you will be asked to call \
                  again.",
                 stage.required_sections.join(", "),
@@ -843,13 +847,18 @@ mod tests {
     /// from 0.15s to 22s, and a summary is allowed to be a megabyte.
     #[test]
     fn a_document_of_repeated_headings_stays_linear() {
-        let summary = "## States\n".repeat(20_000);
+        let summary = "## States\n".repeat(50_000);
         let started = std::time::Instant::now();
         let missing = missing_sections(&summary, &["States".to_string()]);
         assert_eq!(missing, vec!["States".to_string()]);
+        // Linear is well under a second here and quadratic is tens of
+        // seconds, so this discriminates by more than an order of
+        // magnitude either way. Deliberately loose: it is a wall-clock
+        // assertion in a suite that runs in parallel, and a 1s budget on
+        // 20k headings did fail under load.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "20k repeated headings took {:?}; the scan has gone quadratic again",
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "50k repeated headings took {:?}; the scan has gone quadratic again",
             started.elapsed()
         );
     }

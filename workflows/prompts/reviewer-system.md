@@ -126,5 +126,5 @@ Branches → tests, States, Messages, Side effects, Resources and work, Old
 behaviour, Findings, Dismissed. The
 tool checks for them and sends back a report that leaves one out, so write
 the summary in full before you settle on the outcome; a section with
-genuinely nothing in it says "none". A verdict whose summary lacks the
+genuinely nothing in it says "<section>: none". A verdict whose summary lacks the
 walks is not a review.
