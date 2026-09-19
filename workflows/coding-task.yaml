@@ -36,11 +36,31 @@ stages:
   # summary)` (#73) rather than replying with structured JSON; `capture: json`
   # reads `on:`'s next stage straight from the call's `outcome` argument, with
   # a same-shaped-JSON-reply fallback for a turn that never calls the tool.
+  #
+  # `report_sections:` is what stops the review ending at its first blocking
+  # finding (#95). On #88 the first lap named four untested branches, had
+  # enough to reject, and stopped; the next lap — on a commit that added only
+  # tests — found two more defects and a third it had seen and waved through,
+  # all of them already in the code the first lap read. The verdict was
+  # decidable early; the walks weren't done. The tool rejects a report that
+  # leaves a section out, so there is no way to file a verdict without also
+  # filing the walks behind it. The names match `reviewer-system.md`'s steps;
+  # "Prior findings" is not among them because a first lap has none, and the
+  # turn prompt asks for it when there are.
   internal_review:
     kind: agent_turn
     role: reviewer
     prompt_file: prompts/reviewer-turn.md
     capture: json
+    report_sections:
+      - Reviewed
+      - Predictions
+      - Branches → tests
+      - States
+      - Messages
+      - Side effects
+      - Findings
+      - Dismissed
     on:
       approved: open_pr
       changes_requested: revising

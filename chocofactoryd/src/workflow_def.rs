@@ -205,6 +205,49 @@ impl WorkflowDefinition {
                 });
             }
 
+            // #95. Each name is matched against the report's headings, so
+            // a blank one would match every line and a duplicate would ask
+            // twice for the same walk. Neither is anything an author meant,
+            // and both would only show up as a reviewer being rejected for
+            // a section it did write.
+            if let StageKind::AgentTurn {
+                report_sections, ..
+            } = &stage.kind
+            {
+                // An open-ended turn (chat's shape) never concludes, so its
+                // report is optional and purely informational — requiring
+                // sections of it is dead config, rejected for the same
+                // reason `capture:` is just above.
+                if !report_sections.is_empty() && stage.on.is_empty() {
+                    return Err(WorkflowDefError::ReportSectionsOnOpenEndedTurn {
+                        stage: stage_name.clone(),
+                    });
+                }
+                let mut seen: Vec<String> = Vec::new();
+                for section in report_sections {
+                    if section.trim().is_empty() {
+                        return Err(WorkflowDefError::EmptyReportSection {
+                            stage: stage_name.clone(),
+                        });
+                    }
+                    // Compared the way the tool compares them, so two names
+                    // that differ only in case or spacing are caught here
+                    // rather than becoming one heading that satisfies both.
+                    let key = section
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_lowercase();
+                    if seen.contains(&key) {
+                        return Err(WorkflowDefError::DuplicateReportSection {
+                            stage: stage_name.clone(),
+                            section: section.clone(),
+                        });
+                    }
+                    seen.push(key);
+                }
+            }
+
             // A human's reply is free text they typed, not a command's
             // structured stdout (#59) — `capture: json` would either fail
             // to parse (falling back to text with a warning nobody
@@ -359,6 +402,15 @@ pub enum StageKind {
         /// transition, which is how a reviewer's structured verdict routes
         /// the graph (§5.2).
         capture: Option<Capture>,
+        /// Sections this stage requires the turn's `report_outcome` summary
+        /// to carry, in order (#95). The `report_outcome` tool rejects a
+        /// report that leaves one out, which is what stops a reviewer
+        /// reporting the moment it has enough to reject: there is no way to
+        /// file a verdict without also filing the walks behind it.
+        ///
+        /// Empty (the default, and every stage that hasn't opted in) leaves
+        /// the report checked only for its `outcome`, exactly as before.
+        report_sections: Vec<String>,
     },
     Shell {
         command: ShellCommand,
@@ -513,6 +565,8 @@ enum RawStageKind {
         prompt_file: Option<String>,
         #[serde(default)]
         capture: Option<Capture>,
+        #[serde(default)]
+        report_sections: Vec<String>,
     },
     Shell {
         #[serde(default)]
@@ -574,6 +628,7 @@ impl RawStage {
                 role,
                 prompt_file,
                 capture,
+                report_sections,
             } => StageKind::AgentTurn {
                 role,
                 prompt_file: prompt_file
@@ -582,6 +637,7 @@ impl RawStage {
                     })
                     .transpose()?,
                 capture,
+                report_sections,
             },
             RawStageKind::Shell {
                 command,
@@ -884,6 +940,16 @@ pub enum WorkflowDefError {
     CaptureOnOpenEndedTurn {
         stage: String,
     },
+    ReportSectionsOnOpenEndedTurn {
+        stage: String,
+    },
+    EmptyReportSection {
+        stage: String,
+    },
+    DuplicateReportSection {
+        stage: String,
+        section: String,
+    },
     HumanGateCaptureMustBeText {
         stage: String,
     },
@@ -1002,6 +1068,19 @@ impl fmt::Display for WorkflowDefError {
                 f,
                 "agent_turn stage '{stage}' declares 'capture:' but has an empty 'on:' map, so it \
                  never concludes and the capture could never be taken"
+            ),
+            WorkflowDefError::ReportSectionsOnOpenEndedTurn { stage } => write!(
+                f,
+                "agent_turn stage '{stage}' declares 'report_sections:' but has an empty 'on:' \
+                 map, so its report is optional and never routes anything"
+            ),
+            WorkflowDefError::EmptyReportSection { stage } => write!(
+                f,
+                "agent_turn stage '{stage}' has a blank entry in 'report_sections:'"
+            ),
+            WorkflowDefError::DuplicateReportSection { stage, section } => write!(
+                f,
+                "agent_turn stage '{stage}' lists the report section '{section}' more than once"
             ),
             WorkflowDefError::HumanGateCaptureMustBeText { stage } => write!(
                 f,
@@ -2133,6 +2212,148 @@ stages:
             panic!("expected agent_turn stage");
         };
         assert_eq!(*capture, Some(Capture::Json));
+    }
+
+    /// #95: the sections a stage requires of its report, in declaration
+    /// order — the tool matches headings by name, so the strings have to
+    /// survive parsing exactly as written, arrow and all.
+    #[test]
+    fn parses_report_sections_on_an_agent_turn() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer: { cli: claude }
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    report_sections: ["Branches → tests", "Findings"]
+    on: { approved: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::AgentTurn {
+            report_sections, ..
+        } = &def.stages["review"].kind
+        else {
+            panic!("expected agent_turn stage");
+        };
+        assert_eq!(report_sections, &["Branches → tests", "Findings"]);
+    }
+
+    /// Every stage that predates #95, and every one that doesn't opt in:
+    /// no sections required, reports checked only for their outcome.
+    #[test]
+    fn an_agent_turn_without_report_sections_requires_none() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer: { cli: claude }
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on: { approved: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::AgentTurn {
+            report_sections, ..
+        } = &def.stages["review"].kind
+        else {
+            panic!("expected agent_turn stage");
+        };
+        assert!(report_sections.is_empty());
+    }
+
+    /// A blank name would match every line in a report, so a stage that
+    /// asked for one would accept anything — the opposite of the point.
+    #[test]
+    fn rejects_a_blank_report_section() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer: { cli: claude }
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    report_sections: ["Findings", "  "]
+    on: { approved: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::EmptyReportSection { stage } if stage == "review"),
+            "got {err}"
+        );
+    }
+
+    /// Compared the way the tool compares them, so a pair that differs only
+    /// in case or spacing is caught at load time rather than becoming one
+    /// heading that quietly satisfies both entries.
+    #[test]
+    fn rejects_duplicate_report_sections_differing_only_in_case_or_spacing() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer: { cli: claude }
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    report_sections: ["Side effects", "side  EFFECTS"]
+    on: { approved: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WorkflowDefError::DuplicateReportSection { stage, section }
+                    if stage == "review" && section == "side  EFFECTS"
+            ),
+            "got {err}"
+        );
+    }
+
+    /// An open-ended turn's report is optional and routes nothing, so
+    /// requiring sections of it is dead config — rejected for the same
+    /// reason `capture:` is on the same shape of stage.
+    #[test]
+    fn rejects_report_sections_on_an_open_ended_agent_turn() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: chat
+roles:
+  chat: { cli: claude }
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    report_sections: ["Findings"]
+    on: {}
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WorkflowDefError::ReportSectionsOnOpenEndedTurn { stage } if stage == "chatting"
+            ),
+            "got {err}"
+        );
     }
 
     #[test]

@@ -225,4 +225,37 @@ mod tests {
         assert_eq!(def.name, "coding-task");
         assert!(def.worktree);
     }
+
+    /// #95: the sections `internal_review` enforces and the ones its
+    /// reviewer prompt asks for are two copies of the same list, and the
+    /// failure when they drift is silent and expensive — a reviewer writes
+    /// the report it was told to write and the tool rejects it, costing a
+    /// retry on every single review.
+    #[test]
+    fn the_reviewer_prompt_asks_for_every_section_the_stage_enforces() {
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+
+        let def = crate::workflow_def::WorkflowDefinition::load(&dir.path.join("coding-task.yaml"))
+            .unwrap();
+        let crate::workflow_def::StageKind::AgentTurn {
+            report_sections, ..
+        } = &def.stages["internal_review"].kind
+        else {
+            panic!("internal_review should be an agent_turn");
+        };
+        assert!(
+            !report_sections.is_empty(),
+            "internal_review must require report sections"
+        );
+
+        let system_prompt =
+            std::fs::read_to_string(dir.path.join("prompts/reviewer-system.md")).unwrap();
+        for section in report_sections {
+            assert!(
+                system_prompt.contains(section.as_str()),
+                "reviewer-system.md never mentions the required section '{section}'"
+            );
+        }
+    }
 }

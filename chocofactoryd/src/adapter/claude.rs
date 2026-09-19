@@ -169,6 +169,14 @@ fn spawn(
         mcp_args.push("--outcome".to_string());
         mcp_args.push(outcome.clone());
     }
+    // Issue #95: the sections this stage's report must carry, one flag each
+    // for the same round-tripping reason as `--outcome`. The tool rejects a
+    // report that leaves one out, so a reviewer can't file a verdict
+    // without also filing the walks it rests on.
+    for section in &cfg.report_sections {
+        mcp_args.push("--require-section".to_string());
+        mcp_args.push(section.clone());
+    }
     // `alwaysLoad` (#90): without it the CLI lists `report_outcome` as a
     // *deferred* tool whose schema has to be fetched with `ToolSearch` before
     // it can be called. Probed against Claude Code 2.1.272: even with ours as
@@ -895,6 +903,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("hello", &cfg).unwrap();
@@ -937,6 +946,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter
@@ -963,6 +973,7 @@ mod tests {
             system_prompt: None,
             sandboxed: true,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
@@ -994,6 +1005,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
@@ -1023,6 +1035,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
@@ -1057,6 +1070,7 @@ mod tests {
             system_prompt: None,
             sandboxed: false,
             report_outcomes: vec!["approved".to_string(), "changes_requested".to_string()],
+            report_sections: Vec::new(),
             isolation: Isolation::InheritOperatorConfig,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
@@ -1105,6 +1119,56 @@ mod tests {
         );
     }
 
+    /// #95: a stage's `report_sections:` reach the tool as repeated
+    /// `--require-section` argv, after the outcomes and in the order the
+    /// workflow declared them. Without this, enforcement would be
+    /// configured in the workflow and silently absent at the tool, and the
+    /// only symptom would be reviewers going on reporting thin.
+    #[tokio::test]
+    async fn a_turn_with_report_sections_passes_them_to_the_tool() {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: false,
+            report_outcomes: vec!["approved".to_string()],
+            report_sections: vec!["Branches → tests".to_string(), "Findings".to_string()],
+            isolation: Isolation::InheritOperatorConfig,
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+
+        let reply = next_assistant_message(&mut handle).await;
+        let AgentEvent::AssistantMessage { text } = reply else {
+            panic!("expected an assistant message, got {reply:?}");
+        };
+        let mcp_config_json = text
+            .split("|mcp_config=")
+            .nth(1)
+            .and_then(|rest| rest.split("|strict_mcp_config=").next())
+            .expect("mcp_config field");
+        let mcp_config: Value = serde_json::from_str(mcp_config_json).unwrap();
+        let args: Vec<&str> = mcp_config["mcpServers"]["chocofactory"]["args"]
+            .as_array()
+            .expect("args array")
+            .iter()
+            .map(|a| a.as_str().expect("string arg"))
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "mcp-serve",
+                "--outcome",
+                "approved",
+                "--require-section",
+                "Branches → tests",
+                "--require-section",
+                "Findings",
+            ],
+            "got {args:?}"
+        );
+    }
+
     /// The `key=value` fields of `fake_claude_echo_args.py`'s reply. None of
     /// the values these tests pass contain a `|`.
     fn echo_fields(text: &str) -> HashMap<String, String> {
@@ -1122,6 +1186,7 @@ mod tests {
             system_prompt: None,
             sandboxed: true,
             report_outcomes: vec!["done".to_string()],
+            report_sections: Vec::new(),
             isolation,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();

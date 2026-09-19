@@ -10,19 +10,23 @@
 //!
 //! Two deliberate limits:
 //!
-//! - **Stateless.** It never contacts `chocofactoryd`. The daemon already
+//! - **No daemon.** It never contacts `chocofactoryd`. The daemon already
 //!   records every tool call an agent makes as a `tool_call` event, so it
 //!   reads the verdict back off that timeline exactly as it already reads the
-//!   final assistant text. That leaves nothing here to authenticate, no
-//!   endpoint to add, and no shared state to race on.
+//!   final assistant text. That leaves nothing here to authenticate and no
+//!   endpoint to add. The one thing it does keep (issue #95) is a count of
+//!   how many reports it has turned away for missing sections, which lives
+//!   in this process — one server process per CLI session, one thread
+//!   reading one stdio stream, so there is nothing for it to race with.
 //! - **Hand-rolled.** Four JSON-RPC methods over newline-delimited stdio, no
 //!   MCP SDK. `serde_json` is already a dependency; a crate for one tool
 //!   would not be.
 //!
 //! The allowed `outcome` values are passed in with repeated `--outcome`
-//! flags and come from the stage's `on:` map, so this binary has no idea
-//! what a "reviewer" is — every agent turn gets the same tool, and only the
-//! list differs.
+//! flags and come from the stage's `on:` map, and the sections a report must
+//! carry come from the stage's `report_sections:` with repeated
+//! `--require-section` flags, so this binary has no idea what a "reviewer"
+//! is — every agent turn gets the same tool, and only the lists differ.
 
 use std::io::{BufRead, Write};
 
@@ -42,22 +46,50 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 /// own lookup can never disagree about what the tool is called.
 pub const TOOL_NAME: &str = REPORT_OUTCOME_TOOL_NAME;
 
+/// How many reports this server turns away for missing sections before it
+/// takes one anyway (issue #95).
+///
+/// The rejection is the point — a reviewer that stopped at its first
+/// blocking finding has no "Branches → tests" walk to write down, and being
+/// sent back is what makes it do the walk. But a turn that *never* reports
+/// is worse than a thin one: the session nudges it, runs out of nudges and
+/// parks the task for a human (#73, #91). So a model that can't satisfy the
+/// rule costs two retries, and its third call is recorded with the gap named
+/// in the tool's reply — which lands on the task's timeline as a
+/// `tool_result` event, where whoever reads the review can see it.
+const MAX_SECTION_REJECTIONS: u32 = 2;
+
+/// What the stage asks of a report: which `outcome` values route it
+/// (`--outcome`), and which sections its `summary` must carry
+/// (`--require-section`).
+///
+/// One struct rather than two parameters threaded side by side, because
+/// every layer between the stage definition and this server passes both
+/// together and neither means anything without the stage it came from.
+#[derive(Debug, Default, Clone)]
+pub struct StageReport {
+    pub outcomes: Vec<String>,
+    pub required_sections: Vec<String>,
+}
+
 /// Serves the tool over `input`/`output` until the client closes the stream.
 ///
 /// Split from the subcommand entry point so tests can drive a whole session
 /// over byte slices, the same reason `client`'s request builders are split
 /// from their sending halves.
 pub fn serve(
-    outcomes: &[String],
+    stage: &StageReport,
     input: impl BufRead,
     mut output: impl Write,
 ) -> std::io::Result<()> {
+    // Per session, not per call: see `MAX_SECTION_REJECTIONS`.
+    let mut section_rejections = 0;
     for line in input.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(outcomes, &line) {
+        if let Some(response) = handle_line(stage, &mut section_rejections, &line) {
             writeln!(output, "{response}")?;
             output.flush()?;
         }
@@ -68,7 +100,7 @@ pub fn serve(
 /// Answers one request line. `None` means "say nothing", which is required
 /// rather than merely polite: a JSON-RPC *notification* has no `id`, and
 /// replying to one is a protocol violation.
-fn handle_line(outcomes: &[String], line: &str) -> Option<String> {
+fn handle_line(stage: &StageReport, section_rejections: &mut u32, line: &str) -> Option<String> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
         // No `id` is recoverable from an unparseable line, so this is the one
@@ -91,8 +123,8 @@ fn handle_line(outcomes: &[String], line: &str) -> Option<String> {
 
     let result = match method {
         "initialize" => Ok(initialize_result(&request)),
-        "tools/list" => Ok(json!({ "tools": [tool_definition(outcomes)] })),
-        "tools/call" => match call_tool(outcomes, request.get("params")) {
+        "tools/list" => Ok(json!({ "tools": [tool_definition(stage)] })),
+        "tools/call" => match call_tool(stage, section_rejections, request.get("params")) {
             Ok(result) => Ok(result),
             Err(CallError::Protocol(message)) => Err((-32602, message)),
         },
@@ -136,7 +168,12 @@ enum CallError {
 /// only the second form gives it the chance to correct itself and call again
 /// — which is precisely what the old "reply with nothing but this object"
 /// instruction could never offer.
-fn call_tool(outcomes: &[String], params: Option<&Value>) -> Result<Value, CallError> {
+fn call_tool(
+    stage: &StageReport,
+    section_rejections: &mut u32,
+    params: Option<&Value>,
+) -> Result<Value, CallError> {
+    let outcomes = &stage.outcomes[..];
     let params = params.ok_or_else(|| CallError::Protocol("missing params".to_string()))?;
 
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -173,19 +210,179 @@ fn call_tool(outcomes: &[String], params: Option<&Value>) -> Result<Value, CallE
     // that until now. The MCP `inputSchema`'s own `"required"` array is a
     // hint to the model, not something this server validates on its
     // behalf; skip this check and the doc comment's promise is false.
-    if arguments.get("summary").and_then(Value::as_str).is_none() {
+    let Some(summary) = arguments.get("summary").and_then(Value::as_str) else {
         return Ok(tool_error(
             "'summary' is required and must be a string (it may be empty).",
         ));
+    };
+
+    // Issue #95: the stage can require the report to carry named sections,
+    // which is what turns "I have enough to reject" into "I walked every
+    // branch, state and message". Checked after the outcome so a call that
+    // is wrong in both ways is told about the cheaper problem first, and
+    // doesn't spend a retry learning about the second one only afterwards.
+    let missing = missing_sections(summary, &stage.required_sections);
+    if !missing.is_empty() {
+        if *section_rejections < MAX_SECTION_REJECTIONS {
+            *section_rejections += 1;
+            return Ok(tool_error(&missing_sections_message(
+                &missing,
+                &stage.required_sections,
+            )));
+        }
+        // Taken anyway, with the gap stated in the reply rather than
+        // silently dropped: see `MAX_SECTION_REJECTIONS`.
+        return Ok(tool_success(&format!(
+            "Recorded outcome '{outcome}'. Its report is still missing {}, and this is attempt \
+             {}, so it was recorded as it stands.",
+            quoted_list(&missing),
+            *section_rejections + 1,
+        )));
     }
 
-    Ok(json!({
-        "content": [{
-            "type": "text",
-            "text": format!("Recorded outcome '{outcome}'."),
-        }],
+    Ok(tool_success(&format!("Recorded outcome '{outcome}'.")))
+}
+
+/// The required sections `summary` doesn't account for, in the order the
+/// stage declared them. A section is accounted for when the summary has a
+/// heading line for it *and* something under it.
+///
+/// Empty when `required` is empty, which is every stage that doesn't ask
+/// for sections — i.e. all of them before #95, and every workflow that
+/// never opts in.
+fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
+    if required.is_empty() {
+        return Vec::new();
+    }
+    let normalized_names: Vec<String> = required.iter().map(|name| normalized(name)).collect();
+    let lines: Vec<&str> = summary.lines().collect();
+    // Which required section each line is a heading for, so the loop below
+    // can tell "the next heading" (which ends a section's content) from an
+    // ordinary line without matching twice.
+    let headings: Vec<Option<(usize, String)>> = lines
+        .iter()
+        .map(|line| heading_for(line, &normalized_names))
+        .collect();
+
+    let mut satisfied = vec![false; required.len()];
+    for (index, heading) in headings.iter().enumerate() {
+        let Some((section, rest_of_line)) = heading else {
+            continue;
+        };
+        if satisfied[*section] {
+            continue;
+        }
+        // Content is whatever follows the heading on its own line, plus
+        // every line after it up to the next required section's heading.
+        // A report that writes "Findings: none" on one line and one that
+        // writes "Findings" with "none" beneath it both count.
+        let has_content = !rest_of_line.trim().is_empty()
+            || lines[index + 1..]
+                .iter()
+                .zip(&headings[index + 1..])
+                .take_while(|(_, heading)| heading.is_none())
+                .any(|(line, _)| !line.trim().is_empty());
+        satisfied[*section] = has_content;
+    }
+
+    required
+        .iter()
+        .zip(satisfied)
+        .filter(|(_, satisfied)| !satisfied)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// `(index into normalized_names, the rest of the line after the name)` when
+/// `line` is a heading for one of them.
+///
+/// Prefix rather than equality, because a heading is rarely bare: reports
+/// write `## Findings`, `**Findings**`, `Findings (defects):` and
+/// `Findings: none` and all four mean the same thing. The character after
+/// the name must not be alphanumeric, so `Findings` doesn't match a
+/// sentence starting "Findingsomething", and `Prior findings` — a section
+/// only a re-review has — doesn't satisfy a required `Findings`.
+fn heading_for(line: &str, normalized_names: &[String]) -> Option<(usize, String)> {
+    let normalized_line = normalized(line);
+    let (index, name) = normalized_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| {
+            normalized_line.starts_with(name.as_str())
+                && !normalized_line[name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+        })
+        // Longest match wins, so a stage that requires both `Findings` and
+        // `Findings (blocking)` can't have the shorter one swallow the
+        // longer one's heading.
+        .max_by_key(|(_, name)| name.len())?;
+
+    // The rest is taken from the *normalized* line, sliced at the
+    // normalized name's length, because normalizing rewrites `→` into `->`
+    // and so shifts byte offsets away from the raw line's. It is only ever
+    // tested for emptiness, never shown, so losing the original casing and
+    // spacing costs nothing. Punctuation a heading ends with (`Findings:`,
+    // `Findings —`) is not content.
+    let rest = normalized_line[name.len()..]
+        .trim_start_matches([':', '-', '—', '–', '*', '_', '#', ' ', '\t'])
+        .to_string();
+    Some((index, rest))
+}
+
+/// A line or a section name reduced to what matching should care about:
+/// markdown markers off the front, `→` and `->` the same thing, runs of
+/// whitespace collapsed, lowercased.
+///
+/// Deliberately forgiving. The point of the rule is that the walk happened,
+/// and rejecting `## Findings` because the stage wrote `Findings` would
+/// spend a retry on markdown.
+fn normalized(text: &str) -> String {
+    let rewritten = text.replace('→', "->").to_lowercase();
+    let trimmed = rewritten.trim_start_matches([' ', '\t', '#', '*', '_', '-', '>', '`', '"']);
+    let mut out = String::with_capacity(trimmed.len());
+    for (index, word) in trimmed.split_whitespace().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+/// The tool error a report with missing sections comes back with.
+///
+/// Names what's missing *and* the full list in order, because a model that
+/// left out one section usually can't tell which of its headings the server
+/// matched — and a second rejection for a different section would cost
+/// another lap.
+fn missing_sections_message(missing: &[String], required: &[String]) -> String {
+    format!(
+        "Your report's 'summary' is missing {}: each required section needs a heading line with \
+         something under it (write 'none' when there is genuinely nothing). Required sections, in \
+         order: {}. Finish the walks you skipped, then call this tool again with the complete \
+         report.",
+        quoted_list(missing),
+        required.join(", "),
+    )
+}
+
+/// `'a'`, `'a' and 'b'`, `'a', 'b' and 'c'`.
+fn quoted_list(items: &[String]) -> String {
+    let quoted: Vec<String> = items.iter().map(|item| format!("'{item}'")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+fn tool_success(text: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": text }],
         "isError": false,
-    }))
+    })
 }
 
 /// ` Allowed values are: a, b.` — or nothing at all when the stage declares no
@@ -195,6 +392,19 @@ fn allowed_clause(outcomes: &[String]) -> String {
         String::new()
     } else {
         format!(" Allowed values are: {}.", outcomes.join(", "))
+    }
+}
+
+/// ` Its 'summary' must carry these sections, in order: a, b.` — or nothing
+/// when the stage requires none, which is every stage that hasn't opted in.
+fn sections_clause(required_sections: &[String]) -> String {
+    if required_sections.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Its 'summary' must carry these sections, in order: {}.",
+            required_sections.join(", ")
+        )
     }
 }
 
@@ -210,7 +420,8 @@ fn tool_error(message: &str) -> Value {
 /// Both the description and the schema are generated from `outcomes`, which is
 /// the whole reason no workflow author ever writes about this tool in a prompt
 /// file: there is no second copy of the stage's `on:` keys to fall out of sync.
-fn tool_definition(outcomes: &[String]) -> Value {
+fn tool_definition(stage: &StageReport) -> Value {
+    let outcomes = &stage.outcomes[..];
     let mut outcome_schema = json!({
         "type": "string",
         "description": if outcomes.is_empty() {
@@ -224,18 +435,46 @@ fn tool_definition(outcomes: &[String]) -> Value {
         // Said plainly so an agent doesn't spend a call reporting into the
         // void: this stage's transition is fixed, and the report is only ever
         // read by a human skimming the timeline.
-        "Report a status for this stage. Optional — this stage does not route on reported \
-         outcomes, so the report is recorded on the task's timeline but does not affect what \
-         happens next."
-            .to_string()
+        format!(
+            "Report a status for this stage. Optional — this stage does not route on reported \
+             outcomes, so the report is recorded on the task's timeline but does not affect what \
+             happens next.{}",
+            sections_clause(&stage.required_sections),
+        )
     } else {
         outcome_schema["enum"] = json!(outcomes);
         format!(
             "Report this stage's outcome so the workflow can route on it. Call this before you \
-             end your turn. 'outcome' must be exactly one of: {}.",
-            outcomes.join(", ")
+             end your turn. 'outcome' must be exactly one of: {}.{}",
+            outcomes.join(", "),
+            sections_clause(&stage.required_sections),
         )
     };
+
+    // #95: what `summary` must carry, generated from the stage's
+    // `report_sections:` for the same reason the outcome `enum` is
+    // generated from its `on:` keys — a second copy in a prompt file is a
+    // second thing to fall out of sync with what the server enforces.
+    //
+    // Writing the summary first is asked for in words rather than by
+    // ordering the schema's properties: `serde_json`'s object keys are
+    // sorted, so `outcome` precedes `summary` there whatever this code
+    // does.
+    let summary_description = format!(
+        "Your reasoning, specific enough for whoever acts on this next to work from without \
+         re-reading your whole turn. Write this out in full *before* you settle on 'outcome': \
+         the outcome follows from what you found, not the other way round.{}",
+        if stage.required_sections.is_empty() {
+            " May be empty when there is nothing to add.".to_string()
+        } else {
+            format!(
+                " This stage requires these sections, in this order, each with a heading line \
+                 and something under it (write 'none' when there is genuinely nothing): {}. A \
+                 report missing any of them is rejected and you will be asked to call again.",
+                stage.required_sections.join(", "),
+            )
+        },
+    );
 
     json!({
         "name": TOOL_NAME,
@@ -244,12 +483,7 @@ fn tool_definition(outcomes: &[String]) -> Value {
             "type": "object",
             "properties": {
                 "outcome": outcome_schema,
-                "summary": {
-                    "type": "string",
-                    "description": "Your reasoning, specific enough for whoever acts on this \
-                                    next to work from without re-reading your whole turn. May be \
-                                    empty when there is nothing to add.",
-                },
+                "summary": { "type": "string", "description": summary_description },
             },
             // `summary` is required-but-may-be-empty rather than optional, so
             // the captured object always carries the key and a workflow
@@ -272,21 +506,37 @@ fn error_response(id: Value, code: i32, message: &str) -> String {
 mod tests {
     use super::*;
 
-    fn outcomes() -> Vec<String> {
-        vec!["approved".to_string(), "changes_requested".to_string()]
+    fn outcomes() -> StageReport {
+        StageReport {
+            outcomes: vec!["approved".to_string(), "changes_requested".to_string()],
+            required_sections: Vec::new(),
+        }
+    }
+
+    /// The same stage, plus the sections #95 has `internal_review` require.
+    fn with_sections(sections: &[&str]) -> StageReport {
+        StageReport {
+            required_sections: sections.iter().map(|s| s.to_string()).collect(),
+            ..outcomes()
+        }
+    }
+
+    /// A stage with no `on:` edges — chat's shape.
+    fn no_outcomes() -> StageReport {
+        StageReport::default()
     }
 
     /// Drives a whole session and returns one parsed response per line the
     /// server wrote — so a test can assert on what a client would actually
     /// see, including *how many* responses it got.
-    fn session(outcomes: &[String], requests: &[Value]) -> Vec<Value> {
+    fn session(stage: &StageReport, requests: &[Value]) -> Vec<Value> {
         let input = requests
             .iter()
             .map(|request| request.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         let mut output = Vec::new();
-        serve(outcomes, input.as_bytes(), &mut output).unwrap();
+        serve(stage, input.as_bytes(), &mut output).unwrap();
         String::from_utf8(output)
             .unwrap()
             .lines()
@@ -294,9 +544,9 @@ mod tests {
             .collect()
     }
 
-    fn call(outcomes: &[String], arguments: Value) -> Value {
+    fn call(stage: &StageReport, arguments: Value) -> Value {
         let responses = session(
-            outcomes,
+            stage,
             &[json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -379,7 +629,7 @@ mod tests {
     #[test]
     fn tools_list_leaves_outcome_free_form_when_the_stage_declares_none() {
         let responses = session(
-            &[],
+            &no_outcomes(),
             &[json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })],
         );
         let tool = &responses[0]["result"]["tools"][0];
@@ -468,10 +718,224 @@ mod tests {
         assert_eq!(result["isError"], true, "got {result}");
     }
 
+    /// #95's whole point: the verdict alone isn't a report. A reviewer that
+    /// stopped at its first blocking finding has nothing to write under the
+    /// walks, and is sent back with the list.
+    #[test]
+    fn a_report_missing_a_required_section_is_a_tool_error_naming_it() {
+        let stage = with_sections(&["Findings", "Branches → tests"]);
+        let result = call(
+            &stage,
+            json!({
+                "outcome": "changes_requested",
+                "summary": "Findings\n- F1: the allowlist is untested.\n",
+            }),
+        );
+        assert_eq!(result["isError"], true, "got {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("'Branches → tests'"), "got {text}");
+        assert!(!text.contains("'Findings'"), "got {text}");
+    }
+
+    /// A heading with nothing under it is the cheapest way to look like you
+    /// did the walk, so it counts as missing rather than present.
+    #[test]
+    fn a_required_section_with_no_content_is_missing() {
+        let result = call(
+            &with_sections(&["States", "Findings"]),
+            json!({
+                "outcome": "approved",
+                "summary": "## States\n\n## Findings\nnone blocking\n",
+            }),
+        );
+        assert_eq!(result["isError"], true, "got {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("'States'"), "got {text}");
+    }
+
+    /// Reports in the wild write headings every which way — `## Findings`,
+    /// `**Side effects**`, `Messages:` with the content on the same line,
+    /// `Branches -> tests` with an ASCII arrow. All of them did the walk.
+    #[test]
+    fn headings_are_matched_through_markdown_case_and_arrow_spelling() {
+        let result = call(
+            &with_sections(&["Branches → tests", "Side effects", "Messages", "Findings"]),
+            json!({
+                "outcome": "approved",
+                "summary": "## branches -> TESTS\n- resolve_task_workflow: covered\n\n\
+                            **Side effects**\nOne INSERT, recorded once.\n\n\
+                            Messages: the NotFound text is accurate.\n\n\
+                            - Findings (none blocking)\n  nothing to report\n",
+            }),
+        );
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    /// "Prior findings" is a re-review's own section and must not be read as
+    /// the "Findings" every report owes, or a lap that resolved everything
+    /// could skip the findings walk entirely.
+    #[test]
+    fn a_longer_heading_does_not_satisfy_a_different_required_section() {
+        let result = call(
+            &with_sections(&["Findings"]),
+            json!({
+                "outcome": "approved",
+                "summary": "Prior findings\nF1 resolved at engine.rs:329.\n",
+            }),
+        );
+        assert_eq!(result["isError"], true, "got {result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("'Findings'")
+        );
+    }
+
+    /// The escape hatch the error message advertises: a walk that genuinely
+    /// turned nothing up is still a walk, and "none" is how you say so.
+    #[test]
+    fn none_counts_as_content() {
+        let result = call(
+            &with_sections(&["Dismissed"]),
+            json!({ "outcome": "approved", "summary": "Dismissed: none" }),
+        );
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    /// A stage that asks for nothing is every stage that predates #95, and
+    /// an empty summary stays acceptable there.
+    #[test]
+    fn a_stage_requiring_no_sections_accepts_any_summary() {
+        let result = call(&outcomes(), json!({ "outcome": "approved", "summary": "" }));
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    /// Parking a turn costs a human; two rejections don't. After the second
+    /// the report is taken as it stands, with the gap named in the reply so
+    /// it lands on the task's timeline.
+    #[test]
+    fn a_third_attempt_is_accepted_with_the_gap_named() {
+        let stage = with_sections(&["Findings", "States"]);
+        let thin = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": TOOL_NAME,
+                "arguments": { "outcome": "approved", "summary": "Findings: none" },
+            },
+        });
+        let responses = session(&stage, &[thin.clone(), thin.clone(), thin]);
+        assert_eq!(
+            responses[0]["result"]["isError"], true,
+            "{:?}",
+            responses[0]
+        );
+        assert_eq!(
+            responses[1]["result"]["isError"], true,
+            "{:?}",
+            responses[1]
+        );
+        let third = &responses[2]["result"];
+        assert_eq!(third["isError"], false, "got {third}");
+        let text = third["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("'States'"), "got {text}");
+        assert!(text.contains("attempt 3"), "got {text}");
+    }
+
+    /// The allowance is for a model that can't satisfy the rule, not for one
+    /// that gets there in the end: a complete report after two rejections is
+    /// accepted as a complete report, with nothing said about the gap.
+    #[test]
+    fn a_report_that_arrives_complete_after_rejections_is_accepted_cleanly() {
+        let stage = with_sections(&["Findings", "States"]);
+        let thin = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": TOOL_NAME,
+                "arguments": { "outcome": "approved", "summary": "Findings: none" },
+            },
+        });
+        let complete = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": TOOL_NAME,
+                "arguments": {
+                    "outcome": "approved",
+                    "summary": "Findings: none\nStates: no new state",
+                },
+            },
+        });
+        let responses = session(&stage, &[thin.clone(), thin, complete]);
+        let third = &responses[2]["result"];
+        assert_eq!(third["isError"], false, "got {third}");
+        let text = third["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("still missing"), "got {text}");
+    }
+
+    /// The count is per section-rejection, not per call: an off-list outcome
+    /// is a different mistake and must not spend the allowance.
+    #[test]
+    fn an_off_list_outcome_does_not_consume_the_section_allowance() {
+        let stage = with_sections(&["States"]);
+        let bad_outcome = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": TOOL_NAME,
+                "arguments": { "outcome": "lgtm", "summary": "" },
+            },
+        });
+        let thin = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": TOOL_NAME,
+                "arguments": { "outcome": "approved", "summary": "nothing to see" },
+            },
+        });
+        let responses = session(
+            &stage,
+            &[bad_outcome.clone(), bad_outcome, thin.clone(), thin],
+        );
+        for (index, response) in responses.iter().enumerate() {
+            assert_eq!(
+                response["result"]["isError"], true,
+                "response {index}: {response}"
+            );
+        }
+    }
+
+    /// The sections are generated into the tool's own schema, so a model
+    /// knows what is expected before its first call rather than learning it
+    /// from a rejection.
+    #[test]
+    fn tools_list_states_the_required_sections() {
+        let responses = session(
+            &with_sections(&["Findings", "Dismissed"]),
+            &[json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })],
+        );
+        let tool = &responses[0]["result"]["tools"][0];
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains("Findings, Dismissed"), "{description}");
+        let summary = tool["inputSchema"]["properties"]["summary"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(summary.contains("Findings, Dismissed"), "{summary}");
+        assert!(summary.contains("you settle on 'outcome'"), "{summary}");
+    }
+
     #[test]
     fn any_outcome_is_accepted_when_the_stage_declares_none() {
         let result = call(
-            &[],
+            &no_outcomes(),
             json!({ "outcome": "blocked", "summary": "no network" }),
         );
         assert_eq!(result["isError"], false, "got {result}");
