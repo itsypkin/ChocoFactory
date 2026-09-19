@@ -241,6 +241,26 @@ pub enum ProjectCmd {
 mod tests {
     use super::*;
 
+    /// #92: `--resume` and `--fresh` are opposites, so asking for both is
+    /// a parse error rather than one of them silently winning.
+    #[test]
+    fn retry_rejects_asking_to_resume_and_start_fresh_at_once() {
+        let both = Cli::try_parse_from(["choco", "task", "retry", "t1", "--resume", "--fresh"]);
+        assert!(both.is_err(), "both flags at once must not parse");
+
+        let neither = Cli::parse_from(["choco", "task", "retry", "t1"]);
+        let Command::Task(TaskCmd::Retry { resume, fresh, .. }) = neither.command else {
+            panic!("expected a retry command");
+        };
+        assert!(!resume && !fresh, "neither flag means the daemon decides");
+
+        let resumed = Cli::parse_from(["choco", "task", "retry", "t1", "--resume"]);
+        let Command::Task(TaskCmd::Retry { resume, fresh, .. }) = resumed.command else {
+            panic!("expected a retry command");
+        };
+        assert!(resume && !fresh);
+    }
+
     /// `--outcome` is repeatable, not a single comma-joined flag (review,
     /// #75) — this is what `ClaudeAdapter::spawn` (issue #73) actually emits
     /// into `--mcp-config`'s `args`, so a mismatch here would silently make

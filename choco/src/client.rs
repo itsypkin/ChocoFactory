@@ -498,6 +498,11 @@ impl Client {
     /// interrupted agent session when `mode` allows and the daemon finds
     /// one worth resuming (#92). The `202` carries a `RetryOutcome` saying
     /// which of the two happened.
+    ///
+    /// Needs a daemon that speaks #92: an older one answers this `202` with
+    /// an empty body, which is reported as a decode failure rather than
+    /// guessed at. The two binaries ship from this repo together, so that
+    /// is a skewed install to fix, not a case to paper over.
     pub async fn retry_task(&self, id: &str, mode: RetryMode) -> Result<RetryOutcome, ClientError> {
         let resp = self
             .send(
@@ -507,9 +512,7 @@ impl Client {
             )
             .await?;
         let resp = self.check_status(resp).await?;
-        resp.json()
-            .await
-            .map_err(|err| ClientError::Decode(err.to_string()))
+        self.decode(resp).await
     }
 }
 

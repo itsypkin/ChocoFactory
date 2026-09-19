@@ -200,6 +200,11 @@ pub struct RetryOutcome {
     pub resumed: bool,
     /// The session that was resumed, when one was.
     pub session_id: Option<String>,
+    /// Why the stage started fresh instead of resuming, when it did.
+    /// `None` when it resumed. Carried rather than only logged, because
+    /// "it started over" is the answer an operator is most likely to
+    /// question, and the daemon is the only one holding the reason.
+    pub fresh_reason: Option<String>,
 }
 
 /// One row per underlying agent subprocess session a task has had (§3).

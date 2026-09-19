@@ -142,7 +142,7 @@ pub enum AgentEvent {
     ///
     /// `detected_by` names the rule that fired, and is persisted, because
     /// one of those rules matches the CLI's message text (see
-    /// `adapter::claude::interruption`): a timeline that says which rule
+    /// `adapter::claude::usage_limit_text`): a timeline that says which rule
     /// fired is what makes the brittle one safe to delete once the
     /// structured markers are confirmed against a real session.
     Interrupted {
@@ -169,13 +169,14 @@ pub enum AgentEvent {
     },
 }
 
-/// Which of `adapter::claude::interruption`'s rules recognised a usage
-/// limit (#92).
+/// Which of the claude adapter's rules recognised a usage limit (#92) —
+/// see `assistant_interruption`, `normalize_rate_limit_event` and
+/// `usage_limit_text` there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptionEvidence {
     /// A field the CLI emits for machines: an assistant message's
     /// `error: "rate_limit"`/`apiErrorStatus: 429`, or a `rate_limit_event`
-    /// line whose `rate_limit_info.status` is not `allowed`.
+    /// line whose `rate_limit_info.status` is `rejected`.
     Structured,
     /// The `result` line's own human-readable text. Deliberately last, and
     /// deliberately labelled: the CLI's wording is not an interface, so a

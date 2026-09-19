@@ -1531,13 +1531,13 @@ impl WorkflowEngine {
                 self.resumable_session(stage_def, last_run.as_ref()).await?
             }
         };
-        let resume = match (mode, resumable) {
+        let (resume, fresh_reason) = match (mode, resumable) {
             (RetryMode::Resume, Err(why)) => return Err(RetryTaskError::NotResumable(why)),
             (_, Err(why)) => {
                 tracing::info!(task_id, stage = %current_stage, why, "retrying with a fresh session");
-                None
+                (None, Some(why))
             }
-            (_, Ok(resume)) => Some(resume),
+            (_, Ok(resume)) => (Some(resume), None),
         };
 
         // Step 2 — the reopen, which must land *before* the re-entry below.
@@ -1615,6 +1615,7 @@ impl WorkflowEngine {
             stage: current_stage,
             resumed: resume.is_some(),
             session_id: resume.map(|resume| resume.session_id),
+            fresh_reason,
         })
     }
 
@@ -1639,6 +1640,20 @@ impl WorkflowEngine {
         if !matches!(stage_def.kind, StageKind::AgentTurn { .. }) {
             return Ok(Err(
                 "it is not an agent turn, so it has no session".to_string()
+            ));
+        }
+        // A standing stage (empty `on:`, chat) never has a turn to resume:
+        // its session stays open for further live messages, and
+        // `send_message_or_resume` is what picks it up again. Resuming one
+        // here would also hand it a prompt telling it to `report_outcome`,
+        // which such a stage has no outcomes for. Unreachable today — a
+        // standing stage gets no turn watcher and so is never marked stuck
+        // by one — and checked anyway, since the cost of being wrong is a
+        // turn instructed to do something it cannot do.
+        if stage_def.on.is_empty() {
+            return Ok(Err(
+                "it is a standing session, which is resumed by sending it a message rather than                  by retrying"
+                    .to_string(),
             ));
         }
         let Some(run) = last_run else {
@@ -11122,6 +11137,7 @@ stages:
                 stage: "coding".to_string(),
                 resumed: true,
                 session_id: interrupted_run.session_id.clone(),
+                fresh_reason: None,
             }
         );
         wait_until_task_status(&pool, &task_id, "closed").await;
@@ -11201,6 +11217,10 @@ stages:
 
         assert!(!outcome.resumed);
         assert_eq!(outcome.session_id, None);
+        assert_eq!(
+            outcome.fresh_reason.as_deref(),
+            Some("a fresh start was asked for")
+        );
         wait_until_task_status(&pool, &task_id, "closed").await;
 
         let fresh_run = run_after(&pool, &task_id, "coding", &interrupted_run).await;
@@ -11248,6 +11268,9 @@ stages:
 
         let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
         assert!(!outcome.resumed, "a no_report run must not be resumed");
+        // And the operator is told why, rather than left to infer it.
+        let why = outcome.fresh_reason.unwrap();
+        assert!(why.contains("no_report"), "{why}");
     }
 
     #[tokio::test]

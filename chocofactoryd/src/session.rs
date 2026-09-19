@@ -1124,20 +1124,23 @@ fn final_run_state(
                 (status, Some(Reaped))
             } else if turn.lingered {
                 (Exited, Some(Lingered))
-            } else if turn.interrupted && !turn.completed {
-                // #92. Deliberately below every reason above: each of those
-                // describes something the daemon did to this run (killed it,
-                // closed it, gave up on it), and that is the more useful
-                // thing to report. What this arm claims instead is the case
-                // they all leave anonymous today — a turn that was working
-                // and was cut off by a usage limit, which `retry` can resume
-                // rather than restart. A turn that reported before the limit
-                // landed is a completion, not an interruption.
-                (Exited, Some(Interrupted))
             } else if turn.completed {
                 (Idle, None)
             } else if clean_exit && !turn.errored {
+                // Ahead of the interruption arm below on purpose: a turn
+                // that saw a limit, carried on, and then ended its turn
+                // cleanly without reporting was not stopped by the limit —
+                // it is the #90 case, and resuming it would resume a turn
+                // that has nothing to say.
                 (Exited, Some(NoReport))
+            } else if turn.interrupted {
+                // #92. Last of the named reasons, because every one above
+                // describes something more specific — what the daemon did
+                // to this run, or how the turn itself ended. What this arm
+                // claims is only what they all leave anonymous today: a
+                // turn that was working and was cut off by a usage limit,
+                // which `retry` can resume rather than restart.
+                (Exited, Some(Interrupted))
             } else {
                 (Exited, None)
             }
@@ -2661,6 +2664,17 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 expected: (Exited, Some(Lingered)),
+            },
+            Case {
+                // Saw a limit, kept going, then ended its turn cleanly with
+                // nothing reported: #90's case, not an interruption.
+                name: "recovered from a limit, then never reported",
+                kind: SingleShot,
+                turn: turn_with(|t| t.interrupted = true),
+                clean_exit: true,
+                reaped: false,
+                cancelled: false,
+                expected: (Exited, Some(NoReport)),
             },
             Case {
                 name: "cancelled beats interrupted",

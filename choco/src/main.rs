@@ -93,8 +93,10 @@ enum Output {
     /// `--json` stays silent so nothing has to parse a courtesy message.
     Accepted(String),
     /// `task retry`'s own `202`, which does carry a body: whether the stage
-    /// resumed its interrupted session or started a fresh one (#92).
-    Retried(RetryOutcome),
+    /// resumed its interrupted session or started a fresh one (#92). The
+    /// task id rides along only so the human rendering can point at
+    /// `choco task status` the way every other accepted call does.
+    Retried(String, RetryOutcome),
 }
 
 impl Output {
@@ -107,7 +109,7 @@ impl Output {
             Output::TaskDetail(d) => serde_json::to_string(d),
             Output::Events(e) => serde_json::to_string(e),
             Output::Accepted(_) => return None,
-            Output::Retried(r) => serde_json::to_string(r),
+            Output::Retried(_, r) => serde_json::to_string(r),
         };
         Some(value.expect("API models are always serializable"))
     }
@@ -121,7 +123,7 @@ impl Output {
             Output::TaskDetail(d) => render::task_detail(d),
             Output::Events(e) => render::events(e),
             Output::Accepted(msg) => msg.clone(),
-            Output::Retried(r) => render::retried(r),
+            Output::Retried(id, r) => render::retried(id, r),
         })
     }
 }
@@ -204,7 +206,7 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                 _ => RetryMode::Auto,
             };
             let outcome = client.retry_task(&id, mode).await?;
-            Ok(Output::Retried(outcome))
+            Ok(Output::Retried(id, outcome))
         }
         Command::Task(TaskCmd::List { project, status }) => {
             // Resolved the same way as `task create`, so a name works in
