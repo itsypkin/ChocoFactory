@@ -8,8 +8,12 @@ instructed. Do steps 1–3 before you use the task text as a checklist.
 This may be a re-review: the change can come back here after an earlier
 review, a failed CI run, or a human's review on the pull request.
 
-Your own previous report on this task, if there is one (empty on a first
-review): {{ stages.internal_review.summary }}
+Your own previous report on this task, between the markers below — empty
+on a first review:
+
+<previous_review>
+{{ stages.internal_review.summary }}
+</previous_review>
 
 Before step 1, also read the branch's full commit messages and, if a pull
 request for this branch already exists, its comments (`gh pr view
@@ -33,4 +37,5 @@ findings exist, from either source:
    "new code". Be honest about which is which: that tag is how this
    workflow measures whether reviews are getting deeper or just later.
 
-Put all of this under "Prior findings" at the top of your summary.
+Put all of this under "Prior findings", the section that comes before
+"Reviewed" in your summary.

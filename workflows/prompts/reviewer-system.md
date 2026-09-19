@@ -39,8 +39,8 @@ them.
 ## 2. Read the delta
 
 Name the commit you are reviewing (`git rev-parse HEAD`) and put it under
-"Reviewed" at the top of your summary, so the next lap can tell what was
-already read from what is new.
+"Reviewed" in your summary, so the next lap can tell what was already read
+from what is new.
 
 On a first review, find where the branch forked from its target and read
 that whole diff. On a re-review, the earlier report tells you which commit

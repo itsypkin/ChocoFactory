@@ -44,9 +44,20 @@ stages:
   # all of them already in the code the first lap read. The verdict was
   # decidable early; the walks weren't done. The tool rejects a report that
   # leaves a section out, so there is no way to file a verdict without also
-  # filing the walks behind it. The names match `reviewer-system.md`'s steps;
-  # "Prior findings" is not among them because a first lap has none, and the
-  # turn prompt asks for it when there are.
+  # filing the walks behind it. The list is every walk `reviewer-system.md`
+  # step 3 asks for, plus the sections around them — review of #95 caught
+  # this list two walks short of the prompt, and the two missing ones
+  # ("Resources and work", "Old behaviour") are exactly where this repo's
+  # recurring defects live. "Prior findings" is not among them because a
+  # first lap has none, and the turn prompt asks for it when there are.
+  #
+  # `reviewer-turn.md` templates this stage's *own* previous capture, which
+  # is how a re-review gets the earlier report without the engine carrying
+  # anything new. Accepted cost: on a first review there is no capture yet,
+  # so the placeholder renders empty and the task's timeline gets one
+  # `template_unresolved` note (#60) on the happy path — the same shape
+  # `coder-revise.md` has had since #60, where an empty one of two
+  # alternatives is the normal case rather than a mistake.
   internal_review:
     kind: agent_turn
     role: reviewer
@@ -59,6 +70,8 @@ stages:
       - States
       - Messages
       - Side effects
+      - Resources and work
+      - Old behaviour
       - Findings
       - Dismissed
     on:

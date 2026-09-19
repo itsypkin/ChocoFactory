@@ -230,14 +230,14 @@ impl WorkflowDefinition {
                             stage: stage_name.clone(),
                         });
                     }
-                    // Compared the way the tool compares them, so two names
-                    // that differ only in case or spacing are caught here
-                    // rather than becoming one heading that satisfies both.
-                    let key = section
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .to_lowercase();
+                    // Compared with the tool's own normalization, not a
+                    // lookalike of it (review of #95): `Branches → tests`
+                    // and `Branches -> tests` differ here but are one name
+                    // there, and a stage declaring both would require a
+                    // section whose heading can only ever be credited to
+                    // one of them — rejecting every review it ever runs,
+                    // for a section the reviewer did write.
+                    let key = chocofactory_core::mcp::normalize_report_heading(section);
                     if seen.contains(&key) {
                         return Err(WorkflowDefError::DuplicateReportSection {
                             stage: stage_name.clone(),
@@ -2324,6 +2324,37 @@ stages:
                 &err,
                 WorkflowDefError::DuplicateReportSection { stage, section }
                     if stage == "review" && section == "side  EFFECTS"
+            ),
+            "got {err}"
+        );
+    }
+
+    /// Review of #95: the dedupe key has to be the tool's key. These two
+    /// spellings are one section at the tool, so a stage declaring both
+    /// could never satisfy the first of them.
+    #[test]
+    fn rejects_two_report_sections_that_are_one_heading_to_the_tool() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: reviewed
+roles:
+  reviewer: { cli: claude }
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    report_sections: ["Branches → tests", "branches -> tests"]
+    on: { approved: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WorkflowDefError::DuplicateReportSection { stage, section }
+                    if stage == "review" && section == "branches -> tests"
             ),
             "got {err}"
         );

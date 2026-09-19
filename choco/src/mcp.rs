@@ -18,6 +18,10 @@
 //!   how many reports it has turned away for missing sections, which lives
 //!   in this process — one server process per CLI session, one thread
 //!   reading one stdio stream, so there is nothing for it to race with.
+//!   That count is shared with anything else calling the tool over the
+//!   same connection, a sub-agent included; the server can't tell callers
+//!   apart, and the direction it fails in is lenient (an allowance spent
+//!   early, never a turn parked), so it is left as is.
 //! - **Hand-rolled.** Four JSON-RPC methods over newline-delimited stdio, no
 //!   MCP SDK. `serde_json` is already a dependency; a crate for one tool
 //!   would not be.
@@ -30,7 +34,9 @@
 
 use std::io::{BufRead, Write};
 
-use chocofactory_core::mcp::{MCP_SERVER_NAME, REPORT_OUTCOME_TOOL_NAME};
+use chocofactory_core::mcp::{
+    MCP_SERVER_NAME, REPORT_OUTCOME_TOOL_NAME, normalize_report_heading, starts_a_bullet,
+};
 use serde_json::{Value, json};
 
 /// The MCP protocol version answered with when a client doesn't name one.
@@ -83,13 +89,13 @@ pub fn serve(
     mut output: impl Write,
 ) -> std::io::Result<()> {
     // Per session, not per call: see `MAX_SECTION_REJECTIONS`.
-    let mut section_rejections = 0;
+    let mut thin_reports = 0;
     for line in input.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(stage, &mut section_rejections, &line) {
+        if let Some(response) = handle_line(stage, &mut thin_reports, &line) {
             writeln!(output, "{response}")?;
             output.flush()?;
         }
@@ -100,7 +106,7 @@ pub fn serve(
 /// Answers one request line. `None` means "say nothing", which is required
 /// rather than merely polite: a JSON-RPC *notification* has no `id`, and
 /// replying to one is a protocol violation.
-fn handle_line(stage: &StageReport, section_rejections: &mut u32, line: &str) -> Option<String> {
+fn handle_line(stage: &StageReport, thin_reports: &mut u32, line: &str) -> Option<String> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
         // No `id` is recoverable from an unparseable line, so this is the one
@@ -124,7 +130,7 @@ fn handle_line(stage: &StageReport, section_rejections: &mut u32, line: &str) ->
     let result = match method {
         "initialize" => Ok(initialize_result(&request)),
         "tools/list" => Ok(json!({ "tools": [tool_definition(stage)] })),
-        "tools/call" => match call_tool(stage, section_rejections, request.get("params")) {
+        "tools/call" => match call_tool(stage, thin_reports, request.get("params")) {
             Ok(result) => Ok(result),
             Err(CallError::Protocol(message)) => Err((-32602, message)),
         },
@@ -170,7 +176,7 @@ enum CallError {
 /// instruction could never offer.
 fn call_tool(
     stage: &StageReport,
-    section_rejections: &mut u32,
+    thin_reports: &mut u32,
     params: Option<&Value>,
 ) -> Result<Value, CallError> {
     let outcomes = &stage.outcomes[..];
@@ -223,8 +229,11 @@ fn call_tool(
     // doesn't spend a retry learning about the second one only afterwards.
     let missing = missing_sections(summary, &stage.required_sections);
     if !missing.is_empty() {
-        if *section_rejections < MAX_SECTION_REJECTIONS {
-            *section_rejections += 1;
+        // Counted before the branch, and never saturated, so the number in
+        // the message below is the attempt this actually is (review of
+        // #95) rather than a fixed "3" on every later call.
+        *thin_reports += 1;
+        if *thin_reports <= MAX_SECTION_REJECTIONS {
             return Ok(tool_error(&missing_sections_message(
                 &missing,
                 &stage.required_sections,
@@ -236,7 +245,7 @@ fn call_tool(
             "Recorded outcome '{outcome}'. Its report is still missing {}, and this is attempt \
              {}, so it was recorded as it stands.",
             quoted_list(&missing),
-            *section_rejections + 1,
+            *thin_reports,
         )));
     }
 
@@ -254,7 +263,10 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
     if required.is_empty() {
         return Vec::new();
     }
-    let normalized_names: Vec<String> = required.iter().map(|name| normalized(name)).collect();
+    let normalized_names: Vec<String> = required
+        .iter()
+        .map(|name| normalize_report_heading(name))
+        .collect();
     let lines: Vec<&str> = summary.lines().collect();
     // Which required section each line is a heading for, so the loop below
     // can tell "the next heading" (which ends a section's content) from an
@@ -298,21 +310,37 @@ fn missing_sections(summary: &str, required: &[String]) -> Vec<String> {
 ///
 /// Prefix rather than equality, because a heading is rarely bare: reports
 /// write `## Findings`, `**Findings**`, `Findings (defects):` and
-/// `Findings: none` and all four mean the same thing. The character after
-/// the name must not be alphanumeric, so `Findings` doesn't match a
-/// sentence starting "Findingsomething", and `Prior findings` — a section
-/// only a re-review has — doesn't satisfy a required `Findings`.
+/// `Findings: none` and all four mean the same thing.
+///
+/// What may follow the name is the whole difficulty, and #95's own review
+/// found it the hard way. A line is only a heading when what follows the
+/// name is punctuation or nothing:
+///
+/// - `Findings: none`, `Findings (defects):`, `Findings —` are headings.
+/// - `Side effects of the retry are untested` is a *finding that begins
+///   with a section's name*, not the "Side effects" heading. Reading it as
+///   one both satisfied a section nobody wrote and cut the enclosing
+///   section's content short, so a report with the section plainly there
+///   was rejected as missing it.
+/// - A bullet is held to the stricter rule still: only `- Findings` on its
+///   own, never `- Findings F1 is resolved`. Seven bullets under "Prior
+///   findings", each naming a section, otherwise satisfied every
+///   requirement at once — on the re-review lap this issue is about.
+///
+/// The character after the name must also not be alphanumeric, so
+/// `Findings` doesn't match a sentence starting "Findingsomething", and
+/// `Prior findings` — a section only a re-review has — doesn't satisfy a
+/// required `Findings`.
 fn heading_for(line: &str, normalized_names: &[String]) -> Option<(usize, String)> {
-    let normalized_line = normalized(line);
+    let normalized_line = normalize_report_heading(line);
+    let bullet = starts_a_bullet(line);
     let (index, name) = normalized_names
         .iter()
         .enumerate()
         .filter(|(_, name)| {
-            normalized_line.starts_with(name.as_str())
-                && !normalized_line[name.len()..]
-                    .chars()
-                    .next()
-                    .is_some_and(char::is_alphanumeric)
+            normalized_line
+                .strip_prefix(name.as_str())
+                .is_some_and(|rest| heads_a_section(rest, bullet))
         })
         // Longest match wins, so a stage that requires both `Findings` and
         // `Findings (blocking)` can't have the shorter one swallow the
@@ -326,29 +354,24 @@ fn heading_for(line: &str, normalized_names: &[String]) -> Option<(usize, String
     // spacing costs nothing. Punctuation a heading ends with (`Findings:`,
     // `Findings —`) is not content.
     let rest = normalized_line[name.len()..]
-        .trim_start_matches([':', '-', '—', '–', '*', '_', '#', ' ', '\t'])
+        .trim_start_matches([':', '-', '—', '–', '*', '_', '#', '.', ' ', '\t'])
         .to_string();
     Some((index, rest))
 }
 
-/// A line or a section name reduced to what matching should care about:
-/// markdown markers off the front, `→` and `->` the same thing, runs of
-/// whitespace collapsed, lowercased.
-///
-/// Deliberately forgiving. The point of the rule is that the walk happened,
-/// and rejecting `## Findings` because the stage wrote `Findings` would
-/// spend a retry on markdown.
-fn normalized(text: &str) -> String {
-    let rewritten = text.replace('→', "->").to_lowercase();
-    let trimmed = rewritten.trim_start_matches([' ', '\t', '#', '*', '_', '-', '>', '`', '"']);
-    let mut out = String::with_capacity(trimmed.len());
-    for (index, word) in trimmed.split_whitespace().enumerate() {
-        if index > 0 {
-            out.push(' ');
-        }
-        out.push_str(word);
+/// Whether `rest` — what a line has left after a section's name — leaves
+/// the line reading as that section's heading.
+fn heads_a_section(rest: &str, bullet: bool) -> bool {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return true;
     }
-    out
+    // A bullet naming a section and then saying something about it is a
+    // list item, not a heading. Nothing may follow.
+    if bullet {
+        return false;
+    }
+    rest.starts_with([':', '(', '[', '{', '—', '–', '-', ',', '.', '/', '*', '#'])
 }
 
 /// The tool error a report with missing sections comes back with.
@@ -402,7 +425,7 @@ fn sections_clause(required_sections: &[String]) -> String {
         String::new()
     } else {
         format!(
-            " Its 'summary' must carry these sections, in order: {}.",
+            " Its 'summary' must carry these sections, best written in this order: {}.",
             required_sections.join(", ")
         )
     }
@@ -468,9 +491,10 @@ fn tool_definition(stage: &StageReport) -> Value {
             " May be empty when there is nothing to add.".to_string()
         } else {
             format!(
-                " This stage requires these sections, in this order, each with a heading line \
-                 and something under it (write 'none' when there is genuinely nothing): {}. A \
-                 report missing any of them is rejected and you will be asked to call again.",
+                " This stage requires these sections, each with a heading line and something \
+                 under it (write 'none' when there is genuinely nothing): {}. Write them in that \
+                 order. A report missing any of them is rejected and you will be asked to call \
+                 again.",
                 stage.required_sections.join(", "),
             )
         },
@@ -765,7 +789,7 @@ mod tests {
                 "summary": "## branches -> TESTS\n- resolve_task_workflow: covered\n\n\
                             **Side effects**\nOne INSERT, recorded once.\n\n\
                             Messages: the NotFound text is accurate.\n\n\
-                            - Findings (none blocking)\n  nothing to report\n",
+                            - Findings\n  nothing to report\n",
             }),
         );
         assert_eq!(result["isError"], false, "got {result}");
@@ -799,6 +823,72 @@ mod tests {
         let result = call(
             &with_sections(&["Dismissed"]),
             json!({ "outcome": "approved", "summary": "Dismissed: none" }),
+        );
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    /// Review of #95, NF1: a finding that *starts with* another section's
+    /// name is a finding, not that section's heading. Reading it as one
+    /// both cut "Findings" short — rejecting a report whose Findings
+    /// section is plainly there, with no way for the model to see why —
+    /// and credited a walk nobody wrote.
+    #[test]
+    fn a_finding_that_opens_with_a_section_name_is_not_a_heading() {
+        let stage = with_sections(&["Side effects", "Findings"]);
+        let result = call(
+            &stage,
+            json!({
+                "outcome": "changes_requested",
+                "summary": "## Side effects\nOne INSERT, recorded once.\n\n                            ## Findings\n                            - Side effects of the retry are not covered by a test (mcp.rs:226).\n                            - States is missing a way out.\n",
+            }),
+        );
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    /// Review of #95, NF3: the mirror image, and it lands on the very lap
+    /// this issue is about. Seven bullets under "Prior findings", each
+    /// naming a section, must not satisfy seven walks nobody did.
+    #[test]
+    fn bullets_under_prior_findings_do_not_satisfy_the_walks() {
+        let stage = with_sections(&["Reviewed", "Findings", "States", "Messages"]);
+        let result = call(
+            &stage,
+            json!({
+                "outcome": "approved",
+                "summary": "## Prior findings\n                            - Reviewed at abc123 previously.\n                            - Findings F1 resolved at engine.rs:329.\n                            - States handling now atomic.\n                            - Messages text fixed.\n",
+            }),
+        );
+        assert_eq!(result["isError"], true, "got {result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        for section in ["'Reviewed'", "'Findings'", "'States'", "'Messages'"] {
+            assert!(text.contains(section), "{section} missing from {text}");
+        }
+    }
+
+    /// A bullet may still *be* a heading when the name is the whole of it —
+    /// a report that lists its sections as bullets is following the rule,
+    /// not evading it.
+    #[test]
+    fn a_bare_bullet_heading_still_counts() {
+        let result = call(
+            &with_sections(&["Findings"]),
+            json!({ "outcome": "approved", "summary": "- Findings\n  nothing blocking\n" }),
+        );
+        assert_eq!(result["isError"], false, "got {result}");
+    }
+
+    /// Review of #95, NF2: the sections are handed to the model as an
+    /// ordered list, so it numbers them back. Before the fix that matched
+    /// nothing at all — the whole report was rejected twice and then
+    /// accepted with every section named as missing.
+    #[test]
+    fn numbered_and_hyphenated_headings_match() {
+        let result = call(
+            &with_sections(&["Reviewed", "Side effects"]),
+            json!({
+                "outcome": "approved",
+                "summary": "### 1. Reviewed\n5d9cd0a\n\n### 2. Side-effects\nOne INSERT.\n",
+            }),
         );
         assert_eq!(result["isError"], false, "got {result}");
     }
@@ -842,6 +932,28 @@ mod tests {
         let text = third["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("'States'"), "got {text}");
         assert!(text.contains("attempt 3"), "got {text}");
+    }
+
+    /// The attempt number in that reply is the attempt it really is
+    /// (review of #95): saturating the counter made the fourth and tenth
+    /// thin report both claim to be the third.
+    #[test]
+    fn later_thin_reports_are_numbered_honestly() {
+        let stage = with_sections(&["States"]);
+        let thin = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": TOOL_NAME,
+                "arguments": { "outcome": "approved", "summary": "nothing to see" },
+            },
+        });
+        let responses = session(&stage, &[thin.clone(), thin.clone(), thin.clone(), thin]);
+        let fourth = &responses[3]["result"];
+        assert_eq!(fourth["isError"], false, "got {fourth}");
+        let text = fourth["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("attempt 4"), "got {text}");
     }
 
     /// The allowance is for a model that can't satisfy the rule, not for one

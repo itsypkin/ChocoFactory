@@ -98,11 +98,17 @@ internal_review:
 
 Each name must appear as a heading in the report's `summary`, with
 something under it (`Findings: none` counts). Headings are matched
-forgivingly — `## Findings`, `**Findings**` and `Findings:` are the same
-thing, and `->` and `→` are interchangeable — and the list is generated
-into the tool's own schema, so again there is no second copy in a prompt
-file. A report that leaves a section out is rejected with an error the
-agent can act on and call again.
+forgivingly — `## Findings`, `**Findings**`, `- Findings`, `1. Findings`
+and `Findings:` are the same thing, `->` and `→` are interchangeable, and
+a bullet that merely *starts* with a section's name ("- Side effects of
+the retry are untested") is a list item, not a heading. A report that
+leaves a section out is rejected with an error the agent can act on and
+call again.
+
+The list reaches the agent through the tool's own schema, so a stage that
+opts in needs no prompt changes to work. A prompt that explains the
+sections anyway — `coding-task`'s reviewer does — is a second copy of the
+list, and a test keeps the two from drifting.
 
 This is how a verdict is kept from being cheaper than the work behind it: a
 reviewer that stops at its first blocking finding has no walk to write down
