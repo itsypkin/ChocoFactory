@@ -207,7 +207,7 @@ Event::AssistantMessage { text }
 Event::ToolCall { tool, input }
 Event::ToolResult { tool, output, is_error }
 Event::Thinking { text }
-Event::SessionMeta { session_id }
+Event::SessionMeta { adapter_session_id }
 Event::Error { message }
 Event::StageEntered { stage, outcome }
 ```

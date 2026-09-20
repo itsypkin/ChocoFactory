@@ -617,7 +617,7 @@ async fn drain_session(
             event = handle.recv() => {
                 let Some(event) = event else { break };
                 turn.last_event_at = tokio::time::Instant::now();
-                if let AgentEvent::SessionMeta { session_id: adapter_session_id, .. } = &event
+                if let AgentEvent::SessionMeta { adapter_session_id, .. } = &event
                     && let Err(err) = sessions::set_adapter_session_id(pool, session_id, adapter_session_id).await
                 {
                     tracing::error!(session_id, %err, "failed to persist adapter_session_id");
@@ -2906,12 +2906,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(metas.len(), 2);
         assert_eq!(
-            metas[0].payload["session_id"],
-            metas[1].payload["session_id"]
+            metas[0].payload["adapter_session_id"],
+            metas[1].payload["adapter_session_id"]
         );
         assert_eq!(
             run.adapter_session_id.as_deref(),
-            metas[0].payload["session_id"].as_str()
+            metas[0].payload["adapter_session_id"].as_str()
         );
     }
 

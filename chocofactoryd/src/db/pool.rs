@@ -175,7 +175,19 @@ INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
         .execute(&pool)
         .await
         .unwrap();
-        for migration in MIGRATOR.iter().filter(|m| m.version < 9) {
+        // Found by description rather than hardcoded as `< 9`, so a later
+        // migration (0010+) landing after this one doesn't silently widen
+        // what gets seeded here — and, with it, what `MIGRATOR.run` below
+        // actually exercises.
+        let rename_migration_version = MIGRATOR
+            .iter()
+            .find(|m| &*m.description == "rename task runs to sessions")
+            .expect("migration 0009_rename_task_runs_to_sessions must exist")
+            .version;
+        for migration in MIGRATOR
+            .iter()
+            .filter(|m| m.version < rename_migration_version)
+        {
             sqlx::query(
                 "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
                  VALUES (?1, ?2, TRUE, ?3, -1)",

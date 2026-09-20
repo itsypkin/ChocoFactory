@@ -1242,7 +1242,7 @@ impl WorkflowEngine {
         // chat task whose turn has finished, the run is `idle`, so
         // `cancel_task` finds nothing to kill and returns having only
         // written the status. Without this check the send would then
-        // resume a *fresh* subprocess from the persisted `session_id` —
+        // resume a *fresh* subprocess from the persisted `adapter_session_id` —
         // spawning an agent for a task the operator already cancelled,
         // and one that no retry could kill, since every later cancel is a
         // 409. The `human_gate` branch is safe only because
@@ -1392,7 +1392,7 @@ impl WorkflowEngine {
         // deliberately leaves untouched — and a task parked in a
         // standing-open `agent_turn` would take the message, find no live
         // session (cancel killed it), and resume a fresh subprocess from
-        // the persisted `session_id`: restarting the very process the
+        // the persisted `adapter_session_id`: restarting the very process the
         // operator just stopped. `tasks.status` is the only thing that
         // distinguishes that task from a healthy one here.
         if task.status == TASK_STATUS_CANCELLED {
@@ -11172,7 +11172,7 @@ stages:
     /// *kind*, which cancel deliberately doesn't change. Without the
     /// `tasks.status` check, resuming this `human_gate` would advance a
     /// cancelled task; for a standing-open `agent_turn` it would go further
-    /// and spawn a fresh subprocess from the persisted `session_id`,
+    /// and spawn a fresh subprocess from the persisted `adapter_session_id`,
     /// restarting the very process cancel just killed.
     #[tokio::test]
     async fn a_cancelled_task_refuses_further_messages() {

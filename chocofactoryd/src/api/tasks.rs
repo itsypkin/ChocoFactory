@@ -798,7 +798,7 @@ stages:
     /// The hole #69 closes at the HTTP layer: `chatting` is a
     /// standing-open `agent_turn`, so before this guard existed a message
     /// to a cancelled task would be accepted and would resume a fresh
-    /// subprocess from the persisted `session_id` — restarting the agent
+    /// subprocess from the persisted `adapter_session_id` — restarting the agent
     /// the operator had just stopped.
     #[tokio::test]
     async fn sending_a_message_to_a_cancelled_task_is_409() {

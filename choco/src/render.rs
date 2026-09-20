@@ -453,7 +453,7 @@ pub fn events(page: &EventsPage) -> String {
 ///
 /// Payload shapes come from `AgentEvent::payload` (`adapter/mod.rs`) and
 /// the engine's own `HumanMessage` events:
-/// `text` for human/assistant/thinking, `session_id` for session_meta,
+/// `text` for human/assistant/thinking, `adapter_session_id` for session_meta,
 /// `message` for error, and `{tool_use_id, tool, input|output}` for the two
 /// tool kinds — which carry no single "the interesting bit" field, so they
 /// get composed rather than probed. Tool events dominate a real coding
@@ -616,7 +616,7 @@ fn event_summary_body(event: &Event) -> String {
             one_line(&format!("[{kind}] {message}"))
         }
         _ => {
-            for key in ["text", "message", "session_id"] {
+            for key in ["text", "message", "adapter_session_id"] {
                 if let Some(value) = payload.get(key).and_then(Value::as_str) {
                     return one_line(value);
                 }
@@ -1071,7 +1071,7 @@ mod tests {
             (EventType::Thinking, json!({"text": "hmm"}), "hmm"),
             (
                 EventType::SessionMeta,
-                json!({"session_id": "abc-123"}),
+                json!({"adapter_session_id": "abc-123"}),
                 "abc-123",
             ),
             (

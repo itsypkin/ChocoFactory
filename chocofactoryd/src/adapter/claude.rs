@@ -391,13 +391,13 @@ fn user_turn_line(text: &str) -> String {
 fn normalize(value: &Value, tool_names: &mut HashMap<String, String>) -> Vec<AgentEvent> {
     let events = match value.get("type").and_then(Value::as_str) {
         Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
-            let session_id = value
+            let adapter_session_id = value
                 .get("session_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
             vec![AgentEvent::SessionMeta {
-                session_id,
+                adapter_session_id,
                 details: json!({ "init": init_summary(value) }),
             }]
         }
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(
             events,
             vec![AgentEvent::SessionMeta {
-                session_id: "9bf8db32-b723-41f6-8963-ea3ece07cb1a".to_string(),
+                adapter_session_id: "9bf8db32-b723-41f6-8963-ea3ece07cb1a".to_string(),
                 details: json!({ "init": { "tools": ["Bash"], "model": "claude-sonnet-5" } }),
             }]
         );
@@ -954,10 +954,13 @@ mod tests {
             .unwrap();
 
         let first = handle.recv().await.unwrap();
-        let AgentEvent::SessionMeta { session_id, .. } = first else {
+        let AgentEvent::SessionMeta {
+            adapter_session_id, ..
+        } = first
+        else {
             panic!("expected session_meta, got {first:?}");
         };
-        assert_eq!(session_id, "fixed-session-id");
+        assert_eq!(adapter_session_id, "fixed-session-id");
     }
 
     /// #67: `claude`'s normal permission model expects a human to approve

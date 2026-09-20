@@ -1056,7 +1056,10 @@ mod tests {
             &pool,
             &session_id,
             &[
-                (EventType::SessionMeta, json!({ "session_id": "s-1" })),
+                (
+                    EventType::SessionMeta,
+                    json!({ "adapter_session_id": "s-1" }),
+                ),
                 (EventType::AssistantMessage, json!({ "text": "approved" })),
                 (
                     EventType::TurnOutcome,

@@ -133,7 +133,7 @@ pub enum AgentEvent {
     /// environment (its tools, MCP servers, version, model, and the
     /// isolation it was launched with), merged into the persisted payload.
     SessionMeta {
-        session_id: String,
+        adapter_session_id: String,
         details: Value,
     },
     Error {
@@ -238,10 +238,10 @@ impl AgentEvent {
             }),
             AgentEvent::Thinking { text } => serde_json::json!({ "text": text }),
             AgentEvent::SessionMeta {
-                session_id,
+                adapter_session_id,
                 details,
             } => {
-                let mut payload = serde_json::json!({ "session_id": session_id });
+                let mut payload = serde_json::json!({ "adapter_session_id": adapter_session_id });
                 if let (Value::Object(payload), Value::Object(details)) = (&mut payload, details) {
                     for (key, value) in details {
                         payload.entry(key.clone()).or_insert_with(|| value.clone());
