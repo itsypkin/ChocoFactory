@@ -212,10 +212,10 @@ pub fn tasks(list: &[Task]) -> String {
 /// operator who asked for one and got the other should not have to go
 /// looking for that.
 pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
-    let what = match &outcome.session_id {
-        Some(session_id) if outcome.resumed => format!(
-            "Retrying stage '{}' by resuming its interrupted session ({session_id}) — it picks \
-             up where it left off, with its working tree untouched.",
+    let what = match &outcome.adapter_session_id {
+        Some(adapter_session_id) if outcome.resumed => format!(
+            "Retrying stage '{}' by resuming its interrupted session ({adapter_session_id}) — it \
+             picks up where it left off, with its working tree untouched.",
             outcome.stage
         ),
         // `resumed` without a session id is not something the daemon
@@ -670,7 +670,7 @@ mod tests {
             &RetryOutcome {
                 stage: "coding".to_string(),
                 resumed: true,
-                session_id: Some("sess-123".to_string()),
+                adapter_session_id: Some("sess-123".to_string()),
                 fresh_reason: None,
             },
         );
@@ -688,7 +688,7 @@ mod tests {
             &RetryOutcome {
                 stage: "coding".to_string(),
                 resumed: false,
-                session_id: None,
+                adapter_session_id: None,
                 fresh_reason: Some("its turn ended 'no_report'".to_string()),
             },
         );

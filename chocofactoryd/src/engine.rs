@@ -797,7 +797,7 @@ impl fmt::Display for RetryTaskError {
             }
             RetryTaskError::RunStillActive(stage) => write!(
                 f,
-                "stage '{stage}' still has an active run; nothing to retry"
+                "stage '{stage}' still has an active session; nothing to retry"
             ),
             RetryTaskError::Resolve(err) => write!(f, "{err}"),
             RetryTaskError::WorkflowDef(err) => write!(f, "{err}"),
@@ -809,7 +809,7 @@ impl fmt::Display for RetryTaskError {
             RetryTaskError::Db(err) => write!(f, "{err}"),
             RetryTaskError::Enter(err) => write!(f, "{err}"),
             RetryTaskError::NotResumable(why) => {
-                write!(f, "this stage's last run cannot be resumed: {why}")
+                write!(f, "this stage's last session cannot be resumed: {why}")
             }
         }
     }
@@ -1927,7 +1927,7 @@ impl WorkflowEngine {
         Ok(RetryOutcome {
             stage: current_stage,
             resumed: resume.is_some(),
-            session_id: resume.map(|resume| resume.adapter_session_id),
+            adapter_session_id: resume.map(|resume| resume.adapter_session_id),
             fresh_reason,
         })
     }
@@ -3867,7 +3867,7 @@ impl WorkflowEngine {
         // that says the turn picked up where an earlier one left off.
         if let Some(resume) = resume {
             let message = format!(
-                "resuming session {} from session {}, whose turn was interrupted because {}",
+                "resuming adapter session {} from session {}, whose turn was interrupted because {}",
                 resume.adapter_session_id,
                 resume.previous_session_id,
                 resume.describe()
@@ -4036,7 +4036,7 @@ impl WorkflowEngine {
                         tracing::info!(
                             task_id,
                             session_id,
-                            "task run was cancelled; not auto-advancing"
+                            "session was cancelled; not auto-advancing"
                         );
                         return;
                     }
@@ -4047,7 +4047,7 @@ impl WorkflowEngine {
                         tracing::warn!(
                             task_id,
                             session_id,
-                            "task run was force-closed by the idle reaper before completing its turn; not auto-advancing"
+                            "session was force-closed by the idle reaper before completing its turn; not auto-advancing"
                         );
                         engine
                             .mark_stuck(
@@ -4072,7 +4072,7 @@ impl WorkflowEngine {
                         tracing::warn!(
                             task_id,
                             session_id,
-                            "task run was interrupted by a usage limit; not auto-advancing"
+                            "session was interrupted by a usage limit; not auto-advancing"
                         );
                         engine
                             .mark_stuck(
@@ -4099,7 +4099,7 @@ impl WorkflowEngine {
                         tracing::warn!(
                             task_id,
                             session_id,
-                            "task run ended without reporting its outcome; not auto-advancing"
+                            "session ended without reporting its outcome; not auto-advancing"
                         );
                         engine
                             .mark_stuck(
@@ -4120,7 +4120,7 @@ impl WorkflowEngine {
                         tracing::warn!(
                             task_id,
                             session_id,
-                            "task run's process kept running after its turn ended and was killed; not auto-advancing"
+                            "session's process kept running after its turn ended and was killed; not auto-advancing"
                         );
                         engine
                             .mark_stuck(
@@ -4139,7 +4139,7 @@ impl WorkflowEngine {
                         tracing::warn!(
                             task_id,
                             session_id,
-                            "task run exited without completing its turn cleanly; not auto-advancing"
+                            "session exited without completing its turn cleanly; not auto-advancing"
                         );
                         engine
                             .mark_stuck(
@@ -4154,20 +4154,20 @@ impl WorkflowEngine {
                         return;
                     }
                     Ok(Some(_)) => {}
-                    // The run row is gone, which means the task itself was
+                    // The session row is gone, which means the task itself was
                     // deleted — there is no task left to mark stuck.
                     Ok(None) => {
                         tracing::error!(
                             task_id,
                             session_id,
-                            "task run disappeared while watching for turn completion; not auto-advancing"
+                            "session disappeared while watching for turn completion; not auto-advancing"
                         );
                         return;
                     }
                     Err(err) => {
                         tracing::error!(
                             task_id, session_id, %err,
-                            "failed to poll task run while watching for turn completion; not auto-advancing"
+                            "failed to poll session while watching for turn completion; not auto-advancing"
                         );
                         engine
                             .mark_stuck(
@@ -12150,7 +12150,7 @@ stages:
             RetryOutcome {
                 stage: "coding".to_string(),
                 resumed: true,
-                session_id: interrupted_run.adapter_session_id.clone(),
+                adapter_session_id: interrupted_run.adapter_session_id.clone(),
                 fresh_reason: None,
             }
         );
@@ -12233,7 +12233,7 @@ stages:
         let outcome = engine.retry_task(&task_id, RetryMode::Fresh).await.unwrap();
 
         assert!(!outcome.resumed);
-        assert_eq!(outcome.session_id, None);
+        assert_eq!(outcome.adapter_session_id, None);
         assert_eq!(
             outcome.fresh_reason.as_deref(),
             Some("a fresh start was asked for")

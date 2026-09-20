@@ -210,14 +210,14 @@ that keeps its own error type/messages. `global_config.rs` (§2.2) calls
 the same shared helper for `system_prompt_file`, rather than
 reimplementing the same three lines of path-safety logic a second time.
 
-### 2.5 New DB helper: `chocofactoryd/src/db/task_runs.rs`
+### 2.5 New DB helper: `chocofactoryd/src/db/sessions.rs`
 
 ```rust
-/// Most recent task_run recorded against `task_id` for `stage` — the
-/// run currently "open" for that stage, if any.
+/// Most recent session recorded against `task_id` for `stage` — the
+/// session currently "open" for that stage, if any.
 pub async fn get_current_for_stage(
     pool: &SqlitePool, task_id: &str, stage: &str,
-) -> Result<Option<TaskRun>, sqlx::Error> {
+) -> Result<Option<Session>, sqlx::Error> {
     // SELECT ... WHERE task_id = ? AND stage = ? ORDER BY created_at DESC LIMIT 1
 }
 ```
@@ -260,7 +260,7 @@ const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
 /// existing convention of keeping constructors side-effect-free and
 /// having the daemon's startup sequence explicitly call the I/O-bearing
 /// setup steps (`session.rs`'s idle reaper and
-/// `task_runs::recover_stale_active_runs` are both already called this
+/// `sessions::recover_stale_active_sessions` are both already called this
 /// way, not from inside a constructor).
 pub fn seed_builtin_workflows(workflows_dir: &Path) -> std::io::Result<()> { ... }
 ```
@@ -302,16 +302,16 @@ pub async fn send_message(
     // 3. look up current_stage in definition.stages; require StageKind::AgentTurn { .. } with an
     //    EMPTY `on` map — anything else is rejected with SendMessageError::StageNotOpenEnded
     //    (this is the guard discussed in §4.3 — not a Phase-1 gap, a hard boundary)
-    // 4. task_runs::get_current_for_stage(pool, task_id, current_stage)? -> task_run, else NoOpenRun
+    // 4. sessions::get_current_for_stage(pool, task_id, current_stage)? -> session, else NoOpenRun
     // 5. role_config::resolve(...) for that stage's role (same helper as enter_agent_turn)
-    // 6. session_manager.send_message(&task_run.id, text, &resolved.role_config).await
+    // 6. session_manager.send_message(&session.id, text, &resolved.role_config).await
     //    (SessionError propagated through SendMessageError — no new handling needed, §4.4)
 }
 ```
 
 Note `create_task` and `send_message` don't need `task_id`/`workflow_def`
 to be looked up from a shared in-memory registry — everything they need
-(`tasks` row, `workflow_state` row, `task_runs` row) is read fresh from
+(`tasks` row, `workflow_state` row, `sessions` row) is read fresh from
 SQLite each call, same as every other engine method today.
 
 ### 2.8 Workflow-name resolver
@@ -356,7 +356,7 @@ create_task("chat", "...", config: json!({ "roles": { "chat": { "model": "haiku"
 send_message(task_id, "actually check the other branch too")
   -> workflow_state::get(task_id)            -> current_stage = "chatting"
   -> (reload def) stages["chatting"]         -> AgentTurn, on: {} -> OK, open-ended
-  -> task_runs::get_current_for_stage(...)   -> the task_run from start_task above
+  -> sessions::get_current_for_stage(...)    -> the session from start_task above
   -> role_config::resolve(...)               -> same resolved config
   -> session_manager.send_message(...)       -> forwards to live process, or resumes if idle
 ```
@@ -376,7 +376,7 @@ collide on, so there's no "two creates racing for the same row" case to
 guard against. `start_task` (called internally) already takes its own
 per-task lock (existing, unchanged). By the time `create_task` returns
 `Ok`, `start_task` has fully run — the task's `workflow_state` row and
-first `task_run` row are committed, or the whole call returned `Err` and
+first `session` row are committed, or the whole call returned `Err` and
 neither exists in a way a caller could act on (a caller can't call
 `send_message` before it has a `task_id`, and it doesn't have one until
 `create_task` returns). This closes, by construction, the one race that
@@ -400,10 +400,10 @@ syntax left to reason about at all.
 
 A generic "send a message to whatever stage this task is currently in"
 function has a real TOCTOU race for a workflow where stages *do*
-transition: read `current_stage` = A, look up A's task_run, but before
+transition: read `current_stage` = A, look up A's session, but before
 the message is delivered `advance()` (triggered by something else — e.g.
 a `human_gate` resume, once #9 wires that) moves the task to stage B and
-starts a new task_run for B. The message then goes to a task_run that's
+starts a new session for B. The message then goes to a session that's
 no longer "current," or to a stage about to be superseded.
 
 This is closed here, not worked around: `send_message` requires the
@@ -413,7 +413,7 @@ every `on:` target names a real stage — an empty map is simply "zero
 transitions declared") — a stage in this shape can never be advanced,
 full stop (`advance()` looks up `outcome` in `on:`, and there is nothing
 to look up; any outcome fails with `UnknownOutcome`). So for `chat.yaml`
-specifically, "read current_stage, then look up its task_run" isn't
+specifically, "read current_stage, then look up its session" isn't
 merely unlikely to race a concurrent transition — no code path exists
 that could ever move this task off `"chatting"`. The check makes that
 invariant explicit and machine-enforced rather than "true today because
@@ -427,7 +427,7 @@ human_gate's `resumed` relay "[is] not yet wired to an API layer (P1-9)."
 ### 4.4 No new lock in front of `session_manager.send_message`
 
 Two `send_message` calls landing concurrently for the same task both
-resolve to the same `task_run_id` (per §4.3, that's stable) and both call
+resolve to the same `session_id` (per §4.3, that's stable) and both call
 into `SessionManager`, which already serializes on it: if live, both sends
 go through an unbounded `mpsc` channel (safe for concurrent producers,
 processed one at a time by `drain_session`'s single select loop —
@@ -437,7 +437,7 @@ a bug); if idle, `reserve()`'s atomic claim means only one caller resumes
 and the other gets `AlreadyStarting` (existing, already-reviewed
 behavior from PR #28/#35). Adding a second lock in `send_message` ahead of
 this would duplicate a guarantee `SessionManager` already provides at the
-correct granularity (the `task_run_id`, the actual contended resource) —
+correct granularity (the `session_id`, the actual contended resource) —
 and would itself be new surface for exactly the kind of stale-eviction
 bug `task_locks` had. Deliberately not adding it.
 
@@ -464,16 +464,16 @@ codebase. If this ever shows up as a real bottleneck, adding a cache is a
 follow-up with its own invalidation design (likely keyed by mtime), not
 something to bolt on speculatively here.
 
-### 4.6 `task_runs::get_current_for_stage` ordering
+### 4.6 `sessions::get_current_for_stage` ordering
 
 `ORDER BY started_at DESC LIMIT 1` needs `started_at` to actually
-disambiguate concurrent inserts (`task_runs` has no `created_at` column —
+disambiguate concurrent inserts (`sessions` has no `created_at` column —
 `started_at` is the timestamp that exists). `chat.yaml`'s stage only ever
-gets one `task_run` ever created for it (no loop, no re-entry), so this
+gets one `session` ever created for it (no loop, no re-entry), so this
 query returning "the" row rather than "the most recent of several" is the
 common case by construction, not something the ordering has to work hard
 for. Note this is deliberately *not* the same ordering as the existing
-`task_runs::list_for_task` (which orders `BY id`, a random UUID with no
+`sessions::list_for_task` (which orders `BY id`, a random UUID with no
 temporal meaning) — `get_current_for_stage` needs a real time-ordering
 that `list_for_task` never needed, not a continuation of its convention.
 The ordering here is correct in general, so this helper is safe to reuse
@@ -607,7 +607,7 @@ already cover every way delivery can fail.
   receive it.
 - Dynamic adapter dispatch by `cli` string (today there's exactly one
   `Arc<dyn AgentAdapter>` wired into `SessionManager` at construction;
-  the resolved `cli` value is still just recorded on `task_runs` for
+  the resolved `cli` value is still just recorded on `sessions` for
   bookkeeping, as it already is today) — not asked for by this issue.
 - Wiring any of this into `main.rs` — no daemon startup config loading
   exists yet; that's #9's job.

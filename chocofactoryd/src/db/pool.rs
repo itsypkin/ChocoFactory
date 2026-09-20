@@ -94,6 +94,16 @@ mod tests {
     /// that its `task_runs`/`events` rows survive — 0009's header explains
     /// why they don't — only that applying the migration against a database
     /// that already has data doesn't fail.
+    ///
+    /// Goes through `MIGRATOR.run`, the same path `connect`/
+    /// `connect_in_memory` use at real startup — inside a transaction, with
+    /// `PRAGMA foreign_keys = ON` already set on the connection, and rows
+    /// present — rather than applying 0009's SQL directly. 0001-0008 are
+    /// still applied by hand (below) to build the fixture's starting
+    /// schema, but each is also recorded in `_sqlx_migrations` with its
+    /// real checksum (read straight off `MIGRATOR`, so this can't drift
+    /// from the migration files themselves) so the migrator treats them as
+    /// already applied and only actually *runs* 0009.
     #[tokio::test]
     async fn rename_to_sessions_migrates_a_pre_existing_database_cleanly() {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -120,8 +130,12 @@ mod tests {
             sqlx::raw_sql(sql).execute(&pool).await.unwrap();
         }
 
-        // A task with a run and an event, exactly the kind of row 0009's
-        // header says is discarded rather than carried forward.
+        // A task with two chained runs — r2 resumed r1's interrupted
+        // session, via the self-FK 0007 added — and an event against each.
+        // The chain matters: it's what exercises `DROP TABLE task_runs`
+        // against a `resumed_from` self-reference rather than only the
+        // no-chain case, and it's exactly the kind of row 0009's header
+        // says is discarded rather than carried forward.
         sqlx::raw_sql(
             r#"
 INSERT INTO projects (id, name, created_at)
@@ -130,26 +144,54 @@ INSERT INTO tasks (id, project_id, workflow_def, title, created_at, updated_at)
     VALUES ('t1', 'p1', 'chat', 'T1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
 INSERT INTO task_runs (id, task_id, stage, role, cli_adapter, model, session_id, status, started_at)
     VALUES ('r1', 't1', 'chatting', 'chat', 'claude', 'sonnet', 'sess-1', 'idle', '2026-01-01T00:00:00Z');
+INSERT INTO task_runs (id, task_id, stage, role, cli_adapter, model, session_id, status, resumed_from, started_at)
+    VALUES ('r2', 't1', 'chatting', 'chat', 'claude', 'sonnet', 'sess-2', 'idle', 'r1', '2026-01-01T00:00:02Z');
 INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
-    VALUES ('e1', 't1', 'r1', 'assistant_message', '{"text":"hi"}', '2026-01-01T00:00:01Z');
+    VALUES ('e1', 't1', 'r1', 'assistant_message', '{"text":"hi"}', '2026-01-01T00:00:01Z'),
+           ('e2', 't1', 'r2', 'assistant_message', '{"text":"again"}', '2026-01-01T00:00:03Z');
 "#,
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        // The point of the test: applying 0009 against a database that
-        // already has data succeeds rather than failing on the
-        // drop-and-recreate. Applied directly (like the fixture above)
-        // rather than via `MIGRATOR.run`, which tracks applied versions in
-        // `_sqlx_migrations` — a table these hand-applied fixture
-        // migrations never populated.
-        sqlx::raw_sql(include_str!(
-            "../../migrations/0009_rename_task_runs_to_sessions.sql"
-        ))
+        // Record 0001-0008 as already applied, with their real checksums,
+        // so `MIGRATOR.run` below skips re-running SQL that already ran
+        // above and applies only 0009 — through its normal machinery.
+        // `_sqlx_migrations` itself doesn't exist yet outside of
+        // `MIGRATOR.run` (which is what creates it, normally); its schema
+        // is created here up front, matching what sqlx's own migrator
+        // creates, purely so these bookkeeping rows have somewhere to go.
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            );",
+        )
         .execute(&pool)
         .await
         .unwrap();
+        for migration in MIGRATOR.iter().filter(|m| m.version < 9) {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+                 VALUES (?1, ?2, TRUE, ?3, -1)",
+            )
+            .bind(migration.version)
+            .bind(&*migration.description)
+            .bind(&*migration.checksum)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // The point of the test: applying 0009 against a database that
+        // already has data succeeds rather than failing on the
+        // drop-and-recreate.
+        MIGRATOR.run(&pool).await.unwrap();
 
         let tables: Vec<(String,)> =
             sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -158,10 +200,11 @@ INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
                 .unwrap();
         let names: Vec<String> = tables.into_iter().map(|(n,)| n).collect();
         assert!(names.iter().any(|n| n == "sessions"));
+        assert!(names.iter().any(|n| n == "events"));
         assert!(!names.iter().any(|n| n == "task_runs"));
 
         // The task itself survives (0009 never touches `tasks`); its old
-        // session and event do not.
+        // sessions and events do not.
         let (task_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM tasks")
             .fetch_one(&pool)
             .await
@@ -172,6 +215,42 @@ INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
             .await
             .unwrap();
         assert_eq!(session_count, 0);
+        let (event_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(event_count, 0);
+
+        // The rebuilt `events` table still enforces its FKs: a bogus task
+        // is rejected...
+        let bad_task = sqlx::query(
+            "INSERT INTO events (id, task_id, session_id, event_type, payload, created_at)
+             VALUES ('x', 'no-such-task', NULL, 'stage_entered', '{}', '2026-01-01T00:00:04Z')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(bad_task.is_err(), "events.task_id FK should be enforced");
+
+        // ...a bogus session is rejected...
+        let bad_session = sqlx::query(
+            "INSERT INTO events (id, task_id, session_id, event_type, payload, created_at)
+             VALUES ('y', 't1', 'no-such-session', 'assistant_message', '{}', '2026-01-01T00:00:05Z')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            bad_session.is_err(),
+            "events.session_id FK should be enforced"
+        );
+
+        // ...while a session-less row against a real task is accepted.
+        sqlx::query(
+            "INSERT INTO events (id, task_id, session_id, event_type, payload, created_at)
+             VALUES ('s1', 't1', NULL, 'stage_entered', '{}', '2026-01-01T00:00:06Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     /// 0003 rebuilds `events` and backfills the new `task_id` from

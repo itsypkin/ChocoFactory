@@ -191,8 +191,8 @@ Hybrid model per Q4:
    plan), the daemon closes stdin, lets the process exit, and stores the
    CLI's `adapter_session_id` on the `sessions` row (`status = idle`).
 3. **Resume**: next message (from UI, or CLI/agent delegation) spawns a
-   fresh process via `resume(session_id, ...)`, flips the run back to
-   `active`.
+   fresh process via `resume(session_id, adapter_session_id, ...)`, flips
+   the session back to `active`.
 
 This same mechanism underlies Type 3's coder/reviewer roles, just driven
 by the Workflow Engine instead of direct user input.

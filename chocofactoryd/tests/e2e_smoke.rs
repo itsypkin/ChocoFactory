@@ -427,8 +427,8 @@ async fn real_binary_serves_a_chat_task_end_to_end_over_http_and_ws() {
 /// and produces *zero* conversation events for its whole life — the
 /// transitions are the only thing there is to stream. That makes this the
 /// case nothing else can cover by accident: before X-3 a subscriber to this
-/// task would have seen nothing at all, ever, because `events.task_run_id`
-/// was `NOT NULL` and no run exists to attribute a transition to.
+/// task would have seen nothing at all, ever, because `events.session_id`
+/// was `NOT NULL` and no session exists to attribute a transition to.
 ///
 /// `api/ws.rs` asserts the same thing in-process. This one goes through the
 /// spawned daemon, so it also proves the wiring that only exists in
@@ -673,7 +673,7 @@ stages:
     assert_eq!(pending[0]["payload"]["stdout_tail"], "PENDING");
     assert_eq!(pending[0]["payload"]["attempt"], 1);
     // A poll stage opens no session, so its output belongs to the task
-    // itself and carries no run id.
+    // itself and carries no session id.
     assert_eq!(pending[0]["session_id"], Value::Null);
     assert_eq!(pending[0]["task_id"], task_id.as_str());
 

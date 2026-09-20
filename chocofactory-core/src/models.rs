@@ -232,8 +232,12 @@ pub struct RetryOutcome {
     pub stage: String,
     /// Whether the stuck stage's agent session was resumed.
     pub resumed: bool,
-    /// The session that was resumed, when one was.
-    pub session_id: Option<String>,
+    /// The CLI adapter's own identifier for the resumed session, when one
+    /// was resumed — the value `--resume` was given, not a `sessions.id`.
+    /// Named `adapter_session_id` rather than `session_id` so it can't be
+    /// confused with the row identifier `Event.session_id` and
+    /// `Session.id` mean elsewhere on the wire.
+    pub adapter_session_id: Option<String>,
     /// Why the stage started fresh instead of resuming, when it did.
     /// `None` when it resumed. Carried rather than only logged, because
     /// "it started over" is the answer an operator is most likely to

@@ -460,7 +460,7 @@ impl SessionManager {
     /// Runs the idle reaper forever, closing sessions past `idle_timeout`
     /// every `config.interval` (§4.3). Meant to be spawned as a
     /// background task by the daemon's startup code, alongside
-    /// `sessions::recover_stale_active_runs` at startup.
+    /// `sessions::recover_stale_active_sessions` at startup.
     pub async fn run_idle_reaper(self: Arc<Self>, config: IdleReaperConfig) {
         self.run_idle_reaper_loop(&config, None).await;
     }

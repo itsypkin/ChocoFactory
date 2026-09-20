@@ -913,7 +913,7 @@ stages:
         let outcome = response.json();
         assert_eq!(outcome["stage"], "gate");
         assert_eq!(outcome["resumed"], false);
-        assert!(outcome["session_id"].is_null());
+        assert!(outcome["adapter_session_id"].is_null());
 
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert_eq!(detail["status"], "open");
