@@ -75,6 +75,48 @@ pub struct TaskDetail {
     /// to filter out of `GET /tasks/:id/events` so `choco task status`
     /// stays one request and can't show a page-truncated trail.
     pub stage_trail: Vec<Event>,
+    /// Whether `task.workflow_path`'s contents still match the recorded
+    /// `workflow_sha256` (issue #88) — `"unchanged"`, `"changed"`, or
+    /// `"missing"` when the file can't be re-read right now (deleted,
+    /// permissions, ...; any I/O error collapses to this rather than
+    /// failing the whole request). `None` when the task has no
+    /// `workflow_path` at all (a legacy task, predating this column).
+    /// Computed fresh on every request by re-hashing the file — not cached,
+    /// same as every other "resolved right now" value this API serves.
+    pub workflow_file_status: Option<&'static str>,
+}
+
+/// Computes [`TaskDetail::workflow_file_status`] for `task`. A pure
+/// function of the file on disk right now — re-hashes it and compares
+/// against `task.workflow_sha256` — so it's unit-testable without a running
+/// server.
+///
+/// Any read error collapses to `"missing"` so a stale/deleted file never
+/// fails the whole `GET /tasks/{id}` request, but the error itself is still
+/// logged with the task id and path (issue #88 review, F3) — silently
+/// discarding it would violate this repo's own rule that every I/O failure
+/// is propagated or logged with context, and would print a misleading
+/// "(missing)" for a file that actually exists but, say, hit `EACCES`.
+fn workflow_file_status(task: &Task) -> Option<&'static str> {
+    let path = task.workflow_path.as_deref()?;
+    let status = match std::fs::read(path) {
+        Ok(bytes) => {
+            if Some(crate::engine::sha256_hex(&bytes).as_str()) == task.workflow_sha256.as_deref() {
+                "unchanged"
+            } else {
+                "changed"
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                task_id = %task.id, %path, %err,
+                "failed to re-read a task's recorded workflow file for workflow_file_status; \
+                 reporting \"missing\""
+            );
+            "missing"
+        }
+    };
+    Some(status)
 }
 
 /// Three separate reads, deliberately not one transaction: a transition
@@ -98,10 +140,12 @@ pub async fn get(
         .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;
     let workflow_state = workflow_state::get(&state.pool, &id).await?;
     let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
+    let workflow_file_status = workflow_file_status(&task);
     Ok(Json(TaskDetail {
         task,
         workflow_state,
         stage_trail,
+        workflow_file_status,
     }))
 }
 
@@ -418,6 +462,32 @@ mod tests {
             )
             .await;
         assert_eq!(response.status(), 404);
+    }
+
+    /// A `workflow_def` outside the allowlist must be rejected as a 400,
+    /// not silently joined onto the project's repo and global workflow
+    /// directories and searched for as if it were a normal name (issue #88
+    /// review, F1) — `resolve_task_workflow`'s allowlist check is the only
+    /// thing standing between this endpoint and path traversal now that the
+    /// name is joined onto a caller-controlled `project.repo_path` as well
+    /// as the global directory.
+    #[tokio::test]
+    async fn create_task_with_an_invalid_workflow_name_is_400() {
+        let server = TestServer::start().await;
+        let project_id = create_project(&server).await;
+
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "../etc/passwd",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 400);
     }
 
     #[tokio::test]
@@ -946,5 +1016,57 @@ stages:
             )
             .await;
         assert_eq!(response.status(), 409);
+    }
+
+    // ---- workflow_file_status (issue #88) ----
+
+    /// `GET /tasks/{id}`'s `workflow_file_status` walks unchanged -> changed
+    /// -> missing as the recorded workflow file is edited and then deleted
+    /// on disk — the main user-visible piece of issue #88's §4, and until
+    /// now entirely untested (`grep workflow_file_status` found no test).
+    #[tokio::test]
+    async fn get_task_workflow_file_status_tracks_edits_and_deletion() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["workflow_file_status"], "unchanged");
+        let workflow_path = detail["workflow_path"]
+            .as_str()
+            .expect("chat_task's task has a recorded workflow_path")
+            .to_string();
+
+        // Editing the file on disk (without touching the task's recorded
+        // hash) must flip status to "changed", not silently stay
+        // "unchanged" or fail the request.
+        let original = std::fs::read_to_string(&workflow_path).unwrap();
+        std::fs::write(&workflow_path, format!("{original}\n# edited\n")).unwrap();
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["workflow_file_status"], "changed");
+
+        // Deleting it must report "missing", not error the whole request
+        // (any read error collapses to "missing" per the doc comment on
+        // `workflow_file_status`).
+        std::fs::remove_file(&workflow_path).unwrap();
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["workflow_file_status"], "missing");
+    }
+
+    /// A legacy task with no recorded `workflow_path` (predating issue #88)
+    /// reports `workflow_file_status: null` rather than a bogus status.
+    #[tokio::test]
+    async fn get_task_workflow_file_status_is_null_without_a_recorded_path() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+
+        // Simulate a legacy row: clear the columns issue #88 added.
+        sqlx::query("UPDATE tasks SET workflow_path = NULL, workflow_sha256 = NULL WHERE id = ?")
+            .bind(&task_id)
+            .execute(server.pool())
+            .await
+            .unwrap();
+
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert!(detail["workflow_file_status"].is_null());
     }
 }

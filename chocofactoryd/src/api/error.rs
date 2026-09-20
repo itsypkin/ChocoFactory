@@ -8,8 +8,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::engine::{
-    CancelTaskError, CreateTaskError, EngineError, ResolveError, RetryTaskError, SendMessageError,
-    SendMessageOrResumeError,
+    CancelTaskError, CreateTaskError, EngineError, InitWorkflowsError, ResolveError,
+    RetryTaskError, SendMessageError, SendMessageOrResumeError,
 };
 use crate::session::SessionError;
 
@@ -114,6 +114,14 @@ impl From<SendMessageOrResumeError> for ApiError {
             SendMessageOrResumeError::SendMessage(
                 SendMessageError::TaskCancelled | SendMessageError::TaskStuck { .. },
             ) => ApiError::Conflict(err.to_string()),
+            // This task's recorded workflow file (issue #88) is gone — a
+            // conflict with the task's own state (someone deleted the file
+            // out from under it), not a request the caller could have made
+            // differently and not a server fault.
+            SendMessageOrResumeError::MissingWorkflowFile(_)
+            | SendMessageOrResumeError::SendMessage(SendMessageError::MissingWorkflowFile(_)) => {
+                ApiError::Conflict(err.to_string())
+            }
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -172,7 +180,24 @@ impl From<RetryTaskError> for ApiError {
             // so the retry cannot happen — a conflict with the task's own
             // state, not a request the caller could reasonably have made
             // differently, and not a server fault either.
-            RetryTaskError::Resolve(ResolveError::NotFound(_)) => {
+            RetryTaskError::Resolve(ResolveError::NotFound(_))
+            // Same shape, for a task created from a recorded workflow path
+            // (issue #88) whose file has since been deleted.
+            | RetryTaskError::MissingWorkflowFile(_) => ApiError::Conflict(err.to_string()),
+            _ => ApiError::Internal(err.to_string()),
+        }
+    }
+}
+
+impl From<InitWorkflowsError> for ApiError {
+    fn from(err: InitWorkflowsError) -> Self {
+        match &err {
+            InitWorkflowsError::NoSuchProject(_) => ApiError::NotFound(err.to_string()),
+            // No repo path, or a repo path that no longer exists on disk —
+            // both are "well-formed request, the project isn't set up for
+            // this yet", the same conflict shape every other state-mismatch
+            // case in this file uses.
+            InitWorkflowsError::NoRepoPath(_) | InitWorkflowsError::RepoPathMissing(_) => {
                 ApiError::Conflict(err.to_string())
             }
             _ => ApiError::Internal(err.to_string()),

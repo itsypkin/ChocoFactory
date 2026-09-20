@@ -324,7 +324,7 @@ stages:
         // db layer, bypassing create_task) — a genuinely empty backlog,
         // unlike a real chat task which already has events by the time a
         // socket could connect.
-        let project = crate::db::projects::create(server.pool(), "demo")
+        let project = crate::db::projects::create(server.pool(), "demo", None)
             .await
             .unwrap();
         let task = crate::db::tasks::create(
@@ -334,6 +334,8 @@ stages:
                 workflow_def: "chat",
                 title: "t",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await

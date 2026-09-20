@@ -164,6 +164,88 @@ Each session's `session_meta` event records what it actually ran with: the
 CLI version, model, tools, MCP servers, plugins, skills, and the isolation
 it was launched under.
 
+### Project workflows
+
+A project can carry a repo of its own (`repo_path`), set at creation or
+after the fact:
+
+```
+choco project create acme --repo ~/code/acme
+choco project update acme --repo ~/code/acme   # or: --no-repo, to clear it
+```
+
+`--repo` is resolved to an absolute path client-side (a relative path,
+including `.`, works) before the request is sent, and must already be an
+existing directory — it does not need to be a git repo.
+
+A task's `--workflow <name>` is then looked up in **two places, in order**:
+
+1. `<repo_path>/.chocofactory/workflows/<name>.yaml`, if the project has a
+   repo;
+2. the global `~/.config/chocofactory/workflows/<name>.yaml`.
+
+The first match wins. A repo's `.chocofactory/workflows/` has the exact
+same layout as the global folder — one `<name>.yaml` per workflow, plus a
+`prompts/` directory next to it for any prompt files the workflow
+references by relative path (`prompts/coder.md` in a workflow at
+`<repo>/.chocofactory/workflows/coding-task.yaml` resolves to
+`<repo>/.chocofactory/workflows/prompts/coder.md`, not the global prompts
+directory). This is the whole point of a repo workflow: a team's own
+stages, roles, models and prompts, reviewed and versioned alongside the
+code they work on, rather than living only on whoever's machine runs the
+daemon.
+
+A task created with no `--repo` of its own defaults to the project's
+`repo_path` (as `config.cwd`), so registering a repo on a project is also
+what makes `--repo` optional on every task under it.
+
+`choco project init-workflows <project>` seeds a repo with the built-in
+`chat`/`coding-task` workflows and their prompts as a starting point —
+never overwriting a file already there, so it is always safe to run again:
+
+```
+$ choco project init-workflows acme
+Seeded /Users/you/code/acme/.chocofactory/workflows
+  created   /Users/you/code/acme/.chocofactory/workflows/chat.yaml
+  created   /Users/you/code/acme/.chocofactory/workflows/coding-task.yaml
+  created   /Users/you/code/acme/.chocofactory/workflows/prompts/coder.md
+  ...
+
+Commit this directory so the team shares it: git add .chocofactory/ && git commit
+```
+
+From there, edit the seeded files freely (rename `coding-task.yaml` to
+something like `express-sonnet.yaml`, add a second `deep-opus.yaml` with
+different roles/models — a workflow file *is* the unit of configuration
+here, there is no separate project-settings layer) and commit
+`.chocofactory/` so every teammate's `choco task create --workflow ...`
+resolves the same file.
+
+**Trust implication:** a repo's `.chocofactory/workflows/` can define
+`shell` stages, which the daemon runs as ordinary subprocesses on whatever
+machine it's on. Registering a repo on a project means trusting everything
+under that repo's `.chocofactory/` the same way you'd trust a Makefile or
+CI config in it — there is no separate approval step before those commands
+run.
+
+Every task records the exact workflow file it started from — its
+canonical absolute path and a SHA-256 of its contents at that moment — and
+`choco task status` shows it:
+
+```
+$ choco task status bb93ada3-...
+...
+Workflow       coding-task
+Workflow file  /Users/you/code/acme/.chocofactory/workflows/coding-task.yaml  [3f2a9c1e0b7d]
+Status         open
+```
+
+If the file has since been edited, the line is suffixed
+`(changed since task start)`; if it has been deleted, `(missing)` — either
+way the task keeps running (or, for a deleted file, keeps failing to
+reload) with no separate warning elsewhere. A task created before this
+existed shows no `Workflow file` line at all.
+
 ### Reviewing a `coding-task` PR
 
 When a `coding-task` reaches `awaiting_human_review` it has already pushed
@@ -263,8 +345,9 @@ Created  2026-08-01 12:33:37 UTC
 Create a task in it. `--project` takes **either the project name or its
 id** — a name is resolved against `project list`, and is rejected naming
 the candidates if it matches more than one project (names aren't unique).
-`--workflow` names any definition in `~/.config/chocofactory/workflows/`
-(`chat` ships built in):
+`--workflow` names a definition looked up in the project's own repo first,
+then the global `~/.config/chocofactory/workflows/` (`chat` ships built
+in) — see [Project workflows](#project-workflows) above:
 
 ```
 $ choco task create --project acme --workflow gated \

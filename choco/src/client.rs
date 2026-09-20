@@ -20,6 +20,17 @@ pub struct EventsPage {
     pub next_token: Option<String>,
 }
 
+/// `POST /projects/{id}/init-workflows`'s response (issue #88) — mirrors
+/// `chocofactoryd::api::projects::InitWorkflowsResponse`, which isn't
+/// exported (bin-only API layer), so this is `choco`'s own copy of the
+/// shape.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InitWorkflowsResult {
+    pub dir: String,
+    pub created: Vec<String>,
+    pub existing: Vec<String>,
+}
+
 /// Mirrors this repo's hand-rolled `Display`-impl error convention
 /// (`ApiError`, `EngineError`, ...) rather than pulling in `anyhow`/`thiserror`.
 #[derive(Debug)]
@@ -43,6 +54,12 @@ pub enum ClientError {
     /// Always reported rather than skipped: silently dropping an override
     /// would run the task on a model the caller didn't ask for.
     InvalidConfig(String),
+    /// `project create --repo`/`project update --repo` couldn't be resolved
+    /// to an absolute, existing directory client-side (issue #88) — the
+    /// daemon's own cwd differs from the user's, so `choco` canonicalizes
+    /// before ever sending a request, and a failure here is reported
+    /// instead of forwarding a path the daemon would just reject anyway.
+    InvalidRepoPath(String),
 }
 
 impl fmt::Display for ClientError {
@@ -64,6 +81,7 @@ impl fmt::Display for ClientError {
                 ids.join(", ")
             ),
             ClientError::InvalidConfig(msg) => write!(f, "{msg}"),
+            ClientError::InvalidRepoPath(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -319,12 +337,71 @@ impl Client {
             .map_err(|err| ClientError::Decode(err.to_string()))
     }
 
-    pub async fn create_project(&self, name: &str) -> Result<Project, ClientError> {
+    /// `repo_path` must already be an absolute, existing directory — the
+    /// caller (`choco project create --repo`) canonicalizes it client-side
+    /// before this is ever called (issue #88); the daemon validates but
+    /// does not canonicalize.
+    pub async fn create_project(
+        &self,
+        name: &str,
+        repo_path: Option<&str>,
+    ) -> Result<Project, ClientError> {
         let resp = self
             .send(
                 self.http
                     .post(format!("{}/projects", self.base_url))
-                    .json(&json!({ "name": name })),
+                    .json(&json!({ "name": name, "repo_path": repo_path })),
+            )
+            .await?;
+        let resp = self.check_status(resp).await?;
+        self.decode(resp).await
+    }
+
+    /// Builds the `PATCH /projects/{id}` request body — split out from
+    /// [`Self::update_project`] so the absent/null/present distinction is
+    /// unit-testable without a network round trip.
+    ///
+    /// `name: None` and `repo_path: None` (the *outer* `None`) both mean
+    /// "don't send this key at all", which the daemon reads as "leave
+    /// unchanged" — the same absent-vs-null shape `serde_util::
+    /// deserialize_some` decodes on the daemon side. `repo_path: Some(None)`
+    /// sends `"repo_path": null`, which clears it.
+    fn update_project_request(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        repo_path: Option<Option<&str>>,
+    ) -> reqwest::RequestBuilder {
+        let mut body = serde_json::Map::new();
+        if let Some(name) = name {
+            body.insert("name".to_string(), json!(name));
+        }
+        if let Some(repo_path) = repo_path {
+            body.insert("repo_path".to_string(), json!(repo_path));
+        }
+        self.http
+            .patch(format!("{}/projects/{id}", self.base_url))
+            .json(&Value::Object(body))
+    }
+
+    pub async fn update_project(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        repo_path: Option<Option<&str>>,
+    ) -> Result<Project, ClientError> {
+        let resp = self
+            .send(self.update_project_request(id, name, repo_path))
+            .await?;
+        let resp = self.check_status(resp).await?;
+        self.decode(resp).await
+    }
+
+    pub async fn init_workflows(&self, id: &str) -> Result<InitWorkflowsResult, ClientError> {
+        let resp = self
+            .send(
+                self.http
+                    .post(format!("{}/projects/{id}/init-workflows", self.base_url)),
             )
             .await?;
         let resp = self.check_status(resp).await?;
@@ -557,6 +634,31 @@ mod tests {
         assert!(config.is_none());
         let body = body_of(client().create_task_request(&params(config)));
         assert!(body["config"].is_null());
+    }
+
+    // --- update_project_request: absent vs. null vs. present (issue #88) ---
+
+    #[test]
+    fn update_project_request_omits_repo_path_when_not_given() {
+        let body = body_of(client().update_project_request("p1", Some("renamed"), None));
+        assert_eq!(body["name"], "renamed");
+        assert!(
+            body.get("repo_path").is_none(),
+            "repo_path must be absent, not null, when unchanged: {body}"
+        );
+    }
+
+    #[test]
+    fn update_project_request_sends_null_to_clear_repo_path() {
+        let body = body_of(client().update_project_request("p1", None, Some(None)));
+        assert!(body.get("name").is_none());
+        assert!(body["repo_path"].is_null());
+    }
+
+    #[test]
+    fn update_project_request_sends_the_new_repo_path() {
+        let body = body_of(client().update_project_request("p1", None, Some(Some("/repo"))));
+        assert_eq!(body["repo_path"], "/repo");
     }
 
     #[test]

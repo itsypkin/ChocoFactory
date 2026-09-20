@@ -109,7 +109,7 @@ mod tests {
     use serde_json::json;
 
     async fn seed_task(pool: &SqlitePool) -> String {
-        let project_id = projects::create(pool, "demo").await.unwrap().id;
+        let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         tasks::create(
             pool,
             tasks::NewTask {
@@ -117,6 +117,8 @@ mod tests {
                 workflow_def: "coding_task",
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await

@@ -1400,3 +1400,184 @@ async fn task_retry_on_a_non_stuck_task_surfaces_a_clear_409() {
         failed.stderr
     );
 }
+
+// ---- Project workflows / repo path (issue #88) ----
+
+/// A real, absolute, existing directory to use as a project's `repo_path`
+/// — separate from `TempHome`, which is bound to the daemon's `$HOME`
+/// rather than any project's repo.
+struct TempRepoDir(PathBuf);
+
+impl TempRepoDir {
+    fn new() -> Self {
+        let suffix = UNIQUE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("choco-cli-repo-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        TempRepoDir(path)
+    }
+}
+
+impl Drop for TempRepoDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `project create --repo .` must resolve `.` client-side (`choco`'s own
+/// cwd, not the daemon's) before it ever reaches the API — the whole point
+/// of `canonicalize_repo` living in `choco/src/main.rs` rather than being
+/// left to the daemon. This is the one CLI-level proof that it actually
+/// runs, not just its request-body-building unit test in `client.rs`.
+#[tokio::test]
+async fn project_create_with_repo_dot_sends_an_absolute_path() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+
+    let created = run_choco_json(
+        &daemon.base_url,
+        &["project", "create", "demo", "--repo", "."],
+    )
+    .await;
+    assert_eq!(created.code, Some(0), "stderr: {}", created.stderr);
+    let project = created.json();
+    let repo_path = project["repo_path"]
+        .as_str()
+        .expect("repo_path should be set");
+
+    let expected = std::fs::canonicalize(".").unwrap();
+    assert_eq!(
+        PathBuf::from(repo_path),
+        expected,
+        "repo_path should be choco's own cwd, canonicalized"
+    );
+    assert!(
+        PathBuf::from(repo_path).is_absolute(),
+        "repo_path should be absolute: {repo_path}"
+    );
+}
+
+/// `project update --no-repo` must send an explicit `repo_path: null`
+/// through clap and `client.rs`'s absent-vs-null `PATCH` body, not just
+/// omit the field (which would leave the old value in place per the
+/// server's semantics).
+#[tokio::test]
+async fn project_update_no_repo_clears_the_repo_path() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let repo = TempRepoDir::new();
+
+    let created = run_choco_json(
+        &daemon.base_url,
+        &[
+            "project",
+            "create",
+            "demo",
+            "--repo",
+            repo.0.to_str().unwrap(),
+        ],
+    )
+    .await
+    .json();
+    assert!(created["repo_path"].is_string(), "{created:?}");
+    let project_id = created["id"].as_str().unwrap().to_string();
+
+    let updated = run_choco_json(
+        &daemon.base_url,
+        &["project", "update", &project_id, "--no-repo"],
+    )
+    .await;
+    assert_eq!(updated.code, Some(0), "stderr: {}", updated.stderr);
+    assert!(
+        updated.json()["repo_path"].is_null(),
+        "expected repo_path cleared: {:?}",
+        updated.json()
+    );
+
+    // The clearing round-trips through `project list` too, not just the
+    // `update` response.
+    let listed = run_choco_json(&daemon.base_url, &["project", "list"]).await;
+    let found = listed
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == project_id)
+        .cloned()
+        .expect("project missing from list");
+    assert!(found["repo_path"].is_null(), "{found:?}");
+}
+
+/// `project init-workflows` seeds the built-in workflows and prompts into
+/// the project's repo, and its human-readable output must actually name
+/// what it created — the whole point of the command over silently
+/// succeeding, since a user is meant to `git add` exactly what it lists.
+#[tokio::test]
+async fn project_init_workflows_prints_the_created_files() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let repo = TempRepoDir::new();
+
+    let project = run_choco_json(
+        &daemon.base_url,
+        &[
+            "project",
+            "create",
+            "demo",
+            "--repo",
+            repo.0.to_str().unwrap(),
+        ],
+    )
+    .await
+    .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let seeded = run_choco(
+        &daemon.base_url,
+        &["project", "init-workflows", &project_id],
+    )
+    .await;
+    assert_eq!(seeded.code, Some(0), "stderr: {}", seeded.stderr);
+    assert!(
+        seeded.stdout.contains("created"),
+        "stdout: {}",
+        seeded.stdout
+    );
+    assert!(
+        seeded.stdout.contains("coding-task.yaml"),
+        "stdout: {}",
+        seeded.stdout
+    );
+    assert!(
+        seeded.stdout.contains("chat.yaml"),
+        "stdout: {}",
+        seeded.stdout
+    );
+
+    // The files actually landed on disk under the repo, not just in the
+    // printed report.
+    let workflows_dir = repo.0.join(".chocofactory").join("workflows");
+    assert!(workflows_dir.join("coding-task.yaml").is_file());
+    assert!(workflows_dir.join("chat.yaml").is_file());
+
+    // Running it again reports every file as already present, and the
+    // printed report reflects that rather than "created" a second time.
+    let seeded_again = run_choco(
+        &daemon.base_url,
+        &["project", "init-workflows", &project_id],
+    )
+    .await;
+    assert_eq!(
+        seeded_again.code,
+        Some(0),
+        "stderr: {}",
+        seeded_again.stderr
+    );
+    assert!(
+        seeded_again.stdout.contains("existing"),
+        "stdout: {}",
+        seeded_again.stdout
+    );
+    assert!(
+        !seeded_again.stdout.contains("created   "),
+        "second run should not report any file as newly created: {}",
+        seeded_again.stdout
+    );
+}

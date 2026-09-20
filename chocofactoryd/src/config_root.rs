@@ -56,9 +56,22 @@ const BUILTIN_WORKFLOW_PROMPTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// What [`seed_builtin_workflows`] actually did — which files it wrote for
+/// the first time and which were already present (issue #88: `choco project
+/// init-workflows` reports this back to the caller; the daemon's own
+/// startup call only logs it).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SeedReport {
+    /// Files that did not exist before this call and were just written.
+    pub created: Vec<PathBuf>,
+    /// Files that already existed (seeded by a previous run, or edited by a
+    /// user) and were left untouched.
+    pub existing: Vec<PathBuf>,
+}
+
 /// Writes `source` to `path`, but only if it doesn't already exist — a
 /// user's edited copy, or one seeded by a previous release, is never
-/// overwritten.
+/// overwritten. Returns whether this call is the one that created it.
 ///
 /// Uses `create_new` (atomic create-or-fail), not a separate `exists()`
 /// check followed by `write` — the latter is a check-then-act race: two
@@ -69,8 +82,9 @@ const BUILTIN_WORKFLOW_PROMPTS: &[(&str, &str)] = &[
 /// fails atomically if the file already exists, and that specific failure
 /// (`AlreadyExists`) is treated as success — the file is present, seeded
 /// either by an earlier run or a concurrent one, which is exactly the
-/// desired end state either way.
-fn seed_one(path: &Path, source: &str) -> io::Result<()> {
+/// desired end state either way (and is reported as `existing`, not
+/// `created`, since this call didn't write it).
+fn seed_one(path: &Path, source: &str) -> io::Result<bool> {
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut file) => {
             if let Err(err) = file.write_all(source.as_bytes()) {
@@ -84,9 +98,9 @@ fn seed_one(path: &Path, source: &str) -> io::Result<()> {
                 let _ = std::fs::remove_file(path);
                 return Err(err);
             }
-            Ok(())
+            Ok(true)
         }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(err) => Err(err),
     }
 }
@@ -101,18 +115,35 @@ fn seed_one(path: &Path, source: &str) -> io::Result<()> {
 /// free, matching how `session.rs`'s idle reaper and
 /// `task_runs::recover_stale_active_runs` are already separate steps the
 /// daemon's startup sequence calls explicitly, not hidden inside a `new`.
-pub fn seed_builtin_workflows(workflows_dir: &Path) -> io::Result<()> {
+///
+/// Used both for the daemon's own startup seed of `workflows_dir` (which
+/// only logs the returned [`SeedReport`]) and, via `WorkflowEngine::
+/// init_project_workflows` (issue #88), to seed a project repo's own
+/// `.chocofactory/workflows/` — the same built-ins, the same never-
+/// overwrite guarantee, just a different destination directory.
+pub fn seed_builtin_workflows(workflows_dir: &Path) -> io::Result<SeedReport> {
     std::fs::create_dir_all(workflows_dir)?;
+    let mut report = SeedReport::default();
     for (name, source) in BUILTIN_WORKFLOWS {
-        seed_one(&workflows_dir.join(format!("{name}.yaml")), source)?;
+        let path = workflows_dir.join(format!("{name}.yaml"));
+        if seed_one(&path, source)? {
+            report.created.push(path);
+        } else {
+            report.existing.push(path);
+        }
     }
 
     let prompts_dir = workflows_dir.join("prompts");
     std::fs::create_dir_all(&prompts_dir)?;
     for (name, source) in BUILTIN_WORKFLOW_PROMPTS {
-        seed_one(&prompts_dir.join(name), source)?;
+        let path = prompts_dir.join(name);
+        if seed_one(&path, source)? {
+            report.created.push(path);
+        } else {
+            report.existing.push(path);
+        }
     }
-    Ok(())
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -144,7 +175,21 @@ mod tests {
         let dir = TempDir::new();
         assert!(!dir.path.exists());
 
-        seed_builtin_workflows(&dir.path).unwrap();
+        let report = seed_builtin_workflows(&dir.path).unwrap();
+        assert!(report.existing.is_empty(), "{report:?}");
+        assert!(
+            report.created.contains(&dir.path.join("chat.yaml")),
+            "{report:?}"
+        );
+        assert!(
+            report.created.contains(&dir.path.join("coding-task.yaml")),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.created.len(),
+            BUILTIN_WORKFLOWS.len() + BUILTIN_WORKFLOW_PROMPTS.len(),
+            "{report:?}"
+        );
 
         let chat_path = dir.path.join("chat.yaml");
         assert!(chat_path.is_file());
@@ -174,6 +219,13 @@ mod tests {
     fn never_overwrites_an_existing_seeded_file() {
         let dir = TempDir::new();
         seed_builtin_workflows(&dir.path).unwrap();
+        let second = seed_builtin_workflows(&dir.path).unwrap();
+        assert!(second.created.is_empty(), "{second:?}");
+        assert_eq!(
+            second.existing.len(),
+            BUILTIN_WORKFLOWS.len() + BUILTIN_WORKFLOW_PROMPTS.len(),
+            "{second:?}"
+        );
         let chat_path = dir.path.join("chat.yaml");
         std::fs::write(&chat_path, "name: my-custom-chat\n").unwrap();
         let coding_task_path = dir.path.join("coding-task.yaml");

@@ -35,8 +35,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/projects/{id}",
             get(projects::get)
-                .patch(projects::rename)
+                .patch(projects::update)
                 .delete(projects::delete),
+        )
+        .route(
+            "/projects/{id}/init-workflows",
+            post(projects::init_workflows),
         )
         .route("/tasks", post(tasks::create).get(tasks::list))
         .route("/tasks/{id}", get(tasks::get).patch(tasks::update_config))
@@ -127,6 +131,11 @@ stages:
         pub ws_url: String,
         client: reqwest::Client,
         workflows_dir: TempDir,
+        /// A separate, empty temp directory — distinct from `workflows_dir`
+        /// — for tests that need a real, absolute, existing directory to use
+        /// as a project's `repo_path` (issue #88), without it being confused
+        /// with the global workflows directory `workflows_dir` already is.
+        repo_dir: TempDir,
         pool: SqlitePool,
     }
 
@@ -177,12 +186,19 @@ stages:
                 ws_url: format!("ws://{addr}"),
                 client: reqwest::Client::new(),
                 workflows_dir,
+                repo_dir: TempDir::new(),
                 pool,
             }
         }
 
         pub fn pool(&self) -> &SqlitePool {
             &self.pool
+        }
+
+        /// A real, absolute, empty directory — usable as a project's
+        /// `repo_path` (issue #88) without touching `workflows_dir`.
+        pub fn temp_dir(&self) -> PathBuf {
+            self.repo_dir.0.clone()
         }
 
         pub fn seed_chat_workflow(&self) {

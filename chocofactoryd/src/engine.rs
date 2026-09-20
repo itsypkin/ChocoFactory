@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chocofactory_core::models::{
-    EventType, RetryMode, RetryOutcome, Task, TaskRun, TaskRunEndReason, TaskRunStatus,
+    EventType, Project, RetryMode, RetryOutcome, Task, TaskRun, TaskRunEndReason, TaskRunStatus,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -39,6 +39,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
+use crate::config_root;
 use crate::db::{events, projects, task_runs, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
 use crate::poll;
@@ -277,32 +278,94 @@ impl From<WorkingDirError> for EngineError {
     }
 }
 
-/// A `workflow_def` name resolved to a file under a `WorkflowEngine`'s
-/// `workflows_dir` (P1-8 LLD §2.8). Deliberately an allowlist
-/// (`^[A-Za-z0-9_-]+$`), not the workflow loader's absolute-path/`..`
-/// blocklist (`workflow_def.rs::resolve_file`/`fileref::resolve_relative`):
-/// `name` is a single opaque identifier that will eventually arrive
-/// straight from an HTTP request body (#9) or CLI arg (#10), materially
-/// less trusted than a relative path written into a workflow file already
-/// sitting on disk — an allowlist leaves no path syntax to reason about.
-fn resolve_workflow_path(workflows_dir: &Path, name: &str) -> Result<PathBuf, ResolveError> {
-    let valid_name = !name.is_empty()
+/// The one allowlist (`^[A-Za-z0-9_-]+$`) every `workflow_def` name is
+/// checked against before it ever touches the filesystem (P1-8 LLD §2.8),
+/// shared by [`resolve_workflow_path`] and [`resolve_task_workflow`]. Not
+/// the workflow loader's absolute-path/`..` blocklist
+/// (`workflow_def.rs::resolve_file`/`fileref::resolve_relative`): `name` is
+/// a single opaque identifier that arrives straight from an HTTP request
+/// body (#9) or CLI arg (#10), materially less trusted than a relative path
+/// written into a workflow file already sitting on disk — an allowlist
+/// leaves no path syntax to reason about.
+fn is_valid_workflow_name(name: &str) -> bool {
+    !name.is_empty()
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !valid_name {
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A `workflow_def` name resolved to a file under a single directory,
+/// `workflows_dir` — the global `~/.config/chocofactory/workflows/`
+/// candidate [`resolve_task_workflow`] falls back to, and the whole
+/// resolution a legacy task (`workflow_path: NULL`) still uses (`load_task_workflow`).
+fn resolve_workflow_path(workflows_dir: &Path, name: &str) -> Result<PathBuf, ResolveError> {
+    if !is_valid_workflow_name(name) {
         return Err(ResolveError::InvalidName(name.to_string()));
     }
     let path = workflows_dir.join(format!("{name}.yaml"));
     if !path.is_file() {
-        return Err(ResolveError::NotFound(name.to_string()));
+        return Err(workflow_not_found(name, std::slice::from_ref(&path)));
     }
     Ok(path)
+}
+
+/// A `workflow_def` name resolved against a task's *project* (issue #88):
+/// `<project.repo_path>/.chocofactory/workflows/<name>.yaml` first (when the
+/// project has a repo), then the global `workflows_dir`, same as
+/// [`resolve_workflow_path`] alone. Returns the first candidate that
+/// exists; used only at task-creation time (`create_task`) — every later
+/// reload of an existing task's workflow goes through `WorkflowEngine::
+/// load_task_workflow` instead, which reads the *recorded* path rather than
+/// searching again.
+///
+/// The candidate list is a small, ordered `Vec` precisely so a future
+/// source (e.g. a task's own worktree) can be added without touching
+/// anything downstream of it — nothing here assumes exactly two
+/// directories, or that a repo/global split is the only shape resolution
+/// will ever have.
+fn resolve_task_workflow(
+    workflows_dir: &Path,
+    project: &Project,
+    name: &str,
+) -> Result<PathBuf, ResolveError> {
+    if !is_valid_workflow_name(name) {
+        return Err(ResolveError::InvalidName(name.to_string()));
+    }
+
+    let mut candidate_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(repo_path) = &project.repo_path {
+        candidate_dirs.push(Path::new(repo_path).join(".chocofactory").join("workflows"));
+    }
+    candidate_dirs.push(workflows_dir.to_path_buf());
+
+    let mut tried = Vec::with_capacity(candidate_dirs.len());
+    for dir in &candidate_dirs {
+        let path = dir.join(format!("{name}.yaml"));
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(path);
+    }
+    Err(workflow_not_found(name, &tried))
+}
+
+/// Builds a [`ResolveError::NotFound`] whose message names every path that
+/// was searched, so a 404 (or an engine test) says exactly where to look
+/// rather than just the bare name that wasn't found anywhere.
+fn workflow_not_found(name: &str, tried: &[PathBuf]) -> ResolveError {
+    let paths: Vec<String> = tried.iter().map(|p| p.display().to_string()).collect();
+    ResolveError::NotFound(format!(
+        "no workflow named '{name}' was found (looked in: {})",
+        paths.join(", ")
+    ))
 }
 
 #[derive(Debug)]
 pub enum ResolveError {
     InvalidName(String),
+    /// No candidate directory had `<name>.yaml`. The message (built by
+    /// [`workflow_not_found`]) already lists every path that was tried, so
+    /// `Display` prints it verbatim rather than re-wrapping it.
     NotFound(String),
 }
 
@@ -315,12 +378,41 @@ impl fmt::Display for ResolveError {
                     "'{name}' is not a valid workflow name (expected only letters, digits, '_', '-')"
                 )
             }
-            ResolveError::NotFound(name) => write!(f, "no workflow named '{name}' was found"),
+            ResolveError::NotFound(message) => write!(f, "{message}"),
         }
     }
 }
 
 impl std::error::Error for ResolveError {}
+
+/// Reads `path` exactly once, hashes those exact bytes (SHA-256, lowercase
+/// hex), and parses the same bytes as a workflow definition (issue #88).
+///
+/// Deliberately a single read: hashing and parsing from two separate reads
+/// would let the recorded hash describe a different file than the one that
+/// actually ran, if something rewrote `path` in between — a real window on
+/// a shared repo checkout, not a hypothetical one.
+fn load_workflow_file(path: &Path) -> Result<(WorkflowDefinition, String), WorkflowDefError> {
+    let raw = fs::read_to_string(path).map_err(WorkflowDefError::Io)?;
+    let sha256 = sha256_hex(raw.as_bytes());
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let definition = WorkflowDefinition::parse(&raw, base_dir)?;
+    Ok((definition, sha256))
+}
+
+/// SHA-256 of `bytes`, lowercase hex — the shape recorded in
+/// `tasks.workflow_sha256` and compared against in `GET /tasks/{id}`'s
+/// `workflow_file_status`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            out.push_str(&format!("{byte:02x}"));
+            out
+        })
+}
 
 #[derive(Debug)]
 pub enum CreateTaskError {
@@ -333,6 +425,15 @@ pub enum CreateTaskError {
     /// already takes for the opposite direction of that same FK.
     NoSuchProject(String),
     Db(sqlx::Error),
+    /// Canonicalizing the resolved workflow file's path failed (issue #88)
+    /// — before it's recorded as `tasks.workflow_path`, which must be the
+    /// canonical absolute path so a later `load_task_workflow` reload never
+    /// depends on the daemon's current working directory. Carries the path
+    /// that failed to canonicalize and the underlying I/O error.
+    Canonicalize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// `start_task` failed for the task row this call just wrote (X-4,
     /// issue #61). Carries `task_id` — the caller only ever sees this
     /// `Err`, never the `Task` `start_task` was trying to start, so
@@ -352,6 +453,11 @@ impl fmt::Display for CreateTaskError {
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
             CreateTaskError::NoSuchProject(id) => write!(f, "no such project '{id}'"),
             CreateTaskError::Db(err) => write!(f, "{err}"),
+            CreateTaskError::Canonicalize { path, source } => write!(
+                f,
+                "could not resolve the canonical path of workflow file '{}': {source}",
+                path.display()
+            ),
             CreateTaskError::Start { task_id, source } => {
                 write!(f, "task '{task_id}' failed to start: {source}")
             }
@@ -406,6 +512,10 @@ pub enum SendMessageError {
     },
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
+    /// This task's recorded `workflow_path` (issue #88) names a file that no
+    /// longer exists. Deliberately not a fallback to a fresh name lookup —
+    /// see `LoadTaskWorkflowError::MissingFile`.
+    MissingWorkflowFile(PathBuf),
     RoleConfig(RoleConfigError),
     GlobalConfig(GlobalConfigError),
     Session(SessionError),
@@ -457,6 +567,11 @@ impl fmt::Display for SendMessageError {
             }
             SendMessageError::Resolve(err) => write!(f, "{err}"),
             SendMessageError::WorkflowDef(err) => write!(f, "{err}"),
+            SendMessageError::MissingWorkflowFile(path) => write!(
+                f,
+                "this task's recorded workflow file is missing: {}",
+                path.display()
+            ),
             SendMessageError::RoleConfig(err) => write!(f, "{err}"),
             SendMessageError::GlobalConfig(err) => write!(f, "{err}"),
             SendMessageError::Session(err) => write!(f, "{err}"),
@@ -477,6 +592,16 @@ impl From<sqlx::Error> for SendMessageError {
 impl From<WorkingDirError> for SendMessageError {
     fn from(err: WorkingDirError) -> Self {
         SendMessageError::Worktree(err)
+    }
+}
+
+impl From<LoadTaskWorkflowError> for SendMessageError {
+    fn from(err: LoadTaskWorkflowError) -> Self {
+        match err {
+            LoadTaskWorkflowError::Resolve(err) => SendMessageError::Resolve(err),
+            LoadTaskWorkflowError::WorkflowDef(err) => SendMessageError::WorkflowDef(err),
+            LoadTaskWorkflowError::MissingFile(path) => SendMessageError::MissingWorkflowFile(path),
+        }
     }
 }
 
@@ -507,6 +632,9 @@ pub enum SendMessageOrResumeError {
     },
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
+    /// This task's recorded `workflow_path` (issue #88) names a file that no
+    /// longer exists — see `LoadTaskWorkflowError::MissingFile`.
+    MissingWorkflowFile(PathBuf),
     Db(sqlx::Error),
     SendMessage(SendMessageError),
     Advance(EngineError),
@@ -548,6 +676,11 @@ impl fmt::Display for SendMessageOrResumeError {
             }
             SendMessageOrResumeError::Resolve(err) => write!(f, "{err}"),
             SendMessageOrResumeError::WorkflowDef(err) => write!(f, "{err}"),
+            SendMessageOrResumeError::MissingWorkflowFile(path) => write!(
+                f,
+                "this task's recorded workflow file is missing: {}",
+                path.display()
+            ),
             SendMessageOrResumeError::Db(err) => write!(f, "{err}"),
             SendMessageOrResumeError::SendMessage(err) => write!(f, "{err}"),
             SendMessageOrResumeError::Advance(err) => write!(f, "{err}"),
@@ -560,6 +693,18 @@ impl std::error::Error for SendMessageOrResumeError {}
 impl From<sqlx::Error> for SendMessageOrResumeError {
     fn from(err: sqlx::Error) -> Self {
         SendMessageOrResumeError::Db(err)
+    }
+}
+
+impl From<LoadTaskWorkflowError> for SendMessageOrResumeError {
+    fn from(err: LoadTaskWorkflowError) -> Self {
+        match err {
+            LoadTaskWorkflowError::Resolve(err) => SendMessageOrResumeError::Resolve(err),
+            LoadTaskWorkflowError::WorkflowDef(err) => SendMessageOrResumeError::WorkflowDef(err),
+            LoadTaskWorkflowError::MissingFile(path) => {
+                SendMessageOrResumeError::MissingWorkflowFile(path)
+            }
+        }
     }
 }
 
@@ -621,6 +766,9 @@ pub enum RetryTaskError {
     RunStillActive(String),
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
+    /// This task's recorded `workflow_path` (issue #88) names a file that no
+    /// longer exists — see `LoadTaskWorkflowError::MissingFile`.
+    MissingWorkflowFile(PathBuf),
     Db(sqlx::Error),
     /// Re-entering the stage itself failed. `retry_task` marks the task
     /// stuck again before returning this.
@@ -653,6 +801,11 @@ impl fmt::Display for RetryTaskError {
             ),
             RetryTaskError::Resolve(err) => write!(f, "{err}"),
             RetryTaskError::WorkflowDef(err) => write!(f, "{err}"),
+            RetryTaskError::MissingWorkflowFile(path) => write!(
+                f,
+                "this task's recorded workflow file is missing: {}",
+                path.display()
+            ),
             RetryTaskError::Db(err) => write!(f, "{err}"),
             RetryTaskError::Enter(err) => write!(f, "{err}"),
             RetryTaskError::NotResumable(why) => {
@@ -663,6 +816,16 @@ impl fmt::Display for RetryTaskError {
 }
 
 impl std::error::Error for RetryTaskError {}
+
+impl From<LoadTaskWorkflowError> for RetryTaskError {
+    fn from(err: LoadTaskWorkflowError) -> Self {
+        match err {
+            LoadTaskWorkflowError::Resolve(err) => RetryTaskError::Resolve(err),
+            LoadTaskWorkflowError::WorkflowDef(err) => RetryTaskError::WorkflowDef(err),
+            LoadTaskWorkflowError::MissingFile(path) => RetryTaskError::MissingWorkflowFile(path),
+        }
+    }
+}
 
 /// How many times in a row one interrupted session may be picked up again
 /// before a retry insists on a fresh start (#92).
@@ -730,6 +893,79 @@ impl From<sqlx::Error> for RetryTaskError {
     }
 }
 
+/// Errors from [`WorkflowEngine::load_task_workflow`] (issue #88) — every
+/// place an *existing* task's workflow is reloaded (`send_message_locked`,
+/// `send_message_or_resume`, `retry_task_locked`) shares this, rather than
+/// each re-resolving `task.workflow_def` by name the way `create_task` does.
+#[derive(Debug)]
+pub enum LoadTaskWorkflowError {
+    Resolve(ResolveError),
+    WorkflowDef(WorkflowDefError),
+    /// `task.workflow_path` names a file that no longer exists. Deliberately
+    /// *not* a fallback to a fresh name lookup against the global workflows
+    /// directory: the whole point of recording a path at creation time is
+    /// that a task keeps running the exact file it started from, so
+    /// silently substituting a different one here — even one with the same
+    /// name — would defeat that guarantee. Carries the missing path so the
+    /// error names it.
+    MissingFile(PathBuf),
+}
+
+impl fmt::Display for LoadTaskWorkflowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadTaskWorkflowError::Resolve(err) => write!(f, "{err}"),
+            LoadTaskWorkflowError::WorkflowDef(err) => write!(f, "{err}"),
+            LoadTaskWorkflowError::MissingFile(path) => write!(
+                f,
+                "this task's recorded workflow file is missing: {}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LoadTaskWorkflowError {}
+
+/// Errors from [`WorkflowEngine::init_project_workflows`] (issue #88).
+#[derive(Debug)]
+pub enum InitWorkflowsError {
+    NoSuchProject(String),
+    /// The project has no `repo_path` at all — nowhere to seed into.
+    NoRepoPath(String),
+    /// The project has a `repo_path`, but it doesn't exist as a directory
+    /// on this machine right now.
+    RepoPathMissing(PathBuf),
+    Db(sqlx::Error),
+    Io(std::io::Error),
+}
+
+impl fmt::Display for InitWorkflowsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InitWorkflowsError::NoSuchProject(id) => write!(f, "no such project '{id}'"),
+            InitWorkflowsError::NoRepoPath(id) => {
+                write!(f, "project '{id}' has no repo_path set")
+            }
+            InitWorkflowsError::RepoPathMissing(path) => write!(
+                f,
+                "project's repo_path '{}' does not exist or is not a directory",
+                path.display()
+            ),
+            InitWorkflowsError::Db(err) => write!(f, "{err}"),
+            InitWorkflowsError::Io(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for InitWorkflowsError {}
+
+impl From<sqlx::Error> for InitWorkflowsError {
+    fn from(err: sqlx::Error) -> Self {
+        InitWorkflowsError::Db(err)
+    }
+}
+
 impl WorkflowEngine {
     pub fn new(
         pool: SqlitePool,
@@ -760,35 +996,117 @@ impl WorkflowEngine {
         }
     }
 
+    /// Loads the workflow definition an *existing* task runs (issue #88) —
+    /// the single place every reload of an already-created task's workflow
+    /// goes through (`send_message_locked`, `send_message_or_resume`,
+    /// `retry_task_locked`), so none of them re-resolve `task.workflow_def`
+    /// by name the way `create_task` does.
+    ///
+    /// `task.workflow_path` is *the* authority once it's set: this loads
+    /// exactly that file, never falling back to a fresh name lookup if it's
+    /// missing — see `LoadTaskWorkflowError::MissingFile`'s doc comment for
+    /// why a silent fallback would be worse than refusing. It does not
+    /// verify the recorded `workflow_sha256`; the file is allowed to have
+    /// changed since the task started (surfaced separately, for display
+    /// only, by `GET /tasks/{id}`'s `workflow_file_status`), and this
+    /// always loads and runs whatever the path currently contains.
+    ///
+    /// `task.workflow_path` is `None` only for a task created before this
+    /// column existed, which falls back to resolving `task.workflow_def` by
+    /// name against the global workflows directory — exactly what every
+    /// caller here did before this method existed.
+    async fn load_task_workflow(
+        &self,
+        task: &Task,
+    ) -> Result<WorkflowDefinition, LoadTaskWorkflowError> {
+        match &task.workflow_path {
+            Some(recorded_path) => {
+                let path = PathBuf::from(recorded_path);
+                match load_workflow_file(&path) {
+                    Ok((definition, _sha256)) => Ok(definition),
+                    Err(WorkflowDefError::Io(io_err))
+                        if io_err.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Err(LoadTaskWorkflowError::MissingFile(path))
+                    }
+                    Err(err) => Err(LoadTaskWorkflowError::WorkflowDef(err)),
+                }
+            }
+            None => {
+                let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
+                    .map_err(LoadTaskWorkflowError::Resolve)?;
+                WorkflowDefinition::load(&path).map_err(LoadTaskWorkflowError::WorkflowDef)
+            }
+        }
+    }
+
     /// Creates a task under `project_id` running `workflow_def_name`,
     /// feeding `initial_input` in as the entry stage's first message
     /// (P1-8 LLD §2.7). `config` is the task-level override layer
     /// `role_config::resolve` reads (`config.roles.<name>.*`, plus the
     /// task-wide `config.cwd`).
     ///
-    /// `workflow_def_name` is resolved and the definition freshly loaded
-    /// on every call, not cached (P1-8 LLD §4.5) — the same file `WorkflowEngine`
-    /// would otherwise have to invalidate a cache entry for.
+    /// `workflow_def_name` is resolved (issue #88: against the project's own
+    /// `.chocofactory/workflows/` first, then the global workflows
+    /// directory — see `resolve_task_workflow`) and the definition freshly
+    /// loaded on every call, not cached (P1-8 LLD §4.5) — the same file
+    /// `WorkflowEngine` would otherwise have to invalidate a cache entry
+    /// for. The resolved file's canonical path and content hash are
+    /// recorded on the task row (`tasks.workflow_path`/`workflow_sha256`),
+    /// which is what every later reload of this task's workflow uses
+    /// instead of resolving by name again (`load_task_workflow`).
     pub async fn create_task(
         self: &Arc<Self>,
         project_id: &str,
         workflow_def_name: &str,
         title: &str,
         initial_input: &str,
-        config: Value,
+        mut config: Value,
     ) -> Result<Task, CreateTaskError> {
-        let path = resolve_workflow_path(&self.workflows_dir, workflow_def_name)
-            .map_err(CreateTaskError::Resolve)?;
-        let definition =
-            Arc::new(WorkflowDefinition::load(&path).map_err(CreateTaskError::WorkflowDef)?);
+        // The project is loaded first, before any workflow resolution
+        // (issue #88 review: resolution now needs it to search the
+        // project's own repo) — checked explicitly rather than left to
+        // surface as a raw FK violation from the `INSERT` below (P1-9
+        // review): `tasks.project_id` is a foreign key and
+        // `db::pool::connect` enables `foreign_keys`, so a bad id would
+        // otherwise fail as an opaque `sqlx::Error` instead of a reported,
+        // specific error the API layer can map to 404.
+        let project = projects::get(&self.pool, project_id)
+            .await?
+            .ok_or_else(|| CreateTaskError::NoSuchProject(project_id.to_string()))?;
 
-        // Checked explicitly rather than left to surface as a raw FK
-        // violation from the `INSERT` below (P1-9 review): `tasks.project_id`
-        // is a foreign key and `db::pool::connect` enables `foreign_keys`, so
-        // a bad id would otherwise fail as an opaque `sqlx::Error` instead of
-        // a reported, specific error the API layer can map to 404.
-        if projects::get(&self.pool, project_id).await?.is_none() {
-            return Err(CreateTaskError::NoSuchProject(project_id.to_string()));
+        let path = resolve_task_workflow(&self.workflows_dir, &project, workflow_def_name)
+            .map_err(CreateTaskError::Resolve)?;
+
+        // Canonicalize *before* loading (issue #88 review, F2): if `path`
+        // is itself a symlink — a per-repo dotfile link, or a repo
+        // deliberately linking a shared workflow file — resolving prompt
+        // files against the link's parent here and recording the target's
+        // canonical parent for every later reload would mean the file this
+        // stage actually parsed prompts relative to isn't the file the
+        // recorded `workflow_path` describes. Canonicalizing first makes
+        // `load_workflow_file`'s `path.parent()` the exact same directory
+        // `load_task_workflow` resolves against on every subsequent reload.
+        let workflow_path =
+            std::fs::canonicalize(&path).map_err(|source| CreateTaskError::Canonicalize {
+                path: path.clone(),
+                source,
+            })?;
+        let workflow_path_str = workflow_path.to_string_lossy().into_owned();
+
+        let (definition, workflow_sha256) =
+            load_workflow_file(&workflow_path).map_err(CreateTaskError::WorkflowDef)?;
+        let definition = Arc::new(definition);
+
+        // An explicit `--repo`/`config.cwd` always wins; this only fills in
+        // the project's own repo when the caller didn't already say where
+        // to run. `config` staying non-object (or already having a string
+        // `cwd`) is left alone — the existing leniency elsewhere in this
+        // module already treats a non-object `config` as "no overrides".
+        if let (Some(repo_path), Some(map)) = (&project.repo_path, config.as_object_mut())
+            && !matches!(map.get("cwd"), Some(Value::String(_)))
+        {
+            map.insert("cwd".to_string(), Value::String(repo_path.clone()));
         }
 
         let task = tasks::create(
@@ -798,6 +1116,8 @@ impl WorkflowEngine {
                 workflow_def: workflow_def_name,
                 title,
                 config,
+                workflow_path: Some(&workflow_path_str),
+                workflow_sha256: Some(&workflow_sha256),
             },
         )
         .await?;
@@ -959,9 +1279,7 @@ impl WorkflowEngine {
             });
         }
 
-        let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
-            .map_err(SendMessageError::Resolve)?;
-        let definition = WorkflowDefinition::load(&path).map_err(SendMessageError::WorkflowDef)?;
+        let definition = self.load_task_workflow(&task).await?;
 
         let state = workflow_state::get(&self.pool, task_id)
             .await?
@@ -1106,11 +1424,7 @@ impl WorkflowEngine {
             });
         }
 
-        let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
-            .map_err(SendMessageOrResumeError::Resolve)?;
-        let definition = Arc::new(
-            WorkflowDefinition::load(&path).map_err(SendMessageOrResumeError::WorkflowDef)?,
-        );
+        let definition = Arc::new(self.load_task_workflow(&task).await?);
 
         let state = workflow_state::get(&self.pool, task_id)
             .await?
@@ -1489,10 +1803,7 @@ impl WorkflowEngine {
             return Err(RetryTaskError::NotStuck(task.status));
         }
 
-        let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
-            .map_err(RetryTaskError::Resolve)?;
-        let definition =
-            Arc::new(WorkflowDefinition::load(&path).map_err(RetryTaskError::WorkflowDef)?);
+        let definition = Arc::new(self.load_task_workflow(&task).await?);
 
         let state = workflow_state::get(&self.pool, task_id)
             .await?
@@ -1693,6 +2004,34 @@ impl WorkflowEngine {
             previous_run_id: run.id.clone(),
             end_reason,
         }))
+    }
+
+    /// Seeds `project_id`'s repo with the built-in workflows and their
+    /// prompt files, under `<repo_path>/.chocofactory/workflows/` (issue
+    /// #88: `choco project init-workflows <project>`) — the repo-local
+    /// counterpart of the daemon's own startup seed of the global
+    /// `~/.config/chocofactory/workflows/` directory, via the same
+    /// `config_root::seed_builtin_workflows` (so a repo-local copy has the
+    /// exact same never-overwrite guarantee and creates-on-first-seed
+    /// behaviour). Never touches git — no add, no commit; that's left to
+    /// the operator, who `choco project init-workflows`'s own CLI output
+    /// hints at.
+    pub async fn init_project_workflows(
+        &self,
+        project_id: &str,
+    ) -> Result<config_root::SeedReport, InitWorkflowsError> {
+        let project = projects::get(&self.pool, project_id)
+            .await?
+            .ok_or_else(|| InitWorkflowsError::NoSuchProject(project_id.to_string()))?;
+        let repo_path = project
+            .repo_path
+            .ok_or_else(|| InitWorkflowsError::NoRepoPath(project_id.to_string()))?;
+        let repo = PathBuf::from(&repo_path);
+        if !repo.is_dir() {
+            return Err(InitWorkflowsError::RepoPathMissing(repo));
+        }
+        let workflows_dir = repo.join(".chocofactory").join("workflows");
+        config_root::seed_builtin_workflows(&workflows_dir).map_err(InitWorkflowsError::Io)
     }
 
     /// Claims an id for a detached `shell`/`poll` runner about to be
@@ -4996,7 +5335,7 @@ mod tests {
     }
 
     async fn seed_task(pool: &SqlitePool, workflow_def: &str) -> String {
-        let project_id = projects::create(pool, "demo").await.unwrap().id;
+        let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         tasks::create(
             pool,
             tasks::NewTask {
@@ -5004,6 +5343,8 @@ mod tests {
                 workflow_def,
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -6181,7 +6522,7 @@ stages:
         let dir = tempdir();
         let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
 
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -6189,6 +6530,8 @@ stages:
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": dir.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -6366,7 +6709,7 @@ stages:
         let dir = tempdir();
         std::fs::write(dir.join("marker-file"), b"x").unwrap();
 
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let def = shell_def("ls", "    capture: text");
         let task_id = tasks::create(
             &pool,
@@ -6375,6 +6718,8 @@ stages:
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": dir.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -6655,6 +7000,43 @@ stages:
         ));
     }
 
+    /// `resolve_task_workflow` has its own `is_valid_workflow_name` check
+    /// (engine.rs, issue #88 review, F1) — `create_task` calls it instead of
+    /// `resolve_workflow_path`, and the only test of the allowlist,
+    /// `resolve_workflow_path_only_accepts_a_safe_allowlisted_name`, exercises
+    /// the *other* function. Without a direct test here, deleting the check
+    /// (or moving it after the repo/global joins) would still pass the rest
+    /// of the suite while reopening path traversal at `POST /tasks`, since
+    /// the name is now joined onto a caller-controlled `project.repo_path`
+    /// as well as the global directory.
+    #[test]
+    fn resolve_task_workflow_only_accepts_a_safe_allowlisted_name() {
+        let workflows_dir = tempdir();
+        std::fs::write(workflows_dir.join("chat.yaml"), "irrelevant").unwrap();
+        let repo = tempdir();
+        write_repo_workflow(&repo, "chat", "irrelevant");
+        let project = Project {
+            id: "p1".to_string(),
+            name: "demo".to_string(),
+            repo_path: Some(repo.display().to_string()),
+            created_at: chrono::Utc::now(),
+        };
+
+        assert!(resolve_task_workflow(&workflows_dir, &project, "chat").is_ok());
+        assert!(matches!(
+            resolve_task_workflow(&workflows_dir, &project, "").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+        assert!(matches!(
+            resolve_task_workflow(&workflows_dir, &project, "../etc/passwd").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+        assert!(matches!(
+            resolve_task_workflow(&workflows_dir, &project, "chat/../../etc").unwrap_err(),
+            ResolveError::InvalidName(_)
+        ));
+    }
+
     fn write_chat_workflow(workflows_dir: &Path) {
         std::fs::write(
             workflows_dir.join("chat.yaml"),
@@ -6679,7 +7061,7 @@ stages:
         let pool = connect_in_memory().await.unwrap();
         let workflows_dir = tempdir();
         write_chat_workflow(&workflows_dir);
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             &fixture_binary("fake_claude.py"),
@@ -6709,16 +7091,38 @@ stages:
     async fn create_task_with_an_unknown_workflow_name_errors() {
         let pool = connect_in_memory().await.unwrap();
         let workflows_dir = tempdir();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
 
         let err = engine
             .create_task(&project_id, "ghost", "t", "hi", json!({}))
             .await
             .unwrap_err();
+        let CreateTaskError::Resolve(ResolveError::NotFound(message)) = &err else {
+            panic!("expected Resolve(NotFound), got {err:?}");
+        };
+        assert!(message.contains("ghost"), "{message}");
+    }
+
+    /// `create_task` itself must reject an invalid workflow name before it
+    /// ever tries to search for it (issue #88 review, F1) — a unit test on
+    /// `resolve_task_workflow` alone wouldn't catch a regression where
+    /// `create_task` stopped calling it, or called it after building the
+    /// repo/global candidate paths instead of before.
+    #[tokio::test]
+    async fn create_task_with_an_invalid_workflow_name_is_rejected_before_any_lookup() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &workflows_dir);
+
+        let err = engine
+            .create_task(&project_id, "../etc/passwd", "t", "hi", json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
-            CreateTaskError::Resolve(ResolveError::NotFound(name)) if name == "ghost"
+            CreateTaskError::Resolve(ResolveError::InvalidName(_))
         ));
     }
 
@@ -6739,12 +7143,282 @@ stages:
         ));
     }
 
+    // ---- project workflows: repo path resolution (issue #88) ----
+
+    /// Writes `<dir>/.chocofactory/workflows/<name>.yaml`, creating both
+    /// directories.
+    fn write_repo_workflow(repo: &Path, name: &str, yaml: &str) -> PathBuf {
+        let workflows_dir = repo.join(".chocofactory").join("workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        let path = workflows_dir.join(format!("{name}.yaml"));
+        std::fs::write(&path, yaml).unwrap();
+        path
+    }
+
+    fn one_role_workflow_yaml(name: &str, model: &str) -> String {
+        format!(
+            r#"
+name: {name}
+roles:
+  chat:
+    cli: claude
+    model: {model}
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {{}}
+"#
+        )
+    }
+
+    /// A project with a repo that has `.chocofactory/workflows/x.yaml`, and
+    /// a *different* global `x.yaml` (a different role model, so the two
+    /// files are byte-distinct): `create_task` must use the repo file, and
+    /// record its canonical path and its own SHA-256 — not the global
+    /// file's.
+    #[tokio::test]
+    async fn create_task_prefers_the_projects_repo_workflow_over_the_global_one() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        std::fs::write(
+            global_dir.join("x.yaml"),
+            one_role_workflow_yaml("x", "sonnet"),
+        )
+        .unwrap();
+        let repo_path = write_repo_workflow(&repo_dir, "x", &one_role_workflow_yaml("x", "opus"));
+
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &global_dir,
+        );
+
+        let task = engine
+            .create_task(&project.id, "x", "t", "hi", json!({}))
+            .await
+            .unwrap();
+
+        let canonical_repo_path = std::fs::canonicalize(&repo_path).unwrap();
+        assert_eq!(
+            task.workflow_path.as_deref(),
+            Some(canonical_repo_path.to_string_lossy().as_ref())
+        );
+        let repo_bytes = std::fs::read(&repo_path).unwrap();
+        assert_eq!(
+            task.workflow_sha256.as_deref(),
+            Some(sha256_hex(&repo_bytes).as_str())
+        );
+    }
+
+    /// The repo has no `x.yaml`, so the global one is used and recorded —
+    /// today's behaviour, still exercised through the new resolution path.
+    #[tokio::test]
+    async fn create_task_falls_back_to_the_global_workflow_when_the_repo_lacks_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        std::fs::write(
+            global_dir.join("x.yaml"),
+            one_role_workflow_yaml("x", "sonnet"),
+        )
+        .unwrap();
+        // The repo exists but has no `.chocofactory/workflows/x.yaml`.
+
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &global_dir,
+        );
+
+        let task = engine
+            .create_task(&project.id, "x", "t", "hi", json!({}))
+            .await
+            .unwrap();
+
+        let canonical_global_path = std::fs::canonicalize(global_dir.join("x.yaml")).unwrap();
+        assert_eq!(
+            task.workflow_path.as_deref(),
+            Some(canonical_global_path.to_string_lossy().as_ref())
+        );
+    }
+
+    /// Neither the repo nor the global directory has the workflow: the
+    /// error's message names both searched paths.
+    #[tokio::test]
+    async fn create_task_when_neither_repo_nor_global_has_it_lists_both_searched_paths() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &global_dir);
+
+        let err = engine
+            .create_task(&project.id, "x", "t", "hi", json!({}))
+            .await
+            .unwrap_err();
+        let CreateTaskError::Resolve(ResolveError::NotFound(message)) = &err else {
+            panic!("expected Resolve(NotFound), got {err:?}");
+        };
+        let expected_repo_path = repo_dir
+            .join(".chocofactory")
+            .join("workflows")
+            .join("x.yaml");
+        assert!(
+            message.contains(&expected_repo_path.to_string_lossy().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&global_dir.join("x.yaml").to_string_lossy().to_string()),
+            "{message}"
+        );
+    }
+
+    /// A project without `repo_path` resolves against the global directory
+    /// only — today's behaviour, unaffected by issue #88.
+    #[tokio::test]
+    async fn create_task_without_a_project_repo_only_searches_the_global_directory() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        write_chat_workflow(&global_dir);
+        let project = projects::create(&pool, "demo", None).await.unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &global_dir,
+        );
+
+        let task = engine
+            .create_task(&project.id, "chat", "t", "hi", json!({}))
+            .await
+            .unwrap();
+
+        let canonical = std::fs::canonicalize(global_dir.join("chat.yaml")).unwrap();
+        assert_eq!(
+            task.workflow_path.as_deref(),
+            Some(canonical.to_string_lossy().as_ref())
+        );
+    }
+
+    /// `config.cwd` absent and `project.repo_path` set: `create_task` fills
+    /// it in, so the repo is visible in the task's config exactly as if
+    /// `--repo`/`config.cwd` had been passed directly.
+    #[tokio::test]
+    async fn create_task_fills_config_cwd_from_the_projects_repo_path_when_absent() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        write_chat_workflow(&global_dir);
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &global_dir,
+        );
+
+        let task = engine
+            .create_task(&project.id, "chat", "t", "hi", json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(task.config["cwd"], repo_dir.to_string_lossy().as_ref());
+    }
+
+    /// An explicit `config.cwd` (what `--repo` sends) wins over the
+    /// project's own `repo_path`.
+    #[tokio::test]
+    async fn create_task_explicit_cwd_wins_over_the_projects_repo_path() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        let explicit_dir = tempdir();
+        write_chat_workflow(&global_dir);
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &global_dir,
+        );
+
+        let task = engine
+            .create_task(
+                &project.id,
+                "chat",
+                "t",
+                "hi",
+                json!({ "cwd": explicit_dir.to_string_lossy() }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task.config["cwd"], explicit_dir.to_string_lossy().as_ref());
+    }
+
+    /// A repo workflow's `prompt_file` resolves relative to the repo's own
+    /// `.chocofactory/workflows/` directory, not the global one — the
+    /// standard `WorkflowDefinition::load` behaviour, exercised through the
+    /// new repo-first resolution path.
+    #[tokio::test]
+    async fn create_task_resolves_prompt_files_relative_to_the_repo_workflow_file() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        let workflows_dir = repo_dir.join(".chocofactory").join("workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        std::fs::write(workflows_dir.join("prompt.md"), "Do the templated thing.").unwrap();
+        std::fs::write(
+            workflows_dir.join("templated.yaml"),
+            r#"
+name: templated
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    prompt_file: prompt.md
+    on: {}
+"#,
+        )
+        .unwrap();
+
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &global_dir,
+        );
+
+        engine
+            .create_task(&project.id, "templated", "t", "hi", json!({}))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn send_message_reaches_the_live_session_started_by_create_task() {
         let pool = connect_in_memory().await.unwrap();
         let workflows_dir = tempdir();
         write_chat_workflow(&workflows_dir);
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             &fixture_binary("fake_claude.py"),
@@ -6784,6 +7458,170 @@ stages:
         assert!(saw_echo, "follow-up message never reached the live session");
     }
 
+    /// `send_message_or_resume` on a task created from a repo workflow
+    /// reloads the *recorded* `workflow_path` (issue #88), not a fresh
+    /// by-name lookup — proved by writing a different, broken `chat.yaml`
+    /// into the global directory *after* the task was created (with no
+    /// `stages.chatting`, so if the engine ever loaded it instead, the
+    /// stage lookup would fail with `UnknownStage`) and confirming the send
+    /// still succeeds against the repo file.
+    #[tokio::test]
+    async fn send_message_or_resume_reloads_the_recorded_repo_workflow_path() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        write_repo_workflow(&repo_dir, "chat", &one_role_workflow_yaml("chat", "sonnet"));
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &global_dir,
+        );
+
+        let task = engine
+            .create_task(&project.id, "chat", "t", "hello", json!({}))
+            .await
+            .unwrap();
+
+        // A different `chat.yaml` lands in the global directory after
+        // creation, with no `chatting` stage at all.
+        std::fs::write(
+            global_dir.join("chat.yaml"),
+            "name: chat\nstages:\n  other_stage:\n    kind: terminal\n",
+        )
+        .unwrap();
+
+        engine
+            .send_message_or_resume(&task.id, "still there?")
+            .await
+            .unwrap();
+
+        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let mut saw_echo = false;
+        for _ in 0..200 {
+            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+                .await
+                .unwrap();
+            if events.iter().any(|e| {
+                e.payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t == "echo:still there?")
+            }) {
+                saw_echo = true;
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(
+            saw_echo,
+            "send must still have used the recorded repo workflow file"
+        );
+    }
+
+    /// Deleting the recorded workflow file makes the send fail with the
+    /// missing-file error — not a silent fallback to the global directory,
+    /// even though a `chat.yaml` sits right there.
+    #[tokio::test]
+    async fn send_message_or_resume_on_a_task_whose_recorded_file_was_deleted_fails_not_falls_back()
+    {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        write_chat_workflow(&global_dir);
+        let repo_workflow_path =
+            write_repo_workflow(&repo_dir, "chat", &one_role_workflow_yaml("chat", "sonnet"));
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &global_dir,
+        );
+
+        let task = engine
+            .create_task(&project.id, "chat", "t", "hello", json!({}))
+            .await
+            .unwrap();
+
+        std::fs::remove_file(&repo_workflow_path).unwrap();
+
+        let err = engine
+            .send_message_or_resume(&task.id, "hello?")
+            .await
+            .unwrap_err();
+        // `send_message_or_resume` loads the task's workflow itself, before
+        // it even knows which stage kind it's dispatching to, so the
+        // missing-file error surfaces at its own top level here — not
+        // wrapped in the `SendMessage(...)` variant `send_message`'s own
+        // (redundant) reload would produce.
+        assert!(
+            matches!(&err, SendMessageOrResumeError::MissingWorkflowFile(_)),
+            "expected a missing-file error, not a silent fallback to the global chat.yaml: {err:?}"
+        );
+    }
+
+    /// A legacy task — `workflow_path: NULL`, as every task created before
+    /// this column existed has — still reloads by name from the global
+    /// directory, exactly as it always did.
+    #[tokio::test]
+    async fn send_message_or_resume_on_a_legacy_task_falls_back_to_a_name_lookup() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        write_chat_workflow(&workflows_dir);
+        let task_id = seed_task(&pool, "chat").await;
+        let def = Arc::new(WorkflowDefinition::load(&workflows_dir.join("chat.yaml")).unwrap());
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &workflows_dir,
+        );
+
+        engine
+            .start_task(&task_id, &def, Some("hello"))
+            .await
+            .unwrap();
+        assert!(
+            tasks::get(&pool, &task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workflow_path
+                .is_none(),
+            "seed_task must produce a legacy task with no recorded workflow_path"
+        );
+
+        engine
+            .send_message_or_resume(&task_id, "still there?")
+            .await
+            .unwrap();
+
+        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let mut saw_echo = false;
+        for _ in 0..200 {
+            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+                .await
+                .unwrap();
+            if events.iter().any(|e| {
+                e.payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t == "echo:still there?")
+            }) {
+                saw_echo = true;
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(
+            saw_echo,
+            "legacy task must still resolve its workflow by name"
+        );
+    }
+
     /// Regression test: the `events` table used to only ever hold what the
     /// agent adapter emitted — the human's own side of the conversation
     /// (both the task's initial prompt and every `send_message` relay)
@@ -6796,7 +7634,7 @@ stages:
         let pool = connect_in_memory().await.unwrap();
         let workflows_dir = tempdir();
         write_chat_workflow(&workflows_dir);
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             &fixture_binary("fake_claude.py"),
@@ -6889,7 +7727,7 @@ stages:
 "#,
         )
         .unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             &fixture_binary("fake_claude.py"),
@@ -6937,7 +7775,7 @@ stages:
 "#,
         )
         .unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             &fixture_binary("fake_claude.py"),
@@ -7140,7 +7978,7 @@ stages:
         let pool = connect_in_memory().await.unwrap();
         let workflows_dir = tempdir();
         write_chat_workflow(&workflows_dir);
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             &fixture_binary("fake_claude.py"),
@@ -7284,7 +8122,7 @@ stages:
     }
 
     async fn seed_task_in(pool: &SqlitePool, workflow_def: &str, cwd: &Path) -> String {
-        let project_id = projects::create(pool, "demo").await.unwrap().id;
+        let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         tasks::create(
             pool,
             tasks::NewTask {
@@ -7292,6 +8130,8 @@ stages:
                 workflow_def,
                 title: "T",
                 config: json!({ "cwd": cwd.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -9191,7 +10031,7 @@ roles:
         write_two_role_workflow(&workflows_dir);
         let global_config_path = write_global_config(&dir);
 
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_global_config(
             pool.clone(),
             &fixture_binary("fake_claude_echo_args.py"),
@@ -9293,7 +10133,7 @@ stages:
         .unwrap();
         let global_config_path = write_global_config(&dir);
 
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_global_config(
             pool.clone(),
             &fixture_binary("fake_claude_echo_args.py"),
@@ -9401,7 +10241,7 @@ stages:
 "#;
         let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
 
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -9409,6 +10249,8 @@ stages:
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -9455,7 +10297,7 @@ stages:
 "#;
         let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
 
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -9463,6 +10305,8 @@ stages:
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -9493,7 +10337,7 @@ stages:
         let def = human_gate_chain_def();
         assert!(!def.worktree, "human_gate_chain_def must not opt in");
 
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -9501,6 +10345,8 @@ stages:
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -9567,7 +10413,7 @@ stages:
 "#;
         let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
 
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -9575,6 +10421,8 @@ stages:
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -9599,7 +10447,7 @@ stages:
         )
         .await
         .unwrap();
-        projects::rename(&pool, &project_id, "renamed")
+        projects::update(&pool, &project_id, Some("renamed"), None)
             .await
             .unwrap();
 
@@ -9879,7 +10727,7 @@ esac
         fs::write(&reply_path, reviewer_reply).unwrap();
         let claude_wrapper = role_dispatch_claude(scripts_dir, &mock_claude, &reply_path);
 
-        let project_id = projects::create(pool, "demo").await.unwrap().id;
+        let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             pool,
             tasks::NewTask {
@@ -9887,6 +10735,8 @@ esac
                 workflow_def: &def.name,
                 title: "Add a small feature",
                 config: json!({ "cwd": repo.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -10119,7 +10969,7 @@ stages:
     kind: terminal
 "#;
         let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -10127,6 +10977,8 @@ stages:
                 workflow_def: &def.name,
                 title: "T",
                 config: json!({ "cwd": repo.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -10741,11 +11593,12 @@ stages:
     /// Creating the marker and retrying lets the same command succeed.
     ///
     /// Written to `workflows_dir` as `retry-flow.yaml`, not just parsed in
-    /// memory: `retry_task` re-resolves the task's `workflow_def` by name
-    /// through `resolve_workflow_path`, the same as `create_task`/
-    /// `send_message`, so a test driving it needs a real file on disk —
-    /// unlike `start_task`, which takes an already-loaded definition
-    /// directly and never touches `workflows_dir` itself.
+    /// memory: `retry_task` reloads the task's workflow via
+    /// `load_task_workflow` — the recorded `workflow_path` for a task
+    /// created through `create_task`, or a name lookup for a legacy one —
+    /// so a test driving it needs a real file on disk — unlike `start_task`,
+    /// which takes an already-loaded definition directly and never touches
+    /// `workflows_dir` itself.
     fn write_marker_shell_workflow(workflows_dir: &Path, marker: &Path) -> Arc<WorkflowDefinition> {
         let yaml = format!(
             r#"
@@ -10847,7 +11700,7 @@ stages:
 "#,
         )
         .unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             "/no/such/binary-3f6c9a",
@@ -10903,6 +11756,151 @@ stages:
                 .any(|(stage, outcome)| stage == "run" && outcome == &json!("retry")),
             "expected a stage_entered event with outcome 'retry': {trail:?}"
         );
+    }
+
+    /// `retry_task` on a stuck task created from a repo workflow (issue
+    /// #88) reloads the recorded path, not a fresh by-name lookup — proved
+    /// the same way the `send_message_or_resume` version above is: a
+    /// different, broken `retry-flow.yaml` lands in the global directory
+    /// after the task got stuck, and the retry still succeeds against the
+    /// repo file.
+    #[tokio::test]
+    async fn retry_task_on_a_repo_workflow_task_reloads_the_recorded_path() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        let marker = repo_dir.join("marker");
+        let yaml = format!(
+            r#"
+name: retry-flow
+stages:
+  run:
+    kind: shell
+    command: "test -f {}"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+            marker.display()
+        );
+        write_repo_workflow(&repo_dir, "retry-flow", &yaml);
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &global_dir);
+
+        let task = engine
+            .create_task(&project.id, "retry-flow", "t", "hi", json!({}))
+            .await
+            .unwrap();
+        wait_until_task_status(&pool, &task.id, "stuck").await;
+
+        // A different, broken `retry-flow.yaml` (no `run` stage at all)
+        // lands in the global directory only now — if `retry_task` fell
+        // back to a name lookup it would load this one and fail with
+        // `UnknownStage` instead of re-running the shell command.
+        std::fs::write(
+            global_dir.join("retry-flow.yaml"),
+            "name: retry-flow\nstages:\n  other_stage:\n    kind: terminal\n",
+        )
+        .unwrap();
+
+        std::fs::write(&marker, "").unwrap();
+        engine.retry_task(&task.id, RetryMode::Auto).await.unwrap();
+
+        wait_until_task_status(&pool, &task.id, "closed").await;
+    }
+
+    // ---- init_project_workflows (issue #88) ----
+
+    #[tokio::test]
+    async fn init_project_workflows_seeds_the_builtins_and_never_overwrites() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &global_dir);
+
+        let report = engine.init_project_workflows(&project.id).await.unwrap();
+        let target = repo_dir.join(".chocofactory").join("workflows");
+        assert!(target.join("coding-task.yaml").is_file());
+        assert!(target.join("chat.yaml").is_file());
+        for name in [
+            "coder-system.md",
+            "coder-turn.md",
+            "coder-revise.md",
+            "reviewer-system.md",
+            "reviewer-turn.md",
+        ] {
+            assert!(
+                target.join("prompts").join(name).is_file(),
+                "expected prompts/{name} to be seeded"
+            );
+        }
+        assert!(
+            report.created.contains(&target.join("chat.yaml")),
+            "{report:?}"
+        );
+
+        // A user edits one of the seeded files...
+        std::fs::write(target.join("chat.yaml"), "name: my-custom-chat\n").unwrap();
+
+        // ...and a second call reports everything as already existing,
+        // leaving the edit untouched.
+        let second = engine.init_project_workflows(&project.id).await.unwrap();
+        assert!(second.created.is_empty(), "{second:?}");
+        assert!(!second.existing.is_empty(), "{second:?}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("chat.yaml")).unwrap(),
+            "name: my-custom-chat\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_project_workflows_without_a_repo_path_errors() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let project = projects::create(&pool, "demo", None).await.unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &global_dir);
+
+        let err = engine
+            .init_project_workflows(&project.id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InitWorkflowsError::NoRepoPath(id) if id == project.id));
+    }
+
+    #[tokio::test]
+    async fn init_project_workflows_with_a_missing_repo_path_errors() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let repo_dir = tempdir();
+        let missing = repo_dir.join("does-not-exist");
+        let project = projects::create(&pool, "demo", Some(&missing.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &global_dir);
+
+        let err = engine
+            .init_project_workflows(&project.id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InitWorkflowsError::RepoPathMissing(path) if path == missing));
+    }
+
+    #[tokio::test]
+    async fn init_project_workflows_on_an_unknown_project_errors() {
+        let pool = connect_in_memory().await.unwrap();
+        let global_dir = tempdir();
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &global_dir);
+
+        let err = engine
+            .init_project_workflows("no-such-project")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InitWorkflowsError::NoSuchProject(id) if id == "no-such-project"));
     }
 
     #[tokio::test]
@@ -11542,7 +12540,7 @@ stages:
 "#,
         )
         .unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             "/no/such/binary-3f6c9a",
@@ -11668,7 +12666,7 @@ stages:
 "#,
         )
         .unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
 
         let err = engine

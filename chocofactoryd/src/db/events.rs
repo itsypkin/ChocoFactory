@@ -493,7 +493,7 @@ mod tests {
     use serde_json::json;
 
     async fn seed_task_run(pool: &SqlitePool) -> String {
-        let project_id = projects::create(pool, "demo").await.unwrap().id;
+        let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             pool,
             tasks::NewTask {
@@ -501,6 +501,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -566,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn stage_transitions_are_task_scoped_and_carry_stage_and_outcome() {
         let pool = connect_in_memory().await.unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -574,6 +576,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -609,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn stage_transitions_interleave_with_session_events_in_one_timeline() {
         let pool = connect_in_memory().await.unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -617,6 +621,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -683,12 +689,14 @@ mod tests {
     #[tokio::test]
     async fn the_stage_trail_of_one_task_excludes_another_tasks_transitions() {
         let pool = connect_in_memory().await.unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let new_task = |title: &'static str| tasks::NewTask {
             project_id: &project_id,
             workflow_def: "chat",
             title,
             config: json!({}),
+            workflow_path: None,
+            workflow_sha256: None,
         };
         let first = tasks::create(&pool, new_task("A")).await.unwrap().id;
         let second = tasks::create(&pool, new_task("B")).await.unwrap().id;
@@ -719,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn the_stage_trail_of_a_task_with_no_transitions_is_empty() {
         let pool = connect_in_memory().await.unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -727,6 +735,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -762,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn list_for_task_orders_events_across_multiple_task_runs() {
         let pool = connect_in_memory().await.unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -770,6 +780,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await
@@ -816,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn list_for_task_page_caps_results_and_pages_via_the_cursor() {
         let pool = connect_in_memory().await.unwrap();
-        let project_id = projects::create(&pool, "demo").await.unwrap().id;
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             &pool,
             tasks::NewTask {
@@ -824,6 +836,8 @@ mod tests {
                 workflow_def: "chat",
                 title: "T",
                 config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
             },
         )
         .await

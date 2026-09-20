@@ -174,8 +174,10 @@ pub struct TaskCreateArgs {
     /// `project list`, and is rejected if it matches more than one project.
     #[arg(long)]
     pub project: String,
-    /// Workflow definition name (any name under
-    /// `~/.config/chocofactory/workflows/`, not a fixed set).
+    /// Workflow definition name — looked up in the project's own repo
+    /// first (`<repo>/.chocofactory/workflows/<name>.yaml`, issue #88), then
+    /// in the global `~/.config/chocofactory/workflows/<name>.yaml`. Not a
+    /// fixed set either way.
     #[arg(long)]
     pub workflow: String,
     #[arg(long)]
@@ -184,7 +186,8 @@ pub struct TaskCreateArgs {
     #[arg(long)]
     pub prompt: String,
     /// Working directory for the task's agent subprocess. Maps to
-    /// `config.cwd`.
+    /// `config.cwd`. Defaults to the project's own repo path (issue #88)
+    /// when the project has one and this is omitted.
     #[arg(long)]
     pub repo: Option<String>,
     #[command(flatten)]
@@ -244,9 +247,42 @@ pub enum ProjectCmd {
     Create {
         /// Project name.
         name: String,
+        /// A repo this project's tasks default their own `--repo` to
+        /// (issue #88). Resolved to an absolute path client-side (a
+        /// relative path, including `.`, works) — canonicalization fails
+        /// before any request reaches the daemon if the path doesn't exist
+        /// or isn't a directory.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Change a project's name and/or repo path.
+    Update {
+        /// Project name or id.
+        project: String,
+        /// New name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New repo path, resolved to an absolute path client-side like
+        /// `project create --repo`. Conflicts with `--no-repo`.
+        #[arg(long, conflicts_with = "no_repo")]
+        repo: Option<String>,
+        /// Clears the project's repo path. Conflicts with `--repo`.
+        #[arg(long, conflicts_with = "repo")]
+        no_repo: bool,
     },
     /// List all projects.
     List,
+    /// Seed this project's repo with the built-in workflows and their
+    /// prompt files, under `<repo>/.chocofactory/workflows/` (issue #88).
+    ///
+    /// Never overwrites an existing file — safe to run again after an
+    /// upgrade adds new built-ins, or just to check what's already there.
+    /// The seeded directory is meant to be committed and shared with the
+    /// team: `git add .chocofactory/ && git commit`.
+    InitWorkflows {
+        /// Project name or id.
+        project: String,
+    },
 }
 
 #[cfg(test)]
