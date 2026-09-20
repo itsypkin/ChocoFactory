@@ -511,7 +511,7 @@ stages:
     assert_eq!(backlog["payload"]["stage"], "gate");
     assert_eq!(backlog["payload"]["outcome"], Value::Null);
     assert_eq!(backlog["task_id"], task_id.as_str());
-    assert_eq!(backlog["task_run_id"], Value::Null);
+    assert_eq!(backlog["session_id"], Value::Null);
 
     // Resume the gate. This advances the workflow without starting any
     // session, so the engine's own notify for the transition it just
@@ -532,7 +532,7 @@ stages:
     assert_eq!(human_message["event_type"], "human_message");
     assert_eq!(human_message["payload"]["text"], "go");
     assert_eq!(human_message["task_id"], task_id.as_str());
-    assert_eq!(human_message["task_run_id"], Value::Null);
+    assert_eq!(human_message["session_id"], Value::Null);
 
     let live = next_event(&mut ws)
         .await
@@ -541,7 +541,7 @@ stages:
     assert_eq!(live["payload"]["stage"], "review");
     assert_eq!(live["payload"]["outcome"], "resumed");
     assert_eq!(live["task_id"], task_id.as_str());
-    assert_eq!(live["task_run_id"], Value::Null);
+    assert_eq!(live["session_id"], Value::Null);
 
     // The same transition is served by the real binary's `GET /tasks/:id`
     // as `stage_trail`, so the live and polled views agree.
@@ -674,7 +674,7 @@ stages:
     assert_eq!(pending[0]["payload"]["attempt"], 1);
     // A poll stage opens no session, so its output belongs to the task
     // itself and carries no run id.
-    assert_eq!(pending[0]["task_run_id"], Value::Null);
+    assert_eq!(pending[0]["session_id"], Value::Null);
     assert_eq!(pending[0]["task_id"], task_id.as_str());
 
     // Opened before the state flips, so the transition below can only
@@ -693,7 +693,7 @@ stages:
         .await
         .expect("the poll's transition was never pushed over the socket");
     assert_eq!(live["payload"]["outcome"], "green");
-    assert_eq!(live["task_run_id"], Value::Null);
+    assert_eq!(live["session_id"], Value::Null);
 
     let events = command_events(&daemon, &task_id).await;
     assert_eq!(

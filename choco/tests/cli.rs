@@ -961,7 +961,7 @@ stages:
         assert_eq!(entry["task_id"], task_id.as_str());
         assert!(entry["created_at"].is_string(), "{entry}");
     }
-    assert_eq!(trail[0]["task_run_id"], serde_json::Value::Null);
+    assert_eq!(trail[0]["session_id"], serde_json::Value::Null);
 }
 
 // ---- P2-6 per-role config overrides (#17) ----

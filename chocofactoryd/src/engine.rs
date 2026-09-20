@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chocofactory_core::models::{
-    EventType, Project, RetryMode, RetryOutcome, Task, TaskRun, TaskRunEndReason, TaskRunStatus,
+    EventType, Project, RetryMode, RetryOutcome, Session, SessionEndReason, SessionStatus, Task,
 };
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -40,7 +40,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::config_root;
-use crate::db::{events, projects, task_runs, tasks, workflow_state};
+use crate::db::{events, projects, sessions, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
 use crate::poll;
 use crate::role_config::{self, RoleConfigError};
@@ -52,7 +52,7 @@ use crate::workflow_def::{
 };
 use crate::worktree::{self, WorktreeError};
 
-/// How often the `agent_turn` completion watcher polls a `task_run`'s
+/// How often the `agent_turn` completion watcher polls a `session`'s
 /// status. Not configurable (yet) — this is an internal implementation
 /// detail of auto-advancing single-shot turns, not a user-facing knob.
 const TURN_WATCH_INTERVAL: Duration = Duration::from_millis(100);
@@ -128,7 +128,7 @@ pub struct WorkflowEngine {
     /// In-flight detached `shell`/`poll` runners per task, so `cancel_task`
     /// can stop them (#69).
     ///
-    /// Neither stage kind opens a `task_run`, so killing the task's agent
+    /// Neither stage kind opens a `session`, so killing the task's agent
     /// session reaches neither — yet both can be running a command for
     /// minutes, in the task's worktree, which cancel is about to delete.
     /// Aborting the runner drops its future mid-await, which drops
@@ -489,7 +489,7 @@ pub enum SendMessageError {
     /// between this and `advance`'s `human_gate` relay — see P1-8 LLD
     /// §4.3 for why this is a hard boundary, not a Phase-1 gap.
     StageNotOpenEnded(String),
-    /// The stage is open-ended, but no `task_run` has ever been recorded
+    /// The stage is open-ended, but no `session` has ever been recorded
     /// for it (e.g. `create_task`'s `start_task` failed before spawning
     /// one).
     NoOpenRun(String),
@@ -543,7 +543,7 @@ impl fmt::Display for SendMessageError {
                 "stage '{stage}' can transition to another stage, so it cannot accept a relayed message here"
             ),
             SendMessageError::NoOpenRun(stage) => {
-                write!(f, "stage '{stage}' has no task_run recorded for it yet")
+                write!(f, "stage '{stage}' has no session recorded for it yet")
             }
             SendMessageError::TaskCancelled => {
                 write!(f, "task was cancelled and accepts no further messages")
@@ -759,7 +759,7 @@ pub enum RetryTaskError {
     /// `workflow_state.current_stage` names a stage the (possibly
     /// re-resolved) workflow definition no longer declares.
     UnknownStage(String),
-    /// The current stage's `task_run` is still `Active` — defensive: a
+    /// The current stage's `session` is still `Active` — defensive: a
     /// `stuck` task's stage should have nothing running, since the engine
     /// only marks a task stuck once it has given up on that stage's run.
     /// Carries the stage name.
@@ -859,14 +859,15 @@ fn resume_prompt(resume: &ResumeSession) -> String {
 /// than replace (#92).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResumeSession {
-    /// The CLI session to resume, as recorded by the previous run.
-    session_id: String,
-    /// That run, so the new one can point back at it (`resumed_from`) and
-    /// the timeline can name it.
-    previous_run_id: String,
-    /// Why that run's turn ended — the thing that made it resumable, and
-    /// what the resumed turn is told about its own interruption.
-    end_reason: TaskRunEndReason,
+    /// The CLI's own session id to resume, as recorded by the previous
+    /// session.
+    adapter_session_id: String,
+    /// That session, so the new one can point back at it (`resumed_from`)
+    /// and the timeline can name it.
+    previous_session_id: String,
+    /// Why that session's turn ended — the thing that made it resumable,
+    /// and what the resumed turn is told about its own interruption.
+    end_reason: SessionEndReason,
 }
 
 impl ResumeSession {
@@ -874,8 +875,8 @@ impl ResumeSession {
     /// whoever reads the timeline.
     fn describe(&self) -> &'static str {
         match self.end_reason {
-            TaskRunEndReason::Interrupted => "your account hit a usage limit",
-            TaskRunEndReason::Reaped => {
+            SessionEndReason::Interrupted => "your account hit a usage limit",
+            SessionEndReason::Reaped => {
                 "the daemon closed it after it went quiet for longer than its idle timeout"
             }
             // Unreachable: `resumable_session` admits no other reason. A
@@ -1311,7 +1312,7 @@ impl WorkflowEngine {
                 role: role.clone(),
             })?;
 
-        let task_run = task_runs::get_current_for_stage(&self.pool, task_id, &current_stage)
+        let session = sessions::get_current_for_stage(&self.pool, task_id, &current_stage)
             .await?
             .ok_or_else(|| SendMessageError::NoOpenRun(current_stage.clone()))?;
 
@@ -1346,17 +1347,17 @@ impl WorkflowEngine {
         // block the relay that follows.
         if let Err(err) = events::append(
             &self.pool,
-            &task_run.id,
+            &session.id,
             EventType::HumanMessage,
             json!({ "text": text }),
         )
         .await
         {
-            tracing::error!(task_run_id = %task_run.id, %err, "failed to record human message event");
+            tracing::error!(session_id = %session.id, %err, "failed to record human message event");
         }
 
         self.session_manager
-            .send_message(&task_run.id, text, &resolved.role_config)
+            .send_message(&session.id, text, &resolved.role_config)
             .await
             .map_err(SendMessageError::Session)
     }
@@ -1448,11 +1449,11 @@ impl WorkflowEngine {
 
                 // Best-effort, log-and-continue — same as `send_message`'s
                 // chat-path recording just above it in this file. No
-                // `task_run` exists for a `human_gate` (it never opens a
+                // `session` exists for a `human_gate` (it never opens a
                 // session), so this uses `append_for_task` — the same
                 // task-scoped, session-less path `dispatch_stage` already
                 // uses for `StageEntered`/`Error` — rather than `append`,
-                // which needs a `task_run_id` to derive `task_id` from.
+                // which needs a `session_id` to derive `task_id` from.
                 let mut payload = json!({ "text": text });
                 if let Some(note) = note {
                     payload["note"] = json!(note);
@@ -1495,7 +1496,7 @@ impl WorkflowEngine {
     /// after the status write** — which is what lets both of the properties
     /// this function needs hold at once:
     ///
-    /// 1. The one fallible *read* (every `task_run` the task has had) comes
+    /// 1. The one fallible *read* (every `session` the task has had) comes
     ///    first, so a DB error here returns having changed nothing at all and
     ///    a retry starts clean.
     /// 2. `tasks.status` is written **second**, still inside the per-task
@@ -1565,7 +1566,7 @@ impl WorkflowEngine {
         // a live process by run id, whatever that run's recorded status.
         // A task that never reached a stage simply has no runs, which is the
         // state cancel wants; it may still own a worktree, removed below.
-        let runs = task_runs::list_for_task(&self.pool, task_id).await?;
+        let runs = sessions::list_for_task(&self.pool, task_id).await?;
 
         // Step 2 — the write every guard keys off, and the last thing here
         // that can fail. After this the task is durably cancelled: no stage
@@ -1613,14 +1614,14 @@ impl WorkflowEngine {
             // that says so.
             if let Err(err) = self.session_manager.cancel(&run.id).await {
                 tracing::error!(
-                    task_id, task_run_id = %run.id, %err,
+                    task_id, session_id = %run.id, %err,
                     "cancelled task's session could not be killed; a live agent may have been left running"
                 );
             }
         }
 
         // An `agent_turn` is not the only thing that can be running. A
-        // `shell` or `poll` stage runs detached, owns no `task_run` row,
+        // `shell` or `poll` stage runs detached, owns no `session` row,
         // and — for a `worktree: true` workflow — has the worktree as its
         // cwd. Aborting the runner drops the future mid-await, which drops
         // `shell::run`'s `ProcessGroup` guard, which SIGKILLs the
@@ -1821,10 +1822,10 @@ impl WorkflowEngine {
         // freshly re-entered one. Checked anyway rather than assumed,
         // since re-entering over a live run would start a second one
         // alongside it instead of replacing it.
-        let last_run =
-            task_runs::get_current_for_stage(&self.pool, task_id, &current_stage).await?;
-        if let Some(run) = &last_run
-            && run.status == TaskRunStatus::Active
+        let last_session =
+            sessions::get_current_for_stage(&self.pool, task_id, &current_stage).await?;
+        if let Some(session) = &last_session
+            && session.status == SessionStatus::Active
         {
             return Err(RetryTaskError::RunStillActive(current_stage));
         }
@@ -1839,7 +1840,8 @@ impl WorkflowEngine {
         let resumable = match mode {
             RetryMode::Fresh => Err("a fresh start was asked for".to_string()),
             RetryMode::Auto | RetryMode::Resume => {
-                self.resumable_session(stage_def, last_run.as_ref()).await?
+                self.resumable_session(stage_def, last_session.as_ref())
+                    .await?
             }
         };
         let (resume, fresh_reason) = match (mode, resumable) {
@@ -1925,7 +1927,7 @@ impl WorkflowEngine {
         Ok(RetryOutcome {
             stage: current_stage,
             resumed: resume.is_some(),
-            session_id: resume.map(|resume| resume.session_id),
+            session_id: resume.map(|resume| resume.adapter_session_id),
             fresh_reason,
         })
     }
@@ -1935,11 +1937,11 @@ impl WorkflowEngine {
     ///
     /// Resumable means all of: the stage is an `agent_turn` that can
     /// conclude on its own (nothing else has a turn to resume — a standing
-    /// chat session is picked up by sending it a message instead), the run
-    /// recorded a `session_id`, its turn ended for a reason that describes
-    /// something done *to* it — a usage limit, or the idle reaper's close —
-    /// and it has not already been resumed [`MAX_CONSECUTIVE_RESUMES`]
-    /// times in a row.
+    /// chat session is picked up by sending it a message instead), the
+    /// session recorded an `adapter_session_id`, its turn ended for a
+    /// reason that describes something done *to* it — a usage limit, or
+    /// the idle reaper's close — and it has not already been resumed
+    /// [`MAX_CONSECUTIVE_RESUMES`] times in a row.
     ///
     /// Everything else starts fresh, and deliberately so: `no_report`,
     /// `lingered` and a plain crash are the agent's own failure, and
@@ -1948,7 +1950,7 @@ impl WorkflowEngine {
     async fn resumable_session(
         &self,
         stage_def: &StageDef,
-        last_run: Option<&TaskRun>,
+        last_session: Option<&Session>,
     ) -> Result<Result<ResumeSession, String>, RetryTaskError> {
         if !matches!(stage_def.kind, StageKind::AgentTurn { .. }) {
             return Ok(Err(
@@ -1970,11 +1972,11 @@ impl WorkflowEngine {
                     .to_string(),
             ));
         }
-        let Some(run) = last_run else {
-            return Ok(Err("the stage has no previous run".to_string()));
+        let Some(session) = last_session else {
+            return Ok(Err("the stage has no previous session".to_string()));
         };
-        let end_reason = match run.end_reason {
-            Some(reason @ (TaskRunEndReason::Interrupted | TaskRunEndReason::Reaped)) => reason,
+        let end_reason = match session.end_reason {
+            Some(reason @ (SessionEndReason::Interrupted | SessionEndReason::Reaped)) => reason,
             Some(other) => {
                 return Ok(Err(format!(
                     "its turn ended '{other}', which is the agent's own failure rather than an \
@@ -1988,11 +1990,11 @@ impl WorkflowEngine {
                 ));
             }
         };
-        let Some(session_id) = run.session_id.clone() else {
+        let Some(adapter_session_id) = session.adapter_session_id.clone() else {
             return Ok(Err("it never reported a session to resume".to_string()));
         };
         let resumes =
-            task_runs::resume_chain_len(&self.pool, &run.id, MAX_CONSECUTIVE_RESUMES).await?;
+            sessions::resume_chain_len(&self.pool, &session.id, MAX_CONSECUTIVE_RESUMES).await?;
         if resumes >= MAX_CONSECUTIVE_RESUMES {
             return Ok(Err(format!(
                 "its session has already been resumed {resumes} times in a row; starting over is \
@@ -2000,8 +2002,8 @@ impl WorkflowEngine {
             )));
         }
         Ok(Ok(ResumeSession {
-            session_id,
-            previous_run_id: run.id.clone(),
+            adapter_session_id,
+            previous_session_id: session.id.clone(),
             end_reason,
         }))
     }
@@ -2576,7 +2578,7 @@ impl WorkflowEngine {
         // path this would otherwise leave the timeline showing a stage
         // entered and then nothing at all, with the reason only in the
         // daemon's log, so it's still recorded the same way. Task-scoped,
-        // since rendering happens before any `task_run` exists.
+        // since rendering happens before any `session` exists.
         if let Err(EngineError::Template { stage, reason }) = &entered {
             let message = format!("stage '{stage}' could not render a template: {reason}");
             tracing::error!(task_id, stage, reason, "stage parked: {message}");
@@ -2752,7 +2754,7 @@ impl WorkflowEngine {
     /// propagated, same pattern as every other event append in this file.
     /// No-op when nothing was unresolved, so a caller can call this
     /// unconditionally after every render. Task-scoped (`append_for_task`,
-    /// no `task_run_id`): a template renders before any turn/session
+    /// no `session_id`): a template renders before any turn/session
     /// exists, whether it's an `agent_turn`'s prompt or a `shell`/`poll`
     /// stage's `command:`.
     async fn record_unresolved_template_note(
@@ -2844,7 +2846,7 @@ impl WorkflowEngine {
     ) {
         let engine = Arc::clone(self);
         // Registered so `cancel_task` can abort this runner and kill the
-        // command it's running (#69) — a `shell` stage has no `task_run`,
+        // command it's running (#69) — a `shell` stage has no `session`,
         // so killing the task's agent session would not reach it.
         let runner_id = self.reserve_runner_slot(&task_id);
         let registered_task_id = task_id.clone();
@@ -3834,30 +3836,30 @@ impl WorkflowEngine {
         )
         .map_err(EngineError::RoleConfig)?;
 
-        let new_run = task_runs::NewTaskRun {
+        let new_session = sessions::NewSession {
             task_id,
             stage: stage_name,
             role,
             cli_adapter: &resolved.cli,
             model: &resolved.model,
         };
-        // A resume still opens its own run (#92): the attempt history stays
-        // one row per attempt, and `resumed_from` is what records that this
-        // attempt continued the previous one's conversation rather than
-        // starting another.
-        let task_run = match resume {
+        // A resume still opens its own session (#92): the attempt history
+        // stays one row per attempt, and `resumed_from` is what records
+        // that this attempt continued the previous one's conversation
+        // rather than starting another.
+        let session = match resume {
             Some(resume) => {
-                task_runs::create_resumed(
+                sessions::create_resumed(
                     &self.pool,
-                    new_run,
-                    task_runs::ResumedFrom {
-                        run_id: &resume.previous_run_id,
-                        session_id: &resume.session_id,
+                    new_session,
+                    sessions::ResumedFrom {
+                        session_id: &resume.previous_session_id,
+                        adapter_session_id: &resume.adapter_session_id,
                     },
                 )
                 .await?
             }
-            None => task_runs::create(&self.pool, new_run).await?,
+            None => sessions::create(&self.pool, new_session).await?,
         };
 
         // Recorded before the session starts, for the same ordering reason
@@ -3865,20 +3867,20 @@ impl WorkflowEngine {
         // that says the turn picked up where an earlier one left off.
         if let Some(resume) = resume {
             let message = format!(
-                "resuming session {} from run {}, whose turn was interrupted because {}",
-                resume.session_id,
-                resume.previous_run_id,
+                "resuming session {} from session {}, whose turn was interrupted because {}",
+                resume.adapter_session_id,
+                resume.previous_session_id,
                 resume.describe()
             );
             if let Err(err) = events::append(
                 &self.pool,
-                &task_run.id,
+                &session.id,
                 EventType::SessionNote,
                 json!({ "kind": "resume", "message": message }),
             )
             .await
             {
-                tracing::error!(task_run_id = %task_run.id, %err, "failed to record a resume note");
+                tracing::error!(session_id = %session.id, %err, "failed to record a resume note");
             } else {
                 self.events_notify.notify_waiters();
             }
@@ -3901,13 +3903,13 @@ impl WorkflowEngine {
             && resume.is_none()
             && let Err(err) = events::append(
                 &self.pool,
-                &task_run.id,
+                &session.id,
                 EventType::HumanMessage,
                 json!({ "text": prompt }),
             )
             .await
         {
-            tracing::error!(task_run_id = %task_run.id, %err, "failed to record human message event");
+            tracing::error!(session_id = %session.id, %err, "failed to record human message event");
         }
 
         // A stage with an empty `on:` map (chat, §5.4) never concludes — it
@@ -3926,8 +3928,8 @@ impl WorkflowEngine {
             Some(resume) => {
                 self.session_manager
                     .resume(
-                        &task_run.id,
-                        &resume.session_id,
+                        &session.id,
+                        &resume.adapter_session_id,
                         &prompt,
                         &resolved.role_config,
                         session_kind,
@@ -3936,12 +3938,12 @@ impl WorkflowEngine {
             }
             None => {
                 self.session_manager
-                    .start(&task_run.id, &prompt, &resolved.role_config, session_kind)
+                    .start(&session.id, &prompt, &resolved.role_config, session_kind)
                     .await
             }
         };
         if let Err(err) = started {
-            // The task_run row was just created `Active` above; without
+            // The session row was just created `Active` above; without
             // this, a spawn failure here leaves it Active forever (nothing
             // else in this module ever transitions it), wedging the task
             // since workflow_state was already committed to this stage by
@@ -3955,21 +3957,21 @@ impl WorkflowEngine {
             // when a prior stage's `advance_from_stage` re-enters this one —
             // marks the *task* stuck with this error, so it's queryable from
             // `choco task status`/`GET /tasks/{id}` rather than only
-            // discoverable in this log line and the task_run's own
+            // discoverable in this log line and the session's own
             // `end_reason: "start_failed"`.
-            tracing::error!(task_id, task_run_id = %task_run.id, %err, "failed to start session for agent_turn");
-            if let Err(update_err) = task_runs::update_status(
+            tracing::error!(task_id, session_id = %session.id, %err, "failed to start session for agent_turn");
+            if let Err(update_err) = sessions::update_status(
                 &self.pool,
-                &task_run.id,
-                TaskRunStatus::Exited,
+                &session.id,
+                SessionStatus::Exited,
                 Some(Utc::now()),
-                Some(TaskRunEndReason::StartFailed),
+                Some(SessionEndReason::StartFailed),
             )
             .await
             {
                 tracing::error!(
-                    task_run_id = %task_run.id, %update_err,
-                    "failed to mark task run exited after a failed session start"
+                    session_id = %session.id, %update_err,
+                    "failed to mark session exited after a failed session start"
                 );
             }
             return Err(EngineError::Session(err));
@@ -3984,13 +3986,13 @@ impl WorkflowEngine {
                 Arc::clone(definition),
                 stage_name.to_string(),
                 capture,
-                task_run.id,
+                session.id,
             );
         }
         Ok(())
     }
 
-    /// Watches a single-shot `agent_turn`'s `task_run` for completion, takes
+    /// Watches a single-shot `agent_turn`'s `session` for completion, takes
     /// its `capture:` if it declared one, and auto-advances.
     ///
     /// Without a `capture:` the outcome is `done`, which is what §5.2 says a
@@ -4008,12 +4010,12 @@ impl WorkflowEngine {
         definition: Arc<WorkflowDefinition>,
         stage_name: String,
         capture: Option<Capture>,
-        task_run_id: String,
+        session_id: String,
     ) {
         let engine = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                match task_runs::get(&engine.pool, &task_run_id).await {
+                match sessions::get(&engine.pool, &session_id).await {
                     // `Idle` is also what the idle reaper leaves behind
                     // when it force-closes a stalled turn's stdin
                     // (session.rs's `drain_session`) — indistinguishable
@@ -4030,10 +4032,10 @@ impl WorkflowEngine {
                     // would still refuse that transition, so this is the
                     // early, quiet exit rather than the thing that makes
                     // cancel correct.
-                    Ok(Some(run)) if run.end_reason == Some(TaskRunEndReason::Cancelled) => {
+                    Ok(Some(run)) if run.end_reason == Some(SessionEndReason::Cancelled) => {
                         tracing::info!(
                             task_id,
-                            task_run_id,
+                            session_id,
                             "task run was cancelled; not auto-advancing"
                         );
                         return;
@@ -4041,10 +4043,10 @@ impl WorkflowEngine {
                     // Either status: a reaper-closed turn that exited cleanly
                     // is `Idle`, one whose process then had to be killed is
                     // `Exited` (#90).
-                    Ok(Some(run)) if run.end_reason == Some(TaskRunEndReason::Reaped) => {
+                    Ok(Some(run)) if run.end_reason == Some(SessionEndReason::Reaped) => {
                         tracing::warn!(
                             task_id,
-                            task_run_id,
+                            session_id,
                             "task run was force-closed by the idle reaper before completing its turn; not auto-advancing"
                         );
                         engine
@@ -4066,10 +4068,10 @@ impl WorkflowEngine {
                     // this is the one stuck reason whose recovery is
                     // different: retry continues the session instead of
                     // starting another one over the same worktree.
-                    Ok(Some(run)) if run.end_reason == Some(TaskRunEndReason::Interrupted) => {
+                    Ok(Some(run)) if run.end_reason == Some(SessionEndReason::Interrupted) => {
                         tracing::warn!(
                             task_id,
-                            task_run_id,
+                            session_id,
                             "task run was interrupted by a usage limit; not auto-advancing"
                         );
                         engine
@@ -4085,18 +4087,18 @@ impl WorkflowEngine {
                             .await;
                         return;
                     }
-                    Ok(Some(run)) if run.status == TaskRunStatus::Idle => break,
+                    Ok(Some(run)) if run.status == SessionStatus::Idle => break,
                     // #90: the two ways `drain_session` ends a single-shot
                     // turn it could not treat as complete. Each gets its own
                     // reason, since "exited without completing" would send a
                     // human looking for a crash that never happened.
                     Ok(Some(run))
-                        if run.status == TaskRunStatus::Exited
-                            && run.end_reason == Some(TaskRunEndReason::NoReport) =>
+                        if run.status == SessionStatus::Exited
+                            && run.end_reason == Some(SessionEndReason::NoReport) =>
                     {
                         tracing::warn!(
                             task_id,
-                            task_run_id,
+                            session_id,
                             "task run ended without reporting its outcome; not auto-advancing"
                         );
                         engine
@@ -4112,12 +4114,12 @@ impl WorkflowEngine {
                         return;
                     }
                     Ok(Some(run))
-                        if run.status == TaskRunStatus::Exited
-                            && run.end_reason == Some(TaskRunEndReason::Lingered) =>
+                        if run.status == SessionStatus::Exited
+                            && run.end_reason == Some(SessionEndReason::Lingered) =>
                     {
                         tracing::warn!(
                             task_id,
-                            task_run_id,
+                            session_id,
                             "task run's process kept running after its turn ended and was killed; not auto-advancing"
                         );
                         engine
@@ -4133,10 +4135,10 @@ impl WorkflowEngine {
                             .await;
                         return;
                     }
-                    Ok(Some(run)) if run.status == TaskRunStatus::Exited => {
+                    Ok(Some(run)) if run.status == SessionStatus::Exited => {
                         tracing::warn!(
                             task_id,
-                            task_run_id,
+                            session_id,
                             "task run exited without completing its turn cleanly; not auto-advancing"
                         );
                         engine
@@ -4157,14 +4159,14 @@ impl WorkflowEngine {
                     Ok(None) => {
                         tracing::error!(
                             task_id,
-                            task_run_id,
+                            session_id,
                             "task run disappeared while watching for turn completion; not auto-advancing"
                         );
                         return;
                     }
                     Err(err) => {
                         tracing::error!(
-                            task_id, task_run_id, %err,
+                            task_id, session_id, %err,
                             "failed to poll task run while watching for turn completion; not auto-advancing"
                         );
                         engine
@@ -4182,7 +4184,7 @@ impl WorkflowEngine {
                 tokio::time::sleep(TURN_WATCH_INTERVAL).await;
             }
             engine
-                .finish_turn(&task_id, &definition, &stage_name, capture, &task_run_id)
+                .finish_turn(&task_id, &definition, &stage_name, capture, &session_id)
                 .await;
         });
     }
@@ -4196,7 +4198,7 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         stage_name: &str,
         capture: Option<Capture>,
-        task_run_id: &str,
+        session_id: &str,
     ) {
         // Issue #73: an explicit `report_outcome` tool call, if the agent
         // made one, is unambiguous where a reply is guesswork, so it's
@@ -4216,11 +4218,11 @@ impl WorkflowEngine {
         // the write-gate is widened so this alone is enough to write one
         // even on a no-capture stage that would otherwise see nothing.
         let (report, report_fetch_note) =
-            match events::last_report_outcome_for_run(&self.pool, task_run_id).await {
+            match events::last_report_outcome_for_session(&self.pool, session_id).await {
                 Ok(report) => (report, None),
                 Err(err) => {
                     tracing::error!(
-                        task_id, task_run_id, stage = stage_name, %err,
+                        task_id, session_id, stage = stage_name, %err,
                         "could not read a turn's report_outcome tool call back; falling back to \
                          its reply"
                     );
@@ -4325,10 +4327,11 @@ impl WorkflowEngine {
                     // The turn's text isn't held anywhere in memory: the
                     // adapter stream is drained straight into `events` by
                     // `drain_session` and dropped, and this watcher only
-                    // ever sees `task_runs` rows. So the reply is read back
+                    // ever sees `sessions` rows. So the reply is read back
                     // from the timeline.
                     Some(capture) => {
-                        match events::final_assistant_text_for_run(&self.pool, task_run_id).await {
+                        match events::final_assistant_text_for_session(&self.pool, session_id).await
+                        {
                             Ok(reply) => {
                                 let reply = unwrap_code_fence(reply.trim());
                                 let (captured, capture_note) =
@@ -4349,7 +4352,7 @@ impl WorkflowEngine {
                             // back parks for a human.
                             Err(err) => {
                                 tracing::error!(
-                                    task_id, task_run_id, stage = stage_name, %err,
+                                    task_id, session_id, stage = stage_name, %err,
                                     "could not read a turn's reply back to capture it; not \
                                      auto-advancing"
                                 );
@@ -4364,7 +4367,7 @@ impl WorkflowEngine {
                                 .join("; ");
                                 self.append_turn_outcome_event(
                                     task_id,
-                                    task_run_id,
+                                    session_id,
                                     json!({
                                         "stage": stage_name,
                                         "capture": capture_label(Some(capture)),
@@ -4394,19 +4397,19 @@ impl WorkflowEngine {
 
         // `expected_stage` below catches a task that has *left* this stage,
         // but not one that left and came back: re-entering opens a new
-        // `task_run`, and a late watcher for the superseded one would pass
+        // `session`, and a late watcher for the superseded one would pass
         // that check and overwrite the fresh capture with a stale verdict.
         // Advisory only, like poll's `still_in_stage` — it runs outside the
         // lock, and nothing can produce that interleaving today (nothing
         // moves a task out of an `agent_turn` while its run is live), so this
         // is the invariant announcing itself rather than a known case.
         if !self
-            .is_current_run_for_stage(task_id, stage_name, task_run_id)
+            .is_current_run_for_stage(task_id, stage_name, session_id)
             .await
         {
             tracing::warn!(
                 task_id,
-                task_run_id,
+                session_id,
                 stage = stage_name,
                 "discarded a turn's outcome: its stage has since started a newer run"
             );
@@ -4425,7 +4428,7 @@ impl WorkflowEngine {
             Ok(()) => {
                 tracing::debug!(
                     task_id,
-                    task_run_id,
+                    session_id,
                     stage = stage_name,
                     outcome,
                     "turn completed; advanced"
@@ -4555,7 +4558,7 @@ impl WorkflowEngine {
             let note = (!note.is_empty()).then(|| note.join("; "));
             self.append_turn_outcome_event(
                 task_id,
-                task_run_id,
+                session_id,
                 json!({
                     "stage": stage_name,
                     "capture": capture_label(capture),
@@ -4569,7 +4572,7 @@ impl WorkflowEngine {
         }
     }
 
-    /// Whether `task_run_id` is still the newest run of `stage_name`.
+    /// Whether `session_id` is still the newest run of `stage_name`.
     ///
     /// The `Err` arm errs towards proceeding: this only narrows a window
     /// nothing can reach today, and refusing to advance because a *check*
@@ -4586,16 +4589,16 @@ impl WorkflowEngine {
         &self,
         task_id: &str,
         stage_name: &str,
-        task_run_id: &str,
+        session_id: &str,
     ) -> bool {
-        match task_runs::get_current_for_stage(&self.pool, task_id, stage_name).await {
-            Ok(Some(current)) => current.id == task_run_id,
+        match sessions::get_current_for_stage(&self.pool, task_id, stage_name).await {
+            Ok(Some(current)) => current.id == session_id,
             // The run this watcher is for exists, so no row at all means the
             // task was deleted underneath it.
             Ok(None) => false,
             Err(err) => {
                 tracing::warn!(
-                    task_id, task_run_id, stage = stage_name, %err,
+                    task_id, session_id, stage = stage_name, %err,
                     "could not confirm a completed turn is its stage's current run; advancing anyway"
                 );
                 true
@@ -4603,11 +4606,11 @@ impl WorkflowEngine {
         }
     }
 
-    async fn append_turn_outcome_event(&self, task_id: &str, task_run_id: &str, payload: Value) {
-        match events::append(&self.pool, task_run_id, EventType::TurnOutcome, payload).await {
+    async fn append_turn_outcome_event(&self, task_id: &str, session_id: &str, payload: Value) {
+        match events::append(&self.pool, session_id, EventType::TurnOutcome, payload).await {
             Ok(_) => self.events_notify.notify_waiters(),
             Err(err) => tracing::error!(
-                task_id, task_run_id, %err,
+                task_id, session_id, %err,
                 "failed to record turn outcome event"
             ),
         }
@@ -5433,12 +5436,12 @@ mod tests {
         panic!("timed out waiting for status {expected}, last saw {last:?}");
     }
 
-    /// Polls `task_run_id`'s events for one whose `payload.text` equals
+    /// Polls `session_id`'s events for one whose `payload.text` equals
     /// `text` (e.g. an assistant reply from the fake-claude fixture),
     /// since event persistence happens on a spawned background task.
-    async fn wait_until_events_contain(pool: &SqlitePool, task_run_id: &str, text: &str) {
+    async fn wait_until_events_contain(pool: &SqlitePool, session_id: &str, text: &str) {
         for _ in 0..200 {
-            let events = crate::db::events::list_for_task_run(pool, task_run_id)
+            let events = crate::db::events::list_for_session(pool, session_id)
                 .await
                 .unwrap();
             if events
@@ -5459,9 +5462,9 @@ mod tests {
     /// so tests that only care about `model`/`system_prompt`/
     /// `permission_mode` assert a prefix ending right before it instead of
     /// pinning that path.
-    async fn wait_until_events_contain_prefix(pool: &SqlitePool, task_run_id: &str, prefix: &str) {
+    async fn wait_until_events_contain_prefix(pool: &SqlitePool, session_id: &str, prefix: &str) {
         for _ in 0..200 {
-            let events = crate::db::events::list_for_task_run(pool, task_run_id)
+            let events = crate::db::events::list_for_session(pool, session_id)
                 .await
                 .unwrap();
             if events.iter().any(|e| {
@@ -5570,11 +5573,11 @@ stages:
             vec![("gate".to_string(), Value::Null)]
         );
 
-        // `gate` is a human_gate, so no task_run exists to attribute this
+        // `gate` is a human_gate, so no session exists to attribute this
         // to — the case the old schema could not store at all.
         let recorded = events::list_for_task(&pool, &task_id).await.unwrap();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].task_run_id, None);
+        assert_eq!(recorded[0].session_id, None);
         assert_eq!(recorded[0].task_id, task_id);
     }
 
@@ -6034,7 +6037,7 @@ stages:
             .await
             .unwrap();
 
-        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].stage, "chatting");
     }
@@ -6215,15 +6218,15 @@ stages:
 
         engine.start_task(&task_id, &def, None).await.unwrap();
 
-        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         assert_eq!(runs.len(), 1);
         for _ in 0..200 {
-            if task_runs::get(&pool, &runs[0].id)
+            if sessions::get(&pool, &runs[0].id)
                 .await
                 .unwrap()
                 .unwrap()
                 .status
-                == TaskRunStatus::Exited
+                == SessionStatus::Exited
             {
                 break;
             }
@@ -6251,8 +6254,8 @@ stages:
     async fn a_turn_reaped_by_the_idle_timeout_does_not_auto_advance() {
         // Regression test for the ambiguity the review on PR #35 flagged:
         // both a completed turn and a reaper-force-closed turn land the
-        // task_run on `Idle`, so the watcher must consult `end_reason`
-        // rather than treating every `Idle` as "done". The task_run is
+        // session on `Idle`, so the watcher must consult `end_reason`
+        // rather than treating every `Idle` as "done". The session is
         // seeded directly as already `Idle`/`reaped` so the watcher's
         // very first poll observes the condition deterministically,
         // rather than racing a real subprocess to get there first.
@@ -6262,9 +6265,9 @@ stages:
         workflow_state::create(&pool, &task_id, "gate", json!({}))
             .await
             .unwrap();
-        let task_run = task_runs::create(
+        let session = sessions::create(
             &pool,
-            task_runs::NewTaskRun {
+            sessions::NewSession {
                 task_id: &task_id,
                 stage: "gate",
                 role: "chat",
@@ -6274,12 +6277,12 @@ stages:
         )
         .await
         .unwrap();
-        task_runs::update_status(
+        sessions::update_status(
             &pool,
-            &task_run.id,
-            TaskRunStatus::Idle,
+            &session.id,
+            SessionStatus::Idle,
             None,
-            Some(TaskRunEndReason::Reaped),
+            Some(SessionEndReason::Reaped),
         )
         .await
         .unwrap();
@@ -6290,7 +6293,7 @@ stages:
             Arc::clone(&def),
             "chatting".to_string(),
             None,
-            task_run.id.clone(),
+            session.id.clone(),
         );
 
         // Also marks the task stuck (X-4, issue #61; review round 2): the
@@ -6310,7 +6313,7 @@ stages:
     }
 
     #[tokio::test]
-    async fn a_failed_session_start_marks_the_task_run_exited_instead_of_wedging_it() {
+    async fn a_failed_session_start_marks_the_session_exited_instead_of_wedging_it() {
         let pool = connect_in_memory().await.unwrap();
         let dir = tempdir();
         std::fs::write(dir.join("coder-turn.md"), "do the thing").unwrap();
@@ -6338,9 +6341,9 @@ stages:
 
         engine.start_task(&task_id, &def, None).await.unwrap_err();
 
-        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, TaskRunStatus::Exited);
+        assert_eq!(runs[0].status, SessionStatus::Exited);
         assert!(runs[0].ended_at.is_some());
     }
 
@@ -6606,10 +6609,10 @@ stages:
     }
 
     /// The event belongs to the task, not to any agent session — a shell
-    /// stage opens none — so it must carry a null `task_run_id` and still
+    /// stage opens none — so it must carry a null `session_id` and still
     /// appear on the task's timeline.
     #[tokio::test]
-    async fn the_shell_event_is_task_scoped_with_no_task_run() {
+    async fn the_shell_event_is_task_scoped_with_no_session() {
         let pool = connect_in_memory().await.unwrap();
         let def = shell_def("exit 0", "");
         let task_id = seed_task(&pool, &def.name).await;
@@ -6624,10 +6627,10 @@ stages:
             .into_iter()
             .find(|e| e.event_type == EventType::ShellOutput)
             .unwrap();
-        assert_eq!(event.task_run_id, None);
+        assert_eq!(event.session_id, None);
         assert_eq!(event.task_id, task_id);
         assert!(
-            task_runs::list_for_task(&pool, &task_id)
+            sessions::list_for_task(&pool, &task_id)
                 .await
                 .unwrap()
                 .is_empty()
@@ -7082,7 +7085,7 @@ stages:
         assert_eq!(task.workflow_def, "chat");
         let state = workflow_state::get(&pool, &task.id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "chatting");
-        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].stage, "chatting");
     }
@@ -7438,10 +7441,10 @@ stages:
         // fake_claude.py echoes each line it receives as `echo:<text>` in
         // an assistant message event — proves the follow-up reached the
         // same live process this task's create_task call started.
-        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
         let mut saw_echo = false;
         for _ in 0..200 {
-            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            let events = crate::db::events::list_for_session(&pool, &runs[0].id)
                 .await
                 .unwrap();
             if events.iter().any(|e| {
@@ -7498,10 +7501,10 @@ stages:
             .await
             .unwrap();
 
-        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
         let mut saw_echo = false;
         for _ in 0..200 {
-            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            let events = crate::db::events::list_for_session(&pool, &runs[0].id)
                 .await
                 .unwrap();
             if events.iter().any(|e| {
@@ -7599,10 +7602,10 @@ stages:
             .await
             .unwrap();
 
-        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         let mut saw_echo = false;
         for _ in 0..200 {
-            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            let events = crate::db::events::list_for_session(&pool, &runs[0].id)
                 .await
                 .unwrap();
             if events.iter().any(|e| {
@@ -7648,7 +7651,7 @@ stages:
 
         // Wait for the initial turn's reply before sending the follow-up,
         // so the two round trips can't land out of order.
-        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
         wait_until_events_contain(&pool, &runs[0].id, "echo:hello").await;
 
         engine.send_message(&task.id, "again").await.unwrap();
@@ -7661,7 +7664,7 @@ stages:
         // append.
         let mut events = Vec::new();
         for _ in 0..200 {
-            events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            events = crate::db::events::list_for_session(&pool, &runs[0].id)
                 .await
                 .unwrap();
             if events.len() >= 7 {
@@ -7739,10 +7742,10 @@ stages:
             .await
             .unwrap();
 
-        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
         wait_until_events_contain(&pool, &runs[0].id, "echo:Do the templated thing.").await;
 
-        let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+        let events = crate::db::events::list_for_session(&pool, &runs[0].id)
             .await
             .unwrap();
         assert!(
@@ -7795,14 +7798,14 @@ stages:
     }
 
     #[tokio::test]
-    async fn send_message_errors_when_the_open_stage_has_no_task_run_yet() {
+    async fn send_message_errors_when_the_open_stage_has_no_session_yet() {
         let pool = connect_in_memory().await.unwrap();
         let workflows_dir = tempdir();
         write_chat_workflow(&workflows_dir);
         let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
 
         // workflow_state seeded directly, skipping create_task/start_task
-        // (and therefore skipping the task_run it would have created) —
+        // (and therefore skipping the session it would have created) —
         // simulates a task whose entry stage never actually got entered.
         let task_id = seed_task(&pool, "chat").await;
         workflow_state::create(&pool, &task_id, "chatting", json!({}))
@@ -7936,7 +7939,7 @@ stages:
             json!("go fix the off-by-one in the loop guard")
         );
 
-        // Recorded task-scoped (no task_run — a human_gate never opens a
+        // Recorded task-scoped (no session — a human_gate never opens a
         // session), unlike the chat path's session-scoped HumanMessage.
         let recorded = events::list_for_task(&pool, &task_id)
             .await
@@ -7944,7 +7947,7 @@ stages:
             .into_iter()
             .find(|e| e.event_type == EventType::HumanMessage)
             .expect("expected a HumanMessage event");
-        assert_eq!(recorded.task_run_id, None);
+        assert_eq!(recorded.session_id, None);
         assert_eq!(
             recorded.payload["text"],
             json!("go fix the off-by-one in the loop guard")
@@ -7995,10 +7998,10 @@ stages:
             .await
             .unwrap();
 
-        let runs = task_runs::list_for_task(&pool, &task.id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
         let mut saw_echo = false;
         for _ in 0..200 {
-            let events = crate::db::events::list_for_task_run(&pool, &runs[0].id)
+            let events = crate::db::events::list_for_session(&pool, &runs[0].id)
                 .await
                 .unwrap();
             if events.iter().any(|e| {
@@ -8093,7 +8096,7 @@ stages:
 
     /// Waits until a poll has recorded at least one attempt, i.e. its loop
     /// is genuinely running. Not `wait_until_events_contain`, which looks
-    /// events up by `task_run_id` — a poll stage opens no session, so its
+    /// events up by `session_id` — a poll stage opens no session, so its
     /// entries are task-scoped with no run id at all.
     async fn wait_until_poll_attempt_recorded(pool: &SqlitePool, task_id: &str) {
         for _ in 0..600 {
@@ -8661,9 +8664,9 @@ stages:
         workflow_state::create(pool, task_id, "review", json!({}))
             .await
             .unwrap();
-        let run_id = task_runs::create(
+        let run_id = sessions::create(
             pool,
-            task_runs::NewTaskRun {
+            sessions::NewSession {
                 task_id,
                 stage: "review",
                 role: "reviewer",
@@ -8707,7 +8710,7 @@ stages:
                 .await
                 .unwrap();
         }
-        task_runs::update_status(pool, &run_id, TaskRunStatus::Idle, None, None)
+        sessions::update_status(pool, &run_id, SessionStatus::Idle, None, None)
             .await
             .unwrap();
 
@@ -8791,7 +8794,7 @@ stages:
 
         // The fixture echoes back whatever prompt it was handed, so the
         // rendered text showing up as the reply proves what was sent.
-        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         let run = runs.iter().find(|r| r.stage == "coding").unwrap();
         wait_until_events_contain(&pool, &run.id, "echo:fix pr 42").await;
     }
@@ -8838,7 +8841,7 @@ stages:
 
         // The turn ran at all — with the missing feedback blanked, not a
         // stuck task and a dead subprocess.
-        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         let run = runs.iter().find(|r| r.stage == "coding").unwrap();
         wait_until_events_contain(&pool, &run.id, "echo:address: ").await;
 
@@ -8853,7 +8856,7 @@ stages:
             note.payload["placeholders"],
             json!(["{{ stages.internal_review.feedback }}"])
         );
-        assert_eq!(note.task_run_id, None);
+        assert_eq!(note.session_id, None);
     }
 
     /// P2-7a: this is the gap the issue closes — a `prompt_file` entry
@@ -8891,7 +8894,7 @@ stages:
             .unwrap();
         wait_until_stage(&pool, &task_id, "coding").await;
 
-        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         let run = runs.iter().find(|r| r.stage == "coding").unwrap();
         // `seed_task` gives the task the title "T" (§ its own definition).
         wait_until_events_contain(&pool, &run.id, "echo:T: fix the flaky test").await;
@@ -8932,7 +8935,7 @@ stages:
             .unwrap();
         wait_until_stage(&pool, &task_id, "coding").await;
 
-        let runs = task_runs::list_for_task(&pool, &task_id).await.unwrap();
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         let run = runs.iter().find(|r| r.stage == "coding").unwrap();
         wait_until_events_contain(&pool, &run.id, "echo:fix the flaky test").await;
     }
@@ -8990,7 +8993,7 @@ stages:
             json!(["{{ stages.open_pr.missing }}"])
         );
         assert_eq!(
-            note.task_run_id, None,
+            note.session_id, None,
             "a template renders before any session exists, so it is task-scoped"
         );
     }
@@ -9994,9 +9997,9 @@ roles:
         pool: &SqlitePool,
         task_id: &str,
         stage: &str,
-    ) -> chocofactory_core::models::TaskRun {
+    ) -> chocofactory_core::models::Session {
         for _ in 0..500 {
-            let found = task_runs::list_for_task(pool, task_id)
+            let found = sessions::list_for_task(pool, task_id)
                 .await
                 .unwrap()
                 .into_iter()
@@ -10006,7 +10009,7 @@ roles:
             }
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
-        panic!("timed out waiting for a task_run for stage {stage}");
+        panic!("timed out waiting for a session for stage {stage}");
     }
 
     /// The headline confirmation for #17/P2-6: a workflow that actually
@@ -11075,8 +11078,8 @@ stages:
             "cancelled"
         );
         for _ in 0..200 {
-            let run = task_runs::get(&pool, &run.id).await.unwrap().unwrap();
-            if run.end_reason == Some(TaskRunEndReason::Cancelled) {
+            let run = sessions::get(&pool, &run.id).await.unwrap().unwrap();
+            if run.end_reason == Some(SessionEndReason::Cancelled) {
                 return;
             }
             tokio::time::sleep(StdDuration::from_millis(10)).await;
@@ -11440,7 +11443,7 @@ stages:
         );
     }
 
-    /// A `shell` stage owns no `task_run`, so killing the task's agent
+    /// A `shell` stage owns no `session`, so killing the task's agent
     /// session doesn't reach it. Cancel has to abort the detached runner —
     /// otherwise the command keeps running in a worktree cancel is about
     /// to delete.
@@ -11646,7 +11649,7 @@ stages:
         // A binary that can't be spawned at all, so entering `coding` from
         // `run` fails synchronously inside `advance_from_stage` — the same
         // technique
-        // `a_failed_session_start_marks_the_task_run_exited_instead_of_wedging_it`
+        // `a_failed_session_start_marks_the_session_exited_instead_of_wedging_it`
         // uses.
         let engine = engine_with_adapter(pool.clone(), "/no/such/binary-3f6c9a");
 
@@ -11997,7 +12000,7 @@ stages:
                 .any(|(stage, outcome)| stage == "coding" && outcome == &json!("retry")),
             "expected a stage_entered event with outcome 'retry': {trail:?}"
         );
-        let runs: Vec<_> = task_runs::list_for_task(&pool, &task_id)
+        let runs: Vec<_> = sessions::list_for_task(&pool, &task_id)
             .await
             .unwrap()
             .into_iter()
@@ -12006,7 +12009,7 @@ stages:
         assert_eq!(
             runs.len(),
             2,
-            "expected the failed session-start attempt's task_run and the retry's own"
+            "expected the failed session-start attempt's session and the retry's own"
         );
     }
 
@@ -12080,8 +12083,8 @@ stages:
         (task_id, def)
     }
 
-    async fn runs_for_stage(pool: &SqlitePool, task_id: &str, stage: &str) -> Vec<TaskRun> {
-        task_runs::list_for_task(pool, task_id)
+    async fn runs_for_stage(pool: &SqlitePool, task_id: &str, stage: &str) -> Vec<Session> {
+        sessions::list_for_task(pool, task_id)
             .await
             .unwrap()
             .into_iter()
@@ -12096,8 +12099,8 @@ stages:
         pool: &SqlitePool,
         task_id: &str,
         stage: &str,
-        earlier: &TaskRun,
-    ) -> TaskRun {
+        earlier: &Session,
+    ) -> Session {
         let runs = runs_for_stage(pool, task_id, stage).await;
         assert_eq!(runs.len(), 2, "expected exactly two runs: {runs:?}");
         runs.into_iter()
@@ -12119,7 +12122,7 @@ stages:
         );
         let runs = runs_for_stage(&pool, &task_id, "coding").await;
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].end_reason, Some(TaskRunEndReason::Interrupted));
+        assert_eq!(runs[0].end_reason, Some(SessionEndReason::Interrupted));
     }
 
     #[tokio::test]
@@ -12147,7 +12150,7 @@ stages:
             RetryOutcome {
                 stage: "coding".to_string(),
                 resumed: true,
-                session_id: interrupted_run.session_id.clone(),
+                session_id: interrupted_run.adapter_session_id.clone(),
                 fresh_reason: None,
             }
         );
@@ -12161,11 +12164,14 @@ stages:
             resumed_run.resumed_from.as_deref(),
             Some(interrupted_run.id.as_str())
         );
-        assert_eq!(resumed_run.session_id, interrupted_run.session_id);
+        assert_eq!(
+            resumed_run.adapter_session_id,
+            interrupted_run.adapter_session_id
+        );
 
         // And it was told it had been interrupted, rather than handed the
         // stage's prompt for a second time.
-        let echoed = events::list_for_task_run(&pool, &resumed_run.id)
+        let echoed = events::list_for_session(&pool, &resumed_run.id)
             .await
             .unwrap()
             .into_iter()
@@ -12189,7 +12195,7 @@ stages:
                 .any(|(stage, via)| stage == "coding" && via == &json!("retry_resume")),
             "expected a retry_resume transition: {trail:?}"
         );
-        let notes: Vec<String> = events::list_for_task_run(&pool, &resumed_run.id)
+        let notes: Vec<String> = events::list_for_session(&pool, &resumed_run.id)
             .await
             .unwrap()
             .into_iter()
@@ -12237,11 +12243,11 @@ stages:
         let fresh_run = run_after(&pool, &task_id, "coding", &interrupted_run).await;
         assert_eq!(fresh_run.resumed_from, None);
         assert_ne!(
-            fresh_run.session_id, interrupted_run.session_id,
+            fresh_run.adapter_session_id, interrupted_run.adapter_session_id,
             "a fresh start is a new session"
         );
         // And it got the stage's own prompt back, not a resume message.
-        let echoed = events::list_for_task_run(&pool, &fresh_run.id)
+        let echoed = events::list_for_session(&pool, &fresh_run.id)
             .await
             .unwrap()
             .into_iter()
@@ -12274,7 +12280,7 @@ stages:
         wait_until_task_status(&pool, &task_id, "stuck").await;
         assert_eq!(
             runs_for_stage(&pool, &task_id, "coding").await[0].end_reason,
-            Some(TaskRunEndReason::NoReport)
+            Some(SessionEndReason::NoReport)
         );
 
         let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
@@ -12332,10 +12338,10 @@ stages:
         let finished = &def.stages["finished"];
 
         // One ended run per case, so they can't interfere with each other.
-        let ended = async |session: Option<&str>, reason: Option<TaskRunEndReason>| -> TaskRun {
-            let run = task_runs::create(
+        let ended = async |session: Option<&str>, reason: Option<SessionEndReason>| -> Session {
+            let run = sessions::create(
                 &pool,
-                task_runs::NewTaskRun {
+                sessions::NewSession {
                     task_id: &task_id,
                     stage: "coding",
                     role: "coder",
@@ -12346,14 +12352,14 @@ stages:
             .await
             .unwrap();
             if let Some(session) = session {
-                task_runs::set_session_id(&pool, &run.id, session)
+                sessions::set_adapter_session_id(&pool, &run.id, session)
                     .await
                     .unwrap();
             }
-            task_runs::update_status(
+            sessions::update_status(
                 &pool,
                 &run.id,
-                TaskRunStatus::Exited,
+                SessionStatus::Exited,
                 Some(Utc::now()),
                 reason,
             )
@@ -12362,21 +12368,21 @@ stages:
             .unwrap()
         };
 
-        let interrupted = ended(Some("session-a"), Some(TaskRunEndReason::Interrupted)).await;
+        let interrupted = ended(Some("session-a"), Some(SessionEndReason::Interrupted)).await;
         assert_eq!(
             engine
                 .resumable_session(coding, Some(&interrupted))
                 .await
                 .unwrap(),
             Ok(ResumeSession {
-                session_id: "session-a".to_string(),
-                previous_run_id: interrupted.id.clone(),
-                end_reason: TaskRunEndReason::Interrupted,
+                adapter_session_id: "session-a".to_string(),
+                previous_session_id: interrupted.id.clone(),
+                end_reason: SessionEndReason::Interrupted,
             })
         );
 
         // The reaper closing a session is the other thing done *to* a turn.
-        let reaped = ended(Some("session-b"), Some(TaskRunEndReason::Reaped)).await;
+        let reaped = ended(Some("session-b"), Some(SessionEndReason::Reaped)).await;
         assert!(
             engine
                 .resumable_session(coding, Some(&reaped))
@@ -12388,10 +12394,10 @@ stages:
 
         // The agent's own failures, and a crash, are not.
         for reason in [
-            Some(TaskRunEndReason::NoReport),
-            Some(TaskRunEndReason::Lingered),
-            Some(TaskRunEndReason::Cancelled),
-            Some(TaskRunEndReason::StartFailed),
+            Some(SessionEndReason::NoReport),
+            Some(SessionEndReason::Lingered),
+            Some(SessionEndReason::Cancelled),
+            Some(SessionEndReason::StartFailed),
             None,
         ] {
             let run = ended(Some("session-c"), reason).await;
@@ -12406,7 +12412,7 @@ stages:
         }
 
         // Interrupted, but with no session recorded: nothing to resume.
-        let sessionless = ended(None, Some(TaskRunEndReason::Interrupted)).await;
+        let sessionless = ended(None, Some(SessionEndReason::Interrupted)).await;
         assert!(
             engine
                 .resumable_session(coding, Some(&sessionless))
@@ -12442,20 +12448,20 @@ stages:
         let task_id = seed_task(&pool, &def.name).await;
         let coding = &def.stages["coding"];
 
-        let new_run = || task_runs::NewTaskRun {
+        let new_run = || sessions::NewSession {
             task_id: &task_id,
             stage: "coding",
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
         };
-        let interrupt = async |run: &TaskRun| {
-            task_runs::update_status(
+        let interrupt = async |run: &Session| {
+            sessions::update_status(
                 &pool,
                 &run.id,
-                TaskRunStatus::Exited,
+                SessionStatus::Exited,
                 Some(Utc::now()),
-                Some(TaskRunEndReason::Interrupted),
+                Some(SessionEndReason::Interrupted),
             )
             .await
             .unwrap()
@@ -12464,8 +12470,8 @@ stages:
 
         // The original interrupted run, then a chain of resumes of it, each
         // interrupted again.
-        let mut previous = task_runs::create(&pool, new_run()).await.unwrap();
-        task_runs::set_session_id(&pool, &previous.id, "session-a")
+        let mut previous = sessions::create(&pool, new_run()).await.unwrap();
+        sessions::set_adapter_session_id(&pool, &previous.id, "session-a")
             .await
             .unwrap();
         previous = interrupt(&previous).await;
@@ -12486,12 +12492,12 @@ stages:
                 );
                 break;
             }
-            let run = task_runs::create_resumed(
+            let run = sessions::create_resumed(
                 &pool,
                 new_run(),
-                task_runs::ResumedFrom {
-                    run_id: &previous.id,
-                    session_id: "session-a",
+                sessions::ResumedFrom {
+                    session_id: &previous.id,
+                    adapter_session_id: "session-a",
                 },
             )
             .await
@@ -12500,8 +12506,8 @@ stages:
         }
 
         // A fresh start clears it: the next interruption is resumable again.
-        let fresh = task_runs::create(&pool, new_run()).await.unwrap();
-        task_runs::set_session_id(&pool, &fresh.id, "session-b")
+        let fresh = sessions::create(&pool, new_run()).await.unwrap();
+        sessions::set_adapter_session_id(&pool, &fresh.id, "session-b")
             .await
             .unwrap();
         let fresh = interrupt(&fresh).await;
@@ -12992,7 +12998,7 @@ stages:
         wait_until_stage(&pool, &task_id, "finished").await;
 
         let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
-        let reply = events::final_assistant_text_for_run(&pool, &run.id)
+        let reply = events::final_assistant_text_for_session(&pool, &run.id)
             .await
             .unwrap();
         let mcp_config = reply
@@ -13041,7 +13047,7 @@ stages:
         wait_until_stage(&pool, &task_id, "finished").await;
 
         let run = wait_until_run_for_stage(&pool, &task_id, "internal_review").await;
-        let reply = events::final_assistant_text_for_run(&pool, &run.id)
+        let reply = events::final_assistant_text_for_session(&pool, &run.id)
             .await
             .unwrap();
         let mcp_config = reply
@@ -13095,7 +13101,7 @@ stages:
         wait_until_stage(&pool, &task_id, "finished").await;
 
         let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
-        let reply = events::final_assistant_text_for_run(&pool, &run.id)
+        let reply = events::final_assistant_text_for_session(&pool, &run.id)
             .await
             .unwrap();
         for expected in [
@@ -13149,9 +13155,9 @@ stages:
         };
 
         for stage in ["coding", "internal_review"] {
-            let run_id = task_runs::create(
+            let run_id = sessions::create(
                 &pool,
-                task_runs::NewTaskRun {
+                sessions::NewSession {
                     task_id: &task_id,
                     stage,
                     role: "coder",
@@ -13170,7 +13176,7 @@ stages:
             // The earlier stage's run is recorded as finished, exactly as
             // #88's coding run was, while its process is still alive.
             if stage == "coding" {
-                task_runs::update_status(&pool, &run_id, TaskRunStatus::Idle, None, None)
+                sessions::update_status(&pool, &run_id, SessionStatus::Idle, None, None)
                     .await
                     .unwrap();
             }

@@ -20,7 +20,7 @@ GitHub Actions.
 
 ### P1-2. SQLite schema & migrations
 
-Implement the schema for `projects`, `tasks`, `task_runs`, `events`,
+Implement the schema for `projects`, `tasks`, `sessions`, `events`,
 `workflow_state` as described in §3, with a migration tool (e.g. `sqlx
 migrate` or `refinery`) and a repository/DAO layer providing CRUD for
 each table.
@@ -42,10 +42,10 @@ shared `Event` enum (§4.2: `AssistantMessage`, `ToolCall`, `ToolResult`,
 ### P1-4. Session lifecycle manager (active/idle/resume) + idle reaper
 
 Implement the active ⇄ idle ⇄ resume state machine (§4.1) on top of
-`task_runs`: live subprocess while active, teardown + `session_id`
+`sessions`: live subprocess while active, teardown + `adapter_session_id`
 persistence after an idle timeout, resume via a fresh process on the next
 message. Add the background idle reaper (§4.3) that also handles daemon-
-restart recovery — any `task_runs` row left `active` at daemon startup is
+restart recovery — any `sessions` row left `active` at daemon startup is
 flipped to `idle` (its process is gone).
 
 - Design ref: §4.1, §4.3
@@ -55,7 +55,7 @@ flipped to `idle` (its process is gone).
 
 Wire adapter-emitted events into the `events` table, append-only,
 normalized per §4.2. Add a daily scheduled job that prunes `events` rows
-older than 1 year (§4.4), leaving `tasks`/`task_runs` untouched.
+older than 1 year (§4.4), leaving `tasks`/`sessions` untouched.
 
 - Design ref: §4.2, §4.4
 - Depends on: P1-2, P1-3
@@ -146,7 +146,7 @@ The command runs detached and reports its outcome through `advance`,
 carrying the capture into the same locked write as the transition. Adds
 an optional per-stage `timeout:` (nothing else would ever reap a hung
 command) and a `shell_output` timeline event, since a shell stage has no
-`task_run` to hang events off. The runner lives in its own module so P2-2
+`session` to hang events off. The runner lives in its own module so P2-2
 can drive it on an interval.
 
 - Design ref: §5.1, §5.2

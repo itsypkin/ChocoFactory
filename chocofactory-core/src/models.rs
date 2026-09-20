@@ -86,47 +86,47 @@ pub struct Task {
 /// Lifecycle state of an agent subprocess session (design §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskRunStatus {
+pub enum SessionStatus {
     Active,
     Idle,
     Exited,
 }
 
-impl fmt::Display for TaskRunStatus {
+impl fmt::Display for SessionStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            TaskRunStatus::Active => "active",
-            TaskRunStatus::Idle => "idle",
-            TaskRunStatus::Exited => "exited",
+            SessionStatus::Active => "active",
+            SessionStatus::Idle => "idle",
+            SessionStatus::Exited => "exited",
         })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseTaskRunStatusError(pub String);
+pub struct ParseSessionStatusError(pub String);
 
-impl fmt::Display for ParseTaskRunStatusError {
+impl fmt::Display for ParseSessionStatusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid task run status: {}", self.0)
+        write!(f, "invalid session status: {}", self.0)
     }
 }
 
-impl std::error::Error for ParseTaskRunStatusError {}
+impl std::error::Error for ParseSessionStatusError {}
 
-impl FromStr for TaskRunStatus {
-    type Err = ParseTaskRunStatusError;
+impl FromStr for SessionStatus {
+    type Err = ParseSessionStatusError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "active" => Ok(TaskRunStatus::Active),
-            "idle" => Ok(TaskRunStatus::Idle),
-            "exited" => Ok(TaskRunStatus::Exited),
-            other => Err(ParseTaskRunStatusError(other.to_string())),
+            "active" => Ok(SessionStatus::Active),
+            "idle" => Ok(SessionStatus::Idle),
+            "exited" => Ok(SessionStatus::Exited),
+            other => Err(ParseSessionStatusError(other.to_string())),
         }
     }
 }
 
-/// Why a `TaskRun`'s `status` reached its current value, when `status`
+/// Why a `Session`'s `status` reached its current value, when `status`
 /// alone is ambiguous — e.g. `Reaped` when a clean exit into `Idle` was
 /// actually the idle reaper force-closing stdin, not the turn finishing on
 /// its own. A proper enum (rather than bare string literals scattered
@@ -135,7 +135,7 @@ impl FromStr for TaskRunStatus {
 /// #35).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskRunEndReason {
+pub enum SessionEndReason {
     /// The idle reaper force-closed stdin on a session past `idle_timeout`.
     Reaped,
     /// `SessionManager::start` failed to spawn the adapter process at all.
@@ -165,42 +165,42 @@ pub enum TaskRunEndReason {
     Interrupted,
 }
 
-impl fmt::Display for TaskRunEndReason {
+impl fmt::Display for SessionEndReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            TaskRunEndReason::Reaped => "reaped",
-            TaskRunEndReason::StartFailed => "start_failed",
-            TaskRunEndReason::Cancelled => "cancelled",
-            TaskRunEndReason::Lingered => "lingered",
-            TaskRunEndReason::NoReport => "no_report",
-            TaskRunEndReason::Interrupted => "interrupted",
+            SessionEndReason::Reaped => "reaped",
+            SessionEndReason::StartFailed => "start_failed",
+            SessionEndReason::Cancelled => "cancelled",
+            SessionEndReason::Lingered => "lingered",
+            SessionEndReason::NoReport => "no_report",
+            SessionEndReason::Interrupted => "interrupted",
         })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseTaskRunEndReasonError(pub String);
+pub struct ParseSessionEndReasonError(pub String);
 
-impl fmt::Display for ParseTaskRunEndReasonError {
+impl fmt::Display for ParseSessionEndReasonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid task run end reason: {}", self.0)
+        write!(f, "invalid session end reason: {}", self.0)
     }
 }
 
-impl std::error::Error for ParseTaskRunEndReasonError {}
+impl std::error::Error for ParseSessionEndReasonError {}
 
-impl FromStr for TaskRunEndReason {
-    type Err = ParseTaskRunEndReasonError;
+impl FromStr for SessionEndReason {
+    type Err = ParseSessionEndReasonError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "reaped" => Ok(TaskRunEndReason::Reaped),
-            "start_failed" => Ok(TaskRunEndReason::StartFailed),
-            "cancelled" => Ok(TaskRunEndReason::Cancelled),
-            "lingered" => Ok(TaskRunEndReason::Lingered),
-            "no_report" => Ok(TaskRunEndReason::NoReport),
-            "interrupted" => Ok(TaskRunEndReason::Interrupted),
-            other => Err(ParseTaskRunEndReasonError(other.to_string())),
+            "reaped" => Ok(SessionEndReason::Reaped),
+            "start_failed" => Ok(SessionEndReason::StartFailed),
+            "cancelled" => Ok(SessionEndReason::Cancelled),
+            "lingered" => Ok(SessionEndReason::Lingered),
+            "no_report" => Ok(SessionEndReason::NoReport),
+            "interrupted" => Ok(SessionEndReason::Interrupted),
+            other => Err(ParseSessionEndReasonError(other.to_string())),
         }
     }
 }
@@ -243,20 +243,23 @@ pub struct RetryOutcome {
 
 /// One row per underlying agent subprocess session a task has had (§3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TaskRun {
+pub struct Session {
     pub id: String,
     pub task_id: String,
     pub stage: String,
     pub role: String,
     pub cli_adapter: String,
     pub model: String,
-    pub session_id: Option<String>,
-    pub status: TaskRunStatus,
-    pub end_reason: Option<TaskRunEndReason>,
-    /// The run whose agent session this one continued (#92), set when
-    /// `retry` resumed an interrupted turn instead of starting a fresh
-    /// session. `None` for a run that opened its own session, which is
-    /// every run that isn't a resume.
+    /// The CLI adapter's own session identifier (written by
+    /// `db::sessions::set_adapter_session_id`, used for `--resume`) — not
+    /// to be confused with this row's own `id`.
+    pub adapter_session_id: Option<String>,
+    pub status: SessionStatus,
+    pub end_reason: Option<SessionEndReason>,
+    /// The session this one continued (#92), set when `retry` resumed an
+    /// interrupted turn instead of starting a fresh session. `None` for a
+    /// session that opened its own, which is every session that isn't a
+    /// resume.
     pub resumed_from: Option<String>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -269,9 +272,9 @@ pub enum EventType {
     /// A human-sent message — the initial prompt a task was created with, a
     /// `send_message` relay into an already-open `agent_turn` (P1-9), or a
     /// human's reply resuming a `human_gate` (#59). The first two are
-    /// session-scoped (`task_run_id` set); a `human_gate` resume has no
+    /// session-scoped (`session_id` set); a `human_gate` resume has no
     /// session to attribute it to, so that one is recorded task-scoped
-    /// instead (`task_run_id` is `None`). This is the only variant here
+    /// instead (`session_id` is `None`). This is the only variant here
     /// that isn't normalized from an agent adapter's own output; without
     /// it, `events` only ever recorded the agent's half of a conversation.
     HumanMessage,
@@ -291,7 +294,7 @@ pub enum EventType {
     /// The task entered a workflow stage (X-3). Unlike every other variant
     /// this describes the *task*, not an agent session — `human_gate` and
     /// `terminal` stages never open one — so its `Event` has no
-    /// `task_run_id`. Payload is `{"stage", "outcome"}`, where `outcome` is
+    /// `session_id`. Payload is `{"stage", "outcome"}`, where `outcome` is
     /// the transition that selected this stage and is null for the entry
     /// stage. Filtering a task's timeline for these replaces the former
     /// `workflow_state.stage_history` column.
@@ -299,8 +302,8 @@ pub enum EventType {
     /// A `shell` stage's command ran to completion, was killed by its
     /// `timeout`, or failed to spawn at all (P2-1). Like [`Self::StageEntered`]
     /// this belongs to the *task* rather than to an agent session — a shell
-    /// stage opens no session and has no `task_run` — so its `Event` has no
-    /// `task_run_id`. Payload is `{"stage", "command", "exit_code",
+    /// stage opens no session and has no `session` — so its `Event` has no
+    /// `session_id`. Payload is `{"stage", "command", "exit_code",
     /// "timed_out", "duration_ms", "stdout_tail", "stderr_tail"}`, plus an
     /// optional `"note"` when something about the capture needs explaining
     /// (unparseable JSON, oversized output, a spawn failure). Without it a
@@ -339,8 +342,8 @@ pub enum EventType {
     /// this stage doesn't route on it.
     ///
     /// Unlike [`Self::StageEntered`]/[`Self::ShellOutput`] this one *does*
-    /// belong to a session — a turn has a `task_run` — so it carries a
-    /// `task_run_id`. It exists so the lenient fallback above is visible in
+    /// belong to a session — a turn has a `session` — so it carries a
+    /// `session_id`. It exists so the lenient fallback above is visible in
     /// the timeline rather than only in the daemon's logs.
     ///
     /// Written after the transition it describes, so it sorts just *after*
@@ -357,7 +360,7 @@ pub enum EventType {
     /// captured JSON payload actually carries the field is a run-time
     /// question. Like [`Self::StageEntered`]/[`Self::ShellOutput`] this
     /// belongs to the *task*, not a session — rendering happens before any
-    /// `task_run` exists — so its `Event` has no `task_run_id`. Payload is
+    /// `session` exists — so its `Event` has no `session_id`. Payload is
     /// `{"stage", "placeholders"}`, where `placeholders` lists every
     /// blanked-out reference from that one render (one event per render
     /// call, not per placeholder).
@@ -365,7 +368,7 @@ pub enum EventType {
     /// The daemon itself acted on an agent session (#90): it nudged a turn
     /// that ended without calling `report_outcome`, gave up on one that
     /// never did, or killed a process that kept running after its turn had
-    /// completed. Session-scoped (`task_run_id` set). Payload is
+    /// completed. Session-scoped (`session_id` set). Payload is
     /// `{"kind", "message"}`, where `kind` is `"nudge"`, `"no_report"` or
     /// `"lingered"`. Without it those interventions would only be visible
     /// in the daemon's logs and in the run's `end_reason`.
@@ -430,7 +433,7 @@ impl FromStr for EventType {
 ///
 /// Most entries are normalized from an agent session's output and name the
 /// session they came from; `StageEntered`/`ShellOutput` entries belong to the
-/// task itself and leave `task_run_id` `None`. Ordering across a task is always
+/// task itself and leave `session_id` `None`. Ordering across a task is always
 /// `(created_at, id)` — there is no per-session sequence counter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -438,7 +441,7 @@ pub struct Event {
     pub task_id: String,
     /// The agent session this entry came from, or `None` when it describes
     /// the task rather than a session (see [`EventType::StageEntered`]).
-    pub task_run_id: Option<String>,
+    pub session_id: Option<String>,
     pub event_type: EventType,
     pub payload: Value,
     pub created_at: DateTime<Utc>,
@@ -462,45 +465,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_run_status_round_trips_through_display_and_from_str() {
+    fn session_status_round_trips_through_display_and_from_str() {
         for status in [
-            TaskRunStatus::Active,
-            TaskRunStatus::Idle,
-            TaskRunStatus::Exited,
+            SessionStatus::Active,
+            SessionStatus::Idle,
+            SessionStatus::Exited,
         ] {
-            assert_eq!(status.to_string().parse::<TaskRunStatus>().unwrap(), status);
+            assert_eq!(status.to_string().parse::<SessionStatus>().unwrap(), status);
         }
     }
 
     #[test]
-    fn task_run_status_from_str_rejects_unknown_value() {
-        let err = "bogus".parse::<TaskRunStatus>().unwrap_err();
+    fn session_status_from_str_rejects_unknown_value() {
+        let err = "bogus".parse::<SessionStatus>().unwrap_err();
         assert_eq!(err.0, "bogus");
-        assert_eq!(err.to_string(), "invalid task run status: bogus");
+        assert_eq!(err.to_string(), "invalid session status: bogus");
     }
 
     #[test]
-    fn task_run_end_reason_round_trips_through_display_and_from_str() {
+    fn session_end_reason_round_trips_through_display_and_from_str() {
         for reason in [
-            TaskRunEndReason::Reaped,
-            TaskRunEndReason::StartFailed,
-            TaskRunEndReason::Cancelled,
-            TaskRunEndReason::Lingered,
-            TaskRunEndReason::NoReport,
-            TaskRunEndReason::Interrupted,
+            SessionEndReason::Reaped,
+            SessionEndReason::StartFailed,
+            SessionEndReason::Cancelled,
+            SessionEndReason::Lingered,
+            SessionEndReason::NoReport,
+            SessionEndReason::Interrupted,
         ] {
             assert_eq!(
-                reason.to_string().parse::<TaskRunEndReason>().unwrap(),
+                reason.to_string().parse::<SessionEndReason>().unwrap(),
                 reason
             );
         }
     }
 
     #[test]
-    fn task_run_end_reason_from_str_rejects_unknown_value() {
-        let err = "bogus".parse::<TaskRunEndReason>().unwrap_err();
+    fn session_end_reason_from_str_rejects_unknown_value() {
+        let err = "bogus".parse::<SessionEndReason>().unwrap_err();
         assert_eq!(err.0, "bogus");
-        assert_eq!(err.to_string(), "invalid task run end reason: bogus");
+        assert_eq!(err.to_string(), "invalid session end reason: bogus");
     }
 
     #[test]
@@ -535,9 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn task_run_status_serializes_to_snake_case_json() {
+    fn session_status_serializes_to_snake_case_json() {
         assert_eq!(
-            serde_json::to_string(&TaskRunStatus::Idle).unwrap(),
+            serde_json::to_string(&SessionStatus::Idle).unwrap(),
             "\"idle\""
         );
     }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use chocofactoryd::adapter::{AgentAdapter, ClaudeAdapter};
 use chocofactoryd::api::{self, AppState};
 use chocofactoryd::config_root;
-use chocofactoryd::db::{self, task_runs};
+use chocofactoryd::db::{self, sessions};
 use chocofactoryd::engine::WorkflowEngine;
 use chocofactoryd::global_config::GlobalConfig;
 use chocofactoryd::retention::{self, RetentionConfig};
@@ -88,12 +88,12 @@ async fn main() {
         .expect("chocofactoryd: failed to connect to the database");
     tracing::info!(path = %db_path.display(), "connected to database");
 
-    // Before any SessionManager use (its own doc comment): any run left
+    // Before any SessionManager use (its own doc comment): any session left
     // `active` in the DB from a previous process is dead by now.
-    let recovered = task_runs::recover_stale_active_runs(&pool)
+    let recovered = sessions::recover_stale_active_sessions(&pool)
         .await
-        .expect("chocofactoryd: failed to recover stale active task runs");
-    tracing::info!(recovered, "recovered stale active task runs");
+        .expect("chocofactoryd: failed to recover stale active sessions");
+    tracing::info!(recovered, "recovered stale active sessions");
 
     let events_notify = Arc::new(Notify::new());
     let mut claude_adapter = match claude_binary_override() {

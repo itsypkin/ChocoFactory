@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(events[0]["payload"]["outcome"], Value::Null);
         // It belongs to the task, not to a session — and is served over the
         // same endpoint as everything else rather than a parallel one.
-        assert_eq!(events[0]["task_run_id"], Value::Null);
+        assert_eq!(events[0]["session_id"], Value::Null);
         assert_eq!(events[0]["task_id"], task_id.as_str());
 
         // Everything after it is session-scoped conversation, in order.
@@ -238,7 +238,7 @@ mod tests {
             "chat has one stage, so only one transition should appear: {rest:?}"
         );
         assert!(
-            events[1..].iter().all(|e| e["task_run_id"] != Value::Null),
+            events[1..].iter().all(|e| e["session_id"] != Value::Null),
             "conversation events should still name their session"
         );
         assert!(

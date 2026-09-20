@@ -463,8 +463,8 @@ pub fn events(page: &EventsPage) -> String {
 fn event_summary(event: &Event) -> String {
     let summary = event_summary_body(event);
     // #90: output from a sub-agent, or arriving after the turn had already
-    // completed, is recorded on the same run as the main agent's. Marked so a
-    // reader of the timeline can't take either for the turn's own answer.
+    // completed, is recorded on the same session as the main agent's. Marked
+    // so a reader of the timeline can't take either for the turn's own answer.
     let mut markers = String::new();
     if event
         .payload
@@ -707,7 +707,7 @@ mod tests {
         json!({
             "id": format!("e-{stage}-{at}"),
             "task_id": "t1",
-            "task_run_id": Value::Null,
+            "session_id": Value::Null,
             "event_type": "stage_entered",
             "payload": {"stage": stage, "outcome": outcome},
             "created_at": at,
@@ -1043,7 +1043,7 @@ mod tests {
         Event {
             id: "e1".to_string(),
             task_id: "t1".to_string(),
-            task_run_id: Some("r1".to_string()),
+            session_id: Some("r1".to_string()),
             event_type,
             payload,
             created_at: Utc::now(),

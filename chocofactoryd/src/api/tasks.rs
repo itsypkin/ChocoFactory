@@ -223,7 +223,7 @@ pub async fn send_message(
 /// `202`, not `200`: the kill is a signal. By the time this returns the
 /// task is durably un-advanceable and the signal is delivered, but the
 /// subprocess's own teardown — final events draining into the timeline,
-/// the `task_run` landing on `exited` — completes just after. Poll
+/// the session landing on `exited` — completes just after. Poll
 /// `GET /tasks/{id}` for the settled state.
 pub async fn cancel(
     State(state): State<AppState>,
@@ -863,7 +863,7 @@ stages:
     }
 
     /// A stuck task whose stage is a `human_gate` rather than `chat_task`'s
-    /// agent_turn: it opens no `task_run`, so `retry_task`'s defensive
+    /// agent_turn: it opens no session, so `retry_task`'s defensive
     /// `RunStillActive` check can't trip on a session these tests never
     /// stopped — what they exercise is the HTTP layer, not the engine.
     async fn stuck_gate_task(server: &TestServer) -> String {

@@ -122,24 +122,24 @@ SQLite tables (names indicative, not final schema):
   created_at, updated_at`. `config` holds per-task overrides (CLI/model/
   system-prompt per role, repo path, base branch, etc.) layered over
   workflow-definition-level and global defaults.
-- **`task_runs`**: one row per underlying agent subprocess "session" a
-  task has had (a task can span many runs across idle/resume cycles —
-  every `agent_turn` stage execution is one run, keyed by which stage/role
-  it belongs to). `id, task_id, stage, role, cli_adapter, model,
-  session_id (from the CLI), status (active|idle|exited), started_at,
-  ended_at`.
+- **`sessions`**: one row per underlying agent subprocess session a
+  task has had (a task can span many sessions across idle/resume cycles —
+  every `agent_turn` stage execution is one session, keyed by which
+  stage/role it belongs to). `id, task_id, stage, role, cli_adapter,
+  model, adapter_session_id (from the CLI), status (active|idle|exited),
+  started_at, ended_at`.
 - **`events`**: append-only **task timeline** — every entry a task has
-  accumulated, in one totally-ordered log. `id, task_id, task_run_id,
+  accumulated, in one totally-ordered log. `id, task_id, session_id,
   event_type, payload (json), created_at`. This is what the UI timeline
   and the 1-year retention job operate on (§4.4).
 
   Most entries are normalized from an agent session and name the session
   they came from. Session attribution is *optional*, though: a
   `stage_entered` entry (§4.2) describes the task itself and leaves
-  `task_run_id` NULL, because `human_gate` and `terminal` stages never
-  open a session at all — there is no `task_runs` row to point at. Reading
+  `session_id` NULL, because `human_gate` and `terminal` stages never
+  open a session at all — there is no `sessions` row to point at. Reading
   a task's timeline therefore filters `events.task_id` directly rather
-  than joining through `task_runs`, which would silently drop exactly
+  than joining through `sessions`, which would silently drop exactly
   those entries.
 
   Ordering is always `(created_at, id)`, one rule for the whole table.
@@ -189,7 +189,7 @@ Hybrid model per Q4:
    Events, persisted and pushed to any connected UI.
 2. **Idle**: after N minutes with no input (configurable, default TBD in
    plan), the daemon closes stdin, lets the process exit, and stores the
-   CLI's `session_id` on the `task_runs` row (`status = idle`).
+   CLI's `adapter_session_id` on the `sessions` row (`status = idle`).
 3. **Resume**: next message (from UI, or CLI/agent delegation) spawns a
    fresh process via `resume(session_id, ...)`, flips the run back to
    `active`.
@@ -226,29 +226,29 @@ Two of these are not adapter output:
   through (§5.2), so one entry covers a task's entry stage, every
   subsequent transition, and terminal entry alike. `outcome` is the
   transition that selected the stage, null for the entry stage. Because
-  it describes the task rather than a session it has no `task_run_id`
+  it describes the task rather than a session it has no `session_id`
   (§3), and it is what makes a `human_gate`-only workflow observable at
   all — such a task opens no session and would otherwise emit nothing.
 
 ### 4.3 Idle reaper
 
-A background task in `chocofactoryd` periodically scans `task_runs` for
-`active` runs past their idle threshold and tears them down (§4.1 step
-2). Same mechanism handles daemon-restart recovery: any run left `active`
-in the DB when the daemon starts back up is treated as dead (process is
-gone) and flipped to `idle` using its last known `session_id`, so restart
-just means "resume on next message," matching the SQLite-for-restart-
-safety goal from the rough idea.
+A background task in `chocofactoryd` periodically scans `sessions` for
+`active` sessions past their idle threshold and tears them down (§4.1
+step 2). Same mechanism handles daemon-restart recovery: any session left
+`active` in the DB when the daemon starts back up is treated as dead
+(process is gone) and flipped to `idle` using its last known
+`adapter_session_id`, so restart just means "resume on next message,"
+matching the SQLite-for-restart-safety goal from the rough idea.
 
 ### 4.4 Retention job
 
 Scheduled job (daily) deletes `events` rows older than 1 year (Q16).
-Runs off `events.created_at`; doesn't touch `tasks`/`task_runs` rows
+Runs off `events.created_at`; doesn't touch `tasks`/`sessions` rows
 themselves, so task history/metadata outlives its detailed transcript.
 
 One consequence of §3's move of the stage trail into `events`: the trail
 is now subject to this job, where `workflow_state.stage_history` was
-permanent. A task closed over a year ago keeps its `task_runs` metadata
+permanent. A task closed over a year ago keeps its `sessions` metadata
 but loses its `stage_entered` entries along with the rest of its
 transcript. If the trail should outlive the transcript, retention needs
 to exempt `event_type = 'stage_entered'` — deliberately not done here,
@@ -558,14 +558,14 @@ scripting runtime (see §7 non-goal):
   runs in the task's working directory, and what it did (exit code,
   duration, output tails) is recorded on the task's timeline as a
   `shell_output` event — a shell stage opens no agent session, so that
-  entry belongs to the task and carries no `task_run_id`. A `timeout:`
+  entry belongs to the task and carries no `session_id`. A `timeout:`
   kills the command's whole process group, not just the shell the daemon
   spawned, so a timed-out pipeline can't leave grandchildren running in the
   working copy while the workflow retries. A process that escapes the group
   anyway (`setsid`, a double-fork) can still outlive the kill; that isn't
   silently tolerated — the stage reports it on the timeline so an operator
   knows a retry is about to run on top of something still live. Known gap: a shell stage
-  interrupted by a daemon restart has no `task_run` row and no recovery
+  interrupted by a daemon restart has no `session` row and no recovery
   hook, so its task parks at the stage it had entered — the same class of
   gap an interrupted `agent_turn` has, but without the stale-run sweep that
   covers that one.

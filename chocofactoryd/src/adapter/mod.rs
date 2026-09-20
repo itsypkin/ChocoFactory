@@ -142,8 +142,8 @@ pub enum AgentEvent {
     /// The turn was cut off from outside: the CLI reported that the account
     /// hit a usage/rate limit (#92). Recorded as an ordinary `Error` on the
     /// timeline — it *is* an error for the turn — but carried as its own
-    /// variant so `session::drain_session` can end the run
-    /// `TaskRunEndReason::Interrupted` and `retry` can resume the session
+    /// variant so `session::drain_session` can end the session
+    /// `SessionEndReason::Interrupted` and `retry` can resume the session
     /// rather than starting a fresh one over a worktree full of work.
     ///
     /// `detected_by` names the rule that fired, and is persisted, because

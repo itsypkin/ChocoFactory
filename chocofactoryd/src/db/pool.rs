@@ -43,12 +43,135 @@ mod tests {
                 .await
                 .unwrap();
         let names: Vec<String> = tables.into_iter().map(|(n,)| n).collect();
-        for expected in ["projects", "tasks", "task_runs", "events", "workflow_state"] {
+        for expected in ["projects", "tasks", "sessions", "events", "workflow_state"] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "missing table {expected}"
             );
         }
+        // #48: `task_runs` is gone, renamed to `sessions` — and along with
+        // it, the old `task_runs.session_id` (the CLI adapter's own session
+        // id) becomes `sessions.adapter_session_id`, freeing `session_id` for
+        // `events`' foreign key into the renamed table.
+        assert!(
+            !names.iter().any(|n| n == "task_runs"),
+            "task_runs should no longer exist, have {names:?}"
+        );
+
+        let session_columns: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('sessions')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let session_columns: Vec<String> = session_columns.into_iter().map(|(n,)| n).collect();
+        assert!(
+            session_columns.iter().any(|n| n == "adapter_session_id"),
+            "sessions should have adapter_session_id, have {session_columns:?}"
+        );
+        assert!(
+            !session_columns.iter().any(|n| n == "session_id"),
+            "sessions should not have its own session_id column, have {session_columns:?}"
+        );
+
+        let event_columns: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('events')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let event_columns: Vec<String> = event_columns.into_iter().map(|(n,)| n).collect();
+        assert!(
+            event_columns.iter().any(|n| n == "session_id"),
+            "events should have session_id, have {event_columns:?}"
+        );
+        assert!(
+            !event_columns.iter().any(|n| n == "task_run_id"),
+            "events should no longer have task_run_id, have {event_columns:?}"
+        );
+    }
+
+    /// #48: an existing local database (one that predates the `sessions`
+    /// rename) must still upgrade cleanly. This deliberately doesn't assert
+    /// that its `task_runs`/`events` rows survive — 0009's header explains
+    /// why they don't — only that applying the migration against a database
+    /// that already has data doesn't fail.
+    #[tokio::test]
+    async fn rename_to_sessions_migrates_a_pre_existing_database_cleanly() {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        // Every migration up to (not including) 0009, so the fixture below
+        // is written against the schema a real pre-#48 database would have.
+        for sql in [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_task_run_end_reason.sql"),
+            include_str!("../../migrations/0003_stage_transition_events.sql"),
+            include_str!("../../migrations/0004_task_worktree_snapshot.sql"),
+            include_str!("../../migrations/0005_drop_task_parent_task_id.sql"),
+            include_str!("../../migrations/0006_task_stuck_reason.sql"),
+            include_str!("../../migrations/0007_task_run_resumed_from.sql"),
+            include_str!("../../migrations/0008_project_repo_and_task_workflow_file.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+
+        // A task with a run and an event, exactly the kind of row 0009's
+        // header says is discarded rather than carried forward.
+        sqlx::raw_sql(
+            r#"
+INSERT INTO projects (id, name, created_at)
+    VALUES ('p1', 'demo', '2026-01-01T00:00:00Z');
+INSERT INTO tasks (id, project_id, workflow_def, title, created_at, updated_at)
+    VALUES ('t1', 'p1', 'chat', 'T1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+INSERT INTO task_runs (id, task_id, stage, role, cli_adapter, model, session_id, status, started_at)
+    VALUES ('r1', 't1', 'chatting', 'chat', 'claude', 'sonnet', 'sess-1', 'idle', '2026-01-01T00:00:00Z');
+INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
+    VALUES ('e1', 't1', 'r1', 'assistant_message', '{"text":"hi"}', '2026-01-01T00:00:01Z');
+"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The point of the test: applying 0009 against a database that
+        // already has data succeeds rather than failing on the
+        // drop-and-recreate. Applied directly (like the fixture above)
+        // rather than via `MIGRATOR.run`, which tracks applied versions in
+        // `_sqlx_migrations` — a table these hand-applied fixture
+        // migrations never populated.
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0009_rename_task_runs_to_sessions.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tables: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<String> = tables.into_iter().map(|(n,)| n).collect();
+        assert!(names.iter().any(|n| n == "sessions"));
+        assert!(!names.iter().any(|n| n == "task_runs"));
+
+        // The task itself survives (0009 never touches `tasks`); its old
+        // session and event do not.
+        let (task_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM tasks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(task_count, 1);
+        let (session_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(session_count, 0);
     }
 
     /// 0003 rebuilds `events` and backfills the new `task_id` from

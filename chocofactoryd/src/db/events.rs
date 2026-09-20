@@ -6,13 +6,13 @@ use sqlx::types::Json;
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-const COLUMNS: &str = "id, task_id, task_run_id, event_type, payload, created_at";
+const COLUMNS: &str = "id, task_id, session_id, event_type, payload, created_at";
 
 #[derive(FromRow)]
 struct EventRow {
     id: String,
     task_id: String,
-    task_run_id: Option<String>,
+    session_id: Option<String>,
     event_type: String,
     payload: Json<Value>,
     created_at: DateTime<Utc>,
@@ -23,7 +23,7 @@ impl From<EventRow> for Event {
         Event {
             id: row.id,
             task_id: row.task_id,
-            task_run_id: row.task_run_id,
+            session_id: row.session_id,
             event_type: row
                 .event_type
                 .parse()
@@ -38,40 +38,40 @@ impl From<EventRow> for Event {
 /// append-only: there is no update.
 ///
 /// `task_id` is denormalized onto every row so the task timeline needs no
-/// join (X-3), and is read here from the run itself rather than taken as a
-/// parameter — callers only ever hold a `task_run_id`, and deriving it
+/// join (X-3), and is read here from the session itself rather than taken as a
+/// parameter — callers only ever hold a `session_id`, and deriving it
 /// inside the INSERT keeps the two consistent by construction. A
-/// `task_run_id` that doesn't exist therefore selects no row and surfaces
+/// `session_id` that doesn't exist therefore selects no row and surfaces
 /// as `RowNotFound` rather than as a foreign-key violation.
 pub async fn append(
     pool: &SqlitePool,
-    task_run_id: &str,
+    session_id: &str,
     event_type: EventType,
     payload: Value,
 ) -> Result<Event, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, EventRow>(&format!(
-        "INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
-         SELECT ?, tr.task_id, tr.id, ?, ?, ?
-         FROM task_runs tr WHERE tr.id = ?
+        "INSERT INTO events (id, task_id, session_id, event_type, payload, created_at)
+         SELECT ?, s.task_id, s.id, ?, ?, ?
+         FROM sessions s WHERE s.id = ?
          RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(event_type.to_string())
     .bind(Json(payload))
     .bind(now)
-    .bind(task_run_id)
+    .bind(session_id)
     .fetch_one(pool)
     .await?;
     Ok(row.into())
 }
 
 /// Appends an entry that belongs to the *task* rather than to any agent
-/// session, so `task_run_id` is NULL (X-3): stage transitions happen in
+/// session, so `session_id` is NULL (X-3): stage transitions happen in
 /// stages that never open a session (`human_gate`, `terminal`) and before
 /// one exists (a task's entry stage), and a `shell` stage (P2-1) has no
-/// `task_run` at all. Unlike [`append`] there is no run to derive `task_id`
+/// `session` at all. Unlike [`append`] there is no session to derive `task_id`
 /// from, so the caller supplies it directly — an unknown `task_id` is a
 /// foreign-key violation rather than `RowNotFound`.
 pub async fn append_for_task(
@@ -83,7 +83,7 @@ pub async fn append_for_task(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, EventRow>(&format!(
-        "INSERT INTO events (id, task_id, task_run_id, event_type, payload, created_at)
+        "INSERT INTO events (id, task_id, session_id, event_type, payload, created_at)
          VALUES (?, ?, NULL, ?, ?, ?)
          RETURNING {COLUMNS}"
     ))
@@ -125,14 +125,14 @@ pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Event>, sqlx::Err
     Ok(row.map(Into::into))
 }
 
-pub async fn list_for_task_run(
+pub async fn list_for_session(
     pool: &SqlitePool,
-    task_run_id: &str,
+    session_id: &str,
 ) -> Result<Vec<Event>, sqlx::Error> {
     let rows = sqlx::query_as::<_, EventRow>(&format!(
-        "SELECT {COLUMNS} FROM events WHERE task_run_id = ? ORDER BY created_at, id"
+        "SELECT {COLUMNS} FROM events WHERE session_id = ? ORDER BY created_at, id"
     ))
-    .bind(task_run_id)
+    .bind(session_id)
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(Into::into).collect())
@@ -143,7 +143,7 @@ pub async fn list_for_task_run(
 ///
 /// The engine keeps no copy of a turn's reply: `drain_session` appends each
 /// `AssistantMessage` here and drops it, and the completion watcher only ever
-/// sees `task_runs` rows. So the reply is read back from the timeline.
+/// sees `sessions` rows. So the reply is read back from the timeline.
 ///
 /// **Why the final message rather than everything the agent said.** A turn is
 /// not one message. An agent that uses a tool produces
@@ -164,13 +164,13 @@ pub async fn list_for_task_run(
 ///
 /// Every *other* event type is transparent here rather than a boundary, and
 /// that distinction is load-bearing. `run_stderr_reader` turns each non-empty
-/// stderr line into an `error` event on this same run, so a CLI that prints a
+/// stderr line into an `error` event on this same session, so a CLI that prints a
 /// deprecation warning or an update banner *after* its final message would,
 /// under a "anything that isn't assistant_message ends it" rule, leave
 /// nothing to capture at all — and a `capture: json` stage would then fall
 /// back to `done` and route on a verdict the agent never gave. `session_meta`
 /// is the same shape of hazard, and `turn_outcome` (which the engine appends
-/// to this very run after reading) would make a second read poison itself.
+/// to this very session after reading) would make a second read poison itself.
 /// `thinking` is skipped rather than treated as a boundary too: the API puts
 /// thinking blocks first today, but if one were ever interleaved between two
 /// text blocks, a boundary there would silently drop the earlier half.
@@ -179,15 +179,15 @@ pub async fn list_for_task_run(
 /// far larger than the reply and is only needed here as a boundary marker, so
 /// the query selects its type and discards its payload in SQL.
 ///
-/// Two kinds of row on the run are skipped outright rather than scanned
+/// Two kinds of row on the session are skipped outright rather than scanned
 /// (#90): a sub-agent's own events (`parent_tool_use_id` set), which are not
 /// the main agent speaking even though the CLI streams them on the same
 /// stdout, and anything flagged `after_completion`, which arrived after the
 /// turn had already reported and ended and so can't be part of its answer.
 ///
-/// Scoped to one run, which on this path is one turn: a stage that captures
+/// Scoped to one session, which on this path is one turn: a stage that captures
 /// has a non-empty `on:` map, and `send_message` only accepts stages whose
-/// `on:` is empty, so no second turn can be added to this run. A future
+/// `on:` is empty, so no second turn can be added to this session. A future
 /// change that lets a capturing stage take more than one turn would still be
 /// correct here — "the last thing said" is per-turn by construction.
 ///
@@ -196,30 +196,30 @@ pub async fn list_for_task_run(
 /// to handle, instead of a block quietly dropped from the middle of a reply —
 /// which would hand the capture a truncated document that might still parse.
 ///
-/// Reading this after the run reports `idle` is safe by construction:
-/// `drain_session` appends every event before it touches the run's status, so
-/// a completed run's reply is whole here. The one gap is that those appends
+/// Reading this after the session reports `idle` is safe by construction:
+/// `drain_session` appends every event before it touches the session's status, so
+/// a completed session's reply is whole here. The one gap is that those appends
 /// are best-effort — a transient DB failure there is logged and dropped, and
 /// the block it lost is simply not part of the text this returns. That
 /// predates capture; it matters more now that a `capture: json` turn parses
 /// the result, where the worst case is a truncated document that still
 /// parses into the wrong verdict.
-pub async fn final_assistant_text_for_run(
+pub async fn final_assistant_text_for_session(
     pool: &SqlitePool,
-    task_run_id: &str,
+    session_id: &str,
 ) -> Result<String, sqlx::Error> {
     let assistant = EventType::AssistantMessage.to_string();
     let rows: Vec<(String, Option<Json<Value>>)> = sqlx::query_as(
         "SELECT event_type,
                 CASE WHEN event_type = ? THEN payload END AS text_payload
          FROM events
-         WHERE task_run_id = ?
+         WHERE session_id = ?
            AND json_extract(payload, '$.parent_tool_use_id') IS NULL
            AND json_extract(payload, '$.after_completion') IS NULL
          ORDER BY created_at, id",
     )
     .bind(&assistant)
-    .bind(task_run_id)
+    .bind(session_id)
     .fetch_all(pool)
     .await?;
 
@@ -235,9 +235,9 @@ pub async fn final_assistant_text_for_run(
         // rows, which is what this arm has just established.
         let Some(payload) = payload else {
             tracing::error!(
-                task_run_id,
+                session_id,
                 "an assistant_message event came back with no payload; \
-                 it is missing from the text of this run's reply"
+                 it is missing from the text of this session's reply"
             );
             continue;
         };
@@ -250,9 +250,9 @@ pub async fn final_assistant_text_for_run(
             // loud rather than silent — a dropped block would otherwise
             // silently corrupt the capture.
             None => tracing::error!(
-                task_run_id,
+                session_id,
                 "an assistant_message event has no 'text' field; \
-                 it is missing from the text of this run's reply"
+                 it is missing from the text of this session's reply"
             ),
         }
     }
@@ -260,9 +260,9 @@ pub async fn final_assistant_text_for_run(
     Ok(blocks.concat())
 }
 
-/// The agent's **last call** to `report_outcome` (issue #73) in a run — the
+/// The agent's **last call** to `report_outcome` (issue #73) in a session — the
 /// verdict it stated explicitly through a tool, preferred over parsing its
-/// final reply's text (`final_assistant_text_for_run`) when both exist,
+/// final reply's text (`final_assistant_text_for_session`) when both exist,
 /// since a tool call is unambiguous where a reply is guesswork.
 ///
 /// No adapter change was needed to capture this: `normalize_assistant`
@@ -286,25 +286,25 @@ pub async fn final_assistant_text_for_run(
 /// last condition, an agent that reported a valid outcome and then retried
 /// with an invalid one would complete on the first and route on the second.
 ///
-/// Scoped to one run, for the same reason `final_assistant_text_for_run` is:
-/// each stage entry opens a fresh `task_run` (`enter_agent_turn`), so a run
+/// Scoped to one session, for the same reason `final_assistant_text_for_session` is:
+/// each stage entry opens a fresh `session` (`enter_agent_turn`), so a session
 /// is exactly one turn's worth of tool calls.
-pub async fn last_report_outcome_for_run(
+pub async fn last_report_outcome_for_session(
     pool: &SqlitePool,
-    task_run_id: &str,
+    session_id: &str,
 ) -> Result<Option<Value>, sqlx::Error> {
     let tool_call = EventType::ToolCall.to_string();
     let tool_result = EventType::ToolResult.to_string();
     let tool_name = qualified_report_outcome_tool_name();
     let payload: Option<Json<Value>> = sqlx::query_scalar(
         "SELECT call.payload FROM events AS call
-         WHERE call.task_run_id = ? AND call.event_type = ?
+         WHERE call.session_id = ? AND call.event_type = ?
            AND json_extract(call.payload, '$.tool') = ?
            AND json_extract(call.payload, '$.parent_tool_use_id') IS NULL
            AND json_extract(call.payload, '$.after_completion') IS NULL
            AND NOT EXISTS (
              SELECT 1 FROM events AS result
-             WHERE result.task_run_id = call.task_run_id
+             WHERE result.session_id = call.session_id
                AND result.event_type = ?
                AND json_extract(result.payload, '$.tool_use_id')
                    = json_extract(call.payload, '$.tool_use_id')
@@ -313,7 +313,7 @@ pub async fn last_report_outcome_for_run(
          ORDER BY call.created_at DESC, call.id DESC
          LIMIT 1",
     )
-    .bind(task_run_id)
+    .bind(session_id)
     .bind(&tool_call)
     .bind(&tool_name)
     .bind(&tool_result)
@@ -328,7 +328,7 @@ pub async fn last_report_outcome_for_run(
 ///
 /// Deliberately a small allow-list of things that genuinely close a message,
 /// not "everything that isn't an `assistant_message`". See
-/// [`final_assistant_text_for_run`] for why the difference matters.
+/// [`final_assistant_text_for_session`] for why the difference matters.
 ///
 /// Written as an exhaustive `match` rather than a `matches!` so that adding
 /// an `EventType` fails to compile until someone classifies it. A type nobody
@@ -351,7 +351,7 @@ fn ends_a_message(event_type: &str) -> bool {
         EventType::Thinking => false,
         // Out-of-band: stderr lines, session metadata, the CLI's own
         // end-of-turn marker, and the engine's own bookkeeping all land on
-        // the run without interrupting what was said. `TurnCompleted`
+        // the session without interrupting what was said. `TurnCompleted`
         // always arrives after the turn's reply (#70), so treating it as a
         // boundary would erase the very reply it follows.
         EventType::Error
@@ -361,11 +361,11 @@ fn ends_a_message(event_type: &str) -> bool {
         // The daemon's own intervention (#90). A nudge is a new prompt to
         // the agent, exactly like `HumanMessage`, so whatever it answered
         // before the nudge isn't part of the answer that follows it. The
-        // other kinds (a no-report give-up, a lingering kill) park the run,
+        // other kinds (a no-report give-up, a lingering kill) park the session,
         // so no capture ever reads past them.
         EventType::SessionNote => true,
-        // Task-scoped (`task_run_id` is NULL), so unreachable from this
-        // run-scoped query — classified anyway so the match stays total.
+        // Task-scoped (`session_id` is NULL), so unreachable from this
+        // session-scoped query — classified anyway so the match stays total.
         EventType::StageEntered | EventType::ShellOutput | EventType::TemplateUnresolved => false,
     }
 }
@@ -374,11 +374,11 @@ fn ends_a_message(event_type: &str) -> bool {
 /// interleaved with the task's own `stage_entered` entries.
 ///
 /// Filters `events.task_id` directly. This used to join through
-/// `task_runs.task_id`, which is no longer merely slower but *wrong*: a
-/// stage transition has no `task_run_id` (X-3) and would be dropped by the
+/// `sessions.task_id`, which is no longer merely slower but *wrong*: a
+/// stage transition has no `session_id` (X-3) and would be dropped by the
 /// join. Ordering is `created_at, id` — the same "chrono column plus a
 /// deterministic tie-break" shape already used by
-/// `task_runs::get_current_for_stage`'s `ORDER BY started_at DESC, id DESC`.
+/// `sessions::get_current_for_stage`'s `ORDER BY started_at DESC, id DESC`.
 pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<Event>, sqlx::Error> {
     let rows = sqlx::query_as::<_, EventRow>(&format!(
         "SELECT {COLUMNS} FROM events
@@ -473,7 +473,7 @@ pub async fn list_for_task_page(
 }
 
 /// Prunes events older than `cutoff`, returning the number of rows removed.
-/// Backs the 1-year retention job (§4.4); leaves `tasks`/`task_runs` alone.
+/// Backs the 1-year retention job (§4.4); leaves `tasks`/`sessions` alone.
 pub async fn delete_older_than(
     pool: &SqlitePool,
     cutoff: DateTime<Utc>,
@@ -488,11 +488,11 @@ pub async fn delete_older_than(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{connect_in_memory, projects, task_runs, tasks};
+    use crate::db::{connect_in_memory, projects, sessions, tasks};
     use chrono::Duration;
     use serde_json::json;
 
-    async fn seed_task_run(pool: &SqlitePool) -> String {
+    async fn seed_session(pool: &SqlitePool) -> String {
         let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             pool,
@@ -508,9 +508,9 @@ mod tests {
         .await
         .unwrap()
         .id;
-        task_runs::create(
+        sessions::create(
             pool,
-            task_runs::NewTaskRun {
+            sessions::NewSession {
                 task_id: &task_id,
                 stage: "chatting",
                 role: "chat",
@@ -526,8 +526,8 @@ mod tests {
     #[tokio::test]
     async fn append_derives_the_owning_task_from_the_run() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
-        let owning_task = task_runs::get(&pool, &task_run_id)
+        let session_id = seed_session(&pool).await;
+        let owning_task = sessions::get(&pool, &session_id)
             .await
             .unwrap()
             .unwrap()
@@ -535,7 +535,7 @@ mod tests {
 
         let e1 = append(
             &pool,
-            &task_run_id,
+            &session_id,
             EventType::AssistantMessage,
             json!({"text": "hi"}),
         )
@@ -543,8 +543,8 @@ mod tests {
         .unwrap();
 
         assert!(!e1.id.is_empty());
-        assert_eq!(e1.task_run_id.as_deref(), Some(task_run_id.as_str()));
-        // Callers only pass a run; the task is resolved inside the INSERT.
+        assert_eq!(e1.session_id.as_deref(), Some(session_id.as_str()));
+        // Callers only pass a session; the task is resolved inside the INSERT.
         assert_eq!(e1.task_id, owning_task);
 
         let fetched = get(&pool, &e1.id).await.unwrap().unwrap();
@@ -556,10 +556,10 @@ mod tests {
     async fn append_against_an_unknown_run_is_an_error_not_an_orphan_row() {
         let pool = connect_in_memory().await.unwrap();
 
-        // The task_id is derived by selecting the run, so a missing run
+        // The task_id is derived by selecting the session, so a missing session
         // selects nothing and inserts nothing (rather than writing a row
         // with a dangling reference).
-        let err = append(&pool, "no-such-run", EventType::Error, json!({}))
+        let err = append(&pool, "no-such-session", EventType::Error, json!({}))
             .await
             .unwrap_err();
         assert!(matches!(err, sqlx::Error::RowNotFound), "got {err:?}");
@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(entry.task_id, task_id);
         // The point of the change: no session is involved, and none needed
         // to exist for this to be recorded.
-        assert_eq!(entry.task_run_id, None);
+        assert_eq!(entry.session_id, None);
         assert_eq!(entry.payload["stage"], "coding");
         assert_eq!(entry.payload["outcome"], Value::Null);
 
@@ -602,7 +602,7 @@ mod tests {
         assert_eq!(next.payload["stage"], "review");
         assert_eq!(next.payload["outcome"], "approved");
 
-        // Reachable from the task timeline without any task_run existing.
+        // Reachable from the task timeline without any session existing.
         let timeline = list_for_task(&pool, &task_id).await.unwrap();
         assert_eq!(
             timeline.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
@@ -633,10 +633,15 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let run = seed_task_run_for_task(&pool, &task_id, "chatting").await;
-        let said = append(&pool, &run, EventType::AssistantMessage, json!({"n": 1}))
-            .await
-            .unwrap();
+        let session = seed_session_for_task(&pool, &task_id, "chatting").await;
+        let said = append(
+            &pool,
+            &session,
+            EventType::AssistantMessage,
+            json!({"n": 1}),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let advanced = append_stage_transition(&pool, &task_id, "done", Some("finished"))
             .await
@@ -662,9 +667,9 @@ mod tests {
         );
 
         // A session's own slice excludes the task-level entries.
-        let run_only = list_for_task_run(&pool, &run).await.unwrap();
-        assert_eq!(run_only.len(), 1);
-        assert_eq!(run_only[0].event_type, EventType::AssistantMessage);
+        let session_only = list_for_session(&pool, &session).await.unwrap();
+        assert_eq!(session_only.len(), 1);
+        assert_eq!(session_only[0].event_type, EventType::AssistantMessage);
 
         // ...and the trail is the mirror image: the stage entries only, in
         // the same order, with the conversation filtered out. This is what
@@ -745,18 +750,23 @@ mod tests {
 
         // A session event exists, so "empty" is the filter working, not the
         // task simply having no events at all.
-        let run = seed_task_run_for_task(&pool, &task_id, "chatting").await;
-        append(&pool, &run, EventType::AssistantMessage, json!({"n": 1}))
-            .await
-            .unwrap();
+        let session = seed_session_for_task(&pool, &task_id, "chatting").await;
+        append(
+            &pool,
+            &session,
+            EventType::AssistantMessage,
+            json!({"n": 1}),
+        )
+        .await
+        .unwrap();
 
         assert!(list_stage_trail(&pool, &task_id).await.unwrap().is_empty());
     }
 
-    async fn seed_task_run_for_task(pool: &SqlitePool, task_id: &str, stage: &str) -> String {
-        task_runs::create(
+    async fn seed_session_for_task(pool: &SqlitePool, task_id: &str, stage: &str) -> String {
+        sessions::create(
             pool,
-            task_runs::NewTaskRun {
+            sessions::NewSession {
                 task_id,
                 stage,
                 role: "chat",
@@ -770,7 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_for_task_orders_events_across_multiple_task_runs() {
+    async fn list_for_task_orders_events_across_multiple_sessions() {
         let pool = connect_in_memory().await.unwrap();
         let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
@@ -788,23 +798,38 @@ mod tests {
         .unwrap()
         .id;
 
-        // Two task_runs under the same task (an idle/resume cycle, §4.1),
-        // with a third event going back to the *first* run — so a reader
-        // that walked runs in order would emit these out of sequence.
+        // Two sessions under the same task (an idle/resume cycle, §4.1),
+        // with a third event going back to the *first* session — so a reader
+        // that walked sessions in order would emit these out of sequence.
         // Only one `task_id`-scoped `(created_at, id)` order gets it right.
-        let run_a = seed_task_run_for_task(&pool, &task_id, "chatting").await;
-        let e1 = append(&pool, &run_a, EventType::AssistantMessage, json!({"n": 1}))
-            .await
-            .unwrap();
+        let session_a = seed_session_for_task(&pool, &task_id, "chatting").await;
+        let e1 = append(
+            &pool,
+            &session_a,
+            EventType::AssistantMessage,
+            json!({"n": 1}),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let run_b = seed_task_run_for_task(&pool, &task_id, "chatting").await;
-        let e2 = append(&pool, &run_b, EventType::AssistantMessage, json!({"n": 2}))
-            .await
-            .unwrap();
+        let session_b = seed_session_for_task(&pool, &task_id, "chatting").await;
+        let e2 = append(
+            &pool,
+            &session_b,
+            EventType::AssistantMessage,
+            json!({"n": 2}),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let e3 = append(&pool, &run_a, EventType::AssistantMessage, json!({"n": 3}))
-            .await
-            .unwrap();
+        let e3 = append(
+            &pool,
+            &session_a,
+            EventType::AssistantMessage,
+            json!({"n": 3}),
+        )
+        .await
+        .unwrap();
 
         let all = list_for_task(&pool, &task_id).await.unwrap();
         assert_eq!(
@@ -843,14 +868,19 @@ mod tests {
         .await
         .unwrap()
         .id;
-        let run = seed_task_run_for_task(&pool, &task_id, "chatting").await;
+        let session = seed_session_for_task(&pool, &task_id, "chatting").await;
 
         let mut events = Vec::new();
         for n in 0..5 {
             events.push(
-                append(&pool, &run, EventType::AssistantMessage, json!({ "n": n }))
-                    .await
-                    .unwrap(),
+                append(
+                    &pool,
+                    &session,
+                    EventType::AssistantMessage,
+                    json!({ "n": n }),
+                )
+                .await
+                .unwrap(),
             );
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
@@ -883,8 +913,8 @@ mod tests {
     #[tokio::test]
     async fn delete_older_than_prunes_only_stale_events() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
-        append(&pool, &task_run_id, EventType::Error, json!({}))
+        let session_id = seed_session(&pool).await;
+        append(&pool, &session_id, EventType::Error, json!({}))
             .await
             .unwrap();
 
@@ -892,16 +922,16 @@ mod tests {
         let removed = delete_older_than(&pool, cutoff_in_future).await.unwrap();
         assert_eq!(removed, 1);
         assert!(
-            list_for_task_run(&pool, &task_run_id)
+            list_for_session(&pool, &session_id)
                 .await
                 .unwrap()
                 .is_empty()
         );
     }
 
-    async fn append_all(pool: &SqlitePool, task_run_id: &str, events: &[(EventType, Value)]) {
+    async fn append_all(pool: &SqlitePool, session_id: &str, events: &[(EventType, Value)]) {
         for (event_type, payload) in events {
-            append(pool, task_run_id, *event_type, payload.clone())
+            append(pool, session_id, *event_type, payload.clone())
                 .await
                 .unwrap();
         }
@@ -914,11 +944,11 @@ mod tests {
     #[tokio::test]
     async fn the_final_message_excludes_narration_before_a_tool_call() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (EventType::HumanMessage, json!({ "text": "review this" })),
                 (
@@ -941,7 +971,7 @@ mod tests {
         )
         .await;
 
-        let text = final_assistant_text_for_run(&pool, &task_run_id)
+        let text = final_assistant_text_for_session(&pool, &session_id)
             .await
             .unwrap();
         assert_eq!(text, r#"{"outcome": "approved"}"#);
@@ -957,11 +987,11 @@ mod tests {
     #[tokio::test]
     async fn the_final_messages_blocks_are_concatenated_in_order() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::AssistantMessage,
@@ -972,7 +1002,7 @@ mod tests {
         )
         .await;
 
-        let text = final_assistant_text_for_run(&pool, &task_run_id)
+        let text = final_assistant_text_for_session(&pool, &session_id)
             .await
             .unwrap();
         assert_eq!(text, r#"{"comments": "hello"}"#);
@@ -980,7 +1010,7 @@ mod tests {
     }
 
     /// `run_stderr_reader` turns every non-empty stderr line into an `error`
-    /// event on this run, and a Node CLI prints deprecation and update
+    /// event on this session, and a Node CLI prints deprecation and update
     /// banners there — often *after* its final message. Treating any
     /// non-`assistant_message` row as a message boundary would leave nothing
     /// to capture, and a `capture: json` stage would fall back to `done` and
@@ -988,11 +1018,11 @@ mod tests {
     #[tokio::test]
     async fn stderr_chatter_after_the_reply_does_not_erase_it() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::AssistantMessage,
@@ -1007,7 +1037,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             r#"{"outcome": "approved"}"#
@@ -1015,16 +1045,16 @@ mod tests {
     }
 
     /// `session_meta`, and the engine's own `turn_outcome` entry against this
-    /// same run, are likewise not message boundaries — the latter would make
-    /// a second read of the same run return nothing.
+    /// same session, are likewise not message boundaries — the latter would make
+    /// a second read of the same session return nothing.
     #[tokio::test]
     async fn session_and_engine_events_are_not_message_boundaries() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (EventType::SessionMeta, json!({ "session_id": "s-1" })),
                 (EventType::AssistantMessage, json!({ "text": "approved" })),
@@ -1037,7 +1067,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             "approved"
@@ -1050,11 +1080,11 @@ mod tests {
     #[tokio::test]
     async fn a_trailing_turn_completed_is_not_a_message_boundary() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::AssistantMessage,
@@ -1066,7 +1096,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             r#"{"outcome": "approved"}"#
@@ -1078,11 +1108,11 @@ mod tests {
     #[tokio::test]
     async fn the_final_message_excludes_thinking() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::Thinking,
@@ -1094,7 +1124,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             "approved"
@@ -1106,11 +1136,11 @@ mod tests {
     #[tokio::test]
     async fn a_turn_that_ended_on_a_tool_call_has_no_final_message() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::AssistantMessage,
@@ -1122,7 +1152,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             ""
@@ -1132,25 +1162,25 @@ mod tests {
     #[tokio::test]
     async fn a_run_that_said_nothing_has_no_final_message() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             ""
         );
     }
 
-    /// One run is one turn on the capture path, but a chat run accumulates
+    /// One session is one turn on the capture path, but a chat session accumulates
     /// several — and "the last thing said" stays correct for those too.
     #[tokio::test]
     async fn the_final_message_is_the_latest_turns_answer() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (EventType::HumanMessage, json!({ "text": "first" })),
                 (EventType::AssistantMessage, json!({ "text": "answer one" })),
@@ -1161,7 +1191,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             "answer two"
@@ -1183,11 +1213,11 @@ mod tests {
     #[tokio::test]
     async fn last_report_outcome_for_run_reads_the_tool_calls_input() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::AssistantMessage,
@@ -1198,25 +1228,25 @@ mod tests {
         )
         .await;
 
-        let report = last_report_outcome_for_run(&pool, &task_run_id)
+        let report = last_report_outcome_for_session(&pool, &session_id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(report["outcome"], "approved");
     }
 
-    /// The *last* call wins, same as `final_assistant_text_for_run`'s "last
+    /// The *last* call wins, same as `final_assistant_text_for_session`'s "last
     /// thing said" rule — a model that calls the tool twice (a correction,
     /// or a retry after a validation error) should have its final word taken
     /// as the verdict, not its first.
     #[tokio::test]
     async fn last_report_outcome_for_run_prefers_the_most_recent_call() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 report_outcome_call("changes_requested"),
                 report_outcome_call("approved"),
@@ -1224,7 +1254,7 @@ mod tests {
         )
         .await;
 
-        let report = last_report_outcome_for_run(&pool, &task_run_id)
+        let report = last_report_outcome_for_session(&pool, &session_id)
             .await
             .unwrap()
             .unwrap();
@@ -1236,11 +1266,11 @@ mod tests {
     #[tokio::test]
     async fn last_report_outcome_for_run_ignores_other_tool_calls() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[(
                 EventType::ToolCall,
                 json!({
@@ -1253,7 +1283,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            last_report_outcome_for_run(&pool, &task_run_id)
+            last_report_outcome_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             None
@@ -1263,17 +1293,17 @@ mod tests {
     #[tokio::test]
     async fn last_report_outcome_for_run_is_none_when_the_tool_was_never_called() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[(EventType::AssistantMessage, json!({ "text": "approved" }))],
         )
         .await;
 
         assert_eq!(
-            last_report_outcome_for_run(&pool, &task_run_id)
+            last_report_outcome_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             None
@@ -1287,12 +1317,12 @@ mod tests {
     #[tokio::test]
     async fn last_report_outcome_for_run_ignores_a_sub_agents_report() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let tool = qualified_report_outcome_tool_name();
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 report_outcome_call("changes_requested"),
                 (
@@ -1308,7 +1338,7 @@ mod tests {
         )
         .await;
 
-        let report = last_report_outcome_for_run(&pool, &task_run_id)
+        let report = last_report_outcome_for_session(&pool, &session_id)
             .await
             .unwrap()
             .unwrap();
@@ -1321,12 +1351,12 @@ mod tests {
     #[tokio::test]
     async fn last_report_outcome_for_run_ignores_a_rejected_call() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let tool = qualified_report_outcome_tool_name();
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::ToolCall,
@@ -1356,7 +1386,7 @@ mod tests {
         )
         .await;
 
-        let report = last_report_outcome_for_run(&pool, &task_run_id)
+        let report = last_report_outcome_for_session(&pool, &session_id)
             .await
             .unwrap()
             .unwrap();
@@ -1368,12 +1398,12 @@ mod tests {
     #[tokio::test]
     async fn last_report_outcome_for_run_ignores_a_call_after_completion() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let tool = qualified_report_outcome_tool_name();
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 report_outcome_call("approved"),
                 (
@@ -1389,7 +1419,7 @@ mod tests {
         )
         .await;
 
-        let report = last_report_outcome_for_run(&pool, &task_run_id)
+        let report = last_report_outcome_for_session(&pool, &session_id)
             .await
             .unwrap()
             .unwrap();
@@ -1397,16 +1427,16 @@ mod tests {
     }
 
     /// #90: in the #88 incident a background sub-agent's narration landed as
-    /// ordinary assistant messages on the coder's run. Those, and anything
+    /// ordinary assistant messages on the coder's session. Those, and anything
     /// said after the turn completed, are not the main agent's answer.
     #[tokio::test]
     async fn the_final_message_skips_sub_agent_and_post_completion_text() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::AssistantMessage,
@@ -1426,7 +1456,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             "the verdict"
@@ -1438,11 +1468,11 @@ mod tests {
     #[tokio::test]
     async fn a_nudge_ends_the_previous_answer() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         append_all(
             &pool,
-            &task_run_id,
+            &session_id,
             &[
                 (
                     EventType::AssistantMessage,
@@ -1459,7 +1489,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            final_assistant_text_for_run(&pool, &task_run_id)
+            final_assistant_text_for_session(&pool, &session_id)
                 .await
                 .unwrap(),
             "all done"

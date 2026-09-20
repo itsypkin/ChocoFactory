@@ -113,7 +113,7 @@ fn seed_one(path: &Path, source: &str) -> io::Result<bool> {
 ///
 /// Not folded into `WorkflowEngine::new` — constructors stay side-effect-
 /// free, matching how `session.rs`'s idle reaper and
-/// `task_runs::recover_stale_active_runs` are already separate steps the
+/// `sessions::recover_stale_active_sessions` are already separate steps the
 /// daemon's startup sequence calls explicitly, not hidden inside a `new`.
 ///
 /// Used both for the daemon's own startup seed of `workflows_dir` (which
