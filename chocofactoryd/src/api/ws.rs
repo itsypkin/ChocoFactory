@@ -217,7 +217,7 @@ mod tests {
         // session — no turn/session events for its whole life. Before X-3
         // a subscriber would have seen nothing at all for a transition
         // alone; since #59 a human_gate resume also records the human's
-        // message as a task-scoped `human_message` event (no `task_run_id`,
+        // message as a task-scoped `human_message` event (no `session_id`,
         // same as the `stage_entered` it precedes), so this asserts both
         // land on the live stream, in order.
         server.write_workflow(
@@ -300,7 +300,7 @@ stages:
         let human_message: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(human_message["event_type"], "human_message");
         assert_eq!(human_message["payload"]["text"], "go");
-        assert_eq!(human_message["task_run_id"], Value::Null);
+        assert_eq!(human_message["session_id"], Value::Null);
 
         let Ok(Some(Ok(WsMessage::Text(text)))) =
             tokio::time::timeout(Duration::from_secs(5), ws.next()).await
@@ -311,7 +311,7 @@ stages:
         assert_eq!(live["event_type"], "stage_entered");
         assert_eq!(live["payload"]["stage"], "review");
         assert_eq!(live["payload"]["outcome"], "resumed");
-        assert_eq!(live["task_run_id"], Value::Null);
+        assert_eq!(live["session_id"], Value::Null);
 
         let _ = ws.close(None).await;
     }
@@ -320,7 +320,7 @@ stages:
     async fn connecting_to_a_task_with_no_events_yet_sends_nothing_until_one_arrives() {
         let server = TestServer::start().await;
 
-        // A task with no task_run/session at all (created directly at the
+        // A task with no session at all (created directly at the
         // db layer, bypassing create_task) — a genuinely empty backlog,
         // unlike a real chat task which already has events by the time a
         // socket could connect.

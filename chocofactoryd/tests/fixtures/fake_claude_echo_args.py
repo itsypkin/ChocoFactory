@@ -7,7 +7,7 @@ fixtures, its reply is not an echo of the input but a summary of its own
 argv: `model=<--model>|system_prompt=<--system-prompt>|permission_mode=<--permission-mode>|mcp_config=<--mcp-config>|strict_mcp_config=<present?>|setting_sources=<--setting-sources>|disallowed_tools=<--disallowedTools>|disable_auto_memory=<env>|initialize=<control request>|append_system_prompt=<--append-system-prompt>`.
 
 That makes the *resolved role config* observable from the events table.
-`task_runs` persists a run's `cli_adapter`/`model` columns, but nothing
+`sessions` persists a session's `cli_adapter`/`model` columns, but nothing
 persists the system prompt, so reading it back off the subprocess's
 command line is the only way a test can prove which prompt a given role
 actually ran with (P2-6/#17, where two roles must each get their own).

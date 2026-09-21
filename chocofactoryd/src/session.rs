@@ -4,19 +4,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chocofactory_core::models::{EventType, TaskRunEndReason, TaskRunStatus};
+use chocofactory_core::models::{EventType, SessionEndReason, SessionStatus};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, RoleConfig};
-use crate::db::{events, task_runs};
+use crate::db::{events, sessions};
 
 /// Drives the active ⇄ idle ⇄ resume state machine (§4.1) on top of
-/// `task_runs`: keeps a live `AgentHandle` per active `task_run_id`,
+/// `sessions`: keeps a live `AgentHandle` per active `session_id`,
 /// drains its events into the `events` table, and resumes a fresh
-/// process from the persisted `session_id` when a message arrives for a
+/// process from the persisted `adapter_session_id` when a message arrives for a
 /// run that isn't currently live in memory.
 pub struct SessionManager {
     pool: SqlitePool,
@@ -38,7 +38,7 @@ pub struct SessionManager {
 
 /// A `sessions` map entry: reserved while a process is being spawned or
 /// resumed (so a concurrent caller can't also try to establish one for
-/// the same `task_run_id`), then promoted to `Live` once the drain task
+/// the same `session_id`), then promoted to `Live` once the drain task
 /// is actually running.
 enum SessionSlot {
     Establishing,
@@ -90,7 +90,7 @@ struct SessionSignals {
     pgid: Arc<Mutex<Option<u32>>>,
     /// Set by `cancel` immediately *before* it kills the group, and read
     /// by `drain_session` once its loop ends, to record
-    /// `TaskRunEndReason::Cancelled` on the run.
+    /// `SessionEndReason::Cancelled` on the run.
     ///
     /// Deliberately not a `Command` on `cmd_tx`: `drain_session`'s
     /// `select!` is `biased` toward draining events, and its own comment
@@ -108,10 +108,10 @@ enum Command {
 
 #[derive(Debug)]
 pub enum SessionError {
-    UnknownTaskRun,
-    NotResumable(TaskRunStatus),
+    UnknownSession,
+    NotResumable(SessionStatus),
     /// Another call is already spawning or resuming a process for this
-    /// `task_run_id`. The caller can retry once that settles.
+    /// `session_id`. The caller can retry once that settles.
     AlreadyStarting,
     Adapter(AdapterError),
     Db(sqlx::Error),
@@ -120,15 +120,15 @@ pub enum SessionError {
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SessionError::UnknownTaskRun => write!(f, "no such task run"),
+            SessionError::UnknownSession => write!(f, "no such session"),
             SessionError::NotResumable(status) => {
-                write!(f, "task run is {status} and has no session to resume")
-            }
-            SessionError::AlreadyStarting => {
                 write!(
                     f,
-                    "a session for this task run is already being established"
+                    "session is {status} and has no adapter session to resume"
                 )
+            }
+            SessionError::AlreadyStarting => {
+                write!(f, "this session is already being established")
             }
             SessionError::Adapter(err) => write!(f, "{err}"),
             SessionError::Db(err) => write!(f, "{err}"),
@@ -187,40 +187,39 @@ impl SessionManager {
         })
     }
 
-    /// Starts a brand-new subprocess for `task_run_id` and begins
+    /// Starts a brand-new subprocess for `session_id` and begins
     /// draining its events (§4.1 step 1). The caller is responsible for
-    /// having already created the `task_runs` row (it's created `active`
-    /// by `task_runs::create`).
+    /// having already created the `sessions` row (it's created `active`
+    /// by `sessions::create`).
     ///
     /// `kind` decides how `drain_session` reacts to the CLI's own
     /// end-of-turn marker (#70) — see [`SessionKind`].
     pub async fn start(
         self: &Arc<Self>,
-        task_run_id: &str,
+        session_id: &str,
         prompt: &str,
         cfg: &RoleConfig,
         kind: SessionKind,
     ) -> Result<(), SessionError> {
-        self.reserve(task_run_id).await?;
+        self.reserve(session_id).await?;
 
         let handle = match self.adapter.start(prompt, cfg) {
             Ok(handle) => handle,
             Err(err) => {
-                self.sessions.lock().await.remove(task_run_id);
-                tracing::error!(task_run_id, %err, "failed to start session");
+                self.sessions.lock().await.remove(session_id);
+                tracing::error!(session_id, %err, "failed to start session");
                 return Err(SessionError::Adapter(err));
             }
         };
-        tracing::info!(task_run_id, "session started");
-        self.spawn_drain(task_run_id.to_string(), handle, kind)
-            .await;
+        tracing::info!(session_id, "session started");
+        self.spawn_drain(session_id.to_string(), handle, kind).await;
         Ok(())
     }
 
-    /// Starts a subprocess for `task_run_id` that *continues* `session_id`
+    /// Starts a subprocess for `session_id` that *continues* `adapter_session_id`
     /// rather than opening a fresh session (#92), and begins draining it.
-    /// The caller has already created the `task_runs` row, as for
-    /// [`Self::start`]; `session_id` comes from the earlier run whose turn
+    /// The caller has already created the `sessions` row, as for
+    /// [`Self::start`]; `adapter_session_id` comes from the earlier run whose turn
     /// was interrupted, and the new row keeps its own status.
     ///
     /// Separate from [`Self::send_message`]'s resume path on purpose. That
@@ -231,47 +230,50 @@ impl SessionManager {
     /// single-shot turn into a *new* run, so none of those three apply.
     pub async fn resume(
         self: &Arc<Self>,
-        task_run_id: &str,
         session_id: &str,
+        adapter_session_id: &str,
         prompt: &str,
         cfg: &RoleConfig,
         kind: SessionKind,
     ) -> Result<(), SessionError> {
-        self.reserve(task_run_id).await?;
+        self.reserve(session_id).await?;
 
-        let handle = match self.adapter.resume(session_id, prompt, cfg) {
+        let handle = match self.adapter.resume(adapter_session_id, prompt, cfg) {
             Ok(handle) => handle,
             Err(err) => {
-                self.sessions.lock().await.remove(task_run_id);
-                tracing::error!(task_run_id, session_id, %err, "failed to resume session");
+                self.sessions.lock().await.remove(session_id);
+                tracing::error!(session_id, adapter_session_id, %err, "failed to resume session");
                 return Err(SessionError::Adapter(err));
             }
         };
-        tracing::info!(task_run_id, session_id, "session resumed into a new run");
-        self.spawn_drain(task_run_id.to_string(), handle, kind)
-            .await;
+        tracing::info!(
+            session_id,
+            adapter_session_id,
+            "session resumed into a new run"
+        );
+        self.spawn_drain(session_id.to_string(), handle, kind).await;
         Ok(())
     }
 
-    /// Sends a message to `task_run_id`. If the run has a live subprocess
+    /// Sends a message to `session_id`. If the run has a live subprocess
     /// in memory, forwards straight to its stdin. Otherwise resumes a
-    /// fresh process from the persisted `session_id` (§4.1 step 3) and
+    /// fresh process from the persisted `adapter_session_id` (§4.1 step 3) and
     /// flips the run back to `active`.
     pub async fn send_message(
         self: &Arc<Self>,
-        task_run_id: &str,
+        session_id: &str,
         text: &str,
         cfg: &RoleConfig,
     ) -> Result<(), SessionError> {
         {
             let sessions = self.sessions.lock().await;
-            match sessions.get(task_run_id) {
+            match sessions.get(session_id) {
                 Some(SessionSlot::Live(session)) => {
                     *session.signals.last_activity.lock().await = Utc::now();
                     session
                         .cmd_tx
                         .send(Command::Send(text.to_string()))
-                        .map_err(|_| SessionError::UnknownTaskRun)?;
+                        .map_err(|_| SessionError::UnknownSession)?;
                     return Ok(());
                 }
                 Some(SessionSlot::Establishing) => return Err(SessionError::AlreadyStarting),
@@ -279,51 +281,50 @@ impl SessionManager {
             }
         }
 
-        let task_run = task_runs::get(&self.pool, task_run_id)
+        let session_row = sessions::get(&self.pool, session_id)
             .await
             .map_err(SessionError::Db)?
-            .ok_or(SessionError::UnknownTaskRun)?;
-        let Some(session_id) = task_run.session_id.clone() else {
-            return Err(SessionError::NotResumable(task_run.status));
+            .ok_or(SessionError::UnknownSession)?;
+        let Some(adapter_session_id) = session_row.adapter_session_id.clone() else {
+            return Err(SessionError::NotResumable(session_row.status));
         };
-        if task_run.status == TaskRunStatus::Exited {
-            return Err(SessionError::NotResumable(task_run.status));
+        if session_row.status == SessionStatus::Exited {
+            return Err(SessionError::NotResumable(session_row.status));
         }
 
         // Re-checked atomically here (rather than trusting the read
         // above): two concurrent calls for the same not-yet-live
-        // task_run_id can both reach this point, but only one of them
+        // session_id can both reach this point, but only one of them
         // wins the reservation. The loser reports AlreadyStarting instead
         // of also resuming, which would otherwise spawn a duplicate
         // process and corrupt this map (§ review on PR #28).
-        self.reserve(task_run_id).await?;
+        self.reserve(session_id).await?;
 
-        let handle = match self.adapter.resume(&session_id, text, cfg) {
+        let handle = match self.adapter.resume(&adapter_session_id, text, cfg) {
             Ok(handle) => handle,
             Err(err) => {
-                self.sessions.lock().await.remove(task_run_id);
-                tracing::error!(task_run_id, %err, "failed to resume session");
+                self.sessions.lock().await.remove(session_id);
+                tracing::error!(session_id, %err, "failed to resume session");
                 return Err(SessionError::Adapter(err));
             }
         };
         if let Err(err) =
-            task_runs::update_status(&self.pool, task_run_id, TaskRunStatus::Active, None, None)
-                .await
+            sessions::update_status(&self.pool, session_id, SessionStatus::Active, None, None).await
         {
-            self.sessions.lock().await.remove(task_run_id);
+            self.sessions.lock().await.remove(session_id);
             return Err(SessionError::Db(err));
         }
-        tracing::info!(task_run_id, "session resumed");
+        tracing::info!(session_id, "session resumed");
         // Only reachable for an open-ended stage: `send_message_or_resume`
         // routes a single-shot `agent_turn` elsewhere before this can ever
         // be called (`engine.rs`'s `stage_def.on.is_empty()` check), so a
         // resumed session is always standing-open (chat-shaped).
-        self.spawn_drain(task_run_id.to_string(), handle, SessionKind::Standing)
+        self.spawn_drain(session_id.to_string(), handle, SessionKind::Standing)
             .await;
         Ok(())
     }
 
-    /// Kills `task_run_id`'s live subprocess *and everything it spawned*,
+    /// Kills `session_id`'s live subprocess *and everything it spawned*,
     /// so an operator's cancel actually stops the work (#69).
     ///
     /// Unlike the idle reaper's `Command::Close` — which merely closes
@@ -339,16 +340,16 @@ impl SessionManager {
     /// another caller is mid-spawn and this call cannot see, and so cannot
     /// kill, the process it is about to create.
     ///
-    /// This deliberately does not touch the `task_runs` row.
+    /// This deliberately does not touch the `sessions` row.
     /// `drain_session` is that row's single writer, and it records the
     /// `Cancelled` end reason itself once the kill unwinds it; writing the
     /// status here as well would race that write, which
-    /// `task_runs::update_status` — an unconditional `UPDATE` with no
+    /// `sessions::update_status` — an unconditional `UPDATE` with no
     /// expected-status guard — would resolve by silently letting the later
     /// writer win.
-    pub async fn cancel(&self, task_run_id: &str) -> Result<(), SessionError> {
+    pub async fn cancel(&self, session_id: &str) -> Result<(), SessionError> {
         let sessions = self.sessions.lock().await;
-        match sessions.get(task_run_id) {
+        match sessions.get(session_id) {
             Some(SessionSlot::Live(session)) => {
                 // Ordered before the kill, not after: killing the group
                 // closes the subprocess's pipes, which can unwind
@@ -368,7 +369,7 @@ impl SessionManager {
                 match *pgid {
                     Some(pgid) => {
                         tracing::info!(
-                            task_run_id,
+                            session_id,
                             pgid,
                             "cancelling session: killing process group"
                         );
@@ -387,7 +388,7 @@ impl SessionManager {
                     // `tasks.status` — which every guard keys off — is
                     // written by `cancel_task`, not from here.
                     None => tracing::info!(
-                        task_run_id,
+                        session_id,
                         "cancelling session: process already gone, nothing to kill"
                     ),
                 }
@@ -398,24 +399,24 @@ impl SessionManager {
         }
     }
 
-    /// Atomically claims `task_run_id`'s map slot for a caller about to
+    /// Atomically claims `session_id`'s map slot for a caller about to
     /// spawn or resume a process, failing if another caller already holds
     /// it (whether `Establishing` or already `Live`).
-    async fn reserve(&self, task_run_id: &str) -> Result<(), SessionError> {
+    async fn reserve(&self, session_id: &str) -> Result<(), SessionError> {
         let mut sessions = self.sessions.lock().await;
-        if sessions.contains_key(task_run_id) {
+        if sessions.contains_key(session_id) {
             return Err(SessionError::AlreadyStarting);
         }
-        sessions.insert(task_run_id.to_string(), SessionSlot::Establishing);
+        sessions.insert(session_id.to_string(), SessionSlot::Establishing);
         Ok(())
     }
 
-    /// Promotes `task_run_id`'s reserved slot to `Live` and spawns the
+    /// Promotes `session_id`'s reserved slot to `Live` and spawns the
     /// task that drains `handle`. Only the caller that won `reserve`
     /// reaches this, so the `insert` here can't race another spawn.
     async fn spawn_drain(
         self: &Arc<Self>,
-        task_run_id: String,
+        session_id: String,
         handle: AgentHandle,
         kind: SessionKind,
     ) {
@@ -431,7 +432,7 @@ impl SessionManager {
         };
 
         self.sessions.lock().await.insert(
-            task_run_id.clone(),
+            session_id.clone(),
             SessionSlot::Live(ActiveSession {
                 cmd_tx,
                 signals: signals.clone(),
@@ -442,7 +443,7 @@ impl SessionManager {
         tokio::spawn(async move {
             drain_session(
                 &manager.pool,
-                &task_run_id,
+                &session_id,
                 handle,
                 kind,
                 cmd_rx,
@@ -452,14 +453,14 @@ impl SessionManager {
                 &manager.events_notify,
             )
             .await;
-            manager.sessions.lock().await.remove(&task_run_id);
+            manager.sessions.lock().await.remove(&session_id);
         });
     }
 
     /// Runs the idle reaper forever, closing sessions past `idle_timeout`
     /// every `config.interval` (§4.3). Meant to be spawned as a
     /// background task by the daemon's startup code, alongside
-    /// `task_runs::recover_stale_active_runs` at startup.
+    /// `sessions::recover_stale_active_sessions` at startup.
     pub async fn run_idle_reaper(self: Arc<Self>, config: IdleReaperConfig) {
         self.run_idle_reaper_loop(&config, None).await;
     }
@@ -489,9 +490,9 @@ impl SessionManager {
             let sessions = self.sessions.lock().await;
             sessions
                 .iter()
-                .filter_map(|(task_run_id, slot)| match slot {
+                .filter_map(|(session_id, slot)| match slot {
                     SessionSlot::Live(session) => Some((
-                        task_run_id.clone(),
+                        session_id.clone(),
                         session.cmd_tx.clone(),
                         Arc::clone(&session.signals.last_activity),
                     )),
@@ -501,11 +502,11 @@ impl SessionManager {
         };
 
         let now = Utc::now();
-        for (task_run_id, cmd_tx, last_activity) in snapshot {
+        for (session_id, cmd_tx, last_activity) in snapshot {
             let last_activity = *last_activity.lock().await;
             if now - last_activity >= self.idle_timeout {
                 tracing::info!(
-                    task_run_id,
+                    session_id,
                     "idle reaper: closing session past its idle timeout"
                 );
                 let _ = cmd_tx.send(Command::Close);
@@ -515,7 +516,7 @@ impl SessionManager {
 }
 
 /// Owns a live `AgentHandle` exclusively: drains its events into the
-/// `events` table (persisting `session_id` as soon as it's known) while
+/// `events` table (persisting `adapter_session_id` as soon as it's known) while
 /// also accepting further turns and a close request over `cmd_rx`. Runs
 /// until the subprocess exits, then records the run's final status — `idle`
 /// for a clean finish, matching §4.1 step 2 whether that exit was
@@ -556,7 +557,7 @@ impl SessionManager {
 #[allow(clippy::too_many_arguments)]
 async fn drain_session(
     pool: &SqlitePool,
-    task_run_id: &str,
+    session_id: &str,
     mut handle: AgentHandle,
     kind: SessionKind,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
@@ -616,10 +617,10 @@ async fn drain_session(
             event = handle.recv() => {
                 let Some(event) = event else { break };
                 turn.last_event_at = tokio::time::Instant::now();
-                if let AgentEvent::SessionMeta { session_id, .. } = &event
-                    && let Err(err) = task_runs::set_session_id(pool, task_run_id, session_id).await
+                if let AgentEvent::SessionMeta { adapter_session_id, .. } = &event
+                    && let Err(err) = sessions::set_adapter_session_id(pool, session_id, adapter_session_id).await
                 {
-                    tracing::error!(task_run_id, %err, "failed to persist session_id");
+                    tracing::error!(session_id, %err, "failed to persist adapter_session_id");
                 }
                 let event_type = event.event_type();
                 let mut payload = event.payload();
@@ -628,19 +629,19 @@ async fn drain_session(
                 {
                     map.insert("after_completion".to_string(), Value::Bool(true));
                 }
-                match events::append(pool, task_run_id, event_type, payload).await {
+                match events::append(pool, session_id, event_type, payload).await {
                     Ok(appended) => {
-                        tracing::debug!(task_run_id, event_type = %appended.event_type, "appended event");
+                        tracing::debug!(session_id, event_type = %appended.event_type, "appended event");
                         events_notify.notify_waiters();
                     }
-                    Err(err) => tracing::error!(task_run_id, %err, "failed to append event"),
+                    Err(err) => tracing::error!(session_id, %err, "failed to append event"),
                 }
                 if kind == SessionKind::SingleShot {
                     match turn.observe(&event) {
                         TurnStep::Continue => {}
                         TurnStep::Completed => {
                             tracing::info!(
-                                task_run_id,
+                                session_id,
                                 "single-shot turn reported and ended; closing stdin"
                             );
                             handle.close_stdin();
@@ -651,7 +652,7 @@ async fn drain_session(
                             turn.arm_grace(turn_timers.grace, GraceCause::Errored);
                         }
                         TurnStep::WaitingForReport => tracing::info!(
-                            task_run_id,
+                            session_id,
                             "single-shot turn ended without reporting; leaving it open"
                         ),
                     }
@@ -669,7 +670,7 @@ async fn drain_session(
                 match cmd {
                     Some(Command::Send(text)) => {
                         if let Err(err) = handle.send(&text) {
-                            tracing::error!(task_run_id, %err, "failed to deliver message, process already gone");
+                            tracing::error!(session_id, %err, "failed to deliver message, process already gone");
                         }
                         *last_activity.lock().await = Utc::now();
                     }
@@ -704,7 +705,7 @@ async fn drain_session(
                     turn.last_event_at = tokio::time::Instant::now();
                     append_session_note(
                         pool,
-                        task_run_id,
+                        session_id,
                         "nudge",
                         &format!(
                             "the turn ended without calling report_outcome; asked it to report \
@@ -715,15 +716,15 @@ async fn drain_session(
                     )
                     .await;
                     if let Err(err) = handle.send(NUDGE_TEXT) {
-                        tracing::error!(task_run_id, %err, "failed to nudge the turn, process already gone");
+                        tracing::error!(session_id, %err, "failed to nudge the turn, process already gone");
                     }
                     *last_activity.lock().await = Utc::now();
                 } else {
                     turn.gave_up = true;
-                    tracing::warn!(task_run_id, "single-shot turn never reported; closing it");
+                    tracing::warn!(session_id, "single-shot turn never reported; closing it");
                     append_session_note(
                         pool,
-                        task_run_id,
+                        session_id,
                         "no_report",
                         &format!(
                             "the turn never called report_outcome, even after {} nudge(s); \
@@ -768,14 +769,14 @@ async fn drain_session(
                         }
                     };
                     tracing::warn!(
-                        task_run_id,
+                        session_id,
                         grace_ms = turn_timers.grace.as_millis() as u64,
                         cause = after,
                         "process still running after stdin was closed; killed its process group"
                     );
                     append_session_note(
                         pool,
-                        task_run_id,
+                        session_id,
                         "lingered",
                         &format!(
                             "the agent process was still running {:.1}s after {after}; killed its \
@@ -787,7 +788,7 @@ async fn drain_session(
                     .await;
                 } else {
                     tracing::error!(
-                        task_run_id,
+                        session_id,
                         "grace period ran out but the session had no process group left to kill"
                     );
                 }
@@ -801,7 +802,7 @@ async fn drain_session(
                 if turn.kill_settle_deadline.is_some() =>
             {
                 tracing::warn!(
-                    task_run_id,
+                    session_id,
                     "output stream still open after killing the process group; no longer reading it"
                 );
                 break;
@@ -840,7 +841,7 @@ async fn drain_session(
     let exit_status = handle.wait().await;
     let clean_exit = matches!(&exit_status, Ok(status) if status.success());
     if let Err(err) = &exit_status {
-        tracing::error!(task_run_id, %err, "failed to reap subprocess");
+        tracing::error!(session_id, %err, "failed to reap subprocess");
     }
 
     let (final_status, end_reason) = final_run_state(
@@ -854,11 +855,11 @@ async fn drain_session(
         // Surprising but not actionable: the turn reported and ended, and the
         // process is gone. What it exited with doesn't change that.
         tracing::warn!(
-            task_run_id,
+            session_id,
             "subprocess exited non-zero after its single-shot turn had completed"
         );
     }
-    let ended_at = (final_status == TaskRunStatus::Exited).then(Utc::now);
+    let ended_at = (final_status == SessionStatus::Exited).then(Utc::now);
     // `status` and `end_reason` are set in the one statement below rather
     // than two: a watcher elsewhere (engine.rs's turn-completion watcher)
     // polls this row from a separate task and must never be able to
@@ -866,11 +867,11 @@ async fn drain_session(
     // absent) value from before this exit — that's exactly the gap that
     // would resurrect the ambiguity `end_reason` exists to close.
     if let Err(err) =
-        task_runs::update_status(pool, task_run_id, final_status, ended_at, end_reason).await
+        sessions::update_status(pool, session_id, final_status, ended_at, end_reason).await
     {
-        tracing::error!(task_run_id, %err, "failed to update status after drain");
+        tracing::error!(session_id, %err, "failed to update status after drain");
     } else {
-        tracing::info!(task_run_id, status = %final_status, ?end_reason, "session drained");
+        tracing::info!(session_id, status = %final_status, ?end_reason, "session drained");
     }
 }
 
@@ -1088,9 +1089,9 @@ fn final_run_state(
     clean_exit: bool,
     reaped: bool,
     cancelled: bool,
-) -> (TaskRunStatus, Option<TaskRunEndReason>) {
-    use TaskRunEndReason::{Cancelled, Interrupted, Lingered, NoReport, Reaped};
-    use TaskRunStatus::{Exited, Idle};
+) -> (SessionStatus, Option<SessionEndReason>) {
+    use SessionEndReason::{Cancelled, Interrupted, Lingered, NoReport, Reaped};
+    use SessionStatus::{Exited, Idle};
     match kind {
         // A clean exit (reaper-driven close, or a one-shot process finishing on
         // its own) goes to `idle`, ready to resume. A crash, auth failure, or
@@ -1154,21 +1155,21 @@ fn final_run_state(
 /// outcome if this write is lost.
 async fn append_session_note(
     pool: &SqlitePool,
-    task_run_id: &str,
+    session_id: &str,
     kind: &str,
     message: &str,
     events_notify: &Notify,
 ) {
     match events::append(
         pool,
-        task_run_id,
+        session_id,
         EventType::SessionNote,
         serde_json::json!({ "kind": kind, "message": message }),
     )
     .await
     {
         Ok(_) => events_notify.notify_waiters(),
-        Err(err) => tracing::error!(task_run_id, kind, %err, "failed to record a session note"),
+        Err(err) => tracing::error!(session_id, kind, %err, "failed to record a session note"),
     }
 }
 
@@ -1181,7 +1182,7 @@ mod tests {
 
     use super::*;
     use crate::adapter::ClaudeAdapter;
-    use crate::db::{connect_in_memory, events, projects, task_runs, tasks};
+    use crate::db::{connect_in_memory, events, projects, sessions, tasks};
 
     fn fixture_binary(name: &str) -> String {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1191,7 +1192,7 @@ mod tests {
             .into_owned()
     }
 
-    async fn seed_task_run(pool: &SqlitePool) -> String {
+    async fn seed_session(pool: &SqlitePool) -> String {
         let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             pool,
@@ -1207,9 +1208,9 @@ mod tests {
         .await
         .unwrap()
         .id;
-        task_runs::create(
+        sessions::create(
             pool,
-            task_runs::NewTaskRun {
+            sessions::NewSession {
                 task_id: &task_id,
                 stage: "chatting",
                 role: "chat",
@@ -1248,11 +1249,11 @@ mod tests {
     /// poll with a short bounded retry instead of sleeping a fixed time.
     async fn wait_until_events_len(
         pool: &SqlitePool,
-        task_run_id: &str,
+        session_id: &str,
         expected: usize,
     ) -> Vec<chocofactory_core::models::Event> {
         for _ in 0..200 {
-            let stored = events::list_for_task_run(pool, task_run_id).await.unwrap();
+            let stored = events::list_for_session(pool, session_id).await.unwrap();
             if stored.len() >= expected {
                 return stored;
             }
@@ -1261,9 +1262,9 @@ mod tests {
         panic!("timed out waiting for {expected} events");
     }
 
-    async fn wait_until_status(pool: &SqlitePool, task_run_id: &str, expected: TaskRunStatus) {
+    async fn wait_until_status(pool: &SqlitePool, session_id: &str, expected: SessionStatus) {
         for _ in 0..200 {
-            let run = task_runs::get(pool, task_run_id).await.unwrap().unwrap();
+            let run = sessions::get(pool, session_id).await.unwrap().unwrap();
             if run.status == expected {
                 return;
             }
@@ -1275,7 +1276,7 @@ mod tests {
     #[tokio::test]
     async fn a_crashed_subprocess_is_recorded_as_exited_not_idle() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
             "fake_claude_crash.py",
         )));
@@ -1287,21 +1288,21 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
 
         // A non-zero exit should land the run in `exited`, not the
         // `idle` (resumable) state a clean reaper-driven close gets.
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Exited).await;
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        wait_until_status(&pool, &session_id, SessionStatus::Exited).await;
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert!(run.ended_at.is_some());
     }
 
     #[tokio::test]
     async fn start_spawns_a_session_and_drains_its_events() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -1312,22 +1313,22 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
 
-        let stored = wait_until_events_len(&pool, &task_run_id, 2).await;
+        let stored = wait_until_events_len(&pool, &session_id, 2).await;
         assert_eq!(stored[1].payload["text"], "echo:hello");
 
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
-        assert_eq!(run.status, TaskRunStatus::Active);
-        assert!(run.session_id.is_some());
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.status, SessionStatus::Active);
+        assert!(run.adapter_session_id.is_some());
     }
 
     #[tokio::test]
     async fn send_message_forwards_to_an_active_in_memory_session() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -1338,31 +1339,31 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
-        wait_until_events_len(&pool, &task_run_id, 2).await;
+        wait_until_events_len(&pool, &session_id, 2).await;
 
         manager
-            .send_message(&task_run_id, "again", &role_config())
+            .send_message(&session_id, "again", &role_config())
             .await
             .unwrap();
 
         // SessionMeta, AssistantMessage("echo:hello"), TurnCompleted (#70:
         // fake_claude.py's `result` line, no longer discarded),
         // AssistantMessage("echo:again").
-        let stored = wait_until_events_len(&pool, &task_run_id, 4).await;
+        let stored = wait_until_events_len(&pool, &session_id, 4).await;
         assert_eq!(stored[3].payload["text"], "echo:again");
     }
 
     #[tokio::test]
-    async fn send_message_resumes_from_a_persisted_session_id_when_not_active_in_memory() {
+    async fn send_message_resumes_from_a_persisted_adapter_session_id_when_not_active_in_memory() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
-        task_runs::set_session_id(&pool, &task_run_id, "fixed-session-id")
+        let session_id = seed_session(&pool).await;
+        sessions::set_adapter_session_id(&pool, &session_id, "fixed-session-id")
             .await
             .unwrap();
-        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None, None)
+        sessions::update_status(&pool, &session_id, SessionStatus::Idle, None, None)
             .await
             .unwrap();
 
@@ -1376,22 +1377,22 @@ mod tests {
         );
 
         manager
-            .send_message(&task_run_id, "hello again", &role_config())
+            .send_message(&session_id, "hello again", &role_config())
             .await
             .unwrap();
 
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
-        assert_eq!(run.status, TaskRunStatus::Active);
-        assert_eq!(run.session_id.as_deref(), Some("fixed-session-id"));
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.status, SessionStatus::Active);
+        assert_eq!(run.adapter_session_id.as_deref(), Some("fixed-session-id"));
 
-        let stored = wait_until_events_len(&pool, &task_run_id, 2).await;
+        let stored = wait_until_events_len(&pool, &session_id, 2).await;
         assert_eq!(stored[1].payload["text"], "echo:hello again");
     }
 
     #[tokio::test]
     async fn a_send_queued_behind_a_stale_reaper_close_is_not_dropped() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         // A real timeout, so last_activity looks fresh once the queued
@@ -1404,10 +1405,10 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
-        wait_until_events_len(&pool, &task_run_id, 2).await;
+        wait_until_events_len(&pool, &session_id, 2).await;
 
         // Simulate the reaper enqueueing a Close based on a stale read of
         // last_activity, taken before the send_message below bumps it -
@@ -1415,32 +1416,32 @@ mod tests {
         // depending on real scheduler timing.
         {
             let sessions = manager.sessions.lock().await;
-            let Some(SessionSlot::Live(session)) = sessions.get(&task_run_id) else {
+            let Some(SessionSlot::Live(session)) = sessions.get(&session_id) else {
                 panic!("session should be live");
             };
             session.cmd_tx.send(Command::Close).unwrap();
         }
 
         manager
-            .send_message(&task_run_id, "again", &role_config())
+            .send_message(&session_id, "again", &role_config())
             .await
             .unwrap();
 
         // SessionMeta, AssistantMessage("echo:hello"), TurnCompleted (#70:
         // fake_claude.py's `result` line, no longer discarded),
         // AssistantMessage("echo:again").
-        let stored = wait_until_events_len(&pool, &task_run_id, 4).await;
+        let stored = wait_until_events_len(&pool, &session_id, 4).await;
         assert_eq!(stored[3].payload["text"], "echo:again");
     }
 
     #[tokio::test]
-    async fn send_message_rejects_an_exited_task_run() {
+    async fn send_message_rejects_an_exited_session() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
-        task_runs::update_status(
+        let session_id = seed_session(&pool).await;
+        sessions::update_status(
             &pool,
-            &task_run_id,
-            TaskRunStatus::Exited,
+            &session_id,
+            SessionStatus::Exited,
             Some(Utc::now()),
             None,
         )
@@ -1457,23 +1458,23 @@ mod tests {
         );
 
         let err = manager
-            .send_message(&task_run_id, "hello", &role_config())
+            .send_message(&session_id, "hello", &role_config())
             .await
             .unwrap_err();
         assert!(matches!(
             err,
-            SessionError::NotResumable(TaskRunStatus::Exited)
+            SessionError::NotResumable(SessionStatus::Exited)
         ));
     }
 
     #[tokio::test]
-    async fn send_message_rejects_a_concurrent_establish_for_the_same_task_run() {
+    async fn send_message_rejects_a_concurrent_establish_for_the_same_session() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
-        task_runs::set_session_id(&pool, &task_run_id, "fixed-session-id")
+        let session_id = seed_session(&pool).await;
+        sessions::set_adapter_session_id(&pool, &session_id, "fixed-session-id")
             .await
             .unwrap();
-        task_runs::update_status(&pool, &task_run_id, TaskRunStatus::Idle, None, None)
+        sessions::update_status(&pool, &session_id, SessionStatus::Idle, None, None)
             .await
             .unwrap();
 
@@ -1488,10 +1489,10 @@ mod tests {
 
         // Simulate another in-flight call that already claimed the slot
         // between send_message's optimistic map check and its DB read.
-        manager.reserve(&task_run_id).await.unwrap();
+        manager.reserve(&session_id).await.unwrap();
 
         let err = manager
-            .send_message(&task_run_id, "hello", &role_config())
+            .send_message(&session_id, "hello", &role_config())
             .await
             .unwrap_err();
         assert!(matches!(err, SessionError::AlreadyStarting));
@@ -1500,7 +1501,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_resumes_a_session_the_reaper_previously_idled() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         // Zero timeout: the reaper closes the session on its first pass.
@@ -1512,10 +1513,10 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
-        wait_until_events_len(&pool, &task_run_id, 2).await;
+        wait_until_events_len(&pool, &session_id, 2).await;
 
         manager
             .run_idle_reaper_loop(
@@ -1525,10 +1526,10 @@ mod tests {
                 Some(1),
             )
             .await;
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+        wait_until_status(&pool, &session_id, SessionStatus::Idle).await;
 
         manager
-            .send_message(&task_run_id, "again", &role_config())
+            .send_message(&session_id, "again", &role_config())
             .await
             .unwrap();
 
@@ -1536,16 +1537,16 @@ mod tests {
         // (#70: fake_claude.py's `result` line, no longer discarded). Then
         // the resumed process is a fresh subprocess too, so it emits its
         // own SessionMeta (event 3) before the AssistantMessage (event 4).
-        let stored = wait_until_events_len(&pool, &task_run_id, 5).await;
+        let stored = wait_until_events_len(&pool, &session_id, 5).await;
         assert_eq!(stored[4].payload["text"], "echo:again");
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
-        assert_eq!(run.status, TaskRunStatus::Active);
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.status, SessionStatus::Active);
     }
 
     #[tokio::test]
     async fn idle_reaper_closes_sessions_past_the_idle_timeout() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         // Zero timeout: any session is immediately overdue.
@@ -1557,10 +1558,10 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
-        wait_until_events_len(&pool, &task_run_id, 2).await;
+        wait_until_events_len(&pool, &session_id, 2).await;
 
         manager
             .run_idle_reaper_loop(
@@ -1571,21 +1572,21 @@ mod tests {
             )
             .await;
 
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+        wait_until_status(&pool, &session_id, SessionStatus::Idle).await;
 
         // Regression test for the review on PR #35: a reaper-driven clean
         // exit must be distinguishable from a turn that finished on its
         // own, since both land on `Idle` — `end_reason` is what the
         // workflow engine's completion watcher relies on to tell them
         // apart.
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Reaped));
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::Reaped));
     }
 
     #[tokio::test]
     async fn a_session_that_finishes_on_its_own_has_no_end_reason() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
             "fake_claude_oneshot.py",
         )));
@@ -1597,12 +1598,12 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
 
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        wait_until_status(&pool, &session_id, SessionStatus::Idle).await;
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(run.end_reason, None);
     }
 
@@ -1615,7 +1616,7 @@ mod tests {
     #[tokio::test]
     async fn a_single_shot_session_completes_and_closes_stdin_against_a_stay_open_fixture() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -1627,7 +1628,7 @@ mod tests {
 
         manager
             .start(
-                &task_run_id,
+                &session_id,
                 "hello",
                 &single_shot_role_config(),
                 SessionKind::SingleShot,
@@ -1635,8 +1636,8 @@ mod tests {
             .await
             .unwrap();
 
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        wait_until_status(&pool, &session_id, SessionStatus::Idle).await;
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(
             run.end_reason, None,
             "a real completion must not look reaped"
@@ -1644,7 +1645,7 @@ mod tests {
 
         // SessionMeta, the report_outcome call and its result (#90),
         // AssistantMessage, TurnCompleted.
-        let stored = wait_until_events_len(&pool, &task_run_id, 5).await;
+        let stored = wait_until_events_len(&pool, &session_id, 5).await;
         assert_eq!(
             stored[4].event_type,
             chocofactory_core::models::EventType::TurnCompleted
@@ -1654,7 +1655,7 @@ mod tests {
     #[tokio::test]
     async fn idle_reaper_leaves_sessions_within_the_idle_timeout_active() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -1665,10 +1666,10 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
-        wait_until_events_len(&pool, &task_run_id, 2).await;
+        wait_until_events_len(&pool, &session_id, 2).await;
 
         manager
             .run_idle_reaper_loop(
@@ -1682,8 +1683,8 @@ mod tests {
         // Give an incorrect teardown a moment to land before asserting
         // the run is still active.
         tokio::time::sleep(StdDuration::from_millis(50)).await;
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
-        assert_eq!(run.status, TaskRunStatus::Active);
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.status, SessionStatus::Active);
     }
 
     // ---- cancel (#69) ----
@@ -1764,7 +1765,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_kills_a_live_session_and_records_it_as_cancelled() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -1775,20 +1776,20 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
-        wait_until_events_len(&pool, &task_run_id, 2).await;
+        wait_until_events_len(&pool, &session_id, 2).await;
 
-        manager.cancel(&task_run_id).await.unwrap();
+        manager.cancel(&session_id).await.unwrap();
 
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Exited).await;
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        wait_until_status(&pool, &session_id, SessionStatus::Exited).await;
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         // The distinction that matters: a SIGKILLed process exits
         // non-zero, which is indistinguishable from a crash by `status`
         // alone. `end_reason` is what tells an operator their cancel is
         // what stopped it.
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Cancelled));
+        assert_eq!(run.end_reason, Some(SessionEndReason::Cancelled));
         assert!(run.ended_at.is_some());
     }
 
@@ -1802,7 +1803,7 @@ mod tests {
         let (binary, heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
 
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
@@ -1812,7 +1813,7 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "go", &role_config(), SessionKind::Standing)
+            .start(&session_id, "go", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
 
@@ -1822,7 +1823,7 @@ mod tests {
             "the fixture's child should be running before cancel"
         );
 
-        manager.cancel(&task_run_id).await.unwrap();
+        manager.cancel(&session_id).await.unwrap();
 
         // The grandchild, not just the agent: this is the assertion that
         // would fail if `cancel` used `child.kill()` instead of `killpg`.
@@ -1838,9 +1839,9 @@ mod tests {
             "the killed child should have stopped writing its heartbeat"
         );
 
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Exited).await;
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Cancelled));
+        wait_until_status(&pool, &session_id, SessionStatus::Exited).await;
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::Cancelled));
     }
 
     /// A turn that ignores stdin entirely is exactly what the idle
@@ -1852,7 +1853,7 @@ mod tests {
         let (binary, _heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
 
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
@@ -1862,14 +1863,14 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "go", &role_config(), SessionKind::Standing)
+            .start(&session_id, "go", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         read_pid_when_written(&child_pid_path).await;
 
-        manager.cancel(&task_run_id).await.unwrap();
+        manager.cancel(&session_id).await.unwrap();
 
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Exited).await;
+        wait_until_status(&pool, &session_id, SessionStatus::Exited).await;
     }
 
     /// Cancelling a run with no live process is the state cancel is trying
@@ -1879,7 +1880,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_is_a_no_op_for_a_run_with_no_live_session() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -1889,7 +1890,7 @@ mod tests {
             Arc::new(Notify::new()),
         );
 
-        manager.cancel(&task_run_id).await.unwrap();
+        manager.cancel(&session_id).await.unwrap();
         manager.cancel("no-such-run").await.unwrap();
     }
 
@@ -1900,7 +1901,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_rejects_a_run_whose_session_is_still_being_established() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -1910,9 +1911,9 @@ mod tests {
             Arc::new(Notify::new()),
         );
 
-        manager.reserve(&task_run_id).await.unwrap();
+        manager.reserve(&session_id).await.unwrap();
 
-        let err = manager.cancel(&task_run_id).await.unwrap_err();
+        let err = manager.cancel(&session_id).await.unwrap_err();
         assert!(matches!(err, SessionError::AlreadyStarting));
     }
 
@@ -1930,7 +1931,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_beats_reaped_when_a_cancelled_session_still_exits_cleanly() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         // Zero timeout: the reaper closes this session on its first pass.
@@ -1942,16 +1943,16 @@ mod tests {
         );
 
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
-        wait_until_events_len(&pool, &task_run_id, 2).await;
+        wait_until_events_len(&pool, &session_id, 2).await;
 
         // The flag without the kill: stands in for a cancel whose SIGKILL
         // lands just after the process has already wound down on its own.
         {
             let sessions = manager.sessions.lock().await;
-            let Some(SessionSlot::Live(session)) = sessions.get(&task_run_id) else {
+            let Some(SessionSlot::Live(session)) = sessions.get(&session_id) else {
                 panic!("session should be live");
             };
             session.signals.cancelled.store(true, Ordering::SeqCst);
@@ -1967,12 +1968,12 @@ mod tests {
                 Some(1),
             )
             .await;
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+        wait_until_status(&pool, &session_id, SessionStatus::Idle).await;
 
-        let run = task_runs::get(&pool, &task_run_id).await.unwrap().unwrap();
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(
             run.end_reason,
-            Some(TaskRunEndReason::Cancelled),
+            Some(SessionEndReason::Cancelled),
             "a clean exit with both flags set must report the operator's cancel, not the reaper"
         );
     }
@@ -1984,7 +1985,7 @@ mod tests {
     #[tokio::test]
     async fn a_reaped_sessions_pgid_is_cleared_so_cancel_cannot_signal_it() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
             "fake_claude_oneshot.py",
         )));
@@ -1998,12 +1999,12 @@ mod tests {
         // Grab the shared pgid handle while the session is live, so it can
         // still be inspected after the map slot is gone.
         manager
-            .start(&task_run_id, "hello", &role_config(), SessionKind::Standing)
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
             .await
             .unwrap();
         let pgid = {
             let sessions = manager.sessions.lock().await;
-            let Some(SessionSlot::Live(session)) = sessions.get(&task_run_id) else {
+            let Some(SessionSlot::Live(session)) = sessions.get(&session_id) else {
                 panic!("session should be live");
             };
             assert!(
@@ -2015,7 +2016,7 @@ mod tests {
 
         // `fake_claude_oneshot.py` exits on its own, so the drain loop
         // reaps it without any cancel involved.
-        wait_until_status(&pool, &task_run_id, TaskRunStatus::Idle).await;
+        wait_until_status(&pool, &session_id, SessionStatus::Idle).await;
 
         assert!(
             pgid.lock().await.is_none(),
@@ -2062,7 +2063,7 @@ mod tests {
         timers: TurnTimers,
     ) -> (SqlitePool, String, Arc<SessionManager>) {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::with_turn_timers(
             pool.clone(),
@@ -2073,23 +2074,23 @@ mod tests {
         );
         manager
             .start(
-                &task_run_id,
+                &session_id,
                 "go",
                 &single_shot_role_config(),
                 SessionKind::SingleShot,
             )
             .await
             .unwrap();
-        (pool, task_run_id, manager)
+        (pool, session_id, manager)
     }
 
     async fn wait_until_final(
         pool: &SqlitePool,
-        task_run_id: &str,
-    ) -> chocofactory_core::models::TaskRun {
+        session_id: &str,
+    ) -> chocofactory_core::models::Session {
         for _ in 0..500 {
-            let run = task_runs::get(pool, task_run_id).await.unwrap().unwrap();
-            if run.status != TaskRunStatus::Active {
+            let run = sessions::get(pool, session_id).await.unwrap().unwrap();
+            if run.status != SessionStatus::Active {
                 return run;
             }
             tokio::time::sleep(StdDuration::from_millis(10)).await;
@@ -2097,8 +2098,8 @@ mod tests {
         panic!("timed out waiting for the run to leave active");
     }
 
-    async fn session_notes(pool: &SqlitePool, task_run_id: &str) -> Vec<String> {
-        events::list_for_task_run(pool, task_run_id)
+    async fn session_notes(pool: &SqlitePool, session_id: &str) -> Vec<String> {
+        events::list_for_session(pool, session_id)
             .await
             .unwrap()
             .into_iter()
@@ -2125,14 +2126,14 @@ mod tests {
                 {"op": "result"},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Idle);
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle);
         assert_eq!(run.end_reason, None);
         // The only thing that could have delivered the second turn is the
         // daemon's nudge.
-        assert_eq!(session_notes(&pool, &task_run_id).await, vec!["nudge"]);
+        assert_eq!(session_notes(&pool, &session_id).await, vec!["nudge"]);
     }
 
     #[tokio::test]
@@ -2147,13 +2148,13 @@ mod tests {
                 {"op": "answer_every_turn", "text": "still thinking"},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(2)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(2)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Exited);
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::NoReport));
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
         assert_eq!(
-            session_notes(&pool, &task_run_id).await,
+            session_notes(&pool, &session_id).await,
             vec!["nudge", "nudge", "no_report"]
         );
     }
@@ -2172,15 +2173,13 @@ mod tests {
                 {"op": "result"},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::NoReport));
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
 
         // And the sub-agent's rows are marked as such on the timeline.
-        let stored = events::list_for_task_run(&pool, &task_run_id)
-            .await
-            .unwrap();
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
         let sub_agent_rows = stored
             .iter()
             .filter(|e| e.payload["parent_tool_use_id"] == "toolu_agent")
@@ -2205,15 +2204,15 @@ mod tests {
                 {"op": "usage_limit"},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Exited);
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Interrupted));
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::Interrupted));
 
         // And the timeline says which rule recognised it, so a run
         // recognised only by the CLI's wording is visible as such.
-        let detections: Vec<String> = events::list_for_task_run(&pool, &task_run_id)
+        let detections: Vec<String> = events::list_for_session(&pool, &session_id)
             .await
             .unwrap()
             .into_iter()
@@ -2239,12 +2238,12 @@ mod tests {
                 {"op": "usage_limit", "structured": false},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Interrupted));
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::Interrupted));
 
-        let detections: Vec<String> = events::list_for_task_run(&pool, &task_run_id)
+        let detections: Vec<String> = events::list_for_session(&pool, &session_id)
             .await
             .unwrap()
             .into_iter()
@@ -2268,10 +2267,10 @@ mod tests {
                 {"op": "usage_limit"},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Idle);
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle);
         assert_eq!(run.end_reason, None);
     }
 
@@ -2287,10 +2286,10 @@ mod tests {
                 {"op": "result"},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::NoReport));
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
     }
 
     /// A process that exits on its own without ever reporting didn't say it
@@ -2313,12 +2312,12 @@ mod tests {
             nudge_after: StdDuration::from_secs(3600),
             ..fast_timers(3)
         };
-        let (pool, task_run_id, _manager) = start_single_shot(binary, timers).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Exited);
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::NoReport));
-        assert!(session_notes(&pool, &task_run_id).await.is_empty());
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        assert!(session_notes(&pool, &session_id).await.is_empty());
     }
 
     /// The other half of #88: a turn that reported and ended, but whose
@@ -2341,17 +2340,15 @@ mod tests {
                 {"op": "emit_forever", "text": "still going"},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
 
         let child_pid = read_pid_when_written(&child_pid_path).await;
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Exited);
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Lingered));
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::Lingered));
         wait_until_gone(child_pid).await;
 
-        let stored = events::list_for_task_run(&pool, &task_run_id)
-            .await
-            .unwrap();
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
         let late = stored
             .iter()
             .filter(|e| e.payload["after_completion"] == true)
@@ -2361,7 +2358,7 @@ mod tests {
             late.iter().all(|e| e.payload["text"] == "still going"),
             "only post-completion output is flagged: {late:?}"
         );
-        assert_eq!(session_notes(&pool, &task_run_id).await, vec!["lingered"]);
+        assert_eq!(session_notes(&pool, &session_id).await, vec!["lingered"]);
     }
 
     /// A turn that reports, ends, and whose process exits promptly is the
@@ -2378,12 +2375,12 @@ mod tests {
                 {"op": "result"},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Idle);
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle);
         assert_eq!(run.end_reason, None);
-        assert!(session_notes(&pool, &task_run_id).await.is_empty());
+        assert!(session_notes(&pool, &session_id).await.is_empty());
     }
 
     #[tokio::test]
@@ -2396,10 +2393,10 @@ mod tests {
                 {"op": "result", "is_error": true},
             ]),
         );
-        let (pool, task_run_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Exited);
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
         assert_eq!(run.end_reason, None);
     }
 
@@ -2408,7 +2405,7 @@ mod tests {
     #[tokio::test]
     async fn session_meta_records_the_sessions_isolation() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -2425,11 +2422,11 @@ mod tests {
             ..role_config()
         };
         manager
-            .start(&task_run_id, "hello", &cfg, SessionKind::Standing)
+            .start(&session_id, "hello", &cfg, SessionKind::Standing)
             .await
             .unwrap();
 
-        let stored = wait_until_events_len(&pool, &task_run_id, 1).await;
+        let stored = wait_until_events_len(&pool, &session_id, 1).await;
         assert_eq!(stored[0].event_type, EventType::SessionMeta);
         assert_eq!(
             stored[0].payload["isolation"],
@@ -2447,7 +2444,7 @@ mod tests {
         clean_exit: bool,
         reaped: bool,
         cancelled: bool,
-        expected: (TaskRunStatus, Option<TaskRunEndReason>),
+        expected: (SessionStatus, Option<SessionEndReason>),
     }
 
     fn turn_with(f: impl FnOnce(&mut SingleShotTurn)) -> SingleShotTurn {
@@ -2461,9 +2458,9 @@ mod tests {
     /// tests that happen to reach some of them.
     #[test]
     fn final_run_state_precedence() {
+        use SessionEndReason::{Cancelled, Interrupted, Lingered, NoReport, Reaped};
         use SessionKind::{SingleShot, Standing};
-        use TaskRunEndReason::{Cancelled, Interrupted, Lingered, NoReport, Reaped};
-        use TaskRunStatus::{Exited, Idle};
+        use SessionStatus::{Exited, Idle};
 
         let silent = SingleShotTurn::default;
         let completed = || turn_with(|t| t.completed = true);
@@ -2757,7 +2754,7 @@ mod tests {
             ]),
         );
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         // Zero idle timeout: the first reaper pass closes the turn.
         let manager = SessionManager::with_turn_timers(
@@ -2769,14 +2766,14 @@ mod tests {
         );
         manager
             .start(
-                &task_run_id,
+                &session_id,
                 "go",
                 &single_shot_role_config(),
                 SessionKind::SingleShot,
             )
             .await
             .unwrap();
-        wait_until_events_len(&pool, &task_run_id, 1).await;
+        wait_until_events_len(&pool, &session_id, 1).await;
 
         manager
             .run_idle_reaper_loop(
@@ -2787,10 +2784,10 @@ mod tests {
             )
             .await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Exited);
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Reaped));
-        let notes = events::list_for_task_run(&pool, &task_run_id)
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::Reaped));
+        let notes = events::list_for_session(&pool, &session_id)
             .await
             .unwrap()
             .into_iter()
@@ -2823,14 +2820,14 @@ mod tests {
             nudge_after: StdDuration::from_secs(3600),
             ..fast_timers(3)
         };
-        let (pool, task_run_id, manager) = start_single_shot(binary, timers).await;
-        wait_until_events_len(&pool, &task_run_id, 3).await;
+        let (pool, session_id, manager) = start_single_shot(binary, timers).await;
+        wait_until_events_len(&pool, &session_id, 3).await;
 
-        manager.cancel(&task_run_id).await.unwrap();
+        manager.cancel(&session_id).await.unwrap();
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Exited);
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Cancelled));
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::Cancelled));
     }
 
     /// Cancelling during the post-completion grace period: the operator's
@@ -2855,14 +2852,14 @@ mod tests {
             grace: StdDuration::from_secs(3600),
             ..fast_timers(3)
         };
-        let (pool, task_run_id, manager) = start_single_shot(binary, timers).await;
+        let (pool, session_id, manager) = start_single_shot(binary, timers).await;
         let child_pid = read_pid_when_written(&child_pid_path).await;
 
-        manager.cancel(&task_run_id).await.unwrap();
+        manager.cancel(&session_id).await.unwrap();
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Exited);
-        assert_eq!(run.end_reason, Some(TaskRunEndReason::Cancelled));
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::Cancelled));
         wait_until_gone(child_pid).await;
     }
 
@@ -2895,13 +2892,13 @@ mod tests {
             nudge_after: StdDuration::from_millis(400),
             ..fast_timers(3)
         };
-        let (pool, task_run_id, _manager) = start_single_shot(binary, timers).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Idle);
-        assert!(session_notes(&pool, &task_run_id).await.is_empty());
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert!(session_notes(&pool, &session_id).await.is_empty());
 
-        let metas = events::list_for_task_run(&pool, &task_run_id)
+        let metas = events::list_for_session(&pool, &session_id)
             .await
             .unwrap()
             .into_iter()
@@ -2909,12 +2906,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(metas.len(), 2);
         assert_eq!(
-            metas[0].payload["session_id"],
-            metas[1].payload["session_id"]
+            metas[0].payload["adapter_session_id"],
+            metas[1].payload["adapter_session_id"]
         );
         assert_eq!(
-            run.session_id.as_deref(),
-            metas[0].payload["session_id"].as_str()
+            run.adapter_session_id.as_deref(),
+            metas[0].payload["adapter_session_id"].as_str()
         );
     }
 
@@ -2940,11 +2937,11 @@ mod tests {
             grace: StdDuration::from_secs(3600),
             ..fast_timers(3)
         };
-        let (pool, task_run_id, _manager) = start_single_shot(binary, timers).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
         let child_pid = read_pid_when_written(&child_pid_path).await;
 
-        let run = wait_until_final(&pool, &task_run_id).await;
-        assert_eq!(run.status, TaskRunStatus::Idle);
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle);
         assert_eq!(run.end_reason, None);
         wait_until_gone(child_pid).await;
     }

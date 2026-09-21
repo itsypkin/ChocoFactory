@@ -10,11 +10,11 @@ use crate::db::events;
 /// write fails.
 pub async fn capture_events(
     pool: &SqlitePool,
-    task_run_id: &str,
+    session_id: &str,
     handle: &mut AgentHandle,
 ) -> Result<(), sqlx::Error> {
     while let Some(event) = handle.recv().await {
-        events::append(pool, task_run_id, event.event_type(), event.payload()).await?;
+        events::append(pool, session_id, event.event_type(), event.payload()).await?;
     }
     Ok(())
 }
@@ -28,9 +28,9 @@ mod tests {
 
     use super::*;
     use crate::adapter::{AgentAdapter, ClaudeAdapter, RoleConfig};
-    use crate::db::{connect_in_memory, projects, task_runs, tasks};
+    use crate::db::{connect_in_memory, projects, sessions, tasks};
 
-    async fn seed_task_run(pool: &SqlitePool) -> String {
+    async fn seed_session(pool: &SqlitePool) -> String {
         let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             pool,
@@ -46,9 +46,9 @@ mod tests {
         .await
         .unwrap()
         .id;
-        task_runs::create(
+        sessions::create(
             pool,
-            task_runs::NewTaskRun {
+            sessions::NewSession {
                 task_id: &task_id,
                 stage: "coding",
                 role: "coder",
@@ -70,9 +70,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drains_a_one_turn_agent_run_into_the_events_table() {
+    async fn drains_a_one_turn_agent_session_into_the_events_table() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
+        let session_id = seed_session(&pool).await;
 
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_oneshot.py"));
         let cfg = RoleConfig {
@@ -86,13 +86,11 @@ mod tests {
         };
         let mut handle = adapter.start("hello", &cfg).unwrap();
 
-        capture_events(&pool, &task_run_id, &mut handle)
+        capture_events(&pool, &session_id, &mut handle)
             .await
             .unwrap();
 
-        let stored = events::list_for_task_run(&pool, &task_run_id)
-            .await
-            .unwrap();
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
         let types: Vec<EventType> = stored.iter().map(|e| e.event_type).collect();
         // `fake_claude_oneshot.py` emits a `result` line after its reply
         // (#70), which now normalizes to `TurnCompleted` rather than being
@@ -106,11 +104,11 @@ mod tests {
             ]
         );
         assert_eq!(stored[1].payload["text"], "echo:hello");
-        // Both rows resolve back to the run they were captured from.
+        // Both rows resolve back to the session they were captured from.
         assert!(
             stored
                 .iter()
-                .all(|e| e.task_run_id.as_deref() == Some(task_run_id.as_str()))
+                .all(|e| e.session_id.as_deref() == Some(session_id.as_str()))
         );
     }
 }

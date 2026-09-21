@@ -212,10 +212,10 @@ pub fn tasks(list: &[Task]) -> String {
 /// operator who asked for one and got the other should not have to go
 /// looking for that.
 pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
-    let what = match &outcome.session_id {
-        Some(session_id) if outcome.resumed => format!(
-            "Retrying stage '{}' by resuming its interrupted session ({session_id}) — it picks \
-             up where it left off, with its working tree untouched.",
+    let what = match &outcome.adapter_session_id {
+        Some(adapter_session_id) if outcome.resumed => format!(
+            "Retrying stage '{}' by resuming its interrupted session ({adapter_session_id}) — it \
+             picks up where it left off, with its working tree untouched.",
             outcome.stage
         ),
         // `resumed` without a session id is not something the daemon
@@ -453,7 +453,7 @@ pub fn events(page: &EventsPage) -> String {
 ///
 /// Payload shapes come from `AgentEvent::payload` (`adapter/mod.rs`) and
 /// the engine's own `HumanMessage` events:
-/// `text` for human/assistant/thinking, `session_id` for session_meta,
+/// `text` for human/assistant/thinking, `adapter_session_id` for session_meta,
 /// `message` for error, and `{tool_use_id, tool, input|output}` for the two
 /// tool kinds — which carry no single "the interesting bit" field, so they
 /// get composed rather than probed. Tool events dominate a real coding
@@ -463,8 +463,8 @@ pub fn events(page: &EventsPage) -> String {
 fn event_summary(event: &Event) -> String {
     let summary = event_summary_body(event);
     // #90: output from a sub-agent, or arriving after the turn had already
-    // completed, is recorded on the same run as the main agent's. Marked so a
-    // reader of the timeline can't take either for the turn's own answer.
+    // completed, is recorded on the same session as the main agent's. Marked
+    // so a reader of the timeline can't take either for the turn's own answer.
     let mut markers = String::new();
     if event
         .payload
@@ -616,7 +616,7 @@ fn event_summary_body(event: &Event) -> String {
             one_line(&format!("[{kind}] {message}"))
         }
         _ => {
-            for key in ["text", "message", "session_id"] {
+            for key in ["text", "message", "adapter_session_id"] {
                 if let Some(value) = payload.get(key).and_then(Value::as_str) {
                     return one_line(value);
                 }
@@ -670,7 +670,7 @@ mod tests {
             &RetryOutcome {
                 stage: "coding".to_string(),
                 resumed: true,
-                session_id: Some("sess-123".to_string()),
+                adapter_session_id: Some("sess-123".to_string()),
                 fresh_reason: None,
             },
         );
@@ -688,7 +688,7 @@ mod tests {
             &RetryOutcome {
                 stage: "coding".to_string(),
                 resumed: false,
-                session_id: None,
+                adapter_session_id: None,
                 fresh_reason: Some("its turn ended 'no_report'".to_string()),
             },
         );
@@ -707,7 +707,7 @@ mod tests {
         json!({
             "id": format!("e-{stage}-{at}"),
             "task_id": "t1",
-            "task_run_id": Value::Null,
+            "session_id": Value::Null,
             "event_type": "stage_entered",
             "payload": {"stage": stage, "outcome": outcome},
             "created_at": at,
@@ -1043,7 +1043,7 @@ mod tests {
         Event {
             id: "e1".to_string(),
             task_id: "t1".to_string(),
-            task_run_id: Some("r1".to_string()),
+            session_id: Some("r1".to_string()),
             event_type,
             payload,
             created_at: Utc::now(),
@@ -1071,7 +1071,7 @@ mod tests {
             (EventType::Thinking, json!({"text": "hmm"}), "hmm"),
             (
                 EventType::SessionMeta,
-                json!({"session_id": "abc-123"}),
+                json!({"adapter_session_id": "abc-123"}),
                 "abc-123",
             ),
             (

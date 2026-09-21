@@ -22,7 +22,7 @@ impl Default for RetentionConfig {
 
 /// Runs the retention job forever, pruning `events` rows older than
 /// `config.max_age` every `config.interval`. Never touches `tasks`/
-/// `task_runs` (§4.4) — event detail ages out, task history doesn't.
+/// `sessions` (§4.4) — event detail ages out, task history doesn't.
 /// Meant to be spawned as a background task by the daemon's startup code.
 pub async fn run_retention_job(pool: SqlitePool, config: RetentionConfig) {
     run_loop(&pool, &config, None).await;
@@ -55,10 +55,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::db::{connect_in_memory, events, projects, task_runs, tasks};
+    use crate::db::{connect_in_memory, events, projects, sessions, tasks};
     use chocofactory_core::models::EventType;
 
-    async fn seed_task_run(pool: &SqlitePool) -> String {
+    async fn seed_session(pool: &SqlitePool) -> String {
         let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             pool,
@@ -74,9 +74,9 @@ mod tests {
         .await
         .unwrap()
         .id;
-        task_runs::create(
+        sessions::create(
             pool,
-            task_runs::NewTaskRun {
+            sessions::NewSession {
                 task_id: &task_id,
                 stage: "chatting",
                 role: "chat",
@@ -92,8 +92,8 @@ mod tests {
     #[tokio::test]
     async fn prunes_events_once_they_are_older_than_max_age() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
-        events::append(&pool, &task_run_id, EventType::Error, json!({}))
+        let session_id = seed_session(&pool).await;
+        events::append(&pool, &session_id, EventType::Error, json!({}))
             .await
             .unwrap();
 
@@ -108,7 +108,7 @@ mod tests {
         .await;
 
         assert!(
-            events::list_for_task_run(&pool, &task_run_id)
+            events::list_for_session(&pool, &session_id)
                 .await
                 .unwrap()
                 .is_empty()
@@ -118,8 +118,8 @@ mod tests {
     #[tokio::test]
     async fn keeps_events_younger_than_max_age() {
         let pool = connect_in_memory().await.unwrap();
-        let task_run_id = seed_task_run(&pool).await;
-        events::append(&pool, &task_run_id, EventType::Error, json!({}))
+        let session_id = seed_session(&pool).await;
+        events::append(&pool, &session_id, EventType::Error, json!({}))
             .await
             .unwrap();
 
@@ -134,7 +134,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            events::list_for_task_run(&pool, &task_run_id)
+            events::list_for_session(&pool, &session_id)
                 .await
                 .unwrap()
                 .len(),
