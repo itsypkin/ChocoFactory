@@ -96,25 +96,20 @@ impl From<SendMessageOrResumeError> for ApiError {
             // more specific check than `UnknownOutcome` used to catch it
             // with.
             //
-            // This list must stay in agreement with the identical one in
-            // `send_message_or_resume`'s `HumanGate` arm (issue #61),
-            // which uses it to decide when *not* to mark the task
-            // `stuck` — anything outside it there is a real wedge this
-            // mapping falls through to `Internal` for below.
-            SendMessageOrResumeError::Advance(
-                EngineError::UnknownOutcome { .. }
-                | EngineError::TerminalStageHasNoTransitions(_)
-                | EngineError::StageMovedOn { .. }
-                // The same benign race as the rest of this arm, arrived at
-                // from the other direction (#69): a resume passed
-                // `send_message_or_resume`'s status check and a cancel
-                // landed before `advance_from_stage`'s guard ran under the
-                // lock. "The task was cancelled while you were resuming it"
-                // is a conflict, not a server fault — and mapping it to 500
-                // here would contradict the plain `TaskCancelled` → 409
-                // above.
-                | EngineError::TaskCancelled(_),
-            ) => ApiError::Conflict(err.to_string()),
+            // `EngineError::is_benign_resume_race` is the single production
+            // definition of this list, also used by `send_message_or_resume`'s
+            // `HumanGate` arm (issue #61) to decide when *not* to mark the
+            // task `stuck` — anything outside it there is a real wedge this
+            // mapping falls through to `Internal` for below. It includes the
+            // same benign race arrived at from the other direction (#69): a
+            // resume passed `send_message_or_resume`'s status check and a
+            // cancel landed before `advance_from_stage`'s guard ran under the
+            // lock. "The task was cancelled while you were resuming it" is a
+            // conflict, not a server fault — and mapping it to 500 here would
+            // contradict the plain `TaskCancelled` → 409 above.
+            SendMessageOrResumeError::Advance(engine_err) if engine_err.is_benign_resume_race() => {
+                ApiError::Conflict(err.to_string())
+            }
             // Same conflict reached through the `agent_turn` branch, where
             // `send_message` re-checks the status under the per-task lock.
             SendMessageOrResumeError::SendMessage(

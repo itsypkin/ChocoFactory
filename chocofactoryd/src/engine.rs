@@ -278,6 +278,27 @@ impl From<WorkingDirError> for EngineError {
     }
 }
 
+impl EngineError {
+    /// Whether this is one of the benign races a resumed `human_gate`'s
+    /// failed `advance_from_stage` call must *not* treat as a wedge —
+    /// another caller already resumed or cancelled the task concurrently,
+    /// not a stage that failed to start. Used by
+    /// `send_message_or_resume`'s `HumanGate` arm (issue #61) to decide
+    /// when *not* to call `mark_stuck`, and by `api/error.rs`'s
+    /// `SendMessageOrResumeError` → `ApiError` mapping to decide when the
+    /// same error is a 409 rather than a 500 — a single production
+    /// definition so the two can't drift apart.
+    pub(crate) fn is_benign_resume_race(&self) -> bool {
+        matches!(
+            self,
+            EngineError::UnknownOutcome { .. }
+                | EngineError::TerminalStageHasNoTransitions(_)
+                | EngineError::StageMovedOn { .. }
+                | EngineError::TaskCancelled(_)
+        )
+    }
+}
+
 /// The one allowlist (`^[A-Za-z0-9_-]+$`) every `workflow_def` name is
 /// checked against before it ever touches the filesystem (P1-8 LLD §2.8),
 /// shared by [`resolve_workflow_path`] and [`resolve_task_workflow`]. Not
@@ -1480,16 +1501,13 @@ impl WorkflowEngine {
                     Ok(()) => Ok(()),
                     // The benign races: another caller already resumed or
                     // cancelled this task, so there's nothing to rescue.
-                    // This list must stay in agreement with the identical
-                    // one in `api/error.rs`'s `SendMessageOrResumeError` →
-                    // `ApiError` mapping, which maps these same variants to
-                    // 409 for exactly this reason — see the comments there.
-                    Err(
-                        err @ (EngineError::UnknownOutcome { .. }
-                        | EngineError::TerminalStageHasNoTransitions(_)
-                        | EngineError::StageMovedOn { .. }
-                        | EngineError::TaskCancelled(_)),
-                    ) => Err(SendMessageOrResumeError::Advance(err)),
+                    // `is_benign_resume_race` is also what `api/error.rs`'s
+                    // `SendMessageOrResumeError` → `ApiError` mapping calls,
+                    // which maps these same variants to 409 for exactly this
+                    // reason — see the comments there.
+                    Err(err) if err.is_benign_resume_race() => {
+                        Err(SendMessageOrResumeError::Advance(err))
+                    }
                     // Anything else — a session that won't spawn, a prompt
                     // template that fails to render, a transient DB error —
                     // and the gate has already committed
@@ -1506,6 +1524,13 @@ impl WorkflowEngine {
                             "task wedged: its human_gate was resumed but the transition failed"
                         );
                         let blamed = self.stage_to_blame(task_id, &current_stage).await;
+                        // `blamed == current_stage` means the failure happened
+                        // before `workflow_state::update` committed the next
+                        // stage — e.g. a DB error reading state inside
+                        // `advance_from_stage` itself. Deliberately untested:
+                        // triggering it needs a DB failure timed to land
+                        // inside that transition, and there's no fault
+                        // injection harness for `sqlx` in this suite today.
                         let reason = if blamed == current_stage {
                             format!(
                                 "stage '{current_stage}': resumed but the transition failed: {err}"
@@ -8119,47 +8144,40 @@ stages:
         assert_eq!(state.current_stage, "finished");
     }
 
-    /// Which `EngineError` variants a resumed `human_gate`'s failed
-    /// `advance_from_stage` must *not* treat as a wedge — the benign races
-    /// where another caller already resumed or cancelled the task. Kept in
-    /// sync with (and unit-tested against) the identical list in
-    /// `send_message_or_resume`'s `HumanGate` arm and in
-    /// `api/error.rs`'s `SendMessageOrResumeError` → `ApiError` mapping.
-    fn is_benign_resume_race(err: &EngineError) -> bool {
-        matches!(
-            err,
-            EngineError::UnknownOutcome { .. }
-                | EngineError::TerminalStageHasNoTransitions(_)
-                | EngineError::StageMovedOn { .. }
-                | EngineError::TaskCancelled(_)
-        )
-    }
-
+    /// Exercises the actual production predicate,
+    /// `EngineError::is_benign_resume_race` — not a copy of its list — so
+    /// this fails the moment the production match drifts from what this
+    /// task documents as benign.
     #[test]
     fn is_benign_resume_race_accepts_exactly_the_excluded_variants() {
-        assert!(is_benign_resume_race(&EngineError::UnknownOutcome {
-            stage: "gate".to_string(),
-            outcome: "resumed".to_string(),
-        }));
-        assert!(is_benign_resume_race(
-            &EngineError::TerminalStageHasNoTransitions("gate".to_string())
-        ));
-        assert!(is_benign_resume_race(&EngineError::StageMovedOn {
-            expected: "gate".to_string(),
-            actual: "coding".to_string(),
-        }));
-        assert!(is_benign_resume_race(&EngineError::TaskCancelled(
-            "t1".to_string()
-        )));
+        assert!(
+            EngineError::UnknownOutcome {
+                stage: "gate".to_string(),
+                outcome: "resumed".to_string(),
+            }
+            .is_benign_resume_race()
+        );
+        assert!(
+            EngineError::TerminalStageHasNoTransitions("gate".to_string()).is_benign_resume_race()
+        );
+        assert!(
+            EngineError::StageMovedOn {
+                expected: "gate".to_string(),
+                actual: "coding".to_string(),
+            }
+            .is_benign_resume_race()
+        );
+        assert!(EngineError::TaskCancelled("t1".to_string()).is_benign_resume_race());
 
-        assert!(!is_benign_resume_race(&EngineError::NoWorkflowState));
-        assert!(!is_benign_resume_race(&EngineError::UnknownStage(
-            "gate".to_string()
-        )));
-        assert!(!is_benign_resume_race(&EngineError::Template {
-            stage: "coding".to_string(),
-            reason: "bad".to_string(),
-        }));
+        assert!(!EngineError::NoWorkflowState.is_benign_resume_race());
+        assert!(!EngineError::UnknownStage("gate".to_string()).is_benign_resume_race());
+        assert!(
+            !EngineError::Template {
+                stage: "coding".to_string(),
+                reason: "bad".to_string(),
+            }
+            .is_benign_resume_race()
+        );
     }
 
     /// Fires several `send_message_or_resume` calls at the same gate
@@ -8170,39 +8188,41 @@ stages:
     /// one of the benign races above (or an early rejection from
     /// `send_message_or_resume`'s own status/stage checks) rather than
     /// being marked `stuck`.
+    ///
+    /// The destination stage is deliberately another `human_gate`
+    /// (`gate2`), not a stage that runs to completion and closes the task.
+    /// `db::tasks::update_status` sets the new status unconditionally and
+    /// clears `stuck_reason` (tasks.rs), so a task that reaches `closed`
+    /// would silently overwrite any stray `stuck` a loser wrote underneath
+    /// it — masking exactly the regression this test exists to catch. With
+    /// `gate2` the task must still be `open`, waiting on a person, once
+    /// every handle has returned.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_resumes_of_the_same_gate_do_not_mark_the_task_stuck() {
         let pool = connect_in_memory().await.unwrap();
         let workflows_dir = tempdir();
-        std::fs::write(workflows_dir.join("coder-turn.md"), "do the thing").unwrap();
         let yaml = r#"
-name: gate-then-turn-concurrent
-roles:
-  coder:
-    cli: claude
-    model: sonnet
+name: gate-then-gate-concurrent
 stages:
   gate:
     kind: human_gate
-    on: { resumed: coding }
-  coding:
-    kind: agent_turn
-    role: coder
-    prompt_file: coder-turn.md
-    on: { done: finished }
+    on: { resumed: gate2 }
+  gate2:
+    kind: human_gate
+    on: { resumed: finished }
   finished:
     kind: terminal
 "#;
-        std::fs::write(workflows_dir.join("gate-then-turn-concurrent.yaml"), yaml).unwrap();
+        std::fs::write(workflows_dir.join("gate-then-gate-concurrent.yaml"), yaml).unwrap();
         let def = Arc::new(WorkflowDefinition::parse(yaml, &workflows_dir).unwrap());
         let task_id = seed_task(&pool, &def.name).await;
 
-        // A working binary, so the winner's transition into `coding`
-        // actually succeeds — this test is about how many callers win the
-        // race, not about a stage that can't start.
+        // No `agent_turn` stage is involved, so the adapter binary is never
+        // invoked — this test is about how many callers win the race, not
+        // about a stage that can or can't start.
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
-            &reply_binary(&workflows_dir, "ok"),
+            "/no/such/binary-unused-90c1e4",
             &workflows_dir,
         );
         engine.start_task(&task_id, &def, None).await.unwrap();
@@ -8223,7 +8243,7 @@ stages:
                 Ok(()) => ok_count += 1,
                 Err(SendMessageOrResumeError::Advance(err)) => {
                     assert!(
-                        is_benign_resume_race(&err),
+                        err.is_benign_resume_race(),
                         "a losing concurrent resume must fail with a benign race, not {err:?}"
                     );
                     err_count += 1;
@@ -8240,10 +8260,15 @@ stages:
         assert_eq!(ok_count, 1, "exactly one resume should win the race");
         assert_eq!(err_count, 5);
 
-        wait_until_task_status(&pool, &task_id, "closed").await;
+        wait_until_stage(&pool, &task_id, "gate2").await;
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-        assert_eq!(task.status, "closed");
+        assert_eq!(
+            task.status, "open",
+            "a benign loser must not mark the task stuck"
+        );
         assert_eq!(task.stuck_reason, None);
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "gate2");
     }
 
     #[tokio::test]
