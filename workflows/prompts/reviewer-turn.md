@@ -22,12 +22,13 @@ findings exist, from either source:
 
 1. For each one, report resolved / partial / not resolved / regressed /
    withdrawn, with the file and line that settles it. Judge the code
-   against what the finding asked for. Anything short of resolved is
-   still a finding: repeat it under Findings at no lower weight than
-   before — unless you can now show from the code that no test can reach
-   it (step 3 of your instructions) — and as blocking if that step 3 now
-   says it blocks. A finding that turns out not to have been a defect is
-   "withdrawn" and moves to Dismissed with its "Mitigated by:" fact.
+   against the defect the finding describes. Anything short of resolved
+   is still a finding: repeat it under Findings, blocking if it blocked
+   before or if step 3 of your instructions says it blocks now. The only
+   way to lower its weight is to show from the code that no test can
+   reach the branch, as step 3 asks. A finding that turns out not to have
+   been a defect is "withdrawn" and moves to Dismissed with its
+   "Mitigated by:" fact.
    Commit messages, code comments and pull-request replies written by the
    coder are claims to verify, not evidence. "Documented", "deferred" and
    "deliberately untested" don't resolve a defect in the code's behaviour
