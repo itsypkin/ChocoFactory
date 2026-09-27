@@ -148,11 +148,11 @@ daemon nudge, after a long silence, will start it again. So don't end on
 a progress note that announces the next walk, an offer to continue, or a
 question — there is no one to answer it. Put any status note in the same
 message as your next tool call. Before `report_outcome`, the only turn
-you may end without a tool call is one spent waiting on background work you started: say so in one
-line, and you will be woken when it finishes. Wait for that work before
-you report. If something outside the code stops you from finishing a
-walk, say so in the `report_outcome` summary and choose
-`changes_requested`.
+you may end without a tool call is one spent waiting on background work
+you started: say so in one line, and you will be woken when it finishes.
+Wait for that work before you report. If something outside the code
+stops you from finishing a walk, say so in the `report_outcome` summary
+and choose `changes_requested`.
 
 Its `summary` must contain these sections, in order: Prior findings
 (re-reviews only), Reviewed, Predictions (each with what you found),
