@@ -212,9 +212,13 @@ fn spawn(
     //   for instead of `report_outcome` (#61).
     // - With no skills allowed, the `Skill` tool is removed outright; with
     //   some, the allowlist is sent on stdin below.
+    // - Auto-memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) is decided by
+    //   `apply_auto_memory_env` below, not read from the daemon's own
+    //   environment (#105).
+    apply_auto_memory_env(&mut command, &cfg.isolation);
     let initialize = match &cfg.isolation {
         Isolation::InheritOperatorConfig => None,
-        Isolation::Isolated { skills, memory } => {
+        Isolation::Isolated { skills, memory: _ } => {
             command
                 .arg("--setting-sources")
                 .arg("project,local")
@@ -224,9 +228,6 @@ fn spawn(
                 disallowed.push("Skill");
             }
             command.arg("--disallowedTools").arg(disallowed.join(","));
-            if !memory {
-                command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
-            }
             Some(initialize_line(skills))
         }
     };
@@ -278,6 +279,35 @@ fn spawn(
     ));
 
     Ok(AgentHandle::new(child, events_rx, stdin_tx))
+}
+
+/// The single place `CLAUDE_CODE_DISABLE_AUTO_MEMORY` is decided (#105).
+///
+/// A role's auto-memory setting must depend only on its workflow
+/// definition, never on whatever the daemon's own environment happens to
+/// hold. In practice a value already in that environment is almost always
+/// an artifact of *where the daemon was launched* — inside an isolated
+/// agent, which sets this same variable for itself — not a choice the
+/// operator made for this particular role. So every branch states its own
+/// answer explicitly instead of leaving the variable to inherit:
+///
+/// - `Isolated { memory: false, .. }`: set to `"1"`.
+/// - `Isolated { memory: true, .. }`: removed, so a role whose definition
+///   asks for memory gets it even if the daemon's own environment disables
+///   it.
+/// - `InheritOperatorConfig`: also removed, for the same reason — the
+///   role's definition is the only source of truth for its memory, and
+///   "inherit the operator's config" describes the CLI flags this turn
+///   gets, not license to leak the daemon's launch environment into it.
+fn apply_auto_memory_env(command: &mut Command, isolation: &Isolation) {
+    match isolation {
+        Isolation::Isolated { memory: false, .. } => {
+            command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
+        }
+        Isolation::Isolated { memory: true, .. } | Isolation::InheritOperatorConfig => {
+            command.env_remove("CLAUDE_CODE_DISABLE_AUTO_MEMORY");
+        }
+    }
 }
 
 /// The instruction appended to a single-shot turn's system prompt (#90).
@@ -1198,6 +1228,59 @@ mod tests {
             unreachable!()
         };
         echo_fields(&text)
+    }
+
+    /// `Command::get_envs` reports `Some(Some(value))` for a variable that
+    /// was set, `Some(None)` for one explicitly *removed*, and nothing at
+    /// all for one left untouched (inherited from whatever process spawns
+    /// the command). That third case is exactly the bug in #105: the old
+    /// code left `CLAUDE_CODE_DISABLE_AUTO_MEMORY` untouched for the two
+    /// rows below, silently inheriting the daemon's own environment instead
+    /// of stating the role's own answer. No process is spawned by these
+    /// tests, so they're immune to whatever the shell running `cargo test`
+    /// happens to have set.
+    fn auto_memory_env(isolation: &Isolation) -> Option<Option<String>> {
+        let mut command = Command::new("unused");
+        apply_auto_memory_env(&mut command, isolation);
+        command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn isolated_without_memory_disables_auto_memory() {
+        let isolation = Isolation::Isolated {
+            skills: Vec::new(),
+            memory: false,
+        };
+        assert_eq!(auto_memory_env(&isolation), Some(Some("1".to_string())));
+    }
+
+    /// The regression guard for #105: a role whose definition asks for
+    /// memory must get it back even when the daemon's own environment
+    /// disables it, which requires an explicit removal — not merely leaving
+    /// the variable alone — to override whatever the daemon inherited.
+    #[test]
+    fn isolated_with_memory_removes_the_disable_flag() {
+        let isolation = Isolation::Isolated {
+            skills: Vec::new(),
+            memory: true,
+        };
+        assert_eq!(auto_memory_env(&isolation), Some(None));
+    }
+
+    /// Same regression guard as above, for the other role shape that must
+    /// never inherit the daemon's environment (#105): "inherit the
+    /// operator's config" describes this turn's CLI flags, not license to
+    /// leak the daemon's own launch environment into it.
+    #[test]
+    fn inherit_operator_config_removes_the_disable_flag() {
+        assert_eq!(
+            auto_memory_env(&Isolation::InheritOperatorConfig),
+            Some(None)
+        );
     }
 
     /// #90's default: a role that says nothing about isolation gets none of

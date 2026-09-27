@@ -75,6 +75,14 @@ pub enum Isolation {
     },
 }
 
+// Auto-memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) follows only the variant
+// above, never the daemon's own environment (#105): `Isolated { memory:
+// false }` sets it, `Isolated { memory: true }` and `InheritOperatorConfig`
+// both explicitly remove it. See `claude::apply_auto_memory_env` for why
+// removal — not "leave it alone" — is required for the latter two: a value
+// already in the daemon's environment is almost always an artifact of where
+// the daemon was launched, not a choice made for this role.
+
 impl Default for Isolation {
     /// Isolated, with no skills and no memory: the setting a role gets when
     /// its workflow definition says nothing.
