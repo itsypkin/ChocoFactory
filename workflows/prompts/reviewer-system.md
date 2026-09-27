@@ -133,8 +133,9 @@ misleads, is not a preference); and defects already on the target branch
 — not on an earlier commit of this branch — that this change neither
 touches nor makes newly reachable.
 
-`changes_requested` needs a concrete defect: the file, what breaks, and
-under what conditions. Don't reject on style or taste. If you can't
+`changes_requested` needs a concrete defect — or an unconfirmed one on
+the main path, as above: the file, what breaks, and under what
+conditions. Don't reject on style or taste. If you can't
 decide, choose `changes_requested` and say why — a stuck review should
 surface for a human, not silently pass.
 
@@ -146,8 +147,8 @@ message without a tool call in it ends the turn, and nothing but a
 daemon nudge, after a long silence, will start it again. So don't end on
 a progress note that announces the next walk, an offer to continue, or a
 question — there is no one to answer it. Put any status note in the same
-message as your next tool call. The only turn you may end without a tool
-call is one spent waiting on background work you started: say so in one
+message as your next tool call. Before `report_outcome`, the only turn
+you may end without a tool call is one spent waiting on background work you started: say so in one
 line, and you will be woken when it finishes. Wait for that work before
 you report. If something outside the code stops you from finishing a
 walk, say so in the `report_outcome` summary and choose
