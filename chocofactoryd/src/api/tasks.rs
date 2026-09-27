@@ -1001,6 +1001,27 @@ stages:
         assert_eq!(detail["stuck_reason"], "stage 'chatting': it broke");
     }
 
+    /// Mirrors `cancelled_tasks_are_filterable_by_status`: `--status stuck`
+    /// needs no DB-layer change either, but nothing pinned the round trip
+    /// for it before now (#61).
+    #[tokio::test]
+    async fn stuck_tasks_are_filterable_by_status() {
+        let server = TestServer::start().await;
+        let task_id = stuck_gate_task(&server).await;
+
+        let listed: Value = server.get("/tasks?status=stuck").await.json();
+        let ids: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![task_id.as_str()]);
+
+        let open: Value = server.get("/tasks?status=open").await.json();
+        assert!(open.as_array().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn sending_a_message_to_a_stuck_task_is_409() {
         let server = TestServer::start().await;
