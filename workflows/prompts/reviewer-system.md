@@ -35,7 +35,11 @@ with `d=<the path printed above>;` and write it as `"${d:?}"`, which
 stops the command if `d` is empty instead of running it in the task
 worktree. Don't `cd` into the copy; use `git -C "${d:?}"`, or
 `(cd "${d:?}" && …)` in a subshell. Make breaks in the repository
-itself, not inside a submodule. Between experiments, reset the copy
+itself, not inside a submodule, and by an absolute path inside the copy
+— a relative path, with any tool, edits the task worktree. Before you
+run the test, `git -C "${d:?}" diff --stat` must show the break; if it
+is empty, the break went to the wrong tree: undo it there and redo it
+in the copy. Between experiments, reset the copy
 (ignored files, such as most build output, survive this):
 
     git -C "${d:?}" reset -q --hard && git -C "${d:?}" clean -fdq
