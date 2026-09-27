@@ -1526,11 +1526,11 @@ impl WorkflowEngine {
                         let blamed = self.stage_to_blame(task_id, &current_stage).await;
                         // `blamed == current_stage` means the failure happened
                         // before `workflow_state::update` committed the next
-                        // stage — e.g. a DB error reading state inside
-                        // `advance_from_stage` itself. Deliberately untested:
-                        // triggering it needs a DB failure timed to land
-                        // inside that transition, and there's no fault
-                        // injection harness for `sqlx` in this suite today.
+                        // stage — e.g. a DB error updating state inside
+                        // `advance_from_stage` itself. Covered by
+                        // `resuming_a_human_gate_whose_own_transition_fails_marks_the_task_stuck_at_the_gate`,
+                        // which injects exactly that with a SQLite trigger
+                        // on `workflow_state`.
                         let reason = if blamed == current_stage {
                             format!(
                                 "stage '{current_stage}': resumed but the transition failed: {err}"
@@ -8144,6 +8144,93 @@ stages:
         assert_eq!(state.current_stage, "finished");
     }
 
+    /// The other branch of the `HumanGate` catch-all: the failure happens
+    /// *inside* `advance_from_stage`'s own transition, before
+    /// `workflow_state::update` ever commits the next stage, so
+    /// `stage_to_blame` reads the row back unchanged and blames the gate
+    /// itself rather than whatever comes after it.
+    ///
+    /// `connect_in_memory`'s pool is a single SQLite connection
+    /// (`db/pool.rs`), so a trigger on `workflow_state` reliably fails the
+    /// very `UPDATE` `advance_from_stage` issues to move the task out of
+    /// `gate` — no timing needed, unlike a real transient DB error.
+    #[tokio::test]
+    async fn resuming_a_human_gate_whose_own_transition_fails_marks_the_task_stuck_at_the_gate() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        let yaml = r#"
+name: gate-db-failure
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: gate2 }
+  gate2:
+    kind: human_gate
+    on: { resumed: finished }
+  finished:
+    kind: terminal
+"#;
+        std::fs::write(workflows_dir.join("gate-db-failure.yaml"), yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &workflows_dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            "/no/such/binary-unused-1a2b3c",
+            &workflows_dir,
+        );
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "gate").await;
+
+        // Fails every subsequent UPDATE on this table — in particular the
+        // one `advance_from_stage` is about to issue for `gate`'s "resumed"
+        // transition.
+        sqlx::query(
+            "CREATE TRIGGER fail_ws_update BEFORE UPDATE ON workflow_state
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = engine
+            .send_message_or_resume(&task_id, "approved")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SendMessageOrResumeError::Advance(EngineError::Db(_))),
+            "{err:?}"
+        );
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        // The failed UPDATE never committed, so the task is still sitting
+        // in `gate`, not `gate2`.
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "gate");
+
+        let reason = task.stuck_reason.unwrap();
+        assert!(reason.contains("gate"), "{reason:?}");
+        assert!(
+            reason.contains("resumed but the transition failed"),
+            "{reason:?}"
+        );
+        assert!(reason.contains("injected"), "{reason:?}");
+        // Guards against the two reason texts being swapped: the "could not
+        // be entered after" wording belongs to the other branch, where a
+        // *different* stage than the gate is blamed.
+        assert!(!reason.contains("could not be entered"), "{reason:?}");
+
+        let error_events: Vec<_> = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::Error)
+            .collect();
+        assert_eq!(error_events.len(), 1, "{error_events:?}");
+        assert_eq!(error_events[0].payload["stuck"], json!(true));
+    }
+
     /// Exercises the actual production predicate,
     /// `EngineError::is_benign_resume_race` — not a copy of its list — so
     /// this fails the moment the production match drifts from what this
@@ -8185,9 +8272,7 @@ stages:
     /// `concurrent_advance_calls_on_the_same_task_do_not_lose_updates` does
     /// for `advance`. Only one can win `advance_from_stage`'s per-task
     /// lock and actually move the task out of `gate`; every loser must see
-    /// one of the benign races above (or an early rejection from
-    /// `send_message_or_resume`'s own status/stage checks) rather than
-    /// being marked `stuck`.
+    /// one of the benign races above rather than being marked `stuck`.
     ///
     /// The destination stage is deliberately another `human_gate`
     /// (`gate2`), not a stage that runs to completion and closes the task.
@@ -8248,13 +8333,17 @@ stages:
                     );
                     err_count += 1;
                 }
-                // The early rejections in `send_message_or_resume` itself
-                // (status/stage no longer what a loser read) are just as
-                // benign as the `Advance` races above.
-                Err(other) => {
-                    tracing::debug!("early rejection: {other:?}");
-                    err_count += 1;
-                }
+                // Nothing else is expected here: the task is never
+                // cancelled or stuck in this test, so `send_message_or_resume`'s
+                // own status/stage checks have nothing to reject a loser
+                // on before it ever reaches `advance_from_stage` — every
+                // loser's error must be one of the `Advance` races above.
+                // Deliberately not a catch-all: a stray `TaskStuck` here
+                // (the exact bug this test exists to catch) must fail the
+                // test, not get logged and folded into `err_count`.
+                Err(other) => panic!(
+                    "a losing concurrent resume must fail as a benign Advance race, not {other:?}"
+                ),
             }
         }
         assert_eq!(ok_count, 1, "exactly one resume should win the race");
