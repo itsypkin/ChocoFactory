@@ -1467,15 +1467,67 @@ impl WorkflowEngine {
                     }
                 }
 
-                self.advance_from_stage(
-                    task_id,
-                    &definition,
-                    "resumed",
-                    Some(&current_stage),
-                    captured,
-                )
-                .await
-                .map_err(SendMessageOrResumeError::Advance)
+                match self
+                    .advance_from_stage(
+                        task_id,
+                        &definition,
+                        "resumed",
+                        Some(&current_stage),
+                        captured,
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    // The benign races: another caller already resumed or
+                    // cancelled this task, so there's nothing to rescue.
+                    // This list must stay in agreement with the identical
+                    // one in `api/error.rs`'s `SendMessageOrResumeError` →
+                    // `ApiError` mapping, which maps these same variants to
+                    // 409 for exactly this reason — see the comments there.
+                    Err(
+                        err @ (EngineError::UnknownOutcome { .. }
+                        | EngineError::TerminalStageHasNoTransitions(_)
+                        | EngineError::StageMovedOn { .. }
+                        | EngineError::TaskCancelled(_)),
+                    ) => Err(SendMessageOrResumeError::Advance(err)),
+                    // Anything else — a session that won't spawn, a prompt
+                    // template that fails to render, a transient DB error —
+                    // and the gate has already committed
+                    // `workflow_state.current_stage` to the next stage
+                    // before failing to enter it (see `stage_to_blame`'s
+                    // doc comment), so the task is left `open` with nothing
+                    // running unless this marks it `stuck`. Mirrors the
+                    // catch-alls in `finish_shell_stage`/`finish_poll_stage`/
+                    // `finish_turn` — the human-gate path is the one
+                    // #61 left without one.
+                    Err(err) => {
+                        tracing::error!(
+                            task_id, stage = current_stage, %err,
+                            "task wedged: its human_gate was resumed but the transition failed"
+                        );
+                        let blamed = self.stage_to_blame(task_id, &current_stage).await;
+                        let reason = if blamed == current_stage {
+                            format!(
+                                "stage '{current_stage}': resumed but the transition failed: {err}"
+                            )
+                        } else {
+                            format!(
+                                "stage '{blamed}': could not be entered after '{current_stage}' \
+                                 was resumed: {err}"
+                            )
+                        };
+                        // `enter_stage` already appends its own `Error`
+                        // event for a template failure — see `mark_stuck`'s
+                        // doc comment.
+                        self.mark_stuck(
+                            task_id,
+                            &reason,
+                            matches!(err, EngineError::Template { .. }),
+                        )
+                        .await;
+                        Err(SendMessageOrResumeError::Advance(err))
+                    }
+                }
             }
             StageKind::AgentTurn { .. } if stage_def.on.is_empty() => self
                 .send_message(task_id, text)
@@ -7976,6 +8028,224 @@ stages:
         assert!(state.payload.get("stages").is_none());
     }
 
+    // ---- #61: the stage after a resumed human_gate that can't start ------
+
+    /// The regression this task closes: `advance_from_stage`'s `HumanGate`
+    /// arm used to map its error straight through, leaving the task `open`
+    /// in the *next* stage with nothing running when that stage failed to
+    /// start. This must fail on `main` before the fix — an engine whose
+    /// adapter binary can't be spawned, so `coding` never starts once
+    /// `gate` is resumed.
+    #[tokio::test]
+    async fn resuming_a_human_gate_into_a_stage_that_cannot_start_marks_the_task_stuck() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("coder-turn.md"), "do the thing").unwrap();
+        let yaml = r#"
+name: gate-then-turn
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: coding }
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        // `retry_task` re-resolves the workflow from `workflows_dir` by
+        // name, so the file has to be on disk for the recovery half of
+        // this test to find it.
+        std::fs::write(dir.join("gate-then-turn.yaml"), yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+
+        let broken_engine =
+            engine_with_adapter_and_workflows_dir(pool.clone(), "/no/such/binary-3f6c9a", &dir);
+        broken_engine
+            .start_task(&task_id, &def, None)
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "gate").await;
+
+        let err = broken_engine
+            .send_message_or_resume(&task_id, "approved")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SendMessageOrResumeError::Advance(_)),
+            "{err:?}"
+        );
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "coding");
+        let reason = task.stuck_reason.unwrap();
+        assert!(
+            reason.contains("coding") && reason.contains("gate") && reason.contains("could not"),
+            "{reason:?}"
+        );
+
+        let error_events: Vec<_> = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::Error)
+            .collect();
+        assert_eq!(error_events.len(), 1, "{error_events:?}");
+        assert_eq!(error_events[0].payload["stuck"], json!(true));
+
+        // Recovery: `retry_task` from an engine with a working binary
+        // re-enters `coding` (the stage that failed to start) and it runs
+        // to completion.
+        let fixed_engine =
+            engine_with_adapter_and_workflows_dir(pool.clone(), &reply_binary(&dir, "ok"), &dir);
+        fixed_engine
+            .retry_task(&task_id, RetryMode::Auto)
+            .await
+            .unwrap();
+
+        wait_until_task_status(&pool, &task_id, "closed").await;
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.stuck_reason, None);
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "finished");
+    }
+
+    /// Which `EngineError` variants a resumed `human_gate`'s failed
+    /// `advance_from_stage` must *not* treat as a wedge — the benign races
+    /// where another caller already resumed or cancelled the task. Kept in
+    /// sync with (and unit-tested against) the identical list in
+    /// `send_message_or_resume`'s `HumanGate` arm and in
+    /// `api/error.rs`'s `SendMessageOrResumeError` → `ApiError` mapping.
+    fn is_benign_resume_race(err: &EngineError) -> bool {
+        matches!(
+            err,
+            EngineError::UnknownOutcome { .. }
+                | EngineError::TerminalStageHasNoTransitions(_)
+                | EngineError::StageMovedOn { .. }
+                | EngineError::TaskCancelled(_)
+        )
+    }
+
+    #[test]
+    fn is_benign_resume_race_accepts_exactly_the_excluded_variants() {
+        assert!(is_benign_resume_race(&EngineError::UnknownOutcome {
+            stage: "gate".to_string(),
+            outcome: "resumed".to_string(),
+        }));
+        assert!(is_benign_resume_race(
+            &EngineError::TerminalStageHasNoTransitions("gate".to_string())
+        ));
+        assert!(is_benign_resume_race(&EngineError::StageMovedOn {
+            expected: "gate".to_string(),
+            actual: "coding".to_string(),
+        }));
+        assert!(is_benign_resume_race(&EngineError::TaskCancelled(
+            "t1".to_string()
+        )));
+
+        assert!(!is_benign_resume_race(&EngineError::NoWorkflowState));
+        assert!(!is_benign_resume_race(&EngineError::UnknownStage(
+            "gate".to_string()
+        )));
+        assert!(!is_benign_resume_race(&EngineError::Template {
+            stage: "coding".to_string(),
+            reason: "bad".to_string(),
+        }));
+    }
+
+    /// Fires several `send_message_or_resume` calls at the same gate
+    /// concurrently, the way
+    /// `concurrent_advance_calls_on_the_same_task_do_not_lose_updates` does
+    /// for `advance`. Only one can win `advance_from_stage`'s per-task
+    /// lock and actually move the task out of `gate`; every loser must see
+    /// one of the benign races above (or an early rejection from
+    /// `send_message_or_resume`'s own status/stage checks) rather than
+    /// being marked `stuck`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_resumes_of_the_same_gate_do_not_mark_the_task_stuck() {
+        let pool = connect_in_memory().await.unwrap();
+        let workflows_dir = tempdir();
+        std::fs::write(workflows_dir.join("coder-turn.md"), "do the thing").unwrap();
+        let yaml = r#"
+name: gate-then-turn-concurrent
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: coding }
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        std::fs::write(workflows_dir.join("gate-then-turn-concurrent.yaml"), yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &workflows_dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+
+        // A working binary, so the winner's transition into `coding`
+        // actually succeeds — this test is about how many callers win the
+        // race, not about a stage that can't start.
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &reply_binary(&workflows_dir, "ok"),
+            &workflows_dir,
+        );
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "gate").await;
+
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let engine = Arc::clone(&engine);
+            let task_id = task_id.clone();
+            handles.push(tokio::spawn(async move {
+                engine.send_message_or_resume(&task_id, "approved").await
+            }));
+        }
+
+        let (mut ok_count, mut err_count) = (0, 0);
+        for handle in handles {
+            match handle.await.unwrap() {
+                Ok(()) => ok_count += 1,
+                Err(SendMessageOrResumeError::Advance(err)) => {
+                    assert!(
+                        is_benign_resume_race(&err),
+                        "a losing concurrent resume must fail with a benign race, not {err:?}"
+                    );
+                    err_count += 1;
+                }
+                // The early rejections in `send_message_or_resume` itself
+                // (status/stage no longer what a loser read) are just as
+                // benign as the `Advance` races above.
+                Err(other) => {
+                    tracing::debug!("early rejection: {other:?}");
+                    err_count += 1;
+                }
+            }
+        }
+        assert_eq!(ok_count, 1, "exactly one resume should win the race");
+        assert_eq!(err_count, 5);
+
+        wait_until_task_status(&pool, &task_id, "closed").await;
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "closed");
+        assert_eq!(task.stuck_reason, None);
+    }
+
     #[tokio::test]
     async fn send_message_or_resume_routes_an_open_agent_turn_to_send_message() {
         let pool = connect_in_memory().await.unwrap();
@@ -8552,6 +8822,62 @@ stages:
         // First `red` loops back into `watch`; the second exceeds the
         // guard and reroutes.
         wait_until_stage(&pool, &task_id, "stalled").await;
+    }
+
+    /// `finish_poll_stage`'s catch-all (#61) had no test before this task:
+    /// a poll resolves cleanly, but the `agent_turn` its outcome routes
+    /// into can't start (a binary that can't be spawned). Kept fast — a
+    /// short interval and a command that resolves on its first attempt —
+    /// since `interval: 1s` is the loader's floor.
+    #[tokio::test]
+    async fn a_poll_resolving_into_a_stage_that_cannot_start_marks_the_task_stuck() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("coder-turn.md"), "do the thing").unwrap();
+        let yaml = format!(
+            r#"
+name: poll-then-turn
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  watch:
+    kind: poll
+    command: "echo SUCCESS"
+    interval: 1s
+{GREEN_OR_RED}
+    on: {{ green: coding, red: failed, error: failed, timeout: stalled }}
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+  stalled:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "/no/such/binary-3f6c9a");
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "coding");
+        let reason = task.stuck_reason.unwrap();
+        assert!(
+            reason.contains("coding") && reason.contains("watch"),
+            "{reason:?}"
+        );
     }
 
     struct TempDir(PathBuf);
@@ -12644,6 +12970,75 @@ stages:
             1,
             "a template failure must record exactly one Error event, not one from \
              `enter_stage` and a second from `mark_stuck`: {error_events:?}"
+        );
+    }
+
+    /// `finish_turn`'s catch-all (#61) had no test before this task: an
+    /// `agent_turn` completes cleanly, but the stage its edge leads into
+    /// can't be entered. Both turns share one adapter binary (so a failed
+    /// spawn can't be what trips this), so the second stage is failed a
+    /// different way — a prompt template that fails to render, the same
+    /// technique `a_template_failure_marks_the_task_stuck_with_exactly_one_error_event`
+    /// uses for `finish_shell_stage`'s catch-all.
+    #[tokio::test]
+    async fn a_turn_completing_into_a_stage_that_cannot_start_marks_the_task_stuck() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("first-turn.md"), "do the first thing").unwrap();
+        let second_prompt = dir.join("second-turn.md");
+        std::fs::write(&second_prompt, "do the second thing").unwrap();
+        let yaml = r#"
+name: turn-then-turn
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  first:
+    kind: agent_turn
+    role: coder
+    prompt_file: first-turn.md
+    on: { done: second }
+  second:
+    kind: agent_turn
+    role: coder
+    prompt_file: second-turn.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        // Valid at parse time — `WorkflowDefinition::parse` validates the
+        // prompt file's template syntax against *this* content. The
+        // rewrite below only changes what `enter_agent_turn` reads back at
+        // runtime, once `first` has already completed and advancing into
+        // `second` tries to render it.
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        std::fs::write(&second_prompt, "do the second thing {{ task.input").unwrap();
+
+        let engine = engine_with_adapter(pool.clone(), &reply_binary(&dir, "ok"));
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "second");
+        let reason = task.stuck_reason.unwrap();
+        assert!(
+            reason.contains("second") && reason.contains("first"),
+            "{reason:?}"
+        );
+
+        let error_events: Vec<_> = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::Error)
+            .collect();
+        assert_eq!(
+            error_events.len(),
+            1,
+            "a template failure must record exactly one Error event: {error_events:?}"
         );
     }
 

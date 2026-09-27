@@ -95,6 +95,12 @@ impl From<SendMessageOrResumeError> for ApiError {
             // that's the exact same race surfacing through a stronger,
             // more specific check than `UnknownOutcome` used to catch it
             // with.
+            //
+            // This list must stay in agreement with the identical one in
+            // `send_message_or_resume`'s `HumanGate` arm (issue #61),
+            // which uses it to decide when *not* to mark the task
+            // `stuck` — anything outside it there is a real wedge this
+            // mapping falls through to `Internal` for below.
             SendMessageOrResumeError::Advance(
                 EngineError::UnknownOutcome { .. }
                 | EngineError::TerminalStageHasNoTransitions(_)
