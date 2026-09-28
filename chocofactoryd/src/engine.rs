@@ -6384,8 +6384,8 @@ stages:
         assert_eq!(state.current_stage, "review");
         assert_eq!(state.loop_counters, json!({ "review": { "count": 3 } }));
 
-        // The next one escalates: max: 3 allows 3 laps, and the pre-#106
-        // count of 2 plus this bump plus the one above already used both.
+        // The next one escalates: 2 stored + 1 bump above = 3 laps used;
+        // this 4th bump exceeds max: 3.
         engine
             .advance(&task_id, &def, "changes_requested")
             .await

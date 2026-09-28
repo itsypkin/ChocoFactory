@@ -1688,10 +1688,10 @@ stages:
     }
 
     /// #106, item 13: the `coding-task.yaml` shape — the escape stage
-    /// (`escalate`) is reachable from the loop (e.g. `open_pr`-style error
-    /// edges could route there too, in a fuller graph) but *avoidable*: the
-    /// direct return path from `revising` to `review` never touches it. A
-    /// guard like this must stay legal.
+    /// (`escalate`) really is reachable from the loop, via `pr`'s
+    /// `open_pr`-style error edge, but *avoidable*: the direct return path
+    /// from `revising` to `review` never touches it. A guard like this must
+    /// stay legal.
     #[test]
     fn accepts_an_escape_stage_reachable_from_the_loop_but_avoidable() {
         let dir = TempDir::new();
@@ -1707,9 +1707,12 @@ stages:
   review:
     kind: human_gate
     on:
-      approved: done
+      approved: pr
       changes_requested: revising
     loop_guard: { on: changes_requested, max: 3, then: escalate }
+  pr:
+    kind: human_gate
+    on: { done: done, error: escalate }
   escalate:
     kind: human_gate
     on: { resumed: revising }
@@ -1735,6 +1738,43 @@ stages:
   b:
     kind: terminal
   c:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    /// #106, item 2 (re-review): pins that the load-time DFS walks `on:`
+    /// edges only, never a `loop_guard.then` edge belonging to some *other*
+    /// guard it passes through. `outer`'s guarded outcome targets `mid`,
+    /// which only reaches `escalate` and a dead end over `on:` edges —
+    /// never back to `outer` — so `outer`'s guard is legal on its own.
+    /// `escalate` happens to carry its own guard whose `then:` is `outer`;
+    /// that `then:` is not an `on:` edge, so it must not let the DFS treat
+    /// `mid -> escalate -> outer` as a real path. A `reaches` that also
+    /// pushed `loop_guard.then` targets would find `outer` reachable from
+    /// `mid` (via `escalate`'s `then:`) but *not* reachable while avoiding
+    /// `escalate` (since that's the only way in), and wrongly reject this
+    /// as escaping on every lap.
+    #[test]
+    fn reaches_follows_on_edges_only_not_another_guards_then() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: fine
+stages:
+  outer:
+    kind: human_gate
+    on: { loop: mid, done: fin }
+    loop_guard: { on: loop, max: 3, then: escalate }
+  mid:
+    kind: human_gate
+    on: { resumed: escalate }
+  escalate:
+    kind: human_gate
+    on: { resumed: parked }
+    loop_guard: { on: resumed, max: 3, then: outer }
+  parked:
+    kind: terminal
+  fin:
     kind: terminal
 "#;
         WorkflowDefinition::parse(yaml, &dir.path).unwrap();
