@@ -11777,7 +11777,7 @@ esac
         // `coding` once and from `revising` every time after — exactly the
         // shape whose reset the old entry-based rule forgot the first
         // rejection for, letting the task escalate on the 5th rejection
-        // (5 `revising` trips, 6 `internal_review` entries) instead of the
+        // (4 `revising` trips, 5 `internal_review` entries) instead of the
         // 4th.
         assert_eq!(
             trail.iter().filter(|s| s.as_str() == "revising").count(),
