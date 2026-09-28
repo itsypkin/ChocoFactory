@@ -17,10 +17,10 @@
 //! wedge its task forever.
 //!
 //! `loop_guard` bookkeeping (§5.3) lives entirely in `workflow_state.
-//! loop_counters`, keyed by stage name to `{ entered_from, count }`:
-//! `count` is how many times that stage has been left via its guarded
-//! outcome since it was last entered from a *different* prior stage (the
-//! reset condition in §5.3) — see `bump_loop_counter`/`note_stage_entry`.
+//! loop_counters`, keyed by stage name to `{ count }`: `count` is how many
+//! times that stage has been left via its guarded outcome since the task
+//! last arrived at that guard's `then:` stage (#106) — see
+//! `bump_loop_counter`/`clear_guards_escaping_to`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -2505,10 +2505,9 @@ impl WorkflowEngine {
                     let count = bump_loop_counter(&mut loop_counters, &from_stage);
                     if count > u64::from(guard.max) {
                         next_stage = guard.then.clone();
-                        reset_loop_count(&mut loop_counters, &from_stage);
                     }
                 }
-                note_stage_entry(&mut loop_counters, definition, &next_stage, &from_stage);
+                clear_guards_escaping_to(&mut loop_counters, definition, &next_stage);
 
                 let mut payload = state.payload;
                 if let Some(value) = capture {
@@ -5339,59 +5338,46 @@ fn merge_stage_capture(payload: &mut Value, stage: &str, value: Value) {
         .insert(stage.to_string(), value);
 }
 
-/// Increments the guarded stage's transition count. Seeds a fresh entry
-/// with `entered_from: stage` (rather than e.g. `null`) so that the
-/// `note_stage_entry` call later in the same `advance()` — which, for a
-/// stage whose guarded outcome loops back to itself, targets this exact
-/// entry — sees a match and doesn't immediately reset the count this
-/// call just produced.
+/// Increments the guarded stage's transition count and rewrites its whole
+/// `loop_counters` entry as `{ "count": n }`. A pre-#106 entry of the form
+/// `{ "entered_from": …, "count": n }` keeps its count and loses
+/// `entered_from` the first time it is bumped — the `entered_from` seeding
+/// rationale from before #106 (matching a later reset-on-different-entry
+/// check) no longer applies, since that check is gone.
 fn bump_loop_counter(loop_counters: &mut Value, stage: &str) -> u64 {
     let obj = loop_counters
         .as_object_mut()
         .expect("engine always stores loop_counters as a JSON object");
-    let entry = obj
-        .entry(stage.to_string())
-        .or_insert_with(|| json!({ "entered_from": stage, "count": 0 }));
-    let count = entry.get("count").and_then(Value::as_u64).unwrap_or(0) + 1;
-    entry["count"] = json!(count);
+    let count = obj
+        .get(stage)
+        .and_then(|entry| entry.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        + 1;
+    obj.insert(stage.to_string(), json!({ "count": count }));
     count
 }
 
-/// Zeroes a guarded stage's count after it reroutes to `then:`, so the
-/// same loop can run again later without staying permanently maxed out.
-fn reset_loop_count(loop_counters: &mut Value, stage: &str) {
-    if let Some(entry) = loop_counters.get_mut(stage) {
-        entry["count"] = json!(0);
-    }
-}
-
-/// Records which stage `stage` was just entered from, resetting its
-/// guard count if that differs from last time (§5.3's reset condition).
-/// A no-op for stages without a `loop_guard` — there's nothing to track.
-fn note_stage_entry(
+/// Clears the `loop_counters` entry of every stage whose `loop_guard.then`
+/// is `next_stage` — the §5.3 reset rule (#106): a guard's count starts
+/// over exactly when the task arrives at that guard's `then:` stage,
+/// whichever way it got there (the guard's own reroute, or any other
+/// route: a failed command, a timeout, another guard tripping). Nothing
+/// else resets a count.
+fn clear_guards_escaping_to(
     loop_counters: &mut Value,
     definition: &WorkflowDefinition,
-    stage: &str,
-    entered_from: &str,
+    next_stage: &str,
 ) {
-    let Some(stage_def) = definition.stages.get(stage) else {
-        return;
-    };
-    if stage_def.loop_guard.is_none() {
-        return;
-    }
     let obj = loop_counters
         .as_object_mut()
         .expect("engine always stores loop_counters as a JSON object");
-    let recorded_from = obj
-        .get(stage)
-        .and_then(|entry| entry.get("entered_from"))
-        .and_then(Value::as_str);
-    if recorded_from != Some(entered_from) {
-        obj.insert(
-            stage.to_string(),
-            json!({ "entered_from": entered_from, "count": 0 }),
-        );
+    for (stage, stage_def) in &definition.stages {
+        if let Some(guard) = &stage_def.loop_guard
+            && guard.then == next_stage
+        {
+            obj.remove(stage);
+        }
     }
 }
 
@@ -6054,16 +6040,18 @@ stages:
     }
 
     #[tokio::test]
-    async fn loop_guard_count_resets_when_the_guarded_stage_is_entered_from_elsewhere() {
+    async fn loop_guard_count_does_not_reset_when_the_guarded_stage_is_entered_from_elsewhere() {
         let pool = connect_in_memory().await.unwrap();
         let def = two_paths_into_guarded_stage_def();
         let task_id = seed_task(&pool, &def.name).await;
         let engine = engine_with_adapter(pool.clone(), "unused");
         engine.start_task(&task_id, &def, None).await.unwrap();
 
-        // start -> review (entered_from "start"), then one round trip
-        // through coding back into review (entered_from "coding" now —
-        // a different prior stage than last time review was entered).
+        // start -> review, then one round trip through coding back into
+        // review — a different prior stage than last time review was
+        // entered. Under #106's rule that no longer matters: only landing
+        // on the guard's `then:` (here, "escalate") resets the count, and
+        // neither "review" nor "coding" is that stage.
         engine.advance(&task_id, &def, "go").await.unwrap();
         engine
             .advance(&task_id, &def, "changes_requested")
@@ -6073,20 +6061,407 @@ stages:
 
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "review");
-        assert_eq!(
-            state.loop_counters["review"]["entered_from"],
-            json!("coding")
-        );
+        assert_eq!(state.loop_counters["review"]["count"], json!(1));
 
-        // If the reset hadn't happened, this would be the guard's 2nd
-        // transition (carried over from the "start"-sourced visit); with
-        // the reset, it's the 1st against the new "coding"-sourced streak.
+        // A second transition through the guarded outcome carries the
+        // count forward instead of restarting it.
         engine
             .advance(&task_id, &def, "changes_requested")
             .await
             .unwrap();
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
-        assert_eq!(state.loop_counters["review"]["count"], json!(1));
+        assert_eq!(
+            state.loop_counters["review"],
+            json!({ "count": 2 }),
+            "no entered_from: the counter's only shape is {{ count }}"
+        );
+    }
+
+    /// Mirrors `coding-task.yaml`'s actual shape (#106): the guarded stage
+    /// (`review`) is entered once from `coding` and every later time from
+    /// `revising`, so a reset keyed on "did the prior stage change" fires
+    /// on the very first round trip and forgets it.
+    fn coding_revising_review_escalate_def() -> Arc<WorkflowDefinition> {
+        let yaml = r#"
+name: coding-revising-review
+stages:
+  coding:
+    kind: human_gate
+    on: { resumed: review }
+  revising:
+    kind: human_gate
+    on: { resumed: review }
+  review:
+    kind: human_gate
+    on:
+      approved: done
+      changes_requested: revising
+    loop_guard: { on: changes_requested, max: 3, then: escalate }
+  escalate:
+    kind: human_gate
+    on: { resumed: revising }
+  done:
+    kind: terminal
+"#;
+        Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap())
+    }
+
+    /// #106, item 1 (must fail on main): the guarded stage is entered from
+    /// a different prior stage on its very first return (`coding` once,
+    /// then `revising` every time after), which is exactly the shape that
+    /// made `internal_review`'s reset condition fire on the 1st rejection.
+    /// With the old entry-based reset this escalates on the 5th CR, not
+    /// the 4th.
+    #[tokio::test]
+    async fn loop_guard_escalates_on_the_fourth_cr_even_though_first_entered_from_a_different_stage()
+     {
+        let pool = connect_in_memory().await.unwrap();
+        let def = coding_revising_review_escalate_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine.advance(&task_id, &def, "resumed").await.unwrap(); // coding -> review
+
+        // CRs 1-3 leave the task in revising (guard allows 3 laps).
+        for _ in 0..3 {
+            engine
+                .advance(&task_id, &def, "changes_requested")
+                .await
+                .unwrap();
+            let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+            assert_eq!(state.current_stage, "revising");
+            engine.advance(&task_id, &def, "resumed").await.unwrap(); // revising -> review
+        }
+
+        // The 4th CR reroutes to escalate.
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap();
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "escalate");
+    }
+
+    /// #106, item 3: `awaiting_human_review`'s shape — the guarded stage is
+    /// entered from exactly one other stage every time — never tripped the
+    /// old bug, and must keep working under the new rule too.
+    fn human_only_entered_from_ci_def() -> Arc<WorkflowDefinition> {
+        let yaml = r#"
+name: human-only-from-ci
+stages:
+  ci:
+    kind: human_gate
+    on: { green: human }
+  human:
+    kind: human_gate
+    on:
+      approved: done
+      changes_requested: revising
+    loop_guard: { on: changes_requested, max: 3, then: escalate }
+  revising:
+    kind: human_gate
+    on: { resumed: ci }
+  escalate:
+    kind: human_gate
+    on: { resumed: revising }
+  done:
+    kind: terminal
+"#;
+        Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap())
+    }
+
+    #[tokio::test]
+    async fn loop_guard_still_trips_when_the_guarded_stage_has_only_one_entry_stage() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = human_only_entered_from_ci_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine.advance(&task_id, &def, "green").await.unwrap(); // ci -> human
+
+        for _ in 0..3 {
+            engine
+                .advance(&task_id, &def, "changes_requested")
+                .await
+                .unwrap(); // human -> revising
+            engine.advance(&task_id, &def, "resumed").await.unwrap(); // revising -> ci
+            engine.advance(&task_id, &def, "green").await.unwrap(); // ci -> human
+        }
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "human");
+
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap();
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "escalate");
+    }
+
+    /// #106, item 6 (must fail on main): the escalation stage can also be
+    /// reached from a cause unrelated to the guard (here, `pr`'s `error`
+    /// outcome — standing in for `open_pr` failing). Resuming from there
+    /// must still hand the guard a fresh budget: under the old
+    /// entry-based reset, arriving at `escalate` from `pr` never touched
+    /// `review`'s counter (only stages that themselves have a
+    /// `loop_guard` were tracked), so the count carried over and the loop
+    /// tripped on the 2nd CR after resuming, not the 4th.
+    #[tokio::test]
+    async fn a_guard_gets_a_fresh_budget_after_resuming_from_an_escalation_with_another_cause() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: escalate-path
+stages:
+  coding:
+    kind: human_gate
+    on: { resumed: review }
+  revising:
+    kind: human_gate
+    on: { resumed: review }
+  review:
+    kind: human_gate
+    on:
+      approved: pr
+      changes_requested: revising
+    loop_guard: { on: changes_requested, max: 3, then: escalate }
+  pr:
+    kind: human_gate
+    on: { done: finished, error: escalate }
+  escalate:
+    kind: human_gate
+    on: { resumed: revising }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine.advance(&task_id, &def, "resumed").await.unwrap(); // coding -> review
+
+        // 3 CRs, staying under the guard.
+        for _ in 0..3 {
+            engine
+                .advance(&task_id, &def, "changes_requested")
+                .await
+                .unwrap(); // review -> revising
+            engine.advance(&task_id, &def, "resumed").await.unwrap(); // revising -> review
+        }
+
+        engine.advance(&task_id, &def, "approved").await.unwrap(); // review -> pr
+        engine.advance(&task_id, &def, "error").await.unwrap(); // pr -> escalate
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "escalate");
+
+        engine.advance(&task_id, &def, "resumed").await.unwrap(); // escalate -> revising
+        engine.advance(&task_id, &def, "resumed").await.unwrap(); // revising -> review
+
+        // 3 more CRs stay in the loop...
+        for _ in 0..3 {
+            engine
+                .advance(&task_id, &def, "changes_requested")
+                .await
+                .unwrap();
+            let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+            assert_eq!(state.current_stage, "revising");
+            engine.advance(&task_id, &def, "resumed").await.unwrap();
+        }
+        // ...and the 4th escalates.
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap();
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "escalate");
+    }
+
+    /// #106, item 7: two guards sharing the same `then:` both clear on
+    /// arrival there; a third guard with a different `then:` is
+    /// unaffected.
+    #[tokio::test]
+    async fn tripping_one_guard_clears_every_guard_sharing_its_then_but_not_others() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: three-guards
+stages:
+  g1:
+    kind: human_gate
+    on: { loop: g1, next: g2 }
+    loop_guard: { on: loop, max: 1, then: escalate }
+  g2:
+    kind: human_gate
+    on: { loop: g2, next: g3 }
+    loop_guard: { on: loop, max: 5, then: escalate }
+  g3:
+    kind: human_gate
+    on: { loop: g3, next: g1 }
+    loop_guard: { on: loop, max: 5, then: elsewhere }
+  escalate:
+    kind: terminal
+  elsewhere:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine.advance(&task_id, &def, "loop").await.unwrap(); // g1, count 1 (not tripped)
+        engine.advance(&task_id, &def, "next").await.unwrap(); // -> g2
+        engine.advance(&task_id, &def, "loop").await.unwrap(); // g2, count 1
+        engine.advance(&task_id, &def, "next").await.unwrap(); // -> g3
+        engine.advance(&task_id, &def, "loop").await.unwrap(); // g3, count 1
+        engine.advance(&task_id, &def, "next").await.unwrap(); // -> g1
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(
+            state.loop_counters,
+            json!({ "g1": {"count": 1}, "g2": {"count": 1}, "g3": {"count": 1} })
+        );
+
+        // Trips g1's guard (2nd "loop" > max 1).
+        engine.advance(&task_id, &def, "loop").await.unwrap();
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "escalate");
+        assert_eq!(state.loop_counters, json!({ "g3": {"count": 1} }));
+    }
+
+    /// #106, item 8: arriving at a stage that is nobody's `then:` clears
+    /// nothing, even though it's a real, non-trivial transition.
+    #[test]
+    fn clear_guards_escaping_to_a_stage_that_is_no_guards_then_is_a_no_op() {
+        let def = coding_revising_review_escalate_def();
+        let mut loop_counters = json!({ "review": { "count": 2 } });
+        clear_guards_escaping_to(&mut loop_counters, &def, "review");
+        assert_eq!(loop_counters, json!({ "review": { "count": 2 } }));
+    }
+
+    /// #106, item 11: a pre-#106 `{ entered_from, count }` entry keeps its
+    /// count the first time it's bumped after the upgrade, just losing the
+    /// now-meaningless `entered_from`.
+    #[tokio::test]
+    async fn a_pre_106_entry_keeps_its_count_and_drops_entered_from_on_the_next_bump() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: pre-106-shape
+stages:
+  review:
+    kind: human_gate
+    on: { changes_requested: review, approved: done }
+    loop_guard: { on: changes_requested, max: 3, then: escalate }
+  escalate:
+    kind: terminal
+  done:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        workflow_state::update(
+            &pool,
+            &task_id,
+            workflow_state::WorkflowStateUpdate {
+                current_stage: state.current_stage,
+                loop_counters: json!({ "review": { "entered_from": "coding", "count": 2 } }),
+                payload: state.payload,
+            },
+        )
+        .await
+        .unwrap();
+
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap();
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "review");
+        assert_eq!(state.loop_counters, json!({ "review": { "count": 3 } }));
+
+        // The next one escalates: max: 3 allows 3 laps, and the pre-#106
+        // count of 2 plus this bump plus the one above already used both.
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap();
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "escalate");
+    }
+
+    /// #106, item 10: `retry_task` never touches `loop_counters`, even
+    /// when the stuck stage happens to be some other guard's `then:` and
+    /// another guard's count is non-zero at the time.
+    #[tokio::test]
+    async fn retry_task_leaves_loop_counters_untouched_even_at_a_guards_then_stage() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let marker = dir.join("marker"); // never created -> escalate stays stuck
+        let yaml = format!(
+            r#"
+name: retry-at-guard-then
+stages:
+  other:
+    kind: human_gate
+    on: {{ loop: other, next: review }}
+    loop_guard: {{ on: loop, max: 5, then: other_escalate }}
+  review:
+    kind: human_gate
+    on:
+      changes_requested: coding
+      approved: done
+    loop_guard: {{ on: changes_requested, max: 1, then: escalate }}
+  coding:
+    kind: human_gate
+    on: {{ resumed: review }}
+  escalate:
+    kind: shell
+    command: "test -f {}"
+    on: {{ done: coding }}
+  other_escalate:
+    kind: terminal
+  done:
+    kind: terminal
+"#,
+            marker.display()
+        );
+        std::fs::write(dir.join("retry-at-guard-then.yaml"), &yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap(); // -> other
+
+        engine.advance(&task_id, &def, "loop").await.unwrap(); // other, count 1
+        engine.advance(&task_id, &def, "next").await.unwrap(); // -> review
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap(); // review, count 1 (not tripped) -> coding
+        engine.advance(&task_id, &def, "resumed").await.unwrap(); // -> review
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap(); // review, count 2 > 1 -> trips, escalate clears review
+
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        let before = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(before.current_stage, "escalate");
+        assert_eq!(before.loop_counters, json!({ "other": { "count": 1 } }));
+
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+
+        let after = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.loop_counters, before.loop_counters,
+            "retry_task must not touch loop_counters, byte-for-byte"
+        );
+        assert_eq!(after.current_stage, "escalate");
     }
 
     #[tokio::test]
@@ -11301,11 +11676,8 @@ esac
             .unwrap();
         wait_until_stage(&pool, &task_id, "escalate_to_human").await;
 
-        let trail: Vec<String> = stage_trail(&pool, &task_id)
-            .await
-            .into_iter()
-            .map(|(stage, _)| stage)
-            .collect();
+        let raw_trail = stage_trail(&pool, &task_id).await;
+        let trail: Vec<String> = raw_trail.iter().map(|(stage, _)| stage.clone()).collect();
         assert!(
             trail.iter().filter(|s| s.as_str() == "open_pr").count() >= 2,
             "the changes-requested route must come back through open_pr at \
@@ -11319,6 +11691,36 @@ esac
             trail.iter().filter(|s| s.as_str() == "coding").count(),
             1,
             "coding still only ever runs once: {trail:?}"
+        );
+        // #106: `awaiting_human_review`'s own `loop_guard` (max: 3) is what
+        // parks this task, not `internal_review`'s (the coder's stub reply
+        // always approves) — so it must appear exactly 4 times: the first
+        // visit plus the 3 allowed `changes_requested` laps, with the 4th
+        // rerouting to `escalate_to_human` instead of coming back around.
+        assert_eq!(
+            trail
+                .iter()
+                .filter(|s| s.as_str() == "awaiting_human_review")
+                .count(),
+            4,
+            "expected exactly 4 visits to awaiting_human_review: {trail:?}"
+        );
+        let last = raw_trail.last().expect("trail is never empty");
+        assert_eq!(
+            last,
+            &("escalate_to_human".to_string(), json!("changes_requested")),
+            "the last hop must be awaiting_human_review's guard tripping \
+             on changes_requested: {raw_trail:?}"
+        );
+        let last_awaiting_review_index = raw_trail
+            .iter()
+            .rposition(|(stage, _)| stage == "awaiting_human_review")
+            .expect("awaiting_human_review must appear in the trail");
+        assert_eq!(
+            last_awaiting_review_index,
+            raw_trail.len() - 2,
+            "escalate_to_human must be entered immediately after the last \
+             awaiting_human_review, not via some other stage: {raw_trail:?}"
         );
 
         // The load-bearing one: a second `gh pr create` is exactly the
@@ -11371,9 +11773,24 @@ esac
             1,
             "coding only ever runs once; every return path goes through revising: {trail:?}"
         );
-        assert!(
-            trail.iter().filter(|s| s.as_str() == "revising").count() >= 3,
-            "expected at least 3 trips through revising before the loop guard tripped: {trail:?}"
+        // #106 (must fail on main): `internal_review` is entered from
+        // `coding` once and from `revising` every time after — exactly the
+        // shape whose reset the old entry-based rule forgot the first
+        // rejection for, letting the task escalate on the 5th rejection
+        // (5 `revising` trips, 6 `internal_review` entries) instead of the
+        // 4th.
+        assert_eq!(
+            trail.iter().filter(|s| s.as_str() == "revising").count(),
+            3,
+            "expected exactly 3 trips through revising before the loop guard tripped: {trail:?}"
+        );
+        assert_eq!(
+            trail
+                .iter()
+                .filter(|s| s.as_str() == "internal_review")
+                .count(),
+            4,
+            "expected exactly 4 visits to internal_review before the loop guard tripped: {trail:?}"
         );
     }
 

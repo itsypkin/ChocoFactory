@@ -271,11 +271,68 @@ impl WorkflowDefinition {
             self.validate_templates(stage_name, stage)?;
         }
 
+        // A second pass, run only once every stage's own checks above have
+        // passed — so every `on:` target and every `loop_guard.then` is
+        // already known to name a real stage, and this can walk the graph
+        // without re-deriving that. #106: a `loop_guard` whose `then:`
+        // stage sits on every path back from the guarded outcome's target
+        // to the guarded stage itself would have its count reset every lap
+        // (workflow_state.loop_counters clears on arrival at `then:`), so
+        // it could never accumulate past `max` and trip.
+        for (stage_name, stage) in &self.stages {
+            let Some(guard) = &stage.loop_guard else {
+                continue;
+            };
+            // Already validated above: `guard.on` is a key of `stage.on`,
+            // and `guard.then` names a real stage.
+            let target = &stage.on[&guard.on];
+            let escapes_every_lap = self.reaches(target, stage_name, None)
+                && !self.reaches(target, stage_name, Some(&guard.then));
+            if escapes_every_lap {
+                return Err(WorkflowDefError::LoopGuardEscapeOnEveryLap {
+                    stage: stage_name.clone(),
+                    then: guard.then.clone(),
+                    target: target.clone(),
+                });
+            }
+        }
+
         if !self.sink_reachable_from_start() {
             return Err(WorkflowDefError::NoReachableSink);
         }
 
         Ok(())
+    }
+
+    /// DFS over `on:` edges only (never `loop_guard.then`, unlike
+    /// [`Self::sink_reachable_from_start`] — that edge is exactly what's
+    /// being asked about here, not a path to walk through). A zero-length
+    /// path counts: `reaches(x, x, None)` is `true`. `avoiding`, when set,
+    /// is never entered — including as `from` itself, so starting *on*
+    /// the avoided stage never reaches anything.
+    fn reaches(&self, from: &str, to: &str, avoiding: Option<&str>) -> bool {
+        if Some(from) == avoiding {
+            return false;
+        }
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![from.to_string()];
+        while let Some(name) = stack.pop() {
+            if name == to {
+                return true;
+            }
+            if !visited.insert(name.clone()) {
+                continue;
+            }
+            let Some(stage) = self.stages.get(&name) else {
+                continue;
+            };
+            for target in stage.on.values() {
+                if Some(target.as_str()) != avoiding {
+                    stack.push(target.clone());
+                }
+            }
+        }
+        false
     }
 
     /// Checks every `{{ stages.<name>.<field> }}` reference this stage would
@@ -895,6 +952,11 @@ pub enum WorkflowDefError {
         stage: String,
         target: String,
     },
+    LoopGuardEscapeOnEveryLap {
+        stage: String,
+        then: String,
+        target: String,
+    },
     NoReachableSink,
     MissingReferencedFile {
         owner: String,
@@ -1000,6 +1062,16 @@ impl fmt::Display for WorkflowDefError {
             WorkflowDefError::UnknownLoopGuardTarget { stage, target } => write!(
                 f,
                 "stage '{stage}' has a loop_guard 'then' target of unknown stage '{target}'"
+            ),
+            WorkflowDefError::LoopGuardEscapeOnEveryLap {
+                stage,
+                then,
+                target,
+            } => write!(
+                f,
+                "stage '{stage}' has a loop_guard whose 'then' stage '{then}' is on every path \
+                 from '{target}' back to '{stage}', so its count would restart every lap and it \
+                 could never trip"
             ),
             WorkflowDefError::NoReachableSink => write!(
                 f,
@@ -1553,6 +1625,133 @@ stages:
             WorkflowDefError::UnknownLoopGuardTarget { stage, target }
                 if stage == "a" && target == "nowhere"
         ));
+    }
+
+    /// #106, item 12: `then: tidy` sits on every path back from
+    /// `review`'s guarded target (`fix`) to `review` itself — `fix`'s only
+    /// way back is through `tidy`, and arriving at `tidy` clears the
+    /// guard's count before it ever gets back to `review`. The guard could
+    /// never trip, so this is rejected at load time rather than left to
+    /// silently never fire.
+    #[test]
+    fn rejects_a_loop_guard_whose_then_stage_is_on_every_path_back_to_the_guard() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  review:
+    kind: human_gate
+    on: { changes_requested: fix, approved: done }
+    loop_guard: { on: changes_requested, max: 3, then: tidy }
+  fix:
+    kind: human_gate
+    on: { resumed: tidy }
+  tidy:
+    kind: human_gate
+    on: { resumed: review }
+  done:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::LoopGuardEscapeOnEveryLap { stage, then, target }
+                if stage == "review" && then == "tidy" && target == "fix"
+        ));
+    }
+
+    /// #106, item 12: also rejected when `then:` is literally the same
+    /// stage the guarded outcome routes to on every un-tripped lap — the
+    /// most direct way to make the guard un-trippable.
+    #[test]
+    fn rejects_a_loop_guard_whose_then_stage_equals_its_own_guarded_target() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: broken
+stages:
+  review:
+    kind: human_gate
+    on: { changes_requested: fix, approved: done }
+    loop_guard: { on: changes_requested, max: 3, then: fix }
+  fix:
+    kind: human_gate
+    on: { resumed: review }
+  done:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::LoopGuardEscapeOnEveryLap { stage, then, target }
+                if stage == "review" && then == "fix" && target == "fix"
+        ));
+    }
+
+    /// #106, item 13: the `coding-task.yaml` shape — the escape stage
+    /// (`escalate`) is reachable from the loop (e.g. `open_pr`-style error
+    /// edges could route there too, in a fuller graph) but *avoidable*: the
+    /// direct return path from `revising` to `review` never touches it. A
+    /// guard like this must stay legal.
+    #[test]
+    fn accepts_an_escape_stage_reachable_from_the_loop_but_avoidable() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: fine
+stages:
+  coding:
+    kind: human_gate
+    on: { resumed: review }
+  revising:
+    kind: human_gate
+    on: { resumed: review }
+  review:
+    kind: human_gate
+    on:
+      approved: done
+      changes_requested: revising
+    loop_guard: { on: changes_requested, max: 3, then: escalate }
+  escalate:
+    kind: human_gate
+    on: { resumed: revising }
+  done:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    /// #106, item 13: a guard whose guarded outcome never loops back to the
+    /// guarded stage at all has no lap to reset the count of, so it's
+    /// unconditionally legal regardless of where `then:` sits.
+    #[test]
+    fn accepts_a_loop_guard_whose_outcome_never_loops_back() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: fine
+stages:
+  a:
+    kind: human_gate
+    on: { resumed: b, done: c }
+    loop_guard: { on: resumed, max: 3, then: c }
+  b:
+    kind: terminal
+  c:
+    kind: terminal
+"#;
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    /// #106, item 15.
+    #[test]
+    fn loop_guard_escape_on_every_lap_names_the_stage_then_and_target() {
+        let stage = WorkflowDefError::LoopGuardEscapeOnEveryLap {
+            stage: "review".to_string(),
+            then: "tidy".to_string(),
+            target: "fix".to_string(),
+        }
+        .to_string();
+        assert!(stage.contains("'review'"), "{stage}");
+        assert!(stage.contains("'tidy'"), "{stage}");
+        assert!(stage.contains("'fix'"), "{stage}");
     }
 
     #[test]

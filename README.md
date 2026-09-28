@@ -311,8 +311,8 @@ Five things worth knowing:
 
 If no verdict arrives within six hours the task stops waiting and parks at
 `escalate_to_human`, where `choco task send <id> "<note>"` resumes it into
-`revising`. Three `/request-changes` rounds park it the same way instead of
-looping.
+`revising`. A fourth `/request-changes`, after three revise rounds, parks it the same way instead of
+looping, and resuming from there starts the count over.
 
 ## Using the `choco` CLI
 

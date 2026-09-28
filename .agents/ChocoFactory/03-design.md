@@ -623,11 +623,30 @@ is intentional (§7).
 
 ### 5.3 Loop guards
 
-`loop_guard` (Q13) is a per-stage, per-outcome counter: `max` transitions
-through a given `on:` outcome before rerouting to `then:` instead. Reset
-whenever the stage is entered from a *different* prior stage. This is how
-"cap iterations, then escalate to human" is expressed generically rather
-than as bespoke Type-3 logic.
+`loop_guard` (Q13) is a per-stage, per-outcome counter. `{ on, max, then }` lets the stage leave
+through outcome `on` up to `max` times; the next time it would, the task goes to `then` instead.
+So `max: 3` allows three laps, and the fourth `on` outcome reroutes.
+
+A guard's count starts over in exactly one situation: when the task arrives at that guard's
+`then:` stage, whichever way it got there. That covers the guard tripping (its reroute lands on
+`then:`), and it covers a task reaching the same escalation stage for another reason — a failed
+command, a timeout, another guard — so a human resuming a task from its escalation point always
+hands it a full budget. Nothing else resets a count: not which stage the guarded stage was
+entered from, not the task leaving the loop and coming back through it later, and not a retry,
+which re-runs the current stage without taking an `on:` transition.
+
+Counts live in `workflow_state.loop_counters`, keyed by the guarded stage, and are written in the
+same update as the transition that changes them. A workflow is rejected at load time if a guard's
+`then:` stage lies on every path from the guarded outcome's target back to the guarded stage,
+since that guard's count would restart every lap and it could never trip.
+
+This is how "cap iterations, then escalate to human" is expressed generically rather than as
+bespoke Type-3 logic.
+
+*Changed in #106.* The count used to reset whenever the stage was entered from a different prior
+stage than last time. `coding-task`'s `internal_review` is entered from `coding` once and from
+`revising` after that, so its first rejection was always forgotten and the guard allowed one lap
+more than `max`.
 
 ### 5.4 Built-in workflow: Chat (Type 1)
 
