@@ -308,8 +308,13 @@ impl WorkflowDefinition {
                 // `task` is always valid — it's payload the engine seeds
                 // itself in `start_task` (P2-7a), not a stage's `capture:`,
                 // so there's no stage to look up and no capture to require.
+                // Same for `arrival` (#112): it's engine-owned payload set
+                // in `advance_from_stage`/`start_task`, not a stage's own
+                // capture, and `template::parse_reference` has already
+                // rejected any field but `from`/`outcome` at parse time.
                 let referenced_stage = match reference.root {
                     crate::template::Root::Task => continue,
+                    crate::template::Root::Arrival => continue,
                     crate::template::Root::Stage(stage) => stage,
                 };
                 let Some(target) = self.stages.get(&referenced_stage) else {

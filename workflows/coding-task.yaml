@@ -24,8 +24,13 @@ stages:
   # agent with tool access, so it can look up *why* it's back itself (CI
   # logs, PR comments); only what it genuinely can't look up — a reviewer's
   # own summary, or a human's redirect note — gets templated in
-  # (`coder-revise.md`), and only one of those two is ever populated for a
-  # given entry (the other renders empty, #60).
+  # (`coder-revise.md`). The prompt branches on `{{ arrival.from }}`/
+  # `{{ arrival.outcome }}` (#112, the engine's own record of the transition
+  # that landed here), not on which capture happens to be populated: both
+  # `stages.internal_review.summary` and `stages.escalate_to_human` persist
+  # across laps once either stage has ever run, so the prompt labels each
+  # one with the arrival path it's current for and tells the coder to
+  # ignore it on every other path.
   revising:
     kind: agent_turn
     role: coder
