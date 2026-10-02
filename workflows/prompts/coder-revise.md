@@ -35,9 +35,10 @@ changing anything.
 
 Current on the `internal_review` path. On the `escalate_to_human` path it
 may be the rejection that tripped the loop guard, which the human's note
-below is probably replying to: read it as context, and the human's note
-takes priority. On any other path it is left over from an earlier lap
-(usually the approval that opened the PR), so ignore it.
+below is probably replying to, or it may be the stale approval that opened
+the PR: treat it as context at most, and the human's note takes priority.
+On any other path it is left over from an earlier lap (usually the approval
+that opened the PR), so ignore it.
 
 {{ stages.internal_review.summary }}
 

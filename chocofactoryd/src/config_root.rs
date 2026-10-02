@@ -364,6 +364,7 @@ mod tests {
             reviewer_heading < summary && summary < human_note_heading,
             "the stale summary must render only under its own heading:\n{rendered}"
         );
+        assert_eq!(rendered.matches("STALE REVIEWER APPROVAL").count(), 1);
         assert!(
             rendered.contains("Run `gh pr view --comments`"),
             "the awaiting_human_review entry must point the coder at the PR:\n{rendered}"
@@ -372,11 +373,19 @@ mod tests {
 
     #[test]
     fn coder_revise_for_the_checks_polling_path_names_the_arrival() {
-        assert_coder_revise_names_arrival_and_isolates_captures(
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
             "checks_polling",
             "red",
-            serde_json::json!({}),
+            serde_json::json!({ "internal_review": { "summary": "STALE REVIEWER APPROVAL" } }),
         );
+        let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
+        let human_note_heading = rendered.find("## A human's note").unwrap();
+        let summary = rendered.find("STALE REVIEWER APPROVAL").unwrap();
+        assert!(
+            reviewer_heading < summary && summary < human_note_heading,
+            "the stale summary must render only under its own heading:\n{rendered}"
+        );
+        assert_eq!(rendered.matches("STALE REVIEWER APPROVAL").count(), 1);
     }
 
     #[test]

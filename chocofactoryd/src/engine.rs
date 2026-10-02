@@ -5432,6 +5432,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn set_arrival_replaces_a_non_object_payload() {
+        let mut payload = json!(null);
+        set_arrival(&mut payload, "a", "b");
+        assert_eq!(
+            payload,
+            json!({ "arrival": { "from": "a", "outcome": "b" } })
+        );
+    }
     use crate::adapter::{AgentAdapter, ClaudeAdapter};
     use crate::db::{connect_in_memory, projects, tasks};
 
