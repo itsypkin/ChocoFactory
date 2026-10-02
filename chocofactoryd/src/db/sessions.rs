@@ -289,6 +289,22 @@ pub async fn recover_stale_active_sessions(pool: &SqlitePool) -> Result<u64, sql
     Ok(idled + exited)
 }
 
+/// Records that the daemon stopped under an `idle` session that never got
+/// to say why it ended (the startup park sweep, after a crash or SIGKILL):
+/// one compare-and-set, so a session that already carries a reason or has
+/// already exited is left untouched. Returns whether a row changed.
+pub async fn mark_daemon_stopped(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE sessions SET status = 'exited', end_reason = 'daemon_stopped', ended_at = ? \
+         WHERE id = ? AND status = 'idle' AND end_reason IS NULL",
+    )
+    .bind(Utc::now())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM sessions WHERE id = ?")
         .bind(id)
@@ -371,6 +387,62 @@ mod tests {
         assert_eq!(resume_chain_len(&pool, &third.id, 1).await.unwrap(), 1);
         // And a session that doesn't exist has no chain rather than an error.
         assert_eq!(resume_chain_len(&pool, "nope", 3).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mark_daemon_stopped_is_a_compare_and_set() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+        let make = || async {
+            let s = create(
+                &pool,
+                NewSession {
+                    task_id: &task_id,
+                    stage: "coding",
+                    role: "coder",
+                    cli_adapter: "claude",
+                    model: "sonnet",
+                },
+            )
+            .await
+            .unwrap();
+            s.id
+        };
+
+        let idle = make().await;
+        update_status(&pool, &idle, SessionStatus::Idle, None, None)
+            .await
+            .unwrap();
+        assert!(mark_daemon_stopped(&pool, &idle).await.unwrap());
+        let row = get(&pool, &idle).await.unwrap().unwrap();
+        assert_eq!(row.status, SessionStatus::Exited);
+        assert_eq!(row.end_reason, Some(SessionEndReason::DaemonStopped));
+        assert!(row.ended_at.is_some());
+        // Second call: already exited.
+        assert!(!mark_daemon_stopped(&pool, &idle).await.unwrap());
+
+        let reasoned = make().await;
+        update_status(
+            &pool,
+            &reasoned,
+            SessionStatus::Idle,
+            None,
+            Some(SessionEndReason::Reaped),
+        )
+        .await
+        .unwrap();
+        assert!(!mark_daemon_stopped(&pool, &reasoned).await.unwrap());
+        let row = get(&pool, &reasoned).await.unwrap().unwrap();
+        assert_eq!(row.status, SessionStatus::Idle);
+        assert_eq!(row.end_reason, Some(SessionEndReason::Reaped));
+        assert_eq!(row.ended_at, None);
+
+        let active = make().await;
+        assert!(!mark_daemon_stopped(&pool, &active).await.unwrap());
+        assert_eq!(
+            get(&pool, &active).await.unwrap().unwrap().status,
+            SessionStatus::Active
+        );
     }
 
     #[tokio::test]

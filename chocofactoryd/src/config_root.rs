@@ -10,12 +10,10 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-/// `$HOME/.config/chocofactory`, or `None` if `$HOME` isn't set. Callers
-/// either fall back to an explicit path (tests) or accept that no default
-/// exists (e.g. no global config file to load) rather than failing
-/// startup just because `$HOME` is unset.
+/// `$HOME/.config/chocofactory`, or `None` if `$HOME` isn't set. The
+/// definition lives in `chocofactory-core` so `choco` shares it.
 pub fn config_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("chocofactory"))
+    chocofactory_core::paths::config_root()
 }
 
 /// The workflows compiled into the `chocofactoryd` binary — checked into

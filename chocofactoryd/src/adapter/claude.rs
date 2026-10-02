@@ -43,6 +43,11 @@ impl ClaudeAdapter {
         }
     }
 
+    /// The `choco` binary path embedded in every agent turn's `--mcp-config`.
+    pub fn choco_binary(&self) -> &str {
+        &self.choco_binary
+    }
+
     /// Overrides the `choco` binary path used to build `--mcp-config`'s
     /// stdio command (issue #73), mirroring `with_binary`'s override of
     /// `claude` itself. Used by the daemon's `CHOCOFACTORY_CHOCO_BINARY` env
@@ -128,10 +133,11 @@ fn spawn(
         // The tradeoff is the one `shell.rs` already documents: a child in
         // its own group no longer receives the terminal's signals, so
         // Ctrl-C on a foreground daemon reaches the daemon but not the
-        // agent. The daemon installs no shutdown handler today, so
-        // `kill_on_drop` doesn't run on exit either and such a process
-        // already outlives it; this doesn't make that worse, and the real
-        // fix is graceful shutdown, which is not this change's to make.
+        // agent. The daemon now shuts down gracefully (SIGTERM/Ctrl-C
+        // stop every live group via `SessionManager::shutdown`), so this
+        // only matters for SIGKILL, where `kill_on_drop` cannot run; the
+        // startup park sweep covers that case by parking the interrupted
+        // task.
         .process_group(0)
         .kill_on_drop(true);
 

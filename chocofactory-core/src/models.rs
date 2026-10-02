@@ -163,6 +163,11 @@ pub enum SessionEndReason {
     /// itself. Detected by `adapter::claude`'s structured markers (see
     /// `AgentEvent::Interrupted`), never by the engine.
     Interrupted,
+    /// The daemon stopped or restarted during the turn. Like `Cancelled`
+    /// it is requested rather than observed (shutdown kills the process
+    /// group, or the startup park sweep records it after a crash); like
+    /// `Interrupted` the transcript is intact, so `retry` resumes it.
+    DaemonStopped,
 }
 
 impl fmt::Display for SessionEndReason {
@@ -174,6 +179,7 @@ impl fmt::Display for SessionEndReason {
             SessionEndReason::Lingered => "lingered",
             SessionEndReason::NoReport => "no_report",
             SessionEndReason::Interrupted => "interrupted",
+            SessionEndReason::DaemonStopped => "daemon_stopped",
         })
     }
 }
@@ -200,9 +206,40 @@ impl FromStr for SessionEndReason {
             "lingered" => Ok(SessionEndReason::Lingered),
             "no_report" => Ok(SessionEndReason::NoReport),
             "interrupted" => Ok(SessionEndReason::Interrupted),
+            "daemon_stopped" => Ok(SessionEndReason::DaemonStopped),
             other => Err(ParseSessionEndReasonError(other.to_string())),
         }
     }
+}
+
+/// One `open` task whose current stage a daemon restart would strand
+/// (`GET /server`'s `in_flight`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlight {
+    pub task_id: String,
+    pub title: String,
+    pub stage: String,
+    /// `"agent_turn"`, `"shell"`, or `"unknown"` when the task's workflow
+    /// could not be loaded or no longer has the stage.
+    pub kind: String,
+}
+
+/// The body of `GET /server`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    pub version: String,
+    pub commit: Option<String>,
+    pub pid: u32,
+    pub port: u16,
+    pub started_at: DateTime<Utc>,
+    pub config_root: String,
+    pub exe: String,
+    /// `None` when the startup stamp of the executable could not be taken.
+    pub exe_replaced: Option<bool>,
+    pub choco_binary: String,
+    pub choco_binary_found: bool,
+    pub tasks: std::collections::BTreeMap<String, i64>,
+    pub in_flight: Vec<InFlight>,
 }
 
 /// What `choco task retry` should do with the agent session a stuck stage
@@ -501,10 +538,15 @@ mod tests {
             SessionEndReason::Lingered,
             SessionEndReason::NoReport,
             SessionEndReason::Interrupted,
+            SessionEndReason::DaemonStopped,
         ] {
             assert_eq!(
                 reason.to_string().parse::<SessionEndReason>().unwrap(),
                 reason
+            );
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{reason}\"")
             );
         }
     }

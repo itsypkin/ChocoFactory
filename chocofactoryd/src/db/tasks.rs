@@ -166,6 +166,18 @@ pub async fn mark_stuck(pool: &SqlitePool, id: &str, reason: &str) -> Result<boo
     Ok(result.rows_affected() > 0)
 }
 
+/// How many tasks hold each status, in one `GROUP BY` query. Statuses with
+/// no tasks are absent.
+pub async fn count_by_status(
+    pool: &SqlitePool,
+) -> Result<std::collections::BTreeMap<String, i64>, sqlx::Error> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT status, COUNT(*) FROM tasks GROUP BY status")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Reopens a `stuck` task so its current stage can be retried (X-4, issue
 /// #61) — the compare-and-set counterpart to `mark_stuck`: `SET
 /// status='open', stuck_reason=NULL ... WHERE status='stuck'`. `None` means
@@ -268,6 +280,38 @@ mod tests {
 
     async fn seed_project(pool: &SqlitePool) -> String {
         projects::create(pool, "demo", None).await.unwrap().id
+    }
+
+    #[tokio::test]
+    async fn count_by_status_groups_a_mix_of_statuses() {
+        let pool = connect_in_memory().await.unwrap();
+        assert!(count_by_status(&pool).await.unwrap().is_empty());
+        let project_id = seed_project(&pool).await;
+        for status in ["open", "open", "open", "closed", "stuck", "stuck"] {
+            let task = create(
+                &pool,
+                NewTask {
+                    project_id: &project_id,
+                    workflow_def: "chat",
+                    title: "T",
+                    config: json!({}),
+                    workflow_path: None,
+                    workflow_sha256: None,
+                },
+            )
+            .await
+            .unwrap();
+            update_status(&pool, &task.id, status).await.unwrap();
+        }
+        let counts = count_by_status(&pool).await.unwrap();
+        assert_eq!(
+            counts.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("closed".to_string(), 1),
+                ("open".to_string(), 3),
+                ("stuck".to_string(), 2)
+            ]
+        );
     }
 
     #[tokio::test]

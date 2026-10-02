@@ -17,6 +17,9 @@ Binaries land in `target/debug/`.
 
 ## Running the daemon
 
+Logs go to **stderr**, not stdout: redirect with `chocofactoryd 2> daemon.log`
+(a plain `> log` captures nothing).
+
 > **`chocofactoryd` spawns the real `claude` CLI by default** — running the
 > daemon will hit the real, billable `claude` unless you point it at a
 > stand-in first.
@@ -43,13 +46,32 @@ HOME=$(mktemp -d) CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude \
   ./target/debug/chocofactoryd
 ```
 
+Only one daemon runs per config directory. It holds a lock on
+`~/.config/chocofactory/chocofactoryd.lock` for as long as it runs and writes
+a JSON description of itself there: `pid`, `port`, `version`, `commit`,
+`started_at` and `exe`. A second daemon on the same `$HOME` (even on another
+port) refuses to start and names the first one's pid and port. Never delete
+the lock file: the operating system releases the lock when the daemon dies,
+even by `kill -9`, so a leftover file from a dead daemon is harmless.
+
+SIGTERM and Ctrl-C stop the daemon cleanly: every agent and shell process it
+started is stopped with it. Tasks that were in the middle of an agent turn or
+a shell command become `stuck`, and `choco task retry` continues them (an
+agent turn resumes its session when it can; a shell command runs again from
+the start). Waits that live in the database survive a restart untouched:
+poll stages, human gates, and standing chat sessions. The same parking
+happens at the next start if the daemon was killed hard.
+
+`chocofactoryd --version` prints the version and exits without touching
+`$HOME`.
+
 ### Daemon environment variables
 
 | Variable | Purpose |
 |---|---|
 | `CHOCOFACTORY_CLAUDE_BINARY` | Path to the agent CLI. Unset = the real, billable `claude`. |
 | `CHOCOFACTORY_CHOCO_BINARY` | Path to `choco`, used to serve every agent turn's `report_outcome` tool (see below). Unset = the daemon's own sibling `choco` binary. |
-| `CHOCOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. |
+| `CHOCOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. `0` picks a free port; the bound port is written to the lock file. |
 | `MOCK_CLAUDE_REPLY` | Read by `mock-claude` only — reply with this fixed text instead of echoing. |
 | `MOCK_CLAUDE_REPORT` | Read by `mock-claude` only — the JSON input of the `report_outcome` call a single-shot turn makes (default `{"outcome": "done"}`). |
 | `RUST_LOG` | Log filter, e.g. `error` to quiet startup, `debug` for detail. |

@@ -232,12 +232,11 @@ pub async fn run(
         //
         // The tradeoff: a command in its own group no longer receives the
         // terminal's signals, so Ctrl-C on a foreground daemon reaches the
-        // daemon but not the command. The daemon installs no shutdown
-        // handler today, so neither this guard nor `kill_on_drop` runs on
-        // exit and such a command outlives it. That only affects foreground
-        // dev runs, and it's strictly smaller than the orphaned-tree
-        // problem above; the real fix is graceful shutdown, which is not
-        // this change's to make.
+        // daemon but not the command. The daemon now shuts down
+        // gracefully, and dropping the runtime drops this guard, which
+        // SIGKILLs the group; SIGKILL of the daemon itself is the
+        // remaining case, and the startup park sweep covers it by
+        // parking the interrupted task.
         .process_group(0)
         .kill_on_drop(true);
 

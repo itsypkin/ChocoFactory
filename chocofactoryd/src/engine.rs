@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chocofactory_core::models::{
-    EventType, Project, RetryMode, RetryOutcome, Session, SessionEndReason, SessionStatus, Task,
+    EventType, InFlight, Project, RetryMode, RetryOutcome, Session, SessionEndReason,
+    SessionStatus, Task,
 };
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
@@ -63,7 +64,7 @@ const TURN_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 const TURN_DEFAULT_OUTCOME: &str = "done";
 
 /// In-flight detached `shell`/`poll` runners, keyed by task id and then by
-/// the runner id [`WorkflowEngine::reserve_runner_slot`] hands out (#69).
+/// the runner id [`WorkflowEngine::spawn_registered_runner`] hands out (#69).
 ///
 /// The inner `Option` is the reservation: `None` between the slot being
 /// claimed and its `JoinHandle` being attached, which is a window only the
@@ -165,6 +166,9 @@ pub struct WorkflowEngine {
     /// to be unique per task, but a single global counter is simpler than
     /// per-task numbering and just as correct.
     next_runner_id: AtomicU64,
+    /// Set by `abort_all_detached_runners` before it drains: once set, no
+    /// new detached runner may start (see `spawn_registered_runner`).
+    runners_stopping: std::sync::atomic::AtomicBool,
     /// Wall-clock source for every `poll` budget computation (#52). Never
     /// `Instant`: it and tokio's timers stand still while the machine
     /// sleeps, so a `timeout:` measured on them is not calendar time.
@@ -926,6 +930,9 @@ impl ResumeSession {
     fn describe(&self) -> &'static str {
         match self.end_reason {
             SessionEndReason::Interrupted => "your account hit a usage limit",
+            SessionEndReason::DaemonStopped => {
+                "the daemon was stopped or restarted while you were working"
+            }
             SessionEndReason::Reaped => {
                 "the daemon closed it after it went quiet for longer than its idle timeout"
             }
@@ -1073,6 +1080,7 @@ impl WorkflowEngine {
             events_notify,
             detached_runners: std::sync::Mutex::new(HashMap::new()),
             next_runner_id: AtomicU64::new(0),
+            runners_stopping: std::sync::atomic::AtomicBool::new(false),
             wall_clock,
         })
     }
@@ -2158,7 +2166,11 @@ impl WorkflowEngine {
             return Ok(Err("the stage has no previous session".to_string()));
         };
         let end_reason = match session.end_reason {
-            Some(reason @ (SessionEndReason::Interrupted | SessionEndReason::Reaped)) => reason,
+            Some(
+                reason @ (SessionEndReason::Interrupted
+                | SessionEndReason::Reaped
+                | SessionEndReason::DaemonStopped),
+            ) => reason,
             Some(other) => {
                 return Ok(Err(format!(
                     "its turn ended '{other}', which is the agent's own failure rather than an \
@@ -2218,47 +2230,37 @@ impl WorkflowEngine {
         config_root::seed_builtin_workflows(&workflows_dir).map_err(InitWorkflowsError::Io)
     }
 
-    /// Claims an id for a detached `shell`/`poll` runner about to be
-    /// spawned for `task_id` (#69).
+    /// Spawns a detached runner and registers its handle so `cancel_task`
+    /// (and shutdown) can abort it. `make` receives the runner id the
+    /// future must pass to [`Self::finish_runner`] when it ends.
     ///
-    /// Reserved *before* `tokio::spawn`, not after, and that ordering is
-    /// the point: if the slot were only created once the handle existed, a
-    /// runner that finished in between would call [`Self::finish_runner`]
-    /// for an id not yet present, and the later insert would then leak an
-    /// entry for a task that has nothing running.
+    /// The flag check, the spawn and the registration all happen under the
+    /// `detached_runners` lock, so a runner is either refused (shutdown has
+    /// begun) or visible to `abort_all_detached_runners`; there is no
+    /// half-registered slot. Returns `false`, spawning nothing, once
+    /// shutdown has begun. The caller leaves the task where it is, and the
+    /// next start's park and poll sweeps recover it.
     ///
-    /// Callers must hold the task's `task_locks` entry across the
-    /// reserve/spawn/attach sequence — every one does today, since the only
-    /// callers are reached from `enter_stage`, which runs inside
-    /// `advance`/`start_task`'s guard. That is load-bearing rather than
-    /// incidental: `cancel_task` holds the same lock, so it cannot observe
-    /// a half-built slot. A runner spawned outside the lock could have its
-    /// reservation aborted (and dropped) between the reserve and the
-    /// attach, at which point the attach silently no-ops and the runner is
-    /// left with nothing able to stop it.
-    fn reserve_runner_slot(&self, task_id: &str) -> u64 {
-        let id = self.next_runner_id.fetch_add(1, Ordering::Relaxed);
-        self.detached_runners
-            .lock()
-            .expect("detached_runners mutex poisoned")
-            .entry(task_id.to_string())
-            .or_default()
-            .insert(id, None);
-        id
-    }
-
-    /// Fills in the handle for a slot [`Self::reserve_runner_slot`]
-    /// claimed. A slot that has already been removed means the runner
-    /// finished first, so there is deliberately nothing to do — inserting
-    /// it back would be the leak the reservation exists to avoid.
-    fn attach_runner_handle(&self, task_id: &str, id: u64, handle: JoinHandle<()>) {
+    /// Callers hold the task's `task_locks` entry, so `cancel_task` cannot
+    /// interleave.
+    fn spawn_registered_runner<F>(&self, task_id: &str, make: impl FnOnce(u64) -> F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let mut runners = self
             .detached_runners
             .lock()
             .expect("detached_runners mutex poisoned");
-        if let Some(slot) = runners.get_mut(task_id).and_then(|task| task.get_mut(&id)) {
-            *slot = Some(handle);
+        if self.runners_stopping.load(Ordering::SeqCst) {
+            return false;
         }
+        let id = self.next_runner_id.fetch_add(1, Ordering::Relaxed);
+        let handle = tokio::spawn(make(id));
+        runners
+            .entry(task_id.to_string())
+            .or_default()
+            .insert(id, Some(handle));
+        true
     }
 
     /// Drops a finished runner's slot, and the task's whole entry once its
@@ -2274,6 +2276,27 @@ impl WorkflowEngine {
             if task.is_empty() {
                 runners.remove(task_id);
             }
+        }
+    }
+
+    /// Aborts every detached runner of every task and waits until each
+    /// future is dropped (so each process-group guard has SIGKILLed its
+    /// group). Used at shutdown, before the daemon lock is released.
+    pub async fn abort_all_detached_runners(&self) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut runners = self
+                .detached_runners
+                .lock()
+                .expect("detached_runners mutex poisoned");
+            self.runners_stopping.store(true, Ordering::SeqCst);
+            runners
+                .drain()
+                .flat_map(|(_, task)| task.into_values().flatten())
+                .collect()
+        };
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
         }
     }
 
@@ -3161,24 +3184,29 @@ impl WorkflowEngine {
         // Registered so `cancel_task` can abort this runner and kill the
         // command it's running (#69) — a `shell` stage has no `session`,
         // so killing the task's agent session would not reach it.
-        let runner_id = self.reserve_runner_slot(&task_id);
         let registered_task_id = task_id.clone();
-        let handle = tokio::spawn(async move {
-            engine
-                .run_shell_stage(
-                    &task_id,
-                    &definition,
-                    &stage_name,
-                    command,
-                    capture,
-                    timeout,
-                    cwd,
-                    env,
-                )
-                .await;
-            engine.finish_runner(&task_id, runner_id);
-        });
-        self.attach_runner_handle(&registered_task_id, runner_id, handle);
+        let spawned =
+            self.spawn_registered_runner(&registered_task_id, move |runner_id| async move {
+                engine
+                    .run_shell_stage(
+                        &task_id,
+                        &definition,
+                        &stage_name,
+                        command,
+                        capture,
+                        timeout,
+                        cwd,
+                        env,
+                    )
+                    .await;
+                engine.finish_runner(&task_id, runner_id);
+            });
+        if !spawned {
+            tracing::warn!(
+                task_id = %registered_task_id,
+                "daemon is shutting down; shell stage not started, the next start recovers it"
+            );
+        }
     }
 
     /// Runs the command, records what it did on the task's timeline, and
@@ -3468,6 +3496,146 @@ impl WorkflowEngine {
         Ok(report)
     }
 
+    /// Startup sweep (#84): any `open` task sitting in an `agent_turn` or
+    /// `shell` stage lost its process when the previous daemon stopped, so
+    /// it is parked `stuck` (retry continues or re-runs it) rather than
+    /// left `open` forever. Must run before [`Self::resume_interrupted_polls`]:
+    /// a resumed poll can advance into an `agent_turn`, and that live turn
+    /// must not be parked.
+    ///
+    /// Shaped like the poll sweep: per task under its lock, every per-task
+    /// failure ends in `mark_stuck` naming it, and only a failure to list
+    /// the candidates is returned.
+    pub async fn park_interrupted_turns(self: &Arc<Self>) -> Result<ParkReport, sqlx::Error> {
+        let candidates = tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await?;
+        let mut report = ParkReport::default();
+        for task in candidates {
+            let lock = self.lock_for_task(&task.id).await;
+            {
+                let _guard = lock.lock().await;
+                self.park_interrupted_turn_locked(&task.id, &mut report)
+                    .await;
+            }
+            self.evict_task_lock_if_unshared(&task.id, &lock).await;
+        }
+        Ok(report)
+    }
+
+    async fn park_mark_stuck(&self, task_id: &str, reason: &str, report: &mut ParkReport) {
+        self.mark_stuck(task_id, reason, false).await;
+        report.stuck_other += 1;
+    }
+
+    /// The body of [`Self::park_interrupted_turns`] for one task; the caller
+    /// holds its per-task lock.
+    async fn park_interrupted_turn_locked(&self, task_id: &str, report: &mut ParkReport) {
+        let task = match tasks::get(&self.pool, task_id).await {
+            Ok(Some(task)) => task,
+            Ok(None) => return,
+            Err(err) => {
+                let reason = format!("restart sweep could not read the task: {err}");
+                self.park_mark_stuck(task_id, &reason, report).await;
+                return;
+            }
+        };
+        if task.status != TASK_STATUS_OPEN {
+            return;
+        }
+        let state = match workflow_state::get(&self.pool, task_id).await {
+            Ok(Some(state)) => state,
+            Ok(None) => return,
+            Err(err) => {
+                let reason =
+                    format!("restart sweep could not read the task's workflow state: {err}");
+                self.park_mark_stuck(task_id, &reason, report).await;
+                return;
+            }
+        };
+        let stage = state.current_stage.clone();
+        let definition = match self.load_task_workflow(&task).await {
+            Ok(definition) => definition,
+            Err(err) => {
+                let reason = format!(
+                    "the daemon restarted and could not load this task's workflow to check \
+                     whether stage '{stage}' was interrupted: {err}; fix the workflow file, \
+                     then retry"
+                );
+                self.park_mark_stuck(task_id, &reason, report).await;
+                return;
+            }
+        };
+        let Some(stage_def) = definition.stages.get(&stage) else {
+            let reason = format!("stage '{stage}' no longer exists in the task's workflow");
+            self.park_mark_stuck(task_id, &reason, report).await;
+            return;
+        };
+        match restart_effect(stage_def) {
+            RestartEffect::Survives => {}
+            RestartEffect::StrandsShell => {
+                self.mark_stuck(task_id, &shell_reason(&stage), false).await;
+                report.shells += 1;
+            }
+            RestartEffect::StrandsAgentTurn => {
+                let mut reason = agent_reason(&stage);
+                match sessions::get_current_for_stage(&self.pool, task_id, &stage).await {
+                    Ok(Some(session)) => {
+                        if let Err(err) =
+                            sessions::mark_daemon_stopped(&self.pool, &session.id).await
+                        {
+                            reason.push_str(&format!(
+                                "; the interrupted session could not be recorded ({err}), so \
+                                 retry will start the stage fresh"
+                            ));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => reason.push_str(&format!(
+                        "; the interrupted session could not be recorded ({err}), so retry \
+                         will start the stage fresh"
+                    )),
+                }
+                self.mark_stuck(task_id, &reason, false).await;
+                report.agent_turns += 1;
+            }
+        }
+    }
+
+    /// The `open` tasks a restart would strand right now (`GET /server`).
+    /// A workflow that cannot be loaded, or a stage it no longer has, is
+    /// listed with kind `"unknown"` rather than hidden.
+    pub async fn in_flight(&self) -> Result<Vec<InFlight>, sqlx::Error> {
+        let mut out = Vec::new();
+        for task in tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await? {
+            let Some(state) = workflow_state::get(&self.pool, &task.id).await? else {
+                continue;
+            };
+            let stage = state.current_stage;
+            let kind = match self.load_task_workflow(&task).await {
+                Ok(definition) => match definition.stages.get(&stage).map(restart_effect) {
+                    Some(RestartEffect::Survives) => continue,
+                    Some(RestartEffect::StrandsAgentTurn) => "agent_turn",
+                    Some(RestartEffect::StrandsShell) => "shell",
+                    None => "unknown",
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %err,
+                        "could not load the task's workflow; listing it as unknown in-flight"
+                    );
+                    "unknown"
+                }
+            };
+            out.push(InFlight {
+                task_id: task.id,
+                title: task.title,
+                stage,
+                kind: kind.to_string(),
+            });
+        }
+        Ok(out)
+    }
+
     async fn sweep_mark_stuck(&self, task_id: &str, reason: &str, report: &mut PollSweepReport) {
         self.mark_stuck(task_id, reason, false).await;
         report.stuck += 1;
@@ -3695,15 +3863,20 @@ impl WorkflowEngine {
         // interval until the deadline. The advisory `is_cancelled` check in
         // `run_poll_stage` only fires *between* attempts; this stops one
         // already in flight.
-        let runner_id = self.reserve_runner_slot(&task_id);
         let registered_task_id = task_id.clone();
-        let handle = tokio::spawn(async move {
-            engine
-                .run_poll_stage(&task_id, &definition, &stage_name, run)
-                .await;
-            engine.finish_runner(&task_id, runner_id);
-        });
-        self.attach_runner_handle(&registered_task_id, runner_id, handle);
+        let spawned =
+            self.spawn_registered_runner(&registered_task_id, move |runner_id| async move {
+                engine
+                    .run_poll_stage(&task_id, &definition, &stage_name, run)
+                    .await;
+                engine.finish_runner(&task_id, runner_id);
+            });
+        if !spawned {
+            tracing::warn!(
+                task_id = %registered_task_id,
+                "daemon is shutting down; poll stage not started, the next start recovers it"
+            );
+        }
     }
 
     /// Runs the command on `interval` until an outcome matches or the
@@ -4611,6 +4784,20 @@ impl WorkflowEngine {
                                 ),
                                 false,
                             )
+                            .await;
+                        return;
+                    }
+                    // #84: the daemon stopped under this turn (graceful
+                    // shutdown records it itself; the startup park sweep
+                    // records it after a crash). Whatever the status.
+                    Ok(Some(run)) if run.end_reason == Some(SessionEndReason::DaemonStopped) => {
+                        tracing::warn!(
+                            task_id,
+                            session_id,
+                            "the daemon stopped during this turn; not auto-advancing"
+                        );
+                        engine
+                            .mark_stuck(&task_id, &agent_reason(&stage_name), false)
                             .await;
                         return;
                     }
@@ -5929,6 +6116,59 @@ fn poll_window_for(payload: &Value, current_stage: &str) -> Result<Option<PollWi
 /// What is left of a wall-clock budget; `ZERO` once the deadline passed.
 fn remaining_budget(deadline: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
     (deadline - now).to_std().unwrap_or(Duration::ZERO)
+}
+
+/// Whether a stage's work survives a daemon restart. The one place this is
+/// decided: the startup park sweep and `GET /server`'s `in_flight` both use
+/// it, so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartEffect {
+    /// Waiting state lives in the database (or the stage is standing), so a
+    /// restart loses nothing.
+    Survives,
+    /// A single-shot agent turn: its process dies with the daemon.
+    StrandsAgentTurn,
+    /// A shell command: its process dies with the daemon.
+    StrandsShell,
+}
+
+/// Exhaustive on purpose: a new stage kind must be classified here to
+/// compile.
+pub fn restart_effect(def: &StageDef) -> RestartEffect {
+    match &def.kind {
+        // Standing (chat) sessions resume by message instead.
+        StageKind::AgentTurn { .. } if def.on.is_empty() => RestartEffect::Survives,
+        StageKind::AgentTurn { .. } => RestartEffect::StrandsAgentTurn,
+        StageKind::Shell { .. } => RestartEffect::StrandsShell,
+        StageKind::Poll { .. } | StageKind::HumanGate { .. } | StageKind::Terminal => {
+            RestartEffect::Survives
+        }
+    }
+}
+
+fn agent_reason(stage: &str) -> String {
+    format!(
+        "stage '{stage}' was running an agent turn when the daemon stopped; 'choco task retry' \
+         continues it, resuming the agent's session when it can"
+    )
+}
+
+fn shell_reason(stage: &str) -> String {
+    format!(
+        "stage '{stage}' was running a shell command when the daemon stopped; 'choco task retry' \
+         runs it again from the start"
+    )
+}
+
+/// What [`WorkflowEngine::park_interrupted_turns`] did, per task.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ParkReport {
+    /// Single-shot agent turns parked as stuck.
+    pub agent_turns: usize,
+    /// Shell stages parked as stuck.
+    pub shells: usize,
+    /// Tasks parked because the sweep could not classify them.
+    pub stuck_other: usize,
 }
 
 /// What [`WorkflowEngine::resume_interrupted_polls`] did, per task.
@@ -16172,5 +16412,579 @@ stages:
         let events = poll_events(&pool, &task_id).await;
         let tails: Vec<_> = events.iter().map(|e| e["stdout_tail"].clone()).collect();
         assert_eq!(tails, vec![json!("PENDING T"), json!("SUCCESS T")]);
+    }
+
+    // ---- #84: the startup park sweep, restart_effect and in_flight ----
+
+    const CHAT_FLOW: &str = r#"
+name: chat-flow
+roles:
+  chat:
+    cli: claude
+    model: sonnet
+stages:
+  chatting:
+    kind: agent_turn
+    role: chat
+    on: {}
+"#;
+
+    const MIXED_FLOW: &str = r#"
+name: mixed-flow
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  turn:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: { done: finished }
+  sh:
+    kind: shell
+    command: "true"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+
+    async fn open_task_at(
+        pool: &SqlitePool,
+        project_id: &str,
+        workflow: &str,
+        dir: &Path,
+        stage: &str,
+    ) -> String {
+        let id = seed_in_project(pool, project_id, workflow, dir).await;
+        seed_row(pool, &id, stage, json!({})).await;
+        id
+    }
+
+    /// A session as a crashed daemon leaves it: `idle`, with a session to
+    /// resume and no end reason.
+    async fn crashed_session(pool: &SqlitePool, task_id: &str, stage: &str) -> Session {
+        let run = sessions::create(
+            pool,
+            sessions::NewSession {
+                task_id,
+                stage,
+                role: "coder",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap();
+        sessions::set_adapter_session_id(pool, &run.id, "adapter-sess-1")
+            .await
+            .unwrap();
+        sessions::update_status(pool, &run.id, SessionStatus::Idle, None, None)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn restart_effect_classifies_every_stage_kind() {
+        let dir = tempdir();
+        std::fs::write(dir.join("coder-turn.md"), "x").unwrap();
+        let polls = write_poll_flow(&dir, "poll-flow", "echo PENDING", Some("1h"), false);
+        let mixed = WorkflowDefinition::parse(MIXED_FLOW, &dir).unwrap();
+        let chat = WorkflowDefinition::parse(CHAT_FLOW, &dir).unwrap();
+        assert_eq!(
+            restart_effect(&mixed.stages["turn"]),
+            RestartEffect::StrandsAgentTurn
+        );
+        assert_eq!(
+            restart_effect(&mixed.stages["sh"]),
+            RestartEffect::StrandsShell
+        );
+        assert_eq!(
+            restart_effect(&mixed.stages["finished"]),
+            RestartEffect::Survives
+        );
+        assert_eq!(
+            restart_effect(&chat.stages["chatting"]),
+            RestartEffect::Survives
+        );
+        assert_eq!(
+            restart_effect(&polls.stages["watch"]),
+            RestartEffect::Survives
+        );
+        assert_eq!(
+            restart_effect(&polls.stages["gate"]),
+            RestartEffect::Survives
+        );
+    }
+
+    #[tokio::test]
+    async fn parking_an_interrupted_agent_turn_records_the_session_and_retry_resumes_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "coding").await;
+        let crashed = crashed_session(&pool, &task_id, "coding").await;
+
+        let resumed_binary = named_script_binary(
+            &dir,
+            "fake-claude-resumed",
+            json!([
+                {"op": "echo_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &resumed_binary, &dir);
+        let report = engine.park_interrupted_turns().await.unwrap();
+        assert_eq!(
+            report,
+            ParkReport {
+                agent_turns: 1,
+                shells: 0,
+                stuck_other: 0
+            }
+        );
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        assert_eq!(
+            task.stuck_reason.as_deref(),
+            Some(agent_reason("coding").as_str())
+        );
+        assert_eq!(
+            task.stuck_reason.unwrap(),
+            "stage 'coding' was running an agent turn when the daemon stopped; 'choco task \
+             retry' continues it, resuming the agent's session when it can"
+        );
+        let stuck_events = events::list_for_task(&pool, &task_id).await.unwrap();
+        assert!(
+            stuck_events
+                .iter()
+                .any(|e| e.event_type == EventType::Error && e.payload["stuck"] == json!(true)),
+            "expected a stuck event: {stuck_events:?}"
+        );
+        let parked = sessions::get(&pool, &crashed.id).await.unwrap().unwrap();
+        assert_eq!(parked.status, SessionStatus::Exited);
+        assert_eq!(parked.end_reason, Some(SessionEndReason::DaemonStopped));
+
+        let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        assert!(outcome.resumed, "{outcome:?}");
+        assert_eq!(
+            outcome.adapter_session_id.as_deref(),
+            Some("adapter-sess-1")
+        );
+        wait_until_task_status(&pool, &task_id, "closed").await;
+        let resumed_run = run_after(&pool, &task_id, "coding", &crashed).await;
+        assert_eq!(
+            resumed_run.resumed_from.as_deref(),
+            Some(crashed.id.as_str())
+        );
+        assert_eq!(
+            resumed_run.adapter_session_id.as_deref(),
+            Some("adapter-sess-1")
+        );
+        let echoed = events::list_for_session(&pool, &resumed_run.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.payload["text"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            echoed.contains("the daemon was stopped or restarted while you were working"),
+            "{echoed}"
+        );
+    }
+
+    /// When the session cannot be recorded, the reason says so and retry
+    /// really does start the stage fresh.
+    #[tokio::test]
+    async fn parking_says_so_when_the_interrupted_session_cannot_be_recorded() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "coding").await;
+        let crashed = crashed_session(&pool, &task_id, "coding").await;
+        sqlx::query(
+            "CREATE TRIGGER block_daemon_stopped BEFORE UPDATE ON sessions \
+             WHEN NEW.end_reason = 'daemon_stopped' \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fresh_binary = named_script_binary(
+            &dir,
+            "fake-claude-fresh",
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &fresh_binary, &dir);
+        let report = engine.park_interrupted_turns().await.unwrap();
+        assert_eq!(report.agent_turns, 1);
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        let reason = task.stuck_reason.unwrap();
+        assert!(reason.starts_with(&agent_reason("coding")), "{reason}");
+        assert!(
+            reason.contains("the interrupted session could not be recorded")
+                && reason.contains("injected")
+                && reason.ends_with("so retry will start the stage fresh"),
+            "{reason}"
+        );
+        let session = sessions::get(&pool, &crashed.id).await.unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.end_reason, None);
+
+        let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        assert!(!outcome.resumed, "{outcome:?}");
+    }
+
+    /// Shutdown must kill a running shell stage's whole process group
+    /// before the daemon lock is released.
+    #[tokio::test]
+    async fn abort_all_detached_runners_kills_running_shell_groups() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let gc = dir.join("gc");
+        let yaml = format!(
+            r#"
+name: hang-flow
+stages:
+  run:
+    kind: shell
+    command: "sleep 600 & echo $! > {}; wait"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+            gc.display()
+        );
+        std::fs::write(dir.join("hang-flow.yaml"), &yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "run").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        // The row is already at `run`, as after a crash; parking then
+        // retrying starts the shell runner.
+        engine.park_interrupted_turns().await.unwrap();
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+
+        let pid: u32 = crate::test_support::wait_until("the grandchild pid file", || async {
+            std::fs::read_to_string(&gc)
+                .map_err(|e| e.to_string())
+                .and_then(|s| s.trim().parse().map_err(|e| format!("{e}")))
+        })
+        .await;
+        assert!(process_alive(pid));
+
+        engine.abort_all_detached_runners().await;
+        assert!(engine.detached_runners.lock().unwrap().is_empty());
+        crate::test_support::wait_until("the grandchild to die", || async {
+            if process_alive(pid) {
+                Err("still alive".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+    }
+
+    /// Once shutdown has begun no new runner may start: the command never
+    /// runs, and the task stays where it was for the next start's sweeps.
+    #[tokio::test]
+    async fn runner_spawn_after_shutdown_is_refused() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let gc = dir.join("gc");
+        let yaml = format!(
+            r#"
+name: hang-flow
+stages:
+  run:
+    kind: shell
+    command: "sleep 600 & echo $! > {}; wait"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+            gc.display()
+        );
+        std::fs::write(dir.join("hang-flow.yaml"), &yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "run").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.abort_all_detached_runners().await;
+
+        // The helper itself refuses, and never invokes the future factory.
+        let called = std::sync::atomic::AtomicBool::new(false);
+        assert!(!engine.spawn_registered_runner("t", |_| {
+            called.store(true, Ordering::SeqCst);
+            async {}
+        }));
+        assert!(!called.load(Ordering::SeqCst));
+
+        // And end to end: retry enters the shell stage, nothing runs.
+        engine.park_interrupted_turns().await.unwrap();
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(!gc.exists(), "the shell command must never have started");
+        assert!(engine.detached_runners.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parking_a_shell_stage_lets_retry_rerun_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let marker = dir.join("marker");
+        let def = write_marker_shell_workflow(&dir, &marker);
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "run").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+        let report = engine.park_interrupted_turns().await.unwrap();
+        assert_eq!(
+            report,
+            ParkReport {
+                agent_turns: 0,
+                shells: 1,
+                stuck_other: 0
+            }
+        );
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        assert_eq!(
+            task.stuck_reason.unwrap(),
+            "stage 'run' was running a shell command when the daemon stopped; 'choco task \
+             retry' runs it again from the start"
+        );
+
+        std::fs::write(&marker, "").unwrap();
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "closed").await;
+    }
+
+    #[tokio::test]
+    async fn the_park_sweep_leaves_everything_else_alone() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        write_poll_flow(&dir, "poll-flow", "echo PENDING", Some("1h"), false);
+        std::fs::write(dir.join("chat-flow.yaml"), CHAT_FLOW).unwrap();
+        let def = coding_workflow(&dir);
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+
+        let mut untouched = vec![];
+        for (flow, stage) in [
+            ("poll-flow", "watch"),
+            ("poll-flow", "gate"),
+            ("chat-flow", "chatting"),
+        ] {
+            let id = open_task_at(&pool, &project_id, flow, &dir, stage).await;
+            untouched.push((id, "open"));
+        }
+        for status in ["stuck", "closed", "cancelled"] {
+            let id = open_task_at(&pool, &project_id, &def.name, &dir, "coding").await;
+            if status == "stuck" {
+                tasks::mark_stuck(&pool, &id, "because").await.unwrap();
+            } else {
+                tasks::update_status(&pool, &id, status).await.unwrap();
+            }
+            untouched.push((id, status));
+        }
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let report = engine.park_interrupted_turns().await.unwrap();
+        assert_eq!(report, ParkReport::default());
+        for (id, status) in untouched {
+            assert_eq!(
+                tasks::get(&pool, &id).await.unwrap().unwrap().status,
+                status
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_park_sweep_names_what_it_could_not_check() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+
+        let unloadable = open_task_at(&pool, &project_id, "vanished-flow", &dir, "coding").await;
+        let missing_stage = open_task_at(&pool, &project_id, &def.name, &dir, "ghost").await;
+        let no_session = open_task_at(&pool, &project_id, &def.name, &dir, "coding").await;
+
+        let fresh_binary = named_script_binary(
+            &dir,
+            "fake-claude-fresh",
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &fresh_binary, &dir);
+        let report = engine.park_interrupted_turns().await.unwrap();
+        assert_eq!(
+            report,
+            ParkReport {
+                agent_turns: 1,
+                shells: 0,
+                stuck_other: 2
+            }
+        );
+
+        let reason = |id: &str| {
+            let pool = pool.clone();
+            let id = id.to_string();
+            async move {
+                let task = tasks::get(&pool, &id).await.unwrap().unwrap();
+                assert_eq!(task.status, "stuck");
+                task.stuck_reason.unwrap()
+            }
+        };
+        let r = reason(&unloadable).await;
+        assert!(
+            r.starts_with(
+                "the daemon restarted and could not load this task's workflow to check whether \
+                 stage 'coding' was interrupted: "
+            ) && r.ends_with("; fix the workflow file, then retry"),
+            "{r}"
+        );
+        assert_eq!(
+            reason(&missing_stage).await,
+            "stage 'ghost' no longer exists in the task's workflow"
+        );
+        assert_eq!(reason(&no_session).await, agent_reason("coding"));
+
+        // No session to resume: retry starts the stage fresh.
+        let outcome = engine
+            .retry_task(&no_session, RetryMode::Auto)
+            .await
+            .unwrap();
+        assert!(
+            !outcome.resumed && outcome.fresh_reason.is_some(),
+            "{outcome:?}"
+        );
+        wait_until_task_status(&pool, &no_session, "closed").await;
+    }
+
+    /// A single-shot session that ends `daemon_stopped` while its process
+    /// is still being watched parks the task rather than advancing it. Run
+    /// through the real shutdown path.
+    #[tokio::test]
+    async fn the_watcher_parks_a_turn_that_ended_daemon_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let wrapper = dir.join("fake-claude-spawns-child");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nCHOCO_TEST_HEARTBEAT='{}' CHOCO_TEST_CHILD_PID='{}' exec '{}' \"$@\"\n",
+                dir.join("heartbeat").display(),
+                dir.join("child.pid").display(),
+                fixture_binary("fake_claude_spawns_child.py"),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let events_notify = Arc::new(Notify::new());
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::with_binary(wrapper.display().to_string()));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::clone(&events_notify),
+        );
+        let engine = WorkflowEngine::new(
+            pool.clone(),
+            Arc::clone(&manager),
+            dir.to_path_buf(),
+            None,
+            events_notify,
+        );
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        let run = crate::test_support::wait_until("the turn's session", || async {
+            match runs_for_stage(&pool, &task_id, "coding").await.pop() {
+                Some(run) if run.adapter_session_id.is_some() => Ok(run),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+
+        manager.shutdown(Duration::from_secs(10)).await;
+
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.stuck_reason.unwrap(), agent_reason("coding"));
+        assert_eq!(
+            workflow_state::get(&pool, &task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_stage,
+            "coding"
+        );
+        let ended = sessions::get(&pool, &run.id).await.unwrap().unwrap();
+        assert_eq!(ended.end_reason, Some(SessionEndReason::DaemonStopped));
+    }
+
+    #[tokio::test]
+    async fn in_flight_lists_only_what_a_restart_would_strand() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(dir.join("coder-turn.md"), "x").unwrap();
+        std::fs::write(dir.join("mixed-flow.yaml"), MIXED_FLOW).unwrap();
+        std::fs::write(dir.join("chat-flow.yaml"), CHAT_FLOW).unwrap();
+        write_poll_flow(&dir, "poll-flow", "echo PENDING", Some("1h"), false);
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+
+        let turn = open_task_at(&pool, &project_id, "mixed-flow", &dir, "turn").await;
+        let sh = open_task_at(&pool, &project_id, "mixed-flow", &dir, "sh").await;
+        let unloadable = open_task_at(&pool, &project_id, "vanished-flow", &dir, "turn").await;
+        let missing = open_task_at(&pool, &project_id, "mixed-flow", &dir, "ghost").await;
+        for (flow, stage) in [
+            ("poll-flow", "watch"),
+            ("poll-flow", "gate"),
+            ("chat-flow", "chatting"),
+        ] {
+            open_task_at(&pool, &project_id, flow, &dir, stage).await;
+        }
+        let closed = open_task_at(&pool, &project_id, "mixed-flow", &dir, "turn").await;
+        tasks::update_status(&pool, &closed, "closed")
+            .await
+            .unwrap();
+
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let mut listed: Vec<(String, String, String)> = engine
+            .in_flight()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.task_id, f.stage, f.kind))
+            .collect();
+        listed.sort();
+        let mut expected = vec![
+            (turn, "turn".to_string(), "agent_turn".to_string()),
+            (sh, "sh".to_string(), "shell".to_string()),
+            (unloadable, "turn".to_string(), "unknown".to_string()),
+            (missing, "ghost".to_string(), "unknown".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(listed, expected);
     }
 }

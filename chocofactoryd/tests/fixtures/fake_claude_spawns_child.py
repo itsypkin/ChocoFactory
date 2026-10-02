@@ -16,6 +16,9 @@ Requires `CHOCO_TEST_HEARTBEAT` (a path the grandchild writes) and
 `CHOCO_TEST_CHILD_PID` (a path this process writes the grandchild's pid
 to). Both are per-test temp paths rather than fixed names so tests running
 in parallel can't collide.
+
+Optionally, `CHOCO_TEST_AGENT_PID` names a path this process writes its own
+pid to, so a test can assert the agent itself is gone and not only its child.
 """
 import json
 import os
@@ -53,6 +56,12 @@ def main():
     with open(child_pid_path, "w") as f:
         f.write(str(child.pid))
         f.flush()
+
+    agent_pid_path = os.environ.get("CHOCO_TEST_AGENT_PID")
+    if agent_pid_path:
+        with open(agent_pid_path, "w") as f:
+            f.write(str(os.getpid()))
+            f.flush()
 
     emit({"type": "system", "subtype": "init", "session_id": session_id})
     emit(
