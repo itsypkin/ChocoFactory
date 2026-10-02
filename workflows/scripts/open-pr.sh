@@ -51,6 +51,97 @@ strip_markers() {
         }'
 }
 
+# Rewrites every GitHub issue reference that follows a closing keyword, so
+# that agent text can never close an issue (#131). The rule: a PR body choco
+# writes has exactly one authoritative issue line, the one built from the task
+# title; no agent-written text may form "closing keyword + issue reference".
+# Why: merging PR #127 closed #84, because the reviewer's report said
+# "no Closes/Fixes/Resolves #84" and GitHub's parser ignores negation, slash
+# lists and the <details> fold.
+#
+# The reference is rewritten, not the keyword and not with an invisible
+# character: `Resolves #84` -> `Resolves issue 84`, `Closes o/r#3` ->
+# `Closes o/r issue 3`, an issue URL -> `o/r issue N`. With no reference
+# after the keyword nothing can close, whatever the parser does with spacing
+# or punctuation; zero-width characters can't be verified and would poison
+# copied text. Only the first reference after a keyword is rewritten (the
+# only one GitHub closes), and a reference at the start of the next line is
+# rewritten when a line ends with a keyword. Bare references stay links.
+# Code blocks and inline code are rewritten too, deliberately: GitHub doesn't
+# document whether it skips code, agent text quotes commit messages where
+# `Fixes #N` lives, and a cosmetic edit costs far less than a closed issue.
+# Everything else passes byte for byte. Keywords are matched ASCII-only
+# (the script runs with LC_ALL=C). Callers must not hide a failure of this
+# filter behind a pipe: an awk error would publish an empty section.
+neutralize_closing_refs() {
+    awk '
+        BEGIN {
+            KW = "[^A-Za-z0-9_](closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve)"
+            URLRE = "^(https?://)?(www\\.)?github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[0-9]+"
+            pending = 0
+        }
+        # Length of the issue reference at index j of t (0 if none); sets REPL.
+        function refat(t, tl, j,    u, ul, n, s, i, a, rest, p) {
+            u = substr(t, j); ul = substr(tl, j)
+            if (match(u, /^#[0-9]+/)) {
+                REPL = "issue " substr(u, 2, RLENGTH - 1)
+                return RLENGTH
+            }
+            if (match(ul, URLRE)) {
+                n = RLENGTH
+                s = substr(u, 1, n)
+                i = index(tolower(s), "github.com/")
+                split(substr(s, i + 11), a, "/")
+                REPL = a[1] "/" a[2] " issue " a[4]
+                rest = substr(u, n + 1)
+                if (substr(rest, 1, 1) == "/") { n++; rest = substr(rest, 2) }
+                if (match(rest, /^[#?][^ \t\r]*/)) n += RLENGTH
+                return n
+            }
+            if (match(u, /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[0-9]+/)) {
+                n = RLENGTH
+                s = substr(u, 1, n)
+                p = index(s, "#")
+                REPL = substr(s, 1, p - 1) " issue " substr(s, p + 1)
+                return n
+            }
+            return 0
+        }
+        function neutralize(line,    t, tl, pos, op, out, s, e, c, j, k) {
+            # t has a leading sentinel space so a keyword at the start of the
+            # line has a non-word character before it.
+            t = " " line; tl = tolower(t); pos = 1; op = 2; out = ""
+            if (pending) {
+                pending = 0
+                j = 2
+                while (substr(t, j, 1) ~ /[ \t]/) j++
+                k = refat(t, tl, j)
+                if (k > 0) { out = substr(t, op, j - op) REPL; op = j + k; pos = j + k - 1 }
+            }
+            while (1) {
+                s = substr(tl, pos)
+                if (!match(s, KW)) break
+                e = pos + RSTART + RLENGTH - 2
+                c = substr(tl, e + 1, 1)
+                if (c ~ /[a-z0-9_]/) { pos = e; continue }
+                j = e + 1
+                if (substr(t, j, 1) == ":") j++
+                while (substr(t, j, 1) ~ /[ \t]/) j++
+                k = refat(t, tl, j)
+                if (k > 0) {
+                    out = out substr(t, op, j - op) REPL
+                    op = j + k
+                    pos = j + k - 1
+                } else {
+                    if (substr(t, j) ~ /^\r*$/) pending = 1
+                    pos = e
+                }
+            }
+            return out substr(t, op)
+        }
+        { print neutralize($0) }'
+}
+
 # Reads stdin, writes at most $1 bytes of it, never ending in the middle of
 # a UTF-8 character: it drops any trailing continuation bytes (\200-\277)
 # and then one lead byte (\300-\367). Dropping one whole trailing character
@@ -70,10 +161,15 @@ utf8_head() {
 }
 
 # Passes stdin through if it is at most $1 bytes; otherwise outputs the
-# first $1 bytes (cut at a character boundary) and a line saying so.
+# first $1 bytes (cut at a character boundary) and a line saying so. An
+# optional $2 is the real size of text that was cut before it got here: it
+# is then reported as the total, and the truncation line is always printed.
 cap() {
     cat > "$TMP/cap-in"
     total=$(wc -c < "$TMP/cap-in" | tr -d ' ')
+    if [ -n "${2:-}" ]; then
+        total=$2
+    fi
     if [ "$total" -le "$1" ]; then
         cat "$TMP/cap-in"
         return 0
@@ -82,6 +178,19 @@ cap() {
     kept=$(wc -c < "$TMP/cap-out" | tr -d ' ')
     cat "$TMP/cap-out"
     printf '\n[truncated: %s of %s bytes shown]\n' "$kept" "$total"
+}
+
+# Copies the first $1 bytes of file $2 to file $3. Writes "$3.cut": the real
+# size of $2 if it was longer than $1, otherwise empty. The caller hands that
+# to cap, so a cut is never silent and the reported total is the real one.
+bound_input() {
+    head -c "$1" "$2" > "$3"
+    size=$(wc -c < "$2" | tr -d ' ')
+    if [ "$size" -gt "$1" ]; then
+        printf '%s' "$size" > "$3.cut"
+    else
+        : > "$3.cut"
+    fi
 }
 
 # Replaces the generated block in $1 (the PR's current body) with $2 (the
@@ -157,7 +266,14 @@ DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
     printf '%s\n' "$ISSUE_LINE"
     printf '\n'
     if [ -f "$DESC" ] && grep -q '[^[:space:]]' "$DESC"; then
-        strip_markers < "$DESC" | cap 16384
+        # Stepwise through files, not one pipe: a pipe's status is its last
+        # command's, so a failing filter would publish an empty section.
+        # The filter's cost grows with line length, so bound its input first
+        # (4x the cap; the cap still decides what is published).
+        strip_markers < "$DESC" > "$TMP/desc-0"
+        bound_input 65536 "$TMP/desc-0" "$TMP/desc-1"
+        neutralize_closing_refs < "$TMP/desc-1" > "$TMP/desc-2"
+        cap 16384 "$(cat "$TMP/desc-1.cut")" < "$TMP/desc-2"
     else
         printf '%s\n' '> **The coder wrote no description for this PR.** The internal review below and the commits are the record of what changed.'
         note "no PR description at $DESC"
@@ -171,7 +287,10 @@ DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
         printf '%s\n' '<details>'
         printf '%s\n' '<summary>Internal reviewer'"'"'s report</summary>'
         printf '\n'
-        printf '%s\n' "$PR_REVIEW_REPORT" | strip_markers | cap 40960
+        printf '%s\n' "$PR_REVIEW_REPORT" | strip_markers > "$TMP/rep-0"
+        bound_input 163840 "$TMP/rep-0" "$TMP/rep-1"
+        neutralize_closing_refs < "$TMP/rep-1" > "$TMP/rep-2"
+        cap 40960 "$(cat "$TMP/rep-1.cut")" < "$TMP/rep-2"
         printf '\n'
         printf '%s\n' '</details>'
     else
