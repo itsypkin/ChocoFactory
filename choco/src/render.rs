@@ -662,8 +662,180 @@ fn one_line(text: &str) -> String {
     }
 }
 
+/// `3h12m`, `5m`, `42s`: how long the daemon has been up.
+fn uptime(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (d, h, m) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// `choco server status`'s human output (#84): one line per item, then any
+/// warnings.
+pub fn server_status(
+    s: &chocofactory_core::models::ServerStatus,
+    log: &std::path::Path,
+    now: DateTime<Utc>,
+) -> String {
+    use chocofactory_core::version::{VERSION, long_version};
+    let commit = |c: Option<&str>| c.unwrap_or("dev build").to_string();
+    let mut out = vec![
+        format!(
+            "chocofactoryd {} ({})  running  pid {}  port {}  up {}",
+            s.version,
+            commit(s.commit.as_deref()),
+            s.pid,
+            s.port,
+            uptime((now - s.started_at).num_seconds())
+        ),
+        format!("choco         {}", long_version()),
+        format!("binary        {}", s.exe),
+        format!("agents' choco {}", s.choco_binary),
+    ];
+    let tasks: Vec<String> = s
+        .tasks
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(status, n)| format!("{n} {status}"))
+        .collect();
+    out.push(format!(
+        "tasks         {}",
+        if tasks.is_empty() {
+            "none".to_string()
+        } else {
+            tasks.join(", ")
+        }
+    ));
+    if s.in_flight.is_empty() {
+        out.push("in flight     none".to_string());
+    } else {
+        for f in &s.in_flight {
+            out.push(format!(
+                "in flight     {}  {} ({})  {}",
+                f.task_id,
+                f.stage,
+                f.kind,
+                single_line(&f.title)
+            ));
+        }
+    }
+    out.push(format!("log           {}", log.display()));
+    if s.version != VERSION {
+        out.push(format!(
+            "warning: choco {VERSION} is talking to chocofactoryd {}; run `choco server restart` (or `choco update`)",
+            s.version
+        ));
+    }
+    if s.exe_replaced == Some(true) {
+        out.push("warning: the chocofactoryd binary changed on disk since this daemon started; `choco server restart` picks it up".to_string());
+    }
+    if !s.choco_binary_found {
+        out.push(format!(
+            "warning: agents' report_outcome tool will not work: {} not found",
+            s.choco_binary
+        ));
+    }
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn sample_status() -> chocofactory_core::models::ServerStatus {
+        use chocofactory_core::models::{InFlight, ServerStatus};
+        let now = Utc::now();
+        ServerStatus {
+            version: "0.0.0".into(),
+            commit: Some("abc1234".into()),
+            pid: 42,
+            port: 4141,
+            started_at: now - chrono::Duration::seconds(3 * 3600 + 12 * 60),
+            config_root: "/root".into(),
+            exe: "/bin/chocofactoryd".into(),
+            exe_replaced: Some(true),
+            choco_binary: "/bin/choco".into(),
+            choco_binary_found: false,
+            tasks: [
+                ("open".to_string(), 2),
+                ("stuck".to_string(), 1),
+                ("done".to_string(), 0),
+            ]
+            .into_iter()
+            .collect(),
+            in_flight: vec![
+                InFlight {
+                    task_id: "t1".into(),
+                    title: "two\nlines".into(),
+                    stage: "work".into(),
+                    kind: "agent_turn".into(),
+                },
+                InFlight {
+                    task_id: "t2".into(),
+                    title: "x".into(),
+                    stage: "build".into(),
+                    kind: "shell".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn server_status_renders_items_and_warnings() {
+        let s = sample_status();
+        let out = server_status(
+            &s,
+            std::path::Path::new("/log"),
+            s.started_at + chrono::Duration::seconds(3 * 3600 + 12 * 60),
+        );
+        assert!(
+            out.contains("chocofactoryd 0.0.0 (abc1234)  running  pid 42  port 4141  up 3h12m"),
+            "{out}"
+        );
+        assert!(out.contains("tasks         2 open, 1 stuck"), "{out}");
+        assert!(
+            out.contains("in flight     t1  work (agent_turn)  two lines"),
+            "{out}"
+        );
+        assert!(out.contains("in flight     t2  build (shell)  x"), "{out}");
+        assert!(out.contains("log           /log"), "{out}");
+        assert!(out.contains("warning: choco "), "{out}");
+        assert!(out.contains("binary changed on disk"), "{out}");
+        assert!(
+            out.contains("report_outcome tool will not work: /bin/choco not found"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn server_status_quiet_case_has_no_warnings() {
+        let mut s = sample_status();
+        s.version = chocofactory_core::version::VERSION.to_string();
+        s.exe_replaced = Some(false);
+        s.choco_binary_found = true;
+        s.tasks.clear();
+        s.in_flight.clear();
+        let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
+        assert!(!out.contains("warning:"), "{out}");
+        assert!(out.contains("tasks         none"), "{out}");
+        assert!(out.contains("in flight     none"), "{out}");
+    }
+
+    #[test]
+    fn uptime_units() {
+        assert_eq!(uptime(5), "5s");
+        assert_eq!(uptime(125), "2m");
+        assert_eq!(uptime(3700), "1h1m");
+        assert_eq!(uptime(90000), "1d1h");
+        assert_eq!(uptime(-3), "0s");
+    }
 
     #[test]
     fn retried_says_whether_the_session_was_resumed() {
@@ -700,8 +872,6 @@ mod tests {
         );
     }
     use serde_json::json;
-
-    use super::*;
 
     /// One `stage_entered` event per entry, shaped as the daemon serializes
     /// them, with the hop arrow reconstructed from consecutive entries.

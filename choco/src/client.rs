@@ -5,6 +5,8 @@
 //! be backwards coupling.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use chocofactory_core::models::{Event, Project, RetryMode, RetryOutcome, Task};
 use serde::{Deserialize, Serialize};
@@ -318,6 +320,8 @@ pub struct RoleOverrides<'a> {
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
+    /// Set once the first response has been inspected for version skew.
+    version_checked: AtomicBool,
 }
 
 impl Client {
@@ -325,6 +329,51 @@ impl Client {
         Client {
             http: reqwest::Client::new(),
             base_url,
+            version_checked: AtomicBool::new(false),
+        }
+    }
+
+    /// Marks the skew check as done, for callers that report skew themselves.
+    pub fn without_version_check(self) -> Self {
+        self.version_checked.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// `GET /server`, with a caller-chosen timeout.
+    pub async fn server_status(
+        &self,
+        timeout: Duration,
+    ) -> Result<chocofactory_core::models::ServerStatus, ClientError> {
+        let resp = self
+            .send(
+                self.http
+                    .get(format!("{}/server", self.base_url))
+                    .timeout(timeout),
+            )
+            .await?;
+        let resp = self.check_status(resp).await?;
+        self.decode(resp).await
+    }
+
+    /// Warns once on stderr when the daemon's version differs from this
+    /// binary's. Never fails and never touches stdout.
+    fn check_version(&self, resp: &reqwest::Response) {
+        if self.version_checked.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let ours = chocofactory_core::version::VERSION;
+        match resp.headers().get("x-chocofactory-version") {
+            Some(theirs) => {
+                let theirs = String::from_utf8_lossy(theirs.as_bytes());
+                if theirs != ours {
+                    eprintln!(
+                        "warning: choco {ours} is talking to chocofactoryd {theirs}; run `choco server restart` (or `choco update`)"
+                    );
+                }
+            }
+            None => eprintln!(
+                "warning: chocofactoryd doesn't report a version (it predates choco {ours}); restart it"
+            ),
         }
     }
 
@@ -332,10 +381,12 @@ impl Client {
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, ClientError> {
-        builder.send().await.map_err(|err| ClientError::Connect {
+        let resp = builder.send().await.map_err(|err| ClientError::Connect {
             base_url: self.base_url.clone(),
             source: err.to_string(),
-        })
+        })?;
+        self.check_version(&resp);
+        Ok(resp)
     }
 
     /// Turns a non-2xx response into `ClientError::Api`, extracting the

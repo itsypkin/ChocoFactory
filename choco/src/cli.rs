@@ -67,10 +67,11 @@ impl fmt::Display for Until {
 #[derive(Parser)]
 #[command(name = "choco", about = "HTTP client for chocofactoryd")]
 pub struct Cli {
-    /// Base URL of a running `chocofactoryd`. Falls back to `CHOCO_BASE_URL`,
-    /// then `http://127.0.0.1:4141` (the daemon's default port).
-    #[arg(long, env = "CHOCO_BASE_URL", default_value = "http://127.0.0.1:4141")]
-    pub base_url: String,
+    /// Base URL of a running `chocofactoryd`. Also read from `CHOCO_BASE_URL`.
+    /// Defaults to the running daemon's port from its lock file, else
+    /// `http://127.0.0.1:4141`. Ignored by `server` commands.
+    #[arg(long, env = "CHOCO_BASE_URL")]
+    pub base_url: Option<String>,
 
     /// Print the daemon's raw JSON instead of a human-readable summary.
     /// `choco` is meant to be both human-scriptable and agent-callable
@@ -96,6 +97,9 @@ pub enum Command {
     /// Project create/list.
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Start, stop, restart or inspect the chocofactoryd daemon.
+    #[command(subcommand)]
+    Server(ServerCmd),
     /// Serves the `report_outcome` MCP tool over stdio (issue #73): a
     /// stage's agent turn calls it to state its outcome explicitly instead
     /// of leaving the engine to infer one from prose. `chocofactoryd` spawns
@@ -103,6 +107,46 @@ pub enum Command {
     /// meant to be run by hand, hence hidden from `--help`.
     #[command(hide = true)]
     McpServe(McpServeArgs),
+}
+
+/// `choco server ...`: manages the local daemon through its lock file.
+#[derive(Subcommand)]
+pub enum ServerCmd {
+    /// Start chocofactoryd in the background (its own session) and wait
+    /// until it answers. Logs go to ~/.config/chocofactory/logs/chocofactoryd.log.
+    /// Does nothing if it is already running. Running tasks are unaffected.
+    /// Exit codes: 0 started or already running; 1 error.
+    Start {
+        /// Port to listen on (0 picks a free one). Default: the daemon's own.
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Stop chocofactoryd gracefully (SIGTERM). Refuses, exit 3, while an agent
+    /// turn or shell step is running, since stopping marks those tasks stuck
+    /// (`choco task retry` continues them); `--force` stops anyway. Tasks
+    /// waiting on a poll or a human are not affected.
+    /// Exit codes: 0 stopped or not running; 1 error; 3 refused.
+    Stop {
+        /// Stop even if work is in flight; that work is marked stuck.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop (as `stop`) then start chocofactoryd, keeping its port unless
+    /// `--port` is given. Starts it if it was not running.
+    /// Exit codes: 0 ok; 1 error, or the old daemon had to be killed (a new
+    /// one is started only if the old one's lock was released); 3 refused because work is in flight.
+    Restart {
+        /// Stop even if work is in flight; that work is marked stuck.
+        #[arg(long)]
+        force: bool,
+        /// Port for the new daemon. Default: the old daemon's port.
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Show whether chocofactoryd is running, its version, open tasks and
+    /// in-flight work. Exit codes: 0 running; 1 holds the lock but does not
+    /// answer; 3 not running.
+    Status,
 }
 
 #[derive(Args)]
@@ -378,6 +422,40 @@ pub enum ProjectCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_flags_parse() {
+        let cli = Cli::parse_from(["choco", "server", "stop", "--force"]);
+        assert!(matches!(
+            cli.command,
+            Command::Server(ServerCmd::Stop { force: true })
+        ));
+        let cli = Cli::parse_from(["choco", "server", "restart", "--force", "--port", "0"]);
+        assert!(matches!(
+            cli.command,
+            Command::Server(ServerCmd::Restart {
+                force: true,
+                port: Some(0)
+            })
+        ));
+        let cli = Cli::parse_from(["choco", "server", "start", "--port", "4242"]);
+        assert!(matches!(
+            cli.command,
+            Command::Server(ServerCmd::Start { port: Some(4242) })
+        ));
+        assert!(Cli::try_parse_from(["choco", "server", "start", "--port", "x"]).is_err());
+    }
+
+    #[test]
+    fn base_url_is_none_without_flag_or_env() {
+        // SAFETY-free check: only meaningful when the env var is unset.
+        if std::env::var_os("CHOCO_BASE_URL").is_none() {
+            let cli = Cli::parse_from(["choco", "project", "list"]);
+            assert_eq!(cli.base_url, None);
+        }
+        let cli = Cli::parse_from(["choco", "--base-url", "http://x:1", "project", "list"]);
+        assert_eq!(cli.base_url.as_deref(), Some("http://x:1"));
+    }
 
     /// #92: `--resume` and `--fresh` are opposites, so asking for both is
     /// a parse error rather than one of them silently winning.
