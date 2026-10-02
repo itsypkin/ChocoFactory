@@ -2882,6 +2882,22 @@ stages:
         );
     }
 
+    /// #112: a malformed `arrival` reference fails the workflow load.
+    #[test]
+    fn rejects_a_malformed_arrival_reference() {
+        for bad in ["arrival", "arrival.stage", "arrival.from.x"] {
+            let dir = TempDir::new();
+            let yaml = format!(
+                "name: templated\nstages:\n  report:\n    kind: shell\n    command: \"echo {{{{ {bad} }}}}\"\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
+            );
+            let err = WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::InvalidTemplate { stage, .. } if stage == "report"),
+                "{bad}: got {err}"
+            );
+        }
+    }
+
     /// P2-7a: `task` is always a valid root — it names no stage, so it
     /// skips both `UnknownTemplateStage` and `TemplateStageCapturesNothing`
     /// entirely, unlike every `stages.<stage>` reference.

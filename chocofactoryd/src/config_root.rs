@@ -341,6 +341,7 @@ mod tests {
         let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
         let human_note_heading = rendered.find("## A human's note").unwrap();
         let summary = rendered.find("CURRENT REVIEWER SUMMARY").unwrap();
+        assert_eq!(rendered.matches("CURRENT REVIEWER SUMMARY").count(), 1);
         assert!(
             reviewer_heading < summary && summary < human_note_heading,
             "the reviewer's summary must render only under its own heading:\n{rendered}"
@@ -397,6 +398,7 @@ mod tests {
         );
         let human_note_heading = rendered.find("## A human's note").unwrap();
         let note = rendered.find("CURRENT HUMAN NOTE").unwrap();
+        assert_eq!(rendered.matches("CURRENT HUMAN NOTE").count(), 1);
         assert!(
             human_note_heading < note,
             "the human's note must render only under its own heading:\n{rendered}"
