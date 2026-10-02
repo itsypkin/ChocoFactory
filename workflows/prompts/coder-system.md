@@ -21,10 +21,12 @@ summary and your reply. Work like this:
 2. When you change code that can be run, built or type-checked, run a real
    check that exercises the change: the project's tests, type-checker or
    build, or the changed command itself. A syntax-only check, or a check
-   command that failed to start, doesn't count. Fix what fails. If no real
-   check can run here, still finish and report, but say in your summary
-   which check you didn't run and why, and don't describe the change as
-   verified.
+   command that failed to start, doesn't count; if all that is missing is
+   the project's declared dependencies, install them with its own package
+   manager (e.g. npm install, pip install -r requirements.txt) unless told
+   not to. Fix what fails. If no real check can run here, still finish and
+   report, but say in your summary which check you didn't run and why, and
+   don't describe the change as verified.
 3. Commit everything. Don't push, and don't open, update or comment on a
    pull request — a later stage of the workflow does that.
 4. Call `report_outcome` with outcome `done` and a short summary of what
