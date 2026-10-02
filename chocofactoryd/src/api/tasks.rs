@@ -1166,10 +1166,29 @@ stages:
             )
             .await;
         assert_eq!(send.status(), 409, "{}", send.json());
+        assert!(
+            send.json()
+                .to_string()
+                .contains("is not part of this version"),
+            "{}",
+            send.json()
+        );
+        // Retry only reaches the workflow load for a stuck task.
+        crate::db::tasks::mark_stuck(server.pool(), &task_id, "stage 'chatting': it broke")
+            .await
+            .unwrap();
         let retry = server
             .post(&format!("/tasks/{task_id}/retry"), json!({}))
             .await;
         assert_eq!(retry.status(), 409, "{}", retry.json());
+        assert!(
+            retry
+                .json()
+                .to_string()
+                .contains("is not part of this version"),
+            "{}",
+            retry.json()
+        );
     }
 
     /// `POST /tasks` with `workflow_file` (#129): an absolute path is

@@ -1952,6 +1952,35 @@ async fn real_binary_materializes_the_builtins_and_does_not_create_the_old_folde
     );
 }
 
+async fn start_daemon_for_report(
+    home: &std::path::Path,
+    client: &reqwest::Client,
+) -> (tokio::process::Child, String) {
+    let port = free_port();
+    let child = spawn_raw(
+        home,
+        &[
+            ("CHOCOFACTORY_PORT", &port.to_string()),
+            ("RUST_LOG", "info"),
+        ],
+    );
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(resp) = client.get(format!("{base}/projects")).send().await
+            && resp.status().is_success()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never became ready"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    (child, base)
+}
+
 /// A task whose recorded workflow path is inside the old folder is counted by
 /// the startup report after a restart.
 #[tokio::test]
@@ -1968,36 +1997,7 @@ async fn real_binary_counts_tasks_still_using_the_old_workflows_folder() {
     std::fs::write(&custom, chat).unwrap();
     let client = reqwest::Client::new();
 
-    async fn start(
-        home: &std::path::Path,
-        client: &reqwest::Client,
-    ) -> (tokio::process::Child, String) {
-        let port = free_port();
-        let child = spawn_raw(
-            home,
-            &[
-                ("CHOCOFACTORY_PORT", &port.to_string()),
-                ("RUST_LOG", "info"),
-            ],
-        );
-        let base = format!("http://127.0.0.1:{port}");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(resp) = client.get(format!("{base}/projects")).send().await
-                && resp.status().is_success()
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the daemon never became ready"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        (child, base)
-    }
-
-    let (mut child, base) = start(&home.0, &client).await;
+    let (mut child, base) = start_daemon_for_report(&home.0, &client).await;
     let project: Value = client
         .post(format!("{base}/projects"))
         .json(&json!({ "name": "demo" }))
@@ -2022,7 +2022,74 @@ async fn real_binary_counts_tasks_still_using_the_old_workflows_folder() {
     let status = sigterm_and_wait(&mut child).await;
     assert!(status.success(), "{status:?}");
 
-    let (mut child, _base) = start(&home.0, &client).await;
+    let (mut child, _base) = start_daemon_for_report(&home.0, &client).await;
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(
+        stderr.contains("1 tasks still use workflows in"),
+        "{stderr}"
+    );
+}
+
+/// Pre-#88 tasks (no recorded path) count as using the old folder only when
+/// `<folder>/<workflow_def>.yaml` exists; a sibling `workflows2/` task is
+/// never counted.
+#[tokio::test]
+async fn real_binary_counts_null_path_tasks_only_when_the_old_file_exists() {
+    let home = TempHome::new();
+    let cfg = home.0.join(".config/chocofactory");
+    let client = reqwest::Client::new();
+
+    let (mut child, base) = start_daemon_for_report(&home.0, &client).await;
+    let project: Value = client
+        .post(format!("{base}/projects"))
+        .json(&json!({ "name": "demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&json!({
+            "project_id": project["id"].as_str().unwrap(),
+            "workflow_def": "chat",
+            "title": "t",
+            "prompt": "hi",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{:?}", resp.text().await);
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        cfg.join("chocofactory.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE tasks SET workflow_path = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    // No old chat.yaml: not counted.
+    let (mut child, _base) = start_daemon_for_report(&home.0, &client).await;
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(!stderr.contains("tasks still use workflows in"), "{stderr}");
+
+    // With the old file present: counted.
+    let old = cfg.join("workflows");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("chat.yaml"), "name: chat\n").unwrap();
+    let (mut child, _base) = start_daemon_for_report(&home.0, &client).await;
     let status = sigterm_and_wait(&mut child).await;
     assert!(status.success(), "{status:?}");
     let stderr = read_stderr_to_string(&mut child).await;
