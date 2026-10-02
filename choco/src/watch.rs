@@ -351,17 +351,25 @@ fn end_message(
     Some(render::single_line(&msg))
 }
 
+/// Writes one line to stdout. A closed pipe (`| head`) ends the process
+/// quietly with the error code; any other write failure is reported the same
+/// way rather than dropped.
+fn out_line(text: &str) {
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = writeln!(out, "{text}").and_then(|_| out.flush()) {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("error: failed writing to stdout: {e}");
+        }
+        std::process::exit(1);
+    }
+}
+
 fn emit(mode: Mode, detail: &Value, interval: &str) {
     match mode {
-        Mode::Json => println!(
-            "{}",
-            serde_json::to_string(detail).expect("a JSON value always serializes")
-        ),
-        Mode::Tty => {
-            let mut out = std::io::stdout();
-            let _ = writeln!(out, "{}", frame(detail, interval, Utc::now()));
-            let _ = out.flush();
+        Mode::Json => {
+            out_line(&serde_json::to_string(detail).expect("a JSON value always serializes"))
         }
+        Mode::Tty => out_line(&frame(detail, interval, Utc::now())),
         Mode::Plain => {}
     }
 }
@@ -392,7 +400,7 @@ pub async fn watch(client: &Client, args: WatchArgs<'_>) -> Result<WatchEnd, Cli
     let detail = client.get_task(args.id).await?;
     let first = decode(&detail)?;
     match mode {
-        Mode::Plain => println!("{}", start_line(args.id, &first, Utc::now())),
+        Mode::Plain => out_line(&start_line(args.id, &first, Utc::now())),
         _ => emit(mode, &detail, &args.interval.raw),
     }
     let mut prev = first.clone();
@@ -429,13 +437,23 @@ pub async fn watch(client: &Client, args: WatchArgs<'_>) -> Result<WatchEnd, Cli
         };
         tokio::time::sleep(sleep_for).await;
 
-        match client.get_task(args.id).await {
+        // The deadline also bounds a poll that never answers.
+        let polled = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, client.get_task(args.id)).await {
+                    Ok(result) => result,
+                    Err(_) => return finish(WatchEnd::TimedOut, &prev),
+                }
+            }
+            None => client.get_task(args.id).await,
+        };
+        match polled {
             Ok(detail) => {
                 strikes = 0;
                 let snap = decode(&detail)?;
                 let diff = changes(&prev, &snap);
                 match mode {
-                    Mode::Plain => diff.iter().for_each(|c| println!("{}", line_for(c))),
+                    Mode::Plain => diff.iter().for_each(|c| out_line(&line_for(c))),
                     // NDJSON prints only on change; the terminal redraws every poll.
                     Mode::Json if diff.is_empty() => {}
                     _ => emit(mode, &detail, &args.interval.raw),
@@ -580,6 +598,24 @@ mod tests {
             at: parse_time(&Some("2026-08-01T14:22:55Z".into())),
         };
         assert_eq!(line_for(&c), "14:22:55  coding --[done]--> internal_review");
+    }
+
+    #[test]
+    fn outcome_less_and_reason_lines_have_exact_text() {
+        let at = "2026-08-01T14:22:55Z".parse().ok();
+        let stage = |from: Option<&str>| Change::Stage {
+            from: from.map(Into::into),
+            to: "b".into(),
+            outcome: None,
+            at,
+        };
+        assert_eq!(line_for(&stage(Some("a"))), "14:22:55  a --> b");
+        assert_eq!(line_for(&stage(None)), "14:22:55  … --> b");
+        let line = line_for(&Change::Reason {
+            status: "stuck".into(),
+            reason: Some("x".into()),
+        });
+        assert!(line.ends_with("  stuck: x"), "{line}");
     }
 
     #[test]

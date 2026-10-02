@@ -159,6 +159,7 @@ pub enum TaskCmd {
     ///   6  the task closed without reaching the target
     ///
     /// --live alone does not stop at stuck (a human may retry it).
+    #[command(verbatim_doc_comment)]
     #[command(group(ArgGroup::new("watching").args(["live", "until"]).multiple(true)))]
     Status {
         /// Task id.

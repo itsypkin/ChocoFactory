@@ -1674,13 +1674,18 @@ async fn wait_for_first_line(child: &mut Child) {
 
 async fn finish_watcher(mut child: Child) -> (Option<i32>, String) {
     let mut stderr = String::new();
-    if let Some(mut e) = child.stderr.take() {
-        e.read_to_string(&mut stderr).await.unwrap();
-    }
-    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
-        .await
-        .expect("watcher did not exit within 10s")
-        .unwrap();
+    let mut pipe = child.stderr.take();
+    // The read and the wait share one deadline: a hung watcher keeps stderr
+    // open, so reading first would hang the test instead of failing it.
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        if let Some(e) = pipe.as_mut() {
+            e.read_to_string(&mut stderr).await.unwrap();
+        }
+        child.wait().await
+    })
+    .await
+    .expect("watcher did not exit within 10s")
+    .unwrap();
     (status.code(), stderr)
 }
 
@@ -1706,6 +1711,15 @@ async fn watch_until_closed_on_a_stuck_task_exits_3() {
     assert!(out.stderr.contains(&id), "{}", out.stderr);
     assert!(out.stderr.contains("stuck"), "{}", out.stderr);
     assert!(out.stderr.contains("run"), "{}", out.stderr);
+    let task = run_choco_json(&d.base_url, &["task", "status", &id])
+        .await
+        .json();
+    let reason = task["stuck_reason"].as_str().expect("stuck_reason");
+    assert!(
+        out.stderr.contains(&reason.replace('\n', " ")),
+        "stderr lacks reason {reason:?}: {}",
+        out.stderr
+    );
     assert!(!out.stderr.contains("error: "), "{}", out.stderr);
 }
 
@@ -1810,6 +1824,20 @@ async fn watch_json_is_ndjson() {
     }
     let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
     assert_eq!(last["status"], "closed");
+    // One line per change: consecutive lines differ in status, stage or trail.
+    let key = |line: &str| {
+        let v: Value = serde_json::from_str(line).unwrap();
+        (
+            v["status"].clone(),
+            v["workflow_state"]["current_stage"].clone(),
+            v["stage_trail"]
+                .as_array()
+                .map(|t| t.iter().map(|e| e["id"].clone()).collect::<Vec<_>>()),
+        )
+    };
+    for pair in lines.windows(2) {
+        assert_ne!(key(pair[0]), key(pair[1]), "repeated line: {}", pair[0]);
+    }
 }
 
 #[tokio::test]
@@ -1829,9 +1857,12 @@ async fn watch_gives_up_when_the_daemon_goes_away() {
     let (mut d, id) = watch_setup("gatewf", GATE_WF).await;
     let mut child = spawn_watcher(&d.base_url, &id, &["--until", "closed", "--interval", "1s"]);
     wait_for_first_line(&mut child).await;
+    let killed_at = std::time::Instant::now();
     d.child.start_kill().unwrap();
     let (code, stderr) = finish_watcher(child).await;
     assert_eq!(code, Some(1), "stderr: {stderr}");
+    // Three strikes at a 1s interval: not an instant give-up.
+    assert!(killed_at.elapsed() >= Duration::from_secs(2));
     assert!(
         stderr.contains("lost contact with chocofactoryd"),
         "{stderr}"
@@ -1867,6 +1898,12 @@ async fn watch_first_poll_errors_are_fatal() {
     let out = watch_choco(&d, "does-not-exist", &["--until", "closed"]).await;
     assert_eq!(out.code, Some(1));
     assert!(out.stderr.starts_with("error: "), "{}", out.stderr);
+    assert!(
+        out.stderr.to_lowercase().contains("not found")
+            || out.stderr.to_lowercase().contains("no such"),
+        "{}",
+        out.stderr
+    );
     assert_eq!(out.stdout, "");
 }
 
@@ -1888,4 +1925,105 @@ async fn watch_flag_misuse_is_a_usage_error() {
         .await;
         assert_eq!(out.code, Some(2), "{extra:?}: {}", out.stderr);
     }
+}
+
+/// One scripted reply of the fake daemon.
+#[derive(Clone, Copy)]
+enum Reply {
+    Open,
+    NotFound,
+    /// Accept, then drop the connection without answering.
+    Drop,
+    /// Accept, then never answer.
+    Hang,
+}
+
+/// A fake daemon answering `GET /tasks/{id}` from a script (then `Open`
+/// forever once the script runs out).
+async fn fake_daemon(script: Vec<Reply>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut script = script.into_iter();
+        let mut held = Vec::new();
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let (code, body) = match script.next().unwrap_or(Reply::Open) {
+                Reply::Drop => continue,
+                Reply::Hang => {
+                    held.push(sock);
+                    continue;
+                }
+                Reply::NotFound => ("404 Not Found", r#"{"error":"no such task"}"#),
+                Reply::Open => (
+                    "200 OK",
+                    r#"{"id":"t1","status":"open","workflow_state":{"current_stage":"wait"},"stage_trail":[]}"#,
+                ),
+            };
+            let resp = format!(
+                "HTTP/1.1 {code}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+        }
+    });
+    base_url
+}
+
+#[tokio::test]
+async fn watch_rides_out_connection_failures_and_resets_the_count() {
+    use Reply::{Drop, Open};
+    // Two failures, a success, two more failures: never three in a row.
+    let base = fake_daemon(vec![Open, Drop, Drop, Open, Drop, Drop, Open]).await;
+    let started = std::time::Instant::now();
+    let child = spawn_watcher(
+        &base,
+        "t1",
+        &["--until", "closed", "--interval", "1s", "--timeout", "8s"],
+    );
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(5), "stderr: {stderr}");
+    assert!(started.elapsed() >= Duration::from_secs(7));
+}
+
+#[tokio::test]
+async fn watch_mid_watch_api_error_is_fatal_at_once() {
+    use Reply::{NotFound, Open};
+    let base = fake_daemon(vec![Open, NotFound]).await;
+    let child = spawn_watcher(&base, "t1", &["--until", "closed", "--interval", "1s"]);
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("no such task"), "{stderr}");
+}
+
+#[tokio::test]
+async fn watch_timeout_bounds_a_poll_that_never_answers() {
+    use Reply::{Hang, Open};
+    let base = fake_daemon(vec![Open, Hang]).await;
+    let child = spawn_watcher(
+        &base,
+        "t1",
+        &["--until", "closed", "--interval", "1s", "--timeout", "3s"],
+    );
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(5), "stderr: {stderr}");
+    assert!(stderr.contains("timed out"), "{stderr}");
+}
+
+#[tokio::test]
+async fn watch_timeout_cuts_a_long_interval_short() {
+    let (d, id) = watch_setup("gatewf", GATE_WF).await;
+    let started = std::time::Instant::now();
+    let child = spawn_watcher(
+        &d.base_url,
+        &id,
+        &["--until", "closed", "--interval", "1h", "--timeout", "2s"],
+    );
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(5), "stderr: {stderr}");
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
