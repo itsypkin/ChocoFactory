@@ -51,3 +51,12 @@ findings exist, from either source:
 
 Put the statuses from item 1 under "Prior findings", the section that
 comes before "Reviewed" in your summary.
+
+The coder also writes the pull request's description, which a later stage
+publishes for the human reviewer. Read it:
+`cat "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`.
+A claim in it that the code doesn't bear out is a blocking finding, because
+the human will rely on it. These are non-blocking findings: a missing
+description; one that leaves out a change or a trade-off the diff makes;
+a change list that doesn't follow the path a request takes through the
+code; and one that isn't short and in plain English.

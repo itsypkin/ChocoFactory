@@ -268,6 +268,28 @@ impl WorkflowDefinition {
                 });
             }
 
+            if let StageKind::Shell { env, .. } | StageKind::Poll { env, .. } = &stage.kind {
+                for name in env.keys() {
+                    let mut chars = name.chars();
+                    let valid = chars
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if !valid {
+                        return Err(WorkflowDefError::InvalidEnvName {
+                            stage: stage_name.clone(),
+                            name: name.clone(),
+                        });
+                    }
+                    if name.to_ascii_lowercase().starts_with("choco_") {
+                        return Err(WorkflowDefError::ReservedEnvName {
+                            stage: stage_name.clone(),
+                            name: name.clone(),
+                        });
+                    }
+                }
+            }
+
             self.validate_templates(stage_name, stage)?;
         }
 
@@ -356,7 +378,7 @@ impl WorkflowDefinition {
             let references = crate::template::references(&source).map_err(|err| {
                 WorkflowDefError::InvalidTemplate {
                     stage: stage_name.to_string(),
-                    field,
+                    field: field.clone(),
                     reason: err.to_string(),
                 }
             })?;
@@ -377,7 +399,7 @@ impl WorkflowDefinition {
                 let Some(target) = self.stages.get(&referenced_stage) else {
                     return Err(WorkflowDefError::UnknownTemplateStage {
                         stage: stage_name.to_string(),
-                        field,
+                        field: field.clone(),
                         placeholder: reference.placeholder,
                         referenced: referenced_stage,
                     });
@@ -385,7 +407,7 @@ impl WorkflowDefinition {
                 if !declares_capture(&target.kind) {
                     return Err(WorkflowDefError::TemplateStageCapturesNothing {
                         stage: stage_name.to_string(),
-                        field,
+                        field: field.clone(),
                         placeholder: reference.placeholder,
                         referenced: referenced_stage,
                     });
@@ -489,10 +511,16 @@ pub enum StageKind {
         /// restarts. Optional: `None` means run to completion, however
         /// long that takes.
         timeout: Option<Duration>,
+        /// Environment variables for the command, in declaration order (#101).
+        /// Values are templates, rendered once on stage entry and handed to
+        /// the child as environment variables — never parsed by a shell.
+        env: IndexMap<String, String>,
     },
     Poll {
         command: ShellCommand,
         capture: Option<Capture>,
+        /// As `Shell`'s field of the same name.
+        env: IndexMap<String, String>,
         /// How long to wait between the end of one attempt and the start
         /// of the next.
         interval: Duration,
@@ -643,6 +671,11 @@ enum RawStageKind {
         capture: Option<Capture>,
         #[serde(default)]
         timeout: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+        )]
+        env: IndexMap<String, String>,
     },
     Poll {
         #[serde(default)]
@@ -651,6 +684,11 @@ enum RawStageKind {
         script_file: Option<String>,
         #[serde(default)]
         capture: Option<Capture>,
+        #[serde(
+            default,
+            deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+        )]
+        env: IndexMap<String, String>,
         interval: String,
         #[serde(default)]
         timeout: Option<String>,
@@ -710,11 +748,13 @@ impl RawStage {
                 script_file,
                 capture,
                 timeout,
+                env,
             } => {
                 let resolved_command = resolve_command(base_dir, stage_name, command, script_file)?;
                 StageKind::Shell {
                     command: resolved_command,
                     capture,
+                    env,
                     timeout: timeout
                         .map(|value| {
                             parse_duration(&value).map_err(|value| {
@@ -735,9 +775,11 @@ impl RawStage {
                 interval,
                 timeout,
                 outcomes,
+                env,
             } => StageKind::Poll {
                 command: resolve_command(base_dir, stage_name, command, script_file)?,
                 capture,
+                env,
                 interval: parse_duration(&interval).map_err(|value| {
                     WorkflowDefError::InvalidDuration {
                         stage: stage_name.to_string(),
@@ -827,12 +869,13 @@ fn declares_capture(kind: &StageKind) -> bool {
     )
 }
 
-/// The text a stage renders templates into (§5.1): an inline `command:`, or
-/// an `agent_turn`'s `prompt_file` contents.
+/// The text a stage renders templates into (§5.1): an inline `command:`, an
+/// `agent_turn`'s `prompt_file` contents, and the values of a `shell`/`poll`
+/// stage's `env:` map.
 ///
-/// A `script_file` is deliberately absent — §5.1 scopes templating to
-/// `command:` and `prompt_file`, and a script is an executable artifact in
-/// its own right rather than a string the engine composes.
+/// A `script_file` is deliberately absent — a script is an executable
+/// artifact in its own right rather than a string the engine composes. Its
+/// `env:` values are still templated, though.
 ///
 /// The prompt file is read here so its references are validated at load time
 /// too. The engine re-reads it when the turn actually runs, so a file edited
@@ -841,21 +884,24 @@ fn declares_capture(kind: &StageKind) -> bool {
 fn templatable_sources(
     stage_name: &str,
     stage: &StageDef,
-) -> Result<Vec<(&'static str, String)>, WorkflowDefError> {
-    let source = match &stage.kind {
-        StageKind::Shell {
-            command: ShellCommand::Inline(command),
-            ..
+) -> Result<Vec<(String, String)>, WorkflowDefError> {
+    let mut sources = Vec::new();
+    match &stage.kind {
+        StageKind::Shell { command, env, .. } | StageKind::Poll { command, env, .. } => {
+            if let ShellCommand::Inline(command) = command {
+                sources.push(("command".to_string(), command.clone()));
+            }
+            // Templated whether the command is inline or a `script_file`:
+            // the script isn't, but its environment is (#101).
+            for (name, value) in env {
+                sources.push((format!("env '{name}'"), value.clone()));
+            }
         }
-        | StageKind::Poll {
-            command: ShellCommand::Inline(command),
-            ..
-        } => ("command", command.clone()),
         StageKind::AgentTurn {
             prompt_file: Some(path),
             ..
-        } => (
-            "prompt_file",
+        } => sources.push((
+            "prompt_file".to_string(),
             // Not `WorkflowDefError::Io`, whose Display says "failed to read
             // workflow definition" — the definition read fine; it's a file it
             // points at that didn't, and the reader needs the stage and the
@@ -868,10 +914,10 @@ fn templatable_sources(
                 path: path.clone(),
                 reason: err.to_string(),
             })?,
-        ),
-        _ => return Ok(Vec::new()),
-    };
-    Ok(vec![source])
+        )),
+        _ => {}
+    }
+    Ok(sources)
 }
 
 #[derive(Clone, Copy)]
@@ -1026,24 +1072,32 @@ pub enum WorkflowDefError {
     },
     InvalidTemplate {
         stage: String,
-        field: &'static str,
+        field: String,
         reason: String,
     },
     UnknownTemplateStage {
         stage: String,
-        field: &'static str,
+        field: String,
         placeholder: String,
         referenced: String,
     },
     TemplateStageCapturesNothing {
         stage: String,
-        field: &'static str,
+        field: String,
         placeholder: String,
         referenced: String,
     },
     IsolationFieldWithInheritedConfig {
         role: String,
         field: &'static str,
+    },
+    InvalidEnvName {
+        stage: String,
+        name: String,
+    },
+    ReservedEnvName {
+        stage: String,
+        name: String,
     },
 }
 
@@ -1195,6 +1249,16 @@ impl fmt::Display for WorkflowDefError {
                 f,
                 "stage '{stage}' has {placeholder} in its {field}, but stage '{referenced}' \
                  declares no 'capture:' so it stores nothing to reference"
+            ),
+            WorkflowDefError::InvalidEnvName { stage, name } => write!(
+                f,
+                "stage '{stage}' has an invalid env variable name '{name}'; names must match \
+                 [A-Za-z_][A-Za-z0-9_]*"
+            ),
+            WorkflowDefError::ReservedEnvName { stage, name } => write!(
+                f,
+                "stage '{stage}' sets env variable '{name}', but names starting with CHOCO_ are \
+                 reserved for the engine"
             ),
             WorkflowDefError::IsolationFieldWithInheritedConfig { role, field } => write!(
                 f,
@@ -1498,6 +1562,7 @@ stages:
             command,
             capture,
             timeout,
+            ..
         } = &def.stages["open_pr"].kind
         else {
             panic!("expected shell stage");
@@ -2984,5 +3049,158 @@ stages:
     kind: terminal
 "#;
         WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    // ---- #101: `env:` on shell and poll stages ----
+
+    #[test]
+    fn parses_env_on_shell_and_poll_in_declaration_order() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: env
+stages:
+  run:
+    kind: shell
+    command: "true"
+    env:
+      ZED: "1"
+      ALPHA: "{{ task.title }}"
+    on: { done: wait }
+  wait:
+    kind: poll
+    command: "true"
+    interval: 5s
+    env:
+      B: "b"
+      A: "a"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+        let StageKind::Shell { env, .. } = &def.stages["run"].kind else {
+            panic!("expected shell");
+        };
+        assert_eq!(env.keys().collect::<Vec<_>>(), ["ZED", "ALPHA"]);
+        let StageKind::Poll { env, .. } = &def.stages["wait"].kind else {
+            panic!("expected poll");
+        };
+        assert_eq!(env.keys().collect::<Vec<_>>(), ["B", "A"]);
+    }
+
+    #[test]
+    fn rejects_a_duplicate_env_key() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: env
+stages:
+  run:
+    kind: shell
+    command: "true"
+    env:
+      X: "1"
+      X: "2"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(err.to_string().contains("duplicate key"), "{err}");
+    }
+
+    fn env_workflow(name: &str, value: &str) -> String {
+        format!(
+            r#"
+name: env
+stages:
+  run:
+    kind: shell
+    command: "true"
+    env:
+      "{name}": "{value}"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#
+        )
+    }
+
+    #[test]
+    fn rejects_invalid_and_reserved_env_names() {
+        let dir = TempDir::new();
+        for bad in ["1X", "A-B", ""] {
+            let err = WorkflowDefinition::parse(&env_workflow(bad, "v"), &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::InvalidEnvName { stage, name }
+                    if stage == "run" && name == bad),
+                "{bad:?}: {err}"
+            );
+            assert!(err.to_string().contains("run"), "{err}");
+        }
+        for reserved in ["CHOCO_X", "choco_x"] {
+            let err =
+                WorkflowDefinition::parse(&env_workflow(reserved, "v"), &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::ReservedEnvName { stage, name }
+                    if stage == "run" && name == reserved),
+                "{reserved:?}: {err}"
+            );
+            assert!(err.to_string().contains(reserved), "{err}");
+        }
+    }
+
+    #[test]
+    fn validates_env_templates_for_inline_and_script_file_stages() {
+        let dir = TempDir::new();
+        dir.write("run.sh", "#!/bin/sh\n");
+        for command in ["command: \"true\"", "script_file: run.sh"] {
+            let unknown = format!(
+                "name: e\nstages:\n  run:\n    kind: shell\n    {command}\n    env:\n      WHO: \"{{{{ stages.nope.x }}}}\"\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
+            );
+            let err = WorkflowDefinition::parse(&unknown, &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::UnknownTemplateStage { field, referenced, .. }
+                    if field.contains("WHO") && referenced == "nope"),
+                "{command}: {err}"
+            );
+            assert!(err.to_string().contains("WHO"), "{err}");
+
+            let nothing = format!(
+                "name: e\nstages:\n  first:\n    kind: shell\n    command: \"true\"\n    on: {{ done: run }}\n  run:\n    kind: shell\n    {command}\n    env:\n      WHO: \"{{{{ stages.first.x }}}}\"\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
+            );
+            let err = WorkflowDefinition::parse(&nothing, &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::TemplateStageCapturesNothing { field, .. }
+                    if field.contains("WHO")),
+                "{command}: {err}"
+            );
+
+            let task = format!(
+                "name: e\nstages:\n  run:\n    kind: shell\n    {command}\n    env:\n      WHO: \"{{{{ task.title }}}}\"\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
+            );
+            WorkflowDefinition::parse(&task, &dir.path).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_built_in_coding_task_open_pr_stage_passes_agent_text_only_through_env() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows");
+        let def = WorkflowDefinition::load(&root.join("coding-task.yaml")).unwrap();
+        let StageKind::Shell { command, env, .. } = &def.stages["open_pr"].kind else {
+            panic!("open_pr must be a shell stage");
+        };
+        assert!(
+            matches!(command, ShellCommand::ScriptFile(_)),
+            "{command:?}"
+        );
+        let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            pairs,
+            [
+                ("PR_TASK_TITLE", "{{ task.title }}"),
+                ("PR_REVIEW_VERDICT", "{{ stages.internal_review.outcome }}"),
+                ("PR_REVIEW_REPORT", "{{ stages.internal_review.summary }}"),
+            ]
+        );
     }
 }
