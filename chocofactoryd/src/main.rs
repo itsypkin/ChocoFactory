@@ -308,9 +308,10 @@ async fn report_legacy_workflows(pool: &sqlx::SqlitePool, legacy_dir: &std::path
             scan.stale
         );
     }
-    for path in &scan.other {
+    for path in scan.other.iter().filter(|p| !is_hidden_file(p)) {
         tracing::warn!(
-            "{} is no longer read (#129). To keep using it, pass `choco task create --workflow \
+            "{} differs from the current built-in (edited, or left over from an older version) \
+             and is no longer read (#129). To keep using it, pass `choco task create --workflow \
              <path-to-its-workflow.yaml>` (prompts and scripts resolve next to it), or move it \
              with its prompts/ and scripts/ into a repo's .chocofactory/workflows/",
             path.display()
@@ -320,7 +321,7 @@ async fn report_legacy_workflows(pool: &sqlx::SqlitePool, legacy_dir: &std::path
         tracing::error!(%err, "could not canonicalize the old workflows folder; matching tasks by its plain path");
         scan.dir.clone()
     });
-    let prefix = format!("{}/", canonical.display());
+    let prefix = legacy_prefix(&canonical);
     let mut in_use = tasks_using_prefix(pool, &prefix).await;
     // Pre-#88 tasks have no recorded path and still load `<folder>/<name>.yaml`.
     let legacy_defs = db::tasks::active_workflow_defs_without_path(pool)
@@ -337,8 +338,40 @@ async fn report_legacy_workflows(pool: &sqlx::SqlitePool, legacy_dir: &std::path
     }
 }
 
+/// Dotfiles such as `.DS_Store` are not workflows; don't warn about them.
+fn is_hidden_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+}
+
+/// The recorded-path prefix of tasks living in `folder`: the trailing `/`
+/// keeps a sibling such as `workflows2/` from matching.
+fn legacy_prefix(folder: &std::path::Path) -> String {
+    format!("{}/", folder.display())
+}
+
 async fn tasks_using_prefix(pool: &sqlx::SqlitePool, prefix: &str) -> i64 {
     db::tasks::count_active_with_workflow_path_prefix(pool, prefix)
         .await
         .expect("chocofactoryd: failed to count tasks using the old workflows folder")
+}
+
+#[cfg(test)]
+mod legacy_report_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn prefix_ends_with_a_slash_so_siblings_do_not_match() {
+        let prefix = legacy_prefix(Path::new("/c/workflows"));
+        assert_eq!(prefix, "/c/workflows/");
+        assert!(!"/c/workflows2/x.yaml".starts_with(&prefix));
+        assert!("/c/workflows/x.yaml".starts_with(&prefix));
+    }
+
+    #[test]
+    fn dotfiles_are_hidden() {
+        assert!(is_hidden_file(Path::new("/c/workflows/.DS_Store")));
+        assert!(!is_hidden_file(Path::new("/c/workflows/chat.yaml")));
+    }
 }

@@ -28,7 +28,7 @@ const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
 ];
 
 /// The prompt files `coding-task.yaml`'s `system_prompt_file`/`prompt_file`
-/// fields reference, seeded alongside it into `workflows_dir/prompts/` —
+/// fields reference, seeded alongside it into `<dir>/prompts/` —
 /// same embed-and-seed treatment as the workflow YAML itself (#18), since
 /// those fields resolve relative to wherever the seeded copy ends up on
 /// disk, not the repo. `chat.yaml` has no prompt files of its own.
@@ -56,7 +56,7 @@ const BUILTIN_WORKFLOW_PROMPTS: &[(&str, &str)] = &[
 ];
 
 /// The scripts `coding-task.yaml`'s `script_file:` fields reference (#101),
-/// seeded into `workflows_dir/scripts/` executable. Same embed-and-seed
+/// seeded into `<dir>/scripts/` executable. Same embed-and-seed
 /// treatment as the prompts.
 const BUILTIN_WORKFLOW_SCRIPTS: &[(&str, &str)] = &[(
     "open-pr.sh",
@@ -134,11 +134,10 @@ fn seed_one(path: &Path, source: &str, mode: u32) -> io::Result<bool> {
 /// `sessions::recover_stale_active_sessions` are already separate steps the
 /// daemon's startup sequence calls explicitly, not hidden inside a `new`.
 ///
-/// Used both for the daemon's own startup seed of `workflows_dir` (which
-/// only logs the returned [`SeedReport`]) and, via `WorkflowEngine::
-/// init_project_workflows` (issue #88), to seed a project repo's own
-/// `.chocofactory/workflows/` — the same built-ins, the same never-
-/// overwrite guarantee, just a different destination directory.
+/// Used via `WorkflowEngine::init_project_workflows` (issue #88) to seed a
+/// project repo's own `.chocofactory/workflows/`. The daemon itself no
+/// longer seeds anything at startup (#129): it regenerates its private copy
+/// with [`materialize_builtins`].
 pub fn seed_builtin_workflows(workflows_dir: &Path) -> io::Result<SeedReport> {
     std::fs::create_dir_all(workflows_dir)?;
     std::fs::create_dir_all(workflows_dir.join("prompts"))?;
@@ -199,17 +198,31 @@ fn write_if_different(path: &Path, contents: &[u8], mode: u32) -> io::Result<()>
         .to_string_lossy()
         .into_owned();
     let tmp = path.with_file_name(format!(".{file_name}.choco-new"));
+    // A leftover from a crashed start may be read-only (or a planted
+    // symlink): remove it, never open through it.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(with_path(err, "remove", &tmp)),
+    }
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(&tmp)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|err| with_path(err, "create", &tmp))?;
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| with_path(err, "write", &tmp))?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+        .map_err(|err| with_path(err, "set permissions on", &tmp))?;
     drop(file);
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path).map_err(|err| with_path(err, "rename into place", path))
+}
+
+/// Adds the failing operation and path to an I/O error, keeping its kind.
+fn with_path(err: io::Error, action: &str, path: &Path) -> io::Error {
+    io::Error::new(err.kind(), format!("{action} {}: {err}", path.display()))
 }
 
 /// Regenerates the daemon's private, read-only copy of the built-in
@@ -218,20 +231,22 @@ fn write_if_different(path: &Path, contents: &[u8], mode: u32) -> io::Result<()>
 /// `prompts/` or `scripts/` that isn't a current built-in (or `README.txt`)
 /// is deleted. Any I/O error propagates.
 pub fn materialize_builtins(dir: &Path) -> io::Result<()> {
-    set_dir_mode(dir)?;
+    set_dir_mode(dir).map_err(|e| with_path(e, "prepare", dir))?;
     // A `prompts`/`scripts` that is a symlink or a file must not be written
     // through: remove it so it is recreated as a real directory.
     for sub in ["prompts", "scripts"] {
         let path = dir.join(sub);
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_dir() => {}
-            Ok(_) => std::fs::remove_file(&path)?,
+            Ok(_) => std::fs::remove_file(&path).map_err(|e| with_path(e, "remove", &path))?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
     }
-    set_dir_mode(&dir.join("prompts"))?;
-    set_dir_mode(&dir.join("scripts"))?;
+    set_dir_mode(&dir.join("prompts"))
+        .map_err(|e| with_path(e, "prepare", &dir.join("prompts")))?;
+    set_dir_mode(&dir.join("scripts"))
+        .map_err(|e| with_path(e, "prepare", &dir.join("scripts")))?;
 
     let mut keep: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     keep.insert(PathBuf::from(README_NAME));
@@ -247,8 +262,8 @@ pub fn materialize_builtins(dir: &Path) -> io::Result<()> {
             Some(s) => dir.join(s),
             None => dir.to_path_buf(),
         };
-        for entry in std::fs::read_dir(&base)? {
-            let entry = entry?;
+        for entry in std::fs::read_dir(&base).map_err(|e| with_path(e, "list", &base))? {
+            let entry = entry.map_err(|e| with_path(e, "list", &base))?;
             let relative = match sub {
                 Some(s) => Path::new(s).join(entry.file_name()),
                 None => PathBuf::from(entry.file_name()),
@@ -257,7 +272,9 @@ pub fn materialize_builtins(dir: &Path) -> io::Result<()> {
                 continue;
             }
             // `file_type` does not follow symlinks.
-            let file_type = entry.file_type()?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| with_path(e, "inspect", &entry.path()))?;
             if file_type.is_dir() {
                 // Our own subdirectories are kept; a directory elsewhere is
                 // stray content in a directory the daemon owns.
@@ -266,9 +283,11 @@ pub fn materialize_builtins(dir: &Path) -> io::Result<()> {
                 {
                     continue;
                 }
-                std::fs::remove_dir_all(entry.path())?;
+                std::fs::remove_dir_all(entry.path())
+                    .map_err(|e| with_path(e, "remove", &entry.path()))?;
             } else {
-                std::fs::remove_file(entry.path())?;
+                std::fs::remove_file(entry.path())
+                    .map_err(|e| with_path(e, "remove", &entry.path()))?;
             }
         }
     }
@@ -536,6 +555,35 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o600)).unwrap();
         materialize_builtins(&dir.path).unwrap();
         assert_eq!(mode_of(&dir.path.join("chat.yaml")), 0o444);
+    }
+
+    #[test]
+    fn a_read_only_leftover_temp_file_does_not_block_materializing() {
+        let dir = TempDir::new();
+        materialize_builtins(&dir.path).unwrap();
+        let chat = dir.path.join("chat.yaml");
+        std::fs::set_permissions(&chat, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&chat, "edited").unwrap();
+        let leftover = dir.path.join(".chat.yaml.choco-new");
+        std::fs::write(&leftover, "stale").unwrap();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o444)).unwrap();
+        materialize_builtins(&dir.path).unwrap();
+        assert!(!leftover.exists());
+        assert_eq!(mode_of(&chat), 0o444);
+        assert_eq!(
+            std::fs::read_to_string(&chat).unwrap(),
+            BUILTIN_WORKFLOWS[0].1
+        );
+    }
+
+    #[test]
+    fn materialize_errors_name_the_path() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(&dir.path).unwrap();
+        // A directory where the temp file must go cannot be removed with remove_file.
+        std::fs::create_dir_all(dir.path.join(".chat.yaml.choco-new")).unwrap();
+        let err = materialize_builtins(&dir.path).unwrap_err();
+        assert!(err.to_string().contains(".chat.yaml.choco-new"), "{err}");
     }
 
     #[test]

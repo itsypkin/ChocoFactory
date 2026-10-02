@@ -2379,9 +2379,8 @@ impl WorkflowEngine {
 
     /// Seeds `project_id`'s repo with the built-in workflows and their
     /// prompt files, under `<repo_path>/.chocofactory/workflows/` (issue
-    /// #88: `choco project init-workflows <project>`) — the repo-local
-    /// counterpart of the daemon's own startup seed of the global
-    /// `~/.config/chocofactory/workflows/` directory, via the same
+    /// #88: `choco project init-workflows <project>`) — an eject of the
+    /// built-ins in this version of the daemon, via the same
     /// `config_root::seed_builtin_workflows` (so a repo-local copy has the
     /// exact same never-overwrite guarantee and creates-on-first-seed
     /// behaviour). Never touches git — no add, no commit; that's left to
