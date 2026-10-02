@@ -1796,14 +1796,31 @@ async fn watch_exits_6_when_the_task_closes_without_the_target() {
 #[tokio::test]
 async fn watch_until_stuck_and_until_a_fast_stage_exit_0() {
     let (d, id) = watch_setup("stuckwf", STUCK_WF).await;
-    let out = watch_choco(&d, &id, &["--until", "stuck", "--interval", "1s"]).await;
+    let out = watch_choco(
+        &d,
+        &id,
+        &["--until", "stuck", "--interval", "1s", "--timeout", "20s"],
+    )
+    .await;
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 
     // `fast` is entered and left between polls (the task then waits at a
     // gate, so the current stage is not `fast`): only the trail clause can
     // match.
     let (d, id) = watch_setup("fastwf", FAST_WF).await;
-    let out = watch_choco(&d, &id, &["--until", "stage:fast", "--interval", "5s"]).await;
+    let out = watch_choco(
+        &d,
+        &id,
+        &[
+            "--until",
+            "stage:fast",
+            "--interval",
+            "5s",
+            "--timeout",
+            "20s",
+        ],
+    )
+    .await;
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
 
