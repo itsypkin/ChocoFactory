@@ -315,6 +315,12 @@ If no verdict arrives within six hours the task stops waiting and parks at
 it the same way instead of looping, and resuming from there starts the
 count over.
 
+The PR body `open_pr` publishes holds the coder's description and the
+internal reviewer's report. A closing keyword followed by an issue reference
+in either is rewritten (`Resolves #84` becomes `Resolves issue 84`, inside
+code blocks too, since GitHub doesn't say whether it skips code), so only the
+line the script builds from the task title can close an issue.
+
 ## Using the `choco` CLI
 
 With a daemon running, in a second shell:
@@ -331,12 +337,6 @@ the daemon's raw JSON instead — `choco` is meant to be both human-scriptable
 and agent-callable, and `--json` is the half you pipe into `jq` or parse
 from an agent. On failure it prints `error: <message>` to stderr and exits
 `1`.
-
-The PR body `open_pr` publishes holds the coder's description and the
-internal reviewer's report. A closing keyword followed by an issue reference
-in either is rewritten (`Resolves #84` becomes `Resolves issue 84`, inside
-code blocks too, since GitHub doesn't say whether it skips code), so only the
-line the script builds from the task title can close an issue.
 
 ### A full walkthrough
 

@@ -161,10 +161,15 @@ utf8_head() {
 }
 
 # Passes stdin through if it is at most $1 bytes; otherwise outputs the
-# first $1 bytes (cut at a character boundary) and a line saying so.
+# first $1 bytes (cut at a character boundary) and a line saying so. An
+# optional $2 is the real size of text that was cut before it got here: it
+# is then reported as the total, and the truncation line is always printed.
 cap() {
     cat > "$TMP/cap-in"
     total=$(wc -c < "$TMP/cap-in" | tr -d ' ')
+    if [ -n "${2:-}" ]; then
+        total=$2
+    fi
     if [ "$total" -le "$1" ]; then
         cat "$TMP/cap-in"
         return 0
@@ -173,6 +178,19 @@ cap() {
     kept=$(wc -c < "$TMP/cap-out" | tr -d ' ')
     cat "$TMP/cap-out"
     printf '\n[truncated: %s of %s bytes shown]\n' "$kept" "$total"
+}
+
+# Copies the first $1 bytes of file $2 to file $3. Writes "$3.cut": the real
+# size of $2 if it was longer than $1, otherwise empty. The caller hands that
+# to cap, so a cut is never silent and the reported total is the real one.
+bound_input() {
+    head -c "$1" "$2" > "$3"
+    size=$(wc -c < "$2" | tr -d ' ')
+    if [ "$size" -gt "$1" ]; then
+        printf '%s' "$size" > "$3.cut"
+    else
+        : > "$3.cut"
+    fi
 }
 
 # Replaces the generated block in $1 (the PR's current body) with $2 (the
@@ -253,9 +271,9 @@ DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
         # The filter's cost grows with line length, so bound its input first
         # (4x the cap; the cap still decides what is published).
         strip_markers < "$DESC" > "$TMP/desc-0"
-        head -c 65536 "$TMP/desc-0" > "$TMP/desc-1"
+        bound_input 65536 "$TMP/desc-0" "$TMP/desc-1"
         neutralize_closing_refs < "$TMP/desc-1" > "$TMP/desc-2"
-        cap 16384 < "$TMP/desc-2"
+        cap 16384 "$(cat "$TMP/desc-1.cut")" < "$TMP/desc-2"
     else
         printf '%s\n' '> **The coder wrote no description for this PR.** The internal review below and the commits are the record of what changed.'
         note "no PR description at $DESC"
@@ -270,9 +288,9 @@ DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
         printf '%s\n' '<summary>Internal reviewer'"'"'s report</summary>'
         printf '\n'
         printf '%s\n' "$PR_REVIEW_REPORT" | strip_markers > "$TMP/rep-0"
-        head -c 163840 "$TMP/rep-0" > "$TMP/rep-1"
+        bound_input 163840 "$TMP/rep-0" "$TMP/rep-1"
         neutralize_closing_refs < "$TMP/rep-1" > "$TMP/rep-2"
-        cap 40960 < "$TMP/rep-2"
+        cap 40960 "$(cat "$TMP/rep-1.cut")" < "$TMP/rep-2"
         printf '\n'
         printf '%s\n' '</details>'
     else

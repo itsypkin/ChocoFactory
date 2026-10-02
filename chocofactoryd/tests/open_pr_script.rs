@@ -570,7 +570,7 @@ fn closing_regex() -> regex::Regex {
     .unwrap()
 }
 
-const AGENT_LINES: &str = "Its message has no Closes/Fixes/Resolves #84.\nfixes: #12\nCloses owner/repo#3\ncloses https://github.com/o/r/issues/5\nFIXED #6\nresolved:#7\ncloses http://www.github.com/o/r/issues/5/\nfixes https://github.com/o/r/issues/6#issuecomment-1 tail\nresolves github.com/o/r/issues/7?x=1\nfixed:\n#78\nfixes #1 and closes #2";
+const AGENT_LINES: &str = "Its message has no Closes/Fixes/Resolves #84.\nfixes: #12\nCloses owner/repo#3\ncloses https://github.com/o/r/issues/5\nFIXED #6\nresolved:#7\ncloses http://www.github.com/o/r/issues/55/\nfixes https://github.com/o/r/issues/6#issuecomment-1 tail\nresolves github.com/o/r/issues/7?x=1\nfixed:\n#78\nfixes #1 and closes #2";
 
 fn body_for(title: &str, desc: Option<&[u8]>, report: &str) -> String {
     let fx = Fixture::new();
@@ -590,7 +590,7 @@ fn assert_rewritten(body: &str) {
         "closes o/r issue 5",
         "FIXED issue 6",
         "resolved:issue 7",
-        "closes o/r issue 5\n",
+        "closes o/r issue 55\n",
         "fixes o/r issue 6 tail",
         "resolves o/r issue 7\n",
         "fixed:\nissue 78",
@@ -701,13 +701,37 @@ fn a_failing_filter_aborts_before_any_pr_is_opened() {
     let fx = Fixture::new();
     fx.write_description(b"d\n");
     let fake = fx.root.join("bin/awk");
+    let real = Command::new("sh")
+        .args(["-c", "command -v awk"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    assert!(!real.is_empty(), "no awk on this host");
     fs::write(
         &fake,
-        "#!/bin/sh\ncase \"$*\" in *refat*) exit 2;; esac\nexec /usr/bin/awk \"$@\"\n",
+        format!("#!/bin/sh\ncase \"$*\" in *refat*) exit 2;; esac\nexec {real} \"$@\"\n"),
     )
     .unwrap();
     make_executable(&fake);
     let out = fx.run("T (#131)", "approved", "r");
     assert!(!out.status.success(), "{}", stdout(&out));
     assert!(fx.calls_to("pr create").is_empty());
+}
+
+#[test]
+fn text_cut_before_the_filter_is_never_dropped_silently() {
+    // A URL fragment swallows the long token, so the rewritten text is tiny.
+    let desc = format!(
+        "closes https://github.com/o/r/issues/5#{}\nIMPORTANT TAIL\n",
+        "a".repeat(70_000)
+    );
+    let body = body_for("T (#131)", Some(desc.as_bytes()), "r");
+    assert!(body.contains("IMPORTANT TAIL") || body.contains("[truncated: "));
+    // A plain 200 KB description reports its real size.
+    let big = "word ".repeat(40_000);
+    let body = body_for("T (#131)", Some(big.as_bytes()), "r");
+    assert!(
+        body.contains(&format!("of {} bytes shown]", big.len() + 1)),
+        "wrong or missing total"
+    );
 }
