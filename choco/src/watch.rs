@@ -351,15 +351,12 @@ fn end_message(
     Some(render::single_line(&msg))
 }
 
-/// Writes one line to stdout. A closed pipe (`| head`) ends the process
-/// quietly with the error code; any other write failure is reported the same
-/// way rather than dropped.
+/// Writes one line to stdout. A write failure (including a closed pipe,
+/// `| head`) is reported on stderr and ends the process with the error code.
 fn out_line(text: &str) {
     let mut out = std::io::stdout().lock();
     if let Err(e) = writeln!(out, "{text}").and_then(|_| out.flush()) {
-        if e.kind() != std::io::ErrorKind::BrokenPipe {
-            eprintln!("error: failed writing to stdout: {e}");
-        }
+        eprintln!("error: failed writing to stdout: {e}");
         std::process::exit(1);
     }
 }
@@ -397,7 +394,22 @@ pub async fn watch(client: &Client, args: WatchArgs<'_>) -> Result<WatchEnd, Cli
             .map_err(|e| ClientError::Decode(format!("task {}: {e}", args.id)))
     };
 
-    let detail = client.get_task(args.id).await?;
+    // The deadline bounds the first poll too: a daemon that accepts but never
+    // answers must not outlive --timeout.
+    let detail = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, client.get_task(args.id)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                eprintln!(
+                    "timed out after {} waiting for task {}: chocofactoryd did not answer",
+                    args.timeout.map(|t| t.raw.as_str()).unwrap_or("?"),
+                    args.id
+                );
+                return Ok(WatchEnd::TimedOut);
+            }
+        },
+        None => client.get_task(args.id).await?,
+    };
     let first = decode(&detail)?;
     match mode {
         Mode::Plain => out_line(&start_line(args.id, &first, Utc::now())),

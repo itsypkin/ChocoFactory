@@ -2027,3 +2027,27 @@ async fn watch_timeout_cuts_a_long_interval_short() {
     assert_eq!(code, Some(5), "stderr: {stderr}");
     assert!(started.elapsed() < Duration::from_secs(10));
 }
+
+#[tokio::test]
+async fn watch_timeout_bounds_a_first_poll_that_never_answers() {
+    let base = fake_daemon(vec![Reply::Hang]).await;
+    let child = spawn_watcher(
+        &base,
+        "t1",
+        &["--until", "closed", "--interval", "1s", "--timeout", "3s"],
+    );
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(5), "stderr: {stderr}");
+    assert!(stderr.contains("timed out"), "{stderr}");
+}
+
+#[tokio::test]
+async fn watch_closed_stdout_pipe_exits_1_with_a_message() {
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let mut child = spawn_watcher(&d.base_url, &id, &["--live", "--interval", "1s"]);
+    wait_for_first_line(&mut child).await;
+    drop(child.stdout.take());
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("failed writing to stdout"), "{stderr}");
+}
