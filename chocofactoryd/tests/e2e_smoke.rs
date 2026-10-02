@@ -27,14 +27,15 @@ impl TempHome {
         TempHome(path)
     }
 
-    /// Pre-seeds a workflow definition before the daemon starts — safe
-    /// because `seed_builtin_workflows` only ever writes `chat.yaml` when
-    /// absent (`create_new`, never overwrites), so this is untouched by
-    /// startup.
-    fn write_workflow(&self, name: &str, yaml: &str) {
-        let dir = self.0.join(".config/chocofactory/workflows");
+    /// Writes a workflow definition to `<home>/test-workflows/<name>.yaml`
+    /// and returns its path, to create a task with `"workflow_file"` (#129:
+    /// the daemon no longer reads a global workflows folder).
+    fn write_workflow(&self, name: &str, yaml: &str) -> PathBuf {
+        let dir = self.0.join("test-workflows");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
+        let path = dir.join(format!("{name}.yaml"));
+        std::fs::write(&path, yaml).unwrap();
+        path
     }
 }
 
@@ -504,7 +505,7 @@ async fn real_binary_serves_a_chat_task_end_to_end_over_http_and_ws() {
 #[tokio::test]
 async fn real_binary_pushes_a_stage_transition_over_ws_with_no_session_involved() {
     let home = TempHome::new();
-    home.write_workflow(
+    let gated_wf = home.write_workflow(
         "gated-e2e",
         r#"
 name: gated-e2e
@@ -530,7 +531,7 @@ stages:
             "/tasks",
             json!({
                 "project_id": project_id,
-                "workflow_def": "gated-e2e",
+                "workflow_file": gated_wf,
                 "title": "gated smoke",
                 "prompt": "start",
             }),
@@ -673,7 +674,7 @@ async fn real_binary_runs_a_poll_stage_until_its_command_output_changes() {
     let marker = home.0.join("checks-state");
     std::fs::write(&marker, "PENDING\n").unwrap();
 
-    home.write_workflow(
+    let poll_wf = home.write_workflow(
         "poll-e2e",
         &format!(
             r#"
@@ -712,7 +713,7 @@ stages:
             "/tasks",
             json!({
                 "project_id": project_id,
-                "workflow_def": "poll-e2e",
+                "workflow_file": poll_wf,
                 "title": "poll smoke",
                 "prompt": "start",
             }),
@@ -804,7 +805,7 @@ stages:
 #[tokio::test]
 async fn real_binary_routes_a_turn_on_its_captured_verdict_and_templates_it_onward() {
     let home = TempHome::new();
-    home.write_workflow(
+    let capture_wf = home.write_workflow(
         "capture-e2e",
         r#"
 name: capture-e2e
@@ -861,7 +862,7 @@ stages:
             "/tasks",
             json!({
                 "project_id": project_id,
-                "workflow_def": "capture-e2e",
+                "workflow_file": capture_wf,
                 "title": "capture smoke",
                 "prompt": "review this",
             }),
@@ -1268,7 +1269,7 @@ async fn real_binary_cancels_a_live_task_and_refuses_further_work() {
 
 /// A poll-entry workflow that never matches, so it only ever ends by its
 /// wall-clock `timeout`.
-fn write_never_matching_poll(home: &TempHome, timeout: &str) {
+fn write_never_matching_poll(home: &TempHome, timeout: &str) -> PathBuf {
     home.write_workflow(
         "poll-restart",
         &format!(
@@ -1291,10 +1292,10 @@ stages:
     on: {{ resumed: done }}
 "#
         ),
-    );
+    )
 }
 
-async fn create_poll_restart_task(daemon: &Daemon) -> String {
+async fn create_poll_restart_task(daemon: &Daemon, workflow_file: &std::path::Path) -> String {
     let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
     assert_eq!(status, 201);
     let (status, task) = daemon
@@ -1302,7 +1303,7 @@ async fn create_poll_restart_task(daemon: &Daemon) -> String {
             "/tasks",
             json!({
                 "project_id": project["id"].as_str().unwrap(),
-                "workflow_def": "poll-restart",
+                "workflow_file": workflow_file,
                 "title": "restart smoke",
                 "prompt": "start",
             }),
@@ -1333,10 +1334,10 @@ async fn stage_outcomes(daemon: &Daemon, task_id: &str) -> Vec<(String, Value)> 
 #[tokio::test]
 async fn real_binary_resumes_a_poll_after_a_kill_on_its_original_deadline() {
     let home = TempHome::new();
-    write_never_matching_poll(&home, "12s");
+    let poll_wf = write_never_matching_poll(&home, "12s");
     let daemon = Daemon::spawn_with_home(home).await;
     let entered = std::time::Instant::now();
-    let task_id = create_poll_restart_task(&daemon).await;
+    let task_id = create_poll_restart_task(&daemon, &poll_wf).await;
 
     tokio::time::sleep(Duration::from_secs(8)).await;
     let (home, port) = daemon.kill().await;
@@ -1373,9 +1374,9 @@ async fn real_binary_resumes_a_poll_after_a_kill_on_its_original_deadline() {
 #[tokio::test]
 async fn a_second_daemon_dies_at_the_lock_before_sweeping_polls() {
     let home = TempHome::new();
-    write_never_matching_poll(&home, "60s");
+    let poll_wf = write_never_matching_poll(&home, "60s");
     let daemon = Daemon::spawn_with_home(home).await;
-    let task_id = create_poll_restart_task(&daemon).await;
+    let task_id = create_poll_restart_task(&daemon, &poll_wf).await;
 
     let home_path = daemon.home.as_ref().unwrap().0.clone();
     let mut second = spawn_raw(
@@ -1557,7 +1558,7 @@ async fn spawn_agent_daemon(home: TempHome, fixture: &AgentFixture) -> Daemon {
     Daemon::spawn_with_home_and_env(home, &env).await
 }
 
-async fn create_task(daemon: &Daemon, workflow: &str) -> String {
+async fn create_task(daemon: &Daemon, workflow_file: &std::path::Path) -> String {
     let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
     assert_eq!(status, 201);
     let (status, task) = daemon
@@ -1565,7 +1566,7 @@ async fn create_task(daemon: &Daemon, workflow: &str) -> String {
             "/tasks",
             json!({
                 "project_id": project["id"].as_str().unwrap(),
-                "workflow_def": workflow,
+                "workflow_file": workflow_file,
                 "title": "lifecycle smoke",
                 "prompt": "go",
             }),
@@ -1578,17 +1579,17 @@ async fn create_task(daemon: &Daemon, workflow: &str) -> String {
 #[tokio::test]
 async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
     let home = TempHome::new();
-    write_never_matching_poll(&home, "60s");
+    let poll_wf = write_never_matching_poll(&home, "60s");
     let daemon = Daemon::spawn_with_home(home).await;
-    let task_id = create_poll_restart_task(&daemon).await;
+    let task_id = create_poll_restart_task(&daemon, &poll_wf).await;
     let before = stage_outcomes(&daemon, &task_id).await;
 
     // State the second daemon must not touch before it is refused: an
     // `active` session (session recovery would flip it) and a deleted
-    // seeded workflow (seeding would recreate it).
+    // built-in (materializing would recreate it).
     let home_path = daemon.home.as_ref().unwrap().0.clone();
-    let chat_yaml = home_path.join(".config/chocofactory/workflows/chat.yaml");
-    std::fs::remove_file(&chat_yaml).expect("the first daemon seeds chat.yaml");
+    let chat_yaml = home_path.join(".config/chocofactory/.builtin-workflows/chat.yaml");
+    std::fs::remove_file(&chat_yaml).expect("the first daemon materializes chat.yaml");
     let db_url = format!(
         "sqlite://{}",
         home_path
@@ -1624,7 +1625,7 @@ async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
     let first_pid = daemon.child.id().unwrap();
     assert!(stderr.contains(&format!("pid {first_pid}")), "{stderr}");
     for forbidden in [
-        "seeded builtin workflows",
+        "built-in workflows ready",
         "connected to database",
         "recovered stale active sessions",
     ] {
@@ -1634,7 +1635,7 @@ async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
     assert_eq!(stage_outcomes(&daemon, &task_id).await, before);
     assert!(
         !chat_yaml.exists(),
-        "the refused daemon re-seeded chat.yaml"
+        "the refused daemon rewrote the built-ins"
     );
     let status: String =
         sqlx::query_scalar("SELECT status FROM sessions WHERE id = 'planted-active'")
@@ -1647,10 +1648,10 @@ async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
 #[tokio::test]
 async fn sigterm_mid_agent_turn_stops_the_agent_and_parks_the_task_for_retry() {
     let home = TempHome::new();
-    home.write_workflow("agent-e2e", AGENT_TURN_WORKFLOW);
+    let agent_wf = home.write_workflow("agent-e2e", AGENT_TURN_WORKFLOW);
     let fixture = AgentFixture::new(&home);
     let daemon = spawn_agent_daemon(home, &fixture).await;
-    let task_id = create_task(&daemon, "agent-e2e").await;
+    let task_id = create_task(&daemon, &agent_wf).await;
 
     let agent_pid = read_pid_file(&fixture.agent_pid).await;
     let child_pid = read_pid_file(&fixture.child_pid).await;
@@ -1681,7 +1682,7 @@ async fn sigterm_mid_agent_turn_stops_the_agent_and_parks_the_task_for_retry() {
 async fn sigterm_mid_shell_stage_kills_the_command_and_parks_the_task() {
     let home = TempHome::new();
     let gc = home.0.join("gc");
-    home.write_workflow(
+    let shell_wf = home.write_workflow(
         "shell-e2e",
         &format!(
             r#"
@@ -1698,7 +1699,7 @@ stages:
         ),
     );
     let daemon = Daemon::spawn_with_home(home).await;
-    let task_id = create_task(&daemon, "shell-e2e").await;
+    let task_id = create_task(&daemon, &shell_wf).await;
     let grandchild = read_pid_file(&gc).await;
     let _guard = PidGuard(vec![grandchild]);
     assert!(pid_alive(grandchild));
@@ -1732,10 +1733,10 @@ stages:
 #[tokio::test]
 async fn sigkill_mid_agent_turn_is_parked_at_the_next_start() {
     let home = TempHome::new();
-    home.write_workflow("agent-e2e", AGENT_TURN_WORKFLOW);
+    let agent_wf = home.write_workflow("agent-e2e", AGENT_TURN_WORKFLOW);
     let fixture = AgentFixture::new(&home);
     let daemon = spawn_agent_daemon(home, &fixture).await;
-    let task_id = create_task(&daemon, "agent-e2e").await;
+    let task_id = create_task(&daemon, &agent_wf).await;
     let agent_pid = read_pid_file(&fixture.agent_pid).await;
     let child_pid = read_pid_file(&fixture.child_pid).await;
     // Killed by the test itself, since the daemon never got to.
@@ -1902,5 +1903,309 @@ async fn piped_stderr_carries_no_ansi_escapes() {
     assert!(
         !stderr.contains("\x1b["),
         "ANSI escapes in piped stderr: {stderr:?}"
+    );
+}
+
+// ---- #129: built-in workflows come from the binary ----
+
+/// A fresh `$HOME`: startup writes the built-ins into the private
+/// `.builtin-workflows/` copy, never creates `workflows/`, and a `chat` task
+/// records a `builtin:` reference.
+#[tokio::test]
+async fn real_binary_materializes_the_builtins_and_does_not_create_the_old_folder() {
+    let daemon = Daemon::spawn().await;
+    let root = daemon.home.as_ref().unwrap().0.join(".config/chocofactory");
+    let builtins = root.join(".builtin-workflows");
+
+    for (relative, source, _) in chocofactoryd::config_root::builtin_files() {
+        assert_eq!(
+            std::fs::read_to_string(builtins.join(&relative)).unwrap(),
+            source,
+            "{relative:?}"
+        );
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let script = builtins.join("scripts/open-pr.sh");
+    assert!(script.metadata().unwrap().permissions().mode() & 0o111 != 0);
+    assert!(builtins.join("README.txt").is_file());
+    assert!(
+        !root.join("workflows").exists(),
+        "the daemon must not create the old workflows folder"
+    );
+
+    let (_, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project["id"].as_str().unwrap(),
+                "workflow_def": "chat",
+                "title": "t",
+                "prompt": "hi",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{task}");
+    assert_eq!(
+        task["workflow_path"],
+        format!("builtin:chat@{}", chocofactory_core::version::VERSION)
+    );
+}
+
+async fn start_daemon_for_report(
+    home: &std::path::Path,
+    client: &reqwest::Client,
+) -> (tokio::process::Child, String) {
+    let port = free_port();
+    let child = spawn_raw(
+        home,
+        &[
+            ("CHOCOFACTORY_PORT", &port.to_string()),
+            ("RUST_LOG", "info"),
+        ],
+    );
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(resp) = client.get(format!("{base}/projects")).send().await
+            && resp.status().is_success()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never became ready"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    (child, base)
+}
+
+/// A task whose recorded workflow path is inside the old folder is counted by
+/// the startup report after a restart.
+#[tokio::test]
+async fn real_binary_counts_tasks_still_using_the_old_workflows_folder() {
+    let home = TempHome::new();
+    let old = home.0.join(".config/chocofactory/workflows");
+    std::fs::create_dir_all(&old).unwrap();
+    let custom = old.join("chat.yaml");
+    let chat = chocofactoryd::config_root::builtin_files()
+        .into_iter()
+        .find(|(relative, _, _)| relative == std::path::Path::new("chat.yaml"))
+        .unwrap()
+        .1;
+    std::fs::write(&custom, chat).unwrap();
+    let client = reqwest::Client::new();
+
+    let (mut child, base) = start_daemon_for_report(&home.0, &client).await;
+    let project: Value = client
+        .post(format!("{base}/projects"))
+        .json(&json!({ "name": "demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&json!({
+            "project_id": project["id"].as_str().unwrap(),
+            "workflow_file": custom.to_str().unwrap(),
+            "title": "t",
+            "prompt": "hi",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{:?}", resp.text().await);
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+
+    let (mut child, _base) = start_daemon_for_report(&home.0, &client).await;
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(
+        stderr.contains("1 tasks still use workflows in"),
+        "{stderr}"
+    );
+}
+
+/// Pre-#88 tasks (no recorded path) count as using the old folder only when
+/// `<folder>/<workflow_def>.yaml` exists.
+#[tokio::test]
+async fn real_binary_counts_null_path_tasks_only_when_the_old_file_exists() {
+    let home = TempHome::new();
+    let cfg = home.0.join(".config/chocofactory");
+    let client = reqwest::Client::new();
+
+    let (mut child, base) = start_daemon_for_report(&home.0, &client).await;
+    let project: Value = client
+        .post(format!("{base}/projects"))
+        .json(&json!({ "name": "demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&json!({
+            "project_id": project["id"].as_str().unwrap(),
+            "workflow_def": "chat",
+            "title": "t",
+            "prompt": "hi",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{:?}", resp.text().await);
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        cfg.join("chocofactory.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE tasks SET workflow_path = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    // Old folder exists (so the scan runs and reaches the count) but has no
+    // chat.yaml: not counted.
+    let old = cfg.join("workflows");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("other.yaml"), "name: other\n").unwrap();
+    let (mut child, _base) = start_daemon_for_report(&home.0, &client).await;
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(!stderr.contains("tasks still use workflows in"), "{stderr}");
+
+    // With the old file present: counted.
+    std::fs::write(old.join("chat.yaml"), "name: chat\n").unwrap();
+    let (mut child, _base) = start_daemon_for_report(&home.0, &client).await;
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(
+        stderr.contains("1 tasks still use workflows in"),
+        "{stderr}"
+    );
+}
+
+/// A `$HOME` that still has the old folder: an edited `chat.yaml` is warned
+/// about with both remedies, an identical `coding-task.yaml` is counted as a
+/// stale copy, nothing in the folder is touched, and a new `chat` task uses
+/// the built-in rather than the edited copy.
+#[tokio::test]
+async fn real_binary_reports_the_old_workflows_folder_and_leaves_it_alone() {
+    let home = TempHome::new();
+    let old = home.0.join(".config/chocofactory/workflows");
+    std::fs::create_dir_all(&old).unwrap();
+    let coding_task = chocofactoryd::config_root::builtin_files()
+        .into_iter()
+        .find(|(relative, _, _)| relative == std::path::Path::new("coding-task.yaml"))
+        .unwrap()
+        .1;
+    std::fs::write(old.join("coding-task.yaml"), coding_task).unwrap();
+    let edited = "name: chat\nstages:\n  other_stage:\n    kind: terminal\n";
+    std::fs::write(old.join("chat.yaml"), edited).unwrap();
+
+    let port = free_port();
+    let mut child = spawn_raw(
+        &home.0,
+        &[
+            ("CHOCOFACTORY_PORT", &port.to_string()),
+            ("RUST_LOG", "info"),
+        ],
+    );
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(resp) = client.get(format!("{base}/projects")).send().await
+            && resp.status().is_success()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon never became ready"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let project: Value = client
+        .post(format!("{base}/projects"))
+        .json(&json!({ "name": "demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task: Value = client
+        .post(format!("{base}/tasks"))
+        .json(&json!({
+            "project_id": project["id"].as_str().unwrap(),
+            "workflow_def": "chat",
+            "title": "t",
+            "prompt": "hi",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        task["workflow_path"],
+        format!("builtin:chat@{}", chocofactory_core::version::VERSION),
+        "{task}"
+    );
+
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+    let stderr = read_stderr_to_string(&mut child).await;
+
+    let warnings: Vec<&str> = stderr.lines().filter(|l| l.contains("WARN")).collect();
+    let chat_warnings: Vec<&&str> = warnings
+        .iter()
+        .filter(|l| l.contains("chat.yaml"))
+        .collect();
+    assert_eq!(chat_warnings.len(), 1, "{stderr}");
+    assert!(
+        chat_warnings[0].contains("is no longer read (#129)"),
+        "{stderr}"
+    );
+    assert!(
+        chat_warnings[0].contains("choco task create --workflow"),
+        "{stderr}"
+    );
+    assert!(
+        chat_warnings[0].contains("move it with its prompts/ and scripts/ into a repo's"),
+        "{stderr}"
+    );
+    assert!(
+        !warnings.iter().any(|l| l.contains("coding-task.yaml")),
+        "the identical copy is not a warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("ignoring 1 stale copies of built-in workflows"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(old.join("chat.yaml")).unwrap(),
+        edited
+    );
+    assert_eq!(
+        std::fs::read_to_string(old.join("coding-task.yaml")).unwrap(),
+        coding_task
     );
 }

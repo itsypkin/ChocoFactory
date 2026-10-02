@@ -162,21 +162,15 @@ async fn main() {
         })
         .expect("chocofactoryd: failed to write the lock file");
 
-    let workflows_dir = root.join("workflows");
     tracing::info!(root = %root.display(), "starting chocofactoryd");
 
-    // Once before serving any request (P1-9): the built-ins ship compiled
-    // into this binary and are seeded out to the user's own workflows
-    // directory only if not already present (§2.2) — never overwritten on
-    // a later version's startup.
-    let seed_report = config_root::seed_builtin_workflows(&workflows_dir)
-        .expect("chocofactoryd: failed to seed builtin workflow definitions");
-    tracing::info!(
-        dir = %workflows_dir.display(),
-        created = seed_report.created.len(),
-        existing = seed_report.existing.len(),
-        "seeded builtin workflows"
-    );
+    // The built-ins ship compiled into this binary. Regenerated at every
+    // start into a private read-only directory, before anything loads a
+    // workflow (#129): the lock above makes this the only writer.
+    let builtin_dir = root.join(".builtin-workflows");
+    config_root::materialize_builtins(&builtin_dir)
+        .expect("chocofactoryd: failed to write the built-in workflows");
+    tracing::info!(dir = %builtin_dir.display(), "built-in workflows ready");
 
     let db_path = root.join("chocofactory.db");
     let pool = db::connect(&db_path)
@@ -190,6 +184,8 @@ async fn main() {
         .await
         .expect("chocofactoryd: failed to recover stale active sessions");
     tracing::info!(recovered, "recovered stale active sessions");
+
+    report_legacy_workflows(&pool, &root.join("workflows")).await;
 
     let events_notify = Arc::new(Notify::new());
     let mut claude_adapter = match claude_binary_override() {
@@ -210,10 +206,11 @@ async fn main() {
     let engine = WorkflowEngine::new(
         pool.clone(),
         Arc::clone(&session_manager),
-        workflows_dir,
+        builtin_dir,
         GlobalConfig::default_path(),
         Arc::clone(&events_notify),
-    );
+    )
+    .with_legacy_workflows_dir(root.join("workflows"));
 
     tokio::spawn(Arc::clone(&session_manager).run_idle_reaper(IdleReaperConfig::default()));
     tokio::spawn(retention::run_retention_job(
@@ -286,4 +283,95 @@ async fn main() {
     engine.abort_all_detached_runners().await;
     drop(daemon_lock);
     tracing::info!("chocofactoryd stopped");
+}
+
+/// Reports on the old global workflows folder (#129), which is no longer
+/// read. A report, not a precondition: a scan I/O error is logged at `error`
+/// and startup continues, because nothing here changes what the daemon does.
+async fn report_legacy_workflows(pool: &sqlx::SqlitePool, legacy_dir: &std::path::Path) {
+    let scan = match config_root::scan_legacy_workflows(legacy_dir) {
+        Ok(Some(scan)) => scan,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::error!(
+                dir = %legacy_dir.display(), %err,
+                "could not scan the old workflows folder; startup continues"
+            );
+            return;
+        }
+    };
+    let dir = scan.dir.display();
+    if scan.stale > 0 {
+        tracing::info!(
+            "ignoring {} stale copies of built-in workflows in {dir}: the folder is no longer \
+             read (#129) and is safe to delete once no task uses it",
+            scan.stale
+        );
+    }
+    for path in scan.other.iter().filter(|p| !is_hidden_file(p)) {
+        tracing::warn!(
+            "{} differs from the current built-in (edited, or left over from an older version) \
+             and is no longer read (#129). To keep using it, pass `choco task create --workflow \
+             <path-to-its-workflow.yaml>` (prompts and scripts resolve next to it), or move it \
+             with its prompts/ and scripts/ into a repo's .chocofactory/workflows/",
+            path.display()
+        );
+    }
+    let canonical = std::fs::canonicalize(&scan.dir).unwrap_or_else(|err| {
+        tracing::error!(%err, "could not canonicalize the old workflows folder; matching tasks by its plain path");
+        scan.dir.clone()
+    });
+    let prefix = legacy_prefix(&canonical);
+    let mut in_use = tasks_using_prefix(pool, &prefix).await;
+    // Pre-#88 tasks have no recorded path and still load `<folder>/<name>.yaml`.
+    let legacy_defs = db::tasks::active_workflow_defs_without_path(pool)
+        .await
+        .expect("chocofactoryd: failed to list tasks without a recorded workflow path");
+    in_use += legacy_defs
+        .iter()
+        .filter(|name| scan.dir.join(format!("{name}.yaml")).is_file())
+        .count() as i64;
+    if in_use > 0 {
+        tracing::warn!(
+            "{in_use} tasks still use workflows in {dir}; leave it in place until they finish"
+        );
+    }
+}
+
+/// Dotfiles such as `.DS_Store` are not workflows; don't warn about them.
+fn is_hidden_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+}
+
+/// The recorded-path prefix of tasks living in `folder`: the trailing `/`
+/// keeps a sibling such as `workflows2/` from matching.
+fn legacy_prefix(folder: &std::path::Path) -> String {
+    format!("{}/", folder.display())
+}
+
+async fn tasks_using_prefix(pool: &sqlx::SqlitePool, prefix: &str) -> i64 {
+    db::tasks::count_active_with_workflow_path_prefix(pool, prefix)
+        .await
+        .expect("chocofactoryd: failed to count tasks using the old workflows folder")
+}
+
+#[cfg(test)]
+mod legacy_report_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn prefix_ends_with_a_slash_so_siblings_do_not_match() {
+        let prefix = legacy_prefix(Path::new("/c/workflows"));
+        assert_eq!(prefix, "/c/workflows/");
+        assert!(!"/c/workflows2/x.yaml".starts_with(&prefix));
+        assert!("/c/workflows/x.yaml".starts_with(&prefix));
+    }
+
+    #[test]
+    fn dotfiles_are_hidden() {
+        assert!(is_hidden_file(Path::new("/c/workflows/.DS_Store")));
+        assert!(!is_hidden_file(Path::new("/c/workflows/chat.yaml")));
+    }
 }

@@ -261,7 +261,9 @@ pub fn task_detail(detail: &Value) -> String {
     // own.
     if let Some(path) = detail.get("workflow_path").and_then(Value::as_str) {
         let mut line = path.to_string();
+        let builtin = path.starts_with("builtin:");
         match detail.get("workflow_file_status").and_then(Value::as_str) {
+            Some("changed") if builtin => line.push_str(" (built-in updated since task start)"),
             Some("changed") => line.push_str(" (changed since task start)"),
             Some("missing") => line.push_str(" (missing)"),
             _ => {}
@@ -269,7 +271,7 @@ pub fn task_detail(detail: &Value) -> String {
         if let Some(sha) = detail.get("workflow_sha256").and_then(Value::as_str) {
             line.push_str(&format!("  [{}]", &sha[..sha.len().min(12)]));
         }
-        pairs.push(("Workflow file", line));
+        pairs.push((if builtin { "Workflow" } else { "Workflow file" }, line));
     }
     pairs.push(("Status", get("status").to_string()));
     // Right after Status, so the reason for a stuck task (X-4, #61) reads
@@ -1007,6 +1009,25 @@ mod tests {
         let rendered = task_detail(&missing);
         assert!(rendered.contains("(missing)"), "{rendered}");
         assert!(!rendered.contains("changed since task start"), "{rendered}");
+    }
+
+    #[test]
+    fn task_detail_labels_a_builtin_and_flags_an_update() {
+        let detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+            "workflow_path": "builtin:chat@1.0.0",
+            "workflow_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
+            "workflow_file_status": "changed",
+        });
+        let rendered = task_detail(&detail);
+        assert!(!rendered.contains("Workflow file"), "{rendered}");
+        assert!(rendered.contains("builtin:chat@1.0.0"), "{rendered}");
+        assert!(
+            rendered.contains("(built-in updated since task start)"),
+            "{rendered}"
+        );
     }
 
     /// A legacy task (predating issue #88) has `workflow_path: null` and no

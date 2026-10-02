@@ -262,10 +262,11 @@ pub struct TaskCreateArgs {
     /// `project list`, and is rejected if it matches more than one project.
     #[arg(long)]
     pub project: String,
-    /// Workflow definition name — looked up in the project's own repo
-    /// first (`<repo>/.chocofactory/workflows/<name>.yaml`, issue #88), then
-    /// in the global `~/.config/chocofactory/workflows/<name>.yaml`. Not a
-    /// fixed set either way.
+    /// A workflow name, or a path to a workflow `.yaml` file. A name resolves
+    /// to `<repo>/.chocofactory/workflows/<name>.yaml` when the project has
+    /// a repo, else to the built-in of that name. A path (anything
+    /// containing `/` or ending in `.yaml` or `.yml`) is used as is; its
+    /// prompts and scripts resolve next to it.
     #[arg(long)]
     pub workflow: String,
     #[arg(long)]
@@ -363,8 +364,9 @@ pub enum ProjectCmd {
     /// Seed this project's repo with the built-in workflows and their
     /// prompt files, under `<repo>/.chocofactory/workflows/` (issue #88).
     ///
-    /// Never overwrites an existing file — safe to run again after an
-    /// upgrade adds new built-ins, or just to check what's already there.
+    /// Never overwrites an existing file. Copies the built-ins in this
+    /// version of chocofactoryd as a starting point (an eject); later
+    /// upgrades don't change the copies.
     /// The seeded directory is meant to be committed and shared with the
     /// team: `git add .chocofactory/ && git commit`.
     InitWorkflows {

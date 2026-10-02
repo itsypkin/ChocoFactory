@@ -245,6 +245,12 @@ stages:
             std::fs::write(self.workflows_dir.0.join("chat.yaml"), CHAT_WORKFLOW_YAML).unwrap();
         }
 
+        /// Where this server's built-in `<name>.yaml` lives (the engine's
+        /// built-in directory), for tests that edit or delete it.
+        pub fn builtin_workflow_path(&self, name: &str) -> PathBuf {
+            self.workflows_dir.0.join(format!("{name}.yaml"))
+        }
+
         pub fn write_workflow(&self, name: &str, yaml: &str) {
             std::fs::write(self.workflows_dir.0.join(format!("{name}.yaml")), yaml).unwrap();
         }

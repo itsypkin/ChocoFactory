@@ -114,11 +114,16 @@ pub struct WorkflowEngine {
     /// `human_gate` relay) could both read the same row and then both
     /// write, silently clobbering one call's `loop_counters`.
     task_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Where `create_task`/`send_message` resolve a `workflow_def` name to
-    /// a file (P1-8 LLD §2.6/§2.8) — the *seeded* user directory
-    /// (`~/.config/chocofactory/workflows/` in production), never a
-    /// repo-relative path.
-    workflows_dir: PathBuf,
+    /// The directory of built-in workflows (#129): the daemon's regenerated
+    /// private copy of the workflows embedded in its binary
+    /// (`<config root>/.builtin-workflows/` in production), or a test's own
+    /// directory in tests. Real files, so prompt and script references
+    /// resolve next to the YAML exactly as for a repo workflow.
+    builtin_dir: PathBuf,
+    /// The old global `~/.config/chocofactory/workflows/` folder. Used only
+    /// to load a pre-#88 task (`workflow_path` NULL) that was created
+    /// against it; never consulted to resolve a new task.
+    legacy_workflows_dir: Option<PathBuf>,
     /// `None` means "no global config file configured" (e.g. `$HOME`
     /// unset, or a test that doesn't care) — treated the same as a
     /// missing file: role resolution just gets no global defaults.
@@ -334,7 +339,7 @@ impl EngineError {
 
 /// The one allowlist (`^[A-Za-z0-9_-]+$`) every `workflow_def` name is
 /// checked against before it ever touches the filesystem (P1-8 LLD §2.8),
-/// shared by [`resolve_workflow_path`] and [`resolve_task_workflow`]. Not
+/// used by [`resolve_task_workflow`] and [`parse_builtin_ref`]. Not
 /// the workflow loader's absolute-path/`..` blocklist
 /// (`workflow_def.rs::resolve_file`/`fileref::resolve_relative`): `name` is
 /// a single opaque identifier that arrives straight from an HTTP request
@@ -348,78 +353,114 @@ fn is_valid_workflow_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// A `workflow_def` name resolved to a file under a single directory,
-/// `workflows_dir` — the global `~/.config/chocofactory/workflows/`
-/// candidate [`resolve_task_workflow`] falls back to, and the whole
-/// resolution a legacy task (`workflow_path: NULL`) still uses (`load_task_workflow`).
-fn resolve_workflow_path(workflows_dir: &Path, name: &str) -> Result<PathBuf, ResolveError> {
-    if !is_valid_workflow_name(name) {
-        return Err(ResolveError::InvalidName(name.to_string()));
-    }
-    let path = workflows_dir.join(format!("{name}.yaml"));
-    if !path.is_file() {
-        return Err(workflow_not_found(name, std::slice::from_ref(&path)));
-    }
-    Ok(path)
+/// Where a workflow name resolved to at task creation (#129).
+#[derive(Debug, PartialEq, Eq)]
+enum ResolvedWorkflow {
+    /// `<repo>/.chocofactory/workflows/<name>.yaml`; recorded by canonical path.
+    Repo(PathBuf),
+    /// `<builtin_dir>/<name>.yaml`; recorded as `builtin:<name>@<VERSION>`.
+    Builtin(PathBuf),
 }
 
-/// A `workflow_def` name resolved against a task's *project* (issue #88):
+/// A `workflow_def` name resolved against a task's *project* (#88, #129):
 /// `<project.repo_path>/.chocofactory/workflows/<name>.yaml` first (when the
-/// project has a repo), then the global `workflows_dir`, same as
-/// [`resolve_workflow_path`] alone. Returns the first candidate that
-/// exists; used only at task-creation time (`create_task`) — every later
-/// reload of an existing task's workflow goes through `WorkflowEngine::
-/// load_task_workflow` instead, which reads the *recorded* path rather than
-/// searching again.
-///
-/// The candidate list is a small, ordered `Vec` precisely so a future
-/// source (e.g. a task's own worktree) can be added without touching
-/// anything downstream of it — nothing here assumes exactly two
-/// directories, or that a repo/global split is the only shape resolution
-/// will ever have.
+/// project has a repo), then the built-in of that name in `builtin_dir`.
+/// The old global workflows folder is never consulted. Used only at
+/// task-creation time (`create_task_from`) — every later reload goes through
+/// `WorkflowEngine::load_task_workflow`, which reads the *recorded* value.
 fn resolve_task_workflow(
-    workflows_dir: &Path,
+    builtin_dir: &Path,
     project: &Project,
     name: &str,
-) -> Result<PathBuf, ResolveError> {
+) -> Result<ResolvedWorkflow, ResolveError> {
     if !is_valid_workflow_name(name) {
         return Err(ResolveError::InvalidName(name.to_string()));
     }
-
-    let mut candidate_dirs: Vec<PathBuf> = Vec::new();
-    if let Some(repo_path) = &project.repo_path {
-        candidate_dirs.push(Path::new(repo_path).join(".chocofactory").join("workflows"));
+    let repo_candidate = project.repo_path.as_ref().map(|repo_path| {
+        Path::new(repo_path)
+            .join(".chocofactory")
+            .join("workflows")
+            .join(format!("{name}.yaml"))
+    });
+    if let Some(path) = &repo_candidate
+        && path.is_file()
+    {
+        return Ok(ResolvedWorkflow::Repo(path.clone()));
     }
-    candidate_dirs.push(workflows_dir.to_path_buf());
-
-    let mut tried = Vec::with_capacity(candidate_dirs.len());
-    for dir in &candidate_dirs {
-        let path = dir.join(format!("{name}.yaml"));
-        if path.is_file() {
-            return Ok(path);
-        }
-        tried.push(path);
+    let builtin = builtin_dir.join(format!("{name}.yaml"));
+    if builtin.is_file() {
+        return Ok(ResolvedWorkflow::Builtin(builtin));
     }
-    Err(workflow_not_found(name, &tried))
+    Err(workflow_not_found(
+        name,
+        repo_candidate.as_deref(),
+        builtin_dir,
+    ))
 }
 
-/// Builds a [`ResolveError::NotFound`] whose message names every path that
-/// was searched, so a 404 (or an engine test) says exactly where to look
-/// rather than just the bare name that wasn't found anywhere.
-fn workflow_not_found(name: &str, tried: &[PathBuf]) -> ResolveError {
-    let paths: Vec<String> = tried.iter().map(|p| p.display().to_string()).collect();
+/// Builds a [`ResolveError::NotFound`] naming the repo path that was tried
+/// (if any) and the built-in workflows that exist.
+fn workflow_not_found(
+    name: &str,
+    repo_candidate: Option<&Path>,
+    builtin_dir: &Path,
+) -> ResolveError {
+    let mut names: Vec<String> = fs::read_dir(builtin_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                path.file_stem().map(|s| s.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    let looked = match repo_candidate {
+        Some(path) => format!("looked in {}; ", path.display()),
+        None => String::new(),
+    };
     ResolveError::NotFound(format!(
-        "no workflow named '{name}' was found (looked in: {})",
-        paths.join(", ")
+        "no workflow named '{name}' ({looked}built-in workflows: {})",
+        names.join(", ")
     ))
+}
+
+/// Prefix of a `tasks.workflow_path` that names a built-in rather than a file.
+const BUILTIN_PREFIX: &str = "builtin:";
+
+/// The `workflow_path` recorded for a task running a built-in (#129).
+fn builtin_ref(name: &str) -> String {
+    format!(
+        "{BUILTIN_PREFIX}{name}@{}",
+        chocofactory_core::version::VERSION
+    )
+}
+
+/// The name in a `builtin:<name>@<anything>` record; `None` for anything
+/// else, including a name that fails [`is_valid_workflow_name`].
+pub(crate) fn parse_builtin_ref(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix(BUILTIN_PREFIX)?;
+    let (name, _version) = rest.split_once('@')?;
+    is_valid_workflow_name(name).then_some(name)
+}
+
+/// What a task should run: a workflow by name, or an explicit file (#129).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowRef {
+    Name(String),
+    File(PathBuf),
 }
 
 #[derive(Debug)]
 pub enum ResolveError {
     InvalidName(String),
-    /// No candidate directory had `<name>.yaml`. The message (built by
-    /// [`workflow_not_found`]) already lists every path that was tried, so
-    /// `Display` prints it verbatim rather than re-wrapping it.
+    /// Neither the repo nor the built-ins had `<name>.yaml`. The message
+    /// (built by [`workflow_not_found`]) says where it looked, so `Display`
+    /// prints it verbatim.
     NotFound(String),
 }
 
@@ -472,6 +513,9 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 pub enum CreateTaskError {
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
+    /// `WorkflowRef::File` was given a relative path; the daemon's working
+    /// directory is meaningless to the caller, so it must be absolute.
+    WorkflowFileNotAbsolute(PathBuf),
     /// `project_id` doesn't reference an existing project. Checked
     /// explicitly (P1-9 review) rather than left to surface as whatever
     /// `sqlx::Error` a raw `tasks.project_id` foreign-key violation
@@ -505,6 +549,11 @@ impl fmt::Display for CreateTaskError {
         match self {
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
+            CreateTaskError::WorkflowFileNotAbsolute(path) => write!(
+                f,
+                "workflow file path '{}' must be absolute",
+                path.display()
+            ),
             CreateTaskError::NoSuchProject(id) => write!(f, "no such project '{id}'"),
             CreateTaskError::Db(err) => write!(f, "{err}"),
             CreateTaskError::Canonicalize { path, source } => write!(
@@ -570,6 +619,8 @@ pub enum SendMessageError {
     /// longer exists. Deliberately not a fallback to a fresh name lookup —
     /// see `LoadTaskWorkflowError::MissingFile`.
     MissingWorkflowFile(PathBuf),
+    /// The task's built-in workflow is not part of this daemon version.
+    BuiltinWorkflowGone(String),
     RoleConfig(RoleConfigError),
     GlobalConfig(GlobalConfigError),
     Session(SessionError),
@@ -626,6 +677,10 @@ impl fmt::Display for SendMessageError {
                 "this task's recorded workflow file is missing: {}",
                 path.display()
             ),
+            SendMessageError::BuiltinWorkflowGone(name) => write!(
+                f,
+                "the built-in workflow '{name}' is not part of this version of chocofactoryd"
+            ),
             SendMessageError::RoleConfig(err) => write!(f, "{err}"),
             SendMessageError::GlobalConfig(err) => write!(f, "{err}"),
             SendMessageError::Session(err) => write!(f, "{err}"),
@@ -655,6 +710,7 @@ impl From<LoadTaskWorkflowError> for SendMessageError {
             LoadTaskWorkflowError::Resolve(err) => SendMessageError::Resolve(err),
             LoadTaskWorkflowError::WorkflowDef(err) => SendMessageError::WorkflowDef(err),
             LoadTaskWorkflowError::MissingFile(path) => SendMessageError::MissingWorkflowFile(path),
+            LoadTaskWorkflowError::BuiltinGone(name) => SendMessageError::BuiltinWorkflowGone(name),
         }
     }
 }
@@ -689,6 +745,8 @@ pub enum SendMessageOrResumeError {
     /// This task's recorded `workflow_path` (issue #88) names a file that no
     /// longer exists — see `LoadTaskWorkflowError::MissingFile`.
     MissingWorkflowFile(PathBuf),
+    /// The task's built-in workflow is not part of this daemon version.
+    BuiltinWorkflowGone(String),
     Db(sqlx::Error),
     SendMessage(SendMessageError),
     Advance(EngineError),
@@ -735,6 +793,10 @@ impl fmt::Display for SendMessageOrResumeError {
                 "this task's recorded workflow file is missing: {}",
                 path.display()
             ),
+            SendMessageOrResumeError::BuiltinWorkflowGone(name) => write!(
+                f,
+                "the built-in workflow '{name}' is not part of this version of chocofactoryd"
+            ),
             SendMessageOrResumeError::Db(err) => write!(f, "{err}"),
             SendMessageOrResumeError::SendMessage(err) => write!(f, "{err}"),
             SendMessageOrResumeError::Advance(err) => write!(f, "{err}"),
@@ -757,6 +819,9 @@ impl From<LoadTaskWorkflowError> for SendMessageOrResumeError {
             LoadTaskWorkflowError::WorkflowDef(err) => SendMessageOrResumeError::WorkflowDef(err),
             LoadTaskWorkflowError::MissingFile(path) => {
                 SendMessageOrResumeError::MissingWorkflowFile(path)
+            }
+            LoadTaskWorkflowError::BuiltinGone(name) => {
+                SendMessageOrResumeError::BuiltinWorkflowGone(name)
             }
         }
     }
@@ -823,6 +888,8 @@ pub enum RetryTaskError {
     /// This task's recorded `workflow_path` (issue #88) names a file that no
     /// longer exists — see `LoadTaskWorkflowError::MissingFile`.
     MissingWorkflowFile(PathBuf),
+    /// The task's built-in workflow is not part of this daemon version.
+    BuiltinWorkflowGone(String),
     Db(sqlx::Error),
     /// Re-entering the stage itself failed. `retry_task` marks the task
     /// stuck again before returning this.
@@ -860,6 +927,10 @@ impl fmt::Display for RetryTaskError {
                 "this task's recorded workflow file is missing: {}",
                 path.display()
             ),
+            RetryTaskError::BuiltinWorkflowGone(name) => write!(
+                f,
+                "the built-in workflow '{name}' is not part of this version of chocofactoryd"
+            ),
             RetryTaskError::Db(err) => write!(f, "{err}"),
             RetryTaskError::Enter(err) => write!(f, "{err}"),
             RetryTaskError::NotResumable(why) => {
@@ -877,6 +948,7 @@ impl From<LoadTaskWorkflowError> for RetryTaskError {
             LoadTaskWorkflowError::Resolve(err) => RetryTaskError::Resolve(err),
             LoadTaskWorkflowError::WorkflowDef(err) => RetryTaskError::WorkflowDef(err),
             LoadTaskWorkflowError::MissingFile(path) => RetryTaskError::MissingWorkflowFile(path),
+            LoadTaskWorkflowError::BuiltinGone(name) => RetryTaskError::BuiltinWorkflowGone(name),
         }
     }
 }
@@ -967,6 +1039,9 @@ pub enum LoadTaskWorkflowError {
     /// name — would defeat that guarantee. Carries the missing path so the
     /// error names it.
     MissingFile(PathBuf),
+    /// The task runs a built-in (`builtin:<name>@<version>`) that this
+    /// version of the daemon no longer ships.
+    BuiltinGone(String),
 }
 
 impl fmt::Display for LoadTaskWorkflowError {
@@ -978,6 +1053,10 @@ impl fmt::Display for LoadTaskWorkflowError {
                 f,
                 "this task's recorded workflow file is missing: {}",
                 path.display()
+            ),
+            LoadTaskWorkflowError::BuiltinGone(name) => write!(
+                f,
+                "the built-in workflow '{name}' is not part of this version of chocofactoryd"
             ),
         }
     }
@@ -1028,14 +1107,14 @@ impl WorkflowEngine {
     pub fn new(
         pool: SqlitePool,
         session_manager: Arc<SessionManager>,
-        workflows_dir: PathBuf,
+        builtin_dir: PathBuf,
         global_config_path: Option<PathBuf>,
         events_notify: Arc<Notify>,
     ) -> Arc<Self> {
         Self::build(
             pool,
             session_manager,
-            workflows_dir,
+            builtin_dir,
             global_config_path,
             events_notify,
             Arc::new(Utc::now),
@@ -1048,7 +1127,7 @@ impl WorkflowEngine {
     fn new_with_clock(
         pool: SqlitePool,
         session_manager: Arc<SessionManager>,
-        workflows_dir: PathBuf,
+        builtin_dir: PathBuf,
         global_config_path: Option<PathBuf>,
         events_notify: Arc<Notify>,
         wall_clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
@@ -1056,7 +1135,7 @@ impl WorkflowEngine {
         Self::build(
             pool,
             session_manager,
-            workflows_dir,
+            builtin_dir,
             global_config_path,
             events_notify,
             wall_clock,
@@ -1066,7 +1145,7 @@ impl WorkflowEngine {
     fn build(
         pool: SqlitePool,
         session_manager: Arc<SessionManager>,
-        workflows_dir: PathBuf,
+        builtin_dir: PathBuf,
         global_config_path: Option<PathBuf>,
         events_notify: Arc<Notify>,
         wall_clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
@@ -1075,7 +1154,8 @@ impl WorkflowEngine {
             pool,
             session_manager,
             task_locks: Mutex::new(HashMap::new()),
-            workflows_dir,
+            builtin_dir,
+            legacy_workflows_dir: None,
             global_config_path,
             events_notify,
             detached_runners: std::sync::Mutex::new(HashMap::new()),
@@ -1116,17 +1196,33 @@ impl WorkflowEngine {
     /// only, by `GET /tasks/{id}`'s `workflow_file_status`), and this
     /// always loads and runs whatever the path currently contains.
     ///
-    /// `task.workflow_path` is `None` only for a task created before this
-    /// column existed, which falls back to resolving `task.workflow_def` by
-    /// name against the global workflows directory — exactly what every
-    /// caller here did before this method existed.
+    /// A `builtin:<name>@<version>` record loads the built-in directory's
+    /// current `<name>.yaml` (#129); if this daemon no longer ships it that
+    /// is `BuiltinGone`.
+    ///
+    /// `task.workflow_path` is `None` only for a task created before #88,
+    /// which loads `task.workflow_def` from the legacy global folder when
+    /// set and present, else from the built-ins.
     async fn load_task_workflow(
         &self,
         task: &Task,
     ) -> Result<WorkflowDefinition, LoadTaskWorkflowError> {
         match &task.workflow_path {
-            Some(recorded_path) => {
-                let path = PathBuf::from(recorded_path);
+            Some(recorded) => {
+                if let Some(name) = parse_builtin_ref(recorded) {
+                    // A built-in follows the daemon: the *current* copy in
+                    // the built-in directory, not the version it started on.
+                    return match load_workflow_file(&self.builtin_workflow_file(name)) {
+                        Ok((definition, _sha256)) => Ok(definition),
+                        Err(WorkflowDefError::Io(io_err))
+                            if io_err.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            Err(LoadTaskWorkflowError::BuiltinGone(name.to_string()))
+                        }
+                        Err(err) => Err(LoadTaskWorkflowError::WorkflowDef(err)),
+                    };
+                }
+                let path = PathBuf::from(recorded);
                 match load_workflow_file(&path) {
                     Ok((definition, _sha256)) => Ok(definition),
                     Err(WorkflowDefError::Io(io_err))
@@ -1138,69 +1234,148 @@ impl WorkflowEngine {
                 }
             }
             None => {
-                let path = resolve_workflow_path(&self.workflows_dir, &task.workflow_def)
-                    .map_err(LoadTaskWorkflowError::Resolve)?;
+                if !is_valid_workflow_name(&task.workflow_def) {
+                    return Err(LoadTaskWorkflowError::Resolve(ResolveError::InvalidName(
+                        task.workflow_def.clone(),
+                    )));
+                }
+                let file_name = format!("{}.yaml", task.workflow_def);
+                let legacy = self
+                    .legacy_workflows_dir
+                    .as_ref()
+                    .map(|dir| dir.join(&file_name))
+                    .filter(|path| path.is_file());
+                let path = match legacy {
+                    Some(path) => path,
+                    None => {
+                        let builtin = self.builtin_dir.join(&file_name);
+                        if !builtin.is_file() {
+                            return Err(LoadTaskWorkflowError::Resolve(workflow_not_found(
+                                &task.workflow_def,
+                                None,
+                                &self.builtin_dir,
+                            )));
+                        }
+                        builtin
+                    }
+                };
                 WorkflowDefinition::load(&path).map_err(LoadTaskWorkflowError::WorkflowDef)
             }
         }
     }
 
-    /// Creates a task under `project_id` running `workflow_def_name`,
-    /// feeding `initial_input` in as the entry stage's first message
-    /// (P1-8 LLD §2.7). `config` is the task-level override layer
-    /// `role_config::resolve` reads (`config.roles.<name>.*`, plus the
-    /// task-wide `config.cwd`).
-    ///
-    /// `workflow_def_name` is resolved (issue #88: against the project's own
-    /// `.chocofactory/workflows/` first, then the global workflows
-    /// directory — see `resolve_task_workflow`) and the definition freshly
-    /// loaded on every call, not cached (P1-8 LLD §4.5) — the same file
-    /// `WorkflowEngine` would otherwise have to invalidate a cache entry
-    /// for. The resolved file's canonical path and content hash are
-    /// recorded on the task row (`tasks.workflow_path`/`workflow_sha256`),
-    /// which is what every later reload of this task's workflow uses
-    /// instead of resolving by name again (`load_task_workflow`).
+    /// Sets the old global workflows folder, used only to reload pre-#88
+    /// tasks that have no recorded `workflow_path`.
+    pub fn with_legacy_workflows_dir(mut self: Arc<Self>, dir: PathBuf) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_legacy_workflows_dir must be called before the engine is shared")
+            .legacy_workflows_dir = Some(dir);
+        self
+    }
+
+    /// The built-in directory's file for built-in `name` (#129).
+    pub fn builtin_workflow_file(&self, name: &str) -> PathBuf {
+        self.builtin_dir.join(format!("{name}.yaml"))
+    }
+
+    /// Creates a task under `project_id` running the workflow called
+    /// `workflow_def_name` — a thin wrapper over [`Self::create_task_from`].
     pub async fn create_task(
         self: &Arc<Self>,
         project_id: &str,
         workflow_def_name: &str,
         title: &str,
         initial_input: &str,
+        config: Value,
+    ) -> Result<Task, CreateTaskError> {
+        self.create_task_from(
+            project_id,
+            WorkflowRef::Name(workflow_def_name.to_string()),
+            title,
+            initial_input,
+            config,
+        )
+        .await
+    }
+
+    /// Creates a task under `project_id`, feeding `initial_input` in as the
+    /// entry stage's first message (P1-8 LLD §2.7). `config` is the
+    /// task-level override layer `role_config::resolve` reads.
+    ///
+    /// The workflow comes from (#129): an explicit absolute file
+    /// (`WorkflowRef::File`), else the project's own
+    /// `.chocofactory/workflows/<name>.yaml`, else the built-in of that
+    /// name. The global `~/.config/chocofactory/workflows/` is never read.
+    /// The definition is freshly loaded on every call. What is recorded on
+    /// the task row (`workflow_path`/`workflow_sha256`, in the one insert,
+    /// from one read of the file) is the canonical file path, or
+    /// `builtin:<name>@<VERSION>` for a built-in; every later reload uses
+    /// that record (`load_task_workflow`).
+    pub async fn create_task_from(
+        self: &Arc<Self>,
+        project_id: &str,
+        workflow: WorkflowRef,
+        title: &str,
+        initial_input: &str,
         mut config: Value,
     ) -> Result<Task, CreateTaskError> {
-        // The project is loaded first, before any workflow resolution
-        // (issue #88 review: resolution now needs it to search the
-        // project's own repo) — checked explicitly rather than left to
-        // surface as a raw FK violation from the `INSERT` below (P1-9
-        // review): `tasks.project_id` is a foreign key and
-        // `db::pool::connect` enables `foreign_keys`, so a bad id would
-        // otherwise fail as an opaque `sqlx::Error` instead of a reported,
-        // specific error the API layer can map to 404.
+        // The project is loaded first, before any workflow resolution:
+        // resolution needs it to search the project's own repo. Checked
+        // explicitly rather than left to surface as a raw FK violation
+        // from the `INSERT` below (P1-9 review).
         let project = projects::get(&self.pool, project_id)
             .await?
             .ok_or_else(|| CreateTaskError::NoSuchProject(project_id.to_string()))?;
 
-        let path = resolve_task_workflow(&self.workflows_dir, &project, workflow_def_name)
-            .map_err(CreateTaskError::Resolve)?;
-
-        // Canonicalize *before* loading (issue #88 review, F2): if `path`
-        // is itself a symlink — a per-repo dotfile link, or a repo
-        // deliberately linking a shared workflow file — resolving prompt
-        // files against the link's parent here and recording the target's
-        // canonical parent for every later reload would mean the file this
-        // stage actually parsed prompts relative to isn't the file the
-        // recorded `workflow_path` describes. Canonicalizing first makes
-        // `load_workflow_file`'s `path.parent()` the exact same directory
-        // `load_task_workflow` resolves against on every subsequent reload.
-        let workflow_path =
-            std::fs::canonicalize(&path).map_err(|source| CreateTaskError::Canonicalize {
-                path: path.clone(),
+        // Canonicalize *before* loading (issue #88 review, F2), so
+        // `load_workflow_file`'s `path.parent()` is the exact directory
+        // every later reload resolves prompt files against.
+        let canonicalize = |path: &Path| {
+            std::fs::canonicalize(path).map_err(|source| CreateTaskError::Canonicalize {
+                path: path.to_path_buf(),
                 source,
-            })?;
-        let workflow_path_str = workflow_path.to_string_lossy().into_owned();
-
-        let (definition, workflow_sha256) =
-            load_workflow_file(&workflow_path).map_err(CreateTaskError::WorkflowDef)?;
+            })
+        };
+        let (definition, workflow_def_name, workflow_path_str, workflow_sha256) = match workflow {
+            WorkflowRef::File(path) => {
+                if !path.is_absolute() {
+                    return Err(CreateTaskError::WorkflowFileNotAbsolute(path));
+                }
+                let canonical = canonicalize(&path)?;
+                let (definition, sha) =
+                    load_workflow_file(&canonical).map_err(CreateTaskError::WorkflowDef)?;
+                let name = definition.name.clone();
+                (
+                    definition,
+                    name,
+                    canonical.to_string_lossy().into_owned(),
+                    sha,
+                )
+            }
+            WorkflowRef::Name(name) => {
+                match resolve_task_workflow(&self.builtin_dir, &project, &name)
+                    .map_err(CreateTaskError::Resolve)?
+                {
+                    ResolvedWorkflow::Repo(path) => {
+                        let canonical = canonicalize(&path)?;
+                        let (definition, sha) =
+                            load_workflow_file(&canonical).map_err(CreateTaskError::WorkflowDef)?;
+                        (
+                            definition,
+                            name,
+                            canonical.to_string_lossy().into_owned(),
+                            sha,
+                        )
+                    }
+                    ResolvedWorkflow::Builtin(path) => {
+                        let (definition, sha) =
+                            load_workflow_file(&path).map_err(CreateTaskError::WorkflowDef)?;
+                        let record = builtin_ref(&name);
+                        (definition, name, record, sha)
+                    }
+                }
+            }
+        };
         let definition = Arc::new(definition);
 
         // An explicit `--repo`/`config.cwd` always wins; this only fills in
@@ -1218,7 +1393,7 @@ impl WorkflowEngine {
             &self.pool,
             tasks::NewTask {
                 project_id,
-                workflow_def: workflow_def_name,
+                workflow_def: &workflow_def_name,
                 title,
                 config,
                 workflow_path: Some(&workflow_path_str),
@@ -2204,9 +2379,8 @@ impl WorkflowEngine {
 
     /// Seeds `project_id`'s repo with the built-in workflows and their
     /// prompt files, under `<repo_path>/.chocofactory/workflows/` (issue
-    /// #88: `choco project init-workflows <project>`) — the repo-local
-    /// counterpart of the daemon's own startup seed of the global
-    /// `~/.config/chocofactory/workflows/` directory, via the same
+    /// #88: `choco project init-workflows <project>`) — an eject of the
+    /// built-ins in this version of the daemon, via the same
     /// `config_root::seed_builtin_workflows` (so a repo-local copy has the
     /// exact same never-overwrite guarantee and creates-on-first-seed
     /// behaviour). Never touches git — no add, no commit; that's left to
@@ -8667,39 +8841,11 @@ stages:
         assert!(tailed.trim_start_matches('…').chars().all(|c| c == 'é'));
     }
 
-    #[test]
-    fn resolve_workflow_path_only_accepts_a_safe_allowlisted_name() {
-        let dir = tempdir();
-        std::fs::write(dir.join("chat.yaml"), "irrelevant").unwrap();
-
-        assert!(resolve_workflow_path(&dir, "chat").is_ok());
-        assert!(matches!(
-            resolve_workflow_path(&dir, "").unwrap_err(),
-            ResolveError::InvalidName(_)
-        ));
-        assert!(matches!(
-            resolve_workflow_path(&dir, "../etc/passwd").unwrap_err(),
-            ResolveError::InvalidName(_)
-        ));
-        assert!(matches!(
-            resolve_workflow_path(&dir, "chat/../../etc").unwrap_err(),
-            ResolveError::InvalidName(_)
-        ));
-        assert!(matches!(
-            resolve_workflow_path(&dir, "does-not-exist").unwrap_err(),
-            ResolveError::NotFound(_)
-        ));
-    }
-
-    /// `resolve_task_workflow` has its own `is_valid_workflow_name` check
-    /// (engine.rs, issue #88 review, F1) — `create_task` calls it instead of
-    /// `resolve_workflow_path`, and the only test of the allowlist,
-    /// `resolve_workflow_path_only_accepts_a_safe_allowlisted_name`, exercises
-    /// the *other* function. Without a direct test here, deleting the check
-    /// (or moving it after the repo/global joins) would still pass the rest
-    /// of the suite while reopening path traversal at `POST /tasks`, since
-    /// the name is now joined onto a caller-controlled `project.repo_path`
-    /// as well as the global directory.
+    /// `resolve_task_workflow`'s `is_valid_workflow_name` check (issue #88
+    /// review, F1): without a direct test, deleting the check (or moving it
+    /// after the path joins) would still pass the rest of the suite while
+    /// reopening path traversal at `POST /tasks`, since the name is joined
+    /// onto a caller-controlled `project.repo_path`.
     #[test]
     fn resolve_task_workflow_only_accepts_a_safe_allowlisted_name() {
         let workflows_dir = tempdir();
@@ -8725,6 +8871,10 @@ stages:
         assert!(matches!(
             resolve_task_workflow(&workflows_dir, &project, "chat/../../etc").unwrap_err(),
             ResolveError::InvalidName(_)
+        ));
+        assert!(matches!(
+            resolve_task_workflow(&workflows_dir, &project, "does-not-exist").unwrap_err(),
+            ResolveError::NotFound(_)
         ));
     }
 
@@ -8869,7 +9019,7 @@ stages:
     /// record its canonical path and its own SHA-256 — not the global
     /// file's.
     #[tokio::test]
-    async fn create_task_prefers_the_projects_repo_workflow_over_the_global_one() {
+    async fn create_task_prefers_the_projects_repo_workflow_over_the_builtin_one() {
         let pool = connect_in_memory().await.unwrap();
         let global_dir = tempdir();
         let repo_dir = tempdir();
@@ -8906,18 +9056,15 @@ stages:
         );
     }
 
-    /// The repo has no `x.yaml`, so the global one is used and recorded —
-    /// today's behaviour, still exercised through the new resolution path.
+    /// The repo has no `x.yaml`, so the built-in is used and recorded as
+    /// `builtin:<name>@<VERSION>` with the SHA of the built-in YAML.
     #[tokio::test]
-    async fn create_task_falls_back_to_the_global_workflow_when_the_repo_lacks_it() {
+    async fn create_task_falls_back_to_the_builtin_workflow_when_the_repo_lacks_it() {
         let pool = connect_in_memory().await.unwrap();
-        let global_dir = tempdir();
+        let builtin_dir = tempdir();
         let repo_dir = tempdir();
-        std::fs::write(
-            global_dir.join("x.yaml"),
-            one_role_workflow_yaml("x", "sonnet"),
-        )
-        .unwrap();
+        let yaml = one_role_workflow_yaml("x", "sonnet");
+        std::fs::write(builtin_dir.join("x.yaml"), &yaml).unwrap();
         // The repo exists but has no `.chocofactory/workflows/x.yaml`.
 
         let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
@@ -8926,7 +9073,7 @@ stages:
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             &fixture_binary("fake_claude.py"),
-            &global_dir,
+            &builtin_dir,
         );
 
         let task = engine
@@ -8934,25 +9081,32 @@ stages:
             .await
             .unwrap();
 
-        let canonical_global_path = std::fs::canonicalize(global_dir.join("x.yaml")).unwrap();
         assert_eq!(
             task.workflow_path.as_deref(),
-            Some(canonical_global_path.to_string_lossy().as_ref())
+            Some(format!("builtin:x@{}", chocofactory_core::version::VERSION).as_str())
         );
+        assert_eq!(
+            task.workflow_sha256.as_deref(),
+            Some(sha256_hex(yaml.as_bytes()).as_str())
+        );
+        assert_eq!(task.workflow_def, "x");
     }
 
-    /// Neither the repo nor the global directory has the workflow: the
-    /// error's message names both searched paths.
+    /// Neither the repo nor the built-ins have the workflow: the message
+    /// names the repo path tried and lists the built-in names, sorted.
     #[tokio::test]
-    async fn create_task_when_neither_repo_nor_global_has_it_lists_both_searched_paths() {
+    async fn create_task_when_neither_repo_nor_builtin_has_it_names_the_repo_path_and_builtins() {
         let pool = connect_in_memory().await.unwrap();
-        let global_dir = tempdir();
+        let builtin_dir = tempdir();
+        std::fs::write(builtin_dir.join("zeta.yaml"), "x").unwrap();
+        std::fs::write(builtin_dir.join("alpha.yaml"), "x").unwrap();
+        std::fs::write(builtin_dir.join("README.txt"), "x").unwrap();
         let repo_dir = tempdir();
 
         let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
             .await
             .unwrap();
-        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &global_dir);
+        let engine = engine_with_adapter_and_workflows_dir(pool, "unused", &builtin_dir);
 
         let err = engine
             .create_task(&project.id, "x", "t", "hi", json!({}))
@@ -8970,35 +9124,380 @@ stages:
             "{message}"
         );
         assert!(
-            message.contains(&global_dir.join("x.yaml").to_string_lossy().to_string()),
+            message.contains("built-in workflows: alpha, zeta"),
             "{message}"
         );
     }
 
-    /// A project without `repo_path` resolves against the global directory
-    /// only — today's behaviour, unaffected by issue #88.
+    /// A project without `repo_path` resolves to the built-in only, and a
+    /// file of the same name in the legacy folder is ignored (#129).
     #[tokio::test]
-    async fn create_task_without_a_project_repo_only_searches_the_global_directory() {
+    async fn create_task_without_a_project_repo_uses_the_builtin_and_ignores_the_legacy_folder() {
         let pool = connect_in_memory().await.unwrap();
-        let global_dir = tempdir();
-        write_chat_workflow(&global_dir);
+        let builtin_dir = tempdir();
+        let legacy_dir = tempdir();
+        write_chat_workflow(&builtin_dir);
+        std::fs::write(
+            legacy_dir.join("chat.yaml"),
+            one_role_workflow_yaml("chat", "opus"),
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_dir.join("legacy-only.yaml"),
+            one_role_workflow_yaml("legacy-only", "opus"),
+        )
+        .unwrap();
         let project = projects::create(&pool, "demo", None).await.unwrap();
         let engine = engine_with_adapter_and_workflows_dir(
             pool.clone(),
             &fixture_binary("fake_claude.py"),
-            &global_dir,
-        );
+            &builtin_dir,
+        )
+        .with_legacy_workflows_dir(legacy_dir.0.clone());
 
         let task = engine
             .create_task(&project.id, "chat", "t", "hi", json!({}))
             .await
             .unwrap();
+        assert_eq!(
+            task.workflow_path.as_deref(),
+            Some(format!("builtin:chat@{}", chocofactory_core::version::VERSION).as_str())
+        );
+        let chat_yaml = std::fs::read(builtin_dir.join("chat.yaml")).unwrap();
+        assert_eq!(
+            task.workflow_sha256.as_deref(),
+            Some(sha256_hex(&chat_yaml).as_str())
+        );
 
-        let canonical = std::fs::canonicalize(global_dir.join("chat.yaml")).unwrap();
+        let err = engine
+            .create_task(&project.id, "legacy-only", "t", "hi", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CreateTaskError::Resolve(ResolveError::NotFound(_))
+        ));
+    }
+
+    // ---- explicit workflow files, built-in follow semantics (#129) ----
+
+    #[tokio::test]
+    async fn create_task_from_a_file_records_the_canonical_path_and_wins_over_the_repo() {
+        let pool = connect_in_memory().await.unwrap();
+        let builtin_dir = tempdir();
+        let repo_dir = tempdir();
+        let file_dir = tempdir();
+        write_repo_workflow(&repo_dir, "mine", &one_role_workflow_yaml("mine", "opus"));
+        let file_yaml = one_role_workflow_yaml("mine", "sonnet");
+        let file_path = file_dir.join("whatever.yaml");
+        std::fs::write(&file_path, &file_yaml).unwrap();
+        std::fs::write(file_dir.join("prompt.md"), "hello").unwrap();
+        let link = file_dir.join("link.yaml");
+        std::os::unix::fs::symlink(&file_path, &link).unwrap();
+
+        let project = projects::create(&pool, "demo", Some(&repo_dir.to_string_lossy()))
+            .await
+            .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &builtin_dir,
+        );
+
+        // Through a symlink, so the canonical path is the target.
+        let task = engine
+            .create_task_from(
+                &project.id,
+                WorkflowRef::File(link.clone()),
+                "t",
+                "hi",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let canonical = std::fs::canonicalize(&file_path).unwrap();
         assert_eq!(
             task.workflow_path.as_deref(),
             Some(canonical.to_string_lossy().as_ref())
         );
+        assert_eq!(
+            task.workflow_sha256.as_deref(),
+            Some(sha256_hex(file_yaml.as_bytes()).as_str())
+        );
+        // `workflow_def` is the YAML's own `name:`, and the file beat the
+        // repo workflow of the same name.
+        assert_eq!(task.workflow_def, "mine");
+
+        // Relative path: refused before touching the filesystem.
+        let err = engine
+            .create_task_from(
+                &project.id,
+                WorkflowRef::File(PathBuf::from("rel/x.yaml")),
+                "t",
+                "hi",
+                json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CreateTaskError::WorkflowFileNotAbsolute(_)));
+
+        // Missing file: the canonicalize error, naming the path.
+        let missing = file_dir.join("nope.yaml");
+        let err = engine
+            .create_task_from(
+                &project.id,
+                WorkflowRef::File(missing.clone()),
+                "t",
+                "hi",
+                json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CreateTaskError::Canonicalize { path, .. } if *path == missing),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_from_a_file_resolves_prompt_files_next_to_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let builtin_dir = tempdir();
+        let file_dir = tempdir();
+        std::fs::write(file_dir.join("prompt.md"), "hello").unwrap();
+        let yaml = one_role_workflow_yaml("with-prompt", "sonnet").replace(
+            "    role: chat
+",
+            "    role: chat
+    prompt_file: prompt.md
+",
+        );
+        let path = file_dir.join("wf.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let project = projects::create(&pool, "demo", None).await.unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &builtin_dir,
+        );
+
+        engine
+            .create_task_from(&project.id, WorkflowRef::File(path), "t", "hi", json!({}))
+            .await
+            .unwrap();
+    }
+
+    /// A built-in task's next stage loads the built-in directory's *current*
+    /// YAML, not the version it started on.
+    #[tokio::test]
+    async fn a_builtin_task_follows_the_current_builtin_yaml() {
+        let pool = connect_in_memory().await.unwrap();
+        let builtin_dir = tempdir();
+        std::fs::write(
+            builtin_dir.join("x.yaml"),
+            one_role_workflow_yaml("x", "sonnet"),
+        )
+        .unwrap();
+        let project = projects::create(&pool, "demo", None).await.unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &builtin_dir,
+        );
+        let task = engine
+            .create_task(&project.id, "x", "t", "hi", json!({}))
+            .await
+            .unwrap();
+
+        let before = engine.load_task_workflow(&task).await.unwrap();
+        assert!(before.stages.contains_key("chatting"));
+
+        std::fs::write(
+            builtin_dir.join("x.yaml"),
+            "name: x\nstages:\n  other_stage:\n    kind: terminal\n",
+        )
+        .unwrap();
+        let after = engine.load_task_workflow(&task).await.unwrap();
+        assert!(after.stages.contains_key("other_stage"));
+        assert!(!after.stages.contains_key("chatting"));
+    }
+
+    /// A built-in that disappeared: the reload fails with `BuiltinGone`, and
+    /// the restart sweep parks the task stuck with a reason naming it.
+    #[tokio::test]
+    async fn a_builtin_that_disappeared_fails_the_reload_and_sticks_the_task() {
+        let pool = connect_in_memory().await.unwrap();
+        let builtin_dir = tempdir();
+        write_chat_workflow(&builtin_dir);
+        let project = projects::create(&pool, "demo", None).await.unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &builtin_dir,
+        );
+        let task = engine
+            .create_task(&project.id, "chat", "t", "hi", json!({}))
+            .await
+            .unwrap();
+
+        std::fs::remove_file(builtin_dir.join("chat.yaml")).unwrap();
+
+        let err = engine.load_task_workflow(&task).await.unwrap_err();
+        assert!(
+            matches!(&err, LoadTaskWorkflowError::BuiltinGone(name) if name == "chat"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "the built-in workflow 'chat' is not part of this version of chocofactoryd"
+        );
+        let err = engine
+            .send_message_or_resume(&task.id, "hello?")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendMessageOrResumeError::BuiltinWorkflowGone(_)),
+            "{err:?}"
+        );
+
+        engine.park_interrupted_turns().await.unwrap();
+        let task = tasks::get(&pool, &task.id).await.unwrap().unwrap();
+        assert_eq!(task.status, TASK_STATUS_STUCK);
+        let reason = task.stuck_reason.unwrap();
+        assert!(reason.contains("built-in workflow 'chat'"), "{reason}");
+    }
+
+    /// A task that recorded a path into the old global folder keeps loading
+    /// that file; a pre-#88 task (NULL path) loads the legacy dir's file when
+    /// present and the built-in otherwise.
+    #[tokio::test]
+    async fn legacy_records_keep_loading() {
+        let pool = connect_in_memory().await.unwrap();
+        let builtin_dir = tempdir();
+        let legacy_dir = tempdir();
+        std::fs::write(
+            builtin_dir.join("x.yaml"),
+            "name: x\nstages:\n  from_builtin:\n    kind: terminal\n",
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_dir.join("x.yaml"),
+            "name: x\nstages:\n  from_legacy:\n    kind: terminal\n",
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_dir.join("y.yaml"),
+            "name: y\nstages:\n  from_legacy:\n    kind: terminal\n",
+        )
+        .unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &fixture_binary("fake_claude.py"),
+            &builtin_dir,
+        )
+        .with_legacy_workflows_dir(legacy_dir.0.clone());
+
+        // Recorded path into the old folder.
+        let recorded = seed_task(&pool, "y").await;
+        let path = legacy_dir.join("y.yaml");
+        sqlx::query("UPDATE tasks SET workflow_path = ? WHERE id = ?")
+            .bind(path.to_string_lossy().as_ref())
+            .bind(&recorded)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let task = tasks::get(&pool, &recorded).await.unwrap().unwrap();
+        let def = engine.load_task_workflow(&task).await.unwrap();
+        assert!(def.stages.contains_key("from_legacy"));
+
+        // NULL path: the legacy file wins while present...
+        let null_task_id = seed_task(&pool, "x").await;
+        let null_task = tasks::get(&pool, &null_task_id).await.unwrap().unwrap();
+        assert!(null_task.workflow_path.is_none());
+        let def = engine.load_task_workflow(&null_task).await.unwrap();
+        assert!(def.stages.contains_key("from_legacy"));
+        // ...and the built-in is used once it is gone.
+        std::fs::remove_file(legacy_dir.join("x.yaml")).unwrap();
+        let def = engine.load_task_workflow(&null_task).await.unwrap();
+        assert!(def.stages.contains_key("from_builtin"));
+    }
+
+    #[test]
+    fn builtin_refs_round_trip() {
+        let r = builtin_ref("coding-task");
+        assert_eq!(
+            r,
+            format!(
+                "builtin:coding-task@{}",
+                chocofactory_core::version::VERSION
+            )
+        );
+        assert_eq!(parse_builtin_ref(&r), Some("coding-task"));
+        assert_eq!(parse_builtin_ref("builtin:chat@whatever"), Some("chat"));
+        assert_eq!(parse_builtin_ref("builtin:chat"), None);
+        assert_eq!(parse_builtin_ref("builtin:../x@1"), None);
+        assert_eq!(parse_builtin_ref("builtin:@1"), None);
+        assert_eq!(parse_builtin_ref("/abs/path/chat.yaml"), None);
+    }
+
+    /// A built-in's `script_file` is run as a real executable next to the YAML.
+    #[tokio::test]
+    async fn a_builtin_shell_stage_runs_its_script_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let pool = connect_in_memory().await.unwrap();
+        let builtin_dir = tempdir();
+        std::fs::create_dir_all(builtin_dir.join("scripts")).unwrap();
+        let script = builtin_dir.join("scripts").join("hello.sh");
+        std::fs::write(&script, "#!/bin/sh\necho builtin-script-marker\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::write(
+            builtin_dir.join("scripted.yaml"),
+            r#"
+name: scripted
+stages:
+  run:
+    kind: shell
+    script_file: scripts/hello.sh
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+        )
+        .unwrap();
+        let project = projects::create(&pool, "demo", None).await.unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &builtin_dir);
+        let task = engine
+            .create_task(&project.id, "scripted", "t", "hi", json!({}))
+            .await
+            .unwrap();
+        wait_until_task_status(&pool, &task.id, "closed").await;
+        let state = workflow_state::get(&pool, &task.id).await.unwrap().unwrap();
+        assert!(
+            state.payload.to_string().contains("builtin-script-marker"),
+            "{}",
+            state.payload
+        );
+    }
+
+    /// The materialized real `coding-task.yaml` loads, with `open_pr`'s
+    /// script an executable file under `.builtin-workflows/scripts/`.
+    #[test]
+    fn the_materialized_coding_task_gives_open_pr_an_executable_script() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir();
+        let dir = root.join(".builtin-workflows");
+        config_root::materialize_builtins(&dir).unwrap();
+        let (def, _) = load_workflow_file(&dir.join("coding-task.yaml")).unwrap();
+        let stage = def.stages.get("open_pr").expect("open_pr stage");
+        let crate::workflow_def::StageKind::Shell { command, .. } = &stage.kind else {
+            panic!("open_pr should be a shell stage: {:?}", stage.kind);
+        };
+        let crate::workflow_def::ShellCommand::ScriptFile(path) = command else {
+            panic!("open_pr should use a script_file: {command:?}");
+        };
+        assert_eq!(path, &dir.join("scripts").join("open-pr.sh"));
+        assert!(path.metadata().unwrap().permissions().mode() & 0o111 != 0);
     }
 
     /// `config.cwd` absent and `project.repo_path` set: `create_task` fills

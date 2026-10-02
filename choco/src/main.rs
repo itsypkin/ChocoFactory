@@ -15,7 +15,7 @@ use clap::Parser;
 use cli::{Cli, Command, ProjectCmd, RoleOverrideArgs, TaskCmd};
 use client::{
     Client, ClientError, CreateTaskParams, EventsPage, InitWorkflowsResult, RoleOverrides,
-    build_task_config,
+    build_task_config, workflow_arg,
 };
 use serde_json::Value;
 
@@ -234,11 +234,12 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             // Built before resolving the project so a malformed flag fails
             // immediately, without a lookup request first.
             let config = build_task_config(&role_overrides(&args.roles), args.repo.as_deref())?;
+            let workflow = workflow_arg(&args.workflow)?;
             let project_id = client.resolve_project(&args.project).await?;
             let task = client
                 .create_task(&CreateTaskParams {
                     project_id: &project_id,
-                    workflow_def: &args.workflow,
+                    workflow: &workflow,
                     title: &args.title,
                     prompt: &args.prompt,
                     config,

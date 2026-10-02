@@ -35,11 +35,13 @@ CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude ./target/debug/chocof
 `CHOCOFACTORY_CLAUDE_BINARY` at the real `claude` binary only when you
 specifically mean to exercise the real CLI.
 
-The daemon stores its database and workflow definitions under
-`~/.config/chocofactory/`. On first start it seeds the built-in `chat`
-workflow into `~/.config/chocofactory/workflows/` (existing files are never
-overwritten). To keep a test run fully isolated from your real state,
-override `HOME`:
+The daemon stores its database under `~/.config/chocofactory/`. The
+built-in workflows (`chat`, `coding-task`) come from the daemon binary: at
+every start it regenerates a private, read-only copy in
+`~/.config/chocofactory/.builtin-workflows/`, so upgrading the binary
+upgrades them. See [Project workflows](#project-workflows) for where a
+workflow can come from. To keep a test run fully isolated from your real
+state, override `HOME`:
 
 ```
 HOME=$(mktemp -d) CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude \
@@ -177,10 +179,10 @@ roles:
 `skills`/`memory` can't be combined with `inherit_operator_config`. None of
 these can be set from task config (`--config`, `--role-*`) or the global
 config file: only a workflow definition can loosen what its agents see. The
-built-in `chat` workflow inherits your setup; `coding-task` is isolated. The
-daemon never overwrites a workflow already seeded into
-`~/.config/chocofactory/workflows/`, so an existing `chat.yaml` there needs
-`inherit_operator_config: true` added by hand to keep its old behaviour.
+built-in `chat` workflow inherits your setup; `coding-task` is isolated. A
+copy of `chat.yaml` you made yourself (in a repo, or run with
+`--workflow <path>`) needs `inherit_operator_config: true` added by hand to
+keep that behaviour.
 
 Each session's `session_meta` event records what it actually ran with: the
 CLI version, model, tools, MCP servers, plugins, skills, and the isolation
@@ -200,19 +202,22 @@ choco project update acme --repo ~/code/acme   # or: --no-repo, to clear it
 including `.`, works) before the request is sent, and must already be an
 existing directory — it does not need to be a git repo.
 
-A task's `--workflow <name>` is then looked up in **two places, in order**:
+A task's workflow comes from **one of three places, checked in this
+order**:
 
-1. `<repo_path>/.chocofactory/workflows/<name>.yaml`, if the project has a
-   repo;
-2. the global `~/.config/chocofactory/workflows/<name>.yaml`.
+1. an explicit path: `choco task create --workflow <path-to.yaml>` (anything
+   containing `/` or ending in `.yaml`/`.yml`; its prompts and scripts
+   resolve next to it);
+2. the project's repo: `<repo_path>/.chocofactory/workflows/<name>.yaml`, if
+   the project has a repo;
+3. the built-in of that name, embedded in the daemon binary.
 
-The first match wins. A repo's `.chocofactory/workflows/` has the exact
-same layout as the global folder — one `<name>.yaml` per workflow, plus a
+The first match wins. A repo's `.chocofactory/workflows/` has one
+`<name>.yaml` per workflow, plus a
 `prompts/` directory next to it for any prompt files the workflow
 references by relative path (`prompts/coder.md` in a workflow at
 `<repo>/.chocofactory/workflows/coding-task.yaml` resolves to
-`<repo>/.chocofactory/workflows/prompts/coder.md`, not the global prompts
-directory). This is the whole point of a repo workflow: a team's own
+`<repo>/.chocofactory/workflows/prompts/coder.md`). This is the whole point of a repo workflow: a team's own
 stages, roles, models and prompts, reviewed and versioned alongside the
 code they work on, rather than living only on whoever's machine runs the
 daemon.
@@ -261,6 +266,36 @@ Workflow       coding-task
 Workflow file  /Users/you/code/acme/.chocofactory/workflows/coding-task.yaml  [3f2a9c1e0b7d]
 Status         open
 ```
+
+A task running a built-in records `builtin:<name>@<version>` instead of a
+path, and `choco task status` labels that line `Workflow`. A built-in task
+follows the daemon: it runs whatever the current binary ships, and status
+says "built-in updated since task start" when that differs from what it
+began with.
+
+### Customising workflows
+
+- **Eject.** `choco project init-workflows <project>` copies the built-ins in
+  this version of the daemon into the project's repo as a starting point.
+  Later upgrades don't change the copies.
+- **A file of your own.** `choco task create --workflow <path-to.yaml>` runs
+  that file as is, without putting it in a repo. To try an unmerged change to
+  a built-in, point it at the checkout:
+  `--workflow <checkout>/workflows/coding-task.yaml`.
+- **Migrating from the old global folder.** Earlier versions copied the
+  built-ins into `~/.config/chocofactory/workflows/` and never updated
+  them. That folder is no longer read. At startup the daemon logs how many
+  stale built-in copies it is ignoring, and warns about every other file in
+  it (an edited copy, a custom workflow) with the two ways to keep using it:
+  pass the file with `--workflow <path>`, or move it with its `prompts/` and
+  `scripts/` into a repo's `.chocofactory/workflows/`. It also warns when
+  open or stuck tasks still point into the folder. The daemon never
+  modifies or deletes anything there; delete it yourself once no task uses
+  it. Tasks that already recorded a path into it keep running that file.
+
+**Security:** a repo's `.chocofactory/workflows/` and any `--workflow` file
+can run shell commands as you. Pointing choco at an untrusted repo or file
+trusts its workflows.
 
 If the file has since been edited, the line is suffixed
 `(changed since task start)`; if it has been deleted, `(missing)` — either
@@ -374,9 +409,9 @@ Created  2026-08-01 12:33:37 UTC
 Create a task in it. `--project` takes **either the project name or its
 id** — a name is resolved against `project list`, and is rejected naming
 the candidates if it matches more than one project (names aren't unique).
-`--workflow` names a definition looked up in the project's own repo first,
-then the global `~/.config/chocofactory/workflows/` (`chat` ships built
-in) — see [Project workflows](#project-workflows) above:
+`--workflow` is a workflow name (the project's own repo first, then the
+built-ins — `chat` and `coding-task` ship in the daemon) or a path to a
+workflow `.yaml` file — see [Project workflows](#project-workflows) above:
 
 ```
 $ choco task create --project acme --workflow gated \
@@ -617,7 +652,7 @@ task config (--role-* below)  >  the workflow's roles: block  >  ~/.config/choco
 
 The `--role-*` flags set the task-level layer. Each is `ROLE=VALUE` and each
 is repeatable, so several roles can be configured in one command. Using a
-two-role workflow of your own under `~/.config/chocofactory/workflows/` (the
+two-role workflow of your own, passed with `--workflow <path-to.yaml>` (the
 built-in multi-role `coding-task.yaml` is still to come):
 
 ```

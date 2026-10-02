@@ -1,6 +1,8 @@
 //! Task create/list/status and send-message handlers (P1-9, design §6.2:
 //! `choco task create`/`list`/`status`/`send`).
 
+use std::path::PathBuf;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -10,11 +12,18 @@ use serde_json::{Value, json};
 
 use super::{ApiError, AppState};
 use crate::db::{events, tasks, workflow_state};
+use crate::engine::{WorkflowEngine, WorkflowRef};
 
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
     pub project_id: String,
-    pub workflow_def: String,
+    /// A workflow name (repo copy, else built-in). Exactly one of this and
+    /// `workflow_file` must be present.
+    #[serde(default)]
+    pub workflow_def: Option<String>,
+    /// An absolute path to a workflow `.yaml` file (#129).
+    #[serde(default)]
+    pub workflow_file: Option<String>,
     pub title: String,
     /// The task's initial human-typed message (§5.4) — becomes the entry
     /// stage's first input if it's a `prompt_file`-less `agent_turn`.
@@ -27,11 +36,20 @@ pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<CreateTaskRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
+    let workflow = match (body.workflow_def, body.workflow_file) {
+        (Some(name), None) => WorkflowRef::Name(name),
+        (None, Some(file)) => WorkflowRef::File(PathBuf::from(file)),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "pass exactly one of workflow_def and workflow_file".to_string(),
+            ));
+        }
+    };
     let task = state
         .engine
-        .create_task(
+        .create_task_from(
             &body.project_id,
-            &body.workflow_def,
+            workflow,
             &body.title,
             &body.prompt,
             body.config.unwrap_or_else(|| json!({})),
@@ -97,8 +115,17 @@ pub struct TaskDetail {
 /// discarding it would violate this repo's own rule that every I/O failure
 /// is propagated or logged with context, and would print a misleading
 /// "(missing)" for a file that actually exists but, say, hit `EACCES`.
-fn workflow_file_status(task: &Task) -> Option<&'static str> {
-    let path = task.workflow_path.as_deref()?;
+fn workflow_file_status(engine: &WorkflowEngine, task: &Task) -> Option<&'static str> {
+    let recorded = task.workflow_path.as_deref()?;
+    // A `builtin:<name>@<version>` record is not a path: re-hash the
+    // daemon's current copy of that built-in instead.
+    let builtin_file =
+        crate::engine::parse_builtin_ref(recorded).map(|name| engine.builtin_workflow_file(name));
+    let path = match &builtin_file {
+        Some(file) => file.display().to_string(),
+        None => recorded.to_string(),
+    };
+    let path = path.as_str();
     let status = match std::fs::read(path) {
         Ok(bytes) => {
             if Some(crate::engine::sha256_hex(&bytes).as_str()) == task.workflow_sha256.as_deref() {
@@ -140,7 +167,7 @@ pub async fn get(
         .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;
     let workflow_state = workflow_state::get(&state.pool, &id).await?;
     let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
-    let workflow_file_status = workflow_file_status(&task);
+    let workflow_file_status = workflow_file_status(&state.engine, &task);
     Ok(Json(TaskDetail {
         task,
         workflow_state,
@@ -1056,18 +1083,34 @@ stages:
 
     /// `GET /tasks/{id}`'s `workflow_file_status` walks unchanged -> changed
     /// -> missing as the recorded workflow file is edited and then deleted
-    /// on disk — the main user-visible piece of issue #88's §4, and until
-    /// now entirely untested (`grep workflow_file_status` found no test).
+    /// on disk (issue #88), for a task running an explicit workflow file.
     #[tokio::test]
     async fn get_task_workflow_file_status_tracks_edits_and_deletion() {
         let server = TestServer::start().await;
-        let task_id = chat_task(&server).await;
+        server.seed_chat_workflow();
+        let file_dir = server.temp_dir();
+        let workflow_path = file_dir.join("mine.yaml");
+        std::fs::copy(server.builtin_workflow_path("chat"), &workflow_path).unwrap();
+        let project_id = create_project(&server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_file": workflow_path.to_str().unwrap(),
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
 
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert_eq!(detail["workflow_file_status"], "unchanged");
         let workflow_path = detail["workflow_path"]
             .as_str()
-            .expect("chat_task's task has a recorded workflow_path")
+            .expect("the task has a recorded workflow_path")
             .to_string();
 
         // Editing the file on disk (without touching the task's recorded
@@ -1084,6 +1127,138 @@ stages:
         std::fs::remove_file(&workflow_path).unwrap();
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert_eq!(detail["workflow_file_status"], "missing");
+    }
+
+    /// The same walk for a built-in task (#129): `workflow_path` is a
+    /// `builtin:` record, and the status re-hashes the daemon's current copy.
+    #[tokio::test]
+    async fn get_builtin_task_workflow_file_status_tracks_the_builtin_copy() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        let recorded = detail["workflow_path"].as_str().unwrap();
+        assert!(recorded.starts_with("builtin:chat@"), "{recorded}");
+        assert_eq!(detail["workflow_file_status"], "unchanged");
+
+        let file = server.builtin_workflow_path("chat");
+        let original = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, format!("{original}\n# edited\n")).unwrap();
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["workflow_file_status"], "changed");
+
+        std::fs::remove_file(&file).unwrap();
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["workflow_file_status"], "missing");
+    }
+
+    /// A built-in that vanished from the daemon's copy is a conflict, not a
+    /// server error, for both send and retry.
+    #[tokio::test]
+    async fn a_vanished_builtin_is_a_conflict_on_send_and_retry() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+        std::fs::remove_file(server.builtin_workflow_path("chat")).unwrap();
+        let send = server
+            .post(
+                &format!("/tasks/{task_id}/messages"),
+                json!({ "text": "hi" }),
+            )
+            .await;
+        assert_eq!(send.status(), 409, "{}", send.json());
+        assert!(
+            send.json()
+                .to_string()
+                .contains("is not part of this version"),
+            "{}",
+            send.json()
+        );
+        // Retry only reaches the workflow load for a stuck task.
+        crate::db::tasks::mark_stuck(server.pool(), &task_id, "stage 'chatting': it broke")
+            .await
+            .unwrap();
+        let retry = server
+            .post(&format!("/tasks/{task_id}/retry"), json!({}))
+            .await;
+        assert_eq!(retry.status(), 409, "{}", retry.json());
+        assert!(
+            retry
+                .json()
+                .to_string()
+                .contains("is not part of this version"),
+            "{}",
+            retry.json()
+        );
+    }
+
+    /// `POST /tasks` with `workflow_file` (#129): an absolute path is
+    /// recorded canonically; both or neither field, a relative path and a
+    /// missing file are all refused.
+    #[tokio::test]
+    async fn create_task_with_a_workflow_file() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+        let file = server.temp_dir().join("wf.yaml");
+        std::fs::copy(server.builtin_workflow_path("chat"), &file).unwrap();
+        let file_str = file.to_str().unwrap();
+
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_file": file_str,
+                    "title": "t",
+                    "prompt": "hi",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 201, "{}", response.json());
+        let task = response.json();
+        assert_eq!(
+            task["workflow_path"],
+            std::fs::canonicalize(&file).unwrap().to_str().unwrap()
+        );
+
+        for body in [
+            json!({"project_id": project_id, "workflow_def": "chat", "workflow_file": file_str,
+                   "title": "t", "prompt": "hi"}),
+            json!({"project_id": project_id, "title": "t", "prompt": "hi"}),
+            json!({"project_id": project_id, "workflow_file": "rel/wf.yaml",
+                   "title": "t", "prompt": "hi"}),
+        ] {
+            let response = server.post("/tasks", body).await;
+            assert_eq!(response.status(), 400, "{}", response.json());
+        }
+        let both = server
+            .post(
+                "/tasks",
+                json!({"project_id": project_id, "title": "t", "prompt": "hi"}),
+            )
+            .await;
+        assert!(
+            both.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("pass exactly one of workflow_def and workflow_file")
+        );
+
+        let missing = server.temp_dir().join("nope.yaml");
+        let response = server
+            .post(
+                "/tasks",
+                json!({"project_id": project_id, "workflow_file": missing.to_str().unwrap(),
+                       "title": "t", "prompt": "hi"}),
+            )
+            .await;
+        assert_eq!(response.status(), 500);
+        assert!(
+            response.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains(missing.to_str().unwrap())
+        );
     }
 
     /// A legacy task with no recorded `workflow_path` (predating issue #88)

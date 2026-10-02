@@ -48,6 +48,7 @@ impl From<CreateTaskError> for ApiError {
             CreateTaskError::Resolve(ResolveError::NotFound(_)) => {
                 ApiError::NotFound(err.to_string())
             }
+            CreateTaskError::WorkflowFileNotAbsolute(_) => ApiError::BadRequest(err.to_string()),
             CreateTaskError::NoSuchProject(_) => ApiError::NotFound(err.to_string()),
             CreateTaskError::Start {
                 source: EngineError::MissingAgentTurnInput(_),
@@ -120,7 +121,10 @@ impl From<SendMessageOrResumeError> for ApiError {
             // out from under it), not a request the caller could have made
             // differently and not a server fault.
             SendMessageOrResumeError::MissingWorkflowFile(_)
-            | SendMessageOrResumeError::SendMessage(SendMessageError::MissingWorkflowFile(_)) => {
+            | SendMessageOrResumeError::BuiltinWorkflowGone(_)
+            | SendMessageOrResumeError::SendMessage(
+                SendMessageError::MissingWorkflowFile(_) | SendMessageError::BuiltinWorkflowGone(_),
+            ) => {
                 ApiError::Conflict(err.to_string())
             }
             _ => ApiError::Internal(err.to_string()),
@@ -184,7 +188,8 @@ impl From<RetryTaskError> for ApiError {
             RetryTaskError::Resolve(ResolveError::NotFound(_))
             // Same shape, for a task created from a recorded workflow path
             // (issue #88) whose file has since been deleted.
-            | RetryTaskError::MissingWorkflowFile(_) => ApiError::Conflict(err.to_string()),
+            | RetryTaskError::MissingWorkflowFile(_)
+            | RetryTaskError::BuiltinWorkflowGone(_) => ApiError::Conflict(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }
