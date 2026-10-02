@@ -15,7 +15,7 @@ follow that entry:
 - **`awaiting_human_review` → `changes_requested`**: a human asked for
   changes on the open PR. Their feedback is on the PR, not in this prompt.
   Run `gh pr view --comments`, and
-  `gh api "repos/{owner}/{repo}/pulls/$(gh pr view --json number -q .number)/comments"`
+  `gh api --paginate "repos/{owner}/{repo}/pulls/$(gh pr view --json number -q .number)/comments"`
   for inline review comments. Read every comment posted after your last
   commit and address each item it raises, not just the first one. The
   internal reviewer's summary below is **not** this feedback.
@@ -33,9 +33,11 @@ changing anything.
 
 ## Internal reviewer's summary
 
-Current only on the `internal_review` path. On any other path this is left
-over from an earlier lap (usually the approval that opened the PR), so
-ignore it.
+Current on the `internal_review` path. On the `escalate_to_human` path it
+may be the rejection that tripped the loop guard, which the human's note
+below is probably replying to: read it as context, and the human's note
+takes priority. On any other path it is left over from an earlier lap
+(usually the approval that opened the PR), so ignore it.
 
 {{ stages.internal_review.summary }}
 

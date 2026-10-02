@@ -84,9 +84,14 @@ stages:
       changes_requested: revising
     loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
 
-  # Reached either because the coder/reviewer loop guard tripped, or
-  # because `open_pr` itself failed (see below). `capture: text` keeps the
-  # human's reply so `revising` can see what they said.
+  # Reached because either loop guard trips (`internal_review`'s or
+  # `awaiting_human_review`'s), because `open_pr` itself failed (see
+  # below), or because no human review arrives within 6h
+  # (`awaiting_human_review`'s `timeout`). Arriving here restarts both
+  # loop guards' counts (§5.3), whichever of those brought the task here,
+  # so a human resuming from this stage always hands the loop a fresh
+  # budget. `capture: text` keeps the human's reply so `revising` can see
+  # what they said.
   escalate_to_human:
     kind: human_gate
     capture: text
