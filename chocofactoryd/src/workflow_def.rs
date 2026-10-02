@@ -13,6 +13,8 @@ use indexmap::IndexMap;
 use regex::Regex;
 use serde::Deserialize;
 
+use chocofactory_core::duration::parse_duration;
+
 use crate::adapter::Isolation;
 
 /// A parsed, validated workflow definition. `stages` preserves the YAML
@@ -953,33 +955,6 @@ fn resolve_file(
             path,
         },
     })
-}
-
-/// Parses durations in the `<integer><unit>` shape used by §5.1's examples
-/// (`30s`, `5m`, `1h`) — deliberately not pulling in a duration-parsing
-/// crate for a three-suffix format this small.
-fn parse_duration(s: &str) -> Result<Duration, String> {
-    let mut chars = s.chars();
-    let unit = chars.next_back().ok_or_else(|| s.to_string())?;
-    let digits = chars.as_str();
-    let amount: u64 = digits.parse().map_err(|_| s.to_string())?;
-    let multiplier: u64 = match unit {
-        's' => 1,
-        'm' => 60,
-        'h' => 3600,
-        _ => return Err(s.to_string()),
-    };
-    let secs = amount
-        .checked_mul(multiplier)
-        .ok_or_else(|| s.to_string())?;
-    // Zero is never what anyone meant: as a shell `timeout:` it elapses on
-    // the first poll, so the command is killed before it can do anything;
-    // as a poll `interval:` it's a busy loop. Rejecting it at load time
-    // beats either behaviour at runtime.
-    if secs == 0 {
-        return Err(s.to_string());
-    }
-    Ok(Duration::from_secs(secs))
 }
 
 #[derive(Debug)]
