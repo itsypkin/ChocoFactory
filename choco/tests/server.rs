@@ -202,7 +202,7 @@ fn wait_in_flight(env: &Env) {
             .map(|v| {
                 !v["daemon"]["in_flight"]
                     .as_array()
-                    .map_or(true, |a| a.is_empty())
+                    .is_none_or(|a| a.is_empty())
             })
             .unwrap_or(false)
     });
