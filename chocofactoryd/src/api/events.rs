@@ -123,19 +123,29 @@ mod tests {
             .json();
         let task_id = task["id"].as_str().unwrap().to_string();
 
-        // Wait for the initial turn's events (session_meta + echo) so
-        // there's a real, non-trivial history to page through.
-        let mut total = 0usize;
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_task(server.pool(), &task_id)
-                .await
-                .unwrap();
-            if events.len() >= 2 {
-                total = events.len();
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        // Wait for the initial turn's history to settle (it ends with
+        // `turn_completed`), so the history is a real, non-trivial one and
+        // is no longer growing while it is paged through and compared with
+        // the unpaginated fetch.
+        let total = crate::test_support::wait_until(
+            &format!("task {task_id}'s initial turn to complete"),
+            || async {
+                let events = crate::db::events::list_for_task(server.pool(), &task_id)
+                    .await
+                    .unwrap();
+                if events
+                    .iter()
+                    .any(|e| e.event_type == chocofactory_core::models::EventType::TurnCompleted)
+                {
+                    Ok(events.len())
+                } else {
+                    let kinds: Vec<String> =
+                        events.iter().map(|e| e.event_type.to_string()).collect();
+                    Err(format!("{} events: {kinds:?}", events.len()))
+                }
+            },
+        )
+        .await;
         assert!(total >= 2, "expected at least 2 events to page through");
 
         // Page through with limit=1, following next_token, and confirm we
@@ -198,25 +208,34 @@ mod tests {
         // stage's transition. Waits on that specific event rather than on a
         // count, so a slow fixture subprocess under a loaded test run
         // doesn't leave a partial history to assert against.
-        let mut events = Vec::new();
-        let mut saw_reply = false;
-        for _ in 0..500 {
-            let history: Value = server.get(&format!("/tasks/{task_id}/events")).await.json();
-            events = history["events"].as_array().unwrap().clone();
-            if events
-                .iter()
-                .any(|e| e["event_type"] == "assistant_message")
-            {
-                saw_reply = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let events = crate::test_support::wait_until(
+            &format!("an assistant_message in the history of task {task_id}"),
+            || async {
+                let history: Value = server.get(&format!("/tasks/{task_id}/events")).await.json();
+                let events = history["events"].as_array().unwrap().clone();
+                if events
+                    .iter()
+                    .any(|e| e["event_type"] == "assistant_message")
+                {
+                    Ok(events)
+                } else {
+                    let kinds: Vec<&str> = events
+                        .iter()
+                        .map(|e| e["event_type"].as_str().unwrap_or("?"))
+                        .collect();
+                    Err(format!("event types {kinds:?}"))
+                }
+            },
+        )
+        .await;
         let seen: Vec<&str> = events
             .iter()
             .map(|e| e["event_type"].as_str().unwrap())
             .collect();
-        assert!(saw_reply, "initial turn never produced a reply: {seen:?}");
+        assert!(
+            seen.contains(&"assistant_message"),
+            "initial turn never produced a reply: {seen:?}"
+        );
 
         // The stage transition comes first: `start_task` records it before
         // the session it opens can emit anything.
@@ -277,22 +296,25 @@ mod tests {
             )
             .await;
 
-        let mut page = Value::Null;
-        for _ in 0..200 {
-            page = server.get(&format!("/tasks/{task_id}/events")).await.json();
-            let texts: Vec<&str> = page["events"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|e| e["event_type"] == "human_message")
-                .map(|e| e["payload"]["text"].as_str().unwrap())
-                .collect();
-            if texts == vec!["hello", "again"] {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("human_message events never showed up as expected: {page}");
+        crate::test_support::wait_until(
+            &format!("human_message events [hello, again] for task {task_id}"),
+            || async {
+                let page: Value = server.get(&format!("/tasks/{task_id}/events")).await.json();
+                let texts: Vec<&str> = page["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["event_type"] == "human_message")
+                    .map(|e| e["payload"]["text"].as_str().unwrap())
+                    .collect();
+                if texts == vec!["hello", "again"] {
+                    Ok(())
+                } else {
+                    Err(format!("human_message texts {texts:?}"))
+                }
+            },
+        )
+        .await;
     }
 
     #[tokio::test]

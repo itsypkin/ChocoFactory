@@ -5940,14 +5940,41 @@ mod tests {
     /// must wait for them directly (see [`wait_until_task_status`]) rather
     /// than treating arrival at the stage as proof they already happened.
     async fn wait_until_stage(pool: &SqlitePool, task_id: &str, expected: &str) {
-        for _ in 0..500 {
-            let state = workflow_state::get(pool, task_id).await.unwrap().unwrap();
-            if state.current_stage == expected {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for stage {expected}");
+        crate::test_support::wait_until(
+            &format!("stage '{expected}' on task {task_id}"),
+            || async {
+                let state = workflow_state::get(pool, task_id).await.unwrap().unwrap();
+                if state.current_stage == expected {
+                    Ok(())
+                } else {
+                    Err(format!("stage '{}'", state.current_stage))
+                }
+            },
+        )
+        .await
+    }
+
+    /// The last few event texts, for a wait's "last saw" message.
+    fn recent_texts(events: &[chocofactory_core::models::Event]) -> String {
+        let texts: Vec<String> = events
+            .iter()
+            .rev()
+            .take(5)
+            .rev()
+            .map(|e| {
+                let text = e
+                    .payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<no text>");
+                format!(
+                    "{}:{:?}",
+                    e.event_type,
+                    text.chars().take(80).collect::<String>()
+                )
+            })
+            .collect();
+        format!("{} events, last few: [{}]", events.len(), texts.join(", "))
     }
 
     /// Waits for `tasks.status`, which a terminal stage sets from inside
@@ -5956,34 +5983,41 @@ mod tests {
     /// python subprocess, and spawning one can take well over a second when
     /// the whole workspace is running at once.
     async fn wait_until_task_status(pool: &SqlitePool, task_id: &str, expected: &str) {
-        let mut last = String::new();
-        for _ in 0..500 {
-            last = tasks::get(pool, task_id).await.unwrap().unwrap().status;
-            if last == expected {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for status {expected}, last saw {last:?}");
+        crate::test_support::wait_until(
+            &format!("status '{expected}' on task {task_id}"),
+            || async {
+                let status = tasks::get(pool, task_id).await.unwrap().unwrap().status;
+                if status == expected {
+                    Ok(())
+                } else {
+                    Err(format!("status {status:?}"))
+                }
+            },
+        )
+        .await
     }
 
     /// Polls `session_id`'s events for one whose `payload.text` equals
     /// `text` (e.g. an assistant reply from the fake-claude fixture),
     /// since event persistence happens on a spawned background task.
     async fn wait_until_events_contain(pool: &SqlitePool, session_id: &str, text: &str) {
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_session(pool, session_id)
-                .await
-                .unwrap();
-            if events
-                .iter()
-                .any(|e| e.payload.get("text").and_then(Value::as_str) == Some(text))
-            {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for an event with text {text:?}");
+        crate::test_support::wait_until(
+            &format!("an event with text {text:?} on session {session_id}"),
+            || async {
+                let events = crate::db::events::list_for_session(pool, session_id)
+                    .await
+                    .unwrap();
+                if events
+                    .iter()
+                    .any(|e| e.payload.get("text").and_then(Value::as_str) == Some(text))
+                {
+                    Ok(())
+                } else {
+                    Err(recent_texts(&events))
+                }
+            },
+        )
+        .await
     }
 
     /// Same as `wait_until_events_contain`, but matches a *prefix* rather
@@ -5994,21 +6028,25 @@ mod tests {
     /// `permission_mode` assert a prefix ending right before it instead of
     /// pinning that path.
     async fn wait_until_events_contain_prefix(pool: &SqlitePool, session_id: &str, prefix: &str) {
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_session(pool, session_id)
-                .await
-                .unwrap();
-            if events.iter().any(|e| {
-                e.payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| text.starts_with(prefix))
-            }) {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for an event with text starting with {prefix:?}");
+        crate::test_support::wait_until(
+            &format!("an event with text starting with {prefix:?} on session {session_id}"),
+            || async {
+                let events = crate::db::events::list_for_session(pool, session_id)
+                    .await
+                    .unwrap();
+                if events.iter().any(|e| {
+                    e.payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.starts_with(prefix))
+                }) {
+                    Ok(())
+                } else {
+                    Err(recent_texts(&events))
+                }
+            },
+        )
+        .await
     }
 
     /// A task's stage trail, read back off the events timeline. This is
@@ -7447,18 +7485,19 @@ stages:
 
         let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
         assert_eq!(runs.len(), 1);
-        for _ in 0..200 {
-            if sessions::get(&pool, &runs[0].id)
+        crate::test_support::wait_until(&format!("session {} to exit", runs[0].id), || async {
+            let status = sessions::get(&pool, &runs[0].id)
                 .await
                 .unwrap()
                 .unwrap()
-                .status
-                == SessionStatus::Exited
-            {
-                break;
+                .status;
+            if status == SessionStatus::Exited {
+                Ok(())
+            } else {
+                Err(format!("status {status:?}"))
             }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
+        })
+        .await;
 
         // Give the watcher a moment it would need if it had incorrectly
         // decided to auto-advance, then confirm it didn't — and that it
@@ -7622,18 +7661,17 @@ stages:
     /// Waits for the `shell_output` entry a shell stage records, and
     /// returns its payload.
     async fn wait_until_shell_event(pool: &SqlitePool, task_id: &str) -> Value {
-        for _ in 0..500 {
-            let found = events::list_for_task(pool, task_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|e| e.event_type == EventType::ShellOutput);
-            if let Some(event) = found {
-                return event.payload;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for a shell_output event");
+        crate::test_support::wait_until(
+            &format!("a shell_output event on task {task_id}"),
+            || async {
+                let all = events::list_for_task(pool, task_id).await.unwrap();
+                match all.iter().find(|e| e.event_type == EventType::ShellOutput) {
+                    Some(event) => Ok(event.payload.clone()),
+                    None => Err(recent_texts(&all)),
+                }
+            },
+        )
+        .await
     }
 
     #[tokio::test]
@@ -8678,23 +8716,12 @@ stages:
         // an assistant message event — proves the follow-up reached the
         // same live process this task's create_task call started.
         let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
-        let mut saw_echo = false;
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_session(&pool, &runs[0].id)
-                .await
-                .unwrap();
-            if events.iter().any(|e| {
-                e.payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t == "echo:actually check the other branch too")
-            }) {
-                saw_echo = true;
-                break;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        assert!(saw_echo, "follow-up message never reached the live session");
+        wait_until_events_contain(
+            &pool,
+            &runs[0].id,
+            "echo:actually check the other branch too",
+        )
+        .await;
     }
 
     /// `send_message_or_resume` on a task created from a repo workflow
@@ -8738,26 +8765,7 @@ stages:
             .unwrap();
 
         let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
-        let mut saw_echo = false;
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_session(&pool, &runs[0].id)
-                .await
-                .unwrap();
-            if events.iter().any(|e| {
-                e.payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t == "echo:still there?")
-            }) {
-                saw_echo = true;
-                break;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        assert!(
-            saw_echo,
-            "send must still have used the recorded repo workflow file"
-        );
+        wait_until_events_contain(&pool, &runs[0].id, "echo:still there?").await;
     }
 
     /// Deleting the recorded workflow file makes the send fail with the
@@ -8839,26 +8847,7 @@ stages:
             .unwrap();
 
         let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
-        let mut saw_echo = false;
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_session(&pool, &runs[0].id)
-                .await
-                .unwrap();
-            if events.iter().any(|e| {
-                e.payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t == "echo:still there?")
-            }) {
-                saw_echo = true;
-                break;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        assert!(
-            saw_echo,
-            "legacy task must still resolve its workflow by name"
-        );
+        wait_until_events_contain(&pool, &runs[0].id, "echo:still there?").await;
     }
 
     /// Regression test: the `events` table used to only ever hold what the
@@ -8898,16 +8887,20 @@ stages:
         // in the same drain loop (#70) — wait for the full expected count
         // too, so this doesn't race a read against that still-pending
         // append.
-        let mut events = Vec::new();
-        for _ in 0..200 {
-            events = crate::db::events::list_for_session(&pool, &runs[0].id)
-                .await
-                .unwrap();
-            if events.len() >= 7 {
-                break;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
+        let events = crate::test_support::wait_until(
+            &format!("7 events on session {}", runs[0].id),
+            || async {
+                let events = crate::db::events::list_for_session(&pool, &runs[0].id)
+                    .await
+                    .unwrap();
+                if events.len() >= 7 {
+                    Ok(events)
+                } else {
+                    Err(recent_texts(&events))
+                }
+            },
+        )
+        .await;
         let kinds_and_text: Vec<(String, Option<&str>)> = events
             .iter()
             .map(|e| {
@@ -9542,23 +9535,12 @@ stages:
             .unwrap();
 
         let runs = sessions::list_for_task(&pool, &task.id).await.unwrap();
-        let mut saw_echo = false;
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_session(&pool, &runs[0].id)
-                .await
-                .unwrap();
-            if events.iter().any(|e| {
-                e.payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t == "echo:actually check the other branch too")
-            }) {
-                saw_echo = true;
-                break;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        assert!(saw_echo, "follow-up message never reached the live session");
+        wait_until_events_contain(
+            &pool,
+            &runs[0].id,
+            "echo:actually check the other branch too",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -9642,29 +9624,34 @@ stages:
     /// events up by `session_id` — a poll stage opens no session, so its
     /// entries are task-scoped with no run id at all.
     async fn wait_until_poll_attempt_recorded(pool: &SqlitePool, task_id: &str) {
-        for _ in 0..600 {
-            if !poll_events(pool, task_id).await.is_empty() {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for a poll attempt to be recorded");
+        crate::test_support::wait_until(
+            &format!("a poll attempt to be recorded on task {task_id}"),
+            || async {
+                let n = poll_events(pool, task_id).await.len();
+                if n > 0 {
+                    Ok(())
+                } else {
+                    Err(format!("{n} poll events"))
+                }
+            },
+        )
+        .await
     }
 
     /// Waits for the entry a poll records when it resolves — the one
     /// carrying a `note`, as opposed to the bare progress entries.
     async fn wait_until_decisive_poll_event(pool: &SqlitePool, task_id: &str) -> Value {
-        for _ in 0..600 {
-            if let Some(event) = poll_events(pool, task_id)
-                .await
-                .into_iter()
-                .find(|payload| payload.get("note").is_some())
-            {
-                return event;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for a decisive poll event");
+        crate::test_support::wait_until(
+            &format!("a decisive poll event on task {task_id}"),
+            || async {
+                let all = poll_events(pool, task_id).await;
+                let seen = format!("{} poll events, none with a note", all.len());
+                all.into_iter()
+                    .find(|payload| payload.get("note").is_some())
+                    .ok_or(seen)
+            },
+        )
+        .await
     }
 
     async fn seed_task_in(pool: &SqlitePool, workflow_def: &str, cwd: &Path) -> String {
@@ -10206,36 +10193,34 @@ stages:
     /// `wait_until_shell_event` returns whichever came first, which isn't
     /// enough once a flow has two shell stages.
     async fn wait_until_shell_event_for(pool: &SqlitePool, task_id: &str, stage: &str) -> Value {
-        for _ in 0..500 {
-            let found = events::list_for_task(pool, task_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|e| {
+        crate::test_support::wait_until(
+            &format!("a shell_output event for stage '{stage}' on task {task_id}"),
+            || async {
+                let all = events::list_for_task(pool, task_id).await.unwrap();
+                match all.iter().find(|e| {
                     e.event_type == EventType::ShellOutput
                         && e.payload.get("stage").and_then(Value::as_str) == Some(stage)
-                });
-            if let Some(event) = found {
-                return event.payload;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for a shell_output event for stage '{stage}'");
+                }) {
+                    Some(event) => Ok(event.payload.clone()),
+                    None => Err(recent_texts(&all)),
+                }
+            },
+        )
+        .await
     }
 
     async fn wait_until_turn_outcome_event(pool: &SqlitePool, task_id: &str) -> Value {
-        for _ in 0..500 {
-            let found = events::list_for_task(pool, task_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|e| e.event_type == EventType::TurnOutcome);
-            if let Some(event) = found {
-                return event.payload;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for a turn_outcome event");
+        crate::test_support::wait_until(
+            &format!("a turn_outcome event on task {task_id}"),
+            || async {
+                let all = events::list_for_task(pool, task_id).await.unwrap();
+                match all.iter().find(|e| e.event_type == EventType::TurnOutcome) {
+                    Some(event) => Ok(event.payload.clone()),
+                    None => Err(recent_texts(&all)),
+                }
+            },
+        )
+        .await
     }
 
     /// Finishes a `review` (`capture: json`) stage from its recorded reply
@@ -10389,12 +10374,12 @@ stages:
         let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
 
         engine.start_task(&task_id, &def, None).await.unwrap();
-        wait_until_stage(&pool, &task_id, "coding").await;
-
+        // `current_stage` reads `coding` before the stage's session exists,
+        // so wait for the session itself, not just the stage.
+        //
         // The fixture echoes back whatever prompt it was handed, so the
         // rendered text showing up as the reply proves what was sent.
-        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
-        let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+        let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
         wait_until_events_contain(&pool, &run.id, "echo:fix pr 42").await;
     }
 
@@ -10491,10 +10476,7 @@ stages:
             .start_task(&task_id, &def, Some("fix the flaky test"))
             .await
             .unwrap();
-        wait_until_stage(&pool, &task_id, "coding").await;
-
-        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
-        let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+        let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
         // `seed_task` gives the task the title "T" (§ its own definition).
         wait_until_events_contain(&pool, &run.id, "echo:T: fix the flaky test").await;
     }
@@ -10532,10 +10514,7 @@ stages:
             .start_task(&task_id, &def, Some("fix the flaky test"))
             .await
             .unwrap();
-        wait_until_stage(&pool, &task_id, "coding").await;
-
-        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
-        let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+        let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
         wait_until_events_contain(&pool, &run.id, "echo:fix the flaky test").await;
     }
 
@@ -11601,18 +11580,18 @@ roles:
         task_id: &str,
         stage: &str,
     ) -> chocofactory_core::models::Session {
-        for _ in 0..500 {
-            let found = sessions::list_for_task(pool, task_id)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|r| r.stage == stage);
-            if let Some(run) = found {
-                return run;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for a session for stage {stage}");
+        crate::test_support::wait_until(
+            &format!("a session for stage '{stage}' on task {task_id}"),
+            || async {
+                let all = sessions::list_for_task(pool, task_id).await.unwrap();
+                let seen = format!(
+                    "sessions for stages {:?}",
+                    all.iter().map(|r| r.stage.as_str()).collect::<Vec<_>>()
+                );
+                all.into_iter().find(|r| r.stage == stage).ok_or(seen)
+            },
+        )
+        .await
     }
 
     /// The headline confirmation for #17/P2-6: a workflow that actually
@@ -11810,13 +11789,14 @@ stages:
     /// (here, `worktree::remove`) can still be in flight for a moment after
     /// `tasks.status` already reads `closed`.
     async fn wait_until_path_gone(path: &Path) {
-        for _ in 0..500 {
+        crate::test_support::wait_until(&format!("{path:?} to be removed"), || async {
             if !path.exists() {
-                return;
+                Ok(())
+            } else {
+                Err(format!("{path:?} still exists"))
             }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for {path:?} to be removed");
+        })
+        .await
     }
 
     #[tokio::test]
@@ -12722,14 +12702,21 @@ stages:
             tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
             "cancelled"
         );
-        for _ in 0..200 {
-            let run = sessions::get(&pool, &run.id).await.unwrap().unwrap();
-            if run.end_reason == Some(SessionEndReason::Cancelled) {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for the run to be recorded as cancelled");
+        crate::test_support::wait_until(
+            &format!("session {} to be recorded as cancelled", run.id),
+            || async {
+                let run = sessions::get(&pool, &run.id).await.unwrap().unwrap();
+                if run.end_reason == Some(SessionEndReason::Cancelled) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "status {:?}, end_reason {:?}",
+                        run.status, run.end_reason
+                    ))
+                }
+            },
+        )
+        .await;
     }
 
     /// Cancel deliberately leaves `current_stage` alone, so an operator can
@@ -13068,12 +13055,18 @@ stages:
 
         engine.start_task(&task_id, &def, None).await.unwrap();
         // Let at least one attempt land, so the loop is genuinely running.
-        for _ in 0..500 {
-            if fs::metadata(&marker).is_ok_and(|m| m.len() >= 1) {
-                break;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
+        crate::test_support::wait_until(
+            "the poll command to append to the marker file",
+            || async {
+                let len = fs::metadata(&marker).map(|m| m.len());
+                if len.as_ref().is_ok_and(|len| *len >= 1) {
+                    Ok(())
+                } else {
+                    Err(format!("marker length {len:?}"))
+                }
+            },
+        )
+        .await;
         assert!(fs::metadata(&marker).is_ok(), "the poll never ran at all");
 
         engine.cancel_task(&task_id).await.unwrap();
@@ -13105,7 +13098,7 @@ name: long-shell
 stages:
   building:
     kind: shell
-    command: "for i in $(seq 1 200); do printf x >> {} ; sleep 0.05; done"
+    command: "for i in $(seq 1 2000); do printf x >> {} ; sleep 0.05; done"
     on: {{ done: finished, error: finished }}
   finished:
     kind: terminal
@@ -13117,20 +13110,28 @@ stages:
         let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
 
         engine.start_task(&task_id, &def, None).await.unwrap();
-        for _ in 0..500 {
-            if fs::metadata(&marker).is_ok_and(|m| m.len() >= 2) {
-                break;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
+        crate::test_support::wait_until(
+            "the shell command to tick twice into the marker file",
+            || async {
+                let len = fs::metadata(&marker).map(|m| m.len());
+                if len.as_ref().is_ok_and(|len| *len >= 2) {
+                    Ok(())
+                } else {
+                    Err(format!("marker length {len:?}"))
+                }
+            },
+        )
+        .await;
         assert!(
             fs::metadata(&marker).is_ok(),
             "the shell command never started"
         );
 
         engine.cancel_task(&task_id).await.unwrap();
-        // The kill happens when the aborted future drops; give it a beat.
-        tokio::time::sleep(StdDuration::from_millis(200)).await;
+        // `cancel_task` awaits the aborted runner, so the process group is
+        // already killed here. One tick of slack absorbs a `printf` that was
+        // in flight; any growth after that means the command survived.
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
         let at_cancel = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
 
         tokio::time::sleep(StdDuration::from_millis(500)).await;
@@ -13165,18 +13166,22 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
         wait_until_task_status(&pool, &task_id, "closed").await;
 
-        for _ in 0..200 {
-            let empty = engine
-                .detached_runners
-                .lock()
-                .expect("detached_runners mutex poisoned")
-                .is_empty();
-            if empty {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("a finished shell runner left its registry entry behind");
+        crate::test_support::wait_until(
+            "a finished shell runner's registry entry to be removed",
+            || async {
+                let left = engine
+                    .detached_runners
+                    .lock()
+                    .expect("detached_runners mutex poisoned")
+                    .len();
+                if left == 0 {
+                    Ok(())
+                } else {
+                    Err(format!("{left} runner entries left"))
+                }
+            },
+        )
+        .await;
     }
 
     /// `start_task` needs the same guard `advance_from_stage` has:
@@ -14896,33 +14901,36 @@ stages:
             }
         }
 
-        let mut pids = Vec::new();
-        for _ in 0..1000 {
-            pids = fs::read_dir(&*dir)
-                .unwrap()
-                .filter_map(|entry| fs::read_to_string(entry.ok()?.path().join("child.pid")).ok())
-                .filter_map(|text| text.trim().parse::<u32>().ok())
-                .collect();
-            if pids.len() == 2 {
-                break;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
+        let pids: Vec<u32> =
+            crate::test_support::wait_until("both sessions to write a child.pid", || async {
+                let pids: Vec<u32> = fs::read_dir(&*dir)
+                    .unwrap()
+                    .filter_map(|entry| {
+                        fs::read_to_string(entry.ok()?.path().join("child.pid")).ok()
+                    })
+                    .filter_map(|text| text.trim().parse::<u32>().ok())
+                    .collect();
+                if pids.len() == 2 {
+                    Ok(pids)
+                } else {
+                    Err(format!("{} child pids: {pids:?}", pids.len()))
+                }
+            })
+            .await;
         assert_eq!(pids.len(), 2, "both sessions should have started a child");
         assert!(pids.iter().all(|pid| process_alive(*pid)));
 
         engine.cancel_task(&task_id).await.unwrap();
 
         for pid in pids {
-            let mut gone = false;
-            for _ in 0..500 {
+            crate::test_support::wait_until(&format!("pid {pid} to die after cancel"), || async {
                 if !process_alive(pid) {
-                    gone = true;
-                    break;
+                    Ok(())
+                } else {
+                    Err(format!("pid {pid} still alive"))
                 }
-                tokio::time::sleep(StdDuration::from_millis(10)).await;
-            }
-            assert!(gone, "pid {pid} survived cancel");
+            })
+            .await;
         }
     }
 
@@ -15012,13 +15020,18 @@ stages:
     }
 
     async fn wait_for_poll_attempt(pool: &SqlitePool, task_id: &str) {
-        for _ in 0..600 {
-            if poll_events(pool, task_id).await.iter().any(is_real_attempt) {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for a real poll attempt");
+        crate::test_support::wait_until(
+            &format!("a real poll attempt on task {task_id}"),
+            || async {
+                let events = poll_events(pool, task_id).await;
+                if events.iter().any(is_real_attempt) {
+                    Ok(())
+                } else {
+                    Err(format!("{} poll events, none a real attempt", events.len()))
+                }
+            },
+        )
+        .await
     }
 
     async fn state_of(

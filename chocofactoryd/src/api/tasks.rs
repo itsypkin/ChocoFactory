@@ -573,23 +573,31 @@ mod tests {
         // `send_message_or_resume` dispatches to, not just that it
         // returned 202. Checked at the DB layer here (live-over-WS
         // delivery is `ws.rs`'s own test's job).
-        let mut saw_echo = false;
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_task(server.pool(), &task_id)
-                .await
-                .unwrap();
-            if events.iter().any(|e| {
-                e.payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t == "echo:again")
-            }) {
-                saw_echo = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(saw_echo, "follow-up message never reached the live session");
+        crate::test_support::wait_until(
+            &format!("the follow-up echo on task {task_id} (follow-up reaching the live session)"),
+            || async {
+                let events = crate::db::events::list_for_task(server.pool(), &task_id)
+                    .await
+                    .unwrap();
+                if events.iter().any(|e| {
+                    e.payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t == "echo:again")
+                }) {
+                    Ok(())
+                } else {
+                    let texts: Vec<String> = events
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .map(|e| format!("{}:{:?}", e.event_type, e.payload.get("text")))
+                        .collect();
+                    Err(format!("{} events, newest first: {texts:?}", events.len()))
+                }
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -636,16 +644,21 @@ stages:
 
         // fake_claude_oneshot.py exits cleanly right away, auto-advancing
         // this single-shot turn to "finished" (terminal, §5.2).
-        let mut is_finished = false;
-        for _ in 0..200 {
-            let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
-            if detail["workflow_state"]["current_stage"] == "finished" {
-                is_finished = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(is_finished, "task never reached its terminal stage");
+        crate::test_support::wait_until(
+            &format!("task {task_id} to reach its terminal stage 'finished'"),
+            || async {
+                let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+                if detail["workflow_state"]["current_stage"] == "finished" {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "stage {}",
+                        detail["workflow_state"]["current_stage"]
+                    ))
+                }
+            },
+        )
+        .await;
 
         let response = server
             .post(
