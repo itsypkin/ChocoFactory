@@ -1581,3 +1581,311 @@ async fn project_init_workflows_prints_the_created_files() {
         seeded_again.stdout
     );
 }
+
+// ---- `task status --live` / `--until` (#84 part 4) ----
+
+const CLOSING_WF: &str = r#"
+name: closing
+stages:
+  run:
+    kind: shell
+    command: "sleep 2"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+
+const STUCK_WF: &str = r#"
+name: stuckwf
+stages:
+  run:
+    kind: shell
+    command: "sleep 1; false"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+
+const GATE_WF: &str = r#"
+name: gatewf
+stages:
+  wait:
+    kind: human_gate
+    on: { resumed: finished }
+  finished:
+    kind: terminal
+"#;
+
+/// Starts a daemon with one workflow and creates a task on it.
+async fn watch_setup(name: &str, yaml: &str) -> (Daemon, String) {
+    let home = TempHome::new();
+    home.write_workflow(name, yaml);
+    let daemon = Daemon::spawn(home).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let task = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            name,
+            "--title",
+            "t",
+            "--prompt",
+            "p",
+        ],
+    )
+    .await
+    .json();
+    (daemon, task["id"].as_str().unwrap().to_string())
+}
+
+async fn watch_choco(daemon: &Daemon, id: &str, extra: &[&str]) -> ChocoOutput {
+    let mut args = vec!["task", "status", id];
+    args.extend_from_slice(extra);
+    run_choco(&daemon.base_url, &args).await
+}
+
+/// Spawns a watcher as a child so the test can act while it runs.
+fn spawn_watcher(base_url: &str, id: &str, extra: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_choco"))
+        .arg("--base-url")
+        .arg(base_url)
+        .args(["task", "status", id])
+        .args(extra)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn choco")
+}
+
+async fn wait_for_first_line(child: &mut Child) {
+    let stdout = child.stdout.as_mut().expect("piped stdout");
+    let mut line = String::new();
+    BufReader::new(stdout).read_line(&mut line).await.unwrap();
+    assert!(line.contains("watching task"), "first line: {line:?}");
+}
+
+async fn finish_watcher(mut child: Child) -> (Option<i32>, String) {
+    let mut stderr = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        e.read_to_string(&mut stderr).await.unwrap();
+    }
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("watcher did not exit within 10s")
+        .unwrap();
+    (status.code(), stderr)
+}
+
+#[tokio::test]
+async fn watch_until_closed_exits_0_with_plain_lines() {
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "closed", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("watching task"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("run --[done]--> finished"),
+        "{}",
+        out.stdout
+    );
+    assert!(!out.stdout.contains('\x1b'));
+}
+
+#[tokio::test]
+async fn watch_until_closed_on_a_stuck_task_exits_3() {
+    let (d, id) = watch_setup("stuckwf", STUCK_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "closed", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(3), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains(&id), "{}", out.stderr);
+    assert!(out.stderr.contains("stuck"), "{}", out.stderr);
+    assert!(out.stderr.contains("run"), "{}", out.stderr);
+    assert!(!out.stderr.contains("error: "), "{}", out.stderr);
+}
+
+#[tokio::test]
+async fn watch_exits_4_when_the_task_is_cancelled() {
+    let (d, id) = watch_setup("gatewf", GATE_WF).await;
+    let mut child = spawn_watcher(&d.base_url, &id, &["--until", "closed", "--interval", "1s"]);
+    wait_for_first_line(&mut child).await;
+    let cancel = run_choco(&d.base_url, &["task", "cancel", &id]).await;
+    assert_eq!(cancel.code, Some(0), "{}", cancel.stderr);
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(4), "stderr: {stderr}");
+    assert!(stderr.contains("cancelled"), "{stderr}");
+}
+
+#[tokio::test]
+async fn watch_live_alone_exits_4_when_cancelled_from_outside() {
+    let (d, id) = watch_setup("gatewf", GATE_WF).await;
+    let mut child = spawn_watcher(&d.base_url, &id, &["--live", "--interval", "1s"]);
+    wait_for_first_line(&mut child).await;
+    run_choco(&d.base_url, &["task", "cancel", &id]).await;
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(4), "stderr: {stderr}");
+}
+
+#[tokio::test]
+async fn watch_timeout_exits_5_naming_the_last_state() {
+    let (d, id) = watch_setup("gatewf", GATE_WF).await;
+    let started = std::time::Instant::now();
+    let out = watch_choco(
+        &d,
+        &id,
+        &["--until", "closed", "--interval", "1s", "--timeout", "2s"],
+    )
+    .await;
+    assert_eq!(out.code, Some(5), "stderr: {}", out.stderr);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(out.stderr.contains("timed out after 2s"), "{}", out.stderr);
+    assert!(out.stderr.contains(&id), "{}", out.stderr);
+    assert!(out.stderr.contains("open"), "{}", out.stderr);
+    assert!(out.stderr.contains("wait"), "{}", out.stderr);
+}
+
+#[tokio::test]
+async fn watch_exits_6_when_the_task_closes_without_the_target() {
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "stage:nope", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(6), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("closed"), "{}", out.stderr);
+
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "stuck", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(6), "stderr: {}", out.stderr);
+}
+
+#[tokio::test]
+async fn watch_until_stuck_and_until_a_fast_stage_exit_0() {
+    let (d, id) = watch_setup("stuckwf", STUCK_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "stuck", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+
+    // `finished` is entered and the task closed between polls: the trail
+    // clause catches it.
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "stage:finished", "--interval", "5s"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+#[tokio::test]
+async fn watch_on_an_already_closed_task_prints_only_the_first_line() {
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let ok = watch_choco(&d, &id, &["--until", "closed", "--interval", "1s"]).await;
+    assert_eq!(ok.code, Some(0));
+    let out = watch_choco(&d, &id, &["--until", "closed", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(out.stdout.lines().count(), 1, "{}", out.stdout);
+    assert!(out.stdout.contains("watching task"));
+}
+
+#[tokio::test]
+async fn watch_json_is_ndjson() {
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let out = run_choco_json(
+        &d.base_url,
+        &[
+            "task",
+            "status",
+            &id,
+            "--until",
+            "closed",
+            "--interval",
+            "1s",
+        ],
+    )
+    .await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert!(lines.len() >= 2, "{}", out.stdout);
+    for line in &lines {
+        let v: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        assert!(v.is_object() && v.get("id").is_some() && v.get("status").is_some());
+    }
+    let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["status"], "closed");
+}
+
+#[tokio::test]
+async fn watch_live_closes_with_0_and_ignores_stuck() {
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let out = watch_choco(&d, &id, &["--live", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+
+    let (d, id) = watch_setup("stuckwf", STUCK_WF).await;
+    let out = watch_choco(&d, &id, &["--live", "--interval", "1s", "--timeout", "3s"]).await;
+    assert_eq!(out.code, Some(5), "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("-> stuck"), "{}", out.stdout);
+}
+
+#[tokio::test]
+async fn watch_gives_up_when_the_daemon_goes_away() {
+    let (mut d, id) = watch_setup("gatewf", GATE_WF).await;
+    let mut child = spawn_watcher(&d.base_url, &id, &["--until", "closed", "--interval", "1s"]);
+    wait_for_first_line(&mut child).await;
+    d.child.start_kill().unwrap();
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("lost contact with chocofactoryd"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("last seen: open"), "{stderr}");
+}
+
+#[tokio::test]
+async fn watch_first_poll_errors_are_fatal() {
+    let base_url = format!("http://127.0.0.1:{}", free_port());
+    let out = run_choco(
+        &base_url,
+        &[
+            "task",
+            "status",
+            "x",
+            "--until",
+            "closed",
+            "--interval",
+            "1s",
+        ],
+    )
+    .await;
+    assert_eq!(out.code, Some(1));
+    assert!(
+        out.stderr
+            .starts_with("error: failed to connect to chocofactoryd at"),
+        "{}",
+        out.stderr
+    );
+
+    let d = Daemon::spawn(TempHome::new()).await;
+    let out = watch_choco(&d, "does-not-exist", &["--until", "closed"]).await;
+    assert_eq!(out.code, Some(1));
+    assert!(out.stderr.starts_with("error: "), "{}", out.stderr);
+    assert_eq!(out.stdout, "");
+}
+
+#[tokio::test]
+async fn watch_flag_misuse_is_a_usage_error() {
+    for extra in [
+        &["--until", "closed", "--interval", "5"][..],
+        &["--until", "closed", "--interval", "0s"],
+        &["--until", "closed", "--interval", "1d"],
+        &["--until", "foo"],
+        &["--until", "stage:"],
+        &["--timeout", "5s"],
+        &["--interval", "5s"],
+    ] {
+        let out = run_choco(
+            "http://127.0.0.1:1",
+            &[&["task", "status", "x"][..], extra].concat(),
+        )
+        .await;
+        assert_eq!(out.code, Some(2), "{extra:?}: {}", out.stderr);
+    }
+}

@@ -60,6 +60,9 @@ pub enum ClientError {
     /// before ever sending a request, and a failure here is reported
     /// instead of forwarding a path the daemon would just reject anyway.
     InvalidRepoPath(String),
+    /// `task status --live/--until` lost the daemon mid-watch and gave up
+    /// after repeated connection failures. Holds the full message.
+    LostContact(String),
 }
 
 impl fmt::Display for ClientError {
@@ -70,6 +73,7 @@ impl fmt::Display for ClientError {
                 "failed to connect to chocofactoryd at {base_url} (is it running?): {source}"
             ),
             ClientError::Api(message) => write!(f, "{message}"),
+            ClientError::LostContact(message) => write!(f, "{message}"),
             ClientError::Decode(msg) => write!(f, "unexpected response from chocofactoryd: {msg}"),
             ClientError::NoSuchProject(name) => {
                 write!(f, "no project named '{name}' (try `choco project list`)")

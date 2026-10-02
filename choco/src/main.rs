@@ -6,6 +6,7 @@ mod cli;
 mod client;
 mod mcp;
 mod render;
+mod watch;
 
 use std::process::ExitCode;
 
@@ -73,6 +74,33 @@ async fn main() -> ExitCode {
     }
 
     let client = Client::new(cli.base_url);
+
+    // A watching `task status` returns its own exit code (3–6 for the ways a
+    // watch can end other than success), so it's handled apart from `run`.
+    if let Command::Task(TaskCmd::Status {
+        id,
+        live,
+        until,
+        interval,
+        timeout,
+    }) = &cli.command
+        && (*live || until.is_some())
+    {
+        let args = watch::WatchArgs {
+            id,
+            until: until.as_ref(),
+            interval,
+            timeout: timeout.as_ref(),
+            json: cli.json,
+        };
+        return match watch::watch(&client, args).await {
+            Ok(end) => end.exit_code(),
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     match run(&client, cli.command).await {
         Ok(output) => {
@@ -242,7 +270,7 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             })?;
             Ok(Output::Task(client.update_task_config(&id, &config).await?))
         }
-        Command::Task(TaskCmd::Status { id }) => {
+        Command::Task(TaskCmd::Status { id, .. }) => {
             Ok(Output::TaskDetail(client.get_task(&id).await?))
         }
         Command::Task(TaskCmd::Send { id, text }) => {

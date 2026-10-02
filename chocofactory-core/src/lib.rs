@@ -2,5 +2,6 @@
 //! workflow definition types. Populated incrementally by later tickets
 //! (see .agents/ChocoFactory/04-plan.md).
 
+pub mod duration;
 pub mod mcp;
 pub mod models;
