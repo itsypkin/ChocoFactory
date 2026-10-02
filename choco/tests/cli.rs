@@ -37,14 +37,15 @@ impl TempHome {
         TempHome(path)
     }
 
-    /// Pre-seeds a workflow definition before the daemon starts — safe
-    /// because `seed_builtin_workflows` only ever writes `chat.yaml` if
-    /// absent (`create_new`, never overwrites), so this is untouched by
-    /// startup.
-    fn write_workflow(&self, name: &str, yaml: &str) {
-        let dir = self.0.join(".config/chocofactory/workflows");
+    /// Writes a workflow definition to `<home>/test-workflows/<name>.yaml`
+    /// and returns its path, to pass as `--workflow <path>` (#129: the
+    /// daemon no longer reads a global workflows folder).
+    fn write_workflow(&self, name: &str, yaml: &str) -> PathBuf {
+        let dir = self.0.join("test-workflows");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
+        let path = dir.join(format!("{name}.yaml"));
+        std::fs::write(&path, yaml).unwrap();
+        path
     }
 }
 
@@ -363,7 +364,7 @@ async fn project_create_and_list_round_trip() {
 #[tokio::test]
 async fn task_create_accepts_a_custom_workflow_name() {
     let home = TempHome::new();
-    home.write_workflow("echo-workflow", ECHO_WORKFLOW_YAML);
+    let wf_path = home.write_workflow("echo-workflow", ECHO_WORKFLOW_YAML);
     let daemon = Daemon::spawn(home).await;
 
     let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
@@ -379,7 +380,7 @@ async fn task_create_accepts_a_custom_workflow_name() {
             "--project",
             &project_id,
             "--workflow",
-            "echo-workflow",
+            wf_path.to_str().unwrap(),
             "--title",
             "custom",
             "--prompt",
@@ -832,7 +833,7 @@ async fn task_events_for_an_unknown_task_is_an_error() {
 #[tokio::test]
 async fn task_status_shows_stage_progress_with_outcomes_and_timestamps() {
     let home = TempHome::new();
-    home.write_workflow(
+    let wf_path = home.write_workflow(
         "gated",
         r#"
 name: gated
@@ -861,7 +862,7 @@ stages:
             "--project",
             project["id"].as_str().unwrap(),
             "--workflow",
-            "gated",
+            wf_path.to_str().unwrap(),
             "--title",
             "gated task",
             "--prompt",
@@ -994,7 +995,7 @@ stages:
 #[tokio::test]
 async fn task_create_and_reconfigure_set_overrides_for_more_than_one_role() {
     let home = TempHome::new();
-    home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
+    let wf_path = home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
     let daemon = Daemon::spawn(home).await;
 
     let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
@@ -1010,7 +1011,7 @@ async fn task_create_and_reconfigure_set_overrides_for_more_than_one_role() {
             "--project",
             &project_id,
             "--workflow",
-            "two-role",
+            wf_path.to_str().unwrap(),
             "--title",
             "t",
             "--prompt",
@@ -1061,7 +1062,7 @@ async fn task_create_and_reconfigure_set_overrides_for_more_than_one_role() {
 #[tokio::test]
 async fn task_create_human_output_names_each_configured_role() {
     let home = TempHome::new();
-    home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
+    let wf_path = home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
     let daemon = Daemon::spawn(home).await;
 
     let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
@@ -1077,7 +1078,7 @@ async fn task_create_human_output_names_each_configured_role() {
             "--project",
             &project_id,
             "--workflow",
-            "two-role",
+            wf_path.to_str().unwrap(),
             "--title",
             "t",
             "--prompt",
@@ -1107,7 +1108,7 @@ async fn task_create_human_output_names_each_configured_role() {
 #[tokio::test]
 async fn task_create_rejects_a_malformed_role_flag_without_creating_a_task() {
     let home = TempHome::new();
-    home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
+    let wf_path = home.write_workflow("two-role", TWO_ROLE_WORKFLOW_YAML);
     let daemon = Daemon::spawn(home).await;
 
     let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
@@ -1123,7 +1124,7 @@ async fn task_create_rejects_a_malformed_role_flag_without_creating_a_task() {
             "--project",
             &project_id,
             "--workflow",
-            "two-role",
+            wf_path.to_str().unwrap(),
             "--title",
             "t",
             "--prompt",
@@ -1269,7 +1270,7 @@ async fn sending_to_a_cancelled_task_fails_with_a_clear_message() {
 async fn task_retry_reruns_a_stuck_tasks_current_stage() {
     let home = TempHome::new();
     let marker = home.0.join("marker");
-    home.write_workflow(
+    let wf_path = home.write_workflow(
         "retry-flow",
         &format!(
             r#"
@@ -1298,7 +1299,7 @@ stages:
             "--project",
             &project_id,
             "--workflow",
-            "retry-flow",
+            wf_path.to_str().unwrap(),
             "--title",
             "t",
             "--prompt",
@@ -1637,7 +1638,7 @@ stages:
 /// Starts a daemon with one workflow and creates a task on it.
 async fn watch_setup(name: &str, yaml: &str) -> (Daemon, String) {
     let home = TempHome::new();
-    home.write_workflow(name, yaml);
+    let wf_path = home.write_workflow(name, yaml);
     let daemon = Daemon::spawn(home).await;
     let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
         .await
@@ -1651,7 +1652,7 @@ async fn watch_setup(name: &str, yaml: &str) -> (Daemon, String) {
             "--project",
             &project_id,
             "--workflow",
-            name,
+            wf_path.to_str().unwrap(),
             "--title",
             "t",
             "--prompt",
@@ -2127,4 +2128,149 @@ async fn watch_closed_stdout_pipe_exits_1_with_a_message() {
     let (code, stderr) = finish_watcher(child).await;
     assert_eq!(code, Some(1), "stderr: {stderr}");
     assert!(stderr.contains("failed writing to stdout"), "{stderr}");
+}
+
+// ---- Built-in and explicit workflows (#129) ----
+
+/// `--workflow ./wf/x.yaml` run from another cwd is canonicalized client-side
+/// and sent as an absolute `workflow_file`; `task status` shows that path. A
+/// bare name is still sent as a name, and a missing file fails before any
+/// request is made.
+#[tokio::test]
+async fn task_create_workflow_path_is_canonicalized_client_side() {
+    let home = TempHome::new();
+    let wf_path = home.write_workflow("x", ECHO_WORKFLOW_YAML);
+    let canonical = std::fs::canonicalize(&wf_path).unwrap();
+    // `<home>/test-workflows/x.yaml`, reached from `<home>` as `./test-workflows/x.yaml`.
+    let cwd = home.0.clone();
+    let daemon = Daemon::spawn(home).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    let created = Command::new(env!("CARGO_BIN_EXE_choco"))
+        .current_dir(&cwd)
+        .args(["--json", "--base-url", &daemon.base_url])
+        .args(["task", "create", "--project", &project_id])
+        .args(["--workflow", "./test-workflows/x.yaml"])
+        .args(["--title", "t", "--prompt", "hi"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let task: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(
+        task["workflow_path"],
+        canonical.to_string_lossy().as_ref(),
+        "the daemon records the canonical absolute path"
+    );
+    let id = task["id"].as_str().unwrap();
+    let status = run_choco(&daemon.base_url, &["task", "status", id]).await;
+    assert!(
+        status.stdout.contains(canonical.to_str().unwrap()),
+        "stdout: {}",
+        status.stdout
+    );
+
+    // A name is still a name: resolves to the built-in `chat`.
+    let by_name = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "chat",
+            "--title",
+            "t",
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(by_name.code, Some(0), "stderr: {}", by_name.stderr);
+    assert_eq!(
+        by_name.json()["workflow_path"],
+        format!("builtin:chat@{}", chocofactory_core::version::VERSION)
+    );
+
+    // A missing file fails client-side — nothing is listening here at all, so
+    // reaching the network would be a connection error instead.
+    let missing = run_choco(
+        "http://127.0.0.1:1",
+        &[
+            "task",
+            "create",
+            "--project",
+            "p",
+            "--workflow",
+            "missing.yaml",
+            "--title",
+            "t",
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(missing.code, Some(1));
+    assert!(
+        missing.stderr.contains("invalid --workflow 'missing.yaml'"),
+        "stderr: {}",
+        missing.stderr
+    );
+    assert!(
+        !missing.stderr.contains("failed to connect"),
+        "no request should be made: {}",
+        missing.stderr
+    );
+}
+
+/// `task status` on a built-in task labels the line `Workflow`, not
+/// `Workflow file`, and shows the `builtin:` record.
+#[tokio::test]
+async fn task_status_renders_a_builtin_workflow_record() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let task = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            &project_id,
+            "--workflow",
+            "chat",
+            "--title",
+            "t",
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await
+    .json();
+    let id = task["id"].as_str().unwrap();
+    let status = run_choco(&daemon.base_url, &["task", "status", id]).await;
+    assert_eq!(status.code, Some(0), "stderr: {}", status.stderr);
+    let expected = format!("builtin:chat@{}", chocofactory_core::version::VERSION);
+    assert!(
+        status.stdout.lines().any(|l| l.starts_with("Workflow ")
+            && l.contains(&expected)
+            && !l.contains("Workflow file")),
+        "stdout: {}",
+        status.stdout
+    );
+    assert!(
+        !status.stdout.contains("Workflow file"),
+        "{}",
+        status.stdout
+    );
 }

@@ -261,7 +261,9 @@ pub fn task_detail(detail: &Value) -> String {
     // own.
     if let Some(path) = detail.get("workflow_path").and_then(Value::as_str) {
         let mut line = path.to_string();
+        let builtin = path.starts_with("builtin:");
         match detail.get("workflow_file_status").and_then(Value::as_str) {
+            Some("changed") if builtin => line.push_str(" (built-in updated since task start)"),
             Some("changed") => line.push_str(" (changed since task start)"),
             Some("missing") => line.push_str(" (missing)"),
             _ => {}
@@ -269,7 +271,7 @@ pub fn task_detail(detail: &Value) -> String {
         if let Some(sha) = detail.get("workflow_sha256").and_then(Value::as_str) {
             line.push_str(&format!("  [{}]", &sha[..sha.len().min(12)]));
         }
-        pairs.push(("Workflow file", line));
+        pairs.push((if builtin { "Workflow" } else { "Workflow file" }, line));
     }
     pairs.push(("Status", get("status").to_string()));
     // Right after Status, so the reason for a stuck task (X-4, #61) reads

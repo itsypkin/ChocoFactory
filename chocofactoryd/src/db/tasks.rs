@@ -121,6 +121,21 @@ pub async fn list(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// How many `open` or `stuck` tasks have a `workflow_path` starting with
+/// `prefix` (a plain string prefix, no pattern characters).
+pub async fn count_active_with_workflow_path_prefix(
+    pool: &SqlitePool,
+    prefix: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE status IN ('open', 'stuck') \
+         AND substr(workflow_path, 1, length(?1)) = ?1",
+    )
+    .bind(prefix)
+    .fetch_one(pool)
+    .await
+}
+
 /// Sets `tasks.status` unconditionally and clears `stuck_reason` (X-4,
 /// issue #61): `mark_stuck` is the only writer of a non-null reason, so any
 /// other status change — closing, cancelling, or reopening via this

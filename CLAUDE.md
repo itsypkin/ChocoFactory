@@ -65,9 +65,10 @@ Reviews on this repo repeatedly flag the same two defects. Check your own diff f
   captures — never refactor them after their phase closes.
 - Migrations are append-only: add the next numbered file in `chocofactoryd/migrations/`, never edit an
   applied one.
-- `workflows/` in this repo is the source of truth for the built-ins; they are embedded at build time.
-  The daemon **never overwrites** an already-seeded copy in `~/.config/chocofactory/workflows/`, so
-  refresh that directory before testing "the latest" or you'll chase defects that no longer exist.
+- `workflows/` in this repo is the source of truth for the built-ins. They are embedded at build
+  time and the daemon reads them from its binary (#129), so rebuilding and restarting the daemon is
+  the workflow update. To try an unmerged workflow change, create the task with
+  `--workflow <checkout>/workflows/coding-task.yaml`.
 - `CHOCOFACTORY_CLAUDE_BINARY` unset means the daemon drives the real `claude` — that is the intended
   behaviour, not a hazard to route around. `mock-claude` is for the test suites and for a deliberately
   isolated smoke run; never substitute it when the point is to exercise the real CLI, and never leave it

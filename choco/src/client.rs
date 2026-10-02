@@ -60,6 +60,9 @@ pub enum ClientError {
     /// before ever sending a request, and a failure here is reported
     /// instead of forwarding a path the daemon would just reject anyway.
     InvalidRepoPath(String),
+    /// `task create --workflow <path>` named a file that couldn't be
+    /// canonicalized or isn't a regular file. Carries the value and why.
+    InvalidWorkflowPath(String),
     /// `task status --live/--until` lost the daemon mid-watch and gave up
     /// after repeated connection failures. Holds the full message.
     LostContact(String),
@@ -86,8 +89,35 @@ impl fmt::Display for ClientError {
             ),
             ClientError::InvalidConfig(msg) => write!(f, "{msg}"),
             ClientError::InvalidRepoPath(msg) => write!(f, "{msg}"),
+            ClientError::InvalidWorkflowPath(msg) => write!(f, "{msg}"),
         }
     }
+}
+
+/// What `--workflow` resolved to: a name for the daemon to resolve, or an
+/// absolute, canonical file path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowArg {
+    Name(String),
+    File(String),
+}
+
+/// Interprets `--workflow`. A path (contains `/`, or ends in `.yaml`/`.yml`)
+/// is canonicalized here, because the daemon's working directory differs
+/// from the user's; it must be a file. Anything else is a name.
+pub fn workflow_arg(value: &str) -> Result<WorkflowArg, ClientError> {
+    let is_path = value.contains('/') || value.ends_with(".yaml") || value.ends_with(".yml");
+    if !is_path {
+        return Ok(WorkflowArg::Name(value.to_string()));
+    }
+    let invalid = |why: String| {
+        ClientError::InvalidWorkflowPath(format!("invalid --workflow '{value}': {why}"))
+    };
+    let canonical = std::fs::canonicalize(value).map_err(|err| invalid(err.to_string()))?;
+    if !canonical.is_file() {
+        return Err(invalid("not a file".to_string()));
+    }
+    Ok(WorkflowArg::File(canonical.to_string_lossy().into_owned()))
 }
 
 /// `POST /tasks` inputs, grouped into a struct rather than passed as eight
@@ -95,7 +125,7 @@ impl fmt::Display for ClientError {
 /// `#[allow(clippy::too_many_arguments)]` for).
 pub struct CreateTaskParams<'a> {
     pub project_id: &'a str,
-    pub workflow_def: &'a str,
+    pub workflow: &'a WorkflowArg,
     pub title: &'a str,
     pub prompt: &'a str,
     /// Already-assembled task config, or `None` to send no config at all.
@@ -471,15 +501,19 @@ impl Client {
     /// [`Self::create_task`] so the flag -> `config` mapping is
     /// unit-testable without a network round trip.
     fn create_task_request(&self, params: &CreateTaskParams<'_>) -> reqwest::RequestBuilder {
+        let mut body = json!({
+            "project_id": params.project_id,
+            "title": params.title,
+            "prompt": params.prompt,
+            "config": params.config,
+        });
+        match params.workflow {
+            WorkflowArg::Name(name) => body["workflow_def"] = json!(name),
+            WorkflowArg::File(path) => body["workflow_file"] = json!(path),
+        }
         self.http
             .post(format!("{}/tasks", self.base_url))
-            .json(&json!({
-                "project_id": params.project_id,
-                "workflow_def": params.workflow_def,
-                "title": params.title,
-                "prompt": params.prompt,
-                "config": params.config,
-            }))
+            .json(&body)
     }
 
     pub async fn create_task(&self, params: &CreateTaskParams<'_>) -> Result<Task, ClientError> {
@@ -605,10 +639,12 @@ mod tests {
         Client::new("http://127.0.0.1:4141".to_string())
     }
 
+    static CHAT: WorkflowArg = WorkflowArg::Name(String::new());
+
     fn params(config: Option<Value>) -> CreateTaskParams<'static> {
         CreateTaskParams {
             project_id: "p",
-            workflow_def: "chat",
+            workflow: &CHAT,
             title: "t",
             prompt: "hi",
             config,

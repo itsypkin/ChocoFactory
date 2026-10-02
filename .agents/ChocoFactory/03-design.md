@@ -90,19 +90,25 @@ binary itself, one that survives a binary upgrade/reinstall untouched:
   user's default `cli`/`model`/`system_prompt_file` per role name,
   applied whenever a workflow-def doesn't pin that field itself. Absent
   file ⇒ no global defaults, not an error.
-- **`~/.config/chocofactory/workflows/`**: every workflow definition the
-  daemon can reference by name, `chat`/`coding-task` (the two built-ins)
-  included. This is the one thing that needed the most thought: the
-  built-ins ship compiled into the `chocofactoryd` binary (embedded at
-  build time from the repo's own `workflows/` directory, which is the
-  source of truth for their content) and are seeded out to this
-  directory **on first run, only if not already present** — never
-  overwritten on a later version's startup, so a user's edits to their
-  own copy always survive an upgrade. §5 already intends this: *"you can
-  copy/edit either one, or author entirely new ones, without
-  recompiling"* — that only holds if what a user is copying/editing is a
-  real file in a location the tool never touches again, not something
-  hidden inside the binary.
+- **Where a workflow comes from.** Three sources, checked in this order:
+  (1) an explicit path (`choco task create --workflow <path-to.yaml>`);
+  (2) the project's repo, `<repo_path>/.chocofactory/workflows/<name>.yaml`;
+  (3) the built-in of that name, embedded in the `chocofactoryd` binary
+  (built from the repo's own `workflows/` directory, the source of truth for
+  their content). Upgrading the binary upgrades the built-ins; there is no
+  global user folder. Because a workflow's `prompt_file`/`script_file`
+  references must stay real files next to its YAML, the daemon regenerates a
+  private, read-only copy of the embedded set at every start in
+  `~/.config/chocofactory/.builtin-workflows/` (written file by file via a
+  temp file and rename, anything not a current built-in removed) and the
+  engine treats that directory as "the built-ins". A task running a built-in
+  records `builtin:<name>@<version>` as its `workflow_path`, and each reload
+  reads the current copy; any other task records the canonical file path.
+  Migration from the old `~/.config/chocofactory/workflows/`: it is no longer
+  read. Stale copies (byte-identical to a built-in) are ignored and counted
+  in a startup log line; edited or custom files are left in place with a
+  warning naming the two ways to keep using them; nothing there is ever
+  deleted. Tasks that already recorded a path into it keep loading that file.
 - The SQLite file (§3) is a natural sibling here too
   (`~/.config/chocofactory/chocofactory.db`), though its exact wiring is
   the daemon-startup layer's call (§6.2/P1-9), not decided here.
@@ -303,7 +309,7 @@ or author entirely new ones, without recompiling.
 ### 5.1 Workflow definition format
 
 A workflow definition is a YAML file (e.g.
-`~/.config/chocofactory/workflows/coding-task.yaml`, §2.2) describing
+a repo's `.chocofactory/workflows/coding-task.yaml`, or the built-in of that name, §2.2) describing
 stages and how they connect. Each stage has a **kind** (from a
 fixed set implemented in Rust — see §5.2), the config that kind needs,
 and an `on:` map from outcome → next stage name. Long prompts/system
@@ -754,7 +760,7 @@ arms.
   redirection messages to Type 3's `escalated_to_human` state; full
   event timeline (§4.2) for visibility into everything an agent did.
 - New-task flow: pick project, workflow definition (chat, coding-task, or
-  any custom one placed under `~/.config/chocofactory/workflows/`, §2.2),
+  any custom one from the project's repo or passed as a file path, §2.2),
   repo/working dir, per-role overrides (CLI/model/system prompt),
   initial prompt.
 - No auth (Q15); backend binds `127.0.0.1` by default, accessed remotely
