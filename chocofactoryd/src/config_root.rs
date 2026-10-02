@@ -331,6 +331,30 @@ mod tests {
         rendered
     }
 
+    /// One route's bullet out of the rendered path list: from its
+    /// "- **`<from>`" marker to the next bullet or the blank line that ends
+    /// the list. Lets an assertion pin text to the entry that must carry it,
+    /// rather than to anywhere in the prompt.
+    fn route_entry<'a>(rendered: &'a str, from: &str) -> &'a str {
+        let marker = format!("- **`{from}`");
+        let start = rendered
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no route entry for {from}:\n{rendered}"));
+        let rest = &rendered[start + marker.len()..];
+        let end = [rest.find("\n- **`"), rest.find("\n\n")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        &rendered[start..start + marker.len() + end]
+    }
+
+    /// `text` with every run of whitespace collapsed to one space, so a
+    /// phrase assertion doesn't depend on where the prompt wraps its lines.
+    fn squash(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn coder_revise_for_the_internal_review_path_names_the_arrival() {
         let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
@@ -370,6 +394,30 @@ mod tests {
             rendered.contains("Run `gh pr view --comments`"),
             "the awaiting_human_review entry must point the coder at the PR:\n{rendered}"
         );
+
+        // Comments, reviews and inline comments each come back a page at a
+        // time; without `--paginate` a long review's later items go unread.
+        let entry = squash(route_entry(&rendered, "awaiting_human_review"));
+        for endpoint in [
+            "issues/$N/comments",
+            "pulls/$N/reviews",
+            "pulls/$N/comments",
+        ] {
+            assert!(
+                entry.contains(&format!(
+                    r#"gh api --paginate "repos/{{owner}}/{{repo}}/{endpoint}""#
+                )),
+                "the awaiting_human_review entry must page through {endpoint}:\n{entry}"
+            );
+        }
+        // Only accounts that could have sent the task here count as
+        // instructions: the same fence the verdict poll applies, read from
+        // the REST fields it reads (`gh pr view` drops the `[bot]` suffix).
+        assert!(
+            entry.contains("`author_association` OWNER, MEMBER or COLLABORATOR")
+                && entry.contains("`user.login` that doesn't end in `[bot]`"),
+            "the awaiting_human_review entry must say whose comments are instructions:\n{entry}"
+        );
     }
 
     #[test]
@@ -394,14 +442,51 @@ mod tests {
         let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
             "escalate_to_human",
             "resumed",
-            serde_json::json!({ "escalate_to_human": "CURRENT HUMAN NOTE" }),
+            serde_json::json!({
+                "internal_review": { "summary": "STALE REVIEWER APPROVAL" },
+                "escalate_to_human": "CURRENT HUMAN NOTE",
+            }),
         );
+        let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
         let human_note_heading = rendered.find("## A human's note").unwrap();
         let note = rendered.find("CURRENT HUMAN NOTE").unwrap();
         assert_eq!(rendered.matches("CURRENT HUMAN NOTE").count(), 1);
         assert!(
             human_note_heading < note,
             "the human's note must render only under its own heading:\n{rendered}"
+        );
+
+        // When the PR review's loop guard tripped, the reviewer's summary is
+        // the approval that opened the PR: it must sit under its own
+        // heading, framed as context the note outranks.
+        let summary = rendered.find("STALE REVIEWER APPROVAL").unwrap();
+        assert_eq!(rendered.matches("STALE REVIEWER APPROVAL").count(), 1);
+        assert!(
+            reviewer_heading < summary && summary < human_note_heading,
+            "the stale summary must render only under its own heading:\n{rendered}"
+        );
+        let framing = squash(&rendered[reviewer_heading..summary]);
+        assert!(
+            framing.contains("context at most")
+                && framing.contains("the human's note takes priority"),
+            "on the escalate path the summary must be framed as context the note outranks:\n{framing}"
+        );
+        // Either loop guard can escalate; the summary is the rejection only
+        // for the internal reviewer's. The old wording assumed it always was.
+        assert!(
+            framing.contains("the escalation came from the internal reviewer's loop guard")
+                && framing.contains("any rejection is in the PR's comments")
+                && !framing.contains("may be the rejection that tripped the loop guard"),
+            "the escalate framing must tell the two loop guards apart:\n{framing}"
+        );
+
+        // A note like "same issues, keep going" points at the PR, so the
+        // entry must send the coder there too.
+        let entry = squash(route_entry(&rendered, "escalate_to_human"));
+        assert!(
+            entry.contains("posted after your last commit")
+                && entry.contains("from the `awaiting_human_review` entry"),
+            "the escalate_to_human entry must send the coder to the PR's comments:\n{entry}"
         );
     }
 
