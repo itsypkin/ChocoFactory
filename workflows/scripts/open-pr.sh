@@ -107,13 +107,15 @@ splice() {
         }' "$1" "$2"
 }
 
-git push -u origin HEAD >/dev/null
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
-
 # Title: newlines, CRs and tabs become spaces, runs of spaces collapse to
 # one, and the ends are trimmed.
 T=$(printf '%s' "${PR_TASK_TITLE:-}" | tr '\n\r\t' '   ' | tr -s ' ' | sed 's/^ //; s/ $//')
 [ -n "$T" ] || die "the task has no title; refusing to open a PR named after the branch"
+
+# Pushed only once the title is known good, so a task that is going to
+# escalate does not publish a branch first.
+git push -u origin HEAD >/dev/null
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 ISSUE=$(printf '%s' "$T" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')
 if [ -n "$ISSUE" ]; then
@@ -202,7 +204,10 @@ N=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number // em
 if [ -z "$N" ]; then
     gh pr create --title="$T" --body-file "$TMP/block" >/dev/null
 else
-    gh pr view "$N" --json body -q .body > "$TMP/current"
+    # A Go template, not `-q .body`: jq output ends with a newline that
+    # GitHub never stored, and the splice would keep it after the end marker,
+    # growing the human's text by one newline per lap.
+    gh pr view "$N" --json body -t '{{.body}}' > "$TMP/current"
     if splice "$TMP/current" "$TMP/block" > "$TMP/new"; then
         gh pr edit "$N" --body-file "$TMP/new" >/dev/null
     else

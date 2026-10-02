@@ -46,7 +46,14 @@ case "${1:-} ${2:-}" in
         ;;
     esac
     ;;
-"pr view") cat "$CFG/body" ;;
+"pr view")
+    # Like the real command: `-t` prints the body exactly, `-q` (jq) adds a
+    # trailing newline that GitHub never stored.
+    case "$*" in
+    *"-t"*) cat "$CFG/body" ;;
+    *) cat "$CFG/body"; printf '\n' ;;
+    esac
+    ;;
 "pr create") touch "$LOG/created" ;;
 esac
 exit 0
@@ -277,8 +284,8 @@ fn hostile_text_is_never_parsed_by_a_shell() {
     // Short enough to survive the 100-byte title limit untouched; relative
     // marker paths land in the worktree if a shell ever ran them.
     let title = "-q\"uote 's' $(touch a) `touch b` ; touch c \\ %s\nx".to_string();
-    let description = format!("{}\n", hostile(&dir));
-    let report = hostile(&dir);
+    let description = format!("DESC:{}\n", hostile(&dir));
+    let report = format!("REPORT:{}", hostile(&dir));
     fx.write_description(description.as_bytes());
     let out = fx.run(&title, "approved", &report);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -467,6 +474,11 @@ fn failures_exit_nonzero() {
     let out = fx.run("  \n\t ", "approved", "r");
     assert!(!out.status.success());
     assert!(fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty());
+    let remote = git(&fx.root.join("origin.git"), &["branch", "--list", "task/*"]);
+    assert!(
+        remote.trim().is_empty(),
+        "branch pushed despite empty title: {remote}"
+    );
 
     let fx = Fixture::new();
     fx.write_description(b"d\n");
