@@ -1616,6 +1616,24 @@ stages:
     kind: terminal
 "#;
 
+const FAST_WF: &str = r#"
+name: fastwf
+stages:
+  run:
+    kind: shell
+    command: "sleep 2"
+    on: { done: fast }
+  fast:
+    kind: shell
+    command: "true"
+    on: { done: wait }
+  wait:
+    kind: human_gate
+    on: { resumed: finished }
+  finished:
+    kind: terminal
+"#;
+
 /// Starts a daemon with one workflow and creates a task on it.
 async fn watch_setup(name: &str, yaml: &str) -> (Daemon, String) {
     let home = TempHome::new();
@@ -1781,10 +1799,11 @@ async fn watch_until_stuck_and_until_a_fast_stage_exit_0() {
     let out = watch_choco(&d, &id, &["--until", "stuck", "--interval", "1s"]).await;
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 
-    // `finished` is entered and the task closed between polls: the trail
-    // clause catches it.
-    let (d, id) = watch_setup("closing", CLOSING_WF).await;
-    let out = watch_choco(&d, &id, &["--until", "stage:finished", "--interval", "5s"]).await;
+    // `fast` is entered and left between polls (the task then waits at a
+    // gate, so the current stage is not `fast`): only the trail clause can
+    // match.
+    let (d, id) = watch_setup("fastwf", FAST_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "stage:fast", "--interval", "5s"]).await;
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
 
@@ -1793,10 +1812,15 @@ async fn watch_on_an_already_closed_task_prints_only_the_first_line() {
     let (d, id) = watch_setup("closing", CLOSING_WF).await;
     let ok = watch_choco(&d, &id, &["--until", "closed", "--interval", "1s"]).await;
     assert_eq!(ok.code, Some(0));
-    let out = watch_choco(&d, &id, &["--until", "closed", "--interval", "1s"]).await;
-    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
-    assert_eq!(out.stdout.lines().count(), 1, "{}", out.stdout);
-    assert!(out.stdout.contains("watching task"));
+    // A 1h interval: only an immediate check on the first poll can exit.
+    let mut child = spawn_watcher(&d.base_url, &id, &["--until", "closed", "--interval", "1h"]);
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let mut out = String::new();
+    stdout.read_to_string(&mut out).await.unwrap();
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(out.contains("watching task"));
 }
 
 #[tokio::test]
@@ -1936,6 +1960,8 @@ enum Reply {
     Drop,
     /// Accept, then never answer.
     Hang,
+    /// A 200 whose body is JSON but not a task.
+    NotATask,
 }
 
 /// A fake daemon answering `GET /tasks/{id}` from a script (then `Open`
@@ -1958,6 +1984,7 @@ async fn fake_daemon(script: Vec<Reply>) -> String {
                     held.push(sock);
                     continue;
                 }
+                Reply::NotATask => ("200 OK", r#"{"title":"x"}"#),
                 Reply::NotFound => ("404 Not Found", r#"{"error":"no such task"}"#),
                 Reply::Open => (
                     "200 OK",
@@ -1988,6 +2015,39 @@ async fn watch_rides_out_connection_failures_and_resets_the_count() {
     let (code, stderr) = finish_watcher(child).await;
     assert_eq!(code, Some(5), "stderr: {stderr}");
     assert!(started.elapsed() >= Duration::from_secs(7));
+}
+
+#[tokio::test]
+async fn watch_gives_up_after_exactly_three_consecutive_connection_failures() {
+    use Reply::{Drop, Open};
+    // Open, then three drops: the third consecutive failure ends the watch
+    // (exit 1) well before --timeout (a 4-strike limit would exit 5).
+    let base = fake_daemon(vec![Open, Drop, Drop, Drop]).await;
+    let child = spawn_watcher(
+        &base,
+        "t1",
+        &["--until", "closed", "--interval", "1s", "--timeout", "8s"],
+    );
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("lost contact with chocofactoryd"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn watch_mid_watch_decode_error_is_fatal_at_once() {
+    use Reply::{NotATask, Open};
+    let base = fake_daemon(vec![Open, NotATask]).await;
+    let child = spawn_watcher(
+        &base,
+        "t1",
+        &["--until", "closed", "--interval", "1s", "--timeout", "8s"],
+    );
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("unexpected response"), "{stderr}");
 }
 
 #[tokio::test]

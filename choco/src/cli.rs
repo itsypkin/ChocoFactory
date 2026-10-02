@@ -144,8 +144,7 @@ pub struct McpServeArgs {
 pub enum TaskCmd {
     /// Create a task under a project, starting the named workflow.
     Create(TaskCreateArgs),
-    /// Show a task, its current stage, and how it got there; optionally
-    /// watch it or wait for it.
+    /// Show a task, its stage and history; optionally watch or wait for it.
     ///
     /// With --live or --until the command keeps polling and its exit code
     /// says how the watch ended:
