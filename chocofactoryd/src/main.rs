@@ -1,8 +1,13 @@
+use std::io::IsTerminal;
 use std::sync::Arc;
+use std::time::Duration;
 
+use chocofactory_core::daemon_lock::LockInfo;
+use chocofactory_core::version;
 use chocofactoryd::adapter::{AgentAdapter, ClaudeAdapter};
-use chocofactoryd::api::{self, AppState};
+use chocofactoryd::api::{self, AppState, ExeStamp, ServerInfo};
 use chocofactoryd::config_root;
+use chocofactoryd::daemon_lock::DaemonLock;
 use chocofactoryd::db::{self, sessions};
 use chocofactoryd::engine::WorkflowEngine;
 use chocofactoryd::global_config::GlobalConfig;
@@ -20,7 +25,14 @@ use tracing_subscriber::EnvFilter;
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,chocofactoryd=debug,tower_http=info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        // Logs go to stderr, so colour is decided by whether *stderr* is a
+        // terminal (tracing's default writer is stdout, which would make
+        // that check meaningless).
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
 }
 
 /// Bound to `127.0.0.1` only (design §6.1/§6.2, Q15: no auth, accessed
@@ -60,12 +72,80 @@ fn choco_binary_override() -> Option<String> {
 /// exists.
 const DEFAULT_IDLE_TIMEOUT_MINUTES: i64 = 30;
 
+/// How long in-flight HTTP requests get to finish once shutdown starts
+/// before the server is abandoned (open WebSockets never finish on their
+/// own).
+const HTTP_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long `SessionManager::shutdown` waits for killed sessions to record
+/// their end.
+const SESSION_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Resolves once `rx` holds `true`.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    // An `Err` means the sender is gone, which can only be the process
+    // ending; treat it as shutdown too.
+    let _ = rx.wait_for(|stop| *stop).await;
+}
+
 #[tokio::main]
 async fn main() {
+    // Before logging and before touching `$HOME`.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("chocofactoryd {}", version::long_version());
+        return;
+    }
     init_logging();
 
     let root = config_root::config_root()
         .expect("chocofactoryd: $HOME is not set, cannot determine ~/.config/chocofactory");
+    std::fs::create_dir_all(&root).expect("chocofactoryd: failed to create the config directory");
+
+    // The lock is the single-instance guard per config root; nothing below
+    // (seeding, migrations, session recovery) may touch state before it is
+    // held and the port is bound.
+    let daemon_lock = match DaemonLock::acquire(&root) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("chocofactoryd: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    // Bind guards the port. The port is read back from the listener so
+    // `CHOCOFACTORY_PORT=0` works.
+    let requested_port = port_override().unwrap_or(DEFAULT_PORT);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", requested_port))
+        .await
+        .expect("chocofactoryd: failed to bind 127.0.0.1");
+    let port = listener
+        .local_addr()
+        .expect("chocofactoryd: bound listener has no local address")
+        .port();
+    tracing::info!(port, "listening on http://127.0.0.1:{port}");
+
+    let started_at = chrono::Utc::now();
+    let exe = match ExeStamp::capture() {
+        Ok(stamp) => Some(stamp),
+        Err(err) => {
+            tracing::warn!(%err, "could not stamp the daemon executable; exe_replaced will be unknown");
+            None
+        }
+    };
+    daemon_lock
+        .publish(&LockInfo {
+            pid: std::process::id(),
+            port,
+            version: version::VERSION.to_string(),
+            commit: version::BUILD_COMMIT.map(str::to_string),
+            started_at,
+            exe: exe
+                .as_ref()
+                .map(|e| e.path.display().to_string())
+                .unwrap_or_default(),
+        })
+        .expect("chocofactoryd: failed to write the lock file");
+
     let workflows_dir = root.join("workflows");
     tracing::info!(root = %root.display(), "starting chocofactoryd");
 
@@ -103,6 +183,7 @@ async fn main() {
     if let Some(choco_binary) = choco_binary_override() {
         claude_adapter = claude_adapter.with_choco_binary(choco_binary);
     }
+    let choco_binary = claude_adapter.choco_binary().to_string();
     let adapter: Arc<dyn AgentAdapter> = Arc::new(claude_adapter);
     let session_manager = SessionManager::new(
         pool.clone(),
@@ -125,13 +206,20 @@ async fn main() {
     ));
     tracing::info!("spawned idle reaper and retention job");
 
-    // Bind is the single-instance guard, so it comes before the sweep: a
-    // second daemon dies here before it can spawn duplicate pollers.
-    let port = port_override().unwrap_or(DEFAULT_PORT);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+    // First, and inline, before serving: an `agent_turn` or `shell` stage
+    // whose process died with the previous daemon is parked `stuck`. Before
+    // the poll sweep, because a resumed poll can advance into an
+    // `agent_turn`, and that live turn must not be parked.
+    let park = engine
+        .park_interrupted_turns()
         .await
-        .expect("chocofactoryd: failed to bind 127.0.0.1");
-    tracing::info!(port, "listening on http://127.0.0.1:{port}");
+        .expect("chocofactoryd: failed to sweep interrupted agent and shell stages");
+    tracing::info!(
+        agent_turns = park.agent_turns,
+        shells = park.shells,
+        stuck_other = park.stuck_other,
+        "parked interrupted agent and shell stages"
+    );
 
     // After session recovery (a resumed poll may advance into an
     // `agent_turn`) and inline, before serving: `poll` stages whose runner
@@ -152,9 +240,44 @@ async fn main() {
         pool,
         engine,
         events_notify,
+        server: Arc::new(ServerInfo {
+            pid: std::process::id(),
+            port,
+            started_at,
+            config_root: root.clone(),
+            exe,
+            choco_binary,
+        }),
     };
     let router = api::router(state).layer(TraceLayer::new_for_http());
-    axum::serve(listener, router)
-        .await
-        .expect("chocofactoryd: server error");
+
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("chocofactoryd: failed to install the SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("chocofactoryd: failed to install the SIGINT handler");
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
+            _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
+        }
+        let _ = stop_tx.send(true);
+    });
+
+    let serve =
+        axum::serve(listener, router).with_graceful_shutdown(wait_for_shutdown(stop_rx.clone()));
+    let deadline = async {
+        wait_for_shutdown(stop_rx).await;
+        tokio::time::sleep(HTTP_DRAIN_GRACE).await;
+    };
+    tokio::select! {
+        result = serve => result.expect("chocofactoryd: server error"),
+        _ = deadline => tracing::warn!(
+            "HTTP connections did not drain within {HTTP_DRAIN_GRACE:?}; continuing shutdown"
+        ),
+    }
+
+    session_manager.shutdown(SESSION_DRAIN_GRACE).await;
+    drop(daemon_lock);
+    tracing::info!("chocofactoryd stopped");
 }

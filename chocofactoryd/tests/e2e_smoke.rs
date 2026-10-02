@@ -210,7 +210,12 @@ impl Daemon {
     /// restart half of a kill-and-restart test. One attempt, no port-race
     /// retry: the port was just released by the daemon that was killed.
     async fn restart_on(home: TempHome, port: u16) -> Self {
-        let mut child = Command::new(workspace_binary("chocofactoryd"))
+        Self::restart_on_with_env(home, port, &[]).await
+    }
+
+    async fn restart_on_with_env(home: TempHome, port: u16, env: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(workspace_binary("chocofactoryd"));
+        command
             .env("HOME", &home.0)
             .env(
                 "CHOCOFACTORY_CLAUDE_BINARY",
@@ -219,9 +224,11 @@ impl Daemon {
             .env("CHOCOFACTORY_PORT", port.to_string())
             .env("RUST_LOG", "error")
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("failed to spawn chocofactoryd");
+            .kill_on_drop(true);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("failed to spawn chocofactoryd");
         let client = reqwest::Client::new();
         let base_url = format!("http://127.0.0.1:{port}");
         match wait_until_ready(&client, &base_url, &mut child).await {
@@ -241,6 +248,14 @@ impl Daemon {
                 panic!("restarted chocofactoryd exited during startup with {status:?}: {stderr}");
             }
         }
+    }
+
+    /// SIGTERMs the daemon and waits for it to exit on its own, handing back
+    /// its home and port, like [`Self::kill`] but through the graceful path.
+    async fn terminate(mut self) -> (std::process::ExitStatus, TempHome, u16) {
+        let status = sigterm_and_wait(&mut self.child).await;
+        let home = self.home.take().expect("home already taken");
+        (status, home, self.port)
     }
 
     async fn get(&self, path: &str) -> Value {
@@ -1352,28 +1367,21 @@ async fn real_binary_resumes_a_poll_after_a_kill_on_its_original_deadline() {
     );
 }
 
-/// The sweep runs only after bind: a second daemon on the same `$HOME` and
-/// port dies at bind, before it can resume (and so duplicate) anything.
+/// The sweep runs only after the lock: a second daemon on the same `$HOME`
+/// and port dies at the lock (before it even tries to bind), before it can
+/// resume (and so duplicate) anything.
 #[tokio::test]
-async fn a_second_daemon_dies_at_bind_before_sweeping_polls() {
+async fn a_second_daemon_dies_at_the_lock_before_sweeping_polls() {
     let home = TempHome::new();
     write_never_matching_poll(&home, "60s");
     let daemon = Daemon::spawn_with_home(home).await;
     let task_id = create_poll_restart_task(&daemon).await;
 
     let home_path = daemon.home.as_ref().unwrap().0.clone();
-    let mut second = Command::new(workspace_binary("chocofactoryd"))
-        .env("HOME", &home_path)
-        .env(
-            "CHOCOFACTORY_CLAUDE_BINARY",
-            workspace_binary("mock-claude"),
-        )
-        .env("CHOCOFACTORY_PORT", daemon.port.to_string())
-        .env("RUST_LOG", "error")
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("failed to spawn the second chocofactoryd");
+    let mut second = spawn_raw(
+        &home_path,
+        &[("CHOCOFACTORY_PORT", &daemon.port.to_string())],
+    );
     let status = tokio::time::timeout(Duration::from_secs(10), second.wait())
         .await
         .expect("the second daemon did not exit")
@@ -1381,7 +1389,7 @@ async fn a_second_daemon_dies_at_bind_before_sweeping_polls() {
     assert!(!status.success());
     let stderr = read_stderr_to_string(&mut second).await;
     assert!(
-        stderr_says_bind_failed(&stderr),
+        stderr.contains("already running"),
         "unexpected stderr: {stderr}"
     );
 
@@ -1389,5 +1397,423 @@ async fn a_second_daemon_dies_at_bind_before_sweeping_polls() {
     assert!(
         !trail.iter().any(|(_, o)| o == "restart"),
         "the losing daemon must not have resumed the poll: {trail:?}"
+    );
+}
+
+// ---- #84: lock, graceful shutdown, park sweep, version ----
+
+/// A daemon straight from the binary, with the default mock `claude` and
+/// whatever `env` adds (later entries win). stderr piped; the caller owns it.
+fn spawn_raw(home: &std::path::Path, env: &[(&str, &str)]) -> Child {
+    let mut command = Command::new(workspace_binary("chocofactoryd"));
+    command
+        .env("HOME", home)
+        .env(
+            "CHOCOFACTORY_CLAUDE_BINARY",
+            workspace_binary("mock-claude"),
+        )
+        .env("CHOCOFACTORY_PORT", free_port().to_string())
+        .env("RUST_LOG", "error")
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.spawn().expect("failed to spawn chocofactoryd")
+}
+
+fn config_root_of(home: &TempHome) -> PathBuf {
+    home.0.join(".config/chocofactory")
+}
+
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 delivers nothing; it only reports whether the pid exists.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// SIGKILLs these pids on drop, so a failed test doesn't leave the fixture's
+/// orphans running.
+struct PidGuard(Vec<u32>);
+
+impl Drop for PidGuard {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            // SAFETY: a plain signal to a pid this test recorded.
+            unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+}
+
+async fn sigterm_and_wait(child: &mut Child) -> std::process::ExitStatus {
+    let pid = child.id().expect("daemon already exited");
+    // SAFETY: SIGTERM to the daemon this test spawned.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    tokio::time::timeout(Duration::from_secs(15), child.wait())
+        .await
+        .expect("the daemon did not exit within 15s of SIGTERM")
+        .unwrap()
+}
+
+async fn read_pid_file(path: &std::path::Path) -> u32 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse()
+        {
+            return pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_session_meta(daemon: &Daemon, task_id: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let page = daemon.get(&format!("/tasks/{task_id}/events")).await;
+        if page["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|e| e["event_type"] == "session_meta"))
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no session_meta event: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn lock_is_released(home: &TempHome) -> bool {
+    matches!(
+        chocofactory_core::daemon_lock::read_lock(&config_root_of(home)).unwrap(),
+        chocofactory_core::daemon_lock::LockState::NotRunning { .. }
+    )
+}
+
+const AGENT_TURN_WORKFLOW: &str = r#"
+name: agent-e2e
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+
+fn agent_reason(stage: &str) -> String {
+    format!(
+        "stage '{stage}' was running an agent turn when the daemon stopped; 'choco task retry' \
+         continues it, resuming the agent's session when it can"
+    )
+}
+
+/// Everything a test needs to drive the spawns-child fixture as `claude`.
+struct AgentFixture {
+    heartbeat: PathBuf,
+    child_pid: PathBuf,
+    agent_pid: PathBuf,
+}
+
+impl AgentFixture {
+    fn new(home: &TempHome) -> Self {
+        AgentFixture {
+            heartbeat: home.0.join("heartbeat"),
+            child_pid: home.0.join("child.pid"),
+            agent_pid: home.0.join("agent.pid"),
+        }
+    }
+
+    fn env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "CHOCOFACTORY_CLAUDE_BINARY",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_claude_spawns_child.py"
+                )
+                .to_string(),
+            ),
+            ("CHOCO_TEST_HEARTBEAT", self.heartbeat.display().to_string()),
+            ("CHOCO_TEST_CHILD_PID", self.child_pid.display().to_string()),
+            ("CHOCO_TEST_AGENT_PID", self.agent_pid.display().to_string()),
+        ]
+    }
+}
+
+async fn spawn_agent_daemon(home: TempHome, fixture: &AgentFixture) -> Daemon {
+    let env = fixture.env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    Daemon::spawn_with_home_and_env(home, &env).await
+}
+
+async fn create_task(daemon: &Daemon, workflow: &str) -> String {
+    let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    assert_eq!(status, 201);
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project["id"].as_str().unwrap(),
+                "workflow_def": workflow,
+                "title": "lifecycle smoke",
+                "prompt": "go",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{task}");
+    task["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
+    let home = TempHome::new();
+    write_never_matching_poll(&home, "60s");
+    let daemon = Daemon::spawn_with_home(home).await;
+    let task_id = create_poll_restart_task(&daemon).await;
+    let before = stage_outcomes(&daemon, &task_id).await;
+
+    let home_path = daemon.home.as_ref().unwrap().0.clone();
+    let other_port = free_port();
+    assert_ne!(other_port, daemon.port);
+    let mut second = spawn_raw(
+        &home_path,
+        &[("CHOCOFACTORY_PORT", &other_port.to_string())],
+    );
+    let status = tokio::time::timeout(Duration::from_secs(10), second.wait())
+        .await
+        .expect("the second daemon did not exit")
+        .unwrap();
+    assert!(!status.success());
+    let stderr = read_stderr_to_string(&mut second).await;
+    assert!(stderr.contains("already running"), "{stderr}");
+    let first_pid = daemon.child.id().unwrap();
+    assert!(stderr.contains(&format!("pid {first_pid}")), "{stderr}");
+
+    assert_eq!(stage_outcomes(&daemon, &task_id).await, before);
+}
+
+#[tokio::test]
+async fn sigterm_mid_agent_turn_stops_the_agent_and_parks_the_task_for_retry() {
+    let home = TempHome::new();
+    home.write_workflow("agent-e2e", AGENT_TURN_WORKFLOW);
+    let fixture = AgentFixture::new(&home);
+    let daemon = spawn_agent_daemon(home, &fixture).await;
+    let task_id = create_task(&daemon, "agent-e2e").await;
+
+    let agent_pid = read_pid_file(&fixture.agent_pid).await;
+    let child_pid = read_pid_file(&fixture.child_pid).await;
+    let _guard = PidGuard(vec![agent_pid, child_pid]);
+    wait_for_session_meta(&daemon, &task_id).await;
+
+    let (status, home, port) = daemon.terminate().await;
+    assert!(status.success(), "{status:?}");
+    assert!(!pid_alive(agent_pid), "the agent outlived the daemon");
+    assert!(
+        !pid_alive(child_pid),
+        "the agent's child outlived the daemon"
+    );
+    assert!(lock_is_released(&home));
+
+    let daemon = Daemon::restart_on(home, port).await;
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    assert_eq!(detail["status"], "stuck", "{detail}");
+    assert_eq!(detail["stuck_reason"], agent_reason("coding").as_str());
+    let (status, body) = daemon
+        .post(&format!("/tasks/{task_id}/retry"), json!({}))
+        .await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["resumed"], true, "{body}");
+}
+
+#[tokio::test]
+async fn sigterm_mid_shell_stage_kills_the_command_and_parks_the_task() {
+    let home = TempHome::new();
+    let gc = home.0.join("gc");
+    home.write_workflow(
+        "shell-e2e",
+        &format!(
+            r#"
+name: shell-e2e
+stages:
+  run:
+    kind: shell
+    command: "sh -c 'sleep 600 & echo $! > {}; wait'"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+            gc.display()
+        ),
+    );
+    let daemon = Daemon::spawn_with_home(home).await;
+    let task_id = create_task(&daemon, "shell-e2e").await;
+    let grandchild = read_pid_file(&gc).await;
+    let _guard = PidGuard(vec![grandchild]);
+    assert!(pid_alive(grandchild));
+
+    let (status, home, port) = daemon.terminate().await;
+    assert!(status.success(), "{status:?}");
+    // The command's group is SIGKILLed as the runtime drops; allow the
+    // kernel a moment to reap the orphan.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while pid_alive(grandchild) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !pid_alive(grandchild),
+        "the shell command's child outlived the daemon"
+    );
+
+    let daemon = Daemon::restart_on(home, port).await;
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    assert_eq!(detail["status"], "stuck", "{detail}");
+    assert_eq!(
+        detail["stuck_reason"],
+        "stage 'run' was running a shell command when the daemon stopped; 'choco task retry' \
+         runs it again from the start"
+    );
+}
+
+/// The crash path: SIGKILL leaves the agent orphaned and the session row
+/// `active`; the next startup recovers it to `idle` and the park sweep
+/// records `daemon_stopped`.
+#[tokio::test]
+async fn sigkill_mid_agent_turn_is_parked_at_the_next_start() {
+    let home = TempHome::new();
+    home.write_workflow("agent-e2e", AGENT_TURN_WORKFLOW);
+    let fixture = AgentFixture::new(&home);
+    let daemon = spawn_agent_daemon(home, &fixture).await;
+    let task_id = create_task(&daemon, "agent-e2e").await;
+    let agent_pid = read_pid_file(&fixture.agent_pid).await;
+    let child_pid = read_pid_file(&fixture.child_pid).await;
+    // Killed by the test itself, since the daemon never got to.
+    let _guard = PidGuard(vec![agent_pid, child_pid]);
+    wait_for_session_meta(&daemon, &task_id).await;
+
+    let (home, port) = daemon.kill().await;
+    assert!(
+        lock_is_released(&home),
+        "SIGKILL must still release the lock"
+    );
+    let daemon = Daemon::restart_on(home, port).await;
+
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    assert_eq!(detail["status"], "stuck", "{detail}");
+    assert_eq!(detail["stuck_reason"], agent_reason("coding").as_str());
+    let home_path = daemon.home.as_ref().unwrap().0.clone();
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}?mode=ro",
+        home_path
+            .join(".config/chocofactory/chocofactory.db")
+            .display()
+    ))
+    .await
+    .unwrap();
+    let reasons: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT end_reason FROM sessions WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(reasons, vec![Some("daemon_stopped".to_string())]);
+}
+
+#[tokio::test]
+async fn port_zero_binds_a_free_port_and_publishes_it_in_the_lock_file() {
+    let home = TempHome::new();
+    let mut child = spawn_raw(&home.0, &[("CHOCOFACTORY_PORT", "0")]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let info = loop {
+        if let Ok(chocofactory_core::daemon_lock::LockState::Running(info)) =
+            chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
+            && info.port != 0
+        {
+            break info;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the daemon exited: {}",
+            read_stderr_to_string(&mut child).await
+        );
+        assert!(tokio::time::Instant::now() < deadline, "no lock info");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(info.pid, child.id().unwrap());
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/server", info.port);
+    let mut body = None;
+    for _ in 0..100 {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+        {
+            body = Some(resp.json::<Value>().await.unwrap());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let body = body.expect("GET /server never answered on the lock file's port");
+    assert_eq!(body["port"], info.port);
+    assert_eq!(body["pid"], info.pid);
+    assert_eq!(body["version"], chocofactory_core::version::VERSION);
+    sigterm_and_wait(&mut child).await;
+}
+
+#[tokio::test]
+async fn version_flag_prints_and_touches_nothing() {
+    let home = TempHome::new();
+    let out = Command::new(workspace_binary("chocofactoryd"))
+        .arg("--version")
+        .env("HOME", &home.0)
+        .output()
+        .await
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "chocofactoryd {} (dev build)\n",
+            chocofactory_core::version::VERSION
+        )
+    );
+    assert!(!home.0.join(".config").exists());
+}
+
+#[tokio::test]
+async fn piped_stderr_carries_no_ansi_escapes() {
+    let home = TempHome::new();
+    let mut child = spawn_raw(&home.0, &[("RUST_LOG", "info")]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        chocofactory_core::daemon_lock::read_lock(&config_root_of(&home)),
+        Ok(chocofactory_core::daemon_lock::LockState::Running(ref i)) if i.port != 0
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Give startup logging time to land before stopping.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sigterm_and_wait(&mut child).await;
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(
+        stderr.contains("listening"),
+        "no log output at all: {stderr}"
+    );
+    assert!(
+        !stderr.contains("\x1b["),
+        "ANSI escapes in piped stderr: {stderr:?}"
     );
 }

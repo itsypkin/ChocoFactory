@@ -34,6 +34,10 @@ pub struct SessionManager {
     /// management (exactly the class of eviction bug this codebase's
     /// reviews keep flagging elsewhere, e.g. `WorkflowEngine::task_locks`).
     events_notify: Arc<Notify>,
+    /// Set by [`Self::shutdown`] before it snapshots the live sessions;
+    /// once set, nothing new may start. Cloned into every session's
+    /// `SessionSignals::stopping`.
+    shutting_down: Arc<AtomicBool>,
 }
 
 /// A `sessions` map entry: reserved while a process is being spawned or
@@ -99,6 +103,11 @@ struct SessionSignals {
     /// case cancel exists for, so the kill happens inline in `cancel` and
     /// only the *reason* travels through shared state.
     cancelled: Arc<AtomicBool>,
+    /// Set (shared with `SessionManager::shutting_down`) when the daemon is
+    /// stopping. Read by `drain_session` to record `DaemonStopped`; unlike
+    /// `cancelled` it is never set per run, so it can't make an operator's
+    /// cancel look like a shutdown (`Cancelled` outranks it).
+    stopping: Arc<AtomicBool>,
 }
 
 enum Command {
@@ -113,6 +122,8 @@ pub enum SessionError {
     /// Another call is already spawning or resuming a process for this
     /// `session_id`. The caller can retry once that settles.
     AlreadyStarting,
+    /// The daemon is shutting down and starts nothing new.
+    ShuttingDown,
     Adapter(AdapterError),
     Db(sqlx::Error),
 }
@@ -130,6 +141,7 @@ impl fmt::Display for SessionError {
             SessionError::AlreadyStarting => {
                 write!(f, "this session is already being established")
             }
+            SessionError::ShuttingDown => write!(f, "the daemon is shutting down"),
             SessionError::Adapter(err) => write!(f, "{err}"),
             SessionError::Db(err) => write!(f, "{err}"),
         }
@@ -184,6 +196,7 @@ impl SessionManager {
             turn_timers,
             sessions: Mutex::new(HashMap::new()),
             events_notify,
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -403,6 +416,11 @@ impl SessionManager {
     /// spawn or resume a process, failing if another caller already holds
     /// it (whether `Establishing` or already `Live`).
     async fn reserve(&self, session_id: &str) -> Result<(), SessionError> {
+        // Before the slot exists: a start that loses to `shutdown` here
+        // never spawns anything.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SessionError::ShuttingDown);
+        }
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(session_id) {
             return Err(SessionError::AlreadyStarting);
@@ -424,6 +442,7 @@ impl SessionManager {
         let signals = SessionSignals {
             last_activity: Arc::new(Mutex::new(Utc::now())),
             cancelled: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::clone(&self.shutting_down),
             // Read before `handle` moves into the drain task below — that
             // task owns it exclusively from then on, and `cancel` needs the
             // pgid without being able to reach the handle. Cleared again by
@@ -438,6 +457,23 @@ impl SessionManager {
                 signals: signals.clone(),
             }),
         );
+
+        // Re-check after the insert. `shutdown` sets the flag before it
+        // snapshots the map, and the insert above happens before this
+        // read, so either `shutdown`'s snapshot saw this slot (and kills
+        // it) or this read sees the flag (and kills it here): a session
+        // that slipped in between `reserve` and now is never left running.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            let pgid = signals.pgid.lock().await;
+            if let Some(pgid) = *pgid {
+                tracing::info!(
+                    session_id,
+                    pgid,
+                    "daemon is shutting down: killing a session that had just started"
+                );
+                crate::shell::kill_group(pgid);
+            }
+        }
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
@@ -455,6 +491,51 @@ impl SessionManager {
             .await;
             manager.sessions.lock().await.remove(&session_id);
         });
+    }
+
+    /// Graceful shutdown: refuses new sessions, SIGKILLs the process group
+    /// of every live one, and waits up to `grace` for their drain tasks to
+    /// record the outcome (`DaemonStopped`) and leave the map.
+    ///
+    /// Deliberately does not set any run's `cancelled` flag: this is the
+    /// daemon stopping, not an operator's cancel, and the two end reasons
+    /// resume differently in the UI.
+    pub async fn shutdown(&self, grace: Duration) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        // Snapshot the pgid handles and release the map lock before
+        // awaiting each, as `reap_idle_sessions` does.
+        let snapshot: Vec<_> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .iter()
+                .filter_map(|(session_id, slot)| match slot {
+                    SessionSlot::Live(session) => {
+                        Some((session_id.clone(), Arc::clone(&session.signals.pgid)))
+                    }
+                    SessionSlot::Establishing => None,
+                })
+                .collect()
+        };
+        let mut killed = 0usize;
+        for (session_id, pgid) in snapshot {
+            // Same lock `drain_session` takes to retire the pid before
+            // reaping, so a reaped pid is never signalled.
+            let pgid = pgid.lock().await;
+            if let Some(pgid) = *pgid {
+                tracing::info!(session_id, pgid, "shutdown: killing session process group");
+                crate::shell::kill_group(pgid);
+                killed += 1;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + grace;
+        let remaining = loop {
+            let remaining = self.sessions.lock().await.len();
+            if remaining == 0 || tokio::time::Instant::now() >= deadline {
+                break remaining;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        tracing::info!(killed, remaining, "session manager shut down");
     }
 
     /// Runs the idle reaper forever, closing sessions past `idle_timeout`
@@ -569,6 +650,7 @@ async fn drain_session(
     let SessionSignals {
         last_activity,
         cancelled,
+        stopping,
         pgid,
     } = signals;
     // Once `cmd_rx` closes, `recv()` resolves to `None` immediately on
@@ -850,6 +932,7 @@ async fn drain_session(
         clean_exit,
         reaped,
         cancelled.load(Ordering::SeqCst),
+        stopping.load(Ordering::SeqCst),
     );
     if turn.completed && !clean_exit && !turn.lingered {
         // Surprising but not actionable: the turn reported and ended, and the
@@ -1075,6 +1158,10 @@ impl SingleShotTurn {
 /// before the signal landed; the engine's `tasks.status == "cancelled"`
 /// guard, not this row, is what stops a cancelled task from advancing.
 ///
+/// `DaemonStopped` (the daemon shutting down) ranks just below `Cancelled`.
+/// A single-shot turn that had already completed keeps its ordinary result;
+/// a standing session goes to `idle` with it so a chat stays resumable.
+///
 /// For a single-shot turn (#90), only a completed turn is `idle`. After
 /// `Cancelled`, the most specific explanation wins: a turn that never
 /// reported is `NoReport`, even if its process then had to be killed; one the
@@ -1089,8 +1176,9 @@ fn final_run_state(
     clean_exit: bool,
     reaped: bool,
     cancelled: bool,
+    stopping: bool,
 ) -> (SessionStatus, Option<SessionEndReason>) {
-    use SessionEndReason::{Cancelled, Interrupted, Lingered, NoReport, Reaped};
+    use SessionEndReason::{Cancelled, DaemonStopped, Interrupted, Lingered, NoReport, Reaped};
     use SessionStatus::{Exited, Idle};
     match kind {
         // A clean exit (reaper-driven close, or a one-shot process finishing on
@@ -1099,9 +1187,15 @@ fn final_run_state(
         // failure would just get resumed into the same crash forever.
         SessionKind::Standing => {
             let status = if clean_exit { Idle } else { Exited };
-            let reason = if cancelled {
-                Some(Cancelled)
-            } else if clean_exit && reaped {
+            if cancelled {
+                return (status, Some(Cancelled));
+            }
+            if stopping {
+                // Idle whatever the exit looked like: the daemon killed it,
+                // and a chat stays resumable by message.
+                return (Idle, Some(DaemonStopped));
+            }
+            let reason = if clean_exit && reaped {
                 Some(Reaped)
             } else {
                 None
@@ -1116,6 +1210,8 @@ fn final_run_state(
                     Exited
                 };
                 (status, Some(Cancelled))
+            } else if stopping && !turn.completed {
+                (Exited, Some(DaemonStopped))
             } else if turn.gave_up {
                 (Exited, Some(NoReport))
             } else if reaped && !turn.completed {
@@ -1731,9 +1827,10 @@ mod tests {
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nCHOCO_TEST_HEARTBEAT='{}' CHOCO_TEST_CHILD_PID='{}' exec '{}' \"$@\"\n",
+                "#!/bin/sh\nCHOCO_TEST_HEARTBEAT='{}' CHOCO_TEST_CHILD_PID='{}' CHOCO_TEST_AGENT_PID='{}' exec '{}' \"$@\"\n",
                 heartbeat.display(),
                 child_pid.display(),
+                dir.join("agent.pid").display(),
                 fixture_binary("fake_claude_spawns_child.py"),
             ),
         )
@@ -1855,6 +1952,89 @@ mod tests {
         wait_until_status(&pool, &session_id, SessionStatus::Exited).await;
         let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(run.end_reason, Some(SessionEndReason::Cancelled));
+    }
+
+    /// Graceful shutdown (#84): a live single-shot turn's whole group is
+    /// killed and the run records `DaemonStopped`, not an anonymous crash.
+    #[tokio::test]
+    async fn shutdown_kills_a_live_turn_and_its_children_and_records_daemon_stopped() {
+        let dir = TempDir::new();
+        let (binary, heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
+
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        manager
+            .start(
+                &session_id,
+                "go",
+                &single_shot_role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+        let child_pid = read_pid_when_written(&child_pid_path).await;
+        let agent_pid = read_pid_when_written(&dir.0.join("agent.pid")).await;
+        assert!(process_alive(child_pid) && process_alive(agent_pid));
+
+        manager.shutdown(StdDuration::from_secs(10)).await;
+
+        wait_until_gone(agent_pid).await;
+        wait_until_gone(child_pid).await;
+        let after_kill = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        let later = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(after_kill, later, "the heartbeat should have stopped");
+
+        wait_until_status(&pool, &session_id, SessionStatus::Exited).await;
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::DaemonStopped));
+        assert!(run.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn nothing_starts_after_shutdown() {
+        let dir = TempDir::new();
+        let (binary, _heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        manager.shutdown(StdDuration::from_millis(100)).await;
+
+        let err = manager
+            .start(&session_id, "go", &role_config(), SessionKind::Standing)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::ShuttingDown), "{err:?}");
+        let err = manager
+            .resume(
+                &session_id,
+                "adapter-session",
+                "go",
+                &role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::ShuttingDown), "{err:?}");
+        assert_eq!(err.to_string(), "the daemon is shutting down");
+        // Nothing was spawned, and no slot was left reserved.
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+        assert!(!child_pid_path.exists());
+        assert!(!dir.0.join("agent.pid").exists());
+        assert!(manager.sessions.lock().await.is_empty());
     }
 
     /// A turn that ignores stdin entirely is exactly what the idle
@@ -2506,6 +2686,7 @@ mod tests {
         clean_exit: bool,
         reaped: bool,
         cancelled: bool,
+        stopping: bool,
         expected: (SessionStatus, Option<SessionEndReason>),
     }
 
@@ -2520,7 +2701,7 @@ mod tests {
     /// tests that happen to reach some of them.
     #[test]
     fn final_run_state_precedence() {
-        use SessionEndReason::{Cancelled, Interrupted, Lingered, NoReport, Reaped};
+        use SessionEndReason::{Cancelled, DaemonStopped, Interrupted, Lingered, NoReport, Reaped};
         use SessionKind::{SingleShot, Standing};
         use SessionStatus::{Exited, Idle};
 
@@ -2570,6 +2751,7 @@ mod tests {
                 clean_exit: true,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Idle, None),
             },
             Case {
@@ -2579,6 +2761,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Idle, None),
             },
             Case {
@@ -2588,6 +2771,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(Lingered)),
             },
             Case {
@@ -2597,6 +2781,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(NoReport)),
             },
             Case {
@@ -2606,6 +2791,7 @@ mod tests {
                 clean_exit: true,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(NoReport)),
             },
             Case {
@@ -2615,6 +2801,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, None),
             },
             Case {
@@ -2624,6 +2811,7 @@ mod tests {
                 clean_exit: true,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, None),
             },
             Case {
@@ -2633,6 +2821,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(Lingered)),
             },
             Case {
@@ -2642,6 +2831,7 @@ mod tests {
                 clean_exit: true,
                 reaped: true,
                 cancelled: false,
+                stopping: false,
                 expected: (Idle, Some(Reaped)),
             },
             Case {
@@ -2651,6 +2841,7 @@ mod tests {
                 clean_exit: false,
                 reaped: true,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(Reaped)),
             },
             Case {
@@ -2660,6 +2851,7 @@ mod tests {
                 clean_exit: true,
                 reaped: true,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(NoReport)),
             },
             Case {
@@ -2669,6 +2861,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: true,
+                stopping: false,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -2678,6 +2871,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: true,
+                stopping: false,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -2687,6 +2881,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: true,
+                stopping: false,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -2696,6 +2891,7 @@ mod tests {
                 clean_exit: false,
                 reaped: true,
                 cancelled: true,
+                stopping: false,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -2705,6 +2901,7 @@ mod tests {
                 clean_exit: true,
                 reaped: false,
                 cancelled: true,
+                stopping: false,
                 expected: (Idle, Some(Cancelled)),
             },
             Case {
@@ -2714,6 +2911,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(Interrupted)),
             },
             Case {
@@ -2726,6 +2924,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(Lingered)),
             },
             Case {
@@ -2737,6 +2936,7 @@ mod tests {
                 clean_exit: true,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, Some(NoReport)),
             },
             Case {
@@ -2746,6 +2946,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: true,
+                stopping: false,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -2755,6 +2956,7 @@ mod tests {
                 clean_exit: true,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Idle, None),
             },
             Case {
@@ -2764,6 +2966,7 @@ mod tests {
                 clean_exit: true,
                 reaped: true,
                 cancelled: false,
+                stopping: false,
                 expected: (Idle, Some(Reaped)),
             },
             Case {
@@ -2773,6 +2976,7 @@ mod tests {
                 clean_exit: false,
                 reaped: false,
                 cancelled: false,
+                stopping: false,
                 expected: (Exited, None),
             },
             Case {
@@ -2782,6 +2986,67 @@ mod tests {
                 clean_exit: false,
                 reaped: true,
                 cancelled: true,
+                stopping: false,
+                expected: (Exited, Some(Cancelled)),
+            },
+            Case {
+                name: "stopping, incomplete single-shot turn",
+                kind: SingleShot,
+                turn: waiting(),
+                clean_exit: false,
+                reaped: false,
+                cancelled: false,
+                stopping: true,
+                expected: (Exited, Some(DaemonStopped)),
+            },
+            Case {
+                name: "cancelled beats stopping",
+                kind: SingleShot,
+                turn: waiting(),
+                clean_exit: false,
+                reaped: false,
+                cancelled: true,
+                stopping: true,
+                expected: (Exited, Some(Cancelled)),
+            },
+            Case {
+                name: "stopping beats reaped and no-report",
+                kind: SingleShot,
+                turn: gave_up_and_killed(),
+                clean_exit: false,
+                reaped: true,
+                cancelled: false,
+                stopping: true,
+                expected: (Exited, Some(DaemonStopped)),
+            },
+            Case {
+                name: "stopping, but the turn had completed",
+                kind: SingleShot,
+                turn: completed(),
+                clean_exit: false,
+                reaped: false,
+                cancelled: false,
+                stopping: true,
+                expected: (Idle, None),
+            },
+            Case {
+                name: "standing, stopping",
+                kind: Standing,
+                turn: silent(),
+                clean_exit: false,
+                reaped: false,
+                cancelled: false,
+                stopping: true,
+                expected: (Idle, Some(DaemonStopped)),
+            },
+            Case {
+                name: "standing, cancelled beats stopping",
+                kind: Standing,
+                turn: silent(),
+                clean_exit: false,
+                reaped: false,
+                cancelled: true,
+                stopping: true,
                 expected: (Exited, Some(Cancelled)),
             },
         ];
@@ -2792,7 +3057,8 @@ mod tests {
                     &case.turn,
                     case.clean_exit,
                     case.reaped,
-                    case.cancelled
+                    case.cancelled,
+                    case.stopping
                 ),
                 case.expected,
                 "{}",

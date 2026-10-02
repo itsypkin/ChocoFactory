@@ -6,12 +6,16 @@
 mod error;
 mod events;
 mod projects;
+mod server;
 mod tasks;
 mod ws;
 
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::HeaderValue;
+use axum::middleware;
+use axum::response::Response;
 use axum::routing::{get, post};
 use sqlx::SqlitePool;
 use tokio::sync::Notify;
@@ -19,6 +23,7 @@ use tokio::sync::Notify;
 use crate::engine::WorkflowEngine;
 
 pub use error::ApiError;
+pub use server::{ExeStamp, ServerInfo};
 
 /// Shared state every handler gets via `State<AppState>`. Cheap to clone
 /// (a pool handle, two `Arc`s) — axum clones it per request.
@@ -27,6 +32,7 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub engine: Arc<WorkflowEngine>,
     pub events_notify: Arc<Notify>,
+    pub server: Arc<ServerInfo>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -49,7 +55,19 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{id}/retry", post(tasks::retry))
         .route("/tasks/{id}/events", get(events::list))
         .route("/tasks/{id}/events/live", get(ws::task_events))
+        .route("/server", get(server::get))
         .with_state(state)
+        // Every response, 404s and error bodies included, names the daemon's
+        // version so a client can notice a mismatch.
+        .layer(middleware::map_response(add_version_header))
+}
+
+async fn add_version_header(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        "x-chocofactory-version",
+        HeaderValue::from_static(chocofactory_core::version::VERSION),
+    );
+    response
 }
 
 /// Shared HTTP-level test harness (P1-9): every `api/*.rs` module's tests
@@ -67,7 +85,7 @@ pub mod tests {
     use sqlx::SqlitePool;
     use tokio::sync::Notify;
 
-    use super::{AppState, router};
+    use super::{AppState, ExeStamp, ServerInfo, router};
     use crate::adapter::{AgentAdapter, ClaudeAdapter};
     use crate::db;
     use crate::engine::WorkflowEngine;
@@ -114,11 +132,19 @@ stages:
     pub struct TestResponse {
         status: u16,
         body: Vec<u8>,
+        headers: reqwest::header::HeaderMap,
     }
 
     impl TestResponse {
         pub fn status(&self) -> u16 {
             self.status
+        }
+
+        pub fn header(&self, name: &str) -> Option<String> {
+            self.headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
         }
 
         pub fn json(&self) -> Value {
@@ -153,6 +179,12 @@ stages:
         /// tests that need a single-shot `agent_turn` to actually complete
         /// and auto-advance.
         pub async fn start_with_adapter_binary(binary: &str) -> Self {
+            Self::start_with_binaries(binary, "choco").await
+        }
+
+        /// [`Self::start_with_adapter_binary`] that also names the `choco`
+        /// binary `GET /server` reports.
+        pub async fn start_with_binaries(binary: &str, choco_binary: &str) -> Self {
             let pool = db::connect_in_memory().await.unwrap();
             let workflows_dir = TempDir::new();
             let events_notify = Arc::new(Notify::new());
@@ -171,13 +203,21 @@ stages:
                 None,
                 Arc::clone(&events_notify),
             );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
             let state = AppState {
                 pool: pool.clone(),
                 engine,
                 events_notify,
+                server: Arc::new(ServerInfo {
+                    pid: std::process::id(),
+                    port: addr.port(),
+                    started_at: chrono::Utc::now(),
+                    config_root: workflows_dir.0.clone(),
+                    exe: ExeStamp::capture().ok(),
+                    choco_binary: choco_binary.to_string(),
+                }),
             };
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
                 let _ = axum::serve(listener, router(state)).await;
             });
@@ -211,8 +251,13 @@ stages:
 
         async fn to_response(resp: reqwest::Response) -> TestResponse {
             let status = resp.status().as_u16();
+            let headers = resp.headers().clone();
             let body = resp.bytes().await.unwrap().to_vec();
-            TestResponse { status, body }
+            TestResponse {
+                status,
+                body,
+                headers,
+            }
         }
 
         pub async fn get(&self, path: &str) -> TestResponse {
