@@ -614,7 +614,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_stage_env_variable_overrides_an_inherited_one() {
-        // PATH is always inherited; overriding it with a marker proves layering.
+        // HOME is inherited from the daemon's environment; the stage env wins.
+        let inherited = std::env::var("HOME").expect("HOME is set for the test");
+        assert_ne!(inherited, "/choco/override");
         let outcome = run(
             &inline("printf '%s' \"$HOME\""),
             &std::env::temp_dir(),

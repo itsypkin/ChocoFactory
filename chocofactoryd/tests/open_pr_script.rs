@@ -27,6 +27,9 @@ for a in "$@"; do
     prev=$a
 done
 if [ -e "$CFG/fail-${1:-}-${2:-}" ]; then
+    # A create that fails after the PR exists must still fail the script, so
+    # the read-back cannot be what makes the test pass.
+    if [ "${1:-} ${2:-}" = "pr create" ]; then touch "$LOG/created"; fi
     echo "fake gh: configured to fail" >&2
     exit 1
 fi
@@ -417,7 +420,7 @@ fn a_body_without_exactly_one_block_is_left_alone() {
         assert!(fx.calls_to("pr edit").is_empty());
         assert!(fx.calls_to("pr create").is_empty());
         assert!(
-            stderr(&out).contains("has no choco markers"),
+            stderr(&out).contains("doesn't have exactly one choco block"),
             "{}",
             stderr(&out)
         );
@@ -469,6 +472,22 @@ fn failures_exit_nonzero() {
     fx.write_description(b"d\n");
     fx.cfg("fail-pr-create", "");
     assert!(!fx.run("T (#1)", "approved", "r").status.success());
+
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    fx.cfg("open-number", "7\n");
+    fx.cfg("body", &format!("{BEGIN}\nold\n{END}\n"));
+    fx.cfg("fail-pr-view", "");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(!out.status.success());
+    assert!(fx.calls_to("pr edit").is_empty() && fx.calls_to("pr create").is_empty());
+
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    fx.cfg("fail-pr-list", "");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(!out.status.success());
+    assert!(fx.calls_to("pr edit").is_empty() && fx.calls_to("pr create").is_empty());
 
     let fx = Fixture::new();
     fx.write_description(b"d\n");

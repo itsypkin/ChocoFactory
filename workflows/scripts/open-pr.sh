@@ -206,7 +206,7 @@ else
     if splice "$TMP/current" "$TMP/block" > "$TMP/new"; then
         gh pr edit "$N" --body-file "$TMP/new" >/dev/null
     else
-        note "PR #$N's description has no choco markers (a hand-written or pre-#101 body); left unchanged"
+        note "PR #$N's description doesn't have exactly one choco block (begin, then end), e.g. a hand-written or pre-#101 body; left unchanged"
     fi
 fi
 
