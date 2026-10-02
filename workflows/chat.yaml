@@ -2,7 +2,7 @@ name: chat
 roles:
   chat:
     cli: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     # A conversation with the operator, so it keeps the operator's own Claude
     # setup (CLAUDE.md, plugins, MCP servers, skills, memory). Workflow roles
     # are isolated from all of that by default (#90).
