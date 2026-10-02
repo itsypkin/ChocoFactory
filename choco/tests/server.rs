@@ -83,7 +83,14 @@ impl Env {
     }
 
     fn json(&self, args: &[&str]) -> Value {
+        // Non-`server` commands always get an explicit URL read from this
+        // HOME's lock, so a dead test daemon can never send them to the
+        // operator's real daemon on :4141 (`running()` panics instead).
+        let base = format!("http://127.0.0.1:{}", self.running().port);
         let mut a = vec!["--json"];
+        if args.first() != Some(&"server") {
+            a.extend_from_slice(&["--base-url", base.as_str()]);
+        }
         a.extend_from_slice(args);
         let out = self.choco(&a);
         assert!(out.status.success(), "{args:?} failed: {}", text(&out));
@@ -264,11 +271,61 @@ fn start_fails_when_port_is_taken() {
 }
 
 #[test]
+fn startup_failure_tail_shows_only_the_current_run() {
+    let env = Env::new();
+    let logs = env.root().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("chocofactoryd.log"),
+        "=== choco server start earlier ===\nEARLIER-RUN-MARKER\n",
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    let out = env.choco(&["server", "start", "--port", &port]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("failed to bind"), "{err}");
+    assert!(!err.contains("EARLIER-RUN-MARKER"), "{err}");
+}
+
+#[test]
 fn default_base_url_follows_the_lock_file() {
     let env = Env::new();
-    env.start();
+    let info = env.start();
+    // Create a marker through the explicit URL, then check the no-flag
+    // command sees it: only this HOME's daemon can know it.
+    let repo = env.home.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    env.json(&[
+        "project",
+        "create",
+        "marker-project",
+        "--repo",
+        repo.to_str().unwrap(),
+    ]);
     let out = env.choco(&["project", "list"]);
     assert!(out.status.success(), "{}", text(&out));
+    assert!(stdout(&out).contains("marker-project"), "{}", text(&out));
+    assert_ne!(info.port, 4141);
+}
+
+#[test]
+fn stale_lock_makes_default_base_url_an_error_not_a_fallback() {
+    let env = Env::new();
+    let info = env.start();
+    unsafe { libc::kill(info.pid as i32, libc::SIGKILL) };
+    wait_for("the lock to be released", || {
+        matches!(env.lock(), LockState::NotRunning { .. })
+    });
+    let out = env.choco(&["project", "list"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stdout(&out).is_empty(), "{}", text(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("not running") && err.contains(&info.pid.to_string()),
+        "{err}"
+    );
 }
 
 #[test]

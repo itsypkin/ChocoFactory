@@ -71,10 +71,13 @@ pub async fn run(cmd: ServerCmd, json: bool) -> ExitCode {
     }
 }
 
+/// The last `n` lines of the current run only: everything from the last
+/// `=== choco server start` separator, so an earlier daemon's lines never show.
 fn last_lines(path: &Path, n: usize) -> String {
     match std::fs::read_to_string(path) {
         Ok(text) => {
-            let lines: Vec<&str> = text.lines().collect();
+            let from = text.rfind("=== choco server start").unwrap_or(0);
+            let lines: Vec<&str> = text[from..].lines().collect();
             lines[lines.len().saturating_sub(n)..].join("\n")
         }
         Err(e) => format!("(could not read {}: {e})", path.display()),
@@ -166,6 +169,18 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
             .try_wait()
             .map_err(|e| format!("cannot check on chocofactoryd (pid {pid}): {e}"))?
         {
+            // A concurrent `start` may have won the race: if another daemon
+            // now holds the lock, this one lost it and nothing is wrong.
+            if let Ok(LockState::Running(info)) = lock(&root)
+                && info.pid != pid
+            {
+                println!(
+                    "chocofactoryd is already running (pid {}, port {}, version {})",
+                    info.pid, info.port, info.version
+                );
+                skew_warning(&info);
+                return Ok(0);
+            }
             return Err(format!(
                 "chocofactoryd exited during startup ({status}); last log lines:\n{}",
                 last_lines(&log, 20)

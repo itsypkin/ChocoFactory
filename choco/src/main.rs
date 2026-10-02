@@ -51,25 +51,28 @@ fn canonicalize_repo(path: &str) -> Result<String, ClientError> {
 }
 
 /// An explicit `--base-url`/`CHOCO_BASE_URL` wins; else the port the running
-/// daemon published in its lock file; else the default port. A lock file that
-/// cannot be read falls through to the default, but says so on stderr.
-fn resolve_base_url(explicit: Option<String>) -> String {
+/// daemon published in its lock file; else the default port, but only when
+/// there is no record of a daemon at all (one from before the lock file
+/// existed writes none). A lock file that records a dead daemon is an error,
+/// not a reason to talk to whatever listens on the default port. A lock file
+/// that cannot be read falls through to the default, but says so on stderr.
+fn resolve_base_url(explicit: Option<String>) -> Result<String, String> {
     let (url, warning) =
-        resolve_base_url_in(chocofactory_core::paths::config_root().as_deref(), explicit);
+        resolve_base_url_in(chocofactory_core::paths::config_root().as_deref(), explicit)?;
     if let Some(w) = warning {
         eprintln!("{w}");
     }
-    url
+    Ok(url)
 }
 
 /// Returns the URL and, when the lock file could not be read, the warning to print.
 fn resolve_base_url_in(
     root: Option<&std::path::Path>,
     explicit: Option<String>,
-) -> (String, Option<String>) {
+) -> Result<(String, Option<String>), String> {
     use chocofactory_core::daemon_lock::{LockState, read_lock};
     if let Some(url) = explicit {
-        return (url, None);
+        return Ok((url, None));
     }
     let mut warning = None;
     if let Some(root) = root
@@ -77,9 +80,16 @@ fn resolve_base_url_in(
     {
         match read_lock(root) {
             Ok(LockState::Running(info)) => {
-                return (format!("http://127.0.0.1:{}", info.port), None);
+                return Ok((format!("http://127.0.0.1:{}", info.port), None));
             }
-            Ok(LockState::NotRunning { .. }) => {}
+            Ok(LockState::NotRunning { last: None }) => {}
+            Ok(LockState::NotRunning { last: Some(last) }) => {
+                return Err(format!(
+                    "chocofactoryd is not running (last ran as pid {} on port {}); \
+                     start it with `choco server start` or pass --base-url",
+                    last.pid, last.port
+                ));
+            }
             Err(err) => {
                 warning = Some(format!(
                     "warning: could not read the daemon lock file ({err}); using http://127.0.0.1:4141"
@@ -87,7 +97,7 @@ fn resolve_base_url_in(
             }
         }
     }
-    ("http://127.0.0.1:4141".to_string(), warning)
+    Ok(("http://127.0.0.1:4141".to_string(), warning))
 }
 
 #[tokio::main]
@@ -118,7 +128,14 @@ async fn main() -> ExitCode {
         return server::run(cmd, cli.json).await;
     }
 
-    let client = Client::new(resolve_base_url(cli.base_url));
+    let base_url = match resolve_base_url(cli.base_url) {
+        Ok(url) => url,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client = Client::new(base_url);
 
     // A watching `task status` returns its own exit code (3–6 for the ways a
     // watch can end other than success), so it's handled apart from `run`.
@@ -392,13 +409,34 @@ mod tests {
         let root = tmp("explicit");
         assert_eq!(
             resolve_base_url_in(Some(&root), Some("http://x:1".into())),
-            ("http://x:1".to_string(), None)
+            Ok(("http://x:1".to_string(), None))
         );
         assert_eq!(
             resolve_base_url_in(Some(&root), None),
-            (DEFAULT.to_string(), None)
+            Ok((DEFAULT.to_string(), None))
         );
-        assert_eq!(resolve_base_url_in(None, None), (DEFAULT.to_string(), None));
+        assert_eq!(
+            resolve_base_url_in(None, None),
+            Ok((DEFAULT.to_string(), None))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_lock_is_an_error_not_a_fallback() {
+        let root = tmp("stale");
+        std::fs::write(
+            root.join("chocofactoryd.lock"),
+            r#"{"pid":4242,"port":5151,"version":"1","commit":"c","started_at":"2026-01-01T00:00:00Z","exe":"/x"}"#,
+        )
+        .unwrap();
+        let err = resolve_base_url_in(Some(&root), None).unwrap_err();
+        assert!(
+            err.contains("not running") && err.contains("4242") && err.contains("5151"),
+            "{err}"
+        );
+        // An explicit URL still wins.
+        assert!(resolve_base_url_in(Some(&root), Some("http://x:1".into())).is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -410,7 +448,7 @@ mod tests {
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
         // Running as root can still open it; then there is no error to test.
         if chocofactory_core::daemon_lock::read_lock(&root).is_err() {
-            let (url, warning) = resolve_base_url_in(Some(&root), None);
+            let (url, warning) = resolve_base_url_in(Some(&root), None).unwrap();
             assert_eq!(url, DEFAULT);
             let w = warning.expect("an unreadable lock file must warn");
             assert!(w.starts_with("warning:") && w.contains("lock file"), "{w}");

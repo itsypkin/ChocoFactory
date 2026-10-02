@@ -133,7 +133,8 @@ pub enum ServerCmd {
     },
     /// Stop (as `stop`) then start chocofactoryd, keeping its port unless
     /// `--port` is given. Starts it if it was not running.
-    /// Exit codes: 0 ok; 1 error; 3 refused because work is in flight.
+    /// Exit codes: 0 ok; 1 error, or the old daemon had to be killed (a new
+    /// one is still started and may be running); 3 refused because work is in flight.
     Restart {
         /// Stop even if work is in flight; that work is marked stuck.
         #[arg(long)]
