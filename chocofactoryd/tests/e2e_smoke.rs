@@ -1609,7 +1609,10 @@ async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
     assert_ne!(other_port, daemon.port);
     let mut second = spawn_raw(
         &home_path,
-        &[("CHOCOFACTORY_PORT", &other_port.to_string())],
+        &[
+            ("CHOCOFACTORY_PORT", &other_port.to_string()),
+            ("RUST_LOG", "info"),
+        ],
     );
     let status = tokio::time::timeout(Duration::from_secs(10), second.wait())
         .await

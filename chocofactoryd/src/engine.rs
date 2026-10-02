@@ -166,6 +166,10 @@ pub struct WorkflowEngine {
     /// to be unique per task, but a single global counter is simpler than
     /// per-task numbering and just as correct.
     next_runner_id: AtomicU64,
+    /// Set by `abort_all_detached_runners`: a runner attached afterwards
+    /// (a request still running past the HTTP drain deadline) is aborted
+    /// on the spot instead of living until the runtime is dropped.
+    runners_stopping: std::sync::atomic::AtomicBool,
     /// Wall-clock source for every `poll` budget computation (#52). Never
     /// `Instant`: it and tokio's timers stand still while the machine
     /// sleeps, so a `timeout:` measured on them is not calendar time.
@@ -1077,6 +1081,7 @@ impl WorkflowEngine {
             events_notify,
             detached_runners: std::sync::Mutex::new(HashMap::new()),
             next_runner_id: AtomicU64::new(0),
+            runners_stopping: std::sync::atomic::AtomicBool::new(false),
             wall_clock,
         })
     }
@@ -2264,6 +2269,13 @@ impl WorkflowEngine {
             .detached_runners
             .lock()
             .expect("detached_runners mutex poisoned");
+        // Checked under the map lock, which `abort_all_detached_runners`
+        // also holds when it sets the flag, so a handle is either drained
+        // by it or aborted here.
+        if self.runners_stopping.load(Ordering::SeqCst) {
+            handle.abort();
+            return;
+        }
         if let Some(slot) = runners.get_mut(task_id).and_then(|task| task.get_mut(&id)) {
             *slot = Some(handle);
         }
@@ -2294,6 +2306,7 @@ impl WorkflowEngine {
                 .detached_runners
                 .lock()
                 .expect("detached_runners mutex poisoned");
+            self.runners_stopping.store(true, Ordering::SeqCst);
             runners
                 .drain()
                 .flat_map(|(_, task)| task.into_values().flatten())
@@ -16641,6 +16654,56 @@ stages:
 
         let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
         assert!(!outcome.resumed, "{outcome:?}");
+    }
+
+    /// Shutdown must kill a running shell stage's whole process group
+    /// before the daemon lock is released.
+    #[tokio::test]
+    async fn abort_all_detached_runners_kills_running_shell_groups() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let gc = dir.join("gc");
+        let yaml = format!(
+            r#"
+name: hang-flow
+stages:
+  run:
+    kind: shell
+    command: "sleep 600 & echo $! > {}; wait"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+            gc.display()
+        );
+        std::fs::write(dir.join("hang-flow.yaml"), &yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "run").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        // The row is already at `run`, as after a crash; parking then
+        // retrying starts the shell runner.
+        engine.park_interrupted_turns().await.unwrap();
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+
+        let pid: u32 = crate::test_support::wait_until("the grandchild pid file", || async {
+            std::fs::read_to_string(&gc)
+                .map_err(|e| e.to_string())
+                .and_then(|s| s.trim().parse().map_err(|e| format!("{e}")))
+        })
+        .await;
+        assert!(process_alive(pid));
+
+        engine.abort_all_detached_runners().await;
+        assert!(engine.detached_runners.lock().unwrap().is_empty());
+        crate::test_support::wait_until("the grandchild to die", || async {
+            if process_alive(pid) {
+                Err("still alive".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
