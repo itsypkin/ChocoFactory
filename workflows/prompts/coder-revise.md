@@ -15,8 +15,11 @@ follow that entry:
 - **`awaiting_human_review` → `changes_requested`**: a human asked for
   changes on the open PR. Their feedback is on the PR, not in this prompt.
   Run `gh pr view --comments` for an overview, then read it in full, with
-  each author's standing, from the API (set
-  `N=$(gh pr view --json number -q .number)` first):
+  each author's standing, from the API. Set `N` to the open PR's number in
+  the same command as the `gh api` calls, since each command starts a
+  fresh shell:
+  `N=$(gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --state open --json number -q '.[0].number')`
+  (`gh pr view` also finds a closed or merged PR). Then
   `gh api --paginate "repos/{owner}/{repo}/issues/$N/comments"` for
   comments, `gh api --paginate "repos/{owner}/{repo}/pulls/$N/reviews"`
   for review bodies, and
