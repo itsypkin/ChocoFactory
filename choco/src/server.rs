@@ -28,7 +28,7 @@ const LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 
 const EXIT_NOT_RUNNING_OR_REFUSED: u8 = 3;
 
-type Failure = String;
+pub(crate) type Failure = String;
 
 fn root() -> Result<PathBuf, Failure> {
     config_root().ok_or_else(|| "HOME is not set".to_string())
@@ -86,7 +86,24 @@ fn last_lines(path: &Path, n: usize) -> String {
 
 async fn start(port: Option<u16>) -> Result<u8, Failure> {
     let root = root()?;
-    if let LockState::Running(info) = lock(&root)? {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate choco itself: {e}"))?;
+    let daemon = exe
+        .parent()
+        .ok_or("cannot locate choco's directory")?
+        .join("chocofactoryd");
+    start_daemon(&root, &daemon, port).await
+}
+
+/// Starts `daemon` in the background and waits until it answers. Shared by
+/// `choco server start` (the sibling of this choco) and `choco update` (the
+/// freshly installed one, passed explicitly because a replaced `current_exe`
+/// no longer names a usable path on Linux). Exit code 0 on success.
+pub(crate) async fn start_daemon(
+    root: &Path,
+    daemon: &Path,
+    port: Option<u16>,
+) -> Result<u8, Failure> {
+    if let LockState::Running(info) = lock(root)? {
         println!(
             "chocofactoryd is already running (pid {}, port {}, version {})",
             info.pid, info.port, info.version
@@ -94,11 +111,6 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
         skew_warning(&info);
         return Ok(0);
     }
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate choco itself: {e}"))?;
-    let daemon = exe
-        .parent()
-        .ok_or("cannot locate choco's directory")?
-        .join("chocofactoryd");
     if !daemon.is_file() {
         return Err(format!(
             "chocofactoryd not found next to choco (looked for {}); install them side by side",
@@ -107,7 +119,7 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
     }
     let logs = root.join("logs");
     std::fs::create_dir_all(&logs).map_err(|e| format!("cannot create {}: {e}", logs.display()))?;
-    let log = log_path(&root);
+    let log = log_path(root);
     let log_len = match std::fs::metadata(&log) {
         Ok(meta) => meta.len(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -139,7 +151,7 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
         .try_clone()
         .map_err(|e| format!("cannot duplicate log handle: {e}"))?;
 
-    let mut cmd = std::process::Command::new(&daemon);
+    let mut cmd = std::process::Command::new(daemon);
     cmd.stdin(Stdio::null())
         .stdout(file)
         .stderr(err_file)
@@ -171,7 +183,7 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
         {
             // A concurrent `start` may have won the race: if another daemon
             // now holds the lock, this one lost it and nothing is wrong.
-            if let Ok(LockState::Running(info)) = lock(&root)
+            if let Ok(LockState::Running(info)) = lock(root)
                 && info.pid != pid
             {
                 println!(
@@ -189,7 +201,7 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
         // A transient lock-read error (the daemon is between taking the lock
         // and publishing it) means "not ready yet"; it is reported if the
         // deadline passes.
-        let lock_state = lock(&root);
+        let lock_state = lock(root);
         if let Err(e) = &lock_state {
             last_lock_error = Some(e.clone());
         }
@@ -251,7 +263,7 @@ async fn wait_released(root: &Path, pid: u32, timeout: Duration) -> Result<bool,
 
 /// Stops the daemon described by `info`. Exit code 0 stopped, 3 refused, 1
 /// killed after the timeout.
-async fn stop_running(root: &Path, info: LockInfo, force: bool) -> Result<u8, Failure> {
+pub(crate) async fn stop_daemon(root: &Path, info: LockInfo, force: bool) -> Result<u8, Failure> {
     let client = Client::new(url(&info));
     match client.server_status(STATUS_TIMEOUT).await {
         Ok(server) => {
@@ -312,7 +324,7 @@ async fn stop(force: bool) -> Result<u8, Failure> {
             println!("chocofactoryd is not running");
             Ok(0)
         }
-        LockState::Running(info) => stop_running(&root, info, force).await,
+        LockState::Running(info) => stop_daemon(&root, info, force).await,
     }
 }
 
@@ -321,7 +333,7 @@ async fn restart(force: bool, port: Option<u16>) -> Result<u8, Failure> {
     match lock(&root)? {
         LockState::Running(info) => {
             let old_port = info.port;
-            let code = stop_running(&root, info, force).await?;
+            let code = stop_daemon(&root, info, force).await?;
             if code == EXIT_NOT_RUNNING_OR_REFUSED {
                 return Ok(code);
             }

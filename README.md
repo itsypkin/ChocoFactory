@@ -7,6 +7,47 @@ Two binaries:
 - **`choco`** — a thin CLI client against that API (create/inspect/message
   tasks and projects).
 
+## Install
+
+```
+curl -fsSL https://github.com/itsypkin/ChocoFactory/releases/latest/download/install.sh | sh
+```
+
+- Installs `choco` and `chocofactoryd` into `~/.local/bin` (override with
+  `CHOCO_INSTALL_DIR`). `CHOCO_VERSION=X.Y.Z` pins a version;
+  `CHOCO_RELEASES_URL` points at another release host; `CHOCO_INSTALL_ARCHIVE`
+  installs from a local archive without downloading.
+- Platforms: macOS arm64 and x86_64, Linux x86_64 and aarch64 (static musl builds).
+- The two binaries always live **side by side** in one directory: `chocofactoryd`
+  hands agents the `choco` next to it, and `choco server start` runs the
+  `chocofactoryd` next to it.
+- Downloads are verified against the release's `SHA256SUMS` before anything is installed.
+- From source: `cargo install --git https://github.com/itsypkin/ChocoFactory --locked choco chocofactoryd`,
+  or clone and `cargo build --workspace` (see Build below).
+
+## Updating
+
+```
+choco update [--check] [--version X.Y.Z] [--force]
+```
+
+Works for copies installed by `install.sh` (it refuses, with instructions, for
+source builds and cargo installs). `--check` only reports whether an update is
+available. A daemon running from the install directory is stopped and restarted
+on the same port with the new binary; if an agent turn or shell step is in
+flight, `update` refuses (exit 3) unless `--force`, which parks that work like
+`choco server stop --force` (`choco task retry` continues it). A daemon running
+from another directory is left alone. The built-in workflows are inside the
+binary, so they update with it.
+
+## Releasing
+
+Maintainers: bump `[workspace.package] version`, merge, then push `vX.Y.Z-rc.1`
+first (a prerelease that `latest` ignores, so installs are unaffected) and check
+its assets; then push `vX.Y.Z`. The tag must equal `v` + the workspace version
+and be on `main`. **Actions → Release → Run workflow** (`workflow_dispatch`) is a
+dry run: everything except publishing.
+
 ## Build
 
 ```
@@ -746,3 +787,10 @@ cargo test --workspace
 
 Tests never spawn the real `claude` — the integration suites point the
 daemon at `mock-claude` or a Python fixture instead.
+
+## License
+
+Licensed under either of Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+or MIT license ([LICENSE-MIT](LICENSE-MIT)) at your option. Unless you explicitly state otherwise, any
+contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or conditions.

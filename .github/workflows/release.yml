@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches the workspace version and is on main
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version v$version"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is not on main; tag a commit that has been merged"
+            exit 1
+          fi
+
+  test:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            smoke: true
+          - target: x86_64-apple-darwin
+            os: macos-14
+            smoke: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            smoke: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            smoke: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Record the build commit
+        run: echo "CHOCO_BUILD_COMMIT=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Build
+        env:
+          T: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$T" -p choco -p chocofactoryd
+      - name: Package
+        env:
+          T: ${{ matrix.target }}
+        run: scripts/package-release.sh "$T" "target/$T/release" dist
+      - name: Smoke test
+        if: matrix.smoke
+        env:
+          T: ${{ matrix.target }}
+        run: scripts/release-smoke.sh "dist/chocofactory-$T.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chocofactory-${{ matrix.target }}
+          path: dist/chocofactory-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          cd dist
+          sha256sum chocofactory-*.tar.gz > SHA256SUMS
+          printf '{"version":"%s","commit":"%s"}\n' "${TAG#v}" "${GITHUB_SHA::7}" > manifest.json
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          # shellcheck disable=SC2086
+          gh release create "$TAG" chocofactory-*.tar.gz SHA256SUMS manifest.json ../install.sh \
+            --title "$TAG" --generate-notes $prerelease
