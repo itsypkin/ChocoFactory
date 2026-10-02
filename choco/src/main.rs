@@ -82,7 +82,18 @@ fn resolve_base_url_in(
             Ok(LockState::Running(info)) => {
                 return Ok((format!("http://127.0.0.1:{}", info.port), None));
             }
-            Ok(LockState::NotRunning { last: None }) => {}
+            Ok(LockState::NotRunning { last: None }) => {
+                // A missing lock file means no daemon was ever started here. An
+                // existing one with no daemon info (a start that failed before
+                // publishing) must not silently fall back to :4141 either.
+                if root.join("chocofactoryd.lock").exists() {
+                    return Err(
+                        "chocofactoryd is not running (the lock file has no daemon info); \
+                         start it with `choco server start` or pass --base-url"
+                            .to_string(),
+                    );
+                }
+            }
             Ok(LockState::NotRunning { last: Some(last) }) => {
                 return Err(format!(
                     "chocofactoryd is not running (last ran as pid {} on port {}); \
@@ -437,6 +448,15 @@ mod tests {
         );
         // An explicit URL still wins.
         assert!(resolve_base_url_in(Some(&root), Some("http://x:1".into())).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_lock_file_is_an_error_not_a_fallback() {
+        let root = tmp("empty");
+        std::fs::write(root.join("chocofactoryd.lock"), "").unwrap();
+        let err = resolve_base_url_in(Some(&root), None).unwrap_err();
+        assert!(err.contains("not running"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

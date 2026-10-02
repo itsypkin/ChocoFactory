@@ -643,7 +643,7 @@ fn restart_starts_a_daemon_even_when_stop_had_to_kill_the_old_one() {
     let out = env.choco(&["server", "restart", "--force"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(stdout(&out).contains("was killed"), "{}", text(&out));
-    assert!(stdout(&out).contains("started"), "{}", text(&out));
+    assert!(stdout(&out).contains(" started (pid "), "{}", text(&out));
     let now = env.running();
     assert_ne!(now.pid, info.pid);
     assert_eq!(now.port, info.port);
@@ -679,6 +679,72 @@ fn start_without_a_sibling_daemon_fails() {
     assert!(!out.status.success());
     assert!(
         stderr(&out).contains("chocofactoryd not found next to choco"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn start_that_loses_the_race_reports_the_other_daemon() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let env = Env::new();
+    let dir = env.home.join("race");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
+    // A fake daemon that exits on its own, as one that lost the lock race would.
+    let fake = dir.join("chocofactoryd");
+    std::fs::write(&fake, "#!/bin/sh\nsleep 2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let child = Command::new(dir.join("choco"))
+        .args(["server", "start", "--port", "0"])
+        .env("HOME", &env.home)
+        .env("CHOCOFACTORY_CLAUDE_BINARY", &env.claude)
+        .env_remove("CHOCO_BASE_URL")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Once start has written its separator it has passed the "already running" check.
+    let log = env.root().join("logs").join("chocofactoryd.log");
+    let deadline = Instant::now() + DEADLINE;
+    while !std::fs::read_to_string(&log)
+        .map(|t| t.contains("=== choco server start"))
+        .unwrap_or(false)
+    {
+        assert!(Instant::now() < deadline, "start never wrote its log");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Play the winning daemon: hold the lock and publish our own info.
+    let me = std::process::id();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.root().join("chocofactoryd.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    file.set_len(0).unwrap();
+    write!(
+        file,
+        r#"{{"pid":{me},"port":59999,"version":"0.0.0","commit":"c","started_at":"2026-01-01T00:00:00Z","exe":"/x"}}"#
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let so = stdout(&out);
+    assert!(
+        so.contains("already running") && so.contains(&format!("pid {me}")),
         "{}",
         text(&out)
     );

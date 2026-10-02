@@ -38,7 +38,7 @@ choco server status                # version, pid, port, uptime, open tasks, in-
 - **Base URL:** `--base-url` / `CHOCO_BASE_URL` if set; otherwise the port of the
   running daemon from its lock file (`~/.config/chocofactory/chocofactoryd.lock`);
   otherwise `http://127.0.0.1:4141`, but only when there is no lock file (a
-  daemon from before it existed). A lock file recording a dead daemon is an
+  daemon from before it existed). A lock file recording a dead daemon (or an empty one left by a failed start) is an
   error ("chocofactoryd is not running"), never a fallback. `server` commands
   always use the lock file.
 - `choco` warns on stderr when the daemon's version differs from its own.

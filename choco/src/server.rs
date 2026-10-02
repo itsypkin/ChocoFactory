@@ -325,6 +325,10 @@ async fn restart(force: bool, port: Option<u16>) -> Result<u8, Failure> {
             if code == EXIT_NOT_RUNNING_OR_REFUSED {
                 return Ok(code);
             }
+            if code != 0 && matches!(lock(&root)?, LockState::Running(_)) {
+                // SIGKILL did not free the lock; starting would only report the old daemon.
+                return Ok(code);
+            }
             // Code 1 means stop had to SIGKILL the daemon (the lock is released and a
             // warning was printed). The user still wants a daemon, so start one and
             // keep exit 1 as the warning.
