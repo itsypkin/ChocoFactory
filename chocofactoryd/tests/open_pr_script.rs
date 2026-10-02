@@ -554,3 +554,130 @@ fn the_description_is_read_from_the_worktrees_private_git_dir() {
         assert!(text.contains(path_cmd), "{name} lacks the path command");
     }
 }
+
+// ---- #131: agent text can never close an issue ----
+
+const KEYWORDS: &str = "closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve";
+
+/// Keyword, optional colon, optional whitespace (one newline allowed), then
+/// any reference form. Built here from the documented syntax, independent of
+/// the script.
+fn closing_regex() -> regex::Regex {
+    let refs = r"(?:https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|[\w.-]+/[\w.-]+#\d+|#\d+)";
+    regex::Regex::new(&format!(
+        r"(?i)(?:^|[^A-Za-z0-9_])(?:{KEYWORDS})\b:?[ \t]*\r?\n?[ \t]*{refs}"
+    ))
+    .unwrap()
+}
+
+const AGENT_LINES: &str = "Its message has no Closes/Fixes/Resolves #84.\nfixes: #12\nCloses owner/repo#3\ncloses https://github.com/o/r/issues/5\nFIXED #6\nresolved:#7";
+
+fn body_for(title: &str, desc: Option<&[u8]>, report: &str) -> String {
+    let fx = Fixture::new();
+    if let Some(d) = desc {
+        fx.write_description(d);
+    }
+    let out = fx.run(title, "approved", report);
+    assert!(out.status.success(), "{}", stderr(&out));
+    String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap()
+}
+
+fn assert_rewritten(body: &str) {
+    for want in [
+        "Resolves issue 84",
+        "fixes: issue 12",
+        "Closes owner/repo issue 3",
+        "closes o/r issue 5",
+        "FIXED issue 6",
+        "resolved:issue 7",
+    ] {
+        assert!(body.contains(want), "missing {want:?} in {body}");
+    }
+}
+
+#[test]
+fn the_84_regression_report_cannot_close_issues() {
+    let body = body_for("T (#131)", Some(b"d\n"), AGENT_LINES);
+    assert_rewritten(&body);
+    assert_eq!(body.matches("Closes #131\n").count(), 1);
+}
+
+#[test]
+fn only_the_scripts_own_issue_line_matches_a_closing_pattern() {
+    let re = closing_regex();
+    let body = body_for("T (#131)", Some(AGENT_LINES.as_bytes()), AGENT_LINES);
+    let found: Vec<_> = re.find_iter(&body).map(|m| m.as_str().trim()).collect();
+    assert_eq!(found, vec!["Closes #131"], "{body}");
+    let body = body_for("T (#84 part 4)", Some(AGENT_LINES.as_bytes()), AGENT_LINES);
+    assert!(body.contains("\nRefs #84\n"));
+    assert_eq!(re.find_iter(&body).count(), 0, "{body}");
+}
+
+#[test]
+fn the_description_is_neutralised_the_same_way() {
+    let body = body_for("T (#131)", Some(AGENT_LINES.as_bytes()), "r");
+    assert_rewritten(&body);
+}
+
+#[test]
+fn bare_references_are_untouched() {
+    let text = "see #98\nowner/repo#3 is related\nhttps://github.com/o/r/issues/5\n";
+    let body = body_for("T (#1)", Some(text.as_bytes()), text.trim_end());
+    assert_eq!(body.matches(text).count(), 2, "{body}");
+}
+
+#[test]
+fn lookalike_words_are_not_keywords() {
+    let text = "unfixed #6\nprefixes #7\nenclosed #8\nclosest #9\nfixture #10\n";
+    let body = body_for("T (#1)", Some(text.as_bytes()), text.trim_end());
+    assert_eq!(body.matches(text).count(), 2, "{body}");
+}
+
+#[test]
+fn a_reference_on_the_next_line_is_rewritten_but_not_two_lines_down() {
+    let body = body_for("T (#1)", Some(b"This fixes\n#77 as well\n"), "r");
+    assert!(body.contains("This fixes\nissue 77 as well\n"), "{body}");
+    let body = body_for("T (#1)", Some(b"This fixes\nsomething\n#77 as well\n"), "r");
+    assert!(
+        body.contains("This fixes\nsomething\n#77 as well\n"),
+        "{body}"
+    );
+}
+
+#[test]
+fn only_the_first_reference_after_a_keyword_is_rewritten() {
+    let body = body_for("T (#1)", Some(b"Fixes #1, #2\n"), "r");
+    assert!(body.contains("Fixes issue 1, #2\n"), "{body}");
+}
+
+#[test]
+fn code_is_neutralised_too() {
+    let body = body_for(
+        "T (#1)",
+        Some(b"```\nFixes #5\n```\nand `Fixes #5` inline\n"),
+        "r",
+    );
+    assert!(body.contains("```\nFixes issue 5\n```\n"), "{body}");
+    assert!(body.contains("`Fixes issue 5` inline"), "{body}");
+}
+
+#[test]
+fn text_without_keywords_keeps_every_byte() {
+    let text = "caf\u{e9} \u{2014} \u{65e5}\u{672c}\r\nline with spaces   \r\n\ttabbed\r\n";
+    let body = body_for("T (#1)", Some(text.as_bytes()), "r");
+    assert!(body.contains(text), "{body:?}");
+}
+
+#[test]
+fn the_caps_still_hold_for_keyword_floods() {
+    let big = "Fixes #1 ".repeat(12_000);
+    assert!(big.len() > 100_000);
+    let body = body_for("T (#131)", Some(big.as_bytes()), &big);
+    assert!(body.len() < 60_000, "{} bytes", body.len());
+    assert_eq!(body.matches("[truncated: ").count(), 2);
+    let found: Vec<_> = closing_regex()
+        .find_iter(&body)
+        .map(|m| m.as_str().trim().to_string())
+        .collect();
+    assert_eq!(found, vec!["Closes #131"]);
+}

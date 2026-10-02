@@ -30,6 +30,12 @@ summary and your reply. Work like this:
 3. Commit everything. Don't push, and don't open, update or comment on a
    pull request — a later stage of the workflow does that. What the pull
    request says is up to you, through the description file in step 4.
+   Never put a closing keyword followed by an issue reference in a
+   commit message (`Closes #12`, `fixes: #12`, `Resolves owner/repo#12`):
+   GitHub closes that issue when the commit reaches the main branch,
+   whether or not the work finished it. The pull request already says
+   which issue it closes; write `#12` on its own if you need to mention
+   one.
 4. Write the pull request's description to the file this command prints:
    `echo "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`.
    It sits in git's private data for this worktree, so it is never

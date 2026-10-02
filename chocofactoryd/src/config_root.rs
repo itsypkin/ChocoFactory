@@ -685,6 +685,21 @@ mod tests {
         r#"echo "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md""#;
 
     #[test]
+    fn coder_system_step_three_forbids_closing_keywords_in_commit_messages() {
+        let text = squash(embedded_prompt("coder-system.md"));
+        assert_says(
+            &text,
+            &[
+                "Never put a closing keyword followed by an issue reference in a commit message",
+                "`Closes #12`, `fixes: #12`, `Resolves owner/repo#12`",
+                "GitHub closes that issue when the commit reaches the main branch",
+                "write `#12` on its own if you need to mention one.",
+            ],
+            "coder-system.md step 3 must forbid closing keywords in commit messages",
+        );
+    }
+
+    #[test]
     fn coder_system_step_four_asks_for_the_pr_description() {
         let text = squash(embedded_prompt("coder-system.md"));
         assert_says(
