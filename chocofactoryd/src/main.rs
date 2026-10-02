@@ -125,17 +125,35 @@ async fn main() {
     ));
     tracing::info!("spawned idle reaper and retention job");
 
+    // Bind is the single-instance guard, so it comes before the sweep: a
+    // second daemon dies here before it can spawn duplicate pollers.
+    let port = port_override().unwrap_or(DEFAULT_PORT);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("chocofactoryd: failed to bind 127.0.0.1");
+    tracing::info!(port, "listening on http://127.0.0.1:{port}");
+
+    // After session recovery (a resumed poll may advance into an
+    // `agent_turn`) and inline, before serving: `poll` stages whose runner
+    // died with the previous process are re-entered with their stored
+    // deadline (#52).
+    let sweep = engine
+        .resume_interrupted_polls()
+        .await
+        .expect("chocofactoryd: failed to sweep interrupted poll stages");
+    tracing::info!(
+        resumed = sweep.resumed,
+        already_running = sweep.already_running,
+        stuck = sweep.stuck,
+        "resumed interrupted poll stages"
+    );
+
     let state = AppState {
         pool,
         engine,
         events_notify,
     };
     let router = api::router(state).layer(TraceLayer::new_for_http());
-    let port = port_override().unwrap_or(DEFAULT_PORT);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("chocofactoryd: failed to bind 127.0.0.1");
-    tracing::info!(port, "listening on http://127.0.0.1:{port}");
     axum::serve(listener, router)
         .await
         .expect("chocofactoryd: server error");

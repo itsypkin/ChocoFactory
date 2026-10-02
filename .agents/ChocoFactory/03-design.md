@@ -602,13 +602,15 @@ scripting runtime (see §7 non-goal):
   an hour is 120 identical `PENDING`s and the retention job prunes by age
   alone. A poll also re-checks that its task is still in the stage before
   each attempt, since it holds that window open long enough for a human to
-  close or advance the task underneath it. Known gap, shared with `shell`
-  and `agent_turn` but sharper here because a poll is *designed* to run
-  for hours: a poll interrupted by a daemon restart leaves `current_stage`
-  correct but no runner, and nothing re-enters the stage, so its task
-  parks; no deadline is persisted either, so a future recovery sweep
-  couldn't know how much of the budget was already spent. Tracked as
-  [#52](https://github.com/itsypkin/ChocoFactory/issues/52).
+  close or advance the task underneath it. `timeout:` is wall-clock time from entering the stage: it keeps counting while the daemon is
+  stopped or the machine sleeps, because a workflow author means calendar time. The deadline is
+  computed once on entry and stored in `workflow_state.payload.poll_window`, next to `stages`, in the
+  same write that moves the task into the stage. At startup the daemon re-enters every open task
+  sitting in a `poll` stage with the deadline it already had: what's left of the budget, not a fresh
+  one. A poll whose deadline passed while the daemon was down takes its `timeout` edge without
+  running its command again. `interval` stays a delay in awake time, so after the machine wakes a
+  poll notices an expired deadline within one interval. `shell` and `agent_turn` stages are not
+  re-entered after a restart; the `shell` gap above still applies.
 - **`human_gate`**: pauses the task and waits for a human message (same
   live/async mechanism as chat, §4.1) before emitting `resumed`.
 - **`terminal`**: marks the task finished; no `on:` transitions.
