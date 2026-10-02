@@ -253,12 +253,6 @@ a branch, opened a PR and waited for CI. What it wants from you is a
 verdict — and it reads that from the PR's **comments**, not from GitHub's
 formal review (the green *Review changes* button).
 
-The PR body `open_pr` publishes holds the coder's description and the
-internal reviewer's report. A closing keyword followed by an issue reference
-in either is rewritten (`Resolves #84` becomes `Resolves issue 84`, inside
-code blocks too, since GitHub doesn't say whether it skips code), so only the
-line the script builds from the task title can close an issue.
-
 That is deliberate rather than a shortcut. `open_pr` pushes under whatever
 identity the daemon inherited, so on a solo repo the PR belongs to the same
 account that would review it, and GitHub refuses a formal review from a
@@ -337,6 +331,12 @@ the daemon's raw JSON instead — `choco` is meant to be both human-scriptable
 and agent-callable, and `--json` is the half you pipe into `jq` or parse
 from an agent. On failure it prints `error: <message>` to stderr and exits
 `1`.
+
+The PR body `open_pr` publishes holds the coder's description and the
+internal reviewer's report. A closing keyword followed by an issue reference
+in either is rewritten (`Resolves #84` becomes `Resolves issue 84`, inside
+code blocks too, since GitHub doesn't say whether it skips code), so only the
+line the script builds from the task title can close an issue.
 
 ### A full walkthrough
 

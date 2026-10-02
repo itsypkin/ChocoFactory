@@ -250,7 +250,10 @@ DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
     if [ -f "$DESC" ] && grep -q '[^[:space:]]' "$DESC"; then
         # Stepwise through files, not one pipe: a pipe's status is its last
         # command's, so a failing filter would publish an empty section.
-        strip_markers < "$DESC" > "$TMP/desc-1"
+        # The filter's cost grows with line length, so bound its input first
+        # (4x the cap; the cap still decides what is published).
+        strip_markers < "$DESC" > "$TMP/desc-0"
+        head -c 65536 "$TMP/desc-0" > "$TMP/desc-1"
         neutralize_closing_refs < "$TMP/desc-1" > "$TMP/desc-2"
         cap 16384 < "$TMP/desc-2"
     else
@@ -266,7 +269,8 @@ DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
         printf '%s\n' '<details>'
         printf '%s\n' '<summary>Internal reviewer'"'"'s report</summary>'
         printf '\n'
-        printf '%s\n' "$PR_REVIEW_REPORT" | strip_markers > "$TMP/rep-1"
+        printf '%s\n' "$PR_REVIEW_REPORT" | strip_markers > "$TMP/rep-0"
+        head -c 163840 "$TMP/rep-0" > "$TMP/rep-1"
         neutralize_closing_refs < "$TMP/rep-1" > "$TMP/rep-2"
         cap 40960 < "$TMP/rep-2"
         printf '\n'
