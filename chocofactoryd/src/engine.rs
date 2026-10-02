@@ -13128,8 +13128,28 @@ stages:
         );
 
         engine.cancel_task(&task_id).await.unwrap();
-        // The kill happens when the aborted future drops; give it a beat.
-        tokio::time::sleep(StdDuration::from_millis(200)).await;
+        // The kill happens when the aborted future drops. Wait until the marker
+        // has stopped growing for several tick intervals (a tick is 50 ms)
+        // rather than sleeping a fixed beat that a loaded machine can overrun.
+        let seen = std::cell::Cell::new((0u64, tokio::time::Instant::now()));
+        crate::test_support::wait_until(
+            "the cancelled shell command's marker to stop growing",
+            || async {
+                let len = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+                let (last_len, since) = seen.get();
+                if len != last_len {
+                    seen.set((len, tokio::time::Instant::now()));
+                    return Err(format!("marker still growing: {len} ticks"));
+                }
+                let stable = since.elapsed();
+                if stable >= StdDuration::from_millis(250) {
+                    Ok(())
+                } else {
+                    Err(format!("marker stable at {len} ticks for only {stable:?}"))
+                }
+            },
+        )
+        .await;
         let at_cancel = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
 
         tokio::time::sleep(StdDuration::from_millis(500)).await;

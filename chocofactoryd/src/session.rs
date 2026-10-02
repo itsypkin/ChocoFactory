@@ -2235,7 +2235,14 @@ mod tests {
                 {"op": "usage_limit"},
             ]),
         );
-        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+        let (pool, session_id, _manager) = start_single_shot(
+            binary,
+            TurnTimers {
+                grace: crate::test_support::LOAD_ALLOWANCE,
+                ..fast_timers(0)
+            },
+        )
+        .await;
 
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Exited);
@@ -2269,7 +2276,14 @@ mod tests {
                 {"op": "usage_limit", "structured": false},
             ]),
         );
-        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+        let (pool, session_id, _manager) = start_single_shot(
+            binary,
+            TurnTimers {
+                grace: crate::test_support::LOAD_ALLOWANCE,
+                ..fast_timers(0)
+            },
+        )
+        .await;
 
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.end_reason, Some(SessionEndReason::Interrupted));
