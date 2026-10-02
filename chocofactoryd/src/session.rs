@@ -535,7 +535,15 @@ impl SessionManager {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        tracing::info!(killed, remaining, "session manager shut down");
+        if remaining > 0 {
+            tracing::warn!(
+                killed,
+                remaining,
+                "session manager shut down with sessions still draining"
+            );
+        } else {
+            tracing::info!(killed, remaining, "session manager shut down");
+        }
     }
 
     /// Runs the idle reaper forever, closing sessions past `idle_timeout`

@@ -112,6 +112,22 @@ async fn main() {
         }
     };
 
+    // Installed right after the lock so a SIGTERM during startup is held
+    // until serving begins and then shuts down gracefully, rather than
+    // killing the process with sweep-spawned groups still running.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("chocofactoryd: failed to install the SIGTERM handler");
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("chocofactoryd: failed to install the SIGINT handler");
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
+            _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
+        }
+        let _ = stop_tx.send(true);
+    });
+
     // Bind guards the port. The port is read back from the listener so
     // `CHOCOFACTORY_PORT=0` works.
     let requested_port = port_override().unwrap_or(DEFAULT_PORT);
@@ -238,7 +254,7 @@ async fn main() {
 
     let state = AppState {
         pool,
-        engine,
+        engine: engine.clone(),
         events_notify,
         server: Arc::new(ServerInfo {
             pid: std::process::id(),
@@ -250,19 +266,6 @@ async fn main() {
         }),
     };
     let router = api::router(state).layer(TraceLayer::new_for_http());
-
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("chocofactoryd: failed to install the SIGTERM handler");
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .expect("chocofactoryd: failed to install the SIGINT handler");
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
-            _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
-        }
-        let _ = stop_tx.send(true);
-    });
 
     let serve =
         axum::serve(listener, router).with_graceful_shutdown(wait_for_shutdown(stop_rx.clone()));
@@ -278,6 +281,9 @@ async fn main() {
     }
 
     session_manager.shutdown(SESSION_DRAIN_GRACE).await;
+    // Kill every shell/poll runner's process group *before* releasing the
+    // lock, so a successor never overlaps with live runners of this daemon.
+    engine.abort_all_detached_runners().await;
     drop(daemon_lock);
     tracing::info!("chocofactoryd stopped");
 }

@@ -2285,6 +2285,26 @@ impl WorkflowEngine {
         }
     }
 
+    /// Aborts every detached runner of every task and waits until each
+    /// future is dropped (so each process-group guard has SIGKILLed its
+    /// group). Used at shutdown, before the daemon lock is released.
+    pub async fn abort_all_detached_runners(&self) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut runners = self
+                .detached_runners
+                .lock()
+                .expect("detached_runners mutex poisoned");
+            runners
+                .drain()
+                .flat_map(|(_, task)| task.into_values().flatten())
+                .collect()
+        };
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
     /// Aborts every detached `shell`/`poll` runner in flight for `task_id`
     /// (#69), killing the command each one is running.
     ///
@@ -3597,7 +3617,14 @@ impl WorkflowEngine {
                     Some(RestartEffect::StrandsShell) => "shell",
                     None => "unknown",
                 },
-                Err(_) => "unknown",
+                Err(err) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %err,
+                        "could not load the task's workflow; listing it as unknown in-flight"
+                    );
+                    "unknown"
+                }
             };
             out.push(InFlight {
                 task_id: task.id,

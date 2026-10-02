@@ -17,6 +17,9 @@ Binaries land in `target/debug/`.
 
 ## Running the daemon
 
+Logs go to **stderr**, not stdout: redirect with `chocofactoryd 2> daemon.log`
+(a plain `> log` captures nothing).
+
 > **`chocofactoryd` spawns the real `claude` CLI by default** — running the
 > daemon will hit the real, billable `claude` unless you point it at a
 > stand-in first.

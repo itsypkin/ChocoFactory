@@ -1583,7 +1583,28 @@ async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
     let task_id = create_poll_restart_task(&daemon).await;
     let before = stage_outcomes(&daemon, &task_id).await;
 
+    // State the second daemon must not touch before it is refused: an
+    // `active` session (session recovery would flip it) and a deleted
+    // seeded workflow (seeding would recreate it).
     let home_path = daemon.home.as_ref().unwrap().0.clone();
+    let chat_yaml = home_path.join(".config/chocofactory/workflows/chat.yaml");
+    std::fs::remove_file(&chat_yaml).expect("the first daemon seeds chat.yaml");
+    let db_url = format!(
+        "sqlite://{}",
+        home_path
+            .join(".config/chocofactory/chocofactory.db")
+            .display()
+    );
+    let pool = sqlx::SqlitePool::connect(&db_url).await.unwrap();
+    sqlx::query(
+        "INSERT INTO sessions (id, task_id, stage, role, cli_adapter, model, status, started_at) \
+         VALUES ('planted-active', ?, 'x', 'r', 'claude', 'm', 'active', '2026-01-01T00:00:00Z')",
+    )
+    .bind(&task_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let other_port = free_port();
     assert_ne!(other_port, daemon.port);
     let mut second = spawn_raw(
@@ -1599,8 +1620,25 @@ async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
     assert!(stderr.contains("already running"), "{stderr}");
     let first_pid = daemon.child.id().unwrap();
     assert!(stderr.contains(&format!("pid {first_pid}")), "{stderr}");
+    for forbidden in [
+        "seeded builtin workflows",
+        "connected to database",
+        "recovered stale active sessions",
+    ] {
+        assert!(!stderr.contains(forbidden), "{forbidden}: {stderr}");
+    }
 
     assert_eq!(stage_outcomes(&daemon, &task_id).await, before);
+    assert!(
+        !chat_yaml.exists(),
+        "the refused daemon re-seeded chat.yaml"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM sessions WHERE id = 'planted-active'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "active", "the refused daemon ran session recovery");
 }
 
 #[tokio::test]
