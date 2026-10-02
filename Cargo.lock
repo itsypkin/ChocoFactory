@@ -237,9 +237,11 @@ dependencies = [
 name = "choco"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chocofactory-core",
  "chrono",
  "clap",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

@@ -11,7 +11,11 @@ path = "src/main.rs"
 chocofactory-core = { path = "../chocofactory-core" }
 chrono = { workspace = true }
 clap = { workspace = true }
+libc = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

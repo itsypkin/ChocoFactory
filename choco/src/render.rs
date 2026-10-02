@@ -662,6 +662,89 @@ fn one_line(text: &str) -> String {
     }
 }
 
+/// `3h12m`, `5m`, `42s`: how long the daemon has been up.
+fn uptime(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (d, h, m) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// `choco server status`'s human output (#84): one line per item, then any
+/// warnings.
+pub fn server_status(
+    s: &chocofactory_core::models::ServerStatus,
+    log: &std::path::Path,
+    now: DateTime<Utc>,
+) -> String {
+    use chocofactory_core::version::{VERSION, long_version};
+    let commit = |c: Option<&str>| c.unwrap_or("dev build").to_string();
+    let mut out = vec![
+        format!(
+            "chocofactoryd {} ({})  running  pid {}  port {}  up {}",
+            s.version,
+            commit(s.commit.as_deref()),
+            s.pid,
+            s.port,
+            uptime((now - s.started_at).num_seconds())
+        ),
+        format!("choco         {}", long_version()),
+        format!("binary        {}", s.exe),
+        format!("agents' choco {}", s.choco_binary),
+    ];
+    let tasks: Vec<String> = s
+        .tasks
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(status, n)| format!("{n} {status}"))
+        .collect();
+    out.push(format!(
+        "tasks         {}",
+        if tasks.is_empty() {
+            "none".to_string()
+        } else {
+            tasks.join(", ")
+        }
+    ));
+    if s.in_flight.is_empty() {
+        out.push("in flight     none".to_string());
+    } else {
+        for f in &s.in_flight {
+            out.push(format!(
+                "in flight     {}  {} ({})  {}",
+                f.task_id,
+                f.stage,
+                f.kind,
+                single_line(&f.title)
+            ));
+        }
+    }
+    out.push(format!("log           {}", log.display()));
+    if s.version != VERSION {
+        out.push(format!(
+            "warning: choco {VERSION} is talking to chocofactoryd {}; run `choco server restart` (or `choco update`)",
+            s.version
+        ));
+    }
+    if s.exe_replaced == Some(true) {
+        out.push("warning: the chocofactoryd binary changed on disk since this daemon started; `choco server restart` picks it up".to_string());
+    }
+    if !s.choco_binary_found {
+        out.push(format!(
+            "warning: agents' report_outcome tool will not work: {} not found",
+            s.choco_binary
+        ));
+    }
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
 

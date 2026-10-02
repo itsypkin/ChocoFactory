@@ -17,6 +17,30 @@ Binaries land in `target/debug/`.
 
 ## Running the daemon
 
+Use `choco server` (it expects `chocofactoryd` next to the `choco` binary):
+
+```
+choco server start [--port N]      # background, own session; waits until it answers
+choco server stop [--force]        # graceful stop (SIGTERM)
+choco server restart [--force] [--port N]   # keeps the port unless --port is given
+choco server status                # version, pid, port, uptime, open tasks, in-flight work
+```
+
+- **Log:** `~/.config/chocofactory/logs/chocofactoryd.log`. At start, a log over
+  10 MiB is moved to `chocofactoryd.log.1` (replacing any older one).
+- **Exit codes:** `0` ok; `1` error; `3` means "not running" for `status`, and
+  "refused" for `stop`/`restart`.
+- **Stop and running tasks:** agent turns and shell steps are killed and the
+  tasks marked `stuck` (`choco task retry <id>` continues them; an agent turn
+  resumes its session). Tasks waiting on a poll or a human are not affected.
+  Without `--force`, `stop` refuses (exit 3) and lists in-flight work instead.
+- **Base URL:** `--base-url` / `CHOCO_BASE_URL` if set; otherwise the port of the
+  running daemon from its lock file (`~/.config/chocofactory/chocofactoryd.lock`);
+  otherwise `http://127.0.0.1:4141`. `server` commands always use the lock file.
+- `choco` warns on stderr when the daemon's version differs from its own.
+
+### Running it by hand (development)
+
 Logs go to **stderr**, not stdout: redirect with `chocofactoryd 2> daemon.log`
 (a plain `> log` captures nothing).
 

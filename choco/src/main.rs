@@ -6,6 +6,7 @@ mod cli;
 mod client;
 mod mcp;
 mod render;
+mod server;
 mod watch;
 
 use std::process::ExitCode;
@@ -49,6 +50,28 @@ fn canonicalize_repo(path: &str) -> Result<String, ClientError> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+/// An explicit `--base-url`/`CHOCO_BASE_URL` wins; else the port the running
+/// daemon published in its lock file; else the default port. A lock file that
+/// cannot be read falls through to the default, but says so on stderr.
+fn resolve_base_url(explicit: Option<String>) -> String {
+    use chocofactory_core::daemon_lock::{LockState, read_lock};
+    if let Some(url) = explicit {
+        return url;
+    }
+    if let Some(root) = chocofactory_core::paths::config_root()
+        && root.exists()
+    {
+        match read_lock(&root) {
+            Ok(LockState::Running(info)) => return format!("http://127.0.0.1:{}", info.port),
+            Ok(LockState::NotRunning { .. }) => {}
+            Err(err) => eprintln!(
+                "warning: could not read the daemon lock file ({err}); using http://127.0.0.1:4141"
+            ),
+        }
+    }
+    "http://127.0.0.1:4141".to_string()
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -73,7 +96,11 @@ async fn main() -> ExitCode {
         };
     }
 
-    let client = Client::new(cli.base_url);
+    if let Command::Server(cmd) = cli.command {
+        return server::run(cmd, cli.json).await;
+    }
+
+    let client = Client::new(resolve_base_url(cli.base_url));
 
     // A watching `task status` returns its own exit code (3–6 for the ways a
     // watch can end other than success), so it's handled apart from `run`.
@@ -324,5 +351,6 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         // when `cli.command` is `McpServe` — reachable only if that early
         // return is ever removed without updating this arm too.
         Command::McpServe(_) => unreachable!("McpServe is handled in main() before run()"),
+        Command::Server(_) => unreachable!("Server is handled in main() before run()"),
     }
 }
