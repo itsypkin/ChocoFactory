@@ -1252,25 +1252,33 @@ mod tests {
         session_id: &str,
         expected: usize,
     ) -> Vec<chocofactory_core::models::Event> {
-        for _ in 0..200 {
-            let stored = events::list_for_session(pool, session_id).await.unwrap();
-            if stored.len() >= expected {
-                return stored;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for {expected} events");
+        crate::test_support::wait_until(
+            &format!("{expected} events on session {session_id}"),
+            || async {
+                let stored = events::list_for_session(pool, session_id).await.unwrap();
+                if stored.len() >= expected {
+                    Ok(stored)
+                } else {
+                    Err(format!("{} events", stored.len()))
+                }
+            },
+        )
+        .await
     }
 
     async fn wait_until_status(pool: &SqlitePool, session_id: &str, expected: SessionStatus) {
-        for _ in 0..200 {
-            let run = sessions::get(pool, session_id).await.unwrap().unwrap();
-            if run.status == expected {
-                return;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for status {expected:?}");
+        crate::test_support::wait_until(
+            &format!("status {expected:?} on session {session_id}"),
+            || async {
+                let run = sessions::get(pool, session_id).await.unwrap().unwrap();
+                if run.status == expected {
+                    Ok(())
+                } else {
+                    Err(format!("status {:?}", run.status))
+                }
+            },
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1699,13 +1707,14 @@ mod tests {
     }
 
     async fn wait_until_gone(pid: u32) {
-        for _ in 0..200 {
+        crate::test_support::wait_until(&format!("pid {pid} to exit"), || async {
             if !process_alive(pid) {
-                return;
+                Ok(())
+            } else {
+                Err(format!("pid {pid} still alive"))
             }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for pid {pid} to exit");
+        })
+        .await
     }
 
     /// A wrapper around `fake_claude_spawns_child.py` carrying its two
@@ -1734,15 +1743,19 @@ mod tests {
     }
 
     async fn read_pid_when_written(path: &std::path::Path) -> u32 {
-        for _ in 0..1000 {
-            if let Ok(text) = std::fs::read_to_string(path)
-                && let Ok(pid) = text.trim().parse::<u32>()
-            {
-                return pid;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for the fixture to report its child pid");
+        crate::test_support::wait_until(
+            &format!("the fixture to write its child pid to {}", path.display()),
+            || async {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => text
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| format!("unparseable pid file contents {text:?}")),
+                    Err(e) => Err(format!("cannot read pid file: {e}")),
+                }
+            },
+        )
+        .await
     }
 
     struct TempDir(PathBuf);
@@ -2088,14 +2101,18 @@ mod tests {
         pool: &SqlitePool,
         session_id: &str,
     ) -> chocofactory_core::models::Session {
-        for _ in 0..500 {
-            let run = sessions::get(pool, session_id).await.unwrap().unwrap();
-            if run.status != SessionStatus::Active {
-                return run;
-            }
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for the run to leave active");
+        crate::test_support::wait_until(
+            &format!("session {session_id} to leave active"),
+            || async {
+                let run = sessions::get(pool, session_id).await.unwrap().unwrap();
+                if run.status != SessionStatus::Active {
+                    Ok(run)
+                } else {
+                    Err(format!("status {:?}", run.status))
+                }
+            },
+        )
+        .await
     }
 
     async fn session_notes(pool: &SqlitePool, session_id: &str) -> Vec<String> {
@@ -2126,7 +2143,14 @@ mod tests {
                 {"op": "result"},
             ]),
         );
-        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        // Remaining timing dependency (#98): the fixture answers the first
+        // nudge within `nudge_after` (2 s), or a second nudge is recorded.
+        let timers = TurnTimers {
+            nudge_after: crate::test_support::RESPONSE_MARGIN,
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
 
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Idle);
@@ -2375,7 +2399,16 @@ mod tests {
                 {"op": "result"},
             ]),
         );
-        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let (pool, session_id, _manager) = start_single_shot(
+            binary,
+            TurnTimers {
+                // The grace timer must never fire here (#98): a process that
+                // exits promptly still finishes the test immediately.
+                grace: crate::test_support::LOAD_ALLOWANCE,
+                ..fast_timers(3)
+            },
+        )
+        .await;
 
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Idle);
@@ -2879,7 +2912,7 @@ mod tests {
                 {"op": "result"},
                 {"op": "init"},
                 {"op": "text", "text": "the job finished; checking it"},
-                {"op": "sleep", "seconds": 1.0},
+                {"op": "sleep", "seconds": 3.0},
                 {"op": "report", "outcome": "done"},
                 {"op": "text", "text": "done"},
                 {"op": "result"},
@@ -2888,8 +2921,11 @@ mod tests {
         // A pause comfortably longer than the nudge window, deliberately: a
         // turn wrongly treated as waiting would be nudged twice here, so the
         // empty note list below is the assertion that matters.
+        // The 3 s sleep above stays longer than `nudge_after` (2 s), or the
+        // test proves nothing. Remaining timing dependency (#98): the
+        // result->init gap stays under 2 s.
         let timers = TurnTimers {
-            nudge_after: StdDuration::from_millis(400),
+            nudge_after: crate::test_support::RESPONSE_MARGIN,
             ..fast_timers(3)
         };
         let (pool, session_id, _manager) = start_single_shot(binary, timers).await;

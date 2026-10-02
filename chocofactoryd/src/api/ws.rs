@@ -135,21 +135,25 @@ mod tests {
         // Give the initial turn a moment to produce its first events
         // (session_meta + the "hello" echo) before connecting, so the
         // backlog isn't empty.
-        let mut saw_initial_echo = false;
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_task(server.pool(), &task_id)
-                .await
-                .unwrap();
-            if events
-                .iter()
-                .any(|e| e.payload.get("text").and_then(Value::as_str) == Some("echo:hello"))
-            {
-                saw_initial_echo = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(saw_initial_echo, "initial turn never produced its echo");
+        crate::test_support::wait_until(
+            &format!("the initial turn's echo:hello on task {task_id}"),
+            || async {
+                let events = crate::db::events::list_for_task(server.pool(), &task_id)
+                    .await
+                    .unwrap();
+                if events
+                    .iter()
+                    .any(|e| e.payload.get("text").and_then(Value::as_str) == Some("echo:hello"))
+                {
+                    Ok(())
+                } else {
+                    let kinds: Vec<String> =
+                        events.iter().map(|e| e.event_type.to_string()).collect();
+                    Err(format!("{} events: {kinds:?}", events.len()))
+                }
+            },
+        )
+        .await;
 
         let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", server.ws_url))
             .await
@@ -161,7 +165,7 @@ mod tests {
         let mut backlog_has_hello_echo = false;
         for _ in 0..10 {
             let Ok(Some(Ok(WsMessage::Text(text)))) =
-                tokio::time::timeout(Duration::from_secs(2), ws.next()).await
+                tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
             else {
                 break;
             };
@@ -192,7 +196,7 @@ mod tests {
         let mut saw_live_echo = false;
         for _ in 0..20 {
             let Ok(Some(Ok(WsMessage::Text(text)))) =
-                tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+                tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
             else {
                 break;
             };
@@ -256,22 +260,27 @@ stages:
 
         // Wait for the entry stage's transition so the backlog is settled
         // before connecting, then drain it.
-        for _ in 0..200 {
-            let events = crate::db::events::list_for_task(server.pool(), &task_id)
-                .await
-                .unwrap();
-            if !events.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        crate::test_support::wait_until(
+            &format!("the entry stage's first event on task {task_id}"),
+            || async {
+                let events = crate::db::events::list_for_task(server.pool(), &task_id)
+                    .await
+                    .unwrap();
+                if events.is_empty() {
+                    Err("0 events".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
 
         let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", server.ws_url))
             .await
             .unwrap();
 
         let Ok(Some(Ok(WsMessage::Text(text)))) =
-            tokio::time::timeout(Duration::from_secs(2), ws.next()).await
+            tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
         else {
             panic!("entry stage transition was not replayed on connect");
         };
@@ -293,7 +302,7 @@ stages:
         // The human's message is recorded (#59) before the resume advances
         // the stage, so it's the first thing pushed live.
         let Ok(Some(Ok(WsMessage::Text(text)))) =
-            tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+            tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
         else {
             panic!("human message was not pushed over the already-open socket");
         };
@@ -303,7 +312,7 @@ stages:
         assert_eq!(human_message["session_id"], Value::Null);
 
         let Ok(Some(Ok(WsMessage::Text(text)))) =
-            tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+            tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
         else {
             panic!("stage transition was not pushed over the already-open socket");
         };
