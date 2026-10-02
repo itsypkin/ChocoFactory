@@ -33,7 +33,7 @@ use std::time::Duration;
 use chocofactory_core::models::{
     EventType, Project, RetryMode, RetryOutcome, Session, SessionEndReason, SessionStatus, Task,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
@@ -99,6 +99,9 @@ const TASK_STATUS_CANCELLED: &str = "cancelled";
 /// progress, and — unlike `cancelled` — is recoverable: `retry_task`
 /// re-enters the current stage and reopens the task.
 const TASK_STATUS_STUCK: &str = "stuck";
+/// The status a task has while its workflow is running — the only status
+/// the startup poll sweep (#52) considers.
+const TASK_STATUS_OPEN: &str = "open";
 
 pub struct WorkflowEngine {
     pool: SqlitePool,
@@ -147,11 +150,25 @@ pub struct WorkflowEngine {
     /// runner itself when it finishes, and the whole task entry is dropped
     /// once its last runner is gone, so nothing accumulates for tasks that
     /// are never cancelled.
+    ///
+    /// Ownership invariant (#52): every spawner — `start_task`,
+    /// `advance_from_stage`, `retry_task_locked` (via `enter_stage` →
+    /// `spawn_poll_runner`/`spawn_shell_runner`) and the startup sweep
+    /// `resume_interrupted_polls` — registers its slot while holding the
+    /// task's `task_locks` entry. So "does this task have a runner?"
+    /// (`has_detached_runner`) answered under that same lock cannot go stale
+    /// before the caller's own spawn registers. That is the sweep's only
+    /// ownership marker; there is deliberately no database lease.
     detached_runners: std::sync::Mutex<DetachedRunners>,
     /// Source of the ids keying `detached_runners`' inner maps. Only needs
     /// to be unique per task, but a single global counter is simpler than
     /// per-task numbering and just as correct.
     next_runner_id: AtomicU64,
+    /// Wall-clock source for every `poll` budget computation (#52). Never
+    /// `Instant`: it and tokio's timers stand still while the machine
+    /// sleeps, so a `timeout:` measured on them is not calendar time.
+    /// Injectable so tests can jump the clock without waiting.
+    wall_clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
 #[derive(Debug)]
@@ -207,6 +224,14 @@ pub enum EngineError {
         stage: String,
         reason: String,
     },
+    /// A `poll` stage was entered without a usable `payload.poll_window`
+    /// (#52): missing, or malformed. The window is stamped in the same write
+    /// that moves the task into the stage, so this is an invariant
+    /// violation, returned rather than papered over with a default budget.
+    PollWindow {
+        stage: String,
+        reason: String,
+    },
     Session(SessionError),
     Db(sqlx::Error),
     Io(std::io::Error),
@@ -253,6 +278,9 @@ impl fmt::Display for EngineError {
             ),
             EngineError::Template { stage, reason } => {
                 write!(f, "stage '{stage}' could not render a template: {reason}")
+            }
+            EngineError::PollWindow { stage, reason } => {
+                write!(f, "stage '{stage}' has no usable poll window: {reason}")
             }
             EngineError::Session(err) => write!(f, "{err}"),
             EngineError::Db(err) => write!(f, "{err}"),
@@ -996,6 +1024,45 @@ impl WorkflowEngine {
         global_config_path: Option<PathBuf>,
         events_notify: Arc<Notify>,
     ) -> Arc<Self> {
+        Self::build(
+            pool,
+            session_manager,
+            workflows_dir,
+            global_config_path,
+            events_notify,
+            Arc::new(Utc::now),
+        )
+    }
+
+    /// [`Self::new`] with an injected wall clock, so a test can jump time
+    /// (a machine sleeping) without waiting.
+    #[cfg(test)]
+    fn new_with_clock(
+        pool: SqlitePool,
+        session_manager: Arc<SessionManager>,
+        workflows_dir: PathBuf,
+        global_config_path: Option<PathBuf>,
+        events_notify: Arc<Notify>,
+        wall_clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    ) -> Arc<Self> {
+        Self::build(
+            pool,
+            session_manager,
+            workflows_dir,
+            global_config_path,
+            events_notify,
+            wall_clock,
+        )
+    }
+
+    fn build(
+        pool: SqlitePool,
+        session_manager: Arc<SessionManager>,
+        workflows_dir: PathBuf,
+        global_config_path: Option<PathBuf>,
+        events_notify: Arc<Notify>,
+        wall_clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pool,
             session_manager,
@@ -1005,7 +1072,14 @@ impl WorkflowEngine {
             events_notify,
             detached_runners: std::sync::Mutex::new(HashMap::new()),
             next_runner_id: AtomicU64::new(0),
+            wall_clock,
         })
+    }
+
+    /// The current wall-clock time. Every `poll` budget computation goes
+    /// through this (#52), never `Instant` or a bare `Utc::now()`.
+    fn now(&self) -> DateTime<Utc> {
+        (self.wall_clock)()
     }
 
     /// Missing `global_config_path` (not configured) and a missing file at
@@ -1948,6 +2022,32 @@ impl WorkflowEngine {
         // be retried"). If the row is gone entirely, that's `NoSuchTask` —
         // the same error step 1 would have returned had it read this late —
         // rather than a fabricated status no `Task` ever actually has.
+        //
+        // A retried poll gets a fresh budget — retry re-runs the stage from
+        // scratch — so its window is re-stamped first, through the single
+        // `workflow_state::update` below, which changes nothing else
+        // (`current_stage`, `loop_counters`, `arrival` all come through
+        // untouched). It lands *before* the reopen so a failed write leaves
+        // the task `stuck`, unchanged.
+        let payload = if matches!(stage_def.kind, StageKind::Poll { .. }) {
+            let mut payload = state.payload.clone();
+            set_poll_window(&mut payload, &definition, &current_stage, self.now())
+                .map_err(RetryTaskError::Enter)?;
+            workflow_state::update(
+                &self.pool,
+                task_id,
+                workflow_state::WorkflowStateUpdate {
+                    current_stage: current_stage.clone(),
+                    loop_counters: state.loop_counters.clone(),
+                    payload,
+                },
+            )
+            .await?
+            .ok_or(RetryTaskError::NoWorkflowState)?
+            .payload
+        } else {
+            state.payload.clone()
+        };
         if tasks::reopen_stuck(&self.pool, task_id).await?.is_none() {
             return Err(match tasks::get(&self.pool, task_id).await? {
                 Some(t) => RetryTaskError::NotStuck(t.status),
@@ -1986,7 +2086,7 @@ impl WorkflowEngine {
                 &current_stage,
                 input.as_deref(),
                 Some(entered_via),
-                &state.payload,
+                &payload,
                 resume.as_ref(),
             )
             .await
@@ -2356,10 +2456,13 @@ impl WorkflowEngine {
             // render as "" with no `template_unresolved` note (#112) — the
             // same treatment `task` gets, and for the same reason: nothing
             // has transitioned yet.
-            let payload = json!({
+            let mut payload = json!({
                 "task": { "input": initial_input, "title": task.title },
                 "arrival": { "from": "", "outcome": "" },
             });
+            // An entry stage that is a `poll` gets its window in the same
+            // INSERT as the row (#52).
+            set_poll_window(&mut payload, definition, start, self.now())?;
             let state = workflow_state::create(&self.pool, task_id, start, payload).await?;
             self.enter_stage(
                 task_id,
@@ -2530,6 +2633,10 @@ impl WorkflowEngine {
                 // Written into this same payload/update so it commits
                 // atomically with `current_stage` — no second write.
                 set_arrival(&mut payload, &from_stage, outcome);
+                // Stamps (or clears) the poll window for `next_stage`, in
+                // this same payload so the deadline commits in the one
+                // UPDATE that moves `current_stage` (#52).
+                set_poll_window(&mut payload, definition, &next_stage, self.now())?;
 
                 // The returned row is the authority on what was actually
                 // committed, and it's what the next stage renders its
@@ -2783,15 +2890,15 @@ impl WorkflowEngine {
                 command,
                 capture,
                 interval,
-                timeout,
+                timeout: _,
                 outcomes,
             } => {
                 let (command, unresolved) = render_command(command, payload, stage_name)?;
                 self.record_unresolved_template_note(task_id, stage_name, &unresolved)
                     .await;
                 self.enter_poll(
-                    task_id, definition, stage_name, command, *capture, *interval, *timeout,
-                    outcomes,
+                    task_id, definition, stage_name, command, *capture, *interval, outcomes,
+                    payload,
                 )
                 .await
             }
@@ -3208,6 +3315,184 @@ impl WorkflowEngine {
         }
     }
 
+    /// Whether a detached runner is registered for `task_id`. Only a
+    /// meaningful ownership answer while holding the task's lock — see the
+    /// invariant on `detached_runners`.
+    fn has_detached_runner(&self, task_id: &str) -> bool {
+        self.detached_runners
+            .lock()
+            .expect("detached_runners mutex poisoned")
+            .contains_key(task_id)
+    }
+
+    /// Startup sweep (#52): re-enters every `open` task sitting in a `poll`
+    /// stage whose runner died with the previous process, with the
+    /// deadline it already had. Per task it holds the per-task lock, so the
+    /// ownership check (`has_detached_runner`) and the resume's own spawn
+    /// can't be interleaved by another spawner.
+    ///
+    /// Every per-task failure ends in `mark_stuck`; one task's failure
+    /// never stops the sweep. Only a failure to list the candidates is
+    /// returned.
+    pub async fn resume_interrupted_polls(
+        self: &Arc<Self>,
+    ) -> Result<PollSweepReport, sqlx::Error> {
+        let candidates = tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await?;
+        let mut report = PollSweepReport::default();
+        for task in candidates {
+            let lock = self.lock_for_task(&task.id).await;
+            {
+                let _guard = lock.lock().await;
+                self.resume_interrupted_poll_locked(&task.id, &mut report)
+                    .await;
+            }
+            self.evict_task_lock_if_unshared(&task.id, &lock).await;
+        }
+        Ok(report)
+    }
+
+    async fn sweep_mark_stuck(&self, task_id: &str, reason: &str, report: &mut PollSweepReport) {
+        self.mark_stuck(task_id, reason, false).await;
+        report.stuck += 1;
+    }
+
+    /// The body of [`Self::resume_interrupted_polls`] for one task; the
+    /// caller holds its per-task lock.
+    async fn resume_interrupted_poll_locked(
+        self: &Arc<Self>,
+        task_id: &str,
+        report: &mut PollSweepReport,
+    ) {
+        let task = match tasks::get(&self.pool, task_id).await {
+            Ok(Some(task)) => task,
+            Ok(None) => return,
+            Err(err) => {
+                let reason = format!("poll sweep could not read the task: {err}");
+                self.sweep_mark_stuck(task_id, &reason, report).await;
+                return;
+            }
+        };
+        if task.status != TASK_STATUS_OPEN {
+            return;
+        }
+        let state = match workflow_state::get(&self.pool, task_id).await {
+            Ok(Some(state)) => state,
+            Ok(None) => return,
+            Err(err) => {
+                let reason = format!("poll sweep could not read the task's workflow state: {err}");
+                self.sweep_mark_stuck(task_id, &reason, report).await;
+                return;
+            }
+        };
+        let stage = state.current_stage.clone();
+        let window = poll_window_for(&state.payload, &stage);
+        let was_polling = !matches!(window, Ok(None));
+
+        let definition = match self.load_task_workflow(&task).await {
+            Ok(definition) => Arc::new(definition),
+            Err(err) => {
+                if was_polling {
+                    let reason = format!(
+                        "stage '{stage}' was polling when the daemon stopped, but its workflow \
+                         could not be loaded: {err}"
+                    );
+                    self.sweep_mark_stuck(task_id, &reason, report).await;
+                } else {
+                    tracing::warn!(
+                        task_id, %err,
+                        "poll sweep skipped a task whose workflow could not be loaded"
+                    );
+                }
+                return;
+            }
+        };
+        let Some(StageKind::Poll { .. }) = definition.stages.get(&stage).map(|def| &def.kind)
+        else {
+            if was_polling {
+                let reason = format!(
+                    "stage '{stage}' was polling when the daemon stopped, but the workflow no \
+                     longer defines it as a poll stage; retry to run it as defined"
+                );
+                self.sweep_mark_stuck(task_id, &reason, report).await;
+            }
+            return;
+        };
+
+        if self.has_detached_runner(task_id) {
+            report.already_running += 1;
+            return;
+        }
+
+        let payload = match window {
+            Ok(Some(_)) => state.payload.clone(),
+            Ok(None) => {
+                // A row written before the window existed: derive one in
+                // memory from when the row last changed. Not persisted.
+                let mut payload = state.payload.clone();
+                if let Err(err) =
+                    set_poll_window(&mut payload, &definition, &stage, state.updated_at)
+                {
+                    let reason = format!(
+                        "stage '{stage}': poll could not be resumed after a daemon restart: {err}"
+                    );
+                    self.sweep_mark_stuck(task_id, &reason, report).await;
+                    return;
+                }
+                payload
+            }
+            Err(err) => {
+                let reason = format!(
+                    "stage '{stage}': poll could not be resumed after a daemon restart: {err}"
+                );
+                self.sweep_mark_stuck(task_id, &reason, report).await;
+                return;
+            }
+        };
+
+        // A restart is not a transition: `arrival` is left alone, as retry
+        // leaves it.
+        match self
+            .enter_stage(
+                task_id,
+                &definition,
+                &stage,
+                None,
+                Some("restart"),
+                &payload,
+                None,
+            )
+            .await
+        {
+            Ok(()) => {
+                report.resumed += 1;
+                let remaining = match poll_window_for(&payload, &stage) {
+                    Ok(Some(PollWindow {
+                        deadline: Some(at), ..
+                    })) => format!("{:?}", remaining_budget(at, self.now())),
+                    _ => "unbounded".to_string(),
+                };
+                tracing::info!(
+                    task_id,
+                    stage,
+                    remaining,
+                    "resumed an interrupted poll stage"
+                );
+            }
+            Err(err) => {
+                let reason = format!(
+                    "stage '{stage}': poll could not be resumed after a daemon restart: {err}"
+                );
+                self.mark_stuck(
+                    task_id,
+                    &reason,
+                    matches!(err, EngineError::Template { .. }),
+                )
+                .await;
+                report.stuck += 1;
+            }
+        }
+    }
+
     /// Starts a `poll` stage's loop (§5.2) and returns immediately.
     ///
     /// Everything that should fail the transition that entered the stage —
@@ -3224,9 +3509,27 @@ impl WorkflowEngine {
         command: ShellCommand,
         capture: Option<Capture>,
         interval: Duration,
-        timeout: Option<Duration>,
         outcomes: &[PollOutcome],
+        payload: &Value,
     ) -> Result<(), EngineError> {
+        // The deadline was computed once, on entry, and stored in the same
+        // write that moved the task here (#52). A missing or malformed
+        // window is an invariant violation, not a cue to invent a budget.
+        let deadline = match poll_window_for(payload, stage_name) {
+            Ok(Some(window)) => window.deadline,
+            Ok(None) => {
+                return Err(EngineError::PollWindow {
+                    stage: stage_name.to_string(),
+                    reason: "no poll_window recorded for this stage".to_string(),
+                });
+            }
+            Err(reason) => {
+                return Err(EngineError::PollWindow {
+                    stage: stage_name.to_string(),
+                    reason,
+                });
+            }
+        };
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(EngineError::NoSuchTask)?;
@@ -3245,7 +3548,7 @@ impl WorkflowEngine {
                 command,
                 capture,
                 interval,
-                timeout,
+                deadline,
                 outcomes: compiled,
                 cwd,
             },
@@ -3287,6 +3590,12 @@ impl WorkflowEngine {
     /// Runs the command on `interval` until an outcome matches or the
     /// `timeout` budget runs out (§5.2).
     ///
+    /// The budget is a wall-clock deadline (#52): `run.deadline` was fixed
+    /// when the stage was entered and survives a daemon restart, and every
+    /// check against it reads `self.now()`, so it keeps counting while the
+    /// machine sleeps. Only the `interval` sleep and each attempt's kill
+    /// timer run on the monotonic clock.
+    ///
     /// Unlike `shell`, the command's *exit code decides nothing*: a polled
     /// command failing is ordinary — `gh` on a rate limit or a dropped
     /// connection — and is exactly the condition polling exists to ride
@@ -3301,9 +3610,8 @@ impl WorkflowEngine {
         run: PollRun,
     ) {
         let described = describe_command(&run.command);
-        // Captured once, so a long poll's budget can't drift with the
-        // accumulated cost of its own bookkeeping.
-        let deadline = run.timeout.map(|limit| std::time::Instant::now() + limit);
+        // Fixed on stage entry, not here: this runner may be a resumed one.
+        let deadline = run.deadline;
         let mut attempt: u64 = 0;
         // What the previous attempt produced, for the "only record what
         // changed" rule below. `None` until the first attempt reports.
@@ -3348,8 +3656,7 @@ impl WorkflowEngine {
                 return;
             }
 
-            let remaining =
-                deadline.map(|at| at.saturating_duration_since(std::time::Instant::now()));
+            let remaining = deadline.map(|at| remaining_budget(at, self.now()));
             if remaining == Some(Duration::ZERO) {
                 self.finish_poll_timed_out(
                     task_id,
@@ -3652,16 +3959,21 @@ impl WorkflowEngine {
     /// rather than on a fixed cadence, so a command slower than its own
     /// interval can't have attempts overlap and stack up on top of each
     /// other in the task's working copy.
+    ///
+    /// `deadline` is wall-clock (#52) and is compared against `self.now()`;
+    /// the sleep itself is `interval.min(remaining)` on tokio's monotonic
+    /// clock, so after the machine wakes an expired deadline is noticed
+    /// within one interval.
     async fn sleep_before_next_attempt(
         &self,
         interval: Duration,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<DateTime<Utc>>,
     ) -> std::ops::ControlFlow<()> {
         let Some(deadline) = deadline else {
             tokio::time::sleep(interval).await;
             return std::ops::ControlFlow::Continue(());
         };
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining = remaining_budget(deadline, self.now());
         if remaining.is_zero() {
             return std::ops::ControlFlow::Break(());
         }
@@ -3691,7 +4003,12 @@ impl WorkflowEngine {
             "poll stage gave up: its timeout elapsed with no matching outcome"
         );
 
-        let mut note = format!("no outcome matched in {attempts} attempts; timeout elapsed");
+        let mut note = if attempts == 0 {
+            "timeout elapsed before the first attempt: the deadline passed while the daemon was down"
+                .to_string()
+        } else {
+            format!("no outcome matched in {attempts} attempts; timeout elapsed")
+        };
         // Outranks the plain timeout wording: the workflow is about to
         // follow its `timeout` edge while the last command may still be
         // running in the same working copy.
@@ -4874,7 +5191,9 @@ struct PollRun {
     command: ShellCommand,
     capture: Option<Capture>,
     interval: Duration,
-    timeout: Option<Duration>,
+    /// Wall-clock deadline (#52), read from `payload.poll_window`; `None`
+    /// when the stage has no `timeout:`.
+    deadline: Option<DateTime<Utc>>,
     outcomes: poll::CompiledOutcomes,
     cwd: PathBuf,
 }
@@ -5351,6 +5670,98 @@ fn merge_stage_capture(payload: &mut Value, stage: &str, value: Value) {
         .as_object_mut()
         .expect("stages was just ensured to be an object")
         .insert(stage.to_string(), value);
+}
+
+/// The persisted `payload.poll_window` (#52): when the task entered a
+/// `poll` stage and the wall-clock instant its `timeout:` runs out.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct PollWindow {
+    stage: String,
+    entered_at: DateTime<Utc>,
+    deadline: Option<DateTime<Utc>>,
+}
+
+/// Stamps `payload.poll_window` for a task entering `stage` (#52), or
+/// removes it when `stage` isn't a `poll` (or isn't defined at all).
+///
+/// Pure, and **the only place a deadline is computed**. The window is a
+/// sibling of `payload.stages`/`payload.task`, never under
+/// `payload.stages.<stage>`: that key is the capture slot, and a capture
+/// replaces it wholesale.
+fn set_poll_window(
+    payload: &mut Value,
+    definition: &WorkflowDefinition,
+    stage: &str,
+    now: DateTime<Utc>,
+) -> Result<(), EngineError> {
+    // Same non-object handling as `merge_stage_capture`.
+    if !payload.is_object() {
+        *payload = json!({});
+    }
+    let Some(object) = payload.as_object_mut() else {
+        return Ok(());
+    };
+    let timeout = match definition.stages.get(stage).map(|def| &def.kind) {
+        Some(StageKind::Poll { timeout, .. }) => *timeout,
+        _ => {
+            object.remove("poll_window");
+            return Ok(());
+        }
+    };
+    let deadline = match timeout {
+        None => Value::Null,
+        Some(limit) => {
+            let overflow = |reason: String| EngineError::PollWindow {
+                stage: stage.to_string(),
+                reason,
+            };
+            let limit = chrono::Duration::from_std(limit)
+                .map_err(|err| overflow(format!("timeout is out of range: {err}")))?;
+            let at = now
+                .checked_add_signed(limit)
+                .ok_or_else(|| overflow("deadline overflows the calendar".to_string()))?;
+            json!(at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+        }
+    };
+    object.insert(
+        "poll_window".to_string(),
+        json!({
+            "stage": stage,
+            "entered_at": now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            "deadline": deadline,
+        }),
+    );
+    Ok(())
+}
+
+/// Reads `payload.poll_window` for `current_stage`. `Ok(None)` when the
+/// window is absent or belongs to another stage; `Err` when it is malformed.
+fn poll_window_for(payload: &Value, current_stage: &str) -> Result<Option<PollWindow>, String> {
+    let Some(raw) = payload.get("poll_window") else {
+        return Ok(None);
+    };
+    let window: PollWindow = serde_json::from_value(raw.clone())
+        .map_err(|err| format!("malformed poll_window: {err}"))?;
+    if window.stage != current_stage {
+        return Ok(None);
+    }
+    Ok(Some(window))
+}
+
+/// What is left of a wall-clock budget; `ZERO` once the deadline passed.
+fn remaining_budget(deadline: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (deadline - now).to_std().unwrap_or(Duration::ZERO)
+}
+
+/// What [`WorkflowEngine::resume_interrupted_polls`] did, per task.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PollSweepReport {
+    /// Re-entered with the deadline they already had.
+    pub resumed: usize,
+    /// Skipped: a live runner already owns the task.
+    pub already_running: usize,
+    /// Could not be resumed, and were marked stuck.
+    pub stuck: usize,
 }
 
 /// Records the transition that just brought the task into its new current
@@ -14509,5 +14920,640 @@ stages:
             }
             assert!(gone, "pid {pid} survived cancel");
         }
+    }
+
+    // ---- #52: poll windows survive restarts, on a wall clock --------------
+
+    fn rfc(at: DateTime<Utc>) -> String {
+        at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    }
+
+    /// A workflow file `name.yaml` in `dir` with a `watch` poll stage.
+    /// `watch_kind` lets a test swap the stage for something else.
+    fn write_poll_flow(
+        dir: &Path,
+        name: &str,
+        command: &str,
+        timeout: Option<&str>,
+        worktree: bool,
+    ) -> Arc<WorkflowDefinition> {
+        let timeout = timeout
+            .map(|t| format!("    timeout: {t}\n"))
+            .unwrap_or_default();
+        let yaml = format!(
+            r#"
+name: {name}
+worktree: {worktree}
+stages:
+  gate:
+    kind: human_gate
+    on: {{ resumed: watch }}
+  watch:
+    kind: poll
+    command: "{command}"
+    interval: 1s
+{timeout}    capture: text
+    outcomes:
+      - match: "NEVER_MATCHES_XYZ"
+        then: green
+    on: {{ green: finished, timeout: stalled, error: stalled, again: watch }}
+  finished:
+    kind: terminal
+  stalled:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        std::fs::write(dir.join(format!("{name}.yaml")), &yaml).unwrap();
+        Arc::new(WorkflowDefinition::parse(&yaml, dir).unwrap())
+    }
+
+    async fn seed_in_project(
+        pool: &SqlitePool,
+        project_id: &str,
+        name: &str,
+        cwd: &Path,
+    ) -> String {
+        tasks::create(
+            pool,
+            tasks::NewTask {
+                project_id,
+                workflow_def: name,
+                title: "T",
+                config: json!({ "cwd": cwd.to_string_lossy() }),
+                workflow_path: None,
+                workflow_sha256: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// A row as a dead process leaves it: at `stage`, with `payload`, no runner.
+    async fn seed_row(pool: &SqlitePool, task_id: &str, stage: &str, payload: Value) {
+        workflow_state::create(pool, task_id, stage, payload)
+            .await
+            .unwrap();
+    }
+
+    fn window_json(stage: &str, entered: DateTime<Utc>, deadline: Option<DateTime<Utc>>) -> Value {
+        json!({ "stage": stage, "entered_at": rfc(entered), "deadline": deadline.map(rfc) })
+    }
+
+    async fn wait_for_poll_attempt(pool: &SqlitePool, task_id: &str) {
+        wait_until_poll_attempt_recorded(pool, task_id).await;
+    }
+
+    async fn state_of(
+        pool: &SqlitePool,
+        task_id: &str,
+    ) -> chocofactory_core::models::WorkflowState {
+        workflow_state::get(pool, task_id).await.unwrap().unwrap()
+    }
+
+    fn runner_slots(engine: &WorkflowEngine, task_id: &str) -> usize {
+        engine
+            .detached_runners
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .map_or(0, |m| m.len())
+    }
+
+    #[test]
+    fn poll_window_for_handles_absent_other_stage_and_malformed() {
+        assert_eq!(poll_window_for(&json!({}), "watch"), Ok(None));
+        let now = Utc::now();
+        let payload = json!({ "poll_window": window_json("watch", now, None) });
+        assert_eq!(poll_window_for(&payload, "other"), Ok(None));
+        let got = poll_window_for(&payload, "watch").unwrap().unwrap();
+        assert_eq!(got.stage, "watch");
+        assert_eq!(got.deadline, None);
+        let bad = json!({ "poll_window": { "stage": "watch", "entered_at": "nonsense" } });
+        assert!(poll_window_for(&bad, "watch").is_err());
+        assert!(poll_window_for(&json!({ "poll_window": 5 }), "watch").is_err());
+    }
+
+    #[test]
+    fn remaining_budget_is_zero_once_the_deadline_passed() {
+        let now = Utc::now();
+        assert_eq!(
+            remaining_budget(now - chrono::Duration::seconds(5), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            remaining_budget(now + chrono::Duration::seconds(5), now),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn set_poll_window_stamps_polls_and_removes_the_key_otherwise() {
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "unit-flow", "true", Some("6h"), false);
+        let now = Utc::now();
+        let mut payload = json!({ "stages": { "watch": "kept" } });
+        set_poll_window(&mut payload, &def, "watch", now).unwrap();
+        let window = poll_window_for(&payload, "watch").unwrap().unwrap();
+        assert_eq!(window.entered_at, now);
+        assert_eq!(window.deadline, Some(now + chrono::Duration::hours(6)));
+        assert_eq!(payload["stages"]["watch"], json!("kept"));
+        set_poll_window(&mut payload, &def, "finished", now).unwrap();
+        assert!(payload.get("poll_window").is_none());
+        set_poll_window(&mut payload, &def, "watch", now).unwrap();
+        set_poll_window(&mut payload, &def, "no-such-stage", now).unwrap();
+        assert!(payload.get("poll_window").is_none());
+        let mut not_object = json!("x");
+        set_poll_window(&mut not_object, &def, "watch", now).unwrap();
+        assert!(not_object.get("poll_window").is_some());
+    }
+
+    #[tokio::test]
+    async fn entering_a_poll_stamps_its_window_via_start_and_advance() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "stamp-flow", "echo PENDING", Some("6h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+        // Advance path: gate -> watch.
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        assert!(
+            state_of(&pool, &task_id)
+                .await
+                .payload
+                .get("poll_window")
+                .is_none()
+        );
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        let state = state_of(&pool, &task_id).await;
+        assert_eq!(state.current_stage, "watch");
+        let window = poll_window_for(&state.payload, "watch").unwrap().unwrap();
+        assert_eq!(
+            window.deadline,
+            Some(window.entered_at + chrono::Duration::hours(6))
+        );
+
+        // No timeout: deadline null.
+        let dir2 = tempdir();
+        let yaml = r#"
+name: entry-poll
+stages:
+  watch:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    outcomes:
+      - match: "NEVER_MATCHES_XYZ"
+        then: green
+    on: { green: finished }
+  finished:
+    kind: terminal
+"#;
+        let def2 = Arc::new(WorkflowDefinition::parse(yaml, &dir2).unwrap());
+        let pool2 = connect_in_memory().await.unwrap();
+        let task2 = seed_task_in(&pool2, &def2.name, &dir2).await;
+        let engine2 = engine_with_adapter(pool2.clone(), "unused");
+        engine2.start_task(&task2, &def2, None).await.unwrap();
+        let state2 = state_of(&pool2, &task2).await;
+        assert_eq!(state2.payload["poll_window"]["deadline"], Value::Null);
+        assert!(state2.payload["poll_window"]["entered_at"].is_string());
+        assert_eq!(
+            state2.payload["arrival"],
+            json!({ "from": "", "outcome": "" })
+        );
+        engine.abort_detached_runners(&task_id).await;
+        engine2.abort_detached_runners(&task2).await;
+    }
+
+    #[tokio::test]
+    async fn leaving_a_poll_removes_the_window_and_keeps_the_capture() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: leave-flow
+stages:
+  watch:
+    kind: poll
+    command: "echo SUCCESS"
+    interval: 1s
+    timeout: 1h
+    capture: text
+    outcomes:
+      - match: "SUCCESS"
+        then: green
+    on: { green: finished, timeout: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "closed").await;
+        let state = state_of(&pool, &task_id).await;
+        assert!(state.payload.get("poll_window").is_none());
+        assert_eq!(state.payload["stages"]["watch"], json!("SUCCESS"));
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_reentry_keeps_the_previous_laps_string_capture() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "lap-flow", "echo PENDING", Some("1h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let now = Utc::now();
+        seed_row(
+            &pool,
+            &task_id,
+            "watch",
+            json!({
+                "stages": { "watch": "previous lap" },
+                "poll_window": window_json("watch", now - chrono::Duration::hours(2), Some(now - chrono::Duration::hours(1))),
+            }),
+        )
+        .await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.resume_interrupted_polls().await.unwrap();
+        wait_until_stage(&pool, &task_id, "stalled").await;
+        let state = state_of(&pool, &task_id).await;
+        assert_eq!(state.payload["stages"]["watch"], json!("previous lap"));
+        assert!(state.payload.get("poll_window").is_none());
+    }
+
+    #[tokio::test]
+    async fn reentering_the_same_poll_stage_stamps_a_later_entered_at() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "again-flow", "echo PENDING", Some("6h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        let first = poll_window_for(&state_of(&pool, &task_id).await.payload, "watch")
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        engine.advance(&task_id, &def, "again").await.unwrap();
+        let second = poll_window_for(&state_of(&pool, &task_id).await.payload, "watch")
+            .unwrap()
+            .unwrap();
+        assert!(second.entered_at > first.entered_at);
+        engine.abort_detached_runners(&task_id).await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_mid_poll_resumes_with_the_remaining_budget() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "resume-flow", "echo PENDING", Some("6h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let now = Utc::now();
+        let window = window_json(
+            "watch",
+            now - chrono::Duration::hours(1),
+            Some(now + chrono::Duration::seconds(2)),
+        );
+        seed_row(
+            &pool,
+            &task_id,
+            "watch",
+            json!({ "poll_window": window.clone() }),
+        )
+        .await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        assert_eq!(
+            report,
+            PollSweepReport {
+                resumed: 1,
+                already_running: 0,
+                stuck: 0
+            }
+        );
+        assert_eq!(
+            state_of(&pool, &task_id).await.payload["poll_window"],
+            window
+        );
+        assert!(
+            stage_trail(&pool, &task_id)
+                .await
+                .iter()
+                .any(|(s, o)| s == "watch" && o == &json!("restart"))
+        );
+        wait_until_stage(&pool, &task_id, "stalled").await;
+        assert!(!poll_events(&pool, &task_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_expired_deadline_times_out_without_running_the_command() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let marker = dir.join("ran");
+        let def = write_poll_flow(
+            &dir,
+            "expired-flow",
+            &format!("touch {}", marker.display()),
+            Some("6h"),
+            false,
+        );
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let now = Utc::now();
+        seed_row(&pool, &task_id, "watch", json!({ "poll_window": window_json("watch", now - chrono::Duration::hours(1), Some(now - chrono::Duration::minutes(1))) })).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.resume_interrupted_polls().await.unwrap();
+        wait_until_stage(&pool, &task_id, "stalled").await;
+        let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+        assert_eq!(event["attempt"], json!(0));
+        assert_eq!(
+            event["note"],
+            json!(
+                "timeout elapsed before the first attempt: the deadline passed while the daemon was down"
+            )
+        );
+        assert!(
+            !marker.exists(),
+            "the command must not run after the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_does_not_double_spawn_a_live_poll() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "live-flow", "echo PENDING", Some("6h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        assert_eq!(
+            report,
+            PollSweepReport {
+                resumed: 0,
+                already_running: 1,
+                stuck: 0
+            }
+        );
+        assert_eq!(runner_slots(&engine, &task_id), 1);
+        assert!(
+            !stage_trail(&pool, &task_id)
+                .await
+                .iter()
+                .any(|(_, o)| o == &json!("restart"))
+        );
+        engine.abort_detached_runners(&task_id).await;
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_polls_are_marked_stuck_and_healthy_ones_still_resume() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let now = Utc::now();
+        let payload = json!({ "poll_window": window_json("watch", now, Some(now + chrono::Duration::hours(1))) });
+
+        // (a) workflow file deleted.
+        write_poll_flow(&dir, "gone-flow", "echo PENDING", Some("1h"), false);
+        let a = seed_in_project(&pool, &project_id, "gone-flow", &dir).await;
+        seed_row(&pool, &a, "watch", payload.clone()).await;
+        std::fs::remove_file(dir.join("gone-flow.yaml")).unwrap();
+
+        // (b) stage redefined as a shell.
+        std::fs::write(
+            dir.join("shell-flow.yaml"),
+            "name: shell-flow\nstages:\n  watch:\n    kind: shell\n    command: \"true\"\n    on: { done: finished }\n  finished:\n    kind: terminal\n",
+        )
+        .unwrap();
+        let b = seed_in_project(&pool, &project_id, "shell-flow", &dir).await;
+        seed_row(&pool, &b, "watch", payload.clone()).await;
+
+        // (c) enter_stage fails: worktree workflow, task has no snapshot.
+        write_poll_flow(&dir, "tree-flow", "echo PENDING", Some("1h"), true);
+        let c = seed_in_project(&pool, &project_id, "tree-flow", &dir).await;
+        seed_row(&pool, &c, "watch", payload.clone()).await;
+
+        // healthy
+        write_poll_flow(&dir, "ok-flow", "echo PENDING", Some("1h"), false);
+        let ok = seed_in_project(&pool, &project_id, "ok-flow", &dir).await;
+        seed_row(&pool, &ok, "watch", payload.clone()).await;
+
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        assert_eq!(
+            report,
+            PollSweepReport {
+                resumed: 1,
+                already_running: 0,
+                stuck: 3
+            }
+        );
+        for id in [&a, &b, &c] {
+            let task = tasks::get(&pool, id).await.unwrap().unwrap();
+            assert_eq!(task.status, "stuck");
+            assert!(task.stuck_reason.unwrap().contains("'watch'"));
+            let errors = events::list_for_task(&pool, id)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.event_type == EventType::Error)
+                .count();
+            assert!(errors >= 1, "expected a stuck error event");
+        }
+        assert_eq!(
+            tasks::get(&pool, &ok).await.unwrap().unwrap().status,
+            "open"
+        );
+        engine.abort_detached_runners(&ok).await;
+    }
+
+    #[tokio::test]
+    async fn a_malformed_window_marks_the_task_stuck() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "bad-window", "echo PENDING", Some("1h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        seed_row(
+            &pool,
+            &task_id,
+            "watch",
+            json!({ "poll_window": { "stage": "watch" } }),
+        )
+        .await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        assert_eq!(report.stuck, 1);
+        assert_eq!(
+            tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+            "stuck"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_leaves_non_open_and_non_poll_tasks_alone() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        write_poll_flow(&dir, "idle-flow", "echo PENDING", Some("1h"), false);
+        let now = Utc::now();
+        let payload = json!({ "poll_window": window_json("watch", now, Some(now + chrono::Duration::hours(1))) });
+
+        let gate = seed_in_project(&pool, &project_id, "idle-flow", &dir).await;
+        seed_row(&pool, &gate, "gate", payload.clone()).await;
+        let mut others = vec![];
+        for status in ["cancelled", "stuck", "closed"] {
+            let id = seed_in_project(&pool, &project_id, "idle-flow", &dir).await;
+            seed_row(&pool, &id, "watch", payload.clone()).await;
+            if status == "stuck" {
+                tasks::mark_stuck(&pool, &id, "because").await.unwrap();
+            } else {
+                tasks::update_status(&pool, &id, status).await.unwrap();
+            }
+            others.push((id, status));
+        }
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        assert_eq!(report, PollSweepReport::default());
+        assert_eq!(
+            tasks::get(&pool, &gate).await.unwrap().unwrap().status,
+            "open"
+        );
+        for (id, status) in others {
+            assert_eq!(
+                tasks::get(&pool, &id).await.unwrap().unwrap().status,
+                status
+            );
+        }
+        let all = events::list_for_task(&pool, &gate).await.unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_legacy_row_without_a_window_derives_its_deadline_in_memory_only() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "legacy-flow", "echo PENDING", Some("1h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        seed_row(
+            &pool,
+            &task_id,
+            "watch",
+            json!({ "task": { "title": "T" } }),
+        )
+        .await;
+        let backdated = Utc::now() - chrono::Duration::seconds(3598);
+        sqlx::query("UPDATE workflow_state SET updated_at = ? WHERE task_id = ?")
+            .bind(backdated)
+            .bind(&task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = state_of(&pool, &task_id).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        assert_eq!(report.resumed, 1);
+        let after = state_of(&pool, &task_id).await;
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.payload, before.payload);
+        wait_until_stage(&pool, &task_id, "stalled").await;
+    }
+
+    #[tokio::test]
+    async fn the_poll_budget_follows_the_wall_clock_not_the_monotonic_one() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "sleep-flow", "echo PENDING", Some("6h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let offset = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let clock_offset = Arc::clone(&offset);
+        let events_notify = Arc::new(Notify::new());
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary("unused"));
+        let session_manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::clone(&events_notify),
+        );
+        let engine = WorkflowEngine::new_with_clock(
+            pool.clone(),
+            session_manager,
+            dir.to_path_buf(),
+            None,
+            events_notify,
+            Arc::new(move || {
+                Utc::now()
+                    + chrono::Duration::seconds(
+                        clock_offset.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+            }),
+        );
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        wait_for_poll_attempt(&pool, &task_id).await;
+        offset.store(6 * 3600 + 1, std::sync::atomic::Ordering::SeqCst);
+        wait_until_stage(&pool, &task_id, "stalled").await;
+    }
+
+    #[tokio::test]
+    async fn retrying_a_stuck_poll_stamps_a_fresh_window() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "retry-poll", "echo PENDING", Some("1h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let now = Utc::now();
+        let mut payload = json!({
+            "arrival": { "from": "gate", "outcome": "resumed" },
+            "poll_window": window_json("watch", now - chrono::Duration::hours(3), Some(now - chrono::Duration::hours(2))),
+        });
+        seed_row(&pool, &task_id, "watch", payload.take()).await;
+        let counters = json!({ "watch": { "count": 2 } });
+        sqlx::query("UPDATE workflow_state SET loop_counters = ? WHERE task_id = ?")
+            .bind(sqlx::types::Json(counters.clone()))
+            .bind(&task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        tasks::mark_stuck(&pool, &task_id, "x").await.unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        wait_for_poll_attempt(&pool, &task_id).await;
+        let state = state_of(&pool, &task_id).await;
+        assert_eq!(state.current_stage, "watch");
+        assert_eq!(state.loop_counters, counters);
+        assert_eq!(
+            state.payload["arrival"],
+            json!({ "from": "gate", "outcome": "resumed" })
+        );
+        let window = poll_window_for(&state.payload, "watch").unwrap().unwrap();
+        assert!(window.deadline.unwrap() > Utc::now() + chrono::Duration::minutes(50));
+        engine.abort_detached_runners(&task_id).await;
+    }
+
+    #[tokio::test]
+    async fn entering_a_poll_without_a_window_is_an_invariant_error() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(&dir, "nowindow", "echo PENDING", Some("1h"), false);
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let err = engine
+            .enter_stage(&task_id, &def, "watch", None, None, &json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PollWindow { .. }));
+        let err = engine
+            .enter_stage(
+                &task_id,
+                &def,
+                "watch",
+                None,
+                None,
+                &json!({ "poll_window": 1 }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PollWindow { .. }));
     }
 }

@@ -84,7 +84,9 @@ struct Daemon {
     base_url: String,
     ws_url: String,
     client: reqwest::Client,
-    _home: TempHome,
+    /// `Some` until [`Self::kill`] hands it back.
+    home: Option<TempHome>,
+    port: u16,
 }
 
 /// Bounds the `free_port`-race retry (see `Daemon::spawn_with_home_and_env`)
@@ -169,7 +171,8 @@ impl Daemon {
                         base_url,
                         ws_url,
                         client,
-                        _home: home,
+                        home: Some(home),
+                        port,
                     };
                 }
                 // Only an early exit is retried, and only when it's actually
@@ -190,6 +193,54 @@ impl Daemon {
             "chocofactoryd lost the free_port race {MAX_SPAWN_ATTEMPTS} times in a row; \
              last exit {status:?}: {stderr}"
         );
+    }
+
+    /// SIGKILLs the daemon (no graceful shutdown, like a crash) and hands
+    /// back its home and port so a second daemon can take over the same state.
+    async fn kill(mut self) -> (TempHome, u16) {
+        self.child
+            .kill()
+            .await
+            .expect("failed to SIGKILL chocofactoryd");
+        let home = self.home.take().expect("home already taken");
+        (home, self.port)
+    }
+
+    /// Starts a daemon on an explicit `port` and an existing `home` — the
+    /// restart half of a kill-and-restart test. One attempt, no port-race
+    /// retry: the port was just released by the daemon that was killed.
+    async fn restart_on(home: TempHome, port: u16) -> Self {
+        let mut child = Command::new(workspace_binary("chocofactoryd"))
+            .env("HOME", &home.0)
+            .env(
+                "CHOCOFACTORY_CLAUDE_BINARY",
+                workspace_binary("mock-claude"),
+            )
+            .env("CHOCOFACTORY_PORT", port.to_string())
+            .env("RUST_LOG", "error")
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn chocofactoryd");
+        let client = reqwest::Client::new();
+        let base_url = format!("http://127.0.0.1:{port}");
+        match wait_until_ready(&client, &base_url, &mut child).await {
+            Ready::Yes => {
+                spawn_stderr_forwarder(&mut child);
+                Daemon {
+                    child,
+                    base_url,
+                    ws_url: format!("ws://127.0.0.1:{port}"),
+                    client,
+                    home: Some(home),
+                    port,
+                }
+            }
+            Ready::ExitedDuringStartup(status) => {
+                let stderr = read_stderr_to_string(&mut child).await;
+                panic!("restarted chocofactoryd exited during startup with {status:?}: {stderr}");
+            }
+        }
     }
 
     async fn get(&self, path: &str) -> Value {
@@ -1198,4 +1249,145 @@ async fn real_binary_cancels_a_live_task_and_refuses_further_work() {
         )
         .await;
     assert_eq!(status, 409);
+}
+
+/// A poll-entry workflow that never matches, so it only ever ends by its
+/// wall-clock `timeout`.
+fn write_never_matching_poll(home: &TempHome, timeout: &str) {
+    home.write_workflow(
+        "poll-restart",
+        &format!(
+            r#"
+name: poll-restart
+stages:
+  polling:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    timeout: {timeout}
+    outcomes:
+      - match: "NEVER_MATCHES_XYZ"
+        then: green
+    on: {{ green: done, timeout: stalled }}
+  done:
+    kind: terminal
+  stalled:
+    kind: human_gate
+    on: {{ resumed: done }}
+"#
+        ),
+    );
+}
+
+async fn create_poll_restart_task(daemon: &Daemon) -> String {
+    let (status, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    assert_eq!(status, 201);
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project["id"].as_str().unwrap(),
+                "workflow_def": "poll-restart",
+                "title": "restart smoke",
+                "prompt": "start",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201);
+    task["id"].as_str().unwrap().to_string()
+}
+
+async fn stage_outcomes(daemon: &Daemon, task_id: &str) -> Vec<(String, Value)> {
+    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    detail["stage_trail"]
+        .as_array()
+        .expect("stage_trail missing")
+        .iter()
+        .map(|e| {
+            (
+                e["payload"]["stage"].as_str().unwrap().to_string(),
+                e["payload"]["outcome"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// #52 through the real binary: SIGKILL mid-poll, restart on the same
+/// `$HOME`, and the poll resumes with the budget it had — it times out at
+/// the original entry + 12s, not a fresh 12s after the restart.
+#[tokio::test]
+async fn real_binary_resumes_a_poll_after_a_kill_on_its_original_deadline() {
+    let home = TempHome::new();
+    write_never_matching_poll(&home, "12s");
+    let daemon = Daemon::spawn_with_home(home).await;
+    let entered = std::time::Instant::now();
+    let task_id = create_poll_restart_task(&daemon).await;
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let (home, port) = daemon.kill().await;
+    let daemon = Daemon::restart_on(home, port).await;
+
+    // Original entry + 12s + 4s of slack for startup and the interval.
+    let limit = entered + Duration::from_secs(16);
+    let mut stage = String::new();
+    while std::time::Instant::now() < limit {
+        let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+        stage = detail["workflow_state"]["current_stage"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if stage == "stalled" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        stage, "stalled",
+        "the resumed poll missed its original deadline"
+    );
+    let trail = stage_outcomes(&daemon, &task_id).await;
+    assert!(
+        trail.iter().any(|(s, o)| s == "polling" && o == "restart"),
+        "expected a restart stage_entered: {trail:?}"
+    );
+}
+
+/// The sweep runs only after bind: a second daemon on the same `$HOME` and
+/// port dies at bind, before it can resume (and so duplicate) anything.
+#[tokio::test]
+async fn a_second_daemon_dies_at_bind_before_sweeping_polls() {
+    let home = TempHome::new();
+    write_never_matching_poll(&home, "60s");
+    let daemon = Daemon::spawn_with_home(home).await;
+    let task_id = create_poll_restart_task(&daemon).await;
+
+    let home_path = daemon.home.as_ref().unwrap().0.clone();
+    let mut second = Command::new(workspace_binary("chocofactoryd"))
+        .env("HOME", &home_path)
+        .env(
+            "CHOCOFACTORY_CLAUDE_BINARY",
+            workspace_binary("mock-claude"),
+        )
+        .env("CHOCOFACTORY_PORT", daemon.port.to_string())
+        .env("RUST_LOG", "error")
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn the second chocofactoryd");
+    let status = tokio::time::timeout(Duration::from_secs(10), second.wait())
+        .await
+        .expect("the second daemon did not exit")
+        .unwrap();
+    assert!(!status.success());
+    let stderr = read_stderr_to_string(&mut second).await;
+    assert!(
+        stderr_says_bind_failed(&stderr),
+        "unexpected stderr: {stderr}"
+    );
+
+    let trail = stage_outcomes(&daemon, &task_id).await;
+    assert!(
+        !trail.iter().any(|(_, o)| o == "restart"),
+        "the losing daemon must not have resumed the poll: {trail:?}"
+    );
 }
