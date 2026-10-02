@@ -30,7 +30,7 @@ choco server status                # version, pid, port, uptime, open tasks, in-
   10 MiB is moved to `chocofactoryd.log.1` (replacing any older one).
 - **Exit codes:** `0` ok; `1` error; `3` means "not running" for `status`, and
   "refused" for `stop`/`restart`. `restart` also exits `1` when the old daemon
-  had to be killed after 30 s; a new daemon is then started and may be running.
+  had to be killed after 30 s; a new one is started only if the old one's lock was released.
 - **Stop and running tasks:** agent turns and shell steps are killed and the
   tasks marked `stuck` (`choco task retry <id>` continues them; an agent turn
   resumes its session). Tasks waiting on a poll or a human are not affected.

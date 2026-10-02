@@ -749,3 +749,131 @@ fn start_that_loses_the_race_reports_the_other_daemon() {
         text(&out)
     );
 }
+
+#[test]
+fn restart_does_not_start_when_the_killed_daemon_still_holds_the_lock() {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let env = Env::new();
+    // The test's own child stands in for the daemon; the test holds the lock,
+    // so SIGKILL on the child can never release it.
+    let mut victim = Command::new("sleep").arg("300").spawn().unwrap();
+    std::fs::create_dir_all(env.root()).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.root().join("chocofactoryd.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    file.set_len(0).unwrap();
+    write!(
+        file,
+        r#"{{"pid":{},"port":59998,"version":"0.0.0","commit":"c","started_at":"2026-01-01T00:00:00Z","exe":"/x"}}"#,
+        victim.id()
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+
+    let out = env.choco(&["server", "restart", "--force"]);
+    let _ = victim.kill();
+    let _ = victim.wait();
+
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("still holds the lock after SIGKILL"),
+        "{}",
+        text(&out)
+    );
+    assert!(!stdout(&out).contains(" started (pid "), "{}", text(&out));
+    // Calling `start` anyway would only report the old daemon as running.
+    assert!(!text(&out).contains("already running"), "{}", text(&out));
+    let log = env.root().join("logs").join("chocofactoryd.log");
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("=== choco server start"),
+        "no new daemon should have been started: {logged}"
+    );
+    drop(file);
+}
+
+async fn status_server() -> String {
+    use axum::{Router, routing::get};
+    let app = Router::new().route(
+        "/server",
+        get(|| async {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-chocofactory-version", "0.0.0-test".parse().unwrap());
+            let body = serde_json::json!({
+                "version": "0.0.0-test", "commit": null, "pid": std::process::id(),
+                "port": 1, "started_at": "2026-01-01T00:00:00Z", "config_root": "/x",
+                "exe": "/x", "exe_replaced": false, "choco_binary": "/x",
+                "choco_binary_found": true, "tasks": {}, "in_flight": []
+            });
+            (headers, body.to_string())
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    port.to_string()
+}
+
+#[tokio::test]
+async fn status_warns_once_for_a_version_mismatch_in_json_and_human_modes() {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let port = status_server().await;
+    let (json_out, human_out) = tokio::task::spawn_blocking(move || {
+        let env = Env::new();
+        std::fs::create_dir_all(env.root()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(env.root().join("chocofactoryd.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        write!(
+            file,
+            r#"{{"pid":{},"port":{port},"version":"0.0.0-test","commit":"c","started_at":"2026-01-01T00:00:00Z","exe":"/x"}}"#,
+            std::process::id()
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        let j = env.choco(&["--json", "server", "status"]);
+        let h = env.choco(&["server", "status"]);
+        drop(file);
+        (j, h)
+    })
+    .await
+    .unwrap();
+
+    // --json: the client's own warning, once, on stderr; stdout stays JSON.
+    assert!(json_out.status.success(), "{}", text(&json_out));
+    let err = stderr(&json_out);
+    assert_eq!(err.matches("warning: choco").count(), 1, "{err}");
+    serde_json::from_slice::<Value>(&json_out.stdout).expect("stdout stays JSON");
+
+    // Human: the render prints the warning (stdout); the client stays quiet.
+    assert!(human_out.status.success(), "{}", text(&human_out));
+    assert!(
+        !stderr(&human_out).contains("warning:"),
+        "{}",
+        text(&human_out)
+    );
+    assert_eq!(
+        stdout(&human_out).matches("warning: choco").count(),
+        1,
+        "{}",
+        text(&human_out)
+    );
+}
