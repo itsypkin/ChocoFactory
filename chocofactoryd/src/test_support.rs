@@ -76,8 +76,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[should_panic(expected = "waiting for the thing; last saw: still no")]
     async fn panics_after_the_load_allowance_naming_what_and_last_seen() {
-        let _: () = wait_until("the thing", || async { Err("still no".to_string()) }).await;
+        let start = tokio::time::Instant::now();
+        let handle = tokio::spawn(async {
+            let _: () = wait_until("the thing", || async { Err("still no".to_string()) }).await;
+        });
+        let err = handle.await.unwrap_err();
+        assert!(err.is_panic());
+        let payload = err.into_panic();
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap();
+        assert!(
+            msg.contains("waiting for the thing; last saw: still no"),
+            "{msg}"
+        );
+        assert!(tokio::time::Instant::now() - start >= LOAD_ALLOWANCE);
     }
 }

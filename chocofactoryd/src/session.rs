@@ -2172,7 +2172,14 @@ mod tests {
                 {"op": "answer_every_turn", "text": "still thinking"},
             ]),
         );
-        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(2)).await;
+        // Each nudge must be answered before the next is due, and the process
+        // must exit on stdin EOF without the grace timer killing it (#98).
+        let timers = TurnTimers {
+            nudge_after: crate::test_support::RESPONSE_MARGIN,
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(2)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
 
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Exited);
@@ -2291,7 +2298,11 @@ mod tests {
                 {"op": "usage_limit"},
             ]),
         );
-        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(0)).await;
+        let timers = TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
 
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Idle);
@@ -2426,7 +2437,11 @@ mod tests {
                 {"op": "result", "is_error": true},
             ]),
         );
-        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let timers = TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
 
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Exited);
@@ -2926,6 +2941,7 @@ mod tests {
         // result->init gap stays under 2 s.
         let timers = TurnTimers {
             nudge_after: crate::test_support::RESPONSE_MARGIN,
+            grace: crate::test_support::LOAD_ALLOWANCE,
             ..fast_timers(3)
         };
         let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
