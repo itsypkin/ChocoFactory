@@ -1752,17 +1752,19 @@ async fn port_zero_binds_a_free_port_and_publishes_it_in_the_lock_file() {
     assert_eq!(info.pid, child.id().unwrap());
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/server", info.port);
-    let mut body = None;
-    for _ in 0..100 {
+    let answer_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let body = loop {
         if let Ok(resp) = client.get(&url).send().await
             && resp.status().is_success()
         {
-            body = Some(resp.json::<Value>().await.unwrap());
-            break;
+            break resp.json::<Value>().await.unwrap();
         }
+        assert!(
+            tokio::time::Instant::now() < answer_deadline,
+            "GET /server never answered on the lock file's port"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let body = body.expect("GET /server never answered on the lock file's port");
+    };
     assert_eq!(body["port"], info.port);
     assert_eq!(body["pid"], info.pid);
     assert_eq!(body["version"], chocofactory_core::version::VERSION);
@@ -1787,6 +1789,50 @@ async fn version_flag_prints_and_touches_nothing() {
         )
     );
     assert!(!home.0.join(".config").exists());
+}
+
+/// A request that never finishes must not hold shutdown hostage: the HTTP
+/// drain deadline gives up on it and the daemon still exits 0 and releases
+/// the lock.
+#[tokio::test]
+async fn a_stalled_connection_does_not_block_shutdown_past_the_drain_grace() {
+    use tokio::io::AsyncWriteExt;
+
+    let home = TempHome::new();
+    let mut child = spawn_raw(&home.0, &[("RUST_LOG", "warn")]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let port = loop {
+        if let Ok(chocofactory_core::daemon_lock::LockState::Running(info)) =
+            chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
+            && info.port != 0
+        {
+            break info.port;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    // Promises 1000 body bytes, sends 5: the handler blocks on the body.
+    conn.write_all(
+        b"POST /tasks HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+          Content-Length: 1000\r\n\r\n{\"a\":",
+    )
+    .await
+    .unwrap();
+    conn.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(stderr.contains("did not drain"), "{stderr}");
+    assert!(lock_is_released(&home));
+    drop(conn);
 }
 
 #[tokio::test]

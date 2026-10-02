@@ -1998,6 +1998,45 @@ mod tests {
         assert!(run.ended_at.is_some());
     }
 
+    /// The other half of the start/shutdown race guard: a start that
+    /// reserved its slot and spawned before `shutdown` set the flag, but
+    /// reaches the `Live` insert after the snapshot, is killed by the
+    /// re-check in `spawn_drain`.
+    #[tokio::test]
+    async fn a_session_that_slips_past_the_shutdown_snapshot_is_killed_on_insert() {
+        let dir = TempDir::new();
+        let (binary, _heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        manager.reserve(&session_id).await.unwrap();
+        let handle = manager
+            .adapter
+            .start("go", &single_shot_role_config())
+            .unwrap();
+        let child_pid = read_pid_when_written(&child_pid_path).await;
+        let agent_pid = read_pid_when_written(&dir.0.join("agent.pid")).await;
+        // `shutdown` has already run its snapshot (it skipped the
+        // Establishing slot); only the flag is visible to this start.
+        manager.shutting_down.store(true, Ordering::SeqCst);
+        manager
+            .spawn_drain(session_id.clone(), handle, SessionKind::SingleShot)
+            .await;
+
+        wait_until_gone(agent_pid).await;
+        wait_until_gone(child_pid).await;
+        wait_until_status(&pool, &session_id, SessionStatus::Exited).await;
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::DaemonStopped));
+    }
+
     #[tokio::test]
     async fn nothing_starts_after_shutdown() {
         let dir = TempDir::new();

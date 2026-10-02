@@ -16566,6 +16566,56 @@ stages:
         );
     }
 
+    /// When the session cannot be recorded, the reason says so and retry
+    /// really does start the stage fresh.
+    #[tokio::test]
+    async fn parking_says_so_when_the_interrupted_session_cannot_be_recorded() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = coding_workflow(&dir);
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "coding").await;
+        let crashed = crashed_session(&pool, &task_id, "coding").await;
+        sqlx::query(
+            "CREATE TRIGGER block_daemon_stopped BEFORE UPDATE ON sessions \
+             WHEN NEW.end_reason = 'daemon_stopped' \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fresh_binary = named_script_binary(
+            &dir,
+            "fake-claude-fresh",
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+            ]),
+        );
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &fresh_binary, &dir);
+        let report = engine.park_interrupted_turns().await.unwrap();
+        assert_eq!(report.agent_turns, 1);
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        let reason = task.stuck_reason.unwrap();
+        assert!(reason.starts_with(&agent_reason("coding")), "{reason}");
+        assert!(
+            reason.contains("the interrupted session could not be recorded")
+                && reason.contains("injected")
+                && reason.ends_with("so retry will start the stage fresh"),
+            "{reason}"
+        );
+        let session = sessions::get(&pool, &crashed.id).await.unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.end_reason, None);
+
+        let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        assert!(!outcome.resumed, "{outcome:?}");
+    }
+
     #[tokio::test]
     async fn parking_a_shell_stage_lets_retry_rerun_it() {
         let pool = connect_in_memory().await.unwrap();

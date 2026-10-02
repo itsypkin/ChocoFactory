@@ -43,17 +43,17 @@ impl ClaudeAdapter {
         }
     }
 
+    /// The `choco` binary path embedded in every agent turn's `--mcp-config`.
+    pub fn choco_binary(&self) -> &str {
+        &self.choco_binary
+    }
+
     /// Overrides the `choco` binary path used to build `--mcp-config`'s
     /// stdio command (issue #73), mirroring `with_binary`'s override of
     /// `claude` itself. Used by the daemon's `CHOCOFACTORY_CHOCO_BINARY` env
     /// override, and by tests that want a deterministic path to assert
     /// against rather than whatever `default_choco_binary` resolves to in a
     /// given build layout.
-    /// The `choco` binary path embedded in every agent turn's `--mcp-config`.
-    pub fn choco_binary(&self) -> &str {
-        &self.choco_binary
-    }
-
     pub fn with_choco_binary(mut self, choco_binary: impl Into<String>) -> Self {
         self.choco_binary = choco_binary.into();
         self
