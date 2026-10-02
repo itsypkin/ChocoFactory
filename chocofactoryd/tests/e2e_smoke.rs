@@ -2033,8 +2033,7 @@ async fn real_binary_counts_tasks_still_using_the_old_workflows_folder() {
 }
 
 /// Pre-#88 tasks (no recorded path) count as using the old folder only when
-/// `<folder>/<workflow_def>.yaml` exists; a sibling `workflows2/` task is
-/// never counted.
+/// `<folder>/<workflow_def>.yaml` exists.
 #[tokio::test]
 async fn real_binary_counts_null_path_tasks_only_when_the_old_file_exists() {
     let home = TempHome::new();
@@ -2078,7 +2077,11 @@ async fn real_binary_counts_null_path_tasks_only_when_the_old_file_exists() {
         .unwrap();
     pool.close().await;
 
-    // No old chat.yaml: not counted.
+    // Old folder exists (so the scan runs and reaches the count) but has no
+    // chat.yaml: not counted.
+    let old = cfg.join("workflows");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("other.yaml"), "name: other\n").unwrap();
     let (mut child, _base) = start_daemon_for_report(&home.0, &client).await;
     let status = sigterm_and_wait(&mut child).await;
     assert!(status.success(), "{status:?}");
@@ -2086,8 +2089,6 @@ async fn real_binary_counts_null_path_tasks_only_when_the_old_file_exists() {
     assert!(!stderr.contains("tasks still use workflows in"), "{stderr}");
 
     // With the old file present: counted.
-    let old = cfg.join("workflows");
-    std::fs::create_dir_all(&old).unwrap();
     std::fs::write(old.join("chat.yaml"), "name: chat\n").unwrap();
     let (mut child, _base) = start_daemon_for_report(&home.0, &client).await;
     let status = sigterm_and_wait(&mut child).await;
