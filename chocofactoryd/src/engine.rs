@@ -2351,7 +2351,15 @@ impl WorkflowEngine {
                     .await?
                     .ok_or(EngineError::NoSuchTask)?;
             }
-            let payload = json!({ "task": { "input": initial_input, "title": task.title } });
+            // `arrival` is seeded empty here (rather than left absent)
+            // so the entry stage's `{{ arrival.from }}`/`{{ arrival.outcome }}`
+            // render as "" with no `template_unresolved` note (#112) — the
+            // same treatment `task` gets, and for the same reason: nothing
+            // has transitioned yet.
+            let payload = json!({
+                "task": { "input": initial_input, "title": task.title },
+                "arrival": { "from": "", "outcome": "" },
+            });
             let state = workflow_state::create(&self.pool, task_id, start, payload).await?;
             self.enter_stage(
                 task_id,
@@ -2515,6 +2523,13 @@ impl WorkflowEngine {
                     // above has confirmed is still the current one.
                     merge_stage_capture(&mut payload, &from_stage, value);
                 }
+                // Records how the task arrived at `next_stage`, so
+                // `coder-revise.md` and any other template can branch on
+                // the actual transition (#112) instead of guessing from
+                // which stale `stages.*` capture happens to be non-empty.
+                // Written into this same payload/update so it commits
+                // atomically with `current_stage` — no second write.
+                set_arrival(&mut payload, &from_stage, outcome);
 
                 // The returned row is the authority on what was actually
                 // committed, and it's what the next stage renders its
@@ -5338,6 +5353,34 @@ fn merge_stage_capture(payload: &mut Value, stage: &str, value: Value) {
         .insert(stage.to_string(), value);
 }
 
+/// Records the transition that just brought the task into its new current
+/// stage, as an engine-owned `payload.arrival` sibling of `payload.stages`
+/// (#112). `from_stage` is the stage being left and `outcome` is what it
+/// reported — exactly the values `advance_from_stage` already has in scope,
+/// so this is a plain write rather than anything computed from the events
+/// timeline (that trail is best-effort and appended after this commits, and
+/// it doesn't record the stage left — see `enter_stage`'s comment on
+/// `append_stage_transition`).
+///
+/// Unlike `merge_stage_capture`, this always overwrites the whole
+/// `arrival` value rather than merging into it: there is nothing under it
+/// worth preserving between transitions.
+fn set_arrival(payload: &mut Value, from_stage: &str, outcome: &str) {
+    // Same non-object handling as `merge_stage_capture`, and for the same
+    // reason: the engine owns this column, so a payload that isn't an
+    // object should be replaced rather than silently dropping the write.
+    if !payload.is_object() {
+        *payload = json!({});
+    }
+    payload
+        .as_object_mut()
+        .expect("payload was just ensured to be an object")
+        .insert(
+            "arrival".to_string(),
+            json!({ "from": from_stage, "outcome": outcome }),
+        );
+}
+
 /// Increments the guarded stage's transition count and rewrites its whole
 /// `loop_counters` entry as `{ "count": n }`. A pre-#106 entry of the form
 /// `{ "entered_from": …, "count": n }` keeps its count and loses
@@ -5389,6 +5432,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn set_arrival_replaces_a_non_object_payload() {
+        let mut payload = json!(null);
+        set_arrival(&mut payload, "a", "b");
+        assert_eq!(
+            payload,
+            json!({ "arrival": { "from": "a", "outcome": "b" } })
+        );
+    }
     use crate::adapter::{AgentAdapter, ClaudeAdapter};
     use crate::db::{connect_in_memory, projects, tasks};
 
@@ -5614,6 +5667,313 @@ stages:
     kind: terminal
 "#;
         Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap())
+    }
+
+    // ---- arrival (#112) ----
+
+    /// A single-transition workflow whose entry stage is `from_stage`,
+    /// moving to `revising` on `outcome` — for pinning what
+    /// `advance_from_stage` writes into `payload.arrival` on one specific
+    /// path, independent of the real `coding-task.yaml`'s shape.
+    fn arrival_path_def(from_stage: &str, outcome: &str) -> Arc<WorkflowDefinition> {
+        let yaml = format!(
+            r#"
+name: arrival-path
+stages:
+  {from_stage}:
+    kind: human_gate
+    on: {{ {outcome}: revising }}
+  revising:
+    kind: human_gate
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#
+        );
+        Arc::new(WorkflowDefinition::parse(&yaml, Path::new(".")).unwrap())
+    }
+
+    #[tokio::test]
+    async fn arrival_records_the_transition_from_internal_review() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = arrival_path_def("internal_review", "changes_requested");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "revising");
+        assert_eq!(
+            state.payload["arrival"],
+            json!({ "from": "internal_review", "outcome": "changes_requested" })
+        );
+    }
+
+    #[tokio::test]
+    async fn arrival_records_the_transition_from_awaiting_human_review() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = arrival_path_def("awaiting_human_review", "changes_requested");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "revising");
+        assert_eq!(
+            state.payload["arrival"],
+            json!({ "from": "awaiting_human_review", "outcome": "changes_requested" })
+        );
+    }
+
+    #[tokio::test]
+    async fn arrival_records_the_transition_from_checks_polling() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = arrival_path_def("checks_polling", "red");
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine.advance(&task_id, &def, "red").await.unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "revising");
+        assert_eq!(
+            state.payload["arrival"],
+            json!({ "from": "checks_polling", "outcome": "red" })
+        );
+    }
+
+    /// Unlike the three tests above, this drives the real
+    /// `send_message_or_resume` relay (#59) rather than calling `advance`
+    /// directly — the actual caller a human's reply to an escalated task
+    /// goes through — to prove the "resumed" arrival is recorded on that
+    /// path too, not just when a test calls `advance_from_stage` by hand.
+    #[tokio::test]
+    async fn arrival_records_the_transition_from_escalate_to_human_via_the_real_resume_path() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        // `send_message_or_resume` loads the task's workflow by name off
+        // disk (`load_task_workflow`), unlike `advance`, which is handed
+        // the definition directly — so this needs a real file, not just
+        // the parsed `Arc<WorkflowDefinition>` the other arrival tests use.
+        let yaml = r#"
+name: arrival-path
+stages:
+  escalate_to_human:
+    kind: human_gate
+    on: { resumed: revising }
+  revising:
+    kind: human_gate
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        std::fs::write(dir.join("arrival-path.yaml"), yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        engine
+            .send_message_or_resume(&task_id, "go ahead and fix it this way")
+            .await
+            .unwrap();
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "revising");
+        assert_eq!(
+            state.payload["arrival"],
+            json!({ "from": "escalate_to_human", "outcome": "resumed" })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_tasks_entry_stage_has_an_empty_arrival_with_no_unresolved_note() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        fs::write(
+            dir.join("coder-turn.md"),
+            "from=[{{ arrival.from }}] outcome=[{{ arrival.outcome }}]",
+        )
+        .unwrap();
+        let yaml = r#"
+name: arrival-entry
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: {}
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "coding").await;
+
+        // The turn ran with both fields substituted as empty strings — a
+        // present-but-empty value, distinct from a genuinely missing one.
+        let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
+        let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+        wait_until_events_contain(&pool, &run.id, "echo:from=[] outcome=[]").await;
+
+        assert!(
+            events::list_for_task(&pool, &task_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|e| e.event_type != EventType::TemplateUnresolved),
+            "an empty (but present) arrival is a resolved value, not a missing one (#60)"
+        );
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(
+            state.payload["arrival"],
+            json!({ "from": "", "outcome": "" })
+        );
+    }
+
+    /// #112: a task created before this change has no `arrival` key in its
+    /// payload at all until its next `advance_from_stage` — simulated here
+    /// by seeding `workflow_state` directly (bypassing `start_task`, which
+    /// now always seeds it) and re-entering the stage. This must render
+    /// the same way a pre-existing missing `task` key already does: empty,
+    /// with the ordinary #60 note, never a hard failure.
+    #[tokio::test]
+    async fn a_pre_upgrade_payload_with_no_arrival_key_renders_empty_and_is_noted() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: arrival-legacy
+stages:
+  coding:
+    kind: shell
+    command: "test -z \"{{ arrival.from }}\""
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        let state = workflow_state::create(&pool, &task_id, "coding", json!({}))
+            .await
+            .unwrap();
+        engine
+            .enter_stage(&task_id, &def, "coding", None, None, &state.payload, None)
+            .await
+            .unwrap();
+
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let note = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == EventType::TemplateUnresolved)
+            .unwrap_or_else(|| panic!("expected a template_unresolved note on the timeline"));
+        assert_eq!(note.payload["stage"], json!("coding"));
+        assert_eq!(note.payload["placeholders"], json!(["{{ arrival.from }}"]));
+    }
+
+    /// #112, design point 4: `retry_task` re-enters the current stage
+    /// directly (`enter_stage`, not `advance_from_stage`), so a retried
+    /// turn must keep the arrival that originally brought it there rather
+    /// than recording `revising --[retry]--> revising`.
+    #[tokio::test]
+    async fn retrying_a_stuck_stage_leaves_its_arrival_unchanged() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let marker = dir.join("marker"); // never created, so `revising` always fails
+        let yaml = format!(
+            r#"
+name: retry-keeps-arrival
+stages:
+  checks_polling:
+    kind: human_gate
+    on: {{ red: revising }}
+  revising:
+    kind: shell
+    command: "test -f {}"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+            marker.display()
+        );
+        std::fs::write(dir.join("retry-keeps-arrival.yaml"), &yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        // `retry_task` loads the task's workflow by name off disk
+        // (`load_task_workflow`), so this needs a real file in the engine's
+        // workflows directory, unlike `advance`, which takes the
+        // definition directly.
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        engine.advance(&task_id, &def, "red").await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+
+        let before = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(before.current_stage, "revising");
+        let expected_arrival = json!({ "from": "checks_polling", "outcome": "red" });
+        assert_eq!(before.payload["arrival"], expected_arrival);
+
+        // The marker is still missing, so the retried command fails again
+        // and the task lands back on `stuck` without ever going through
+        // `advance_from_stage` — the case this test exists to pin.
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+
+        let after = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(after.current_stage, "revising");
+        assert_eq!(after.payload["arrival"], expected_arrival);
+    }
+
+    /// #112, design point 1: a `loop_guard` reroute still records the
+    /// stage actually left and the outcome that fired the reroute —
+    /// `internal_review`/`changes_requested` — not a synthetic value for
+    /// having been rerouted.
+    #[tokio::test]
+    async fn a_loop_guard_reroute_records_the_stage_and_outcome_that_tripped_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let def = coder_reviewer_guard_def();
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+
+        // 3 round trips are allowed by the guard; the 4th reroutes to
+        // escalate_to_human instead of back to coding.
+        for _ in 0..4 {
+            engine.advance(&task_id, &def, "resumed").await.unwrap();
+            engine
+                .advance(&task_id, &def, "changes_requested")
+                .await
+                .unwrap();
+        }
+
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.current_stage, "escalate_to_human");
+        assert_eq!(
+            state.payload["arrival"],
+            json!({ "from": "internal_review", "outcome": "changes_requested" })
+        );
     }
 
     #[tokio::test]
@@ -7015,11 +7375,15 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
         wait_until_stage(&pool, &task_id, "finished").await;
 
-        // `task` is the entry stage's only payload (P2-7a) — the stage
-        // itself writes nothing, since it declares no `capture:`.
+        // `task` and `arrival` are the only payload here — the stage
+        // itself writes nothing, since it declares no `capture:` (#112:
+        // `arrival` now always accompanies the transition into `finished`).
         assert_eq!(
             payload_of(&pool, &task_id).await,
-            json!({"task": {"input": null, "title": "T"}})
+            json!({
+                "task": {"input": null, "title": "T"},
+                "arrival": {"from": "run", "outcome": "done"},
+            })
         );
     }
 
@@ -7363,12 +7727,17 @@ stages:
                 if expected == "run" && actual == "finished"),
             "got {err:?}"
         );
-        // Neither the transition nor the capture was applied.
+        // Neither the transition nor the capture was applied — `arrival`
+        // still reflects the real `run --[done]--> finished` transition
+        // from `start_task`'s advance, not the rejected late outcome.
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "finished");
         assert_eq!(
             state.payload,
-            json!({"task": {"input": null, "title": "T"}})
+            json!({
+                "task": {"input": null, "title": "T"},
+                "arrival": {"from": "run", "outcome": "done"},
+            })
         );
     }
 
@@ -10098,11 +10467,15 @@ stages:
         wait_until_stage(&pool, &task_id, "finished").await;
 
         // Even though the reply *was* a JSON verdict, a stage that declared
-        // no `capture:` neither stores it nor routes on it — `task` is the
-        // only payload key present (P2-7a).
+        // no `capture:` neither stores it nor routes on it — `task` and the
+        // engine-owned `arrival` (#112) are the only payload keys present
+        // (P2-7a).
         assert_eq!(
             payload_of(&pool, &task_id).await,
-            json!({"task": {"input": null, "title": "T"}})
+            json!({
+                "task": {"input": null, "title": "T"},
+                "arrival": {"from": "coding", "outcome": "done"},
+            })
         );
         let trail = stage_trail(&pool, &task_id).await;
         assert!(

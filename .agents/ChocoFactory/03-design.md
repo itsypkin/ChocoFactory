@@ -410,9 +410,12 @@ Substitution rules, in full (P2-3):
   around it but not inside it. Nested fields work (`stages.a.b.c`); a
   bare `{{ stages.<name> }}` is how a `capture: text` stage is read,
   since its payload entry is a plain string rather than an object.
-- `stages` is the only namespace a template may read. Reserving the rest
-  keeps room for engine-owned keys later without a definition that
-  guessed at one silently changing meaning.
+- `stages`, `task` and `arrival` are the only three roots a template may
+  read. `task.input`/`task.title` are the task's own title/initial input,
+  seeded once by `start_task`. `arrival.from`/`arrival.outcome` (#112) are
+  the stage the task just left and the outcome that fired the transition
+  into its current stage, rewritten on every `advance_from_stage`; on a
+  task's entry stage — nothing has transitioned yet — both render as `""`.
 - Only scalars substitute: strings verbatim, numbers and booleans as
   their JSON text. `null`, objects and arrays are an error — capture is
   for short structured signals (a verdict, an id, a url), and splicing a

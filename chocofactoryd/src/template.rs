@@ -8,8 +8,16 @@
 //!
 //! A second root, `{{ task.<field> }}` (`input`/`title`), reads a sibling
 //! key seeded once by `start_task` rather than any stage's `capture:` — it's
-//! how a task's own description reaches a `prompt_file` (P2-7a). `stages`
-//! and `task` are the only two roots a template can read from.
+//! how a task's own description reaches a `prompt_file` (P2-7a).
+//!
+//! A third root, `{{ arrival.from }}`/`{{ arrival.outcome }}`, reads the
+//! stage the task just left and the outcome that fired the transition into
+//! its current stage (#112) — written by `engine::advance_from_stage`
+//! (`engine::set_arrival`) into the same payload, next to `stages` and
+//! `task`, so a `prompt_file` can branch on *why* it's here instead of
+//! guessing from which stale `stages.*` capture happens to be non-empty.
+//! `stages`, `task` and `arrival` are the only three roots a template can
+//! read from.
 //!
 //! This is deliberately *only* variable substitution. There are no
 //! conditionals, no expressions, and no function calls — branching stays in
@@ -40,13 +48,25 @@ const NAMESPACE: &str = "stages";
 /// by `start_task` rather than any stage's `capture:`.
 const TASK_NAMESPACE: &str = "task";
 
-/// Which of the two recognised roots a reference reads from.
+/// The `arrival` root: the stage the task just left and the outcome that
+/// fired the transition into its current stage (#112), rewritten on every
+/// `advance_from_stage` (`engine::set_arrival`) rather than any stage's
+/// `capture:`.
+const ARRIVAL_NAMESPACE: &str = "arrival";
+
+/// Which of the three recognised roots a reference reads from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Root {
     /// `stages.<stage>.<path>` — a stage's capture.
     Stage(String),
     /// `task.<path>` — the task's own title/initial input.
     Task,
+    /// `arrival.from` or `arrival.outcome` — the stage the task arrived from
+    /// and the outcome that fired the transition into the current stage
+    /// (#112). Unlike `task`, only these two exact fields exist, so
+    /// `parse_reference` rejects any other field at parse time rather than
+    /// letting it reach `resolve` as a render-time "unresolved" miss.
+    Arrival,
 }
 
 /// One `{{ … }}` occurrence, parsed but not yet resolved.
@@ -91,6 +111,14 @@ pub enum TemplateError {
         placeholder: String,
         field: String,
     },
+    /// The `arrival` root has no such field. Only reachable for a payload
+    /// with no `arrival` key at all — a row from before this namespace
+    /// existed (#112) — since `parse_reference` already rejects any field
+    /// name but `from`/`outcome`. Same treatment as `UnresolvedTaskField`.
+    UnresolvedArrivalField {
+        placeholder: String,
+        field: String,
+    },
     /// Resolved to something that can't be substituted into a command or a
     /// prompt as-is. Capture is for short structured signals — a verdict, an
     /// id, a url — not for splicing a blob into a shell command (§5.1).
@@ -115,6 +143,7 @@ impl TemplateError {
             TemplateError::UnresolvedStage { .. }
                 | TemplateError::UnresolvedField { .. }
                 | TemplateError::UnresolvedTaskField { .. }
+                | TemplateError::UnresolvedArrivalField { .. }
                 | TemplateError::NotScalar { .. }
         )
     }
@@ -131,8 +160,8 @@ impl fmt::Display for TemplateError {
             }
             TemplateError::UnknownNamespace { placeholder, root } => write!(
                 f,
-                "{placeholder} reads from '{root}', but '{NAMESPACE}' and '{TASK_NAMESPACE}' \
-                 are the only namespaces a template can read from"
+                "{placeholder} reads from '{root}', but '{NAMESPACE}', '{TASK_NAMESPACE}' and \
+                 '{ARRIVAL_NAMESPACE}' are the only namespaces a template can read from"
             ),
             TemplateError::UnresolvedStage { placeholder, stage } => write!(
                 f,
@@ -150,6 +179,11 @@ impl fmt::Display for TemplateError {
             TemplateError::UnresolvedTaskField { placeholder, field } => {
                 write!(f, "{placeholder} has no value: the task has no '{field}'")
             }
+            TemplateError::UnresolvedArrivalField { placeholder, field } => write!(
+                f,
+                "{placeholder} has no value: the task has no arrival '{field}' \
+                 (a payload from before #112)"
+            ),
             TemplateError::NotScalar { placeholder, kind } => write!(
                 f,
                 "{placeholder} resolves to {kind}, which cannot be substituted into a command \
@@ -301,6 +335,23 @@ fn parse_reference(body: &str) -> Result<TemplateRef, TemplateError> {
             root: Root::Task,
             path: remainder.iter().map(|field| (*field).to_string()).collect(),
         }),
+        // Unlike `task`, `arrival` has exactly two valid fields, so a bad
+        // one is rejected here at parse time (loader-catchable, #112) rather
+        // than left to resolve into a render-time "unresolved" miss the way
+        // an unknown `task` field does.
+        ARRIVAL_NAMESPACE => {
+            if !matches!(remainder.as_slice(), ["from"] | ["outcome"]) {
+                return Err(TemplateError::Malformed {
+                    placeholder,
+                    reason: format!("`{ARRIVAL_NAMESPACE}` only has `from` and `outcome` fields"),
+                });
+            }
+            Ok(TemplateRef {
+                placeholder,
+                root: Root::Arrival,
+                path: remainder.iter().map(|field| (*field).to_string()).collect(),
+            })
+        }
         other => Err(TemplateError::UnknownNamespace {
             placeholder,
             root: other.to_string(),
@@ -317,6 +368,10 @@ fn parse_reference(body: &str) -> Result<TemplateRef, TemplateError> {
 // instead, same as any other reference resolving to `null` does).
 const MISSING_TASK: Value = Value::Null;
 
+// Same defensive fallback as `MISSING_TASK`, for a payload predating #112
+// that has no `arrival` key at all (see `UnresolvedArrivalField`).
+const MISSING_ARRIVAL: Value = Value::Null;
+
 fn resolve(reference: &TemplateRef, payload: &Value) -> Result<String, TemplateError> {
     let mut value = match &reference.root {
         Root::Stage(stage) => payload
@@ -327,6 +382,7 @@ fn resolve(reference: &TemplateRef, payload: &Value) -> Result<String, TemplateE
                 stage: stage.clone(),
             })?,
         Root::Task => payload.get(TASK_NAMESPACE).unwrap_or(&MISSING_TASK),
+        Root::Arrival => payload.get(ARRIVAL_NAMESPACE).unwrap_or(&MISSING_ARRIVAL),
     };
 
     for (depth, field) in reference.path.iter().enumerate() {
@@ -339,6 +395,10 @@ fn resolve(reference: &TemplateRef, payload: &Value) -> Result<String, TemplateE
                 field: reference.path[..=depth].join("."),
             },
             Root::Task => TemplateError::UnresolvedTaskField {
+                placeholder: reference.placeholder.clone(),
+                field: reference.path[..=depth].join("."),
+            },
+            Root::Arrival => TemplateError::UnresolvedArrivalField {
                 placeholder: reference.placeholder.clone(),
                 field: reference.path[..=depth].join("."),
             },
@@ -621,5 +681,70 @@ mod tests {
     #[test]
     fn references_is_empty_for_plain_text() {
         assert!(references("gh pr create --fill").unwrap().is_empty());
+    }
+
+    fn arrival_payload() -> Value {
+        json!({ "arrival": { "from": "internal_review", "outcome": "changes_requested" } })
+    }
+
+    #[test]
+    fn resolves_arrival_from_and_outcome() {
+        let rendered = render_text(
+            "{{ arrival.from }} / {{ arrival.outcome }}",
+            &arrival_payload(),
+        );
+        assert_eq!(rendered, "internal_review / changes_requested");
+    }
+
+    /// #112: a bare `arrival`, an unrecognised field, or a path under a
+    /// valid field are all rejected at *parse* time — unlike `task`, which
+    /// only rejects a genuinely unknown field at render time — so a
+    /// workflow referencing them fails to load rather than failing mid-run.
+    #[test]
+    fn a_bare_arrival_reference_is_malformed() {
+        let err = references("{{ arrival }}").unwrap_err();
+        assert!(matches!(err, TemplateError::Malformed { .. }), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_arrival_field_is_malformed() {
+        let err = references("{{ arrival.stage }}").unwrap_err();
+        assert!(matches!(err, TemplateError::Malformed { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_path_under_an_arrival_field_is_malformed() {
+        let err = references("{{ arrival.from.x }}").unwrap_err();
+        assert!(matches!(err, TemplateError::Malformed { .. }), "{err}");
+    }
+
+    /// A payload from before #112 has no `arrival` key at all — same
+    /// treatment as a pre-`task` payload: renders empty and is noted, not a
+    /// hard error.
+    #[test]
+    fn a_missing_arrival_key_renders_empty_and_is_noted() {
+        let (rendered, unresolved) = render("{{ arrival.from }}", &json!({})).unwrap();
+        assert_eq!(rendered, "");
+        assert_eq!(unresolved, vec!["{{ arrival.from }}"]);
+    }
+
+    /// The empty string is a legitimate *value* (a task's entry stage,
+    /// seeded by `start_task`), not a missing one — no note expected.
+    #[test]
+    fn an_empty_arrival_renders_with_no_note() {
+        let payload = json!({ "arrival": { "from": "", "outcome": "" } });
+        let (rendered, unresolved) = render("{{ arrival.from }}", &payload).unwrap();
+        assert_eq!(rendered, "");
+        assert!(unresolved.is_empty());
+    }
+
+    /// `gh api "repos/{owner}/{repo}/..."` uses single braces, which is
+    /// `gh`'s own placeholder syntax, not this module's `{{ … }}` — it must
+    /// pass through `render` untouched rather than being mistaken for a
+    /// reference (relied on by `coder-revise.md`, #112).
+    #[test]
+    fn single_brace_placeholders_pass_through_untouched() {
+        let input = r#"gh api "repos/{owner}/{repo}/pulls/1/comments""#;
+        assert_eq!(render_text(input, &json!({})), input);
     }
 }

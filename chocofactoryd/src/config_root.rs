@@ -278,6 +278,133 @@ mod tests {
         assert!(def.worktree);
     }
 
+    fn coder_revise_content() -> &'static str {
+        BUILTIN_WORKFLOW_PROMPTS
+            .iter()
+            .find(|(name, _)| *name == "coder-revise.md")
+            .expect("coder-revise.md must be a seeded prompt")
+            .1
+    }
+
+    /// #112: the embedded `coder-revise.md` branches on `{{ arrival.from }}`/
+    /// `{{ arrival.outcome }}`, not on which of `stages.internal_review.
+    /// summary`/`stages.escalate_to_human` happens to be non-empty — both
+    /// captures persist across laps once either stage has ever run, so a
+    /// stale one must never be mistaken for the actual reason the coder is
+    /// back. Each of these four tests renders the real embedded prompt for
+    /// one arrival path, with a stale-looking capture seeded in the
+    /// "wrong" slot, and checks that: the "You are back here because"
+    /// sentence names the real arrival, and any seeded capture text only
+    /// ever appears after its own heading.
+    fn assert_coder_revise_names_arrival_and_isolates_captures(
+        from: &str,
+        outcome: &str,
+        stages: serde_json::Value,
+    ) -> String {
+        let payload = serde_json::json!({
+            "task": { "title": "Fix the thing", "input": "do the thing" },
+            "arrival": { "from": from, "outcome": outcome },
+            "stages": stages,
+        });
+        let (rendered, _unresolved) = crate::template::render(coder_revise_content(), &payload)
+            .unwrap_or_else(|err| panic!("coder-revise.md failed to render: {err}"));
+
+        assert!(
+            rendered.contains(&format!(
+                "the `{from}` stage ended with the outcome `{outcome}`"
+            )),
+            "expected the arrival sentence to name {from}/{outcome}:\n{rendered}"
+        );
+
+        let path_list_start = rendered
+            .find("- **`internal_review`")
+            .expect("path list must be present");
+        let reviewer_heading = rendered
+            .find("## Internal reviewer's summary")
+            .expect("reviewer summary heading must be present");
+        let human_note_heading = rendered
+            .find("## A human's note")
+            .expect("human note heading must be present");
+        assert!(path_list_start < reviewer_heading);
+        assert!(reviewer_heading < human_note_heading);
+
+        rendered
+    }
+
+    #[test]
+    fn coder_revise_for_the_internal_review_path_names_the_arrival() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "internal_review",
+            "changes_requested",
+            serde_json::json!({ "internal_review": { "summary": "CURRENT REVIEWER SUMMARY" } }),
+        );
+        let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
+        let human_note_heading = rendered.find("## A human's note").unwrap();
+        let summary = rendered.find("CURRENT REVIEWER SUMMARY").unwrap();
+        assert_eq!(rendered.matches("CURRENT REVIEWER SUMMARY").count(), 1);
+        assert!(
+            reviewer_heading < summary && summary < human_note_heading,
+            "the reviewer's summary must render only under its own heading:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn coder_revise_for_the_awaiting_human_review_path_isolates_the_stale_reviewer_summary() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "awaiting_human_review",
+            "changes_requested",
+            serde_json::json!({ "internal_review": { "summary": "STALE REVIEWER APPROVAL" } }),
+        );
+        // Stale from the original internal_review approval that opened the
+        // PR — must still land only under its own heading, never mistaken
+        // for the human's actual PR feedback (#112's whole point).
+        let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
+        let human_note_heading = rendered.find("## A human's note").unwrap();
+        let summary = rendered.find("STALE REVIEWER APPROVAL").unwrap();
+        assert!(
+            reviewer_heading < summary && summary < human_note_heading,
+            "the stale summary must render only under its own heading:\n{rendered}"
+        );
+        assert_eq!(rendered.matches("STALE REVIEWER APPROVAL").count(), 1);
+        assert!(
+            rendered.contains("Run `gh pr view --comments`"),
+            "the awaiting_human_review entry must point the coder at the PR:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn coder_revise_for_the_checks_polling_path_names_the_arrival() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "checks_polling",
+            "red",
+            serde_json::json!({ "internal_review": { "summary": "STALE REVIEWER APPROVAL" } }),
+        );
+        let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
+        let human_note_heading = rendered.find("## A human's note").unwrap();
+        let summary = rendered.find("STALE REVIEWER APPROVAL").unwrap();
+        assert!(
+            reviewer_heading < summary && summary < human_note_heading,
+            "the stale summary must render only under its own heading:\n{rendered}"
+        );
+        assert_eq!(rendered.matches("STALE REVIEWER APPROVAL").count(), 1);
+    }
+
+    #[test]
+    fn coder_revise_for_the_escalate_to_human_path_isolates_the_human_note() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "escalate_to_human",
+            "resumed",
+            serde_json::json!({ "escalate_to_human": "CURRENT HUMAN NOTE" }),
+        );
+        let human_note_heading = rendered.find("## A human's note").unwrap();
+        let note = rendered.find("CURRENT HUMAN NOTE").unwrap();
+        assert_eq!(rendered.matches("CURRENT HUMAN NOTE").count(), 1);
+        assert!(
+            human_note_heading < note,
+            "the human's note must render only under its own heading:\n{rendered}"
+        );
+    }
+
     /// #95: the sections `internal_review` enforces and the ones its
     /// reviewer prompt asks for are two copies of the same list, and the
     /// failure when they drift is silent and expensive — a reviewer writes
