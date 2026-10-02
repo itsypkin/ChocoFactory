@@ -4,7 +4,65 @@
 //! status (`chocofactory_core::models::Task::status`) are both free-form,
 //! driven by data on disk/in the DB, not fixed by this crate.
 
-use clap::{Args, Parser, Subcommand};
+use std::fmt;
+use std::str::FromStr;
+use std::time::Duration;
+
+use clap::{ArgGroup, Args, Parser, Subcommand};
+
+/// A `--interval`/`--timeout` value: parsed with the same
+/// `chocofactory_core::duration::parse_duration` the workflow YAML uses,
+/// with the spelling as typed kept for messages.
+#[derive(Clone, Debug)]
+pub struct DurationArg {
+    pub raw: String,
+    pub duration: Duration,
+}
+
+fn parse_duration_arg(s: &str) -> Result<DurationArg, String> {
+    chocofactory_core::duration::parse_duration(s)
+        .map(|duration| DurationArg {
+            raw: s.to_string(),
+            duration,
+        })
+        .map_err(|_| {
+            format!("'{s}' is not a duration — use <integer><s|m|h>, non-zero (e.g. 5s, 5m, 1h)")
+        })
+}
+
+/// What `task status --until` waits for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Until {
+    /// The task's `status` equals this (`closed`, `cancelled`, `stuck`).
+    Status(String),
+    /// The task has entered this stage (`stage:<name>`).
+    Stage(String),
+}
+
+impl FromStr for Until {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "closed" | "cancelled" | "stuck" => Ok(Until::Status(s.to_string())),
+            _ => match s.strip_prefix("stage:") {
+                Some(name) if !name.is_empty() => Ok(Until::Stage(name.to_string())),
+                _ => Err(format!(
+                    "'{s}' is not a valid target — use closed, cancelled, stuck or stage:<name>"
+                )),
+            },
+        }
+    }
+}
+
+impl fmt::Display for Until {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Until::Status(s) => write!(f, "{s}"),
+            Until::Stage(s) => write!(f, "stage:{s}"),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "choco", about = "HTTP client for chocofactoryd")]
@@ -86,10 +144,40 @@ pub struct McpServeArgs {
 pub enum TaskCmd {
     /// Create a task under a project, starting the named workflow.
     Create(TaskCreateArgs),
-    /// Show a task, its current stage, and how it got there.
+    /// Show a task, its stage and history; optionally watch or wait for it.
+    ///
+    /// With --live or --until the command keeps polling and its exit code
+    /// says how the watch ended:
+    ///
+    ///   0  the awaited target was reached (with --live alone: the task closed)
+    ///   1  an error (unknown task, API error, daemon unreachable)
+    ///   2  a usage error
+    ///   3  the task became stuck, and stuck was not the target
+    ///   4  the task was cancelled, and cancelled was not the target
+    ///   5  --timeout elapsed first
+    ///   6  the task closed without reaching the target
+    ///
+    /// --live alone does not stop at stuck (a human may retry it).
+    #[command(verbatim_doc_comment)]
+    #[command(group(ArgGroup::new("watching").args(["live", "until"]).multiple(true)))]
     Status {
         /// Task id.
         id: String,
+        /// Keep the view current until the task closes or is cancelled.
+        /// On a terminal the view is redrawn every poll; piped, one line is
+        /// printed per change; with --json, one JSON object per change.
+        #[arg(long)]
+        live: bool,
+        /// Block until the task reaches TARGET, then exit 0: `closed`,
+        /// `cancelled`, `stuck`, or `stage:<name>`. Implies watching.
+        #[arg(long, value_name = "TARGET")]
+        until: Option<Until>,
+        /// Poll cadence, `<integer><s|m|h>`. Needs --live or --until.
+        #[arg(long, value_parser = parse_duration_arg, default_value = "2s", requires = "watching")]
+        interval: DurationArg,
+        /// Give up after this long and exit 5. Needs --live or --until.
+        #[arg(long, value_parser = parse_duration_arg, requires = "watching")]
+        timeout: Option<DurationArg>,
     },
     /// Send a message into a task's active session (or resume a human_gate).
     Send {

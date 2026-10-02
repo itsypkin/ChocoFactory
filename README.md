@@ -525,6 +525,58 @@ review
 `task send` returns 202 with no body, so under `--json` it prints nothing
 at all rather than a message that would break a pipe.
 
+### Watching a task
+
+`choco task status <id>` can watch a task or wait on it, so scripts need no
+hand-written polling loop. It polls the daemon (`GET /tasks/<id>`).
+
+| Flag | Meaning |
+|---|---|
+| `--live` | Keep the view current until the task closes or is cancelled. |
+| `--until <target>` | Block until the task reaches `<target>`, then exit 0. Implies watching. |
+| `--interval <dur>` | Poll cadence. Default `2s`. Needs `--live` or `--until`. |
+| `--timeout <dur>` | Give up after this long and exit 5. Default: none. Needs `--live` or `--until`. |
+
+`<dur>` is `<integer><s|m|h>`, non-zero, the same spelling as workflow YAML
+(`5s`, `30s`, `5m`, `1h`). `<target>` is `closed`, `cancelled`, `stuck`, or
+`stage:<name>` (the task has entered that stage, even if it already left it
+between two polls). The `stage:` prefix keeps stage names apart from
+statuses. A `--live` watch alone does not stop at `stuck`, since a human may
+`choco task retry` it.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | The target was reached (with `--live` alone: the task closed). |
+| 1 | An error: unknown task, API error, or the daemon is unreachable (a connection lost mid-watch is retried; three failures in a row end it). |
+| 2 | A usage error. |
+| 3 | The task became stuck, and `stuck` was not the target. |
+| 4 | The task was cancelled, and `cancelled` was not the target. |
+| 5 | `--timeout` elapsed first. |
+| 6 | The task closed without reaching the target. |
+
+Every non-zero exit from a watch explains itself on stderr.
+
+```
+$ choco task status "$id" --until closed --timeout 2h
+$ case $? in
+    0) echo "done" ;;
+    3) echo "stuck — needs a human" ;;
+    4) echo "cancelled" ;;
+    5) echo "still running after 2h" ;;
+    *) echo "something else went wrong" ;;
+  esac
+```
+
+Watching in a terminal redraws the status view every poll:
+
+```
+$ choco task status "$id" --live
+```
+
+When stdout is piped, the output is one line per change, with no escape
+sequences. With `--json` it is NDJSON: one full task object per line, per
+change.
+
 ### Per-role config
 
 A workflow can declare more than one role — a `coder` and a `reviewer`, say —

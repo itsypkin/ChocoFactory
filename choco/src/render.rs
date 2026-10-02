@@ -643,7 +643,7 @@ fn value_text(value: &Value) -> String {
 /// and project names are free-form and reach the API unvalidated (`POST
 /// /tasks` takes any string, and a shell can pass `--title $'a\nb'`), so a
 /// raw one would otherwise split a row across lines and break the layout.
-fn single_line(text: &str) -> String {
+pub fn single_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
