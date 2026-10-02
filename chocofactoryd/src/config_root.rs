@@ -7,6 +7,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// `$HOME/.config/chocofactory`, or `None` if `$HOME` isn't set. Callers
@@ -56,6 +57,14 @@ const BUILTIN_WORKFLOW_PROMPTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The scripts `coding-task.yaml`'s `script_file:` fields reference (#101),
+/// seeded into `workflows_dir/scripts/` executable. Same embed-and-seed
+/// treatment as the prompts.
+const BUILTIN_WORKFLOW_SCRIPTS: &[(&str, &str)] = &[(
+    "open-pr.sh",
+    include_str!("../../workflows/scripts/open-pr.sh"),
+)];
+
 /// What [`seed_builtin_workflows`] actually did — which files it wrote for
 /// the first time and which were already present (issue #88: `choco project
 /// init-workflows` reports this back to the caller; the daemon's own
@@ -84,8 +93,17 @@ pub struct SeedReport {
 /// either by an earlier run or a concurrent one, which is exactly the
 /// desired end state either way (and is reported as `existing`, not
 /// `created`, since this call didn't write it).
-fn seed_one(path: &Path, source: &str) -> io::Result<bool> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
+///
+/// `mode` is applied at creation, on the same `create_new` open, so a script
+/// is never briefly present without its executable bits. It is never applied
+/// to an existing file.
+fn seed_one(path: &Path, source: &str, mode: u32) -> io::Result<bool> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+    {
         Ok(mut file) => {
             if let Err(err) = file.write_all(source.as_bytes()) {
                 // Otherwise a write failure partway through (e.g. disk
@@ -107,6 +125,8 @@ fn seed_one(path: &Path, source: &str) -> io::Result<bool> {
 
 /// Writes each of `BUILTIN_WORKFLOWS` into `workflows_dir/<name>.yaml` and
 /// each of `BUILTIN_WORKFLOW_PROMPTS` into `workflows_dir/prompts/<name>`,
+/// and each of `BUILTIN_WORKFLOW_SCRIPTS` (mode 0755) into
+/// `workflows_dir/scripts/<name>`,
 /// via [`seed_one`] — so neither a workflow definition nor a prompt file is
 /// ever overwritten once present. Creates `workflows_dir` (and its
 /// `prompts` subdirectory) if missing.
@@ -126,7 +146,7 @@ pub fn seed_builtin_workflows(workflows_dir: &Path) -> io::Result<SeedReport> {
     let mut report = SeedReport::default();
     for (name, source) in BUILTIN_WORKFLOWS {
         let path = workflows_dir.join(format!("{name}.yaml"));
-        if seed_one(&path, source)? {
+        if seed_one(&path, source, 0o644)? {
             report.created.push(path);
         } else {
             report.existing.push(path);
@@ -137,7 +157,18 @@ pub fn seed_builtin_workflows(workflows_dir: &Path) -> io::Result<SeedReport> {
     std::fs::create_dir_all(&prompts_dir)?;
     for (name, source) in BUILTIN_WORKFLOW_PROMPTS {
         let path = prompts_dir.join(name);
-        if seed_one(&path, source)? {
+        if seed_one(&path, source, 0o644)? {
+            report.created.push(path);
+        } else {
+            report.existing.push(path);
+        }
+    }
+
+    let scripts_dir = workflows_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir)?;
+    for (name, source) in BUILTIN_WORKFLOW_SCRIPTS {
+        let path = scripts_dir.join(name);
+        if seed_one(&path, source, 0o755)? {
             report.created.push(path);
         } else {
             report.existing.push(path);
@@ -187,7 +218,9 @@ mod tests {
         );
         assert_eq!(
             report.created.len(),
-            BUILTIN_WORKFLOWS.len() + BUILTIN_WORKFLOW_PROMPTS.len(),
+            BUILTIN_WORKFLOWS.len()
+                + BUILTIN_WORKFLOW_PROMPTS.len()
+                + BUILTIN_WORKFLOW_SCRIPTS.len(),
             "{report:?}"
         );
 
@@ -223,7 +256,9 @@ mod tests {
         assert!(second.created.is_empty(), "{second:?}");
         assert_eq!(
             second.existing.len(),
-            BUILTIN_WORKFLOWS.len() + BUILTIN_WORKFLOW_PROMPTS.len(),
+            BUILTIN_WORKFLOWS.len()
+                + BUILTIN_WORKFLOW_PROMPTS.len()
+                + BUILTIN_WORKFLOW_SCRIPTS.len(),
             "{second:?}"
         );
         let chat_path = dir.path.join("chat.yaml");
@@ -474,10 +509,17 @@ mod tests {
         assert_says(
             &squash(&rendered[done..]),
             &[
+                "Commit your revisions, and update the PR description file (step 4 of your \
+                 instructions) so it describes the branch as it now stands.",
+                "If the only thing you changed on this turn is that description, make an empty \
+                 commit (`git commit --allow-empty -m \"Update the PR description: <why>\"`)",
                 "In its summary, give one short line per item you were sent back for: what \
                  you changed, or that you didn't act on it and why.",
-                "Some can't be done from here, such as an edit to the PR description, since \
-                 you don't touch the PR. List those as not done rather than leaving them out.",
+                "A requested change to the PR's description is done by editing that file; the \
+                 workflow republishes it.",
+                "The PR's title comes from the task and can't be changed from here. List a \
+                 title change, and anything else you can't do from here, as not done rather \
+                 than leaving it out.",
             ],
             "the closing section must ask for an account of every item",
         );
@@ -629,5 +671,116 @@ mod tests {
                 });
             searched_from += found + section.len();
         }
+    }
+
+    fn embedded_prompt(name: &str) -> &'static str {
+        BUILTIN_WORKFLOW_PROMPTS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("{name} must be a seeded prompt"))
+            .1
+    }
+
+    const DESCRIPTION_PATH_COMMAND: &str =
+        r#"echo "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md""#;
+
+    #[test]
+    fn coder_system_step_four_asks_for_the_pr_description() {
+        let text = squash(embedded_prompt("coder-system.md"));
+        assert_says(
+            &text,
+            &[
+                "What the pull request says is up to you, through the description file in step 4.",
+                "4. Write the pull request's description to the file this command prints:",
+                DESCRIPTION_PATH_COMMAND,
+                "so it is never committed: don't `git add` it or copy it into the tree.",
+                "so write none of those, and no `Closes #…` line.",
+                "Write it as a short guide to the change for a human reviewer who hasn't read \
+                 the task: concise, in plain English, with no codebase jargon or shorthand of \
+                 your own, readable in about two minutes.",
+                "Write it on every turn, for the branch as a whole rather than for this turn's \
+                 commits, rewriting whatever an earlier turn left there.",
+                "Start where the request or the change enters the system",
+                "Put small incidental fixes last, together in one item.",
+                "5. Call `report_outcome`",
+            ],
+            "coder-system.md step 4 must ask for the PR description",
+        );
+        let mut at = 0;
+        for heading in [
+            "`## Problem`",
+            "`## Solution`",
+            "`## Changes, in reading order`",
+            "`## Look closely at`",
+            "`## Review history`",
+            "`## Not done`",
+        ] {
+            let found = text[at..]
+                .find(heading)
+                .unwrap_or_else(|| panic!("{heading} missing or out of order"));
+            at += found + heading.len();
+        }
+    }
+
+    #[test]
+    fn reviewer_turn_reads_the_pr_description() {
+        let text = squash(embedded_prompt("reviewer-turn.md"));
+        assert_says(
+            &text,
+            &[
+                r#"`cat "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`"#,
+                "A claim in it that the code doesn't bear out is a blocking finding",
+                "These are non-blocking findings: a missing description; one that leaves out a \
+                 change or a trade-off the diff makes; a change list that doesn't follow the \
+                 path a request takes through the code; and one that isn't short and in plain \
+                 English.",
+            ],
+            "reviewer-turn.md must have the reviewer check the PR description",
+        );
+    }
+
+    #[test]
+    fn seeding_writes_the_open_pr_script_executable_and_never_overwrites_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let script = dir.path.join("scripts/open-pr.sh");
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "mode {mode:o}");
+
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let second = seed_builtin_workflows(&dir.path).unwrap();
+        assert!(second.existing.contains(&script), "{second:?}");
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\nexit 7\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "an existing script is never re-chmodded"
+        );
+    }
+
+    /// The script is embedded verbatim and resolves from the seeded dir.
+    #[test]
+    fn the_seeded_open_pr_stage_resolves_its_script_file() {
+        use crate::workflow_def::{ShellCommand, StageKind};
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let def = crate::workflow_def::WorkflowDefinition::load(&dir.path.join("coding-task.yaml"))
+            .unwrap();
+        let StageKind::Shell { command, .. } = &def.stages["open_pr"].kind else {
+            panic!("open_pr must be a shell stage");
+        };
+        assert_eq!(
+            command,
+            &ShellCommand::ScriptFile(dir.path.join("scripts/open-pr.sh"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path.join("scripts/open-pr.sh")).unwrap(),
+            BUILTIN_WORKFLOW_SCRIPTS[0].1
+        );
     }
 }

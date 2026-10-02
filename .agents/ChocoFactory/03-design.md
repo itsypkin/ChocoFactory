@@ -420,10 +420,13 @@ Substitution rules, in full (P2-3):
   their JSON text. `null`, objects and arrays are an error — capture is
   for short structured signals (a verdict, an id, a url), and splicing a
   blob into a shell command is not something the format promises.
-- Only `command:` and `prompt_file` are templated. A `script_file` is an
-  executable in its own right and its contents are left alone; so is
-  live human input into an open `agent_turn`, which is what a person
-  typed rather than something the graph composed.
+- Only `command:`, `prompt_file` and the values of a `shell`/`poll` stage's
+  `env:` map are templated. A `script_file` is an executable in its own
+  right and its contents are left alone; so is live human input into an
+  open `agent_turn`, which is what a person typed rather than something
+  the graph composed. An `env:` value is rendered like a command and
+  handed to the child as an environment variable, never parsed by a
+  shell, and is capped at 64 KiB.
 - **Unresolvable references are errors, never empty strings.** Whatever
   the loader can settle it settles at load time: that the syntax parses,
   that the named stage exists, and that it declares a `capture:` at all
@@ -463,8 +466,10 @@ PR title) rather than authored by the role. Anyone templating a capture
 into a command that does more than echo it should treat the value as
 untrusted. Quoting on substitution was considered and rejected as a
 silent behaviour change: `"{{ x }}"` in an already-quoted context would
-gain literal quotes. If this needs closing, the honest fix is an
-explicit filter syntax, which the format doesn't have yet.
+gain literal quotes. The safe channel is `env:` (#101): render the value
+into an environment variable and quote it in the command as `"$NAME"`, or
+read it from a `script_file`, which is never templated. The built-in
+`open_pr` stage works this way.
 
 *`{{` is reserved everywhere in an inline `command:`.* A command that
 legitimately contains GitHub Actions syntax (`gh workflow run …
@@ -552,7 +557,11 @@ scripting runtime (see §7 non-goal):
   stages to reference (see templating, §5.1). An inline `command:` runs
   through `sh -c`, since these are shell strings and the examples above
   are pipelines; a `script_file:` is executed directly, so its `#!` line
-  picks the interpreter (and it must be executable). Exit code is the
+  picks the interpreter (and it must be executable). Its `env:` map (also
+  on `poll`) sets environment variables from templates, and the engine always
+  adds `CHOCO_TASK_ID`, `CHOCO_WORKFLOW`, `CHOCO_STAGE` and `CHOCO_ROLE_MODELS`
+  (the distinct `role=model` pairs the task's sessions ran on); names starting
+  with `CHOCO_` are reserved. Exit code is the
   *only* thing that decides the outcome — stdout that doesn't parse under
   `capture: json` is kept as text rather than failing the stage. An
   optional `timeout:` kills a command that runs too long and treats it as

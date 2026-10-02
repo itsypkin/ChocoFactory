@@ -366,7 +366,10 @@ fn ends_a_message(event_type: &str) -> bool {
         EventType::SessionNote => true,
         // Task-scoped (`session_id` is NULL), so unreachable from this
         // session-scoped query — classified anyway so the match stays total.
-        EventType::StageEntered | EventType::ShellOutput | EventType::TemplateUnresolved => false,
+        EventType::StageEntered
+        | EventType::ShellOutput
+        | EventType::TemplateUnresolved
+        | EventType::EnvTruncated => false,
     }
 }
 

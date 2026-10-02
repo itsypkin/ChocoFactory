@@ -97,40 +97,20 @@ stages:
     capture: text
     on: { resumed: revising }
 
-  # `gh pr create` has no `--json` flag — the PR's number/url can only be
-  # read back with a separate `gh pr view` after creating it. Earlier
-  # commands' stdout is discarded so `capture: json` sees only the last
-  # command's output.
-  # `gh pr create` fails outright when a PR for the branch already
-  # exists, which every lap after the first hits: `revising` pushes more
-  # commits to the same branch and comes back through here. The `||`
-  # makes the create conditional on the probe finding nothing, so a
-  # second lap re-pushes and reuses the open PR instead of taking the
-  # `error` edge into `escalate_to_human` (#78).
-  #
-  # `gh pr list --state open` rather than `gh pr view`: branch resolution
-  # in `gh pr view` matches a *closed or merged* PR too (its underlying
-  # query passes `states: null`). That would make the probe succeed on a
-  # branch whose PR a human already merged, skip the create, and hand
-  # every later stage a dead PR number to poll — checks and comments on a
-  # merged PR, for six hours. Reachable by the ordinary route: escalate,
-  # merge by hand, `choco task send`, `revising`. Both calls need the
-  # scope, the read-back as much as the probe.
-  #
-  # The trailing `grep .` is the fail-closed half: an empty read-back
-  # would otherwise hand `capture: json` a bare `null` and the failure
-  # would surface much later as a template error on `{{ stages.open_pr.
-  # number }}`. Failing here takes the `error` edge instead.
+  # The probe (`gh pr list --state open`, never `gh pr view`), the
+  # conditional create (#78), the refresh of an existing PR's description
+  # and the fail-closed read-back all live in `scripts/open-pr.sh`, with
+  # their rationale; read it there. Agent-written text reaches the script
+  # only through the `env:` map below and the description file the coder
+  # leaves in git's private directory — never through a shell command line
+  # (a `command:` is templated as raw text; a `script_file:` is not).
   open_pr:
     kind: shell
-    command: >-
-      git push -u origin HEAD >/dev/null &&
-      BRANCH="$(git rev-parse --abbrev-ref HEAD)" &&
-      (gh pr list --head "$BRANCH" --state open --json number
-      -q '.[0].number // empty' | grep -q . ||
-      gh pr create --fill >/dev/null) &&
-      gh pr list --head "$BRANCH" --state open --json number,url
-      -q '.[0] // empty' | grep .
+    script_file: scripts/open-pr.sh
+    env:
+      PR_TASK_TITLE: "{{ task.title }}"
+      PR_REVIEW_VERDICT: "{{ stages.internal_review.outcome }}"
+      PR_REVIEW_REPORT: "{{ stages.internal_review.summary }}"
     capture: json
     timeout: 5m
     on: { done: checks_polling, error: escalate_to_human }

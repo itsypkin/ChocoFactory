@@ -11,7 +11,10 @@
 //! The command inherits the daemon's environment wholesale, like every
 //! other subprocess this codebase spawns (`adapter/claude.rs`,
 //! `worktree.rs`) — a stage command is operator-authored YAML, trusted the
-//! same way the daemon's own configuration is. Output is buffered in full
+//! same way the daemon's own configuration is. The stage's `env:` and the
+//! engine's `CHOCO_*` variables are layered on top of that inheritance
+//! (#101); they are set as environment variables and never spliced into a
+//! string, so text an agent wrote cannot be parsed by a shell. Output is buffered in full
 //! before any cap is applied, so a command that prints without bound is
 //! bounded only by memory; that is the same exposure `worktree.rs` already
 //! carries, and streaming it would mean draining both pipes by hand for
@@ -198,6 +201,7 @@ pub async fn run(
     command: &ShellCommand,
     cwd: &Path,
     timeout: Option<Duration>,
+    env: &[(String, String)],
 ) -> Result<ShellOutcome, ShellError> {
     let mut cmd = match command {
         ShellCommand::Inline(line) => {
@@ -207,6 +211,9 @@ pub async fn run(
         }
         ShellCommand::ScriptFile(path) => Command::new(path),
     };
+
+    // Layered on the inherited environment; never turned into a string.
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
     cmd.current_dir(cwd)
         // Nothing is ever written to a stage command's stdin, and leaving
@@ -361,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn captures_stdout_of_a_successful_command() {
-        let outcome = run(&inline("printf 'hello'"), &std::env::temp_dir(), None)
+        let outcome = run(&inline("printf 'hello'"), &std::env::temp_dir(), None, &[])
             .await
             .unwrap();
 
@@ -377,6 +384,7 @@ mod tests {
             &inline("printf 'boom' >&2; exit 3"),
             &std::env::temp_dir(),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -394,6 +402,7 @@ mod tests {
             &inline("printf 'b\\na\\na\\n' | sort -u | tr -d '\\n'"),
             &std::env::temp_dir(),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -406,7 +415,7 @@ mod tests {
         let dir = TempDir::new();
         std::fs::write(dir.path().join("marker"), b"x").unwrap();
 
-        let outcome = run(&inline("ls"), dir.path(), None).await.unwrap();
+        let outcome = run(&inline("ls"), dir.path(), None, &[]).await.unwrap();
 
         assert_eq!(outcome.stdout.trim(), "marker");
     }
@@ -417,6 +426,7 @@ mod tests {
             &inline("sleep 30"),
             &std::env::temp_dir(),
             Some(Duration::from_millis(100)),
+            &[],
         )
         .await
         .unwrap();
@@ -452,6 +462,7 @@ mod tests {
             // yet — never failing spuriously, but quietly ceasing to test
             // anything.
             Some(Duration::from_millis(300)),
+            &[],
         )
         .await
         .unwrap();
@@ -474,6 +485,7 @@ mod tests {
             &inline("printf 'got this far'; sleep 30"),
             &std::env::temp_dir(),
             Some(Duration::from_secs(1)),
+            &[],
         )
         .await
         .unwrap();
@@ -488,6 +500,7 @@ mod tests {
             &inline("printf 'fast'"),
             &std::env::temp_dir(),
             Some(Duration::from_secs(30)),
+            &[],
         )
         .await
         .unwrap();
@@ -515,6 +528,7 @@ mod tests {
             &ShellCommand::ScriptFile(script),
             &std::env::temp_dir(),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -536,6 +550,7 @@ mod tests {
             &ShellCommand::ScriptFile(script),
             &std::env::temp_dir(),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -548,9 +563,14 @@ mod tests {
 
     #[tokio::test]
     async fn non_utf8_output_does_not_fail_the_run() {
-        let outcome = run(&inline("printf '\\377\\376'"), &std::env::temp_dir(), None)
-            .await
-            .unwrap();
+        let outcome = run(
+            &inline("printf '\\377\\376'"),
+            &std::env::temp_dir(),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert!(outcome.succeeded());
         assert!(!outcome.stdout.is_empty());
@@ -558,12 +578,51 @@ mod tests {
 
     #[tokio::test]
     async fn a_signal_killed_command_has_no_exit_code() {
-        let outcome = run(&inline("kill -TERM $$"), &std::env::temp_dir(), None)
+        let outcome = run(&inline("kill -TERM $$"), &std::env::temp_dir(), None, &[])
             .await
             .unwrap();
 
         assert_eq!(outcome.exit_code, None);
         assert!(!outcome.succeeded());
         assert!(!outcome.timed_out);
+    }
+
+    /// #101: text an agent wrote reaches the child as an environment
+    /// variable, so nothing in it is ever parsed by a shell.
+    #[tokio::test]
+    async fn env_values_are_never_parsed_by_a_shell() {
+        let dir = TempDir::new();
+        let d = dir.path().display();
+        let value = format!(
+            "\"quote\" 'single' $(touch {d}/a) `touch {d}/b` ; touch {d}/c \\ %s\nsecond line"
+        );
+        let outcome = run(
+            &inline("printf '%s' \"$X\""),
+            dir.path(),
+            None,
+            &[("X".to_string(), value.clone())],
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.succeeded());
+        assert_eq!(outcome.stdout, value);
+        for marker in ["a", "b", "c"] {
+            assert!(!dir.path().join(marker).exists(), "{marker} was created");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stage_env_variable_overrides_an_inherited_one() {
+        // PATH is always inherited; overriding it with a marker proves layering.
+        let outcome = run(
+            &inline("printf '%s' \"$HOME\""),
+            &std::env::temp_dir(),
+            None,
+            &[("HOME".to_string(), "/choco/override".to_string())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.stdout, "/choco/override");
     }
 }

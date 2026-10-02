@@ -34,6 +34,7 @@ use chocofactory_core::models::{
     EventType, Project, RetryMode, RetryOutcome, Session, SessionEndReason, SessionStatus, Task,
 };
 use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
@@ -2883,12 +2884,21 @@ impl WorkflowEngine {
                 command,
                 capture,
                 timeout,
+                env,
             } => {
-                let (command, unresolved) = render_command(command, payload, stage_name)?;
+                let (command, mut unresolved) = render_command(command, payload, stage_name)?;
+                let (env, env_unresolved, truncated) = self
+                    .stage_environment(task_id, definition, stage_name, env, payload)
+                    .await?;
+                unresolved.extend(env_unresolved);
                 self.record_unresolved_template_note(task_id, stage_name, &unresolved)
                     .await;
-                self.enter_shell(task_id, definition, stage_name, command, *capture, *timeout)
-                    .await
+                self.record_env_truncated_note(task_id, stage_name, &truncated)
+                    .await;
+                self.enter_shell(
+                    task_id, definition, stage_name, command, *capture, *timeout, env,
+                )
+                .await
             }
             StageKind::Poll {
                 command,
@@ -2896,13 +2906,20 @@ impl WorkflowEngine {
                 interval,
                 timeout: _,
                 outcomes,
+                env,
             } => {
-                let (command, unresolved) = render_command(command, payload, stage_name)?;
+                let (command, mut unresolved) = render_command(command, payload, stage_name)?;
+                let (env, env_unresolved, truncated) = self
+                    .stage_environment(task_id, definition, stage_name, env, payload)
+                    .await?;
+                unresolved.extend(env_unresolved);
                 self.record_unresolved_template_note(task_id, stage_name, &unresolved)
+                    .await;
+                self.record_env_truncated_note(task_id, stage_name, &truncated)
                     .await;
                 self.enter_poll(
                     task_id, definition, stage_name, command, *capture, *interval, outcomes,
-                    payload,
+                    payload, env,
                 )
                 .await
             }
@@ -2947,6 +2964,96 @@ impl WorkflowEngine {
             Err(err) => tracing::error!(
                 task_id, %err,
                 "failed to remove worktree after entering terminal stage"
+            ),
+        }
+    }
+
+    /// The stage's rendered `env:` followed by the engine's `CHOCO_*`
+    /// variables (so the engine's values win), plus what rendering left
+    /// unresolved and the names it truncated. Computed on entry and never
+    /// stored.
+    async fn stage_environment(
+        &self,
+        task_id: &str,
+        definition: &WorkflowDefinition,
+        stage_name: &str,
+        env: &IndexMap<String, String>,
+        payload: &Value,
+    ) -> Result<(Vec<(String, String)>, Vec<String>, Vec<String>), EngineError> {
+        let rendered = render_env(env, payload, stage_name)?;
+        let mut pairs = rendered.pairs;
+        pairs.extend(self.engine_env(task_id, definition, stage_name).await?);
+        Ok((pairs, rendered.unresolved, rendered.truncated))
+    }
+
+    /// The variables the engine itself sets on a `shell`/`poll` command
+    /// (#101): the task, workflow and stage, and the distinct `role=model`
+    /// pairs the task's sessions ran on.
+    async fn engine_env(
+        &self,
+        task_id: &str,
+        definition: &WorkflowDefinition,
+        stage_name: &str,
+    ) -> Result<Vec<(String, String)>, EngineError> {
+        let sessions = sessions::list_for_task(&self.pool, task_id).await?;
+        let mut pairs: Vec<(String, String)> = sessions
+            .into_iter()
+            .map(|s| {
+                let model = if s.model.is_empty() {
+                    "default".to_string()
+                } else {
+                    s.model
+                };
+                (s.role, model)
+            })
+            .collect();
+        pairs.sort();
+        pairs.dedup();
+        let role_models = pairs
+            .iter()
+            .map(|(role, model)| format!("{role}={model}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(vec![
+            ("CHOCO_TASK_ID".to_string(), task_id.to_string()),
+            ("CHOCO_WORKFLOW".to_string(), definition.name.clone()),
+            ("CHOCO_STAGE".to_string(), stage_name.to_string()),
+            ("CHOCO_ROLE_MODELS".to_string(), role_models),
+        ])
+    }
+
+    /// Records that an `env:` value was cut to `MAX_ENV_VALUE_BYTES`,
+    /// best-effort like `record_unresolved_template_note`. No-op when
+    /// nothing was truncated.
+    async fn record_env_truncated_note(&self, task_id: &str, stage_name: &str, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            task_id,
+            stage = stage_name,
+            ?names,
+            "stage env value exceeded the cap; truncated"
+        );
+        match events::append_for_task(
+            &self.pool,
+            task_id,
+            EventType::EnvTruncated,
+            json!({
+                "stage": stage_name,
+                "message": format!(
+                    "stage '{stage_name}' truncated env variable(s) {} to {MAX_ENV_VALUE_BYTES} bytes",
+                    names.join(", ")
+                ),
+                "env_truncated": names,
+            }),
+        )
+        .await
+        {
+            Ok(_) => self.events_notify.notify_waiters(),
+            Err(err) => tracing::error!(
+                task_id, stage = stage_name, %err,
+                "failed to record an env-truncated event"
             ),
         }
     }
@@ -2999,6 +3106,7 @@ impl WorkflowEngine {
     /// report its outcome, and `tokio::sync::Mutex` is not reentrant. The
     /// `agent_turn` path has the same constraint and resolves it the same
     /// way, via `spawn_turn_watcher`.
+    #[allow(clippy::too_many_arguments)]
     async fn enter_shell(
         self: &Arc<Self>,
         task_id: &str,
@@ -3007,6 +3115,7 @@ impl WorkflowEngine {
         command: ShellCommand,
         capture: Option<Capture>,
         timeout: Option<Duration>,
+        env: Vec<(String, String)>,
     ) -> Result<(), EngineError> {
         // Resolved here rather than in the spawned task so that a missing
         // task fails the transition that caused it, where the caller can
@@ -3024,6 +3133,7 @@ impl WorkflowEngine {
             capture,
             timeout,
             cwd,
+            env,
         );
         Ok(())
     }
@@ -3045,6 +3155,7 @@ impl WorkflowEngine {
         capture: Option<Capture>,
         timeout: Option<Duration>,
         cwd: PathBuf,
+        env: Vec<(String, String)>,
     ) {
         let engine = Arc::clone(self);
         // Registered so `cancel_task` can abort this runner and kill the
@@ -3062,6 +3173,7 @@ impl WorkflowEngine {
                     capture,
                     timeout,
                     cwd,
+                    env,
                 )
                 .await;
             engine.finish_runner(&task_id, runner_id);
@@ -3081,6 +3193,7 @@ impl WorkflowEngine {
         capture: Option<Capture>,
         timeout: Option<Duration>,
         cwd: PathBuf,
+        env: Vec<(String, String)>,
     ) {
         let described = describe_command(&command);
 
@@ -3092,7 +3205,7 @@ impl WorkflowEngine {
         // goes on the timeline, since it's the only place an operator would
         // find it.
         let started = std::time::Instant::now();
-        let outcome = match shell::run(&command, &cwd, timeout).await {
+        let outcome = match shell::run(&command, &cwd, timeout, &env).await {
             Ok(outcome) => outcome,
             Err(err) => {
                 // The two variants mean materially different things to
@@ -3515,6 +3628,7 @@ impl WorkflowEngine {
         interval: Duration,
         outcomes: &[PollOutcome],
         payload: &Value,
+        env: Vec<(String, String)>,
     ) -> Result<(), EngineError> {
         // The deadline was computed once, on entry, and stored in the same
         // write that moved the task here (#52). A missing or malformed
@@ -3555,6 +3669,7 @@ impl WorkflowEngine {
                 deadline,
                 outcomes: compiled,
                 cwd,
+                env,
             },
         );
         Ok(())
@@ -3683,7 +3798,7 @@ impl WorkflowEngine {
             // and the stage could never resolve. With no `timeout:` at all
             // there is no cap, and a hung command parks the task, the same
             // gap `shell` carries without one.
-            let outcome = match shell::run(&run.command, &run.cwd, remaining).await {
+            let outcome = match shell::run(&run.command, &run.cwd, remaining, &run.env).await {
                 Ok(outcome) => outcome,
                 // Nothing ran and nothing will: no `sh` on PATH, or a
                 // `script_file` that isn't executable. Retrying on an
@@ -5200,6 +5315,8 @@ struct PollRun {
     deadline: Option<DateTime<Utc>>,
     outcomes: poll::CompiledOutcomes,
     cwd: PathBuf,
+    /// Rendered once on stage entry (#101) and passed to every attempt.
+    env: Vec<(String, String)>,
 }
 
 /// A duration as whole milliseconds, saturating rather than wrapping — a
@@ -5639,6 +5756,63 @@ fn render_command(
         }
         ShellCommand::ScriptFile(path) => Ok((ShellCommand::ScriptFile(path.clone()), Vec::new())),
     }
+}
+
+/// The largest an `env:` value may be once rendered (#101). Linux rejects a
+/// single environment string over 128 KiB with `E2BIG`, which would fail
+/// every lap of the stage the same way.
+const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
+
+struct RenderedEnv {
+    pairs: Vec<(String, String)>,
+    unresolved: Vec<String>,
+    truncated: Vec<String>,
+}
+
+/// Renders each `env:` value like a command template (#101). Values over
+/// `MAX_ENV_VALUE_BYTES` are cut at a UTF-8 boundary and end in a suffix
+/// saying how much was kept.
+fn render_env(
+    env: &IndexMap<String, String>,
+    payload: &Value,
+    stage_name: &str,
+) -> Result<RenderedEnv, EngineError> {
+    let mut out = RenderedEnv {
+        pairs: Vec::with_capacity(env.len()),
+        unresolved: Vec::new(),
+        truncated: Vec::new(),
+    };
+    for (name, template_text) in env {
+        let (mut value, unresolved) =
+            template::render(template_text, payload).map_err(|err| EngineError::Template {
+                stage: stage_name.to_string(),
+                reason: err.to_string(),
+            })?;
+        out.unresolved.extend(unresolved);
+        if value.len() > MAX_ENV_VALUE_BYTES {
+            let total = value.len();
+            // The suffix's own length depends on the digits of `kept`, so
+            // settle it by iterating; two rounds always suffice.
+            let mut kept = MAX_ENV_VALUE_BYTES;
+            let suffix = loop {
+                let suffix = format!("\n[truncated by chocofactory: {kept} of {total} bytes]");
+                let budget = MAX_ENV_VALUE_BYTES - suffix.len();
+                let mut cut = budget.min(total);
+                while !value.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                if cut == kept {
+                    value.truncate(cut);
+                    break suffix;
+                }
+                kept = cut;
+            };
+            value.push_str(&suffix);
+            out.truncated.push(name.clone());
+        }
+        out.pairs.push((name.clone(), value));
+    }
+    Ok(out)
 }
 
 /// Stores a stage's captured stdout at `payload.stages.<stage>` (§5.1).
@@ -15719,5 +15893,271 @@ stages:
         let state = state_of(&pool, &task_id).await;
         assert!(state.payload.get("poll_window").is_none());
         engine.abort_detached_runners(&task_id).await;
+    }
+
+    // ---- #101: `env:` and the engine's CHOCO_* variables ----
+
+    fn hostile_text(marker_dir: &Path) -> String {
+        let d = marker_dir.display();
+        format!(
+            "he said \"hi\" 'there' $(touch {d}/a) `touch {d}/b` ; touch {d}/c \\ %s\nsecond line"
+        )
+    }
+
+    /// A reviewer-style `capture: json` turn whose report carries `summary`
+    /// feeds `env:` into a later shell stage, which prints it back.
+    #[tokio::test]
+    async fn env_carries_agent_text_to_a_shell_stage_without_a_shell_parsing_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: env-flow
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on: { done: echo }
+  echo:
+    kind: shell
+    command: "printf '%s' \"$X\""
+    env:
+      X: "{{ stages.review.summary }}"
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        let hostile = hostile_text(&dir);
+        let reply = json!({"outcome": "done", "summary": hostile}).to_string();
+        finish_review_turn_from_reply(&pool, &engine, &def, &task_id, &reply).await;
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        assert_eq!(payload["stages"]["echo"], json!(hostile));
+        for marker in ["a", "b", "c"] {
+            assert!(!dir.join(marker).exists(), "{marker} was created");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_engine_sets_the_choco_variables() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: choco-env
+stages:
+  show:
+    kind: shell
+    command: "printf '%s|%s|%s|%s' \"$CHOCO_TASK_ID\" \"$CHOCO_WORKFLOW\" \"$CHOCO_STAGE\" \"$CHOCO_ROLE_MODELS\""
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let engine = engine_with_adapter(pool.clone(), "unused");
+
+        for (sessions_to_seed, expected) in [
+            (
+                vec![
+                    ("reviewer", "claude-opus-5-5"),
+                    ("coder", "claude-sonnet-5-5"),
+                    ("coder", "claude-sonnet-5-5"),
+                ],
+                "coder=claude-sonnet-5-5, reviewer=claude-opus-5-5",
+            ),
+            (vec![("coder", "")], "coder=default"),
+            (vec![], ""),
+        ] {
+            let task_id = seed_task(&pool, &def.name).await;
+            for (role, model) in sessions_to_seed {
+                sessions::create(
+                    &pool,
+                    sessions::NewSession {
+                        task_id: &task_id,
+                        stage: "coding",
+                        role,
+                        cli_adapter: "claude",
+                        model,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            engine.start_task(&task_id, &def, None).await.unwrap();
+            let event = wait_until_shell_event_for(&pool, &task_id, "show").await;
+            assert_eq!(
+                event["stdout_tail"],
+                json!(format!("{task_id}|choco-env|show|{expected}")),
+                "for sessions of {expected:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_env_placeholders_join_the_commands_in_one_note() {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = r#"
+name: env-unresolved
+stages:
+  open_pr:
+    kind: shell
+    command: "printf '{\"number\": 42}'"
+    capture: json
+    on: { done: report }
+  report:
+    kind: shell
+    command: "printf '%s' '{{ stages.open_pr.gone }}'"
+    env:
+      X: "{{ stages.open_pr.missing }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let notes: Vec<_> = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::TemplateUnresolved)
+            .collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].payload["stage"], json!("report"));
+        assert_eq!(
+            notes[0].payload["placeholders"],
+            json!(["{{ stages.open_pr.gone }}", "{{ stages.open_pr.missing }}"])
+        );
+    }
+
+    #[test]
+    fn render_env_truncates_at_a_char_boundary_and_says_so() {
+        let mut env = IndexMap::new();
+        env.insert("BIG".to_string(), "{{ task.input }}".to_string());
+        env.insert("SMALL".to_string(), "ok".to_string());
+        let big = "é".repeat(40_000); // 80,000 bytes
+        let rendered = render_env(&env, &json!({"task": {"input": big}}), "s").unwrap();
+        assert_eq!(rendered.truncated, vec!["BIG".to_string()]);
+        let value = &rendered.pairs[0].1;
+        assert!(value.len() <= MAX_ENV_VALUE_BYTES);
+        let (kept_text, suffix) = value.split_once("\n[truncated by chocofactory: ").unwrap();
+        assert_eq!(
+            suffix,
+            format!("{} of 80000 bytes]", kept_text.len()),
+            "the suffix reports the kept length"
+        );
+        assert!(kept_text.chars().all(|c| c == 'é'));
+        assert_eq!(rendered.pairs[1], ("SMALL".to_string(), "ok".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_env_value_arrives_truncated_and_is_noted() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: env-big
+roles:
+  reviewer:
+    cli: claude
+    model: sonnet
+stages:
+  review:
+    kind: agent_turn
+    role: reviewer
+    capture: json
+    on: { done: echo }
+  echo:
+    kind: shell
+    command: "printf '%s' \"$X\""
+    env:
+      X: "{{ stages.review.summary }}"
+    capture: text
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        let reply = json!({"outcome": "done", "summary": "é".repeat(40_000)}).to_string();
+        finish_review_turn_from_reply(&pool, &engine, &def, &task_id, &reply).await;
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let payload = payload_of(&pool, &task_id).await;
+        let echoed = payload["stages"]["echo"].as_str().unwrap();
+        assert!(echoed.len() <= MAX_ENV_VALUE_BYTES);
+        assert!(
+            echoed.contains("\n[truncated by chocofactory: "),
+            "tail: {}",
+            &echoed[echoed.len() - 80..]
+        );
+        assert!(echoed.ends_with(" of 80000 bytes]"));
+
+        let note = events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == EventType::EnvTruncated)
+            .expect("a truncation note on the timeline");
+        assert_eq!(note.payload["stage"], json!("echo"));
+        assert_eq!(note.payload["env_truncated"], json!(["X"]));
+    }
+
+    #[tokio::test]
+    async fn a_poll_stages_env_reaches_every_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let script = dir.join("check.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nn=$(cat count 2>/dev/null || echo 0)\nn=$((n+1))\n\
+             echo $n > count\nif [ $n -ge 2 ]; then echo \"SUCCESS $X\"; else echo \"PENDING $X\"; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let yaml = format!(
+            r#"
+name: poll-env
+stages:
+  watch:
+    kind: poll
+    script_file: check.sh
+    interval: 1s
+    timeout: 30s
+    env:
+      X: "{{{{ task.title }}}}"
+{GREEN_OR_RED}
+    on: {{ green: finished, red: failed, timeout: stalled }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+  stalled:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "finished").await;
+
+        let events = poll_events(&pool, &task_id).await;
+        let tails: Vec<_> = events.iter().map(|e| e["stdout_tail"].clone()).collect();
+        assert_eq!(tails, vec![json!("PENDING T"), json!("SUCCESS T")]);
     }
 }

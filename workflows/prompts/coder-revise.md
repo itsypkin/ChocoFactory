@@ -75,8 +75,15 @@ left over from an earlier escalation, so ignore it.
 
 ## When you're done
 
-Commit your revisions. Then call `report_outcome` with the outcome `done`.
-In its summary, give one short line per item you were sent back for:
-what you changed, or that you didn't act on it and why. Some can't be
-done from here, such as an edit to the PR description, since you don't
-touch the PR. List those as not done rather than leaving them out.
+Commit your revisions, and update the PR description file (step 4 of your
+instructions) so it describes the branch as it now stands. If the only
+thing you changed on this turn is that description, make an empty commit
+(`git commit --allow-empty -m "Update the PR description: <why>"`): the
+PR's review is read against the latest commit, and without a new one the
+same request for changes would be read again. Then call `report_outcome`
+with the outcome `done`. In its summary, give one short line per item you
+were sent back for: what you changed, or that you didn't act on it and
+why. A requested change to the PR's description is done by editing that
+file; the workflow republishes it. The PR's title comes from the task and
+can't be changed from here. List a title change, and anything else you
+can't do from here, as not done rather than leaving it out.

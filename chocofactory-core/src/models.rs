@@ -369,6 +369,10 @@ pub enum EventType {
     /// blanked-out reference from that one render (one event per render
     /// call, not per placeholder).
     TemplateUnresolved,
+    /// A `shell`/`poll` stage's rendered `env:` value was over the size cap
+    /// and was cut (#101). Task-scoped like [`Self::TemplateUnresolved`].
+    /// Payload is `{"stage", "message", "env_truncated"}`.
+    EnvTruncated,
     /// The daemon itself acted on an agent session (#90): it nudged a turn
     /// that ended without calling `report_outcome`, gave up on one that
     /// never did, or killed a process that kept running after its turn had
@@ -394,6 +398,7 @@ impl fmt::Display for EventType {
             EventType::ShellOutput => "shell_output",
             EventType::TurnOutcome => "turn_outcome",
             EventType::TemplateUnresolved => "template_unresolved",
+            EventType::EnvTruncated => "env_truncated",
             EventType::SessionNote => "session_note",
         })
     }
@@ -427,6 +432,7 @@ impl FromStr for EventType {
             "shell_output" => Ok(EventType::ShellOutput),
             "turn_outcome" => Ok(EventType::TurnOutcome),
             "template_unresolved" => Ok(EventType::TemplateUnresolved),
+            "env_truncated" => Ok(EventType::EnvTruncated),
             "session_note" => Ok(EventType::SessionNote),
             other => Err(ParseEventTypeError(other.to_string())),
         }
@@ -525,6 +531,7 @@ mod tests {
             EventType::ShellOutput,
             EventType::TurnOutcome,
             EventType::TemplateUnresolved,
+            EventType::EnvTruncated,
             EventType::SessionNote,
         ] {
             assert_eq!(
