@@ -219,6 +219,17 @@ fn write_if_different(path: &Path, contents: &[u8], mode: u32) -> io::Result<()>
 /// is deleted. Any I/O error propagates.
 pub fn materialize_builtins(dir: &Path) -> io::Result<()> {
     set_dir_mode(dir)?;
+    // A `prompts`/`scripts` that is a symlink or a file must not be written
+    // through: remove it so it is recreated as a real directory.
+    for sub in ["prompts", "scripts"] {
+        let path = dir.join(sub);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => std::fs::remove_file(&path)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
     set_dir_mode(&dir.join("prompts"))?;
     set_dir_mode(&dir.join("scripts"))?;
 
@@ -430,6 +441,20 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     }
 
     #[test]
+    fn a_symlinked_subdirectory_is_replaced_not_written_through() {
+        let dir = TempDir::new();
+        let outside = TempDir::new();
+        std::fs::create_dir_all(&dir.path).unwrap();
+        std::fs::create_dir_all(&outside.path).unwrap();
+        std::os::unix::fs::symlink(&outside.path, dir.path.join("prompts")).unwrap();
+        materialize_builtins(&dir.path).unwrap();
+        let meta = std::fs::symlink_metadata(dir.path.join("prompts")).unwrap();
+        assert!(meta.file_type().is_dir());
+        assert_eq!(std::fs::read_dir(&outside.path).unwrap().count(), 0);
+        assert!(dir.path.join("prompts").join("coder-turn.md").exists());
+    }
+
+    #[test]
     fn materialize_again_is_idempotent_and_repairs_drift() {
         let dir = TempDir::new();
         materialize_builtins(&dir.path).unwrap();
@@ -451,6 +476,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         // `coding` keeps its bytes but gets mode 0644 (above).
         std::fs::write(dir.path.join("extra.yaml"), "x").unwrap();
         std::fs::write(dir.path.join("prompts").join("x.md"), "x").unwrap();
+        std::fs::create_dir_all(dir.path.join("prompts").join("sub").join("deep")).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", dir.path.join("scripts").join("link")).unwrap();
         let leftover = dir.path.join(".coding-task.yaml.choco-new");
         std::fs::write(&leftover, "stale").unwrap();
@@ -468,6 +494,10 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_eq!(mode_of(&coding), 0o444);
         assert!(!dir.path.join("extra.yaml").exists());
         assert!(!dir.path.join("prompts").join("x.md").exists());
+        assert!(
+            !dir.path.join("prompts").join("sub").exists(),
+            "stray dir removed"
+        );
         assert!(
             std::fs::symlink_metadata(dir.path.join("scripts").join("link")).is_err(),
             "symlink removed"

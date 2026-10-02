@@ -136,6 +136,19 @@ pub async fn count_active_with_workflow_path_prefix(
     .await
 }
 
+/// The `workflow_def` of every `open` or `stuck` task with no recorded
+/// `workflow_path` (created before #88).
+pub async fn active_workflow_defs_without_path(
+    pool: &SqlitePool,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT workflow_def FROM tasks WHERE status IN ('open', 'stuck') \
+         AND workflow_path IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Sets `tasks.status` unconditionally and clears `stuck_reason` (X-4,
 /// issue #61): `mark_stuck` is the only writer of a non-null reason, so any
 /// other status change — closing, cancelling, or reopening via this
@@ -327,6 +340,44 @@ mod tests {
                 ("stuck".to_string(), 2)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn counts_only_active_tasks_under_the_folder_prefix() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = seed_project(&pool).await;
+        let cases = [
+            ("open", Some("/x/workflows/chat.yaml")),
+            ("stuck", Some("/x/workflows/sub/a.yaml")),
+            ("closed", Some("/x/workflows/chat.yaml")),
+            ("open", Some("/x/workflows2/chat.yaml")),
+            ("open", Some("builtin:chat@1")),
+            ("open", None),
+            ("stuck", None),
+            ("closed", None),
+        ];
+        for (status, path) in cases {
+            let task = create(
+                &pool,
+                NewTask {
+                    project_id: &project_id,
+                    workflow_def: "chat",
+                    title: "T",
+                    config: json!({}),
+                    workflow_path: path,
+                    workflow_sha256: None,
+                },
+            )
+            .await
+            .unwrap();
+            update_status(&pool, &task.id, status).await.unwrap();
+        }
+        let n = count_active_with_workflow_path_prefix(&pool, "/x/workflows/")
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        let defs = active_workflow_defs_without_path(&pool).await.unwrap();
+        assert_eq!(defs, vec!["chat".to_string(), "chat".to_string()]);
     }
 
     #[tokio::test]

@@ -1152,6 +1152,26 @@ stages:
         assert_eq!(detail["workflow_file_status"], "missing");
     }
 
+    /// A built-in that vanished from the daemon's copy is a conflict, not a
+    /// server error, for both send and retry.
+    #[tokio::test]
+    async fn a_vanished_builtin_is_a_conflict_on_send_and_retry() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+        std::fs::remove_file(server.builtin_workflow_path("chat")).unwrap();
+        let send = server
+            .post(
+                &format!("/tasks/{task_id}/messages"),
+                json!({ "text": "hi" }),
+            )
+            .await;
+        assert_eq!(send.status(), 409, "{}", send.json());
+        let retry = server
+            .post(&format!("/tasks/{task_id}/retry"), json!({}))
+            .await;
+        assert_eq!(retry.status(), 409, "{}", retry.json());
+    }
+
     /// `POST /tasks` with `workflow_file` (#129): an absolute path is
     /// recorded canonically; both or neither field, a relative path and a
     /// missing file are all refused.

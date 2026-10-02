@@ -639,12 +639,12 @@ mod tests {
         Client::new("http://127.0.0.1:4141".to_string())
     }
 
-    static CHAT: WorkflowArg = WorkflowArg::Name(String::new());
+    static EMPTY_NAME: WorkflowArg = WorkflowArg::Name(String::new());
 
     fn params(config: Option<Value>) -> CreateTaskParams<'static> {
         CreateTaskParams {
             project_id: "p",
-            workflow: &CHAT,
+            workflow: &EMPTY_NAME,
             title: "t",
             prompt: "hi",
             config,

@@ -1952,6 +1952,86 @@ async fn real_binary_materializes_the_builtins_and_does_not_create_the_old_folde
     );
 }
 
+/// A task whose recorded workflow path is inside the old folder is counted by
+/// the startup report after a restart.
+#[tokio::test]
+async fn real_binary_counts_tasks_still_using_the_old_workflows_folder() {
+    let home = TempHome::new();
+    let old = home.0.join(".config/chocofactory/workflows");
+    std::fs::create_dir_all(&old).unwrap();
+    let custom = old.join("chat.yaml");
+    let chat = chocofactoryd::config_root::builtin_files()
+        .into_iter()
+        .find(|(relative, _, _)| relative == std::path::Path::new("chat.yaml"))
+        .unwrap()
+        .1;
+    std::fs::write(&custom, chat).unwrap();
+    let client = reqwest::Client::new();
+
+    async fn start(
+        home: &std::path::Path,
+        client: &reqwest::Client,
+    ) -> (tokio::process::Child, String) {
+        let port = free_port();
+        let child = spawn_raw(
+            home,
+            &[
+                ("CHOCOFACTORY_PORT", &port.to_string()),
+                ("RUST_LOG", "info"),
+            ],
+        );
+        let base = format!("http://127.0.0.1:{port}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(resp) = client.get(format!("{base}/projects")).send().await
+                && resp.status().is_success()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon never became ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        (child, base)
+    }
+
+    let (mut child, base) = start(&home.0, &client).await;
+    let project: Value = client
+        .post(format!("{base}/projects"))
+        .json(&json!({ "name": "demo" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&json!({
+            "project_id": project["id"].as_str().unwrap(),
+            "workflow_file": custom.to_str().unwrap(),
+            "title": "t",
+            "prompt": "hi",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{:?}", resp.text().await);
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+
+    let (mut child, _base) = start(&home.0, &client).await;
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(
+        stderr.contains("1 tasks still use workflows in"),
+        "{stderr}"
+    );
+}
+
 /// A `$HOME` that still has the old folder: an edited `chat.yaml` is warned
 /// about with both remedies, an identical `coding-task.yaml` is counted as a
 /// stale copy, nothing in the folder is touched, and a new `chat` task uses

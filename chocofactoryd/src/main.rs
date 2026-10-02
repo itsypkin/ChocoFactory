@@ -321,7 +321,15 @@ async fn report_legacy_workflows(pool: &sqlx::SqlitePool, legacy_dir: &std::path
         scan.dir.clone()
     });
     let prefix = format!("{}/", canonical.display());
-    let in_use = tasks_using_prefix(pool, &prefix).await;
+    let mut in_use = tasks_using_prefix(pool, &prefix).await;
+    // Pre-#88 tasks have no recorded path and still load `<folder>/<name>.yaml`.
+    let legacy_defs = db::tasks::active_workflow_defs_without_path(pool)
+        .await
+        .expect("chocofactoryd: failed to list tasks without a recorded workflow path");
+    in_use += legacy_defs
+        .iter()
+        .filter(|name| scan.dir.join(format!("{name}.yaml")).is_file())
+        .count() as i64;
     if in_use > 0 {
         tracing::warn!(
             "{in_use} tasks still use workflows in {dir}; leave it in place until they finish"
