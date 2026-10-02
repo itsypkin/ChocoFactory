@@ -170,6 +170,9 @@ pub struct WorkflowEngine {
     /// (a request still running past the HTTP drain deadline) is aborted
     /// on the spot instead of living until the runtime is dropped.
     runners_stopping: std::sync::atomic::AtomicBool,
+    /// Handles aborted at attach time because shutdown had begun; a later
+    /// `abort_all_detached_runners` pass awaits them.
+    late_aborted_runners: std::sync::Mutex<Vec<JoinHandle<()>>>,
     /// Wall-clock source for every `poll` budget computation (#52). Never
     /// `Instant`: it and tokio's timers stand still while the machine
     /// sleeps, so a `timeout:` measured on them is not calendar time.
@@ -1082,6 +1085,7 @@ impl WorkflowEngine {
             detached_runners: std::sync::Mutex::new(HashMap::new()),
             next_runner_id: AtomicU64::new(0),
             runners_stopping: std::sync::atomic::AtomicBool::new(false),
+            late_aborted_runners: std::sync::Mutex::new(Vec::new()),
             wall_clock,
         })
     }
@@ -2274,6 +2278,10 @@ impl WorkflowEngine {
         // by it or aborted here.
         if self.runners_stopping.load(Ordering::SeqCst) {
             handle.abort();
+            self.late_aborted_runners
+                .lock()
+                .expect("late_aborted_runners mutex poisoned")
+                .push(handle);
             return;
         }
         if let Some(slot) = runners.get_mut(task_id).and_then(|task| task.get_mut(&id)) {
@@ -2301,7 +2309,7 @@ impl WorkflowEngine {
     /// future is dropped (so each process-group guard has SIGKILLed its
     /// group). Used at shutdown, before the daemon lock is released.
     pub async fn abort_all_detached_runners(&self) {
-        let handles: Vec<JoinHandle<()>> = {
+        let mut handles: Vec<JoinHandle<()>> = {
             let mut runners = self
                 .detached_runners
                 .lock()
@@ -2312,6 +2320,14 @@ impl WorkflowEngine {
                 .flat_map(|(_, task)| task.into_values().flatten())
                 .collect()
         };
+        // Runners attached after shutdown began were aborted at attach;
+        // await them too so their groups are dead before the lock drops.
+        handles.append(
+            &mut self
+                .late_aborted_runners
+                .lock()
+                .expect("late_aborted_runners mutex poisoned"),
+        );
         for handle in handles {
             handle.abort();
             let _ = handle.await;
@@ -16704,6 +16720,62 @@ stages:
             }
         })
         .await;
+    }
+
+    /// A runner attached after shutdown began must be aborted at once, so
+    /// its process group never survives.
+    #[tokio::test]
+    async fn runner_attached_after_shutdown_is_aborted() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let gc = dir.join("gc");
+        let yaml = format!(
+            r#"
+name: hang-flow
+stages:
+  run:
+    kind: shell
+    command: "sleep 600 & echo $! > {}; wait"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+            gc.display()
+        );
+        std::fs::write(dir.join("hang-flow.yaml"), &yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "run").await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.abort_all_detached_runners().await;
+        engine.park_interrupted_turns().await.unwrap();
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+
+        // The runner may be killed before it writes the pid file, so the
+        // file is optional; if it appears, that process must die.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut pid = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&gc)
+                && let Ok(p) = s.trim().parse::<u32>()
+            {
+                pid = Some(p);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        engine.abort_all_detached_runners().await;
+        assert!(engine.late_aborted_runners.lock().unwrap().is_empty());
+        if let Some(pid) = pid {
+            crate::test_support::wait_until("the grandchild to die", || async {
+                if process_alive(pid) {
+                    Err("still alive".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+        }
     }
 
     #[tokio::test]
