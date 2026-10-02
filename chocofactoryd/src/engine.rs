@@ -2029,10 +2029,14 @@ impl WorkflowEngine {
         // (`current_stage`, `loop_counters`, `arrival` all come through
         // untouched). It lands *before* the reopen so a failed write leaves
         // the task `stuck`, unchanged.
-        let payload = if matches!(stage_def.kind, StageKind::Poll { .. }) {
-            let mut payload = state.payload.clone();
-            set_poll_window(&mut payload, &definition, &current_stage, self.now())
-                .map_err(RetryTaskError::Enter)?;
+        // For a stage that is no longer a poll, the same call removes a stale
+        // window (so a later restart can't mistake it for an interrupted
+        // poll); nothing is written when the payload comes out unchanged.
+        let mut new_payload = state.payload.clone();
+        set_poll_window(&mut new_payload, &definition, &current_stage, self.now())
+            .map_err(RetryTaskError::Enter)?;
+        let payload = if new_payload != state.payload {
+            let payload = new_payload;
             workflow_state::update(
                 &self.pool,
                 task_id,
@@ -15001,8 +15005,20 @@ stages:
         json!({ "stage": stage, "entered_at": rfc(entered), "deadline": deadline.map(rfc) })
     }
 
+    /// True for an event a poll records for an attempt that really ran its
+    /// command: not the `attempt: 0` timeout entry, and not a decisive one.
+    fn is_real_attempt(event: &Value) -> bool {
+        event["attempt"].as_u64().is_some_and(|n| n >= 1) && event.get("note").is_none()
+    }
+
     async fn wait_for_poll_attempt(pool: &SqlitePool, task_id: &str) {
-        wait_until_poll_attempt_recorded(pool, task_id).await;
+        for _ in 0..600 {
+            if poll_events(pool, task_id).await.iter().any(is_real_attempt) {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for a real poll attempt");
     }
 
     async fn state_of(
@@ -15243,7 +15259,13 @@ stages:
                 .any(|(s, o)| s == "watch" && o == &json!("restart"))
         );
         wait_until_stage(&pool, &task_id, "stalled").await;
-        assert!(!poll_events(&pool, &task_id).await.is_empty());
+        assert!(
+            poll_events(&pool, &task_id)
+                .await
+                .iter()
+                .any(is_real_attempt),
+            "the remaining budget must allow at least one real attempt"
+        );
     }
 
     #[tokio::test]
@@ -15491,6 +15513,7 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
         engine.advance(&task_id, &def, "resumed").await.unwrap();
         wait_for_poll_attempt(&pool, &task_id).await;
+        assert_eq!(state_of(&pool, &task_id).await.current_stage, "watch");
         offset.store(6 * 3600 + 1, std::sync::atomic::Ordering::SeqCst);
         wait_until_stage(&pool, &task_id, "stalled").await;
     }
@@ -15555,5 +15578,146 @@ stages:
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::PollWindow { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_overflowing_timeout_is_a_poll_window_error_and_writes_nothing() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let def = write_poll_flow(
+            &dir,
+            "huge-flow",
+            "echo PENDING",
+            Some("3000000000h"),
+            false,
+        );
+        let now = Utc::now();
+        let mut payload = json!({});
+        let err = set_poll_window(&mut payload, &def, "watch", now).unwrap_err();
+        assert!(matches!(err, EngineError::PollWindow { .. }));
+        assert!(payload.get("poll_window").is_none());
+
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        // gate -> watch overflows: the advance must fail before any write.
+        let _ = engine.advance(&task_id, &def, "resumed").await;
+        let state = state_of(&pool, &task_id).await;
+        assert_eq!(state.current_stage, "gate");
+        assert!(state.payload.get("poll_window").is_none());
+        assert_eq!(runner_slots(&engine, &task_id), 0);
+    }
+
+    #[tokio::test]
+    async fn an_overflowing_timeout_fails_start_task_without_creating_state() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let yaml = r#"
+name: huge-entry
+stages:
+  watch:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    timeout: 3000000000h
+    outcomes:
+      - match: "NEVER_MATCHES_XYZ"
+        then: green
+    on: { green: finished, timeout: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &dir).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        let err = engine.start_task(&task_id, &def, None).await.unwrap_err();
+        assert!(matches!(err, EngineError::PollWindow { .. }), "{err:?}");
+        assert!(
+            workflow_state::get(&pool, &task_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_marks_a_task_stuck_when_its_workflow_state_cannot_be_read() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let now = Utc::now();
+        let payload = json!({ "poll_window": window_json("watch", now, Some(now + chrono::Duration::hours(1))) });
+        write_poll_flow(&dir, "bad-json", "echo PENDING", Some("1h"), false);
+        let bad = seed_in_project(&pool, &project_id, "bad-json", &dir).await;
+        seed_row(&pool, &bad, "watch", payload.clone()).await;
+        sqlx::query("UPDATE workflow_state SET payload = '{' WHERE task_id = ?")
+            .bind(&bad)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ok = seed_in_project(&pool, &project_id, "bad-json", &dir).await;
+        seed_row(&pool, &ok, "watch", payload).await;
+
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        assert_eq!(report.stuck, 1);
+        assert_eq!(report.resumed, 1);
+        let task = tasks::get(&pool, &bad).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        assert!(task.stuck_reason.unwrap().contains("workflow state"));
+        assert_eq!(
+            tasks::get(&pool, &ok).await.unwrap().unwrap().status,
+            "open"
+        );
+        engine.abort_detached_runners(&ok).await;
+    }
+
+    #[tokio::test]
+    async fn the_sweep_skips_open_tasks_without_state_or_with_an_unloadable_non_poll_workflow() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        write_poll_flow(&dir, "skip-flow", "echo PENDING", Some("1h"), false);
+
+        // Open task with no workflow_state row.
+        let no_state = seed_in_project(&pool, &project_id, "skip-flow", &dir).await;
+
+        // Non-poll stage, no window, workflow file gone: warn and skip.
+        let gone = seed_in_project(&pool, &project_id, "vanished-flow", &dir).await;
+        seed_row(&pool, &gone, "gate", json!({})).await;
+
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        assert_eq!(report, PollSweepReport::default());
+        for id in [&no_state, &gone] {
+            assert_eq!(tasks::get(&pool, id).await.unwrap().unwrap().status, "open");
+            assert!(events::list_for_task(&pool, id).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn retrying_a_stuck_non_poll_stage_drops_a_stale_window() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        std::fs::write(
+            dir.join("redefined.yaml"),
+            "name: redefined\nstages:\n  watch:\n    kind: shell\n    command: \"sleep 30\"\n    on: { done: finished }\n  finished:\n    kind: terminal\n",
+        )
+        .unwrap();
+        let task_id = seed_task_in(&pool, "redefined", &dir).await;
+        let now = Utc::now();
+        seed_row(
+            &pool,
+            &task_id,
+            "watch",
+            json!({ "poll_window": window_json("watch", now, None) }),
+        )
+        .await;
+        tasks::mark_stuck(&pool, &task_id, "x").await.unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        let state = state_of(&pool, &task_id).await;
+        assert!(state.payload.get("poll_window").is_none());
+        engine.abort_detached_runners(&task_id).await;
     }
 }
