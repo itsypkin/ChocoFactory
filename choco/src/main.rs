@@ -54,26 +54,40 @@ fn canonicalize_repo(path: &str) -> Result<String, ClientError> {
 /// daemon published in its lock file; else the default port. A lock file that
 /// cannot be read falls through to the default, but says so on stderr.
 fn resolve_base_url(explicit: Option<String>) -> String {
-    resolve_base_url_in(chocofactory_core::paths::config_root().as_deref(), explicit)
+    let (url, warning) =
+        resolve_base_url_in(chocofactory_core::paths::config_root().as_deref(), explicit);
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    url
 }
 
-fn resolve_base_url_in(root: Option<&std::path::Path>, explicit: Option<String>) -> String {
+/// Returns the URL and, when the lock file could not be read, the warning to print.
+fn resolve_base_url_in(
+    root: Option<&std::path::Path>,
+    explicit: Option<String>,
+) -> (String, Option<String>) {
     use chocofactory_core::daemon_lock::{LockState, read_lock};
     if let Some(url) = explicit {
-        return url;
+        return (url, None);
     }
+    let mut warning = None;
     if let Some(root) = root
         && root.exists()
     {
         match read_lock(root) {
-            Ok(LockState::Running(info)) => return format!("http://127.0.0.1:{}", info.port),
+            Ok(LockState::Running(info)) => {
+                return (format!("http://127.0.0.1:{}", info.port), None);
+            }
             Ok(LockState::NotRunning { .. }) => {}
-            Err(err) => eprintln!(
-                "warning: could not read the daemon lock file ({err}); using http://127.0.0.1:4141"
-            ),
+            Err(err) => {
+                warning = Some(format!(
+                    "warning: could not read the daemon lock file ({err}); using http://127.0.0.1:4141"
+                ))
+            }
         }
     }
-    "http://127.0.0.1:4141".to_string()
+    ("http://127.0.0.1:4141".to_string(), warning)
 }
 
 #[tokio::main]
@@ -378,10 +392,13 @@ mod tests {
         let root = tmp("explicit");
         assert_eq!(
             resolve_base_url_in(Some(&root), Some("http://x:1".into())),
-            "http://x:1"
+            ("http://x:1".to_string(), None)
         );
-        assert_eq!(resolve_base_url_in(Some(&root), None), DEFAULT);
-        assert_eq!(resolve_base_url_in(None, None), DEFAULT);
+        assert_eq!(
+            resolve_base_url_in(Some(&root), None),
+            (DEFAULT.to_string(), None)
+        );
+        assert_eq!(resolve_base_url_in(None, None), (DEFAULT.to_string(), None));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -393,7 +410,10 @@ mod tests {
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
         // Running as root can still open it; then there is no error to test.
         if chocofactory_core::daemon_lock::read_lock(&root).is_err() {
-            assert_eq!(resolve_base_url_in(Some(&root), None), DEFAULT);
+            let (url, warning) = resolve_base_url_in(Some(&root), None);
+            assert_eq!(url, DEFAULT);
+            let w = warning.expect("an unreadable lock file must warn");
+            assert!(w.starts_with("warning:") && w.contains("lock file"), "{w}");
         }
         let _ = std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600));
         let _ = std::fs::remove_dir_all(&root);

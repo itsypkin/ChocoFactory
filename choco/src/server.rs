@@ -307,10 +307,18 @@ async fn restart(force: bool, port: Option<u16>) -> Result<u8, Failure> {
         LockState::Running(info) => {
             let old_port = info.port;
             let code = stop_running(&root, info, force).await?;
-            if code != 0 {
+            if code == EXIT_NOT_RUNNING_OR_REFUSED {
                 return Ok(code);
             }
-            start(port.or(Some(old_port))).await
+            // Code 1 means stop had to SIGKILL the daemon (the lock is released and a
+            // warning was printed). The user still wants a daemon, so start one and
+            // keep exit 1 as the warning.
+            let started = start(port.or(Some(old_port))).await?;
+            Ok(if code != 0 && started == 0 {
+                code
+            } else {
+                started
+            })
         }
         LockState::NotRunning { .. } => {
             println!("chocofactoryd was not running; starting it");
@@ -341,16 +349,18 @@ async fn status(json: bool) -> Result<u8, Failure> {
     };
     let log = log_path(&root);
     // The render below already warns about a version mismatch.
-    let server: ServerStatus = Client::new(url(&info))
-        .without_version_check()
-        .server_status(STATUS_TIMEOUT)
-        .await
-        .map_err(|e| {
-            format!(
-                "chocofactoryd (pid {}, port {}) holds the lock but isn't answering: {e}",
-                info.pid, info.port
-            )
-        })?;
+    let client = Client::new(url(&info));
+    let client = if json {
+        client
+    } else {
+        client.without_version_check()
+    };
+    let server: ServerStatus = client.server_status(STATUS_TIMEOUT).await.map_err(|e| {
+        format!(
+            "chocofactoryd (pid {}, port {}) holds the lock but isn't answering: {e}",
+            info.pid, info.port
+        )
+    })?;
     if json {
         println!(
             "{}",

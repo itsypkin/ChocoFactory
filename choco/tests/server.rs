@@ -522,6 +522,77 @@ fn start_times_out_without_killing_a_daemon_that_never_answers() {
 }
 
 #[test]
+fn start_keeps_waiting_through_an_unreadable_lock_and_reports_it() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root can open a mode-000 file; nothing to test
+    }
+    let env = Env::new();
+    let dir = env.home.join("fake");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
+    let pidfile = dir.join("pid");
+    let lockfile = env.root().join("chocofactoryd.lock");
+    let fake = dir.join("chocofactoryd");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ > {}\n: > {lock}\nchmod 000 {lock}\nexec sleep 120\n",
+            pidfile.display(),
+            lock = lockfile.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let started = std::time::Instant::now();
+    let out = env.choco_at(&dir.join("choco"), &["server", "start", "--port", "0"]);
+    let elapsed = started.elapsed();
+    // The pid comes from the fake's own pidfile; this test started it.
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = std::fs::set_permissions(&lockfile, std::fs::Permissions::from_mode(0o600));
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        elapsed >= std::time::Duration::from_secs(25),
+        "start gave up after {elapsed:?} instead of waiting out the timeout"
+    );
+    let err = stderr(&out);
+    assert!(err.contains("did not answer within 30s"), "{err}");
+    assert!(err.contains("last lock error"), "{err}");
+}
+
+#[test]
+fn start_reports_a_log_it_cannot_inspect() {
+    let env = Env::new();
+    let logs = env.root().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    // A self-referencing symlink: stat fails with ELOOP, not NotFound.
+    std::os::unix::fs::symlink("chocofactoryd.log", logs.join("chocofactoryd.log")).unwrap();
+    let out = env.choco(&["server", "start", "--port", "0"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stderr(&out).contains("cannot inspect"), "{}", text(&out));
+}
+
+#[test]
+fn restart_starts_a_daemon_even_when_stop_had_to_kill_the_old_one() {
+    let env = Env::new();
+    let info = env.start();
+    unsafe { libc::kill(info.pid as i32, libc::SIGSTOP) };
+    let out = env.choco(&["server", "restart", "--force"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stdout(&out).contains("was killed"), "{}", text(&out));
+    assert!(stdout(&out).contains("started"), "{}", text(&out));
+    let now = env.running();
+    assert_ne!(now.pid, info.pid);
+    assert_eq!(now.port, info.port);
+}
+
+#[test]
 fn oversized_log_is_rotated() {
     let env = Env::new();
     let logs = env.root().join("logs");
