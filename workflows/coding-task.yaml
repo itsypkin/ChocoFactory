@@ -3,7 +3,7 @@ worktree: true
 roles:
   coder:
     cli: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     system_prompt_file: prompts/coder-system.md
   reviewer:
     cli: claude
