@@ -54,14 +54,18 @@ fn canonicalize_repo(path: &str) -> Result<String, ClientError> {
 /// daemon published in its lock file; else the default port. A lock file that
 /// cannot be read falls through to the default, but says so on stderr.
 fn resolve_base_url(explicit: Option<String>) -> String {
+    resolve_base_url_in(chocofactory_core::paths::config_root().as_deref(), explicit)
+}
+
+fn resolve_base_url_in(root: Option<&std::path::Path>, explicit: Option<String>) -> String {
     use chocofactory_core::daemon_lock::{LockState, read_lock};
     if let Some(url) = explicit {
         return url;
     }
-    if let Some(root) = chocofactory_core::paths::config_root()
+    if let Some(root) = root
         && root.exists()
     {
-        match read_lock(&root) {
+        match read_lock(root) {
             Ok(LockState::Running(info)) => return format!("http://127.0.0.1:{}", info.port),
             Ok(LockState::NotRunning { .. }) => {}
             Err(err) => eprintln!(
@@ -352,5 +356,46 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         // return is ever removed without updating this arm too.
         Command::McpServe(_) => unreachable!("McpServe is handled in main() before run()"),
         Command::Server(_) => unreachable!("Server is handled in main() before run()"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_base_url_in;
+    use std::os::unix::fs::PermissionsExt;
+
+    const DEFAULT: &str = "http://127.0.0.1:4141";
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("choco-resolve-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn explicit_url_wins_and_missing_root_uses_default() {
+        let root = tmp("explicit");
+        assert_eq!(
+            resolve_base_url_in(Some(&root), Some("http://x:1".into())),
+            "http://x:1"
+        );
+        assert_eq!(resolve_base_url_in(Some(&root), None), DEFAULT);
+        assert_eq!(resolve_base_url_in(None, None), DEFAULT);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unreadable_lock_file_falls_back_to_the_default() {
+        let root = tmp("unreadable");
+        let lock = root.join("chocofactoryd.lock");
+        std::fs::write(&lock, "{}").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root can still open it; then there is no error to test.
+        if chocofactory_core::daemon_lock::read_lock(&root).is_err() {
+            assert_eq!(resolve_base_url_in(Some(&root), None), DEFAULT);
+        }
+        let _ = std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

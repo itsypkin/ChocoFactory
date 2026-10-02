@@ -333,6 +333,12 @@ impl Client {
         }
     }
 
+    /// Marks the skew check as done, for callers that report skew themselves.
+    pub fn without_version_check(self) -> Self {
+        self.version_checked.store(true, Ordering::Relaxed);
+        self
+    }
+
     /// `GET /server`, with a caller-chosen timeout.
     pub async fn server_status(
         &self,

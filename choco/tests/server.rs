@@ -211,14 +211,29 @@ fn wait_in_flight(env: &Env) {
 #[test]
 fn start_status_log_and_session() {
     let env = Env::new();
-    let info = env.start();
+    // Start by hand with info-level logging so the daemon's startup lines
+    // land in the log (the shared helper pins RUST_LOG=error).
+    let out = Command::new(target_dir().join("choco"))
+        .args(["server", "start", "--port", "0"])
+        .env("HOME", &env.home)
+        .env("CHOCOFACTORY_CLAUDE_BINARY", &env.claude)
+        .env("RUST_LOG", "info")
+        .env_remove("CHOCO_BASE_URL")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let info = env.running();
+    assert_ne!(info.port, 4141);
     let status = env.json(&["server", "status"]);
     assert_eq!(status["running"], true);
     assert_eq!(status["daemon"]["pid"], info.pid);
     assert_eq!(status["daemon"]["version"], status["choco"]["version"]);
     let log = std::fs::read_to_string(env.root().join("logs/chocofactoryd.log")).unwrap();
     assert!(log.contains("=== choco server start"), "{log}");
-    assert!(log.len() > 60, "daemon startup lines missing: {log}");
+    assert!(
+        log.contains("listening on"),
+        "daemon startup lines missing: {log}"
+    );
     assert_eq!(unsafe { libc::getsid(info.pid as i32) }, info.pid as i32);
     // Human status renders too.
     let human = env.choco(&["server", "status"]);
@@ -281,6 +296,13 @@ fn stop_refuses_while_an_agent_turn_runs_and_force_parks_it() {
     assert_eq!(out.status.code(), Some(3), "{}", text(&out));
     let all = text(&out);
     assert!(all.contains("(agent_turn)") && all.contains(&id), "{all}");
+    assert_eq!(env.json(&["server", "status"])["running"], true);
+
+    // A refused stop also refuses the restart: same daemon, still answering.
+    let before = env.running().pid;
+    let out = env.choco(&["server", "restart"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    assert_eq!(env.running().pid, before);
     assert_eq!(env.json(&["server", "status"])["running"], true);
 
     let out = env.choco(&["server", "stop", "--force"]);
@@ -354,35 +376,61 @@ fn status_json_when_not_running() {
     assert!(v["choco"]["version"].is_string());
 }
 
-async fn skew_server(version: Option<&'static str>) -> String {
+/// A fake daemon. `/projects` answers with one project named `demo` and
+/// `/tasks` with an empty list, both carrying the version header (when
+/// given); with `fail_projects` `/projects` answers 500 instead.
+async fn skew_server(version: Option<&'static str>, fail_projects: bool) -> String {
     use axum::{Router, routing::get};
-    let app = Router::new().route(
-        "/projects",
-        get(move || async move {
-            let mut headers = axum::http::HeaderMap::new();
-            if let Some(v) = version {
-                headers.insert("x-chocofactory-version", v.parse().unwrap());
-            }
-            (headers, "[]")
-        }),
-    );
+    let headers = move || {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(v) = version {
+            headers.insert("x-chocofactory-version", v.parse().unwrap());
+        }
+        headers
+    };
+    let app = Router::new()
+        .route(
+            "/projects",
+            get(move || async move {
+                if fail_projects {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        headers(),
+                        "{\"error\":\"boom\"}".to_string(),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        headers(),
+                        r#"[{"id":"p1","name":"demo","repo_path":null,"created_at":"2026-01-01T00:00:00Z"}]"#
+                            .to_string(),
+                    )
+                }
+            }),
+        )
+        .route("/tasks", get(move || async move { (headers(), "[]") }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     url
 }
 
-#[tokio::test]
-async fn version_skew_warning_prints_once_on_stderr() {
-    let env = Env::new();
-    let url = skew_server(Some("0.0.0-test")).await;
-    let out = tokio::task::spawn_blocking(move || {
-        let o = env.choco(&["--base-url", &url, "--json", "project", "list"]);
-        (env, o)
+async fn run_against(url: String, args: &'static [&'static str]) -> Output {
+    tokio::task::spawn_blocking(move || {
+        let env = Env::new();
+        let mut a = vec!["--base-url", url.as_str(), "--json"];
+        a.extend_from_slice(args);
+        env.choco(&a)
     })
     .await
     .unwrap()
-    .1;
+}
+
+#[tokio::test]
+async fn version_skew_warning_prints_once_across_several_requests() {
+    // `task list --project demo` makes two requests: /projects then /tasks.
+    let url = skew_server(Some("0.0.0-test"), false).await;
+    let out = run_against(url, &["task", "list", "--project", "demo"]).await;
     assert!(out.status.success(), "{}", text(&out));
     let err = stderr(&out);
     assert_eq!(err.matches("warning: choco").count(), 1, "{err}");
@@ -391,22 +439,86 @@ async fn version_skew_warning_prints_once_on_stderr() {
 }
 
 #[tokio::test]
-async fn missing_version_header_warns() {
+async fn version_skew_warning_fires_on_an_error_response() {
+    let url = skew_server(Some("0.0.0-test"), true).await;
+    let out = run_against(url, &["task", "list", "--project", "demo"]).await;
+    assert!(!out.status.success(), "{}", text(&out));
+    let err = stderr(&out);
+    assert_eq!(err.matches("warning: choco").count(), 1, "{err}");
+    assert!(err.contains("chocofactoryd 0.0.0-test"), "{err}");
+}
+
+#[tokio::test]
+async fn missing_version_header_warns_once() {
+    let url = skew_server(None, false).await;
+    let out = run_against(url, &["task", "list", "--project", "demo"]).await;
+    assert!(out.status.success(), "{}", text(&out));
+    let err = stderr(&out);
+    assert_eq!(err.matches("doesn't report a version").count(), 1, "{err}");
+    serde_json::from_slice::<Value>(&out.stdout).expect("stdout stays JSON");
+}
+
+#[test]
+fn unanswering_daemon_is_reported_and_force_kills_it() {
     let env = Env::new();
-    let url = skew_server(None).await;
-    let out = tokio::task::spawn_blocking(move || {
-        let o = env.choco(&["--base-url", &url, "--json", "project", "list"]);
-        (env, o)
-    })
-    .await
-    .unwrap()
-    .1;
+    let info = env.start();
+    let pid = info.pid as i32;
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+
+    let out = env.choco(&["server", "status"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stderr(&out).contains("isn't answering"), "{}", text(&out));
+
+    let out = env.choco(&["server", "stop"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stderr(&out).contains("stops it anyway"), "{}", text(&out));
+    assert_eq!(env.running().pid, info.pid);
+
+    // SIGTERM stays pending on a stopped process, so only the SIGKILL
+    // fallback after the stop timeout ends it.
+    let out = env.choco(&["server", "stop", "--force"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stdout(&out).contains("was killed"), "{}", text(&out));
+    wait_for("the lock to be released", || {
+        matches!(env.lock(), LockState::NotRunning { .. })
+    });
+}
+
+#[test]
+fn start_times_out_without_killing_a_daemon_that_never_answers() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let dir = env.home.join("fake");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
+    let pidfile = dir.join("pid");
+    let fake = dir.join("chocofactoryd");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 120\n",
+            pidfile.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = env.choco_at(&dir.join("choco"), &["server", "start", "--port", "0"]);
+    // The pid comes from the fake's own pidfile; this test started it.
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(
-        stderr(&out).contains("doesn't report a version"),
+        stderr(&out).contains("did not answer within 30s"),
         "{}",
         text(&out)
     );
-    serde_json::from_slice::<Value>(&out.stdout).expect("stdout stays JSON");
+    assert!(alive, "start must not kill the daemon it timed out on");
 }
 
 #[test]

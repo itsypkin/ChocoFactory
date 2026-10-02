@@ -105,9 +105,12 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
     let logs = root.join("logs");
     std::fs::create_dir_all(&logs).map_err(|e| format!("cannot create {}: {e}", logs.display()))?;
     let log = log_path(&root);
-    if let Ok(meta) = std::fs::metadata(&log)
-        && meta.len() > LOG_ROTATE_BYTES
-    {
+    let log_len = match std::fs::metadata(&log) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(format!("cannot inspect {}: {e}", log.display())),
+    };
+    if log_len > LOG_ROTATE_BYTES {
         let rotated = logs.join("chocofactoryd.log.1");
         std::fs::rename(&log, &rotated).map_err(|e| {
             format!(
@@ -157,6 +160,7 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
     let pid = child.id();
 
     let deadline = Instant::now() + START_TIMEOUT;
+    let mut last_lock_error: Option<String> = None;
     loop {
         if let Some(status) = child
             .try_wait()
@@ -167,7 +171,14 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
                 last_lines(&log, 20)
             ));
         }
-        if let LockState::Running(info) = lock(&root)?
+        // A transient lock-read error (the daemon is between taking the lock
+        // and publishing it) means "not ready yet"; it is reported if the
+        // deadline passes.
+        let lock_state = lock(&root);
+        if let Err(e) = &lock_state {
+            last_lock_error = Some(e.clone());
+        }
+        if let Ok(LockState::Running(info)) = lock_state
             && info.pid == pid
         {
             let client = Client::new(url(&info));
@@ -184,8 +195,11 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
             }
         }
         if Instant::now() >= deadline {
+            let lock_note = last_lock_error
+                .map(|e| format!(" (last lock error: {e})"))
+                .unwrap_or_default();
             return Err(format!(
-                "chocofactoryd (pid {pid}) did not answer within {}s; it is still running; see {}",
+                "chocofactoryd (pid {pid}) did not answer within {}s; it is still running; see {}{lock_note}",
                 START_TIMEOUT.as_secs(),
                 log.display()
             ));
@@ -233,7 +247,10 @@ async fn stop_running(root: &Path, info: LockInfo, force: bool) -> Result<u8, Fa
                 for f in &server.in_flight {
                     text.push_str(&format!(
                         "  {}  {} ({})  {}\n",
-                        f.task_id, f.stage, f.kind, f.title
+                        f.task_id,
+                        f.stage,
+                        f.kind,
+                        render::single_line(&f.title)
                     ));
                 }
                 text.push_str(
@@ -323,7 +340,9 @@ async fn status(json: bool) -> Result<u8, Failure> {
         LockState::Running(info) => info,
     };
     let log = log_path(&root);
+    // The render below already warns about a version mismatch.
     let server: ServerStatus = Client::new(url(&info))
+        .without_version_check()
         .server_status(STATUS_TIMEOUT)
         .await
         .map_err(|e| {
