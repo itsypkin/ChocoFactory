@@ -64,7 +64,7 @@ const TURN_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 const TURN_DEFAULT_OUTCOME: &str = "done";
 
 /// In-flight detached `shell`/`poll` runners, keyed by task id and then by
-/// the runner id [`WorkflowEngine::reserve_runner_slot`] hands out (#69).
+/// the runner id [`WorkflowEngine::spawn_registered_runner`] hands out (#69).
 ///
 /// The inner `Option` is the reservation: `None` between the slot being
 /// claimed and its `JoinHandle` being attached, which is a window only the
@@ -166,13 +166,9 @@ pub struct WorkflowEngine {
     /// to be unique per task, but a single global counter is simpler than
     /// per-task numbering and just as correct.
     next_runner_id: AtomicU64,
-    /// Set by `abort_all_detached_runners`: a runner attached afterwards
-    /// (a request still running past the HTTP drain deadline) is aborted
-    /// on the spot instead of living until the runtime is dropped.
+    /// Set by `abort_all_detached_runners` before it drains: once set, no
+    /// new detached runner may start (see `spawn_registered_runner`).
     runners_stopping: std::sync::atomic::AtomicBool,
-    /// Handles aborted at attach time because shutdown had begun; a later
-    /// `abort_all_detached_runners` pass awaits them.
-    late_aborted_runners: std::sync::Mutex<Vec<JoinHandle<()>>>,
     /// Wall-clock source for every `poll` budget computation (#52). Never
     /// `Instant`: it and tokio's timers stand still while the machine
     /// sleeps, so a `timeout:` measured on them is not calendar time.
@@ -1085,7 +1081,6 @@ impl WorkflowEngine {
             detached_runners: std::sync::Mutex::new(HashMap::new()),
             next_runner_id: AtomicU64::new(0),
             runners_stopping: std::sync::atomic::AtomicBool::new(false),
-            late_aborted_runners: std::sync::Mutex::new(Vec::new()),
             wall_clock,
         })
     }
@@ -2235,58 +2230,37 @@ impl WorkflowEngine {
         config_root::seed_builtin_workflows(&workflows_dir).map_err(InitWorkflowsError::Io)
     }
 
-    /// Claims an id for a detached `shell`/`poll` runner about to be
-    /// spawned for `task_id` (#69).
+    /// Spawns a detached runner and registers its handle so `cancel_task`
+    /// (and shutdown) can abort it. `make` receives the runner id the
+    /// future must pass to [`Self::finish_runner`] when it ends.
     ///
-    /// Reserved *before* `tokio::spawn`, not after, and that ordering is
-    /// the point: if the slot were only created once the handle existed, a
-    /// runner that finished in between would call [`Self::finish_runner`]
-    /// for an id not yet present, and the later insert would then leak an
-    /// entry for a task that has nothing running.
+    /// The flag check, the spawn and the registration all happen under the
+    /// `detached_runners` lock, so a runner is either refused (shutdown has
+    /// begun) or visible to `abort_all_detached_runners`; there is no
+    /// half-registered slot. Returns `false`, spawning nothing, once
+    /// shutdown has begun. The caller leaves the task where it is, and the
+    /// next start's park and poll sweeps recover it.
     ///
-    /// Callers must hold the task's `task_locks` entry across the
-    /// reserve/spawn/attach sequence — every one does today, since the only
-    /// callers are reached from `enter_stage`, which runs inside
-    /// `advance`/`start_task`'s guard. That is load-bearing rather than
-    /// incidental: `cancel_task` holds the same lock, so it cannot observe
-    /// a half-built slot. A runner spawned outside the lock could have its
-    /// reservation aborted (and dropped) between the reserve and the
-    /// attach, at which point the attach silently no-ops and the runner is
-    /// left with nothing able to stop it.
-    fn reserve_runner_slot(&self, task_id: &str) -> u64 {
-        let id = self.next_runner_id.fetch_add(1, Ordering::Relaxed);
-        self.detached_runners
-            .lock()
-            .expect("detached_runners mutex poisoned")
-            .entry(task_id.to_string())
-            .or_default()
-            .insert(id, None);
-        id
-    }
-
-    /// Fills in the handle for a slot [`Self::reserve_runner_slot`]
-    /// claimed. A slot that has already been removed means the runner
-    /// finished first, so there is deliberately nothing to do — inserting
-    /// it back would be the leak the reservation exists to avoid.
-    fn attach_runner_handle(&self, task_id: &str, id: u64, handle: JoinHandle<()>) {
+    /// Callers hold the task's `task_locks` entry, so `cancel_task` cannot
+    /// interleave.
+    fn spawn_registered_runner<F>(&self, task_id: &str, make: impl FnOnce(u64) -> F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let mut runners = self
             .detached_runners
             .lock()
             .expect("detached_runners mutex poisoned");
-        // Checked under the map lock, which `abort_all_detached_runners`
-        // also holds when it sets the flag, so a handle is either drained
-        // by it or aborted here.
         if self.runners_stopping.load(Ordering::SeqCst) {
-            handle.abort();
-            self.late_aborted_runners
-                .lock()
-                .expect("late_aborted_runners mutex poisoned")
-                .push(handle);
-            return;
+            return false;
         }
-        if let Some(slot) = runners.get_mut(task_id).and_then(|task| task.get_mut(&id)) {
-            *slot = Some(handle);
-        }
+        let id = self.next_runner_id.fetch_add(1, Ordering::Relaxed);
+        let handle = tokio::spawn(make(id));
+        runners
+            .entry(task_id.to_string())
+            .or_default()
+            .insert(id, Some(handle));
+        true
     }
 
     /// Drops a finished runner's slot, and the task's whole entry once its
@@ -2309,7 +2283,7 @@ impl WorkflowEngine {
     /// future is dropped (so each process-group guard has SIGKILLed its
     /// group). Used at shutdown, before the daemon lock is released.
     pub async fn abort_all_detached_runners(&self) {
-        let mut handles: Vec<JoinHandle<()>> = {
+        let handles: Vec<JoinHandle<()>> = {
             let mut runners = self
                 .detached_runners
                 .lock()
@@ -2320,14 +2294,6 @@ impl WorkflowEngine {
                 .flat_map(|(_, task)| task.into_values().flatten())
                 .collect()
         };
-        // Runners attached after shutdown began were aborted at attach;
-        // await them too so their groups are dead before the lock drops.
-        handles.append(
-            &mut self
-                .late_aborted_runners
-                .lock()
-                .expect("late_aborted_runners mutex poisoned"),
-        );
         for handle in handles {
             handle.abort();
             let _ = handle.await;
@@ -3218,24 +3184,29 @@ impl WorkflowEngine {
         // Registered so `cancel_task` can abort this runner and kill the
         // command it's running (#69) — a `shell` stage has no `session`,
         // so killing the task's agent session would not reach it.
-        let runner_id = self.reserve_runner_slot(&task_id);
         let registered_task_id = task_id.clone();
-        let handle = tokio::spawn(async move {
-            engine
-                .run_shell_stage(
-                    &task_id,
-                    &definition,
-                    &stage_name,
-                    command,
-                    capture,
-                    timeout,
-                    cwd,
-                    env,
-                )
-                .await;
-            engine.finish_runner(&task_id, runner_id);
-        });
-        self.attach_runner_handle(&registered_task_id, runner_id, handle);
+        let spawned =
+            self.spawn_registered_runner(&registered_task_id, move |runner_id| async move {
+                engine
+                    .run_shell_stage(
+                        &task_id,
+                        &definition,
+                        &stage_name,
+                        command,
+                        capture,
+                        timeout,
+                        cwd,
+                        env,
+                    )
+                    .await;
+                engine.finish_runner(&task_id, runner_id);
+            });
+        if !spawned {
+            tracing::warn!(
+                task_id = %registered_task_id,
+                "daemon is shutting down; shell stage not started, the next start recovers it"
+            );
+        }
     }
 
     /// Runs the command, records what it did on the task's timeline, and
@@ -3892,15 +3863,20 @@ impl WorkflowEngine {
         // interval until the deadline. The advisory `is_cancelled` check in
         // `run_poll_stage` only fires *between* attempts; this stops one
         // already in flight.
-        let runner_id = self.reserve_runner_slot(&task_id);
         let registered_task_id = task_id.clone();
-        let handle = tokio::spawn(async move {
-            engine
-                .run_poll_stage(&task_id, &definition, &stage_name, run)
-                .await;
-            engine.finish_runner(&task_id, runner_id);
-        });
-        self.attach_runner_handle(&registered_task_id, runner_id, handle);
+        let spawned =
+            self.spawn_registered_runner(&registered_task_id, move |runner_id| async move {
+                engine
+                    .run_poll_stage(&task_id, &definition, &stage_name, run)
+                    .await;
+                engine.finish_runner(&task_id, runner_id);
+            });
+        if !spawned {
+            tracing::warn!(
+                task_id = %registered_task_id,
+                "daemon is shutting down; poll stage not started, the next start recovers it"
+            );
+        }
     }
 
     /// Runs the command on `interval` until an outcome matches or the
@@ -16722,10 +16698,10 @@ stages:
         .await;
     }
 
-    /// A runner attached after shutdown began must be aborted at once, so
-    /// its process group never survives.
+    /// Once shutdown has begun no new runner may start: the command never
+    /// runs, and the task stays where it was for the next start's sweeps.
     #[tokio::test]
-    async fn runner_attached_after_shutdown_is_aborted() {
+    async fn runner_spawn_after_shutdown_is_refused() {
         let pool = connect_in_memory().await.unwrap();
         let dir = tempdir();
         let gc = dir.join("gc");
@@ -16748,34 +16724,21 @@ stages:
         let task_id = open_task_at(&pool, &project_id, &def.name, &dir, "run").await;
         let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
         engine.abort_all_detached_runners().await;
+
+        // The helper itself refuses, and never invokes the future factory.
+        let called = std::sync::atomic::AtomicBool::new(false);
+        assert!(!engine.spawn_registered_runner("t", |_| {
+            called.store(true, Ordering::SeqCst);
+            async {}
+        }));
+        assert!(!called.load(Ordering::SeqCst));
+
+        // And end to end: retry enters the shell stage, nothing runs.
         engine.park_interrupted_turns().await.unwrap();
         engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
-
-        // The runner may be killed before it writes the pid file, so the
-        // file is optional; if it appears, that process must die.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut pid = None;
-        while std::time::Instant::now() < deadline {
-            if let Ok(s) = std::fs::read_to_string(&gc)
-                && let Ok(p) = s.trim().parse::<u32>()
-            {
-                pid = Some(p);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        engine.abort_all_detached_runners().await;
-        assert!(engine.late_aborted_runners.lock().unwrap().is_empty());
-        if let Some(pid) = pid {
-            crate::test_support::wait_until("the grandchild to die", || async {
-                if process_alive(pid) {
-                    Err("still alive".to_string())
-                } else {
-                    Ok(())
-                }
-            })
-            .await;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(!gc.exists(), "the shell command must never have started");
+        assert!(engine.detached_runners.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
