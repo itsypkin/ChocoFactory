@@ -36,15 +36,19 @@ hours without your verdict, or when `open_pr` fails.
 **First run.** Once per machine and project:
 
 ```bash
-cargo build --release                        # or install a release with install.sh
-gh auth status                               # open_pr and the polls run gh as this account; it is who "you" are for votes
+cd <repo>                                     # every line below runs from here
+cargo build --release && export PATH="$PWD/target/release:$PATH"   # or install a release with install.sh
+gh auth status                                # open_pr and the polls run gh as this account; it is who "you" are for votes
 choco server start && choco server status
-choco project list                           # or: choco project create <name> [--repo <path>]
-git -C <repo> worktree add --detach ../<repo>-base origin/main    # once
-BASE_CHECKOUT=$(cd ../<repo>-base && pwd)     # then, before each task:
-git -C "$BASE_CHECKOUT" fetch origin && git -C "$BASE_CHECKOUT" checkout --detach origin/main
+choco project list                            # or: choco project create <name> [--repo <path>]
+git worktree add --detach ../<name>-base origin/main            # once
+BASE_CHECKOUT=$(cd ../<name>-base && pwd)     # set again in each new shell
+git -C "$BASE_CHECKOUT" fetch origin && git -C "$BASE_CHECKOUT" checkout --detach origin/main   # before each task
 ```
 
+You can also build and run the daemon from the base checkout itself. Then
+"move the base to `origin/main`, rebuild, restart" is one routine, and the
+daemon never runs whatever branch your working checkout happens to be on.
 The base as a linked worktree has one side effect; see
 [Cost and safety](#cost-and-safety).
 
@@ -262,17 +266,21 @@ with no verdict, or an `open_pr` failure. `/approve` does nothing here; only
   Don't send a note after merging by hand: the next `open_pr` would open a
   fresh PR.
 
-**Getting your items done despite #138.** In both real cases so far (PR #134
-and PR #137), the internal review that ran after the ignored lap is what
-rescued the task. Work in this order:
+**Getting your items done despite #138.** In both real cases so far, the
+internal review that ran after the ignored lap is what set up the rescue. In
+PR #137 that review named your items, and the next lap fixed them. In PR
+#134 its rejection escalated the task, and a note listing the items got them
+done. Work in this order:
 
 1. **Let the next `internal_review` run.** It re-reads the PR's comments. If
    it rejects and names your items, they reach the coder through the
    templated reviewer summary, which the coder does follow.
 2. **If that rejection escalates the task** (the loop guard; see
-   [Review and vote](#4-review-the-pr-and-vote)), send your items as the
-   note: `choco task send <id> --text "..."`. The note is templated into the
-   coder's prompt verbatim.
+   [Review and vote](#4-review-the-pr-and-vote)), paste every item in full
+   into the note: `choco task send <id> --text "..."`. The note is templated
+   into the coder's prompt verbatim. A note that only points at the PR
+   ("same issues", "read the PR") doesn't work: in #134 the coder never
+   opened the PR, even when told to.
 3. **If the task comes back to `awaiting_human_review` with items still
    undone,** post a second `/request-changes`. That is the default: one more
    lap, with the reviewer backing it up again. A 4th vote from you
@@ -282,8 +290,8 @@ rescued the task. Work in this order:
      points at a checkout of the old task's branch, and you close the old PR
      either way.
    - Or leave the PR without a verdict until the 6-hour window parks it,
-     then send the note. That is the last resort, since no command moves a
-     task out of `awaiting_human_review`.
+     then send the note. That is the last resort: no command moves a
+     task from `awaiting_human_review` to `escalate_to_human`.
 
 **`choco task cancel <id>`** is final. It kills the task's agents, marks it
 cancelled and removes its worktree, so uncommitted work there is lost:
