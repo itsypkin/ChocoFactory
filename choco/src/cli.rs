@@ -65,7 +65,11 @@ impl fmt::Display for Until {
 }
 
 #[derive(Parser)]
-#[command(name = "choco", about = "HTTP client for chocofactoryd")]
+#[command(
+    name = "choco",
+    about = "HTTP client for chocofactoryd",
+    version = chocofactory_core::version::long_version()
+)]
 pub struct Cli {
     /// Base URL of a running `chocofactoryd`. Also read from `CHOCO_BASE_URL`.
     /// Defaults to the running daemon's port from its lock file, else
@@ -438,6 +442,25 @@ pub enum ProjectCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_flags_display_version() {
+        for flag in ["--version", "-V"] {
+            let err = Cli::try_parse_from(["choco", flag])
+                .err()
+                .expect("should not parse");
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion, "{flag}");
+        }
+    }
+
+    #[test]
+    fn update_version_arg_is_not_the_top_level_flag() {
+        let cli = Cli::try_parse_from(["choco", "update", "--version", "0.2.0"]).unwrap();
+        match cli.command {
+            Command::Update { version, .. } => assert_eq!(version, Some("0.2.0".to_string())),
+            _ => panic!("expected Command::Update"),
+        }
+    }
 
     #[test]
     fn server_flags_parse() {

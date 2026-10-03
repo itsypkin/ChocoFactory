@@ -216,6 +216,31 @@ fn wait_in_flight(env: &Env) {
 }
 
 #[test]
+fn version_flag_prints_without_a_daemon() {
+    let expected = format!(
+        "choco {} (dev build)\n",
+        chocofactory_core::version::VERSION
+    );
+    for (flag, unreachable) in [("--version", false), ("-V", true)] {
+        let env = Env::new();
+        let bin = target_dir().join("choco");
+        let mut cmd = Command::new(&bin);
+        cmd.arg(flag)
+            .env("HOME", &env.home)
+            .env("RUST_LOG", "error")
+            .env_remove("CHOCO_BASE_URL");
+        if unreachable {
+            cmd.env("CHOCO_BASE_URL", "http://127.0.0.1:9");
+        }
+        let out = cmd.output().expect("failed to run choco");
+        assert!(out.status.success(), "{flag}: {}", text(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{flag}");
+        assert!(out.stderr.is_empty(), "{flag}: {}", text(&out));
+        assert!(!env.home.join(".config").exists(), "{flag} touched $HOME");
+    }
+}
+
+#[test]
 fn start_status_log_and_session() {
     let env = Env::new();
     // Start by hand with info-level logging so the daemon's startup lines
