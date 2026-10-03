@@ -206,8 +206,10 @@ async fn fetch_release(
                 src.join("chocofactoryd").display()
             )
         })?;
+    let ok = reported.status.success();
     let reported = String::from_utf8_lossy(&reported.stdout).trim().to_string();
-    if !reported.contains(version) {
+    // "chocofactoryd <VERSION> (<commit>|dev build)": compare the version field exactly.
+    if !ok || reported.split_whitespace().nth(1) != Some(version) {
         return Err(format!(
             "the downloaded chocofactoryd reports {reported}, expected {version}"
         ));
@@ -364,9 +366,18 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
             .map(|_| ()),
         None => Ok(()),
     };
-    replaced?;
-    marker_result?;
-    restart_result.map_err(|e| format!("updated, but chocofactoryd did not restart: {e}"))?;
+    let restart_note = restart_result
+        .err()
+        .map(|e| format!("chocofactoryd did not restart: {e}"));
+    if let Some(e) = replaced.err().or(marker_result.err()) {
+        return Err(match restart_note {
+            Some(n) => format!("{e}; also, {n}"),
+            None => e,
+        });
+    }
+    if let Some(n) = restart_note {
+        return Err(format!("updated, but {n}"));
+    }
     println!("updated {VERSION} → {new_version}");
     Ok(0)
 }

@@ -42,11 +42,14 @@ binary, so they update with it.
 
 ## Releasing
 
-Maintainers: bump `[workspace.package] version`, merge, then push `vX.Y.Z-rc.1`
-first (a prerelease that `latest` ignores, so installs are unaffected) and check
-its assets; then push `vX.Y.Z`. The tag must equal `v` + the workspace version
-and be on `main`. **Actions → Release → Run workflow** (`workflow_dispatch`) is a
-dry run: everything except publishing.
+Maintainers: the tag must equal `v` + the workspace version and be on `main`,
+and the binaries report the workspace version, so a release candidate needs its
+own version. To cut `X.Y.Z`: merge a change setting `[workspace.package] version`
+to `X.Y.Z-rc.1` (and `Cargo.lock`), push `vX.Y.Z-rc.1` (a prerelease that `latest`
+ignores, so installs are unaffected) and check its assets; then merge a change
+setting the version to `X.Y.Z` and push `vX.Y.Z`. A copy installed from the rc
+moves to the final release with `choco update`. **Actions → Release → Run
+workflow** (`workflow_dispatch`) is a dry run: everything except publishing.
 
 ## Build
 

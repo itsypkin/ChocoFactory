@@ -879,6 +879,181 @@ fn update_names_the_manifest_url_when_it_cannot_be_fetched() {
 
 // ---- 13. release-smoke.sh --------------------------------------------------
 
+fn no_update_dirs(env: &Env) -> bool {
+    std::fs::read_dir(&env.bin).unwrap().all(|e| {
+        !e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".choco-update")
+    })
+}
+
+#[test]
+fn update_with_a_version_reads_the_versioned_manifest_not_latest() {
+    let env = Env::new();
+    env.install_from_archive();
+    let server = Server::new();
+    let archive = archive_bytes();
+    server.release(Some(VERSION), archive, sums_for(archive), VERSION);
+    let before = env.inodes();
+    let out = env.choco(&server.url, &["update", "--version", VERSION, "--force"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let reqs = server.requests();
+    assert!(
+        reqs.contains(&format!("/download/v{VERSION}/manifest.json")),
+        "{reqs:?}"
+    );
+    assert!(reqs.iter().all(|p| !p.contains("latest")), "{reqs:?}");
+    assert_ne!(env.inodes(), before);
+
+    // An invalid version is refused before any request.
+    let n = server.requests().len();
+    let out = env.choco(&server.url, &["update", "--version", "a/b"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stderr(&out).contains("invalid --version"), "{}", text(&out));
+    assert_eq!(server.requests().len(), n);
+}
+
+#[test]
+fn update_leaves_a_daemon_running_from_another_dir_alone() {
+    let env = Env::new();
+    env.install_from_archive();
+    let other = env.home.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    for b in ["choco", "chocofactoryd"] {
+        std::fs::copy(target_dir().join(b), other.join(b)).unwrap();
+    }
+    let out = env
+        .base_cmd(other.join("choco"), NO_SERVER)
+        .args(["server", "start", "--port", "0"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let old = env.running();
+    assert_ne!(old.port, 4141);
+    let server = Server::new();
+    let archive = archive_bytes();
+    server.release(Some(VERSION), archive, sums_for(archive), VERSION);
+    server.put(
+        "/latest/download/manifest.json",
+        format!(r#"{{"version":"{VERSION}","commit":"x"}}"#).into_bytes(),
+    );
+    let out = env.choco(&server.url, &["update", "--force"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(stdout(&out).contains("leaving it alone"), "{}", text(&out));
+    assert_eq!(env.running().pid, old.pid);
+}
+
+#[test]
+fn install_prints_the_path_and_running_daemon_hints() {
+    let env = Env::new();
+    env.install_from_archive();
+    env.start_daemon();
+    let archive = env.home.join("archive.tar.gz");
+    let out = env
+        .install_cmd(NO_SERVER)
+        .env("CHOCO_INSTALL_ARCHIVE", &archive)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let so = stdout(&out);
+    assert!(
+        so.contains("restart the running daemon to use the new version: choco server restart"),
+        "{so}"
+    );
+    assert!(
+        so.contains(&format!("{} is not on your PATH", env.bin.display())),
+        "{so}"
+    );
+    // With the dir on PATH there is no PATH hint.
+    let path = format!(
+        "{}:{}",
+        env.bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = env
+        .install_cmd(NO_SERVER)
+        .env("CHOCO_INSTALL_ARCHIVE", &archive)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!stdout(&out).contains("not on your PATH"), "{}", text(&out));
+}
+
+#[test]
+fn update_refuses_a_cargo_install() {
+    let env = Env::new();
+    let cb = env.home.join(".cargo").join("bin");
+    std::fs::create_dir_all(&cb).unwrap();
+    std::fs::copy(target_dir().join("choco"), cb.join("choco")).unwrap();
+    let out = env
+        .base_cmd(cb.join("choco"), NO_SERVER)
+        .arg("update")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("installed with cargo"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn update_reports_bad_manifests_missing_checksums_and_up_to_date_checks() {
+    let env = Env::new();
+    env.install_from_archive();
+    let server = Server::new();
+    let before = env.inodes();
+
+    server.put("/latest/download/manifest.json", b"not json".to_vec());
+    let out = env.choco(&server.url, &["update"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stderr(&out).contains("not valid JSON"), "{}", text(&out));
+
+    server.put(
+        "/latest/download/manifest.json",
+        br#"{"commit":"x"}"#.to_vec(),
+    );
+    let out = env.choco(&server.url, &["update"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("has no \"version\""),
+        "{}",
+        text(&out)
+    );
+
+    // A checksum file with no line for this asset.
+    server.release(
+        Some("9.9.9"),
+        archive_bytes(),
+        b"abc  other.tar.gz\n".to_vec(),
+        "9.9.9",
+    );
+    server.put(
+        "/latest/download/manifest.json",
+        br#"{"version":"9.9.9","commit":"x"}"#.to_vec(),
+    );
+    let out = env.choco(&server.url, &["update"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(stderr(&out).contains("no checksum for"), "{}", text(&out));
+    assert!(no_update_dirs(&env));
+
+    server.put(
+        "/latest/download/manifest.json",
+        format!(r#"{{"version":"{VERSION}","commit":"x"}}"#).into_bytes(),
+    );
+    let out = env.choco(&server.url, &["update", "--check"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        stdout(&out).contains(&format!("choco is up to date ({VERSION})")),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(env.inodes(), before);
+}
+
 #[test]
 fn release_smoke_passes_on_a_packaged_archive() {
     let env = Env::new();

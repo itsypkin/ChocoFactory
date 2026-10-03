@@ -65,13 +65,16 @@ done
 
 mkdir -p "$DIR" || die "cannot create $DIR"
 DIR=$(cd "$DIR" && pwd -P) || die "cannot resolve $DIR"
+case "$DIR" in
+    *[\"\\]*) die "install directory $DIR contains a quote or backslash, which the marker file cannot hold" ;;
+esac
 # Never overwrite a binary in place: macOS caches code signatures per file.
 # Copy under a temporary name, then rename over the old one. Daemon first.
 for b in chocofactoryd choco; do
     tmpbin="$DIR/.choco-install.$$.$b"
-    cp "$src/$b" "$tmpbin" || die "cannot copy $b to $tmpbin"
-    chmod 755 "$tmpbin" || die "cannot chmod $tmpbin"
-    mv -f "$tmpbin" "$DIR/$b" || die "cannot move $tmpbin to $DIR/$b"
+    cp "$src/$b" "$tmpbin" || { rm -f "$tmpbin"; die "cannot copy $b to $tmpbin"; }
+    chmod 755 "$tmpbin" || { rm -f "$tmpbin"; die "cannot chmod $tmpbin"; }
+    mv -f "$tmpbin" "$DIR/$b" || { rm -f "$tmpbin"; die "cannot move $tmpbin to $DIR/$b"; }
 done
 
 vline=$("$DIR/chocofactoryd" --version) || die "$DIR/chocofactoryd --version failed"
