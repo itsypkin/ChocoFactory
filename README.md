@@ -44,11 +44,14 @@ binary, so they update with it.
 
 Maintainers: the tag must equal `v` + the workspace version and be on `main`,
 and the binaries report the workspace version, so a release candidate needs its
-own version. To cut `X.Y.Z`: merge a change setting `[workspace.package] version`
-to `X.Y.Z-rc.1` (and `Cargo.lock`), push `vX.Y.Z-rc.1` (a prerelease that `latest`
-ignores, so installs are unaffected) and check its assets; then merge a change
-setting the version to `X.Y.Z` and push `vX.Y.Z`. A copy installed from the rc
-moves to the final release with `choco update`. **Actions → Release → Run
+own version. The workspace version is kept at `X.Y.Z-rc.1` until the final
+release. To cut `X.Y.Z`: merge at `X.Y.Z-rc.1`, push `vX.Y.Z-rc.1` (a
+prerelease) and check its assets; then merge a one-line change setting the
+version to `X.Y.Z` (and `Cargo.lock`) and push `vX.Y.Z`. While only a prerelease
+exists, `releases/latest/download/*` returns 404, so install the rc with
+`CHOCO_VERSION=X.Y.Z-rc.1` and the versioned script, e.g.
+`curl -fsSL <RELEASES>/download/vX.Y.Z-rc.1/install.sh | CHOCO_VERSION=X.Y.Z-rc.1 sh`.
+A copy installed from the rc moves to the final release with `choco update`. **Actions → Release → Run
 workflow** (`workflow_dispatch`) is a dry run: everything except publishing.
 
 ## Build

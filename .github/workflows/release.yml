@@ -76,7 +76,12 @@ jobs:
           key: ${{ matrix.target }}
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        env:
+          T: ${{ matrix.target }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          # cc looks for <arch>-linux-musl-gcc, which musl-tools does not ship.
+          echo "CC_$(printf '%s' "$T" | tr '-' '_')=musl-gcc" >> "$GITHUB_ENV"
       - name: Record the build commit
         run: echo "CHOCO_BUILD_COMMIT=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
       - name: Build

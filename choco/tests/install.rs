@@ -552,6 +552,28 @@ fn reinstall_replaces_by_rename_and_leaves_no_temp_files() {
 }
 
 #[test]
+fn symlinked_install_dir_on_path_gets_no_path_hint() {
+    let env = Env::new();
+    let real = env.home.join("real-bin");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = env.home.join("link-bin");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(link.starts_with(&env.home));
+    let archive = env.home.join("archive.tar.gz");
+    std::fs::write(&archive, archive_bytes()).unwrap();
+    let path = format!("{}:{}", link.display(), std::env::var("PATH").unwrap());
+    let out = env
+        .install_cmd(NO_SERVER)
+        .env("CHOCO_INSTALL_ARCHIVE", &archive)
+        .env("CHOCO_INSTALL_DIR", &link)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("not on your PATH"), "{}", text(&out));
+}
+
+#[test]
 fn install_from_a_local_archive_needs_no_server() {
     let env = Env::new();
     let out = env.install_from_archive();
@@ -1121,6 +1143,11 @@ fn release_workflow_has_the_expected_shape() {
             .unwrap()
             .contains("refs/tags/")
     );
+    // Tag must equal v + workspace version; prerelease flag for hyphenated tags.
+    assert!(text.contains(r#"[ "$GITHUB_REF_NAME" != "v$version" ]"#));
+    assert!(text.contains(r#"case "$TAG" in *-*) prerelease="--prerelease""#));
+    // musl builds need an explicit C compiler name.
+    assert!(text.contains("musl-gcc") && text.contains("CC_"));
 }
 
 // ---- 15. license -----------------------------------------------------------
@@ -1152,7 +1179,7 @@ fn install_rejects_an_unrepresentable_dir_before_creating_it() {
     let env = Env::new();
     let archive = env.home.join("archive.tar.gz");
     std::fs::write(&archive, archive_bytes()).unwrap();
-    for name in ["a\"b", "a\\b", "a\tb"] {
+    for name in ["a\"b", "a\\b", "a\tb", "a\nb"] {
         let dir = env.home.join(name);
         assert!(dir.starts_with(&env.home));
         let out = env

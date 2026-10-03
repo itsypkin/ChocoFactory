@@ -339,8 +339,9 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
             let code = stop_daemon(&root, info, true).await?;
             if code != 0
                 && matches!(
-                    read_lock(&root)
-                        .map_err(|e| format!("could not read the daemon lock file: {e}"))?,
+                    read_lock(&root).map_err(|e| format!(
+                        "could not read the daemon lock file: {e}; the daemon may have been stopped, nothing was replaced; run `choco server start`"
+                    ))?,
                     LockState::Running(_)
                 )
             {

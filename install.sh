@@ -67,12 +67,17 @@ nl='
 '
 tab=$(printf '\t')
 # The marker is plain JSON without escaping: refuse characters it cannot hold,
-# before anything is created.
-case "$DIR" in
-    *[\"\\]*|*"$nl"*|*"$tab"*) die "install directory $DIR contains a quote, backslash, tab or newline, which the marker file cannot hold" ;;
-esac
+# before anything is created, and again on the resolved path.
+check_dir() {
+    case "$1" in
+        *[\"\\]*|*"$nl"*|*"$tab"*) die "install directory $1 contains a quote, backslash, tab or newline, which the marker file cannot hold" ;;
+    esac
+}
+check_dir "$DIR"
 mkdir -p "$DIR" || die "cannot create $DIR"
+INPUT_DIR=$DIR
 DIR=$(cd "$DIR" && pwd -P) || die "cannot resolve $DIR"
+check_dir "$DIR"
 # Never overwrite a binary in place: macOS caches code signatures per file.
 # Copy under a temporary name, then rename over the old one. Daemon first.
 for b in chocofactoryd choco; do
@@ -94,7 +99,7 @@ mv -f "$conf/install.json.$$" "$conf/install.json" || die "cannot write $conf/in
 
 printf 'installed chocofactory %s to %s\n' "$version" "$DIR"
 case ":${PATH:-}:" in
-    *":$DIR:"*) ;;
+    *":$DIR:"*|*":$INPUT_DIR:"*) ;;
     *) printf '%s is not on your PATH; add it with:\n  export PATH="%s:$PATH"\n' "$DIR" "$DIR" ;;
 esac
 # A nonzero status here just means no daemon is running (the designed case).
