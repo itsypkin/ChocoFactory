@@ -140,7 +140,8 @@ poll stages, human gates, and standing chat sessions. The same parking
 happens at the next start if the daemon was killed hard.
 
 `chocofactoryd --version` prints the version and exits without touching
-`$HOME`.
+`$HOME`. `choco --version` (or `-V`) prints the CLI's version the same way,
+without contacting the daemon.
 
 ### Daemon environment variables
 

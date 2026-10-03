@@ -17,7 +17,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chocofactory-core = { path = "chocofactory-core" }
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "string"] }
 futures-util = "0.3"
 indexmap = { version = "2", features = ["serde"] }
 # Only for `killpg` — a shell stage's timeout has to reap the command's
