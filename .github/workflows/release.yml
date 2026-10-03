@@ -96,7 +96,10 @@ jobs:
         if: matrix.smoke
         env:
           T: ${{ matrix.target }}
-        run: scripts/release-smoke.sh "dist/chocofactory-$T.tar.gz"
+        run: |
+          EXPECT_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          export EXPECT_VERSION
+          scripts/release-smoke.sh "dist/chocofactory-$T.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: chocofactory-${{ matrix.target }}

@@ -34,14 +34,16 @@ CHOCO_INSTALL_ARCHIVE=$archive CHOCO_INSTALL_DIR=$bin CHOCO_RELEASES_URL=http://
 for b in choco chocofactoryd; do
     [ -x "$bin/$b" ] || fail "$bin/$b is missing or not executable"
 done
-vline=$("$bin/chocofactoryd" --version) || fail 'chocofactoryd --version failed'
-printf '%s\n' "$vline"
-if [ -n "${EXPECT_VERSION:-}" ]; then
-    case "$vline" in
-        "chocofactoryd $EXPECT_VERSION "*) ;;
-        *) fail "expected version $EXPECT_VERSION, got: $vline" ;;
-    esac
-fi
+for b in chocofactoryd choco; do
+    vline=$("$bin/$b" --version) || fail "$b --version failed"
+    printf '%s\n' "$vline"
+    if [ -n "${EXPECT_VERSION:-}" ]; then
+        case "$vline" in
+            "$b $EXPECT_VERSION "*) ;;
+            *) fail "expected $b version $EXPECT_VERSION, got: $vline" ;;
+        esac
+    fi
+done
 
 started=1
 CHOCOFACTORY_CLAUDE_BINARY=/usr/bin/false "$bin/choco" server start --port 0 || fail 'server start failed'
