@@ -1146,3 +1146,23 @@ fn every_crate_inherits_the_dual_license() {
         assert!(std::fs::metadata(root.join(f)).unwrap().len() > 0, "{f}");
     }
 }
+
+#[test]
+fn install_rejects_an_unrepresentable_dir_before_creating_it() {
+    let env = Env::new();
+    let archive = env.home.join("archive.tar.gz");
+    std::fs::write(&archive, archive_bytes()).unwrap();
+    for name in ["a\"b", "a\\b", "a\tb"] {
+        let dir = env.home.join(name);
+        assert!(dir.starts_with(&env.home));
+        let out = env
+            .install_cmd(NO_SERVER)
+            .env("CHOCO_INSTALL_ARCHIVE", &archive)
+            .env("CHOCO_INSTALL_DIR", &dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(text(&out).contains("cannot hold"), "{}", text(&out));
+        assert!(!dir.exists(), "{name:?} was created");
+    }
+}

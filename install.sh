@@ -63,11 +63,16 @@ for b in choco chocofactoryd; do
     [ -f "$src/$b" ] || die "the archive has no $b (looked for $src/$b)"
 done
 
+nl='
+'
+tab=$(printf '\t')
+# The marker is plain JSON without escaping: refuse characters it cannot hold,
+# before anything is created.
+case "$DIR" in
+    *[\"\\]*|*"$nl"*|*"$tab"*) die "install directory $DIR contains a quote, backslash, tab or newline, which the marker file cannot hold" ;;
+esac
 mkdir -p "$DIR" || die "cannot create $DIR"
 DIR=$(cd "$DIR" && pwd -P) || die "cannot resolve $DIR"
-case "$DIR" in
-    *[\"\\]*) die "install directory $DIR contains a quote or backslash, which the marker file cannot hold" ;;
-esac
 # Never overwrite a binary in place: macOS caches code signatures per file.
 # Copy under a temporary name, then rename over the old one. Daemon first.
 for b in chocofactoryd choco; do
