@@ -66,12 +66,13 @@ tail -n "$n" "$tmp" | jq -r '
     def one_line: tostring | gsub("\\s+"; " ") | .[0:160];
     (.payload | if type != "object" then tostring
         elif has("tool") then
-            "\(.tool): \(.input.command // .input.file_path // .input.pattern // .output // .input // "")"
+            "\(.tool): \((.input | objects | .command // .file_path // .pattern) // .output // .input // "")"
         elif has("exit_code") then
             "\(.stage // "")\(if .attempt then " attempt \(.attempt)," else "" end) exit \(.exit_code)"
+            + (if .timed_out then " (timed out)" else "" end)
             + (if .note then " \(.note)" else "" end)
             + " \(.stdout_tail // "")"
-            + (if (.exit_code // 0) != 0 then " stderr: \(.stderr_tail // "")" else "" end)
+            + (if .exit_code != 0 then " stderr: \(.stderr_tail // "")" else "" end)
         else (.text // .message // .note
               // (if .stage then "\(.stage) \(.outcome // "")" else null end)
               // tostring)

@@ -195,11 +195,14 @@ Before you merge, check what it will close in two places:
 - `gh pr view <n> --json closingIssuesReferences` shows what the PR body
   closes.
 - The commit messages are not covered by that check, and each one lands on
-  `main` with a merge commit and closes what it names:
+  `main` with a merge commit and closes what it names. Check the pushed
+  branch (the PR's `headRefName`), since the task's worktree is gone once it
+  is `done`:
 
   ```bash
-  git log --format=%B origin/main..<branch> \
-    | grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+'
+  git fetch origin
+  git log --format=%B origin/main..origin/<head-branch> \
+    | grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +(([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+|https?://github\.com/[^ ]+/issues/[0-9]+)'
   ```
 
 ## 5. Recover
@@ -235,7 +238,9 @@ with no verdict, or an `open_pr` failure. `/approve` does nothing here; only
   verdict until the 6-hour window parks the task (keep the machine awake),
   then send your items with `choco task send <id> --text "..."`. It is
   faster to cancel the task and create a new one with your items in the
-  spec.
+  spec. A new task forks from its `--repo` checkout and redoes the work from
+  scratch. To build on the old work, point `--repo` at a checkout of the old
+  task's branch. Close the old PR either way.
 - The internal reviewer is told to re-check a human's PR comments on its
   next round, so it sometimes catches an ignored item. Treat that as a bonus,
   not a workaround: #138's own cases came back to human review with the
