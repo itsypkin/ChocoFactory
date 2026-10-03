@@ -28,17 +28,34 @@ Every way back lands on `revising`, which returns to `internal_review`:
 - a human resumes the task from `escalate_to_human` with `choco task send`.
 
 A task parks at `escalate_to_human` after a 4th rejection by
-`internal_review` or by you, after 6 hours without your verdict, or when
-`open_pr` fails.
+`internal_review`, or a 4th by you (each is counted separately), after 6
+hours without your verdict, or when `open_pr` fails.
 
 ## 1. Prepare
+
+**First run.** Once per machine and project:
+
+```bash
+cargo build --release                        # or install a release with install.sh
+gh auth status                               # open_pr and the polls run gh as this account; it is who "you" are for votes
+choco server start && choco server status
+choco project list                           # or: choco project create <name> [--repo <path>]
+git -C <repo> worktree add --detach ../<repo>-base origin/main    # once
+BASE_CHECKOUT=$(cd ../<repo>-base && pwd)     # then, before each task:
+git -C "$BASE_CHECKOUT" fetch origin && git -C "$BASE_CHECKOUT" checkout --detach origin/main
+```
+
+The base as a linked worktree has one side effect; see
+[Cost and safety](#cost-and-safety).
 
 **Check the daemon you are about to use.** `choco server status` shows its
 version, open tasks and in-flight work. Built-in workflows and their
 prompts come from the daemon *binary* (#129) and are written out when it
 starts: a change merged to `workflows/` reaches no task until the daemon is
-rebuilt **and restarted**, or updated with `choco update`. A rebuild alone
-changes nothing for the running daemon.
+rebuilt **and restarted**. For an `install.sh` copy, `choco update` delivers
+it once a release contains it. A rebuild alone changes nothing for the
+running daemon. `choco server status` warns when the binary on disk changed
+since the daemon started.
 `choco task status` shows which workflow a task runs (`builtin:<name>@<version>`
 or a file path with a hash), and says when the built-in changed since the
 task started. Before blaming a prompt for a run's behaviour, check that line
@@ -61,7 +78,9 @@ whatever that checkout's HEAD is.
 
 **A repo can override the built-ins.** If the *project's* `repo_path` (not
 the task's `--repo` checkout) has `.chocofactory/workflows/<name>.yaml`, that
-file wins over the built-in of that name.
+file wins over the built-in of that name. `choco project init-workflows`
+creates exactly that folder, and from then on built-in updates no longer
+reach that project's tasks.
 To try an unmerged workflow change on one task, pass
 `--workflow <checkout>/workflows/coding-task.yaml` instead of editing
 anything global.
@@ -70,7 +89,8 @@ anything global.
 turns stall for hours, and a poll's wall-clock deadline keeps running: a
 6-hour review window can expire overnight and park the task at
 `escalate_to_human`. Something like `caffeinate -dims` in a spare terminal
-is enough.
+is enough. Don't tie it to the daemon with `-w <pid>`: the pid changes on
+restart, and the machine then sleeps mid-turn.
 
 ## 2. Write the spec
 
@@ -124,8 +144,8 @@ choco task create --project <p> --workflow coding-task \
   most with `--limit`), and a real task has hundreds to thousands of events.
   `choco task events | tail` shows the task's first minutes and looks stale.
   To read the newest events, run
-  `.claude/skills/run-choco-task/scripts/tail-events.sh <id> [n]`, which
-  follows `next_token` to the end.
+  `.claude/skills/run-choco-task/scripts/tail-events.sh <id> [n]` from the
+  repo root, which follows `next_token` to the end.
 
 What each stage is doing while you watch:
 
@@ -134,12 +154,13 @@ What each stage is doing while you watch:
   without reporting is nudged, then closed.
 - **internal_review.** The reviewer routes the task on its own verdict. Its
   loop guard counts every rejection: the 4th sends the task to
-  `escalate_to_human`, and escalating starts the count over.
+  `escalate_to_human`, and only escalating starts the count over. Your
+  `/request-changes` doesn't reset it.
 - **open_pr.** Pushes the branch and opens or refreshes the PR. The title
   comes from the task title; the body is the coder's own description plus
-  the internal reviewer's report. A closing keyword in the *body* is
-  defused, but commit messages are not: the coder is told not to write
-  `Closes #N` in one, and that is all.
+  the internal reviewer's report. Most closing keywords in the *body* are
+  defused (#133 covers the unverified forms), but commit messages are not:
+  the coder is told not to write `Closes #N` in one, and that is all.
 - **checks_polling.** Polls for 5 minutes. It goes green only if every check
   reports `SUCCESS`, and red on a `FAILURE` or `ERROR` state (that starts a
   paid `revising` lap). Everything else times out into
@@ -178,16 +199,26 @@ practice:
 - Only `OWNER`, `MEMBER` and `COLLABORATOR` accounts vote, and `[bot]`
   accounts never do. Anything commenting under your account, including an
   agent, votes as you.
-- Prose doesn't retract a verdict. To change your mind, post the other
-  marker.
+- Prose doesn't retract a verdict, and the first verdict the poll sees is
+  acted on within a minute. To change your mind, post the other marker
+  inside that minute. After it, the task is already `done` or `revising`.
 
 **Batch your findings into one `/request-changes`.** Each one costs a coder
 lap and a review lap. Prefer approve-and-file-a-follow-up for minor points.
 
+**Before you vote, count the internal rejections.** Your vote doesn't reset
+`internal_review`'s loop guard. A task that reached you after 3 internal
+rejections escalates on the very next one after your vote. Count the
+`internal_review --[changes_requested]-->` lines in `choco task status`
+since the last escalation; the counter itself isn't shown.
+
 **Known bug (#138): after `/request-changes`, the coder often ignores your
 comment** and works from the internal reviewer's old summary instead. After
-the lap, check that each of your items maps to a commit. If they don't,
-don't vote again (see [Recover](#5-recover)).
+each lap, check that each of your items maps to a commit. An **empty
+commit** is the trap to watch for: the coder makes one under the
+description-only rule, it moves the head past your comment, and it uses up
+your `/request-changes` without changing anything (#134). What to do next is
+in [Recover](#5-recover).
 
 `/approve` moves the task to `done`. **Merging the PR is still your job.**
 Before you merge, check what it will close in two places:
@@ -202,7 +233,7 @@ Before you merge, check what it will close in two places:
   ```bash
   git fetch origin
   git log --format=%B origin/main..origin/<head-branch> \
-    | grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +(([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+|https?://github\.com/[^ ]+/issues/[0-9]+)'
+    | grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[*_]*:?[*_]* +(([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+|https?://github\.com/[^ ]+/issues/[0-9]+)'
   ```
 
 ## 5. Recover
@@ -230,21 +261,29 @@ with no verdict, or an `open_pr` failure. `/approve` does nothing here; only
 - If the PR is already good, merge it and then `choco task cancel` the task.
   Don't send a note after merging by hand: the next `open_pr` would open a
   fresh PR.
-- **The reliable way around #138** is the note: it is templated into the
-  coder's prompt verbatim. No command moves a task from
-  `awaiting_human_review` to `escalate_to_human`, though. After a
-  `/request-changes` the coder ignored, don't vote again, since each vote
-  buys another ignored coder lap and review lap. Leave the PR without a
-  verdict until the 6-hour window parks the task (keep the machine awake),
-  then send your items with `choco task send <id> --text "..."`. It is
-  faster to cancel the task and create a new one with your items in the
-  spec. A new task forks from its `--repo` checkout and redoes the work from
-  scratch. To build on the old work, point `--repo` at a checkout of the old
-  task's branch. Close the old PR either way.
-- The internal reviewer is told to re-check a human's PR comments on its
-  next round, so it sometimes catches an ignored item. Treat that as a bonus,
-  not a workaround: #138's own cases came back to human review with the
-  items still undone.
+
+**Getting your items done despite #138.** In both real cases so far (PR #134
+and PR #137), the internal review that ran after the ignored lap is what
+rescued the task. Work in this order:
+
+1. **Let the next `internal_review` run.** It re-reads the PR's comments. If
+   it rejects and names your items, they reach the coder through the
+   templated reviewer summary, which the coder does follow.
+2. **If that rejection escalates the task** (the loop guard; see
+   [Review and vote](#4-review-the-pr-and-vote)), send your items as the
+   note: `choco task send <id> --text "..."`. The note is templated into the
+   coder's prompt verbatim.
+3. **If the task comes back to `awaiting_human_review` with items still
+   undone,** post a second `/request-changes`. That is the default: one more
+   lap, with the reviewer backing it up again. A 4th vote from you
+   escalates.
+   - The other options are costlier. Cancel and create a new task with your
+     items in the spec: it redoes the work from scratch unless `--repo`
+     points at a checkout of the old task's branch, and you close the old PR
+     either way.
+   - Or leave the PR without a verdict until the 6-hour window parks it,
+     then send the note. That is the last resort, since no command moves a
+     task out of `awaiting_human_review`.
 
 **`choco task cancel <id>`** is final. It kills the task's agents, marks it
 cancelled and removes its worktree, so uncommitted work there is lost:
@@ -263,6 +302,13 @@ directory with the task's worktree.
   mock run as evidence about the real CLI.
 - **A repo's `.chocofactory/workflows/` and any `--workflow` file can run
   shell commands as you.** Pointing choco at a repo trusts its workflows.
+- **Agents inherit your local Claude settings through a linked base checkout
+  (#141).** Agents run with `--setting-sources project,local`. In a linked
+  worktree, `local` resolves to the *main* checkout's
+  `.claude/settings.local.json`, so every agent gets its output style,
+  permissions and hooks. Until #141 is fixed, keep that file free of hooks
+  and personal styles, or make the base a separate clone rather than a
+  linked worktree.
 - **Cancel a task that is going round in circles** rather than letting it
   spend a coder lap per round.
 - `choco update` and `choco server stop` refuse while work is in flight. Use
@@ -272,6 +318,11 @@ directory with the task's worktree.
 
 - **#138:** the coder ignores a human's `/request-changes` comment. Work
   around it as described in [Recover](#5-recover).
+- **#141:** agents inherit the main checkout's `.claude/settings.local.json`
+  through a linked base checkout.
+- **#133:** the PR-body closing-keyword filter isn't verified for
+  markdown-wrapped forms (`**Fixes** #N`, `[#N](url)`, `GH-N`). The
+  pre-merge checks above still catch them.
 - **#102:** finished and cancelled tasks leave their branches behind.
 - **#115:** agents sometimes call wait tools (`ScheduleWakeup`, `Monitor`)
   that never fire under `--print`, then sit idle until the daemon nudges
