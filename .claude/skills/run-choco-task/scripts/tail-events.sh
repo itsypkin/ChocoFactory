@@ -1,9 +1,10 @@
 #!/bin/sh
 # Print the newest N events of a choco task, oldest of them first.
 #
-# `choco task events` returns the *oldest* events first, at most 500 per
-# page, so a plain `| tail` shows a long task's first minutes. This follows
-# `next_token` to the last page and prints the tail of the whole history.
+# `choco task events` returns the *oldest* events first (100 per page by
+# default, 500 at most), so a plain `| tail` shows a long task's first
+# minutes. This follows `next_token` to the last page and prints the tail of
+# the whole history. Nothing is printed unless every page was fetched.
 #
 # Usage: tail-events.sh <task-id> [n]     (n defaults to 20)
 # Env:   CHOCO           path to the choco binary (default: `choco` on PATH)
@@ -19,7 +20,10 @@ usage() {
 task=$1
 n=${2:-20}
 case $n in
-    '' | *[!0-9]* | 0) echo "tail-events.sh: n must be a positive integer, got '$n'" >&2; usage ;;
+    '' | *[!0-9]* | 0*)
+        echo "tail-events.sh: n must be a positive integer, got '$n'" >&2
+        usage
+        ;;
 esac
 
 CHOCO=${CHOCO:-choco}
@@ -33,7 +37,13 @@ command -v jq >/dev/null 2>&1 || {
 }
 
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT HUP INT TERM
+# Clean up on any exit, and make the signals actually end the script: a
+# trap that only deleted the file would let the loop carry on into a fresh
+# file and print an incomplete tail.
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 token=''
 while :; do
@@ -53,8 +63,17 @@ while :; do
 done
 
 tail -n "$n" "$tmp" | jq -r '
-    (.payload | (.text // .message // .note // .input.command // .input.file_path
-                 // (if .attempt then "\(.stage // "") attempt \(.attempt), exit \(.exit_code // "?") \(.stdout_tail // "")" else null end)
-                 // (if .stage then "\(.stage) \(.outcome // "")" else null end)
-                 // tostring)) as $detail
-    | "\(.created_at[0:19] | sub("T"; " ")) \(.event_type)  \($detail | tostring | gsub("\\s+"; " ") | .[0:160])"'
+    def one_line: tostring | gsub("\\s+"; " ") | .[0:160];
+    (.payload | if type != "object" then tostring
+        elif has("tool") then
+            "\(.tool): \(.input.command // .input.file_path // .input.pattern // .output // .input // "")"
+        elif has("exit_code") then
+            "\(.stage // "")\(if .attempt then " attempt \(.attempt)," else "" end) exit \(.exit_code)"
+            + (if .note then " \(.note)" else "" end)
+            + " \(.stdout_tail // "")"
+            + (if (.exit_code // 0) != 0 then " stderr: \(.stderr_tail // "")" else "" end)
+        else (.text // .message // .note
+              // (if .stage then "\(.stage) \(.outcome // "")" else null end)
+              // tostring)
+        end) as $detail
+    | "\(.created_at[0:19] | sub("T"; " ")) UTC \(.event_type)  \($detail | one_line)"'

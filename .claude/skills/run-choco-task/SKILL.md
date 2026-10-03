@@ -18,17 +18,27 @@ The workflow you will almost always run is the built-in `coding-task`:
 
 ```
 coding → internal_review → open_pr → checks_polling → awaiting_human_review → done
-              ↑    │                                        │
-              │    └──────────→ revising ←──────────────────┘
-              └────────────────────┘          (both escalate_to_human on a loop guard or timeout)
 ```
+
+Every way back lands on `revising`, which returns to `internal_review`:
+
+- `internal_review` requests changes;
+- `checks_polling` sees a failed check;
+- you post `/request-changes`;
+- a human resumes the task from `escalate_to_human` with `choco task send`.
+
+A task parks at `escalate_to_human` after a 4th rejection by
+`internal_review` or by you, after 6 hours without your verdict, or when
+`open_pr` fails.
 
 ## 1. Prepare
 
 **Check the daemon you are about to use.** `choco server status` shows its
 version, open tasks and in-flight work. Built-in workflows and their
-prompts come from the daemon *binary* (#129): a change merged to
-`workflows/` reaches no task until the daemon is rebuilt or updated.
+prompts come from the daemon *binary* (#129) and are written out when it
+starts: a change merged to `workflows/` reaches no task until the daemon is
+rebuilt **and restarted**, or updated with `choco update`. A rebuild alone
+changes nothing for the running daemon.
 `choco task status` shows which workflow a task runs (`builtin:<name>@<version>`
 or a file path with a hash), and says when the built-in changed since the
 task started. Before blaming a prompt for a run's behaviour, check that line
@@ -37,8 +47,10 @@ and the daemon's build.
 - Don't stop or restart the daemon while an agent turn or shell step runs.
   `stop`/`restart` refuse (exit 3) unless `--force`, which marks those
   tasks `stuck`. Tasks waiting on a poll or a human survive a restart.
-- Its log is `~/.config/chocofactory/logs/chocofactoryd.log`. Watch it when
-  something looks wrong: kills, `stuck` marks and nudges show up there first.
+- Started with `choco server start`, it logs to
+  `~/.config/chocofactory/logs/chocofactoryd.log` (a daemon started by hand
+  logs to stderr). Watch the log when something looks wrong: kills, `stuck`
+  marks and nudges show up there first.
 
 **Point the task at a dedicated base checkout.** A task's worktree is forked
 from its `--repo` checkout's HEAD at creation (default: the project's
@@ -47,8 +59,9 @@ works in, and move it to the latest `origin/main` before each task. Never use
 a checkout another session is switching branches in. The task inherits
 whatever that checkout's HEAD is.
 
-**A repo can override the built-ins.** A project repo with
-`.chocofactory/workflows/<name>.yaml` wins over the built-in of that name.
+**A repo can override the built-ins.** If the *project's* `repo_path` (not
+the task's `--repo` checkout) has `.chocofactory/workflows/<name>.yaml`, that
+file wins over the built-in of that name.
 To try an unmerged workflow change on one task, pass
 `--workflow <checkout>/workflows/coding-task.yaml` instead of editing
 anything global.
@@ -86,7 +99,8 @@ criteria, and an explicit out-of-scope list.
 - **The title decides what the PR closes.** A title ending in `(#N)` makes
   the PR say `Closes #N`; any other `#N` in it gives `Refs #N`. For one part
   of a multi-part issue, don't end the title with `(#N)`: merging would close
-  the whole issue.
+  the whole issue. Commit messages can close issues too (see
+  [Review and vote](#4-review-the-pr-and-vote)).
 
 ## 3. Create and watch
 
@@ -102,10 +116,16 @@ choco task create --project <p> --workflow coding-task \
 - Wait with `choco task status <id> --until stage:awaiting_human_review
   --timeout 2h`, or follow along with `--live`. The exit code says how it
   ended: 0 reached, 3 stuck, 4 cancelled, 5 timed out, 6 closed early.
-- `choco task events` is **oldest first**, 500 per page, and a real task has
-  thousands. `choco task events | tail` shows the task's first minutes and
-  looks stale. To read the newest events, run
-  `scripts/tail-events.sh <id> [n]`, which follows `next_token` to the end.
+  `--until` waits for one target only. A task that parks at
+  `escalate_to_human` stays `open`, so an `--until` for another stage just
+  runs to its `--timeout`. For long waits, prefer `--live` or a short
+  timeout.
+- `choco task events` is **oldest first**, 100 per page by default (500 at
+  most with `--limit`), and a real task has hundreds to thousands of events.
+  `choco task events | tail` shows the task's first minutes and looks stale.
+  To read the newest events, run
+  `.claude/skills/run-choco-task/scripts/tail-events.sh <id> [n]`, which
+  follows `next_token` to the end.
 
 What each stage is doing while you watch:
 
@@ -117,13 +137,15 @@ What each stage is doing while you watch:
   `escalate_to_human`, and escalating starts the count over.
 - **open_pr.** Pushes the branch and opens or refreshes the PR. The title
   comes from the task title; the body is the coder's own description plus
-  the internal reviewer's report. A closing keyword in either is defused,
-  so only the title's `(#N)` can close an issue.
+  the internal reviewer's report. A closing keyword in the *body* is
+  defused, but commit messages are not: the coder is told not to write
+  `Closes #N` in one, and that is all.
 - **checks_polling.** Polls for 5 minutes. It goes green only if every check
-  reports `SUCCESS`, and red on any failure (that starts a paid `revising`
-  lap). No checks at all, a mix that includes skipped checks, or slow CI all
-  time out into `awaiting_human_review` exactly as if CI had passed. Check
-  `gh pr checks <n>` and whether the PR merges into `main` yourself.
+  reports `SUCCESS`, and red on a `FAILURE` or `ERROR` state (that starts a
+  paid `revising` lap). Everything else times out into
+  `awaiting_human_review` exactly as if CI had passed: no checks at all,
+  skipped, cancelled or timed-out checks, and slow CI. Check `gh pr checks
+  <n>` and whether the PR merges into `main` yourself.
 - **awaiting_human_review.** Polls the PR's comments every minute for your
   verdict, for up to 6 hours.
 
@@ -164,12 +186,21 @@ lap and a review lap. Prefer approve-and-file-a-follow-up for minor points.
 
 **Known bug (#138): after `/request-changes`, the coder often ignores your
 comment** and works from the internal reviewer's old summary instead. After
-the lap, check that each of your items maps to a commit. If they don't, see
-[Recover](#5-recover).
+the lap, check that each of your items maps to a commit. If they don't,
+don't vote again (see [Recover](#5-recover)).
 
 `/approve` moves the task to `done`. **Merging the PR is still your job.**
-Before you merge, run `gh pr view <n> --json closingIssuesReferences` to
-confirm the PR closes exactly what you expect.
+Before you merge, check what it will close in two places:
+
+- `gh pr view <n> --json closingIssuesReferences` shows what the PR body
+  closes.
+- The commit messages are not covered by that check, and each one lands on
+  `main` with a merge commit and closes what it names:
+
+  ```bash
+  git log --format=%B origin/main..<branch> \
+    | grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?):? +([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+'
+  ```
 
 ## 5. Recover
 
@@ -184,20 +215,31 @@ and `choco task list --status stuck` finds every stuck task.
 - After a usage limit, wait for the reset time shown in the error event,
   then retry.
 - A turn that never called `report_outcome` was nudged and then closed
-  (`no_report`). A process that outlived its reported turn was killed
-  (`lingered`). Neither advances the task, because something may still be
-  landing in the worktree.
+  (`no_report`): there is no outcome to route on, so read its last events
+  before retrying. A process that outlived its reported turn was killed
+  (`lingered`): the task parks because something it started may still have
+  been writing to the worktree, so check `git status` there first.
 
 **`escalate_to_human`** happens after a 4th rejection, a 6-hour review window
 with no verdict, or an `open_pr` failure. `/approve` does nothing here; only
 `choco task send <id> --text "<note>"` moves it on, into `revising`.
 
 - If the PR is already good, merge it and then `choco task cancel` the task.
-- This is also **the reliable way around #138**. Let the task escalate (or
-  wait for it to), then send your review items in the note. The note is
-  templated into the coder's prompt verbatim. Alternatively, let the internal
-  reviewer enforce your items: it re-checks a human's PR items on its next
-  round.
+  Don't send a note after merging by hand: the next `open_pr` would open a
+  fresh PR.
+- **The reliable way around #138** is the note: it is templated into the
+  coder's prompt verbatim. No command moves a task from
+  `awaiting_human_review` to `escalate_to_human`, though. After a
+  `/request-changes` the coder ignored, don't vote again, since each vote
+  buys another ignored coder lap and review lap. Leave the PR without a
+  verdict until the 6-hour window parks the task (keep the machine awake),
+  then send your items with `choco task send <id> --text "..."`. It is
+  faster to cancel the task and create a new one with your items in the
+  spec.
+- The internal reviewer is told to re-check a human's PR comments on its
+  next round, so it sometimes catches an ignored item. Treat that as a bonus,
+  not a workaround: #138's own cases came back to human review with the
+  items still undone.
 
 **`choco task cancel <id>`** is final. It kills the task's agents, marks it
 cancelled and removes its worktree, so uncommitted work there is lost:
