@@ -17,6 +17,10 @@ This skill is the judgement. The mechanics are in the
 because flags drift. Issue and PR numbers in this skill (#138 and so on)
 are in the ChocoFactory repo, not in the repo you are working on.
 
+To use this skill in your own repo, copy the whole `run-choco-task/` folder,
+including `scripts/`, into that repo's `.claude/skills/` (or into
+`~/.claude/skills/` for every repo).
+
 The workflow you will almost always run is the built-in `coding-task`:
 
 ```
@@ -39,14 +43,20 @@ hours without your verdict, or when `open_pr` fails.
 **Check whether choco is installed.**
 
 ```bash
-command -v choco chocofactoryd && chocofactoryd --version
+command -v choco && command -v chocofactoryd && chocofactoryd --version
 ```
+
+From 0.2.0 on, `choco --version` prints the version too.
 
 - **Both found:** run `choco update --check`. If it reports a newer
   release, `choco update` installs it and restarts a daemon that runs from
-  the install folder. If it refuses, this copy wasn't installed by the
-  install script and can't update itself; the error says what to run
-  instead.
+  the install folder. If it fails with a 404, only a prerelease exists:
+  take its version from the
+  [releases page](https://github.com/itsypkin/ChocoFactory/releases) and run
+  `choco update --check --version <version>`, then
+  `choco update --version <version>` to install it. If it refuses, this copy
+  wasn't installed by the install script and can't update itself; the error
+  says what to run instead.
 - **Not found:** install both binaries with the install script:
 
   ```bash
@@ -63,17 +73,19 @@ command -v choco chocofactoryd && chocofactoryd --version
 **First run.** Once per machine and project:
 
 ```bash
+cd <repo>                                     # the repo choco will work on; every line below runs from here
 claude --version                              # agents run the claude CLI, logged in as you
 gh auth status                                # open_pr and the polls run gh as this account; it is who "you" are for votes
 choco server start && choco server status
-choco project list                            # or: choco project create <name> [--repo <path>]
-cd <repo>                                     # the repo choco will work on; the lines below run from here
+choco project list                            # or: choco project create <name> [--repo .]
 git worktree add --detach ../<name>-base origin/main            # once
 BASE_CHECKOUT=$(cd ../<name>-base && pwd)     # set again in each new shell
 git -C "$BASE_CHECKOUT" fetch origin && git -C "$BASE_CHECKOUT" checkout --detach origin/main   # before each task
 ```
 
-Replace `origin/main` with your repo's default branch if it differs. The
+Replace `origin/main` with your repo's default branch if it differs, here
+and in the commit-message check in
+[Review and vote](#4-review-the-pr-and-vote). The
 base as a linked worktree has one side effect; see
 [Cost and safety](#cost-and-safety).
 
