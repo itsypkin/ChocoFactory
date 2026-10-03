@@ -98,8 +98,9 @@ printf '{"channel":"github-release","dir":"%s","version":"%s","target":"%s"}\n' 
 mv -f "$conf/install.json.$$" "$conf/install.json" || die "cannot write $conf/install.json"
 
 printf 'installed chocofactory %s to %s\n' "$version" "$DIR"
+INPUT_TRIMMED=${INPUT_DIR%/}
 case ":${PATH:-}:" in
-    *":$DIR:"*|*":$INPUT_DIR:"*) ;;
+    *":$DIR:"*|*":$INPUT_DIR:"*|*":$INPUT_TRIMMED:"*) ;;
     *) printf '%s is not on your PATH; add it with:\n  export PATH="%s:$PATH"\n' "$DIR" "$DIR" ;;
 esac
 # A nonzero status here just means no daemon is running (the designed case).

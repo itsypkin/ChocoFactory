@@ -1147,7 +1147,14 @@ fn release_workflow_has_the_expected_shape() {
     assert!(text.contains(r#"[ "$GITHUB_REF_NAME" != "v$version" ]"#));
     assert!(text.contains(r#"case "$TAG" in *-*) prerelease="--prerelease""#));
     // musl builds need an explicit C compiler name.
-    assert!(text.contains("musl-gcc") && text.contains("CC_"));
+    assert!(text.contains(r#"=musl-gcc" >> "$GITHUB_ENV""#));
+    assert!(text.contains("CC_"));
+    assert!(text.contains(
+        r#"exit 1
+          fi
+          if ! git merge-base"#
+    ));
+    assert!(text.contains("--generate-notes $prerelease"));
 }
 
 // ---- 15. license -----------------------------------------------------------
