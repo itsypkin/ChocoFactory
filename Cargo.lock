@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "choco"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "axum",
  "chocofactory-core",
@@ -245,12 +245,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2",
  "tokio",
 ]
 
 [[package]]
 name = "chocofactory-core"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "chrono",
  "serde",
@@ -259,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "chocofactoryd"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "axum",
  "base64",
@@ -1138,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "mock-claude"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "serde_json",
  "uuid",

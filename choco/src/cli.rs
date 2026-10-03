@@ -100,6 +100,22 @@ pub enum Command {
     /// Start, stop, restart or inspect the chocofactoryd daemon.
     #[command(subcommand)]
     Server(ServerCmd),
+    /// Update choco and chocofactoryd to the latest release (only for copies
+    /// installed by install.sh). Refuses, exit 3, while an agent turn or shell
+    /// step is running unless `--force`. Exit codes: 0 updated or up to date;
+    /// 1 error or not updatable; 3 refused because work is in flight.
+    Update {
+        /// Only report whether an update is available.
+        #[arg(long)]
+        check: bool,
+        /// Install this version instead of the latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// Update even when already on that version or work is in flight
+        /// (that work is marked stuck; `choco task retry` continues it).
+        #[arg(long)]
+        force: bool,
+    },
     /// Serves the `report_outcome` MCP tool over stdio (issue #73): a
     /// stage's agent turn calls it to state its outcome explicitly instead
     /// of leaving the engine to infer one from prose. `chocofactoryd` spawns

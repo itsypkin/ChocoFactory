@@ -7,6 +7,7 @@ mod client;
 mod mcp;
 mod render;
 mod server;
+mod update;
 mod watch;
 
 use std::process::ExitCode;
@@ -137,6 +138,15 @@ async fn main() -> ExitCode {
 
     if let Command::Server(cmd) = cli.command {
         return server::run(cmd, cli.json).await;
+    }
+
+    if let Command::Update {
+        check,
+        version,
+        force,
+    } = cli.command
+    {
+        return update::run(check, version, force).await;
     }
 
     let base_url = match resolve_base_url(cli.base_url) {
@@ -398,6 +408,7 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         // return is ever removed without updating this arm too.
         Command::McpServe(_) => unreachable!("McpServe is handled in main() before run()"),
         Command::Server(_) => unreachable!("Server is handled in main() before run()"),
+        Command::Update { .. } => unreachable!("Update is handled in main() before run()"),
     }
 }
 
