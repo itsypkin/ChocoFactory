@@ -1,6 +1,6 @@
 ---
 name: run-choco-task
-description: Drive a coding task through a running ChocoFactory daemon end to end — prepare the daemon and a base checkout, write the task spec, create and watch the task, review its PR and cast the verdict, and recover a stuck, escalated or interrupted task. Use when asked to have choco implement an issue, or to run, watch, review or rescue a choco task.
+description: Drive a coding task through a running ChocoFactory daemon end to end — install or check choco and its daemon, prepare a base checkout, write the task spec, create and watch the task, review its PR and cast the verdict, and recover a stuck, escalated or interrupted task. Use when asked to have choco implement an issue, or to run, watch, review or rescue a choco task.
 ---
 
 # Run a choco task
@@ -10,9 +10,12 @@ what they're asked for, whether the result is good, and what happens when
 they get stuck. Every stage runs the real `claude` CLI, so every lap costs
 real money: read [Cost and safety](#cost-and-safety) before starting.
 
-This skill is the judgement. The mechanics are in the README ("Running the
-daemon", "Reviewing a `coding-task` PR", "Stuck tasks", "Watching a task")
-and in `choco <command> --help`; check them there, because flags drift.
+This skill is the judgement. The mechanics are in the
+[ChocoFactory README](https://github.com/itsypkin/ChocoFactory#readme)
+("Running the daemon", "Reviewing a `coding-task` PR", "Stuck tasks",
+"Watching a task") and in `choco <command> --help`; check them there,
+because flags drift. Issue and PR numbers in this skill (#138 and so on)
+are in the ChocoFactory repo, not in the repo you are working on.
 
 The workflow you will almost always run is the built-in `coding-task`:
 
@@ -33,67 +36,83 @@ hours without your verdict, or when `open_pr` fails.
 
 ## 1. Prepare
 
+**Check whether choco is installed.**
+
+```bash
+command -v choco chocofactoryd && chocofactoryd --version
+```
+
+- **Both found:** run `choco update --check`. If it reports a newer
+  release, `choco update` installs it and restarts a daemon that runs from
+  the install folder. If it refuses, this copy wasn't installed by the
+  install script and can't update itself; the error says what to run
+  instead.
+- **Not found:** install both binaries with the install script:
+
+  ```bash
+  curl -fsSL https://github.com/itsypkin/ChocoFactory/releases/latest/download/install.sh | sh
+  ```
+
+  It puts `choco` and `chocofactoryd` side by side in `~/.local/bin`, and
+  prints the `export PATH=...` line to add if that folder isn't on your
+  `PATH`. If the download fails with a 404, only a prerelease exists so far:
+  take its version from the
+  [releases page](https://github.com/itsypkin/ChocoFactory/releases) and run
+  `curl -fsSL https://github.com/itsypkin/ChocoFactory/releases/download/v<version>/install.sh | CHOCO_VERSION=<version> sh`.
+
 **First run.** Once per machine and project:
 
 ```bash
-cd <repo>                                     # every line below runs from here
-cargo build --release && export PATH="$PWD/target/release:$PATH"   # or install a release with install.sh
+claude --version                              # agents run the claude CLI, logged in as you
 gh auth status                                # open_pr and the polls run gh as this account; it is who "you" are for votes
 choco server start && choco server status
 choco project list                            # or: choco project create <name> [--repo <path>]
+cd <repo>                                     # the repo choco will work on; the lines below run from here
 git worktree add --detach ../<name>-base origin/main            # once
 BASE_CHECKOUT=$(cd ../<name>-base && pwd)     # set again in each new shell
 git -C "$BASE_CHECKOUT" fetch origin && git -C "$BASE_CHECKOUT" checkout --detach origin/main   # before each task
 ```
 
-You can also build and run the daemon from the base checkout itself. Then
-"move the base to `origin/main`, rebuild, restart" is one routine, and the
-daemon never runs whatever branch your working checkout happens to be on.
-The base as a linked worktree has one side effect; see
+Replace `origin/main` with your repo's default branch if it differs. The
+base as a linked worktree has one side effect; see
 [Cost and safety](#cost-and-safety).
 
 **Check the daemon you are about to use.** `choco server status` shows its
-version, open tasks and in-flight work. Built-in workflows and their
-prompts come from the daemon *binary* (#129) and are written out when it
-starts: a change merged to `workflows/` reaches no task until the daemon is
-rebuilt **and restarted**. For an `install.sh` copy, `choco update` delivers
-it once a release contains it. A rebuild alone changes nothing for the
-running daemon. `choco server status` warns when the binary on disk changed
-since the daemon started.
+version, open tasks and in-flight work, and warns when the daemon binary on
+disk changed since the daemon started: restart it to pick that up. The
+built-in workflows and their prompts ship inside the daemon, so updating
+choco is what updates them.
 `choco task status` shows which workflow a task runs (`builtin:<name>@<version>`
 or a file path with a hash), and says when the built-in changed since the
 task started. Before blaming a prompt for a run's behaviour, check that line
-and the daemon's build.
+and the daemon's version.
 
 - Don't stop or restart the daemon while an agent turn or shell step runs.
   `stop`/`restart` refuse (exit 3) unless `--force`, which marks those
   tasks `stuck`. Tasks waiting on a poll or a human survive a restart.
-- Started with `choco server start`, it logs to
-  `~/.config/chocofactory/logs/chocofactoryd.log` (a daemon started by hand
-  logs to stderr). Watch the log when something looks wrong: kills, `stuck`
-  marks and nudges show up there first.
+- The daemon logs to `~/.config/chocofactory/logs/chocofactoryd.log`. Watch
+  the log when something looks wrong: kills, `stuck` marks and nudges show
+  up there first.
 
 **Point the task at a dedicated base checkout.** A task's worktree is forked
 from its `--repo` checkout's HEAD at creation (default: the project's
-`repo_path`). Use a detached checkout of `origin/main` that nothing else
-works in, and move it to the latest `origin/main` before each task. Never use
+`repo_path`). Use a detached checkout of your default branch that nothing
+else works in, and move it to the latest commit before each task. Never use
 a checkout another session is switching branches in. The task inherits
 whatever that checkout's HEAD is.
 
 **A repo can override the built-ins.** If the *project's* `repo_path` (not
 the task's `--repo` checkout) has `.chocofactory/workflows/<name>.yaml`, that
 file wins over the built-in of that name. `choco project init-workflows`
-creates exactly that folder, and from then on built-in updates no longer
-reach that project's tasks.
-To try an unmerged workflow change on one task, pass
-`--workflow <checkout>/workflows/coding-task.yaml` instead of editing
-anything global.
+creates exactly that folder, and from then on choco updates no longer change
+that project's workflows. Customising a workflow is outside this skill; see
+"Customising workflows" in the README (a skill for it is planned in #143).
 
 **Keep the machine awake for the whole run.** On a sleeping laptop, agent
 turns stall for hours, and a poll's wall-clock deadline keeps running: a
 6-hour review window can expire overnight and park the task at
-`escalate_to_human`. Something like `caffeinate -dims` in a spare terminal
-is enough. Don't tie it to the daemon with `-w <pid>`: the pid changes on
+`escalate_to_human`. On macOS, `caffeinate -dims` in a spare terminal is
+enough. Don't tie it to the daemon with `-w <pid>`: the pid changes on
 restart, and the machine then sleeps mid-turn.
 
 ## 2. Write the spec
@@ -115,11 +134,11 @@ criteria, and an explicit out-of-scope list.
 - **Name what not to build.** Agents gold-plate, and the reviewer then
   defends whatever they added.
 - **Inline everything the task needs.** The task's worktree only has what
-  is committed. A design note in a gitignored folder (such as `.omc/`) is
-  invisible to it.
-- **Check for collisions against `main`:** migration numbers above all,
-  then file names and flags. Two tasks that both take the next number
-  conflict, and the second PR's CI may not run at all.
+  is committed. A design note in a gitignored folder is invisible to it.
+- **Check for collisions against your default branch:** numbered files such
+  as database migrations above all, then file names and flags. Two tasks
+  that both take the next number conflict, and the second PR's CI may not
+  run at all.
 - **The title decides what the PR closes.** A title ending in `(#N)` makes
   the PR say `Closes #N`; any other `#N` in it gives `Refs #N`. For one part
   of a multi-part issue, don't end the title with `(#N)`: merging would close
@@ -147,9 +166,9 @@ choco task create --project <p> --workflow coding-task \
 - `choco task events` is **oldest first**, 100 per page by default (500 at
   most with `--limit`), and a real task has hundreds to thousands of events.
   `choco task events | tail` shows the task's first minutes and looks stale.
-  To read the newest events, run
-  `.claude/skills/run-choco-task/scripts/tail-events.sh <id> [n]` from the
-  repo root, which follows `next_token` to the end.
+  To read the newest events, run this skill's
+  `scripts/tail-events.sh <id> [n]` (it needs `jq`), which follows
+  `next_token` to the end.
 
 What each stage is doing while you watch:
 
@@ -170,7 +189,7 @@ What each stage is doing while you watch:
   paid `revising` lap). Everything else times out into
   `awaiting_human_review` exactly as if CI had passed: no checks at all,
   skipped, cancelled or timed-out checks, and slow CI. Check `gh pr checks
-  <n>` and whether the PR merges into `main` yourself.
+  <n>` and whether the PR merges into your default branch yourself.
 - **awaiting_human_review.** Polls the PR's comments every minute for your
   verdict, for up to 6 hours.
 
@@ -179,18 +198,17 @@ What each stage is doing while you watch:
 Choco's internal approval is not your review. Read the diff yourself, or have
 an independent reviewer do it, and look for what agents systematically miss:
 
-- **Does the branch still merge into `main`?** GitHub runs no `pull_request`
-  workflows on a conflicting PR, so its checks stay empty.
+- **Does the branch still merge into your default branch?** GitHub runs no
+  `pull_request` workflows on a conflicting PR, so its checks stay empty.
 - **Tests for the new branches**, not only the ones the spec listed. Break
   the main fix in a scratch copy and confirm a test fails.
 - **Claims are not evidence.** Code comments ("deliberately untested"),
   commit messages and "addressed in <sha>" replies are claims to verify.
 - **Numbered artifacts** (migrations above all) against what has landed on
-  `main` since the task started.
+  the default branch since the task started.
 - **New messages and states**: read each one with the values its own path
   passes, and check every new state has a way out.
-- This repo's recurring findings: non-atomic read-then-write on shared
-  state, and swallowed errors.
+- **Your repo's own recurring review findings**, if you know them.
 
 **The verdict is a PR comment**, not a GitHub review: `/approve` or
 `/request-changes` alone on its own line. The README has the full rules. In
@@ -219,10 +237,10 @@ since the last escalation; the counter itself isn't shown.
 **Known bug (#138): after `/request-changes`, the coder often ignores your
 comment** and works from the internal reviewer's old summary instead. After
 each lap, check that each of your items maps to a commit. An **empty
-commit** is the trap to watch for: the coder makes one under the
-description-only rule, it moves the head past your comment, and it uses up
-your `/request-changes` without changing anything (#134). What to do next is
-in [Recover](#5-recover).
+commit** is the trap to watch for: the coder makes one when it decides only
+the PR description needs changing, it moves the head past your comment, and
+it uses up your `/request-changes` without changing anything. What to do
+next is in [Recover](#5-recover).
 
 `/approve` moves the task to `done`. **Merging the PR is still your job.**
 Before you merge, check what it will close in two places:
@@ -230,9 +248,9 @@ Before you merge, check what it will close in two places:
 - `gh pr view <n> --json closingIssuesReferences` shows what the PR body
   closes.
 - The commit messages are not covered by that check, and each one lands on
-  `main` with a merge commit and closes what it names. Check the pushed
-  branch (the PR's `headRefName`), since the task's worktree is gone once it
-  is `done`:
+  your default branch with a merge commit and closes what it names. Check
+  the pushed branch (the PR's `headRefName`), since the task's worktree is
+  gone once it is `done`:
 
   ```bash
   git fetch origin
@@ -266,11 +284,11 @@ with no verdict, or an `open_pr` failure. `/approve` does nothing here; only
   Don't send a note after merging by hand: the next `open_pr` would open a
   fresh PR.
 
-**Getting your items done despite #138.** In both real cases so far, the
+**Getting your items done despite #138.** In both cases seen so far, the
 internal review that ran after the ignored lap is what set up the rescue. In
-PR #137 that review named your items, and the next lap fixed them. In PR
-#134 its rejection escalated the task, and a note listing the items got them
-done. Work in this order:
+the first, that review named your items, and the next lap fixed them. In
+the second, its rejection escalated the task, and a note listing the items
+got them done. Work in this order:
 
 1. **Let the next `internal_review` run.** It re-reads the PR's comments. If
    it rejects and names your items, they reach the coder through the
@@ -279,8 +297,8 @@ done. Work in this order:
    [Review and vote](#4-review-the-pr-and-vote)), paste every item in full
    into the note: `choco task send <id> --text "..."`. The note is templated
    into the coder's prompt verbatim. A note that only points at the PR
-   ("same issues", "read the PR") doesn't work: in #134 the coder never
-   opened the PR, even when told to.
+   ("same issues", "read the PR") doesn't work: in the second case the coder
+   never opened the PR, even when told to.
 3. **If the task comes back to `awaiting_human_review` with items still
    undone,** post a second `/request-changes`. That is the default: one more
    lap, with the reviewer backing it up again. A 4th vote from you
@@ -305,18 +323,15 @@ directory with the task's worktree.
 ## Cost and safety
 
 - **Every stage runs the real `claude` CLI.** Don't create a task to try
-  something out; use the test suite, or a daemon pointed at `mock-claude`
-  through `CHOCOFACTORY_CLAUDE_BINARY` in an isolated `HOME`. Never present a
-  mock run as evidence about the real CLI.
+  something out. For a first run, pick a small, real change.
 - **A repo's `.chocofactory/workflows/` and any `--workflow` file can run
   shell commands as you.** Pointing choco at a repo trusts its workflows.
 - **Agents inherit your local Claude settings through a linked base checkout
-  (#141).** Agents run with `--setting-sources project,local`. In a linked
-  worktree, `local` resolves to the *main* checkout's
-  `.claude/settings.local.json`, so every agent gets its output style,
-  permissions and hooks. Until #141 is fixed, keep that file free of hooks
-  and personal styles, or make the base a separate clone rather than a
-  linked worktree.
+  (#141).** Agents read the task's repo settings, including
+  `.claude/settings.local.json`. In a linked worktree, that file is the
+  *main* checkout's, so every agent gets its output style, permissions and
+  hooks. Until #141 is fixed, keep that file free of hooks and personal
+  styles, or make the base a separate clone rather than a linked worktree.
 - **Cancel a task that is going round in circles** rather than letting it
   spend a coder lap per round.
 - `choco update` and `choco server stop` refuse while work is in flight. Use
@@ -335,5 +350,5 @@ directory with the task's worktree.
 - **#115:** agents sometimes call wait tools (`ScheduleWakeup`, `Monitor`)
   that never fire under `--print`, then sit idle until the daemon nudges
   them.
-- **#121:** the coder's check of which PR comments are new compares local
-  time with UTC.
+- **#121:** the coder can misjudge which PR comments are new, because it
+  compares your machine's local time with UTC.
