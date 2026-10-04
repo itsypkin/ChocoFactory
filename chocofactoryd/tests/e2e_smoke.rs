@@ -1183,10 +1183,12 @@ exec "{mock_claude}" "$@"
 
     let detail = wait_until("the task to reach `done`", || async {
         let detail = daemon.get(&format!("/tasks/{task_id}")).await;
-        if detail["workflow_state"]["current_stage"] == "done" {
+        // `current_stage` and `status` are committed in separate writes, so
+        // wait for both rather than racing the second.
+        if detail["workflow_state"]["current_stage"] == "done" && detail["status"] == "closed" {
             Ok(detail)
         } else {
-            Err(format!("task did not finish: {detail}"))
+            Err(format!("task did not finish and close: {detail}"))
         }
     })
     .await;
