@@ -1099,7 +1099,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &[
                 "If this branch has an open PR, also read everything on it posted or edited \
                  after your last commit, using the fallback commands and the rule about whose \
-                 comments are instructions from the `awaiting_human_review` entry.",
+                 comments are instructions from the `awaiting_human_review` entry, plus top-level \
+                 comments: `gh api --paginate \"repos/{owner}/{repo}/issues/$N/comments\"`.",
                 "Where the note and a comment disagree, follow the note.",
             ],
             "the escalate_to_human entry must send the coder to the PR under the same fence",

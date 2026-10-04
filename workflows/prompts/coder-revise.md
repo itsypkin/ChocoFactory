@@ -38,7 +38,8 @@ follow that entry:
   current. Follow it. If this branch has an open PR, also read everything on
   it posted or edited after your last commit, using the fallback commands
   and the rule about whose comments are instructions from the
-  `awaiting_human_review` entry. When the escalation came from the PR
+  `awaiting_human_review` entry, plus top-level comments:
+  `gh api --paginate "repos/{owner}/{repo}/issues/$N/comments"`. When the escalation came from the PR
   review's loop guard, the section "The human's review" below is that
   review; on any other escalation it may be left over from an earlier
   review, so check its comments against your last commit. When the

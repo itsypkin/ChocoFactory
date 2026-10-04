@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const FAKE_GH: &str = r#"#!/bin/sh
-# Pages are $DIR/page-1.json, page-2.json ... (one `gh api` comments call
-# prints each page's `-q` output in turn, like --paginate). $DIR/since is the
+# Pages are $DIR/page-1.json, page-2.json ... (a `gh api` comments call
+# prints each page's `-q` output in turn only with --paginate). $DIR/since is the
 # head commit's date. $DIR/fail-<what> makes that call fail, where <what> is
 # pr-view, commits, or comments-<n> for the nth comments call.
 DIR="$GH_FAKE_DIR"
@@ -32,12 +32,14 @@ done
 case "$1" in
 pr)
     [ -e "$DIR/fail-pr-view" ] && { echo "fake gh: pr view failed" >&2; exit 1; }
+    [ -e "$DIR/fail-empty-pr-view" ] && exit 0
     echo "0123456789abcdef"
     ;;
 api)
     case "$2$3" in
     *commits/*)
         [ -e "$DIR/fail-commits" ] && { echo "fake gh: commits failed" >&2; exit 1; }
+        [ -e "$DIR/fail-empty-commits" ] && exit 0
         cat "$DIR/since"
         ;;
     *)
@@ -539,4 +541,47 @@ fn an_oversized_rendering_is_truncated_well_under_the_capture_limit() {
     assert!(out.starts_with("REQUEST_CHANGES\n\n"));
     assert!(out.len() < 600_000, "{}", out.len());
     assert!(out.contains("[truncated"), "no truncation note");
+}
+
+/// Truncation keeps the newest comments: the latest findings must survive.
+#[test]
+fn truncation_keeps_the_newest_comments() {
+    let big = "x".repeat(60_000);
+    let mut cs: Vec<String> = (0..12)
+        .map(|_| comment(FRESH, "OWNER", Some("me"), &big))
+        .collect();
+    cs.push(comment(
+        LATER,
+        "OWNER",
+        Some("me"),
+        "FIX THIS\n/request-changes",
+    ));
+    let out = stdout_of(SINCE, &[list(&cs)]);
+    assert!(out.contains("FIX THIS"), "newest comment was cut");
+}
+
+/// Empty gh answers and a missing PR_NUMBER are errors, not "no verdict".
+#[test]
+fn empty_head_empty_date_and_missing_pr_number_are_errors() {
+    let page = list(&[comment(FRESH, "OWNER", Some("me"), "/approve")]);
+    for what in ["empty-pr-view", "empty-commits"] {
+        let fx = Fixture::new(SINCE, std::slice::from_ref(&page));
+        fx.fail(what);
+        let out = fx.run();
+        assert!(!out.status.success(), "{what} must fail the script");
+        assert!(out.stdout.is_empty(), "{what}: no partial verdict");
+        assert!(!out.stderr.is_empty(), "{what}: stderr must say why");
+    }
+    let fx = Fixture::new(SINCE, std::slice::from_ref(&page));
+    let path = format!("{}:{}", fx.dir.display(), std::env::var("PATH").unwrap());
+    let out = Command::new("sh")
+        .arg(script_path())
+        .env("PATH", path)
+        .env("GH_FAKE_DIR", &fx.dir)
+        .env_remove("PR_NUMBER")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
 }
