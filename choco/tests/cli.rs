@@ -308,13 +308,29 @@ impl ChocoOutput {
 /// `args`, and waits for it to exit. Output is the default human-readable
 /// rendering — use [`run_choco_json`] for the machine-facing form.
 async fn run_choco(base_url: &str, args: &[&str]) -> ChocoOutput {
-    let output = Command::new(env!("CARGO_BIN_EXE_choco"))
-        .arg("--base-url")
-        .arg(base_url)
-        .args(args)
-        .output()
-        .await
-        .expect("failed to spawn choco");
+    // Bounded, so a `choco` that ignores its own `--timeout` (or a daemon
+    // that stops a stage advancing) fails the test instead of hanging
+    // `cargo test`. Twice `LOAD_ALLOWANCE`: `watch_choco` hands the process
+    // a `--timeout` of one `LOAD_ALLOWANCE`, and this must outlast it so the
+    // CLI's own exit 5 is what a healthy run sees. `kill_on_drop` reaps the
+    // process when the timeout drops the future.
+    let output = tokio::time::timeout(
+        LOAD_ALLOWANCE * 2,
+        Command::new(env!("CARGO_BIN_EXE_choco"))
+            .arg("--base-url")
+            .arg(base_url)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "`choco {args:?}` was still running after {:?}",
+            LOAD_ALLOWANCE * 2
+        )
+    })
+    .expect("failed to spawn choco");
     ChocoOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -2136,7 +2152,9 @@ async fn watch_timeout_cuts_a_long_interval_short() {
     );
     let (code, stderr) = finish_watcher(child).await;
     assert_eq!(code, Some(5), "stderr: {stderr}");
-    assert!(started.elapsed() < LOAD_ALLOWANCE);
+    // An assertion, not a wait: 10 s separates a 2 s cut-short from the 1 h
+    // hang; `finish_watcher` already enforces `LOAD_ALLOWANCE`.
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 #[tokio::test]

@@ -782,9 +782,17 @@ stages:
         "the decisive entry should say which rule fired: {decisive}"
     );
 
-    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
-    assert_eq!(detail["workflow_state"]["current_stage"], "done");
-    assert_eq!(detail["status"], "closed");
+    // `stage_entered done` is pushed before the status write that closes
+    // the task, so wait for the close rather than racing it.
+    let detail = wait_until("the task to be closed", || async {
+        let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+        if detail["workflow_state"]["current_stage"] == "done" && detail["status"] == "closed" {
+            Ok(detail)
+        } else {
+            Err(format!("task not yet closed: {detail}"))
+        }
+    })
+    .await;
     let trail: Vec<&str> = detail["stage_trail"]
         .as_array()
         .expect("stage_trail missing from the real binary's task detail")
@@ -880,10 +888,12 @@ stages:
     // templated command rendered.
     let detail = wait_until("the task to reach `done`", || async {
         let detail = daemon.get(&format!("/tasks/{task_id}")).await;
-        if detail["workflow_state"]["current_stage"] == "done" {
+        // `current_stage` and `status` are committed in separate writes, so
+        // wait for both rather than racing the second.
+        if detail["workflow_state"]["current_stage"] == "done" && detail["status"] == "closed" {
             Ok(detail)
         } else {
-            Err(format!("task did not finish: {detail}"))
+            Err(format!("task did not finish and close: {detail}"))
         }
     })
     .await;
@@ -1874,8 +1884,10 @@ async fn a_stalled_connection_does_not_block_shutdown_past_the_drain_grace() {
     conn.flush().await.unwrap();
     // Not a fixed sleep: the kernel hands connections to `accept` in order,
     // so once the daemon has answered a second, complete request on a fresh
-    // connection it has certainly accepted (and registered for draining)
-    // the stalled one made before it.
+    // connection it has accepted and registered the stalled one made before
+    // it. That narrows the race rather than closing it: "registered" is not
+    // "in flight", and the HTTP server can still drop a connection that
+    // hasn't yet sent enough bytes to identify its protocol version.
     let client = reqwest::Client::new();
     wait_until(
         "the daemon to answer a request after the stalled one",
