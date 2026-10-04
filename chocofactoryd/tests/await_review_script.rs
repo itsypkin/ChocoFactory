@@ -45,8 +45,12 @@ api)
         n=$((n+1))
         echo "$n" > "$DIR/count"
         [ -e "$DIR/fail-comments-$n" ] && { echo "fake gh: comments failed" >&2; exit 1; }
+        # Like gh: only the first page unless --paginate is given.
+        paginate=0
+        for a in "$@"; do [ "$a" = "--paginate" ] && paginate=1; done
         for page in "$DIR"/page-*.json; do
             jq -r "$q" < "$page" || exit 1
+            [ "$paginate" = 1 ] || break
         done
         ;;
     esac
@@ -520,4 +524,19 @@ fn a_body_line_naming_the_other_token_cannot_change_the_outcome() {
         )])],
     );
     assert!(ap.is_match(out.trim()) && !rc.is_match(out.trim()), "{out}");
+}
+
+/// Output over the engine's 1 MiB capture limit would leave the previous
+/// lap's capture in place, so the script truncates and says so.
+#[test]
+fn an_oversized_rendering_is_truncated_well_under_the_capture_limit() {
+    let big = "x".repeat(60_000);
+    let mut cs: Vec<String> = (0..12)
+        .map(|_| comment(FRESH, "OWNER", Some("me"), &big))
+        .collect();
+    cs.push(comment(LATER, "OWNER", Some("me"), "/request-changes"));
+    let out = stdout_of(SINCE, &[list(&cs)]);
+    assert!(out.starts_with("REQUEST_CHANGES\n\n"));
+    assert!(out.len() < 600_000, "{}", out.len());
+    assert!(out.contains("[truncated"), "no truncation note");
 }

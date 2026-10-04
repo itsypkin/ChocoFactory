@@ -36,11 +36,14 @@ follow that entry:
 - **`escalate_to_human` → `resumed`**: a human stepped in after the task was
   escalated. Their note is quoted below under "A human's note", and it is
   current. Follow it. If this branch has an open PR, also read everything on
-  it posted or edited after your last commit: the section "The human's
-  review" below, and the fallback commands and the rule about whose
-  comments are instructions from the `awaiting_human_review` entry. When the
-  escalation came from the PR review, that's where the rejection is, and a short note like "same issues,
-  keep going" refers to it. Where the note and a comment disagree, follow
+  it posted or edited after your last commit, using the fallback commands
+  and the rule about whose comments are instructions from the
+  `awaiting_human_review` entry. When the escalation came from the PR
+  review's loop guard, the section "The human's review" below is that
+  review; on any other escalation it may be left over from an earlier
+  review, so check its comments against your last commit. When the
+  escalation came from the PR review, that's where the rejection is, and a
+  short note like "same issues, keep going" refers to it. Where the note and a comment disagree, follow
   the note.
 
 If your transition isn't in this list, check `gh pr checks`,

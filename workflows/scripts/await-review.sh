@@ -96,7 +96,15 @@ V=$(tail -n 1 "$TMP/verdicts")
 gh api --paginate "$URL" -q "$RENDER" > "$TMP/rendered" ||
     fail "gh api issues/$PR_NUMBER/comments failed (rendering)"
 
+# The engine stores a capture only up to 1 MiB; over that, the previous
+# lap's capture would survive and be read as current. Cap well under it.
+MAX=500000
 {
     printf '%s\n\n' "$V"
-    cat "$TMP/rendered"
+    if [ "$(wc -c < "$TMP/rendered")" -gt "$MAX" ]; then
+        head -c "$MAX" "$TMP/rendered"
+        printf '\n\n[truncated: the comments were too long to include in full; read the rest with `gh api --paginate "repos/{owner}/{repo}/issues/%s/comments"`]\n' "$PR_NUMBER"
+    else
+        cat "$TMP/rendered"
+    fi
 }

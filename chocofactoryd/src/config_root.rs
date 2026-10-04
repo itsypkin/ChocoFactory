@@ -1060,6 +1060,15 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             reviewer_heading < summary && summary < human_note_heading,
             "the stale summary must render only under its own heading:\n{rendered}"
         );
+        // The entry must not present the captured human review as current
+        // on every escalation: only when the review's loop guard tripped.
+        assert!(
+            squash(&rendered).contains(
+                "When the escalation came from the PR review's loop guard, the section \"The \
+                 human's review\" below is that review; on any other escalation it may be left over"
+            ),
+            "the escalate entry must make the human-review reference conditional:\n{rendered}"
+        );
         let framing = squash(&rendered[reviewer_heading..summary]);
         // Either loop guard can escalate; the summary is the rejection only
         // for the internal reviewer's. The old wording assumed it always was,
@@ -1089,9 +1098,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &entry,
             &[
                 "If this branch has an open PR, also read everything on it posted or edited \
-                 after your last commit: the section \"The human's review\" below, and the \
-                 fallback commands and the rule about whose comments are instructions from \
-                 the `awaiting_human_review` entry.",
+                 after your last commit, using the fallback commands and the rule about whose \
+                 comments are instructions from the `awaiting_human_review` entry.",
                 "Where the note and a comment disagree, follow the note.",
             ],
             "the escalate_to_human entry must send the coder to the PR under the same fence",

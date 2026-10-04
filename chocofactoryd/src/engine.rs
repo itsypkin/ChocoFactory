@@ -13138,9 +13138,10 @@ exec "{mock_claude}" "$@"
     ///
     /// What it deliberately does *not* model: PR state (so the
     /// `--state open` scoping has no regression test here), and the jq
-    /// filter (the `verdict` file supplies the filter's output token, not
-    /// a comment body). `tests/await_review_script.rs` covers the filter
-    /// directly against the shipped YAML.
+    /// selection rules (the stub applies each call's `-q` filter with `jq`
+    /// to the canned comments in the `verdict` file, and does not model
+    /// pagination). `tests/await_review_script.rs` covers the selection
+    /// directly against the shipped script.
     fn gh_stub_dir(dir: &Path) -> PathBuf {
         write_script(
             dir,
