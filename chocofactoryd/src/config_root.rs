@@ -921,10 +921,10 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert!(!entry.contains("Run `gh pr view --comments`"));
     }
 
-    /// On the `internal_review` path the human's review is left over from an
-    /// earlier lap and must be labelled so.
+    /// On the `internal_review` path the human's review is from an earlier
+    /// lap, already handled, and must be labelled so.
     #[test]
-    fn coder_revise_for_the_internal_review_path_labels_the_humans_review_as_left_over() {
+    fn coder_revise_for_the_internal_review_path_labels_the_humans_review_as_handled() {
         let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
             "internal_review",
             "changes_requested",
