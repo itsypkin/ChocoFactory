@@ -13115,6 +13115,15 @@ exec "{mock_claude}" "$@"
         }
     }
 
+    /// A page of PR comments holding one owner comment, newer than the
+    /// stub's head commit date. `body` is spliced into JSON as is, so
+    /// newlines are written `\\n`.
+    fn owner_comment_page(body: &str) -> String {
+        format!(
+            r#"[{{"created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:00:00Z", "author_association": "OWNER", "user": {{"login": "owner"}}, "html_url": "https://example.test/c/1", "body": "{body}"}}]"#
+        )
+    }
+
     /// A stub `gh` covering exactly the invocations `coding-task.yaml`
     /// makes: `pr create`, `pr checks`, `pr list` (`open_pr`'s existence
     /// probe and its number/url read-back), `pr view` (the head SHA), and
@@ -13130,7 +13139,7 @@ exec "{mock_claude}" "$@"
     /// What it deliberately does *not* model: PR state (so the
     /// `--state open` scoping has no regression test here), and the jq
     /// filter (the `verdict` file supplies the filter's output token, not
-    /// a comment body). `tests/verdict_filter.rs` covers the filter
+    /// a comment body). `tests/await_review_script.rs` covers the filter
     /// directly against the shipped YAML.
     fn gh_stub_dir(dir: &Path) -> PathBuf {
         write_script(
@@ -13142,15 +13151,21 @@ set -eu
 created="{dir}/pr-created"
 case "$1" in
     api)
-        # `awaiting_human_review` makes two `gh api` calls: the head
-        # commit's date, then the comment list its filter runs over. The
-        # stub answers the second from a file the test owns — which means
-        # it stands in for the *whole* query, jq filter included. That
-        # filter is covered separately and directly by
-        # `verdict_filter_*` in `tests/verdict_filter.rs`; what these
-        # workflow tests cover is the routing either side of it.
+        # `awaiting_human_review` runs `scripts/await-review.sh`, which
+        # makes the head commit's date call and then the comments calls.
+        # The stub answers the comments calls like gh would: it applies the
+        # call's `-q` filter (with `jq`) to a canned page the test owns in
+        # the `verdict` file (a JSON array of PR comments). What a comment
+        # has to look like to vote is covered in
+        # `tests/await_review_script.rs`; these workflow tests cover the
+        # routing either side of it.
         if printf '%s\n' "$@" | grep -q '/comments'; then
-            cat "{dir}/verdict" 2>/dev/null || true
+            q=""; prev=""
+            for a in "$@"; do
+                if [ "$prev" = "-q" ]; then q=$a; fi
+                prev=$a
+            done
+            jq -r "$q" < "{dir}/verdict"
         else
             echo "2020-01-01T00:00:00Z"
         fi
@@ -13271,12 +13286,13 @@ esac
 
         let scripts_dir = tempdir();
         let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
-        // The token `awaiting_human_review`'s filter *emits* for an
-        // approval — not the `/approve` marker a human types. The stub
-        // stands in for the whole query, jq filter included, so what a
-        // comment body has to look like to produce this token is covered
-        // in `tests/verdict_filter.rs` rather than here.
-        fs::write(scripts_dir.join("verdict"), "APPROVE\n").unwrap();
+        // The PR comments `awaiting_human_review`'s script reads: an
+        // owner's `/approve`. See `owner_comment_page`.
+        fs::write(
+            scripts_dir.join("verdict"),
+            owner_comment_page("looks good\\n/approve"),
+        )
+        .unwrap();
 
         let (task_id, def, claude_wrapper) = seed_coding_task(
             &pool,
@@ -13340,7 +13356,11 @@ esac
         let _origin = add_bare_origin(&repo).await;
         let scripts_dir = tempdir();
         let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
-        fs::write(scripts_dir.join("verdict"), "REQUEST_CHANGES\n").unwrap();
+        fs::write(
+            scripts_dir.join("verdict"),
+            owner_comment_page("HUMAN ITEM: fix the release build\\n/request-changes"),
+        )
+        .unwrap();
 
         let (task_id, def, claude_wrapper) = seed_coding_task(
             &pool,
@@ -13403,6 +13423,31 @@ esac
             "escalate_to_human must be entered immediately after the last \
              awaiting_human_review, not via some other stage: {raw_trail:?}"
         );
+
+        // #138: the poll's capture is the human's review, and it is in the
+        // payload, here on the path where the poll's own loop guard routed
+        // the 4th `changes_requested` to `escalate_to_human`.
+        let payload = payload_of(&pool, &task_id).await;
+        let review = payload["stages"]["awaiting_human_review"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text capture in {payload}"));
+        assert!(
+            review.starts_with("REQUEST_CHANGES\n\n### owner (OWNER), "),
+            "{review:?}"
+        );
+        assert!(review.contains("HUMAN ITEM: fix the release build"));
+        // ...and it renders into the coder's prompt under its heading.
+        let prompt_src = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/prompts/coder-revise.md"),
+        )
+        .unwrap();
+        let mut render_payload = payload.clone();
+        render_payload["arrival"] =
+            json!({ "from": "awaiting_human_review", "outcome": "changes_requested" });
+        let (prompt, _) = crate::template::render(&prompt_src, &render_payload).unwrap();
+        let heading = prompt.find("## The human's review").unwrap();
+        let item = prompt.find("HUMAN ITEM: fix the release build").unwrap();
+        assert!(heading < item, "{prompt}");
 
         // The load-bearing one: a second `gh pr create` is exactly the
         // failure #78's second half describes, and it would have shown up

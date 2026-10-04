@@ -158,11 +158,17 @@ stages:
   # a few minutes slow can re-admit one already-consumed verdict. The
   # loop guard below bounds that at three laps rather than a spin.
   #
-  # The filter resolves the verdict itself and prints one token, so the
-  # engine's regexes match `^APPROVE$`/`^REQUEST_CHANGES$` rather than
-  # picking a marker out of free text. `/request-changes` is tested
-  # first: a comment carrying both markers must never resolve to
-  # "merge it".
+  # `scripts/await-review.sh` resolves the verdict itself and prints it
+  # as the first line, so the engine's regexes anchor to the start of the
+  # output (`\A`) rather than picking a marker out of free text. Below the
+  # first line it prints the qualifying comments (#138), which `revising`
+  # renders into the coder's prompt. A comment body containing a line
+  # `APPROVE` cannot change the outcome: the patterns accept the token only
+  # as the first line. (`outcomes.matching` trims stdout and matches the
+  # whole of it, `$` meaning end of output.) `/request-changes` is tested
+  # first: a comment carrying both markers must never resolve to "merge
+  # it". The script's own header documents the selection, the output
+  # format and the two-call trade-off.
   #
   # Two author fences, because on a *public* repo the comment box is open
   # to the whole internet and this stage spends money. `authorAssociation`
@@ -183,26 +189,16 @@ stages:
   # still votes.
   awaiting_human_review:
     kind: poll
-    command: >-
-      SINCE="$(gh api
-      "repos/{owner}/{repo}/commits/$(gh pr view {{ stages.open_pr.number }}
-      --json headRefOid -q .headRefOid)" -q .commit.committer.date)" &&
-      export SINCE &&
-      gh api --paginate
-      "repos/{owner}/{repo}/issues/{{ stages.open_pr.number }}/comments?per_page=100"
-      -q '.[] | select(([.created_at, .updated_at] | max) > $ENV.SINCE)
-      | select(.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
-      | select((.user.login // "") | endswith("[bot]") | not)
-      | (.body // "") | split("\n") | map(sub("[ \t\r]+$"; ""))
-      | if index("/request-changes") then "REQUEST_CHANGES"
-      elif index("/approve") then "APPROVE" else empty end'
-      | tail -n 1
+    script_file: scripts/await-review.sh
+    env:
+      PR_NUMBER: "{{ stages.open_pr.number }}"
+    capture: text
     interval: 60s
     timeout: 6h
     outcomes:
-      - match: '^REQUEST_CHANGES$'
+      - match: '\AREQUEST_CHANGES(\n|$)'
         then: changes_requested
-      - match: '^APPROVE$'
+      - match: '\AAPPROVE(\n|$)'
         then: approved
     on:
       approved: done

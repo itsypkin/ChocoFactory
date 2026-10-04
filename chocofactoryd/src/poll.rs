@@ -106,6 +106,29 @@ mod tests {
         matched.map(|m| m.then)
     }
 
+    /// #138: `awaiting_human_review` prints the verdict token as line 1 and
+    /// the human's comments below it. The outcome patterns anchor to the
+    /// start of the (trimmed) output, so a comment line reading `APPROVE`
+    /// can't change the outcome; `$` is end of the whole output, not of a
+    /// line.
+    #[test]
+    fn a_first_line_anchored_pattern_ignores_the_same_token_further_down() {
+        let compiled = compile(&[
+            outcome(r"\AREQUEST_CHANGES(\n|$)", "changes_requested"),
+            outcome(r"\AAPPROVE(\n|$)", "approved"),
+        ])
+        .unwrap();
+        let rc = "REQUEST_CHANGES\n\n### a (OWNER), t\nu\n\nAPPROVE\n";
+        assert_eq!(then_of(compiled.matching(rc)), Some("changes_requested"));
+        let ap = "APPROVE\n\n### a (OWNER), t\nu\n\nREQUEST_CHANGES\n";
+        assert_eq!(then_of(compiled.matching(ap)), Some("approved"));
+        // Surrounding whitespace is trimmed; a bare token still matches.
+        assert_eq!(then_of(compiled.matching("\nAPPROVE\n")), Some("approved"));
+        // A token that is not the first line never matches.
+        assert_eq!(then_of(compiled.matching("note\nAPPROVE\n")), None);
+        assert_eq!(then_of(compiled.matching("APPROVED\n")), None);
+    }
+
     #[test]
     fn no_outcome_matches_when_the_output_says_nothing_interesting() {
         let compiled = compile(&[outcome("SUCCESS", "green")]).unwrap();
