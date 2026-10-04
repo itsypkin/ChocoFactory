@@ -565,7 +565,7 @@ fn truncation_keeps_the_newest_comments() {
 /// (`stdout_of` already asserts the latter via `String::from_utf8`).
 #[test]
 fn truncation_starts_at_a_whole_comment_with_multibyte_bodies() {
-    // 3-byte characters, so a byte cut is very likely to split one.
+    // 2- and 3-byte characters, so a byte cut is very likely to split one.
     let big = "é€".repeat(12_000);
     let mut cs: Vec<String> = (0..12)
         .map(|_| comment(FRESH, "OWNER", Some("me"), &big))
@@ -574,7 +574,22 @@ fn truncation_starts_at_a_whole_comment_with_multibyte_bodies() {
     let out = stdout_of(SINCE, &[list(&cs)]);
     let (_, after) = out.split_once("]\n\n").expect("no truncation note");
     assert!(out.contains("[truncated"), "no truncation note");
-    assert!(after.starts_with("### me (OWNER), "), "{:?}", &after[..80]);
+    assert!(
+        after.starts_with("### me (OWNER), "),
+        "{:?}",
+        after.chars().take(80).collect::<String>()
+    );
+}
+
+/// A single comment over the cap leaves no header in the kept tail; its end
+/// (the findings and the marker) must still come through.
+#[test]
+fn truncation_of_one_oversized_comment_keeps_its_end() {
+    let body = format!("{}\nFIX THIS\n/request-changes", "x".repeat(600_000));
+    let cs = vec![comment(FRESH, "OWNER", Some("me"), &body)];
+    let out = stdout_of(SINCE, &[list(&cs)]);
+    assert!(out.contains("[truncated"), "no truncation note");
+    assert!(out.contains("FIX THIS"), "newest text was dropped");
 }
 
 /// Empty gh answers and a missing PR_NUMBER are errors, not "no verdict".

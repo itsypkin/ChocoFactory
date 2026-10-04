@@ -832,8 +832,9 @@ cargo test --workspace
 ```
 
 `jq` must be installed to run `cargo test --workspace`: the `gh` stubs in
-`chocofactoryd/src/engine.rs` and `chocofactoryd/tests/e2e_smoke.rs` apply
-`-q` filters with it, so the engine unit tests fail on a machine without it.
+`chocofactoryd/src/engine.rs`, `chocofactoryd/tests/e2e_smoke.rs` and
+`chocofactoryd/tests/await_review_script.rs` apply `-q` filters with it, so
+those tests fail on a machine without it.
 CI has it.
 
 Tests never spawn the real `claude` — the integration suites point the
