@@ -237,8 +237,12 @@ the tool rejected.
 
 By default an agent role runs isolated from the operator's own Claude Code
 setup: no `~/.claude/CLAUDE.md`, no user plugins, hooks or output style, no
-MCP servers other than the daemon's, no skills, no auto-memory, and no
-built-in `ReportFindings` tool. The task repo's own `CLAUDE.md` and
+MCP servers other than the daemon's, no skills, no auto-memory, no
+built-in `ReportFindings` tool, and no timer or wait tools (`ScheduleWakeup`,
+`Monitor`, `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`, #115):
+an agent that ends its turn to wait on its own timer races the daemon's
+nudge clock. Chat keeps `ScheduleWakeup` and `Monitor` but can't use the cron
+or remote-trigger tools. The task repo's own `CLAUDE.md` and
 `.claude/settings.json` still apply, including any hooks or plugins that
 repo enables: they belong to the code being worked on. The repo's
 `.claude/settings.local.json` is *not* read: it is the operator's personal
@@ -252,7 +256,7 @@ roles:
     skills: [run-tests]   # skills it may invoke; omitted = none
     memory: true          # use auto-memory; omitted = no
   chat:
-    inherit_operator_config: true   # your full setup, as before
+    inherit_operator_config: true   # your full setup, minus cron/remote-trigger tools
 ```
 
 `skills`/`memory` can't be combined with `inherit_operator_config`. None of
