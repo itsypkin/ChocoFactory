@@ -560,6 +560,23 @@ fn truncation_keeps_the_newest_comments() {
     assert!(out.contains("FIX THIS"), "newest comment was cut");
 }
 
+/// The cut can land mid-comment and mid-character; the output after the
+/// truncation note must start at a whole comment header and be valid UTF-8
+/// (`stdout_of` already asserts the latter via `String::from_utf8`).
+#[test]
+fn truncation_starts_at_a_whole_comment_with_multibyte_bodies() {
+    // 3-byte characters, so a byte cut is very likely to split one.
+    let big = "é€".repeat(12_000);
+    let mut cs: Vec<String> = (0..12)
+        .map(|_| comment(FRESH, "OWNER", Some("me"), &big))
+        .collect();
+    cs.push(comment(LATER, "OWNER", Some("me"), "/request-changes"));
+    let out = stdout_of(SINCE, &[list(&cs)]);
+    let (_, after) = out.split_once("]\n\n").expect("no truncation note");
+    assert!(out.contains("[truncated"), "no truncation note");
+    assert!(after.starts_with("### me (OWNER), "), "{:?}", &after[..80]);
+}
+
 /// Empty gh answers and a missing PR_NUMBER are errors, not "no verdict".
 #[test]
 fn empty_head_empty_date_and_missing_pr_number_are_errors() {
