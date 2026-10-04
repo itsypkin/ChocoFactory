@@ -187,8 +187,14 @@ mod tests {
         let t = Tmp::new();
         let lock = DaemonLock::acquire(&t.0).unwrap();
         lock.publish(&info()).unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
+        // The child blocks reading a stdin pipe this test holds open, so it
+        // stays alive until the test says otherwise. A `sleep N` ran out its
+        // own clock under load (#152), making `alive` false for a reason
+        // unrelated to the lock. `alive` is still asserted, so the test
+        // can't pass vacuously with a child that is already gone.
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
         drop(lock);

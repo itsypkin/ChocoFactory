@@ -2616,7 +2616,16 @@ mod tests {
                 {"op": "emit_forever", "text": "still going"},
             ]),
         );
-        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        // Grace must fire exactly once, and only after the fixture has
+        // spawned its child and emitted its post-completion output. With
+        // the 400 ms default a loaded machine can kill the group first
+        // (#126), so give the fixture `RESPONSE_MARGIN` (the max-elapsed
+        // rule from #98) to get there; it is the real bound on the fixture.
+        let timers = TurnTimers {
+            grace: crate::test_support::RESPONSE_MARGIN,
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
 
         let child_pid = read_pid_when_written(&child_pid_path).await;
         let run = wait_until_final(&pool, &session_id).await;
