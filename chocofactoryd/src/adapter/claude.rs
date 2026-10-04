@@ -102,19 +102,23 @@ impl AgentAdapter for ClaudeAdapter {
     }
 }
 
-/// #115: tools that schedule or wait for something later. Every agent turn
-/// runs under `--print` with stream-json, where nothing wakes a turn on a
-/// timer, so a turn that calls one and ends to "wait" just stalls until the
-/// daemon nudges it.
-/// - `ScheduleWakeup`: a wake-up that never fires.
-/// - `Monitor`: waits on background output that cannot restart the turn.
-/// - `CronCreate`, `CronDelete`, `CronList`: session-scoped schedules that
-///   only fire in an idle interactive session.
+/// #115: tools that schedule or wait for something later. They do work under
+/// `--print` when stdin stays open: a wake-up, a monitor or a cron schedule
+/// starts a new turn. The problem is who owns that turn. A workflow agent
+/// that ends its turn to wait on its own timer races the daemon's nudge
+/// clock (`nudge_after`, `max_nudges`, then the turn closes as `no_report`)
+/// and spends wall-clock time the daemon can't see, so workflow roles lose
+/// all of them.
+/// - `ScheduleWakeup`, `Monitor`: the agent waits on its own timer or
+///   watcher instead of the daemon's.
+/// - `CronCreate`, `CronDelete`, `CronList`: recurring turns the task
+///   doesn't own.
 /// - `RemoteTrigger`: schedules cloud agents that would run outside choco,
 ///   after the turn, as the operator.
 ///
-/// An unknown name in `--disallowedTools` is ignored, so naming a tool an
-/// older CLI lacks is safe.
+/// Background `Bash` and `Agent` stay available: the workflows rely on them
+/// waking the turn correctly. An unknown name in `--disallowedTools` is
+/// ignored, so naming a tool an older CLI lacks is safe.
 const TIMER_TOOLS: [&str; 6] = [
     "ScheduleWakeup",
     "Monitor",
@@ -123,6 +127,13 @@ const TIMER_TOOLS: [&str; 6] = [
     "CronList",
     "RemoteTrigger",
 ];
+
+/// #115: the subset of `TIMER_TOOLS` the chat role loses. Chat is a standing
+/// session that is never nudged, so a one-off wait the operator asked for
+/// ("check CI in 10 minutes") works there: `ScheduleWakeup` and `Monitor`
+/// stay. Cron and remote triggers start unattended or recurring turns, and
+/// may keep the session from being idle-reaped.
+const CHAT_BLOCKED_TOOLS: [&str; 4] = ["CronCreate", "CronDelete", "CronList", "RemoteTrigger"];
 
 fn spawn(
     binary: &str,
@@ -247,12 +258,15 @@ fn spawn(
     //   environment (#105).
     apply_auto_memory_env(&mut command, &cfg.isolation);
     //
-    // #115: the timer tools are removed from every role, isolated or not.
-    // "Inherit the operator's config" means the operator's settings,
-    // plugins and MCP servers, not tools that cannot work under `--print`.
+    // #115: workflow (isolated) roles lose all of `TIMER_TOOLS`; chat loses
+    // only `CHAT_BLOCKED_TOOLS` (see their comments for why). "Inherit the
+    // operator's config" means the operator's settings, plugins and MCP
+    // servers, not tools that start turns nobody supervises.
     let initialize = match &cfg.isolation {
         Isolation::InheritOperatorConfig => {
-            command.arg("--disallowedTools").arg(TIMER_TOOLS.join(","));
+            command
+                .arg("--disallowedTools")
+                .arg(CHAT_BLOCKED_TOOLS.join(","));
             None
         }
         Isolation::Isolated { skills, memory: _ } => {
@@ -1364,34 +1378,45 @@ mod tests {
         let fields = echo_args_for(Isolation::InheritOperatorConfig).await;
         assert_eq!(fields["setting_sources"], "<unset>");
         assert_eq!(fields["strict_mcp_config"], "false");
-        // #115: a decision, not an isolation flag. Chat keeps `ReportFindings`
-        // and `Skill`; only tools that cannot work under `--print` go.
+        // #115: a decision, not an isolation flag. Chat keeps `ReportFindings`,
+        // `Skill`, `ScheduleWakeup` and `Monitor`; it loses only the cron and
+        // remote-trigger tools.
         assert_eq!(
             fields["disallowed_tools"],
-            "ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger"
+            "CronCreate,CronDelete,CronList,RemoteTrigger"
         );
         assert_eq!(fields["disable_auto_memory"], "<unset>");
         assert_eq!(fields["initialize"], "<unset>");
     }
 
-    /// #115: every role shape loses every timer tool, so a tool added to the
-    /// constant can't be dropped from one shape.
+    /// #115: workflow role shapes lose every timer tool, and chat loses
+    /// every tool in `CHAT_BLOCKED_TOOLS`, so a tool added to a constant
+    /// can't be dropped from one shape.
     #[tokio::test]
-    async fn every_role_shape_loses_every_timer_tool() {
+    async fn every_role_shape_loses_the_tools_it_should() {
         let shapes = [
-            Isolation::default(),
-            Isolation::Isolated {
-                skills: vec!["run-tests".to_string()],
-                memory: true,
-            },
-            Isolation::InheritOperatorConfig,
+            (Isolation::default(), TIMER_TOOLS.to_vec()),
+            (
+                Isolation::Isolated {
+                    skills: vec!["run-tests".to_string()],
+                    memory: true,
+                },
+                TIMER_TOOLS.to_vec(),
+            ),
+            (
+                Isolation::InheritOperatorConfig,
+                CHAT_BLOCKED_TOOLS.to_vec(),
+            ),
         ];
-        for isolation in shapes {
+        for (isolation, expected) in shapes {
             let fields = echo_args_for(isolation).await;
             let listed: Vec<&str> = fields["disallowed_tools"].split(',').collect();
-            for tool in TIMER_TOOLS {
+            for tool in expected {
                 assert!(listed.contains(&tool), "{tool} missing from {listed:?}");
             }
+        }
+        for tool in CHAT_BLOCKED_TOOLS {
+            assert!(TIMER_TOOLS.contains(&tool), "{tool} not a timer tool");
         }
     }
 
