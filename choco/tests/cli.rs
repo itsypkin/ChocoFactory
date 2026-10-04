@@ -24,6 +24,13 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+/// How long a test waits for something asynchronous before declaring it
+/// never happened (#98, #152). A constants-only copy of the value in
+/// `chocofactoryd/src/test_support.rs`, which is the source of truth: this
+/// crate can't include that file because its tests need tokio's
+/// `test-util`, which `choco`'s dev-dependencies lack. Keep it in step.
+const LOAD_ALLOWANCE: Duration = Duration::from_secs(30);
+
 struct TempHome(PathBuf);
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -250,7 +257,7 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut 
     // accepts the connection but never answers (e.g. blocked writing to a
     // full stderr pipe) still reaches the kill-and-report path below
     // instead of hanging the test.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     while tokio::time::Instant::now() < deadline {
         if let Ok(resp) = client
             .get(format!("{base_url}/projects"))
@@ -301,13 +308,29 @@ impl ChocoOutput {
 /// `args`, and waits for it to exit. Output is the default human-readable
 /// rendering — use [`run_choco_json`] for the machine-facing form.
 async fn run_choco(base_url: &str, args: &[&str]) -> ChocoOutput {
-    let output = Command::new(env!("CARGO_BIN_EXE_choco"))
-        .arg("--base-url")
-        .arg(base_url)
-        .args(args)
-        .output()
-        .await
-        .expect("failed to spawn choco");
+    // Bounded, so a `choco` that ignores its own `--timeout` (or a daemon
+    // that stops a stage advancing) fails the test instead of hanging
+    // `cargo test`. Twice `LOAD_ALLOWANCE`: `watch_choco` hands the process
+    // a `--timeout` of one `LOAD_ALLOWANCE`, and this must outlast it so the
+    // CLI's own exit 5 is what a healthy run sees. `kill_on_drop` reaps the
+    // process when the timeout drops the future.
+    let output = tokio::time::timeout(
+        LOAD_ALLOWANCE * 2,
+        Command::new(env!("CARGO_BIN_EXE_choco"))
+            .arg("--base-url")
+            .arg(base_url)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "`choco {args:?}` was still running after {:?}",
+            LOAD_ALLOWANCE * 2
+        )
+    })
+    .expect("failed to spawn choco");
     ChocoOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -1617,13 +1640,15 @@ stages:
     kind: terminal
 "#;
 
+// The first stage is a gate so the test controls when `fast` is reached:
+// it resumes the gate only after the watcher's first poll has printed, so
+// that poll comes before `fast` by construction rather than by a sleep (#130).
 const FAST_WF: &str = r#"
 name: fastwf
 stages:
-  run:
-    kind: shell
-    command: "sleep 2"
-    on: { done: fast }
+  start:
+    kind: human_gate
+    on: { resumed: fast }
   fast:
     kind: shell
     command: "true"
@@ -1665,9 +1690,24 @@ async fn watch_setup(name: &str, yaml: &str) -> (Daemon, String) {
 }
 
 async fn watch_choco(daemon: &Daemon, id: &str, extra: &[&str]) -> ChocoOutput {
+    let limit = timeout_arg();
     let mut args = vec!["task", "status", id];
     args.extend_from_slice(extra);
+    // A watch with no time limit hangs `cargo test` if a stage stops
+    // advancing, instead of failing it (#130). Callers that pass their own
+    // `--timeout` keep it; the flag is never given twice.
+    if !extra
+        .iter()
+        .any(|a| *a == "--timeout" || a.starts_with("--timeout="))
+    {
+        args.extend_from_slice(&["--timeout", &limit]);
+    }
     run_choco(&daemon.base_url, &args).await
+}
+
+/// `--timeout` value equal to `LOAD_ALLOWANCE`.
+fn timeout_arg() -> String {
+    format!("{}s", LOAD_ALLOWANCE.as_secs())
 }
 
 /// Spawns a watcher as a child so the test can act while it runs.
@@ -1696,14 +1736,14 @@ async fn finish_watcher(mut child: Child) -> (Option<i32>, String) {
     let mut pipe = child.stderr.take();
     // The read and the wait share one deadline: a hung watcher keeps stderr
     // open, so reading first would hang the test instead of failing it.
-    let status = tokio::time::timeout(Duration::from_secs(10), async {
+    let status = tokio::time::timeout(LOAD_ALLOWANCE, async {
         if let Some(e) = pipe.as_mut() {
             e.read_to_string(&mut stderr).await.unwrap();
         }
         child.wait().await
     })
     .await
-    .expect("watcher did not exit within 10s")
+    .expect("watcher did not exit within LOAD_ALLOWANCE")
     .unwrap();
     (status.code(), stderr)
 }
@@ -1775,6 +1815,8 @@ async fn watch_timeout_exits_5_naming_the_last_state() {
     )
     .await;
     assert_eq!(out.code, Some(5), "stderr: {}", out.stderr);
+    // An upper bound on the behaviour under test (a 2 s timeout must not
+    // run to the 30 s default), not a wait, so it is not LOAD_ALLOWANCE.
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(out.stderr.contains("timed out after 2s"), "{}", out.stderr);
     assert!(out.stderr.contains(&id), "{}", out.stderr);
@@ -1807,10 +1849,12 @@ async fn watch_until_stuck_and_until_a_fast_stage_exit_0() {
 
     // `fast` is entered and left between polls (the task then waits at a
     // gate, so the current stage is not `fast`): only the trail clause can
-    // match.
+    // match. The task waits at its first gate until the watcher has made
+    // its first poll (it prints "watching task" after it), so `fast` is
+    // reached strictly after that poll however slow it is.
     let (d, id) = watch_setup("fastwf", FAST_WF).await;
-    let out = watch_choco(
-        &d,
+    let mut watcher = spawn_watcher(
+        &d.base_url,
         &id,
         &[
             "--until",
@@ -1820,9 +1864,12 @@ async fn watch_until_stuck_and_until_a_fast_stage_exit_0() {
             "--timeout",
             "20s",
         ],
-    )
-    .await;
-    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    );
+    wait_for_first_line(&mut watcher).await;
+    let sent = run_choco(&d.base_url, &["task", "send", &id, "--text", "go"]).await;
+    assert_eq!(sent.code, Some(0), "stderr: {}", sent.stderr);
+    let (code, stderr) = finish_watcher(watcher).await;
+    assert_eq!(code, Some(0), "stderr: {stderr}");
 }
 
 #[tokio::test]
@@ -1854,6 +1901,8 @@ async fn watch_json_is_ndjson() {
             "closed",
             "--interval",
             "1s",
+            "--timeout",
+            &timeout_arg(),
         ],
     )
     .await;
@@ -2103,6 +2152,8 @@ async fn watch_timeout_cuts_a_long_interval_short() {
     );
     let (code, stderr) = finish_watcher(child).await;
     assert_eq!(code, Some(5), "stderr: {stderr}");
+    // An assertion, not a wait: 10 s separates a 2 s cut-short from the 1 h
+    // hang; `finish_watcher` already enforces `LOAD_ALLOWANCE`.
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 

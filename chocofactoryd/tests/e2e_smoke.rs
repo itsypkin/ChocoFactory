@@ -18,6 +18,13 @@ use tokio::process::{Child, Command};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+// One source of truth for the load-tolerant wait budgets (#98, #152): the
+// same file the unit tests use. `RESPONSE_MARGIN` is unused here.
+#[path = "../src/test_support.rs"]
+#[allow(dead_code)]
+mod test_support;
+use test_support::{LOAD_ALLOWANCE, wait_until};
+
 struct TempHome(PathBuf);
 
 impl TempHome {
@@ -303,7 +310,7 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut 
     // accepts the connection but never answers (e.g. blocked writing to a
     // full stderr pipe) still reaches the kill-and-report path below
     // instead of hanging the test.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     while tokio::time::Instant::now() < deadline {
         if let Ok(resp) = client
             .get(format!("{base_url}/projects"))
@@ -400,8 +407,7 @@ async fn next_event(
              + Unpin
          ),
 ) -> Option<Value> {
-    let Ok(Some(Ok(WsMessage::Text(raw)))) =
-        tokio::time::timeout(Duration::from_secs(5), ws.next()).await
+    let Ok(Some(Ok(WsMessage::Text(raw)))) = tokio::time::timeout(LOAD_ALLOWANCE, ws.next()).await
     else {
         return None;
     };
@@ -543,17 +549,15 @@ stages:
     // Let the entry stage's transition land before connecting, so the
     // backlog is settled rather than racing the socket. Polled over HTTP —
     // unlike the in-process test there's no pool to look at from here.
-    let mut history = Value::Null;
-    let mut recorded = false;
-    for _ in 0..100 {
-        history = daemon.get(&format!("/tasks/{task_id}/events")).await;
-        if !history["events"].as_array().unwrap().is_empty() {
-            recorded = true;
-            break;
+    let history = wait_until("the entry stage to be recorded", || async {
+        let history = daemon.get(&format!("/tasks/{task_id}/events")).await;
+        if history["events"].as_array().unwrap().is_empty() {
+            Err(format!("no events: {history}"))
+        } else {
+            Ok(history)
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(recorded, "entry stage was never recorded: {history}");
+    })
+    .await;
 
     // The premise this test rests on, up to this point: no session has
     // opened, so the only event recorded so far is the entry stage's own
@@ -724,14 +728,15 @@ stages:
 
     // Wait for the poll to actually report an attempt, so what follows is
     // testing a running loop rather than racing its startup.
-    let mut pending = Vec::new();
-    for _ in 0..200 {
-        pending = command_events(&daemon, &task_id).await;
-        if !pending.is_empty() {
-            break;
+    let pending = wait_until("the poll to report an attempt", || async {
+        let pending = command_events(&daemon, &task_id).await;
+        if pending.is_empty() {
+            Err("no command events yet".to_string())
+        } else {
+            Ok(pending)
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await;
     assert_eq!(
         pending.len(),
         1,
@@ -777,9 +782,17 @@ stages:
         "the decisive entry should say which rule fired: {decisive}"
     );
 
-    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
-    assert_eq!(detail["workflow_state"]["current_stage"], "done");
-    assert_eq!(detail["status"], "closed");
+    // `stage_entered done` is pushed before the status write that closes
+    // the task, so wait for the close rather than racing it.
+    let detail = wait_until("the task to be closed", || async {
+        let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+        if detail["workflow_state"]["current_stage"] == "done" && detail["status"] == "closed" {
+            Ok(detail)
+        } else {
+            Err(format!("task not yet closed: {detail}"))
+        }
+    })
+    .await;
     let trail: Vec<&str> = detail["stage_trail"]
         .as_array()
         .expect("stage_trail missing from the real binary's task detail")
@@ -873,15 +886,17 @@ stages:
 
     // The task runs to completion only if the verdict routed and the
     // templated command rendered.
-    for _ in 0..200 {
+    let detail = wait_until("the task to reach `done`", || async {
         let detail = daemon.get(&format!("/tasks/{task_id}")).await;
-        if detail["workflow_state"]["current_stage"] == "done" {
-            break;
+        // `current_stage` and `status` are committed in separate writes, so
+        // wait for both rather than racing the second.
+        if detail["workflow_state"]["current_stage"] == "done" && detail["status"] == "closed" {
+            Ok(detail)
+        } else {
+            Err(format!("task did not finish and close: {detail}"))
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    })
+    .await;
     assert_eq!(
         detail["workflow_state"]["current_stage"], "done",
         "task did not finish: {detail}"
@@ -1166,15 +1181,17 @@ exec "{mock_claude}" "$@"
     assert_eq!(status, 201, "task creation failed: {task}");
     let task_id = task["id"].as_str().unwrap().to_string();
 
-    for _ in 0..300 {
+    let detail = wait_until("the task to reach `done`", || async {
         let detail = daemon.get(&format!("/tasks/{task_id}")).await;
-        if detail["workflow_state"]["current_stage"] == "done" {
-            break;
+        // `current_stage` and `status` are committed in separate writes, so
+        // wait for both rather than racing the second.
+        if detail["workflow_state"]["current_stage"] == "done" && detail["status"] == "closed" {
+            Ok(detail)
+        } else {
+            Err(format!("task did not finish and close: {detail}"))
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let detail = daemon.get(&format!("/tasks/{task_id}")).await;
+    })
+    .await;
     assert_eq!(
         detail["workflow_state"]["current_stage"], "done",
         "task did not finish: {detail}"
@@ -1383,7 +1400,7 @@ async fn a_second_daemon_dies_at_the_lock_before_sweeping_polls() {
         &home_path,
         &[("CHOCOFACTORY_PORT", &daemon.port.to_string())],
     );
-    let status = tokio::time::timeout(Duration::from_secs(10), second.wait())
+    let status = tokio::time::timeout(LOAD_ALLOWANCE, second.wait())
         .await
         .expect("the second daemon did not exit")
         .unwrap();
@@ -1449,14 +1466,14 @@ async fn sigterm_and_wait(child: &mut Child) -> std::process::ExitStatus {
     let pid = child.id().expect("daemon already exited");
     // SAFETY: SIGTERM to the daemon this test spawned.
     assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
-    tokio::time::timeout(Duration::from_secs(15), child.wait())
+    tokio::time::timeout(LOAD_ALLOWANCE, child.wait())
         .await
-        .expect("the daemon did not exit within 15s of SIGTERM")
+        .expect("the daemon did not exit within LOAD_ALLOWANCE of SIGTERM")
         .unwrap()
 }
 
 async fn read_pid_file(path: &std::path::Path) -> u32 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     loop {
         if let Ok(text) = std::fs::read_to_string(path)
             && let Ok(pid) = text.trim().parse()
@@ -1473,7 +1490,7 @@ async fn read_pid_file(path: &std::path::Path) -> u32 {
 }
 
 async fn wait_for_session_meta(daemon: &Daemon, task_id: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     loop {
         let page = daemon.get(&format!("/tasks/{task_id}/events")).await;
         if page["events"]
@@ -1615,7 +1632,7 @@ async fn a_second_daemon_on_the_same_home_and_another_port_is_refused() {
             ("RUST_LOG", "info"),
         ],
     );
-    let status = tokio::time::timeout(Duration::from_secs(10), second.wait())
+    let status = tokio::time::timeout(LOAD_ALLOWANCE, second.wait())
         .await
         .expect("the second daemon did not exit")
         .unwrap();
@@ -1708,7 +1725,7 @@ stages:
     assert!(status.success(), "{status:?}");
     // The command's group is SIGKILLed as the runtime drops; allow the
     // kernel a moment to reap the orphan.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     while pid_alive(grandchild) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1775,7 +1792,7 @@ async fn sigkill_mid_agent_turn_is_parked_at_the_next_start() {
 async fn port_zero_binds_a_free_port_and_publishes_it_in_the_lock_file() {
     let home = TempHome::new();
     let mut child = spawn_raw(&home.0, &[("CHOCOFACTORY_PORT", "0")]);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     let info = loop {
         if let Ok(chocofactory_core::daemon_lock::LockState::Running(info)) =
             chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
@@ -1794,7 +1811,7 @@ async fn port_zero_binds_a_free_port_and_publishes_it_in_the_lock_file() {
     assert_eq!(info.pid, child.id().unwrap());
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/server", info.port);
-    let answer_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let answer_deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     let body = loop {
         if let Ok(resp) = client.get(&url).send().await
             && resp.status().is_success()
@@ -1842,7 +1859,7 @@ async fn a_stalled_connection_does_not_block_shutdown_past_the_drain_grace() {
 
     let home = TempHome::new();
     let mut child = spawn_raw(&home.0, &[("RUST_LOG", "warn")]);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     let port = loop {
         if let Ok(chocofactory_core::daemon_lock::LockState::Running(info)) =
             chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
@@ -1867,7 +1884,29 @@ async fn a_stalled_connection_does_not_block_shutdown_past_the_drain_grace() {
     .await
     .unwrap();
     conn.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Not a fixed sleep: the kernel hands connections to `accept` in order,
+    // so once the daemon has answered a second, complete request on a fresh
+    // connection it has accepted and registered the stalled one made before
+    // it. That narrows the race rather than closing it: "registered" is not
+    // "in flight", and the HTTP server can still drop a connection that
+    // hasn't yet sent enough bytes to identify its protocol version.
+    let client = reqwest::Client::new();
+    wait_until(
+        "the daemon to answer a request after the stalled one",
+        || async {
+            match client
+                .get(format!("http://127.0.0.1:{port}/projects"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => Ok(()),
+                Ok(resp) => Err(format!("status {}", resp.status())),
+                Err(err) => Err(err.to_string()),
+            }
+        },
+    )
+    .await;
 
     let status = sigterm_and_wait(&mut child).await;
     assert!(status.success(), "{status:?}");
@@ -1881,7 +1920,7 @@ async fn a_stalled_connection_does_not_block_shutdown_past_the_drain_grace() {
 async fn piped_stderr_carries_no_ansi_escapes() {
     let home = TempHome::new();
     let mut child = spawn_raw(&home.0, &[("RUST_LOG", "info")]);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     while !matches!(
         chocofactory_core::daemon_lock::read_lock(&config_root_of(&home)),
         Ok(chocofactory_core::daemon_lock::LockState::Running(ref i)) if i.port != 0
@@ -1965,7 +2004,7 @@ async fn start_daemon_for_report(
         ],
     );
     let base = format!("http://127.0.0.1:{port}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     loop {
         if let Ok(resp) = client.get(format!("{base}/projects")).send().await
             && resp.status().is_success()
@@ -2128,7 +2167,7 @@ async fn real_binary_reports_the_old_workflows_folder_and_leaves_it_alone() {
     );
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     loop {
         if let Ok(resp) = client.get(format!("{base}/projects")).send().await
             && resp.status().is_success()
