@@ -15739,7 +15739,7 @@ stages:
         for expected in [
             "|setting_sources=project|",
             "|strict_mcp_config=true|",
-            "|disallowed_tools=ReportFindings|",
+            "|disallowed_tools=ReportFindings,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger|",
             "|disable_auto_memory=1|",
             r#"|initialize={"skills":["run-tests"],"subtype":"initialize"}|"#,
         ] {

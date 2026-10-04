@@ -102,6 +102,28 @@ impl AgentAdapter for ClaudeAdapter {
     }
 }
 
+/// #115: tools that schedule or wait for something later. Every agent turn
+/// runs under `--print` with stream-json, where nothing wakes a turn on a
+/// timer, so a turn that calls one and ends to "wait" just stalls until the
+/// daemon nudges it.
+/// - `ScheduleWakeup`: a wake-up that never fires.
+/// - `Monitor`: waits on background output that cannot restart the turn.
+/// - `CronCreate`, `CronDelete`, `CronList`: session-scoped schedules that
+///   only fire in an idle interactive session.
+/// - `RemoteTrigger`: schedules cloud agents that would run outside choco,
+///   after the turn, as the operator.
+///
+/// An unknown name in `--disallowedTools` is ignored, so naming a tool an
+/// older CLI lacks is safe.
+const TIMER_TOOLS: [&str; 6] = [
+    "ScheduleWakeup",
+    "Monitor",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "RemoteTrigger",
+];
+
 fn spawn(
     binary: &str,
     choco_binary: &str,
@@ -224,14 +246,22 @@ fn spawn(
     //   `apply_auto_memory_env` below, not read from the daemon's own
     //   environment (#105).
     apply_auto_memory_env(&mut command, &cfg.isolation);
+    //
+    // #115: the timer tools are removed from every role, isolated or not.
+    // "Inherit the operator's config" means the operator's settings,
+    // plugins and MCP servers, not tools that cannot work under `--print`.
     let initialize = match &cfg.isolation {
-        Isolation::InheritOperatorConfig => None,
+        Isolation::InheritOperatorConfig => {
+            command.arg("--disallowedTools").arg(TIMER_TOOLS.join(","));
+            None
+        }
         Isolation::Isolated { skills, memory: _ } => {
             command
                 .arg("--setting-sources")
                 .arg("project")
                 .arg("--strict-mcp-config");
             let mut disallowed = vec!["ReportFindings"];
+            disallowed.extend(TIMER_TOOLS);
             if skills.is_empty() {
                 disallowed.push("Skill");
             }
@@ -1300,7 +1330,10 @@ mod tests {
         let fields = echo_args_for(Isolation::default()).await;
         assert_eq!(fields["setting_sources"], "project");
         assert_eq!(fields["strict_mcp_config"], "true");
-        assert_eq!(fields["disallowed_tools"], "ReportFindings,Skill");
+        assert_eq!(
+            fields["disallowed_tools"],
+            "ReportFindings,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger,Skill"
+        );
         assert_eq!(fields["disable_auto_memory"], "1");
         let initialize: Value = serde_json::from_str(&fields["initialize"]).unwrap();
         assert_eq!(initialize, json!({ "subtype": "initialize", "skills": [] }));
@@ -1313,7 +1346,10 @@ mod tests {
             memory: true,
         })
         .await;
-        assert_eq!(fields["disallowed_tools"], "ReportFindings");
+        assert_eq!(
+            fields["disallowed_tools"],
+            "ReportFindings,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger"
+        );
         assert_eq!(fields["disable_auto_memory"], "<unset>");
         let initialize: Value = serde_json::from_str(&fields["initialize"]).unwrap();
         assert_eq!(
@@ -1323,13 +1359,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_spawn_that_inherits_the_operators_setup_gets_no_isolation_flags() {
+    async fn a_spawn_that_inherits_the_operators_setup_gets_no_isolation_flags_but_loses_timer_tools()
+     {
         let fields = echo_args_for(Isolation::InheritOperatorConfig).await;
         assert_eq!(fields["setting_sources"], "<unset>");
         assert_eq!(fields["strict_mcp_config"], "false");
-        assert_eq!(fields["disallowed_tools"], "<unset>");
+        // #115: a decision, not an isolation flag. Chat keeps `ReportFindings`
+        // and `Skill`; only tools that cannot work under `--print` go.
+        assert_eq!(
+            fields["disallowed_tools"],
+            "ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger"
+        );
         assert_eq!(fields["disable_auto_memory"], "<unset>");
         assert_eq!(fields["initialize"], "<unset>");
+    }
+
+    /// #115: every role shape loses every timer tool, so a tool added to the
+    /// constant can't be dropped from one shape.
+    #[tokio::test]
+    async fn every_role_shape_loses_every_timer_tool() {
+        let shapes = [
+            Isolation::default(),
+            Isolation::Isolated {
+                skills: vec!["run-tests".to_string()],
+                memory: true,
+            },
+            Isolation::InheritOperatorConfig,
+        ];
+        for isolation in shapes {
+            let fields = echo_args_for(isolation).await;
+            let listed: Vec<&str> = fields["disallowed_tools"].split(',').collect();
+            for tool in TIMER_TOOLS {
+                assert!(listed.contains(&tool), "{tool} missing from {listed:?}");
+            }
+        }
     }
 
     /// #90: without `alwaysLoad` the CLI defers `report_outcome` behind
