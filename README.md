@@ -240,7 +240,10 @@ setup: no `~/.claude/CLAUDE.md`, no user plugins, hooks or output style, no
 MCP servers other than the daemon's, no skills, no auto-memory, and no
 built-in `ReportFindings` tool. The task repo's own `CLAUDE.md` and
 `.claude/settings.json` still apply, including any hooks or plugins that
-repo enables: they belong to the code being worked on. A role can loosen the
+repo enables: they belong to the code being worked on. The repo's
+`.claude/settings.local.json` is *not* read: it is the operator's personal
+file, and in a task's linked worktree Claude Code would resolve it to the
+main checkout's (#141). A role can loosen the
 rest in the workflow file:
 
 ```yaml
@@ -793,7 +796,9 @@ cargo test --workspace
 ```
 
 Tests never spawn the real `claude` — the integration suites point the
-daemon at `mock-claude` or a Python fixture instead.
+daemon at `mock-claude` or a Python fixture instead. `scripts/probe-setting-sources.sh` is an opt-in
+check against the real CLI that `local` settings don't leak into a linked
+worktree (#141); it costs a little (two tiny haiku turns) and is not part of CI.
 
 ## License
 

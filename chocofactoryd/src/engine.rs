@@ -15737,7 +15737,7 @@ stages:
             .await
             .unwrap();
         for expected in [
-            "|setting_sources=project,local|",
+            "|setting_sources=project|",
             "|strict_mcp_config=true|",
             "|disallowed_tools=ReportFindings|",
             "|disable_auto_memory=1|",

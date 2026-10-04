@@ -208,10 +208,12 @@ fn spawn(
     // style and only our MCP server, the transcript loaded only the task
     // repo's `CLAUDE.md`, and no hooks ran.
     //
-    // - `--setting-sources project,local` skips user settings, which is
-    //   where plugins, hooks and the output style are enabled, and also
-    //   skips `~/.claude/CLAUDE.md`. The task repo's own settings and
-    //   `CLAUDE.md` still apply: those belong to the code being worked on.
+    // - `--setting-sources project` skips user settings (plugins, hooks,
+    //   output style, `~/.claude/CLAUDE.md`) and local settings.
+    //   `.claude/settings.local.json` is the operator's personal,
+    //   uncommitted file, and in a linked worktree (every choco task)
+    //   Claude Code resolves it to the main checkout's (#141). The task
+    //   repo's committed `.claude/settings.json` and `CLAUDE.md` still apply.
     // - `--strict-mcp-config` drops the operator's MCP servers, leaving only
     //   ours.
     // - `ReportFindings` is a built-in verdict tool that reviewers reached
@@ -227,7 +229,7 @@ fn spawn(
         Isolation::Isolated { skills, memory: _ } => {
             command
                 .arg("--setting-sources")
-                .arg("project,local")
+                .arg("project")
                 .arg("--strict-mcp-config");
             let mut disallowed = vec!["ReportFindings"];
             if skills.is_empty() {
@@ -1292,10 +1294,11 @@ mod tests {
     /// #90's default: a role that says nothing about isolation gets none of
     /// the operator's settings, plugins, hooks, output style, MCP servers,
     /// skills or memory, and no `ReportFindings`.
+    /// Only `project` settings: `local` is the operator's file (#141).
     #[tokio::test]
     async fn an_isolated_spawn_drops_the_operators_setup() {
         let fields = echo_args_for(Isolation::default()).await;
-        assert_eq!(fields["setting_sources"], "project,local");
+        assert_eq!(fields["setting_sources"], "project");
         assert_eq!(fields["strict_mcp_config"], "true");
         assert_eq!(fields["disallowed_tools"], "ReportFindings,Skill");
         assert_eq!(fields["disable_auto_memory"], "1");
