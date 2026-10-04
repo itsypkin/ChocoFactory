@@ -831,6 +831,11 @@ cargo build --workspace --all-targets   # test harnesses spawn these binaries
 cargo test --workspace
 ```
 
+`jq` must be installed to run `cargo test --workspace`: the `gh` stubs in
+`chocofactoryd/src/engine.rs` and `chocofactoryd/tests/e2e_smoke.rs` apply
+`-q` filters with it, so the engine unit tests fail on a machine without it.
+CI has it.
+
 Tests never spawn the real `claude` — the integration suites point the
 daemon at `mock-claude` or a Python fixture instead. `scripts/probe-setting-sources.sh` is an opt-in
 check against the real CLI that `local` settings don't leak into a linked
