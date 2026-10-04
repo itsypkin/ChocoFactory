@@ -73,5 +73,8 @@ Reviews on this repo repeatedly flag the same two defects. Check your own diff f
   behaviour, not a hazard to route around. `mock-claude` is for the test suites and for a deliberately
   isolated smoke run; never substitute it when the point is to exercise the real CLI, and never leave it
   set in a run whose result you intend to trust.
+- A PR that changes behaviour the `run-choco-task` skill (`.claude/skills/run-choco-task/`) describes
+  updates the skill in the same PR, so the skill in each release describes that release and never
+  needs to explain what used to be true.
 - Issues and design text written before the rename spell things with a `k` — `chokofactoryd`,
   `CHOKOFACTORY_*`, `.agents/ChokoFactory/`. Don't copy a path out of an old issue body.

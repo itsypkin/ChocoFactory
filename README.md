@@ -40,6 +40,35 @@ flight, `update` refuses (exit 3) unless `--force`, which parks that work like
 from another directory is left alone. The built-in workflows are inside the
 binary, so they update with it.
 
+## Using choco from Claude Code
+
+The `run-choco-task` skill teaches Claude Code to drive a `coding-task`
+end to end: write the spec, watch the task, review its PR and recover it.
+Copy the whole skill folder, including `scripts/` and `reference/`, into
+your repo's `.claude/skills/` (or `~/.claude/skills/` for every repo). From
+the repo's root:
+
+```bash
+dest=.claude/skills    # or ~/.claude/skills for every repo
+ver=$(choco --version | awk '{print $2}')
+d=$(mktemp -d) &&
+  git -c advice.detachedHead=false clone --depth 1 --filter=blob:none --sparse --branch "v$ver" https://github.com/itsypkin/ChocoFactory.git "$d" &&
+  git -C "$d" sparse-checkout set .claude/skills/run-choco-task &&
+  mkdir -p "$dest" && rm -rf "$dest/run-choco-task" &&
+  cp -R "$d/.claude/skills/run-choco-task" "$dest/" &&
+  rm -rf "$d"
+```
+
+- `--branch "v$ver"` takes the skill from the release you run. The skill
+  describes that release only, so fetch it again after `choco update`.
+  Without `--branch` you get `main`'s copy, which can describe behaviour
+  newer than your choco.
+- A clone keeps `scripts/tail-events.sh` executable. If you fetch the files
+  another way, such as the GitHub contents API, `chmod +x` it.
+- A new Claude Code session finds the skill. In a running session, if the
+  `skills/` folder you copied into didn't exist when it started, run
+  `/reload-skills` or start a new session.
+
 ## Releasing
 
 Maintainers: the tag must equal `v` + the workspace version and be on `main`,
@@ -450,7 +479,7 @@ Five things worth knowing:
   under your account counts as you.
 
 If no verdict arrives within six hours the task stops waiting and parks at
-`escalate_to_human`, where `choco task send <id> "<note>"` resumes it into
+`escalate_to_human`, where `choco task send <id> --text "<note>"` resumes it into
 `revising`. A fourth `/request-changes`, after three revise rounds, parks
 it the same way instead of looping, and resuming from there starts the
 count over.
