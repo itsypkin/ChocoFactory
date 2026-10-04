@@ -19,7 +19,25 @@ are in the ChocoFactory repo, not in the repo you are working on.
 
 To use this skill in your own repo, copy the whole `run-choco-task/` folder,
 including `scripts/`, into that repo's `.claude/skills/` (or into
-`~/.claude/skills/` for every repo).
+`~/.claude/skills/` for every repo). From the repo's root:
+
+```bash
+dest=.claude/skills    # or ~/.claude/skills for every repo
+d=$(mktemp -d) &&
+  git clone --depth 1 --filter=blob:none --sparse https://github.com/itsypkin/ChocoFactory.git "$d" &&
+  git -C "$d" sparse-checkout set .claude/skills/run-choco-task &&
+  mkdir -p "$dest" && rm -rf "$dest/run-choco-task" &&
+  cp -R "$d/.claude/skills/run-choco-task" "$dest/" &&
+  rm -rf "$d"
+```
+
+This takes the skill from `main`, which can describe
+features newer than your choco; add `--branch v<version>` to the clone to
+match the release you run. A clone keeps `scripts/tail-events.sh`
+executable. If you fetch the files another way, such as the GitHub contents
+API, run `chmod +x` on it. A new Claude Code session finds the skill at
+once; a session that is already running can take several minutes to notice
+it, so start a new one if it doesn't appear.
 
 The workflow you will almost always run is the built-in `coding-task`:
 
@@ -78,16 +96,31 @@ claude --version                              # agents run the claude CLI, logge
 gh auth status                                # open_pr and the polls run gh as this account; it is who "you" are for votes
 choco server start && choco server status
 choco project list                            # or: choco project create <name> [--repo .]
-git worktree add --detach ../<name>-base origin/main            # once
+git worktree add --detach ../<name>-base origin/main            # once; before choco 0.2.1, clone instead (below)
 BASE_CHECKOUT=$(cd ../<name>-base && pwd)     # set again in each new shell
 git -C "$BASE_CHECKOUT" fetch origin && git -C "$BASE_CHECKOUT" checkout --detach origin/main   # before each task
 ```
 
 Replace `origin/main` with your repo's default branch if it differs, here
 and in the commit-message check in
-[Review and vote](#4-review-the-pr-and-vote). The
-base as a linked worktree has one side effect; see
-[Cost and safety](#cost-and-safety).
+[Review and vote](#4-review-the-pr-and-vote).
+
+**Before choco 0.2.1, make the base a separate clone instead of a linked
+worktree** (#141, fixed in 0.2.1; see [Cost and safety](#cost-and-safety)).
+The version that counts is the daemon's, shown by `choco server status`.
+Replace the `git worktree add` line with:
+
+```bash
+git clone <your repo's GitHub URL> ../<name>-base   # once
+```
+
+Clone from the GitHub URL, not from your local checkout's path: `open_pr`
+pushes to the base's `origin`, and that has to be the real remote.
+
+**A project with no repo.** If `choco project list` shows `REPO -` for your
+project, a workflow name such as `coding-task` always means the built-in,
+and every `coding-task` (like any workflow that makes a worktree) needs
+`--repo`: without it there is no checkout to fork the task's worktree from.
 
 **Check the daemon you are about to use.** `choco server status` shows its
 version, open tasks and in-flight work, and warns when the daemon binary on
@@ -173,8 +206,40 @@ choco task create --project <p> --workflow coding-task \
   ended: 0 reached, 3 stuck, 4 cancelled, 5 timed out, 6 closed early.
   `--until` waits for one target only. A task that parks at
   `escalate_to_human` stays `open`, so an `--until` for another stage just
-  runs to its `--timeout`. For long waits, prefer `--live` or a short
-  timeout.
+  runs to its `--timeout`.
+- `--live` is for a person at a terminal. An agent that has to notice
+  "ready for review", "escalated" and "ended" alike can poll the JSON
+  instead: the status is `.status` (`open`, `stuck`, `cancelled` or
+  `closed`) and the stage is `.workflow_state.current_stage`. Run this in
+  the background (it needs `jq`). It prints the status and stage it
+  stopped on, and exits 1 if `choco` or `jq` fails (the error is printed
+  above it):
+
+  ```bash
+  id=<task-id>
+  (
+    while :; do
+      json=$(choco --json task status "$id") || exit 1
+      state=$(printf '%s\n' "$json" | jq -r '"\(.status) \(.workflow_state.current_stage)"') || exit 1
+      case $state in
+        "open awaiting_human_review" | "open escalate_to_human" | stuck\ * | cancelled\ * | closed\ *)
+          echo "$state"; exit 0 ;;
+      esac
+      sleep 60
+    done
+  )
+  ```
+
+  The parentheses keep `exit` from closing your own shell. After you vote,
+  the task stays at `awaiting_human_review` for up to a minute until the
+  poll reads your comment, so a loop started straight away stops at once.
+  Wait for the stage to change first, for example with
+  `choco task status <id> --until stage:revising --timeout 5m` after a
+  `/request-changes`.
+- **Finding the task's PR.** `choco task status` doesn't print it. The
+  task pushes to the branch `task/<task-id>`, so run
+  `gh pr list --head task/<task-id>`, adding `--state all` once the PR is
+  merged or closed.
 - `choco task events` is **oldest first**, 100 per page by default (500 at
   most with `--limit`), and a real task has hundreds to thousands of events.
   `choco task events | tail` shows the task's first minutes and looks stale.
@@ -338,12 +403,15 @@ directory with the task's worktree.
   something out. For a first run, pick a small, real change.
 - **A repo's `.chocofactory/workflows/` and any `--workflow` file can run
   shell commands as you.** Pointing choco at a repo trusts its workflows.
-- **Agents inherit your local Claude settings through a linked base checkout
-  (#141).** Agents read the task's repo settings, including
-  `.claude/settings.local.json`. In a linked worktree, that file is the
+- **Before choco 0.2.1, agents inherit your local Claude settings through
+  a linked base checkout (#141, fixed in 0.2.1).** Those versions let
+  agents read the task's repo settings including
+  `.claude/settings.local.json`, and in a linked worktree that file is the
   *main* checkout's, so every agent gets its output style, permissions and
-  hooks. Until #141 is fixed, keep that file free of hooks and personal
-  styles, or make the base a separate clone rather than a linked worktree.
+  hooks. From 0.2.1 on, agents in the built-in `coding-task` no longer read
+  that file, and a linked worktree is safe as the base. On an older daemon,
+  update choco, or make the base a separate clone as shown in
+  [Prepare](#1-prepare).
 - **Cancel a task that is going round in circles** rather than letting it
   spend a coder lap per round.
 - `choco update` and `choco server stop` refuse while work is in flight. Use
@@ -353,8 +421,9 @@ directory with the task's worktree.
 
 - **#138:** the coder ignores a human's `/request-changes` comment. Work
   around it as described in [Recover](#5-recover).
-- **#141:** agents inherit the main checkout's `.claude/settings.local.json`
-  through a linked base checkout.
+- **#141 (fixed in 0.2.1):** before choco 0.2.1, agents inherit the main
+  checkout's `.claude/settings.local.json` through a linked base checkout.
+  On those versions, use a separate clone as the base.
 - **#133:** the PR-body closing-keyword filter isn't verified for
   markdown-wrapped forms (`**Fixes** #N`, `[#N](url)`, `GH-N`). The
   pre-merge checks above still catch them.
