@@ -1038,15 +1038,21 @@ set -eu
 created="{dir}/pr-created"
 case "$1" in
     api)
-        # `awaiting_human_review` makes two `gh api` calls: the head
-        # commit's date, then the comment list its filter runs over. The
-        # stub answers the second from a file the test owns — which means
-        # it stands in for the *whole* query, jq filter included. That
-        # filter is covered separately and directly by
-        # `verdict_filter_*` in `tests/verdict_filter.rs`; what these
-        # workflow tests cover is the routing either side of it.
+        # `awaiting_human_review` runs `scripts/await-review.sh`, which
+        # makes the head commit's date call and then the comments calls.
+        # The stub answers the comments calls like gh would: it applies the
+        # call's `-q` filter (with `jq`) to a canned page the test owns in
+        # the `verdict` file (a JSON array of PR comments). What a comment
+        # has to look like to vote is covered in
+        # `tests/await_review_script.rs`; these workflow tests cover the
+        # routing either side of it.
         if printf '%s\n' "$@" | grep -q '/comments'; then
-            cat "{dir}/verdict" 2>/dev/null || true
+            q=""; prev=""
+            for a in "$@"; do
+                if [ "$prev" = "-q" ]; then q=$a; fi
+                prev=$a
+            done
+            jq -r "$q" < "{dir}/verdict"
         else
             echo "2020-01-01T00:00:00Z"
         fi
@@ -1121,9 +1127,13 @@ esac
         r#"{"outcome": "approved", "summary": ""}"#,
     )
     .unwrap();
-    // The token `awaiting_human_review`'s filter emits for an approval;
-    // the stub stands in for the query that would derive it.
-    std::fs::write(scripts_dir.join("verdict"), "APPROVE\n").unwrap();
+    // The PR comments `awaiting_human_review`'s script reads (the stub
+    // applies the script's `-q` filter to this page): an owner's approval.
+    std::fs::write(
+        scripts_dir.join("verdict"),
+        r#"[{"created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:00:00Z", "author_association": "OWNER", "user": {"login": "owner"}, "html_url": "https://example.test/c/1", "body": "looks good\n/approve"}]"#,
+    )
+    .unwrap();
     let claude_wrapper = write_script(
         &scripts_dir,
         "mock-claude-role-dispatch.sh",

@@ -444,8 +444,11 @@ its own line**:
 The rest of the comment is yours to write however you like — put the marker
 on the last line and your review above it. A comment that reads "Two
 findings, one worth fixing before merge." followed by your prose, and then
-a final line containing only `/request-changes`, sends the coder back round
-with your review already on the PR for it to read.
+a final line containing only `/request-changes`, sends the coder back round.
+The workflow hands the coder every qualifying comment (see the points
+below), oldest first, in its prompt; the coder doesn't have to fetch them.
+Formal review bodies and inline review comments are not handed over; the
+coder looks those up itself.
 
 Five things worth knowing:
 
