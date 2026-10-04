@@ -1799,7 +1799,9 @@ async fn watch_timeout_exits_5_naming_the_last_state() {
     )
     .await;
     assert_eq!(out.code, Some(5), "stderr: {}", out.stderr);
-    assert!(started.elapsed() < LOAD_ALLOWANCE);
+    // An upper bound on the behaviour under test (a 2 s timeout must not
+    // run to the 30 s default), not a wait, so it is not LOAD_ALLOWANCE.
+    assert!(started.elapsed() < Duration::from_secs(10));
     assert!(out.stderr.contains("timed out after 2s"), "{}", out.stderr);
     assert!(out.stderr.contains(&id), "{}", out.stderr);
     assert!(out.stderr.contains("open"), "{}", out.stderr);
