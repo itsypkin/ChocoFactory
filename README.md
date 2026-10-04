@@ -52,7 +52,7 @@ the repo's root:
 dest=.claude/skills    # or ~/.claude/skills for every repo
 ver=$(choco --version | awk '{print $2}')
 d=$(mktemp -d) &&
-  git clone --depth 1 --filter=blob:none --sparse --branch "v$ver" https://github.com/itsypkin/ChocoFactory.git "$d" &&
+  git -c advice.detachedHead=false clone --depth 1 --filter=blob:none --sparse --branch "v$ver" https://github.com/itsypkin/ChocoFactory.git "$d" &&
   git -C "$d" sparse-checkout set .claude/skills/run-choco-task &&
   mkdir -p "$dest" && rm -rf "$dest/run-choco-task" &&
   cp -R "$d/.claude/skills/run-choco-task" "$dest/" &&

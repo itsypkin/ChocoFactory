@@ -28,9 +28,8 @@ and `choco task list --status stuck` finds every stuck task.
 
 ## `escalate_to_human`: send a note
 
-The task parks here after a 4th rejection, a 6-hour review window with no
-verdict, or an `open_pr` failure. `/approve` does nothing here; only
-`choco task send <id> --text "<note>"` moves it on, into `revising`.
+`/approve` does nothing here; only `choco task send <id> --text "<note>"`
+moves the task on, into `revising`.
 
 - If the PR is already good, merge it and then `choco task cancel <id>`.
   Don't send a note after merging by hand: the next `open_pr` would open a

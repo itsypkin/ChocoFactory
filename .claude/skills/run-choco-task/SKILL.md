@@ -48,16 +48,10 @@ choco update             # installs the latest release and restarts a daemon run
 choco --version
 ```
 
-- `choco: command not found`: install it, then go on.
-
-  ```bash
-  curl -fsSL https://github.com/itsypkin/ChocoFactory/releases/latest/download/install.sh | sh
-  ```
-
-  It puts `choco` and `chocofactoryd` side by side in `~/.local/bin` and
-  prints the `export PATH=...` line to add if that folder isn't on `PATH`.
-- `choco update` refuses with exit 3 while an agent turn or shell step is
-  running. Wait for it; `--force` marks that work `stuck`.
+- `choco: command not found`: install it as in the
+  [README](https://github.com/itsypkin/ChocoFactory#install), then go on.
+- `choco update` refuses while work is in flight; see
+  [Cost and safety](#cost-and-safety).
 - It refuses with exit 1 for a copy that wasn't installed by the install
   script; the error says what to run instead.
 
@@ -105,8 +99,8 @@ the pre-merge check in step 4.
   of scope here; see
   [Customising workflows](https://github.com/itsypkin/ChocoFactory#customising-workflows).
 - **Don't stop or restart the daemon while an agent turn or shell step
-  runs.** `stop`/`restart` refuse with exit 3 unless `--force`, which marks
-  that work `stuck`. Tasks waiting on a poll or a human survive a restart.
+  runs.** `stop` and `restart` refuse (see [Cost and safety](#cost-and-safety)).
+  Tasks waiting on a poll or a human survive a restart.
   The daemon logs to `~/.config/chocofactory/logs/chocofactoryd.log`; kills,
   `stuck` marks and nudges show up there first.
 - **Keep the machine awake for the whole run.** On a sleeping laptop agent
@@ -287,5 +281,7 @@ cancelling. In short:
   shell commands as you.** Pointing choco at a repo trusts its workflows.
 - **Cancel a task that is going round in circles** rather than letting it
   spend a coder lap per round.
-- `choco update` and `choco server stop` refuse while work is in flight. Use
-  `--force` only if you are prepared to retry the tasks it marks `stuck`.
+- **`choco update`, `choco server stop` and `choco server restart` refuse
+  with exit 3 while an agent turn or shell step is running.** `--force` goes
+  ahead and marks that work `stuck`; use it only if you are prepared to
+  `choco task retry` those tasks.
