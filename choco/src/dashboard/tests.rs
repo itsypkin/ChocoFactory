@@ -260,6 +260,19 @@ fn sections_group_and_order_tasks() {
     assert_eq!(ids(&closed_s), ["z1", "z2"]);
 }
 
+#[test]
+fn a_task_at_the_planned_workflows_question_gate_needs_you() {
+    let mut app = new_app(Scope::AllProjects);
+    let active = vec![
+        summary("q", "q", "open", Some("spec_questions"), Some(5), "p"),
+        summary("w", "w", "open", Some("coding"), Some(5), "p"),
+    ];
+    load(&mut app, active, vec![]);
+    let [needs, progress, _, _] = app.sections();
+    assert_eq!(ids(&needs), ["q"]);
+    assert_eq!(ids(&progress), ["w"]);
+}
+
 // ---- keys ---------------------------------------------------------------
 
 #[test]
@@ -845,6 +858,8 @@ fn detail_events_follow_until_scrolled() {
 struct Fake {
     tasks: Arc<Vec<TaskSummary>>,
     cancels: Arc<Mutex<Vec<String>>>,
+    /// The `keep` field of each cancel request body, in order.
+    keeps: Arc<Mutex<Vec<Value>>>,
     /// When set, the detail, cancel and retry endpoints never answer.
     hang: bool,
 }
@@ -895,10 +910,15 @@ async fn fake_server(state: Fake) -> String {
         }
         StatusCode::OK
     }
-    async fn cancel(State(s): State<Fake>, Path(id): Path<String>) -> StatusCode {
+    async fn cancel(
+        State(s): State<Fake>,
+        Path(id): Path<String>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> StatusCode {
         if s.hang {
             std::future::pending::<()>().await;
         }
+        s.keeps.lock().unwrap().push(body["keep"].clone());
         s.cancels.lock().unwrap().push(id);
         StatusCode::ACCEPTED
     }
@@ -975,6 +995,7 @@ async fn the_real_loop_against_a_fake_daemon() {
     let fake = Fake {
         tasks: Arc::new(tasks),
         cancels: Arc::new(Mutex::new(Vec::new())),
+        keeps: Arc::new(Mutex::new(Vec::new())),
         hang: false,
     };
     let base_url = fake_server(fake.clone()).await;
@@ -1053,6 +1074,8 @@ async fn the_real_loop_against_a_fake_daemon() {
             .expect("the loop should end on q");
     result.unwrap();
     assert_eq!(fake.cancels.lock().unwrap().len(), 1);
+    // The dashboard never keeps work: `keep` is sent, and it is false.
+    assert_eq!(*fake.keeps.lock().unwrap(), vec![json!(false)]);
 }
 
 #[tokio::test]
@@ -1300,6 +1323,7 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
             ),
         ]),
         cancels: Arc::new(Mutex::new(Vec::new())),
+        keeps: Arc::new(Mutex::new(Vec::new())),
         hang: true,
     };
     let base_url = fake_server(fake).await;

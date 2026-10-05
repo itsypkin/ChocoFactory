@@ -11,10 +11,17 @@ use chrono::{DateTime, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 
-/// The built-in `coding-task` workflow's stages that wait on a person.
-/// A rename of either stage in `workflows/coding-task.yaml` must update this
-/// list, or those tasks fall into "In progress".
-pub const NEEDS_YOU_STAGES: [&str; 2] = ["awaiting_human_review", "escalate_to_human"];
+/// The built-in workflows' stages that wait on a person: `coding-task`'s
+/// `awaiting_human_review` and `escalate_to_human`, and `coding-task-planned`'s
+/// `spec_questions` gate (it has the other two as well). A rename of any of
+/// them in `workflows/coding-task.yaml` or `workflows/coding-task-planned.yaml`
+/// must update this list, or those tasks fall into "In progress". Interim: a
+/// rule based on the stage kind will replace it.
+pub const NEEDS_YOU_STAGES: [&str; 3] = [
+    "awaiting_human_review",
+    "escalate_to_human",
+    "spec_questions",
+];
 
 /// Most events the detail view keeps; older ones are dropped.
 const MAX_EVENTS: usize = 1000;
