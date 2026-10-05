@@ -1015,6 +1015,7 @@ async fn the_real_loop_against_a_fake_daemon() {
         closed: 10,
         project_id: None,
         timeout: Duration::from_secs(30),
+        poll_timeout: Duration::from_secs(30),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1092,6 +1093,7 @@ async fn an_unreachable_daemon_shows_the_error_and_the_loop_still_quits() {
         closed: 10,
         project_id: None,
         timeout: Duration::from_secs(30),
+        poll_timeout: Duration::from_secs(30),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1244,6 +1246,7 @@ async fn a_hung_daemon_does_not_stop_the_first_load_from_quitting() {
         closed: 10,
         project_id: None,
         timeout: Duration::from_secs(30),
+        poll_timeout: Duration::from_secs(30),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
@@ -1275,6 +1278,7 @@ async fn a_request_that_times_out_is_shown_as_unreachable() {
         closed: 10,
         project_id: None,
         timeout: Duration::from_millis(300),
+        poll_timeout: Duration::from_millis(300),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1336,6 +1340,7 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
         closed: 10,
         project_id: None,
         timeout: Duration::from_millis(300),
+        poll_timeout: Duration::from_millis(300),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));

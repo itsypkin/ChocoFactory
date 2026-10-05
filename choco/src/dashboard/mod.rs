@@ -43,6 +43,9 @@ pub struct LoopConfig {
     /// Longest any one request may take before it is reported as failed
     /// (a hung daemon must never freeze the board or swallow an action).
     pub timeout: Duration,
+    /// Longest a list poll may take. At most the poll interval, so the outage banner's "retrying every <interval>" stays true
+    /// even when the daemon accepts a connection and never answers.
+    pub poll_timeout: Duration,
 }
 
 pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
@@ -72,6 +75,7 @@ pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
         closed: args.closed,
         project_id,
         timeout: REQUEST_TIMEOUT,
+        poll_timeout: args.interval.duration.min(REQUEST_TIMEOUT),
     };
 
     let mut terminal = match enter_terminal() {
@@ -257,14 +261,17 @@ fn timed_out() -> String {
 }
 
 async fn fetch_bounded(client: &Client, config: &LoopConfig, projects: bool) -> ListResult {
-    tokio::time::timeout(config.timeout, fetch(client, config, projects))
-        .await
-        .unwrap_or_else(|_| ListResult {
-            at: Utc::now(),
-            active: Err(timed_out()),
-            closed: Err(timed_out()),
-            projects: None,
-        })
+    tokio::time::timeout(
+        config.poll_timeout.min(config.timeout),
+        fetch(client, config, projects),
+    )
+    .await
+    .unwrap_or_else(|_| ListResult {
+        at: Utc::now(),
+        active: Err(timed_out()),
+        closed: Err(timed_out()),
+        projects: None,
+    })
 }
 
 fn draw<B: Backend>(
@@ -299,12 +306,14 @@ fn run_effect(
             let (client, tx) = (Arc::clone(client), tx.clone());
             let (closed, project_id, timeout) =
                 (config.closed, config.project_id.clone(), config.timeout);
+            let poll_timeout = config.poll_timeout;
             tokio::spawn(async move {
                 let cfg = LoopConfig {
                     tick: Duration::ZERO,
                     closed,
                     project_id,
                     timeout,
+                    poll_timeout,
                 };
                 let result = fetch_bounded(&client, &cfg, projects).await;
                 let _ = tx.send(Msg::List(Box::new(result)));
