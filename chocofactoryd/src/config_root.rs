@@ -18,17 +18,22 @@ pub fn config_root() -> Option<PathBuf> {
 
 /// The workflows compiled into the `chocofactoryd` binary — checked into
 /// the repo's own `workflows/` directory as the source of truth, embedded
-/// at build time. `chat` (P1-8) plus `coding-task` (P2-7, #18).
+/// at build time. `chat` (P1-8), `coding-task` (P2-7, #18) and
+/// `coding-task-planned`, which is `coding-task` with a spec check in front.
 const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
     ("chat", include_str!("../../workflows/chat.yaml")),
     (
         "coding-task",
         include_str!("../../workflows/coding-task.yaml"),
     ),
+    (
+        "coding-task-planned",
+        include_str!("../../workflows/coding-task-planned.yaml"),
+    ),
 ];
 
-/// The prompt files `coding-task.yaml`'s `system_prompt_file`/`prompt_file`
-/// fields reference, seeded alongside it into `<dir>/prompts/` —
+/// The prompt files `coding-task.yaml`'s and `coding-task-planned.yaml`'s
+/// `system_prompt_file`/`prompt_file` fields reference, seeded alongside it into `<dir>/prompts/` —
 /// same embed-and-seed treatment as the workflow YAML itself (#18), since
 /// those fields resolve relative to wherever the seeded copy ends up on
 /// disk, not the repo. `chat.yaml` has no prompt files of its own.
@@ -52,6 +57,26 @@ const BUILTIN_WORKFLOW_PROMPTS: &[(&str, &str)] = &[
     (
         "reviewer-turn.md",
         include_str!("../../workflows/prompts/reviewer-turn.md"),
+    ),
+    (
+        "planner-system.md",
+        include_str!("../../workflows/prompts/planner-system.md"),
+    ),
+    (
+        "planner-turn.md",
+        include_str!("../../workflows/prompts/planner-turn.md"),
+    ),
+    (
+        "coder-turn-planned.md",
+        include_str!("../../workflows/prompts/coder-turn-planned.md"),
+    ),
+    (
+        "coder-revise-planned.md",
+        include_str!("../../workflows/prompts/coder-revise-planned.md"),
+    ),
+    (
+        "reviewer-turn-planned.md",
+        include_str!("../../workflows/prompts/reviewer-turn-planned.md"),
     ),
 ];
 
@@ -1329,5 +1354,240 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             std::fs::read_to_string(dir.path.join("scripts/open-pr.sh")).unwrap(),
             BUILTIN_WORKFLOW_SCRIPTS[0].1
         );
+    }
+
+    fn load_seeded(dir: &TempDir, file: &str) -> crate::workflow_def::WorkflowDefinition {
+        crate::workflow_def::WorkflowDefinition::load(&dir.path.join(file)).unwrap()
+    }
+
+    fn on_map(stage: &crate::workflow_def::StageDef) -> Vec<(&str, &str)> {
+        stage
+            .on
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    /// `coding-task-planned` (#120): the seeded workflow loads and has the
+    /// two new stages wired as designed.
+    #[test]
+    fn the_seeded_coding_task_planned_workflow_loads_and_validates() {
+        use crate::workflow_def::{Capture, StageKind};
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let def = load_seeded(&dir, "coding-task-planned.yaml");
+        assert_eq!(def.name, "coding-task-planned");
+        assert!(def.worktree);
+        assert_eq!(def.start_stage(), "spec_check");
+        assert_eq!(
+            def.roles["planner"].model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+
+        let spec_check = &def.stages["spec_check"];
+        let StageKind::AgentTurn {
+            role,
+            capture,
+            report_sections,
+            ..
+        } = &spec_check.kind
+        else {
+            panic!("spec_check must be an agent_turn");
+        };
+        assert_eq!(role, "planner");
+        assert_eq!(*capture, Some(Capture::Json));
+        assert_eq!(
+            report_sections,
+            &["Checks", "Decisions", "Questions", "Spec"]
+        );
+        assert_eq!(
+            on_map(spec_check),
+            [("ready", "coding"), ("needs_input", "spec_questions")]
+        );
+        assert!(spec_check.loop_guard.is_none());
+
+        let gate = &def.stages["spec_questions"];
+        let StageKind::HumanGate { capture } = &gate.kind else {
+            panic!("spec_questions must be a human_gate");
+        };
+        assert_eq!(*capture, Some(Capture::Text));
+        assert_eq!(on_map(gate), [("resumed", "spec_check")]);
+        assert!(gate.loop_guard.is_none());
+    }
+
+    /// Drift guard: every stage from `coding` on, and the `coder`/`reviewer`
+    /// roles, are `coding-task`'s, apart from three prompt files.
+    #[test]
+    fn coding_task_planned_stages_and_roles_match_coding_task() {
+        use crate::workflow_def::StageKind;
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let base = load_seeded(&dir, "coding-task.yaml");
+        let planned = load_seeded(&dir, "coding-task-planned.yaml");
+
+        let expected: Vec<&str> = ["spec_check", "spec_questions"]
+            .into_iter()
+            .chain(base.stages.keys().map(String::as_str))
+            .collect();
+        let actual: Vec<&str> = planned.stages.keys().map(String::as_str).collect();
+        assert_eq!(actual, expected);
+
+        let swapped = [
+            ("coding", "coder-turn-planned.md"),
+            ("revising", "coder-revise-planned.md"),
+            ("internal_review", "reviewer-turn-planned.md"),
+        ];
+        for (name, base_stage) in &base.stages {
+            let mut planned_stage = planned.stages[name].clone();
+            if let Some((_, file)) = swapped.iter().find(|(n, _)| n == name) {
+                let StageKind::AgentTurn { prompt_file, .. } = &mut planned_stage.kind else {
+                    panic!("{name} must be an agent_turn");
+                };
+                assert_eq!(
+                    prompt_file.as_ref().and_then(|p| p.file_name()),
+                    Some(std::ffi::OsStr::new(file)),
+                    "{name} must use {file}"
+                );
+                let StageKind::AgentTurn {
+                    prompt_file: base_file,
+                    ..
+                } = &base_stage.kind
+                else {
+                    panic!("{name} must be an agent_turn");
+                };
+                *prompt_file = base_file.clone();
+            }
+            assert_eq!(&planned_stage, base_stage, "stage {name} drifted");
+        }
+
+        for role in ["coder", "reviewer"] {
+            assert_eq!(planned.roles[role], base.roles[role], "role {role} drifted");
+        }
+    }
+
+    /// Drift guard: each `-planned` prompt is its original with the one
+    /// `{{ task.input }}` replaced.
+    #[test]
+    fn planned_prompts_are_their_originals_with_the_spec_swapped_in() {
+        for stem in ["coder-turn", "coder-revise", "reviewer-turn"] {
+            let original = embedded_prompt(&format!("{stem}.md"));
+            let planned = embedded_prompt(&format!("{stem}-planned.md"));
+            assert_eq!(original.matches("{{ task.input }}").count(), 1, "{stem}");
+            assert_eq!(
+                planned,
+                original.replace("{{ task.input }}", "{{ stages.spec_check.summary }}"),
+                "{stem}-planned.md drifted"
+            );
+            assert!(!planned.contains("{{ task.input }}"), "{stem}");
+        }
+    }
+
+    #[test]
+    fn planned_prompts_render_the_spec_not_the_task_text() {
+        let payload = serde_json::json!({
+            "task": { "title": "T", "input": "ORIGINAL TASK TEXT" },
+            "arrival": { "from": "internal_review", "outcome": "changes_requested" },
+            "stages": {
+                "spec_check": { "summary": "HARDENED SPEC TEXT" },
+                "internal_review": { "summary": "R", "outcome": "changes_requested" },
+                "escalate_to_human": "H",
+            },
+        });
+        for name in [
+            "coder-turn-planned.md",
+            "coder-revise-planned.md",
+            "reviewer-turn-planned.md",
+        ] {
+            let (out, _) = crate::template::render(embedded_prompt(name), &payload)
+                .unwrap_or_else(|e| panic!("{name} failed to render: {e}"));
+            assert!(out.contains("HARDENED SPEC TEXT"), "{name}");
+            assert!(!out.contains("ORIGINAL TASK TEXT"), "{name}");
+        }
+    }
+
+    #[test]
+    fn planner_turn_renders_first_turn_and_resumed_turn() {
+        let first = serde_json::json!({
+            "task": { "title": "T", "input": "THE TASK INPUT" },
+            "arrival": { "from": "", "outcome": "" },
+        });
+        let (out, _) = crate::template::render(embedded_prompt("planner-turn.md"), &first).unwrap();
+        assert!(out.contains("THE TASK INPUT"));
+
+        let resumed = serde_json::json!({
+            "task": { "title": "T", "input": "THE TASK INPUT" },
+            "arrival": { "from": "spec_questions", "outcome": "resumed" },
+            "stages": {
+                "spec_check": { "summary": "PREVIOUS REPORT" },
+                "spec_questions": "HUMAN ANSWER",
+            },
+        });
+        let (out, _) =
+            crate::template::render(embedded_prompt("planner-turn.md"), &resumed).unwrap();
+        assert_eq!(out.matches("PREVIOUS REPORT").count(), 1);
+        assert_eq!(out.matches("HUMAN ANSWER").count(), 1);
+        let prev_heading = out.find("## Your previous report").unwrap();
+        let answer_heading = out.find("## The human's answer").unwrap();
+        let prev = out.find("PREVIOUS REPORT").unwrap();
+        let answer = out.find("HUMAN ANSWER").unwrap();
+        assert!(prev_heading < prev && prev < answer_heading);
+        assert!(answer_heading < answer);
+    }
+
+    /// The text between `heading` and the next `## ` heading, squashed.
+    fn section_of(text: &str, heading: &str) -> String {
+        let (_, after) = text
+            .split_once(heading)
+            .unwrap_or_else(|| panic!("missing {heading:?}"));
+        let body = after.split("\n## ").next().unwrap();
+        squash(body)
+    }
+
+    #[test]
+    fn planner_system_pins_the_stop_criteria() {
+        let section = section_of(
+            embedded_prompt("planner-system.md"),
+            "## Your job, and when to stop",
+        );
+        let numbered = section
+            .split(' ')
+            .filter(|w| w.len() == 2 && w.ends_with('.') && w.as_bytes()[0].is_ascii_digit())
+            .collect::<Vec<_>>();
+        assert_eq!(numbered, ["1.", "2.", "3."]);
+        assert_says(
+            &section,
+            &[
+                "contradicts itself about what is wanted",
+                "The goal is missing or ambiguous",
+                "irreversible",
+                "security-relevant",
+                "clearly costly",
+                "Nothing else is a reason to stop",
+            ],
+            "planner-system.md stop criteria",
+        );
+    }
+
+    #[test]
+    fn planner_system_names_the_sections_the_stage_enforces_in_order() {
+        use crate::workflow_def::StageKind;
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let def = load_seeded(&dir, "coding-task-planned.yaml");
+        let StageKind::AgentTurn {
+            report_sections, ..
+        } = &def.stages["spec_check"].kind
+        else {
+            panic!("spec_check should be an agent_turn");
+        };
+        assert!(!report_sections.is_empty());
+        let section = section_of(embedded_prompt("planner-system.md"), "## What you report");
+        let mut from = 0;
+        for name in report_sections {
+            let found = section[from..]
+                .find(&format!("**{name}.**"))
+                .unwrap_or_else(|| panic!("'{name}' missing or out of order: {section}"));
+            from += found + name.len();
+        }
     }
 }

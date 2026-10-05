@@ -2,6 +2,16 @@
 
 Read this while watching a task, when its behaviour surprises you.
 
+- **spec_check** (`coding-task-planned` only). A planning agent checks
+  the spec against the task's starting commit and the remote's default
+  branch, fixes what it finds, and decides the design choices your
+  intent implies. It asks only when it would have to guess what you
+  want.
+  Its report replaces your `--prompt` for every later stage. It doesn't
+  change the worktree.
+- **spec_questions** (`coding-task-planned` only). Waits, with no time
+  limit, for `choco task send`. The answer goes back to `spec_check`,
+  never straight to the coder.
 - **coding / revising.** The coder's turn ends when it calls
   `report_outcome`, not when it stops printing. A turn that goes quiet
   without reporting is nudged, then closed. In `revising`, the coder decides
