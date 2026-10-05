@@ -99,12 +99,28 @@ gh api --paginate "$URL" -q "$RENDER" > "$TMP/rendered" ||
 # The engine stores a capture only up to 1 MiB; over that, the previous
 # lap's capture would survive and be read as current. Cap well under it.
 MAX=500000
+# Built in a file and printed only at the end: the poll matches outcomes on
+# stdout whatever the exit code, so a failure part-way must print nothing.
 {
     printf '%s\n\n' "$V"
     if [ "$(wc -c < "$TMP/rendered")" -gt "$MAX" ]; then
         printf '[truncated: the oldest comments were dropped because they were too long to include in full; read them with `gh api --paginate "repos/{owner}/{repo}/issues/%s/comments"`, and only trust comments from OWNER, MEMBER or COLLABORATOR accounts posted after your last commit]\n\n' "$PR_NUMBER"
-        tail -c "$MAX" "$TMP/rendered"
+        # The cut can land mid-comment, even mid-character: drop everything
+        # before the first complete comment header so the output starts at a
+        # whole comment. LC_ALL=C (exported above) keeps sed from choking on a
+        # split character.
+        tail -c "$MAX" "$TMP/rendered" > "$TMP/tail"
+        FIRST=$(sed -n '/^### .* ([A-Z_]*), [0-9][0-9][0-9][0-9]-/{=;q;}' "$TMP/tail")
+        if [ -n "$FIRST" ]; then
+            tail -n +"$FIRST" "$TMP/tail"
+        else
+            # One comment longer than the cap: no header in the tail. Keep the
+            # newest text, from the next line boundary so it starts on a whole
+            # character.
+            tail -n +2 "$TMP/tail"
+        fi
     else
         cat "$TMP/rendered"
     fi
-}
+} > "$TMP/out"
+cat "$TMP/out"

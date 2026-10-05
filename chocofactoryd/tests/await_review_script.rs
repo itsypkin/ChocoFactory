@@ -543,6 +543,25 @@ fn an_oversized_rendering_is_truncated_well_under_the_capture_limit() {
     assert!(out.contains("[truncated"), "no truncation note");
 }
 
+/// A failure while building a truncated capture must not leave a verdict on
+/// stdout: the poll matches outcomes on stdout whatever the exit code.
+#[test]
+fn a_failure_mid_truncation_prints_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let big = "x".repeat(60_000);
+    let mut cs: Vec<String> = (0..12)
+        .map(|_| comment(FRESH, "OWNER", Some("me"), &big))
+        .collect();
+    cs.push(comment(LATER, "OWNER", Some("me"), "/request-changes"));
+    let fx = Fixture::new(SINCE, &[list(&cs)]);
+    let sed = fx.dir.join("sed");
+    fs::write(&sed, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&sed, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = fx.run();
+    assert!(!out.status.success(), "a failing sed must fail the script");
+    assert!(out.stdout.is_empty(), "no partial verdict on stdout");
+}
+
 /// Truncation keeps the newest comments: the latest findings must survive.
 #[test]
 fn truncation_keeps_the_newest_comments() {
@@ -558,6 +577,38 @@ fn truncation_keeps_the_newest_comments() {
     ));
     let out = stdout_of(SINCE, &[list(&cs)]);
     assert!(out.contains("FIX THIS"), "newest comment was cut");
+}
+
+/// The cut can land mid-comment and mid-character; the output after the
+/// truncation note must start at a whole comment header and be valid UTF-8
+/// (`stdout_of` already asserts the latter via `String::from_utf8`).
+#[test]
+fn truncation_starts_at_a_whole_comment_with_multibyte_bodies() {
+    // 2- and 3-byte characters, so a byte cut is very likely to split one.
+    let big = "é€".repeat(12_000);
+    let mut cs: Vec<String> = (0..12)
+        .map(|_| comment(FRESH, "OWNER", Some("me"), &big))
+        .collect();
+    cs.push(comment(LATER, "OWNER", Some("me"), "/request-changes"));
+    let out = stdout_of(SINCE, &[list(&cs)]);
+    let (_, after) = out.split_once("]\n\n").expect("no truncation note");
+    assert!(out.contains("[truncated"), "no truncation note");
+    assert!(
+        after.starts_with("### me (OWNER), "),
+        "{:?}",
+        after.chars().take(80).collect::<String>()
+    );
+}
+
+/// A single comment over the cap leaves no header in the kept tail; its end
+/// (the findings and the marker) must still come through.
+#[test]
+fn truncation_of_one_oversized_comment_keeps_its_end() {
+    let body = format!("{}\nFIX THIS\n/request-changes", "x".repeat(600_000));
+    let cs = vec![comment(FRESH, "OWNER", Some("me"), &body)];
+    let out = stdout_of(SINCE, &[list(&cs)]);
+    assert!(out.contains("[truncated"), "no truncation note");
+    assert!(out.contains("FIX THIS"), "newest text was dropped");
 }
 
 /// Empty gh answers and a missing PR_NUMBER are errors, not "no verdict".

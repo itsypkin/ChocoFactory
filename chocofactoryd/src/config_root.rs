@@ -921,10 +921,10 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert!(!entry.contains("Run `gh pr view --comments`"));
     }
 
-    /// On the `internal_review` path the human's review is left over from an
-    /// earlier lap and must be labelled so.
+    /// On the `internal_review` path the human's review is from an earlier
+    /// lap, already handled, and must be labelled so.
     #[test]
-    fn coder_revise_for_the_internal_review_path_labels_the_humans_review_as_left_over() {
+    fn coder_revise_for_the_internal_review_path_labels_the_humans_review_as_handled() {
         let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
             "internal_review",
             "changes_requested",
@@ -933,15 +933,47 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         let entry = squash(route_entry(&rendered, "internal_review"));
         assert_says(
             &entry,
-            &["and it is current. Address every finding in it."],
-            "the internal_review entry names its own section as current",
+            &[
+                "and it is current. Address every finding in it.",
+                "If \"The human's review\" below has content, it is from an earlier lap and already handled on this branch: each item was either done or declined with a reason. Don't redo it, don't take up a declined item, and don't undo it. If a finding would undo a change the human asked for, keep the human's change and say so in your summary.",
+            ],
+            "the internal_review entry names its own section as current and the human's review as handled",
         );
         let human_heading = rendered.find("## The human's review").unwrap();
         let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
         assert_says(
             &squash(&rendered[human_heading..reviewer_heading]),
-            &["On any other path it is left over from an earlier review, so ignore it."],
-            "the human's review label must say it is left over here",
+            &[HUMAN_LABEL_OTHER_PATHS],
+            "the human's review label must say it is already handled here",
+        );
+    }
+
+    /// The label's wording for every path but the two that use the review.
+    const HUMAN_LABEL_OTHER_PATHS: &str = "On any other path it is from an earlier lap and already handled on this branch (each item done or declined with a reason): don't redo it, and don't undo it.";
+
+    /// On the `checks_polling` → `red` path the human's review is likewise
+    /// handled: CI must be fixed without undoing it.
+    #[test]
+    fn coder_revise_for_the_checks_polling_red_path_labels_the_humans_review_as_handled() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "checks_polling",
+            "red",
+            stale_approval_and_human_review(),
+        );
+        let entry = squash(route_entry(&rendered, "checks_polling"));
+        assert_says(
+            &entry,
+            &[
+                "If \"The human's review\" below has content, it is from an earlier lap and already handled on this branch (each item done or declined with a reason): fix the failure without undoing the human's change. If the only fix would undo it, say so in your summary.",
+            ],
+            "the checks_polling entry says the human's review is handled",
+        );
+        let human_heading = rendered.find("## The human's review").unwrap();
+        let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
+        assert_says(
+            &squash(&rendered[human_heading..reviewer_heading]),
+            &[HUMAN_LABEL_OTHER_PATHS],
+            "the human's review label must say it is already handled here",
         );
     }
 
