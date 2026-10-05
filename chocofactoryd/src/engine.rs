@@ -13545,10 +13545,21 @@ role="coder"
 for arg in "$@"; do
     case "$arg" in
         *"reviewing agent"*) role="reviewer" ;;
+        *"planning agent"*) role="planner" ;;
     esac
 done
 export MOCK_CLAUDE_ONESHOT=1
-if [ "$role" = "reviewer" ]; then
+if [ "$role" = "planner" ]; then
+    # Call N reads `planner-reply-N.json` when present, else
+    # `planner-reply.json`, so a test can script a different report per call.
+    n=$(cat "{dir}/planner-calls" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "{dir}/planner-calls"
+    f="{dir}/planner-reply-$n.json"
+    [ -f "$f" ] || f="{dir}/planner-reply.json"
+    export MOCK_CLAUDE_REPLY="planned"
+    export MOCK_CLAUDE_REPORT="$(cat "$f")"
+elif [ "$role" = "reviewer" ]; then
     export MOCK_CLAUDE_REPLY="$(cat "{reply_path}")"
     export MOCK_CLAUDE_REPORT="$(cat "{reply_path}")"
 else
@@ -13558,6 +13569,7 @@ exec "{mock_claude}" "$@"
 "#,
                 reply_path = reply_path.display(),
                 mock_claude = mock_claude.display(),
+                dir = dir.display(),
             ),
         )
     }
@@ -13763,13 +13775,25 @@ esac
         scripts_dir: &Path,
         reviewer_reply: &str,
     ) -> (String, Arc<WorkflowDefinition>, PathBuf) {
+        seed_builtin_coding_task(pool, repo, scripts_dir, reviewer_reply, "coding-task").await
+    }
+
+    /// `seed_coding_task` for any shipped coding workflow, named by its file
+    /// stem (`coding-task`, `coding-task-planned`).
+    async fn seed_builtin_coding_task(
+        pool: &SqlitePool,
+        repo: &Path,
+        scripts_dir: &Path,
+        reviewer_reply: &str,
+        workflow: &str,
+    ) -> (String, Arc<WorkflowDefinition>, PathBuf) {
         let def = Arc::new(
             WorkflowDefinition::load(
                 Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../workflows/coding-task.yaml")
+                    .join(format!("../workflows/{workflow}.yaml"))
                     .as_path(),
             )
-            .expect("workflows/coding-task.yaml failed to load"),
+            .unwrap_or_else(|e| panic!("workflows/{workflow}.yaml failed to load: {e}")),
         );
 
         let mock_claude = workspace_binary("mock-claude");
@@ -13870,6 +13894,153 @@ esac
         // Worktree cleanup (#58) still fires for the real shipped workflow.
         let worktree_dir = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
         wait_until_path_gone(&worktree_dir).await;
+    }
+
+    /// A planner report carrying the four sections `spec_check` enforces.
+    fn planner_report(outcome: &str) -> String {
+        json!({
+            "outcome": outcome,
+            "summary": "Checks: all fine\nDecisions: none\nQuestions: none\nSpec: build the small feature",
+        })
+        .to_string()
+    }
+
+    /// #120: `coding-task-planned` with a planner that reports `ready` walks
+    /// the whole way to `done`, through `spec_check` first.
+    #[tokio::test]
+    async fn the_real_coding_task_planned_workflow_walks_the_happy_path_to_done() {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+        let _origin = add_bare_origin(&repo).await;
+        let scripts_dir = tempdir();
+        let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+        fs::write(
+            scripts_dir.join("verdict"),
+            owner_comment_page("looks good\\n/approve"),
+        )
+        .unwrap();
+        fs::write(
+            scripts_dir.join("planner-reply.json"),
+            planner_report("ready"),
+        )
+        .unwrap();
+
+        let (task_id, def, claude_wrapper) = seed_builtin_coding_task(
+            &pool,
+            &repo,
+            &scripts_dir,
+            r#"{"outcome": "approved", "feedback": ""}"#,
+            "coding-task-planned",
+        )
+        .await;
+        let engine = engine_with_adapter(pool.clone(), &claude_wrapper.to_string_lossy());
+
+        engine
+            .start_task(&task_id, &def, Some("Add a small feature"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "done").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        assert_eq!(
+            stage_trail(&pool, &task_id)
+                .await
+                .into_iter()
+                .map(|(stage, _)| stage)
+                .collect::<Vec<_>>(),
+            vec![
+                "spec_check",
+                "coding",
+                "internal_review",
+                "open_pr",
+                "checks_polling",
+                "awaiting_human_review",
+                "done",
+            ]
+        );
+    }
+
+    /// #120: a planner that reports `needs_input` parks the task, open, at
+    /// `spec_questions`; the human's answer goes back to `spec_check`, and
+    /// the second report (`ready`) lets the coder start.
+    #[tokio::test]
+    async fn the_planned_workflow_parks_for_answers_then_resumes_through_spec_check() {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+        let _origin = add_bare_origin(&repo).await;
+        let scripts_dir = tempdir();
+        let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+        fs::write(
+            scripts_dir.join("verdict"),
+            owner_comment_page("looks good\\n/approve"),
+        )
+        .unwrap();
+        fs::write(
+            scripts_dir.join("planner-reply-1.json"),
+            planner_report("needs_input"),
+        )
+        .unwrap();
+        fs::write(
+            scripts_dir.join("planner-reply.json"),
+            planner_report("ready"),
+        )
+        .unwrap();
+
+        let (task_id, def, claude_wrapper) = seed_builtin_coding_task(
+            &pool,
+            &repo,
+            &scripts_dir,
+            r#"{"outcome": "approved", "feedback": ""}"#,
+            "coding-task-planned",
+        )
+        .await;
+        // The resume reloads the workflow by name, so the engine needs the
+        // shipped workflows seeded where it looks for them.
+        let workflows_dir = tempdir();
+        config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &claude_wrapper.to_string_lossy(),
+            &workflows_dir,
+        );
+
+        engine
+            .start_task(&task_id, &def, Some("Add a small feature"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "spec_questions").await;
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "open");
+
+        engine
+            .send_message_or_resume(&task_id, "ANSWER")
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "done").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        assert_eq!(
+            stage_trail(&pool, &task_id)
+                .await
+                .into_iter()
+                .map(|(stage, _)| stage)
+                .collect::<Vec<_>>(),
+            vec![
+                "spec_check",
+                "spec_questions",
+                "spec_check",
+                "coding",
+                "internal_review",
+                "open_pr",
+                "checks_polling",
+                "awaiting_human_review",
+                "done",
+            ]
+        );
+        let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(state.payload["stages"]["spec_questions"], "ANSWER");
     }
 
     /// A merged PR counts as approval (#102): `MERGED` routes

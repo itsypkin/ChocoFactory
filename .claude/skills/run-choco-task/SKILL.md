@@ -134,6 +134,21 @@ explicit out-of-scope list.
   the PR say `Closes #N`; any other `#N` in it gives `Refs #N`. For one part
   of a multi-part issue, don't end the title with `(#N)`: merging would close
   the whole issue.
+- **To have choco check the spec before coding**, create the task with
+  `--workflow coding-task-planned`. A planning agent checks the spec
+  against the code the task starts from, fixes stale references and
+  loose test requirements, and decides the design choices your intent
+  implies, listing each with its reason. It parks the task at
+  `spec_questions` with questions for you only when it can't go on
+  without guessing what you want: the spec contradicts itself, the goal
+  is unclear, or the only way forward is irreversible, weakens security
+  or costs far more than the spec suggests. From then on, the coder
+  and the reviewer work from its report, not your `--prompt`. Read the
+  report with
+  `choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'`,
+  and answer with `choco task send <id> --text "<answers>"`. The planner
+  folds your answers in and checks again; an answer can tell it to
+  decide a question itself.
 
 ## 3. Create and watch
 
@@ -161,7 +176,7 @@ choco task create --project <p> --workflow coding-task \
 
   A task parked at `escalate_to_human` stays `open`, so an `--until` for
   another stage runs to its `--timeout`.
-- **To notice every way it can stop** (ready for review, escalated, ended),
+- **To notice every way it can stop** (ready for review, escalated, waiting for your answers, ended),
   poll the JSON in the background instead (needs `jq`). It prints the status
   and stage it stopped on, and exits 1 if `choco` or `jq` fails:
 
@@ -172,7 +187,7 @@ choco task create --project <p> --workflow coding-task \
       json=$(choco --json task status "$id") || exit 1
       state=$(printf '%s\n' "$json" | jq -r '"\(.status) \(.workflow_state.current_stage)"') || exit 1
       case $state in
-        "open awaiting_human_review" | "open escalate_to_human" | stuck\ * | cancelled\ * | closed\ *)
+        "open awaiting_human_review" | "open escalate_to_human" | "open spec_questions" | stuck\ * | cancelled\ * | closed\ *)
           echo "$state"; exit 0 ;;
       esac
       sleep 60

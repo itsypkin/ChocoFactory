@@ -1,0 +1,147 @@
+# `coding-task` with a spec check in front. It is a separate workflow so the
+# two can be compared on real runs. Every stage from `coding` on is
+# `coding-task.yaml`'s; read the rationale in that file's comments. Only
+# three prompt files differ, and each is its `coding-task` counterpart with
+# `{{ task.input }}` replaced by the planner's report. Tests in
+# `chocofactoryd/src/config_root.rs` pin both facts, so an edit to
+# `coding-task.yaml` or to one of those prompts must be copied here too.
+name: coding-task-planned
+worktree: true
+roles:
+  planner:
+    cli: claude
+    model: claude-opus-5-5
+    system_prompt_file: prompts/planner-system.md
+  coder:
+    cli: claude
+    model: claude-sonnet-5-5
+    system_prompt_file: prompts/coder-system.md
+  reviewer:
+    cli: claude
+    model: claude-opus-5-5
+    system_prompt_file: prompts/reviewer-system.md
+
+stages:
+  # Checks the task's spec against the code the coder will start from, and
+  # writes the hardened version that every later stage reads in place of
+  # the task text (`{{ stages.spec_check.summary }}`). It reports `ready`
+  # when nothing is left to decide. It reports `needs_input` to park the
+  # task for a human's answers, which it does only when it would otherwise
+  # have to guess what the user wants. Because of `report_sections:`, the
+  # tool refuses a report with no spec in it, so an empty spec can't reach
+  # the coder, and every decision is listed with its reason. Both outcomes
+  # use the same four sections because the tool checks them whatever the
+  # outcome; on `ready`, Questions says "none".
+  spec_check:
+    kind: agent_turn
+    role: planner
+    prompt_file: prompts/planner-turn.md
+    capture: json
+    report_sections: [Checks, Decisions, Questions, Spec]
+    on: { ready: coding, needs_input: spec_questions }
+
+  # The human answers with `choco task send <id> --text "..."`. The answer
+  # goes back to `spec_check`, which folds it into the spec, rather than
+  # straight to the coder, so the coder and the reviewer only ever work from
+  # one text. There is no loop guard, because every round here waits on a
+  # human.
+  spec_questions:
+    kind: human_gate
+    capture: text
+    on: { resumed: spec_check }
+
+  # Same as `coding-task.yaml`'s `coding`.
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompts/coder-turn-planned.md
+    on: { done: internal_review }
+
+  # Same as `coding-task.yaml`'s `revising`.
+  revising:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompts/coder-revise-planned.md
+    on: { done: internal_review }
+
+  # Same as `coding-task.yaml`'s `internal_review`.
+  internal_review:
+    kind: agent_turn
+    role: reviewer
+    prompt_file: prompts/reviewer-turn-planned.md
+    capture: json
+    report_sections:
+      - Reviewed
+      - Predictions
+      - Branches → tests
+      - States
+      - Messages
+      - Side effects
+      - Resources and work
+      - Old behaviour
+      - Findings
+      - Dismissed
+    on:
+      approved: open_pr
+      changes_requested: revising
+    loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Same as `coding-task.yaml`'s `escalate_to_human`.
+  escalate_to_human:
+    kind: human_gate
+    capture: text
+    on: { resumed: revising }
+
+  # Same as `coding-task.yaml`'s `open_pr`.
+  open_pr:
+    kind: shell
+    script_file: scripts/open-pr.sh
+    env:
+      PR_TASK_TITLE: "{{ task.title }}"
+      PR_REVIEW_VERDICT: "{{ stages.internal_review.outcome }}"
+      PR_REVIEW_REPORT: "{{ stages.internal_review.summary }}"
+    capture: json
+    timeout: 5m
+    on: { done: checks_polling, error: escalate_to_human }
+
+  # Same as `coding-task.yaml`'s `checks_polling`.
+  checks_polling:
+    kind: poll
+    command: "gh pr checks {{ stages.open_pr.number }} --json state -q '.[].state' | sort -u"
+    interval: 30s
+    timeout: 5m
+    outcomes:
+      - match: "^SUCCESS$"
+        then: green
+      - match: "FAILURE|ERROR"
+        then: red
+    on:
+      green: awaiting_human_review
+      red: revising
+      timeout: awaiting_human_review
+
+  # Same as `coding-task.yaml`'s `awaiting_human_review`.
+  awaiting_human_review:
+    kind: poll
+    script_file: scripts/await-review.sh
+    env:
+      PR_NUMBER: "{{ stages.open_pr.number }}"
+    capture: text
+    interval: 60s
+    timeout: 6h
+    outcomes:
+      - match: '\AREQUEST_CHANGES(\n|$)'
+        then: changes_requested
+      - match: '\AAPPROVE(\n|$)'
+        then: approved
+      - match: '\AMERGED(\n|$)'
+        then: approved
+    on:
+      approved: done
+      changes_requested: revising
+      timeout: escalate_to_human
+    loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Same as `coding-task.yaml`'s `done`.
+  done:
+    kind: terminal

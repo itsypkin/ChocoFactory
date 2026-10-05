@@ -140,7 +140,7 @@ CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude ./target/debug/chocof
 specifically mean to exercise the real CLI.
 
 The daemon stores its database under `~/.config/chocofactory/`. The
-built-in workflows (`chat`, `coding-task`) come from the daemon binary: at
+built-in workflows (`chat`, `coding-task`, `coding-task-planned`) come from the daemon binary: at
 every start it regenerates a private, read-only copy in
 `~/.config/chocofactory/.builtin-workflows/`, so upgrading the binary
 upgrades them. See [Project workflows](#project-workflows) for where a
@@ -415,6 +415,31 @@ way the task keeps running (or, for a deleted file, keeps failing to
 reload) with no separate warning elsewhere. A task created before this
 existed shows no `Workflow file` line at all.
 
+### Checking the spec first: `coding-task-planned`
+
+`coding-task-planned` is `coding-task` with a spec check in front. Its first
+stage, `spec_check`, has a planning agent read your `--prompt` against the
+code the task starts from. It makes the spec buildable (fixing stale
+references, commands that don't work here and loose test requirements) and
+decides the design choices your intent implies, listing each with its reason.
+It stops and asks you only when it would otherwise have to guess what you
+want: the spec contradicts itself, the goal is missing or unclear, or every
+way forward is irreversible, weakens security or costs far more than the
+spec suggests.
+
+From then on the coder and the internal reviewer work from the planner's
+report, not from your `--prompt`. Read it with:
+
+```
+choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'
+```
+
+A task waiting at `spec_questions` is answered with
+`choco task send <id> --text "..."`. The answer goes back to the planner,
+which folds it into the spec and checks again; you can tell it to decide a
+question itself. The stage has no time limit. The workflow is offered
+alongside `coding-task` so the two can be compared.
+
 ### Reviewing a `coding-task` PR
 
 When a `coding-task` reaches `awaiting_human_review` it has already pushed
@@ -532,7 +557,7 @@ Create a task in it. `--project` takes **either the project name or its
 id** — a name is resolved against `project list`, and is rejected naming
 the candidates if it matches more than one project (names aren't unique).
 `--workflow` is a workflow name (the project's own repo first, then the
-built-ins — `chat` and `coding-task` ship in the daemon) or a path to a
+built-ins — `chat`, `coding-task` and `coding-task-planned` ship in the daemon) or a path to a
 workflow `.yaml` file — see [Project workflows](#project-workflows) above:
 
 ```
