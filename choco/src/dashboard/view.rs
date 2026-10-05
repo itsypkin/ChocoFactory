@@ -164,7 +164,7 @@ struct Grid {
 
 const ID_W: usize = 8;
 const PR_W: usize = 6;
-const TIME_W: usize = 9;
+const TIME_W: usize = 10;
 const LAPS_W: usize = 5;
 /// Project and stage shrink before the title drops below this.
 const TITLE_MIN: usize = 20;

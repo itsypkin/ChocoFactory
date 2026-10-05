@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 
 use super::app::*;
 use super::view::draw;
-use super::{LoopConfig, run_loop};
+use super::{LoopConfig, PanicSignal, run_loop};
 use crate::client::Client;
 
 fn now() -> DateTime<Utc> {
@@ -1441,4 +1441,63 @@ async fn a_panic_signal_stops_the_loop_with_an_error() {
             .await
             .expect("the loop must stop on a panic");
     assert!(result.unwrap_err().contains("panicked"));
+}
+
+#[tokio::test]
+async fn list_polls_time_out_at_the_poll_timeout_not_the_request_timeout() {
+    let client = Arc::new(Client::new(hung_daemon().await).without_version_check());
+    let mut app = new_app(Scope::AllProjects);
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout: Duration::from_secs(30),
+        poll_timeout: Duration::from_millis(200),
+        panicked: Arc::default(),
+    };
+    let (ktx, mut krx) = mpsc::unbounded_channel();
+    let latest = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&latest);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    let driver = async {
+        wait_for(&latest, "daemon unreachable: request timed out").await;
+        ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+    };
+    let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let run = run_loop(
+        &mut terminal,
+        &mut app,
+        client,
+        &config,
+        &mut krx,
+        &mut on_frame,
+    );
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(run, driver) })
+            .await
+            .expect("a hung list poll must time out at the poll timeout");
+    result.unwrap();
+}
+
+#[test]
+fn the_poll_timeout_follows_the_interval_up_to_the_request_timeout() {
+    assert_eq!(
+        super::poll_timeout_for(Duration::from_secs(2)),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        super::poll_timeout_for(Duration::from_secs(600)),
+        super::REQUEST_TIMEOUT
+    );
+}
+
+#[test]
+fn a_panic_on_any_thread_trips_the_signal_through_the_hook() {
+    let signal: Arc<PanicSignal> = Arc::default();
+    let prev = super::install_panic_hook_with(Arc::clone(&signal), || {});
+    let joined = std::thread::spawn(|| panic!("boom from a spawned thread")).join();
+    super::restore_panic_hook(prev);
+    assert!(joined.is_err());
+    assert!(signal.is_tripped());
 }

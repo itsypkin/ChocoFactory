@@ -66,6 +66,11 @@ impl PanicSignal {
         self.wake.notify_one();
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_tripped(&self) -> bool {
+        self.tripped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     async fn tripped(&self) {
         loop {
             if self.tripped.load(std::sync::atomic::Ordering::SeqCst) {
@@ -103,7 +108,7 @@ pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
         closed: args.closed,
         project_id,
         timeout: REQUEST_TIMEOUT,
-        poll_timeout: args.interval.duration.min(REQUEST_TIMEOUT),
+        poll_timeout: poll_timeout_for(args.interval.duration),
         panicked: Arc::new(PanicSignal::default()),
     };
 
@@ -179,10 +184,20 @@ fn restore_terminal() {
 /// the normal screen instead of vanishing with the alternate one. A panic on
 /// any thread also trips `signal`, which stops the loop.
 fn install_panic_hook(signal: Arc<PanicSignal>) -> PanicHook {
+    install_panic_hook_with(signal, restore_terminal)
+}
+
+/// How long a list poll may take: the poll interval, so "retrying every
+/// <interval>" stays true, but never longer than the general request timeout.
+pub(crate) fn poll_timeout_for(interval: Duration) -> Duration {
+    interval.min(REQUEST_TIMEOUT)
+}
+
+fn install_panic_hook_with(signal: Arc<PanicSignal>, restore: fn()) -> PanicHook {
     let prev: PanicHook = Arc::from(std::panic::take_hook());
     let chained = Arc::clone(&prev);
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        restore();
         signal.trip();
         chained(info);
     }));
