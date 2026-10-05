@@ -78,6 +78,8 @@ strip_markers() {
 # `GH-N` is tried before `o/r#N`, so `Fixes gh-1/repo#3` becomes `Fixes issue
 # 1/repo#3`: the other order would leave `GH-1` right after the keyword.
 # Reference-style links (`[x][1]` plus a definition) are not handled; unverified.
+# Link text containing brackets (`[a [b]](URL)`, `[a\]b](URL)`) is not handled
+# either: the text stops at the first `]`. Unverified.
 # Code blocks and inline code are rewritten too, deliberately: GitHub doesn't
 # document whether it skips code, agent text quotes commit messages where
 # `Fixes #N` lives, and a cosmetic edit costs far less than a closed issue.
@@ -139,6 +141,7 @@ neutralize_closing_refs() {
                 if (match(rest, /^[ \t]*\)/)) return m + RLENGTH
                 if (match(rest, /^[ \t]+"[^"]*"[ \t]*\)/)) return m + RLENGTH
                 if (match(rest, /^[ \t]+\047[^\047]*\047[ \t]*\)/)) return m + RLENGTH
+                if (match(rest, /^[ \t]+\([^()]*\)[ \t]*\)/)) return m + RLENGTH
                 return 0
             }
             n = urlat(u, ul, "")

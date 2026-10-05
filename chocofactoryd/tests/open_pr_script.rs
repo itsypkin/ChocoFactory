@@ -563,7 +563,7 @@ const KEYWORDS: &str = "closes|closed|close|fixes|fixed|fix|resolves|resolved|re
 /// any reference form. Built here from the documented syntax, independent of
 /// the script.
 fn closing_regex() -> regex::Regex {
-    let refs = r#"(?:https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|[\w.-]+/[\w.-]+#\d+|#\d+|GH-\d+|<URL>|\[[^\]\n]*\]\([ \t]*<?URL>?(?:[ \t]+(?:"[^"\n]*"|\x27[^\x27\n]*\x27))?[ \t]*\))"#;
+    let refs = r#"(?:https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|[\w.-]+/[\w.-]+#\d+|#\d+|GH-\d+|<URL>|\[[^\]\n]*\]\([ \t]*<?URL>?(?:[ \t]+(?:"[^"\n]*"|\x27[^\x27\n]*\x27|\([^()\n]*\)))?[ \t]*\))"#;
     // `URL` stands for the issue-URL alternation (scheme and www optional).
     let url = r"(?:https?://)?(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+";
     let refs = refs.replace("URL", url);
@@ -573,7 +573,7 @@ fn closing_regex() -> regex::Regex {
     .unwrap()
 }
 
-const AGENT_LINES: &str = "Its message has no Closes/Fixes/Resolves #84.\nfixes: #12\nCloses owner/repo#3\ncloses https://github.com/o/r/issues/5\nFIXED #6\nresolved:#7\ncloses http://www.github.com/o/r/issues/55/\nfixes https://github.com/o/r/issues/6#issuecomment-1 tail\nresolves github.com/o/r/issues/7?x=1\nfixed:\n#78\nfixes #1 and closes #2\nFixes GH-13\nfixes gh-17\nFixes <https://github.com/o/r/issues/21>\nFixes [#12](https://github.com/o/r/issues/12)\nFixes [issue 18](https://github.com/o/r/issues/18)\nFixes [x](https://github.com/o/r/issues/4 \"title\")\nFixes [x](<https://github.com/o/r/issues/4>)\nFixes [x]( https://github.com/o/r/issues/4 )\nFixes gh-1/repo#3";
+const AGENT_LINES: &str = "Its message has no Closes/Fixes/Resolves #84.\nfixes: #12\nCloses owner/repo#3\ncloses https://github.com/o/r/issues/5\nFIXED #6\nresolved:#7\ncloses http://www.github.com/o/r/issues/55/\nfixes https://github.com/o/r/issues/6#issuecomment-1 tail\nresolves github.com/o/r/issues/7?x=1\nfixed:\n#78\nfixes #1 and closes #2\nFixes GH-13\nfixes gh-17\nFixes <https://github.com/o/r/issues/21>\nFixes [#12](https://github.com/o/r/issues/12)\nFixes [issue 18](https://github.com/o/r/issues/18)\nFixes [x](https://github.com/o/r/issues/4 \"title\")\nFixes [x](<https://github.com/o/r/issues/4>)\nFixes [x]( https://github.com/o/r/issues/4 )\nFixes [x](https://github.com/o/r/issues/4 'title')\nFixes [x](https://github.com/o/r/issues/4 (title))\nFixes gh-1/repo#3";
 
 fn body_for(title: &str, desc: Option<&[u8]>, report: &str) -> String {
     let fx = Fixture::new();
@@ -603,7 +603,7 @@ fn assert_rewritten(body: &str) {
         "Fixes o/r issue 21\n",
         "Fixes o/r issue 12\n",
         "Fixes o/r issue 18",
-        "Fixes o/r issue 4\nFixes o/r issue 4\nFixes o/r issue 4\nFixes issue 1/repo#3",
+        "Fixes o/r issue 4\nFixes o/r issue 4\nFixes o/r issue 4\nFixes o/r issue 4\nFixes o/r issue 4\nFixes issue 1/repo#3",
     ] {
         assert!(body.contains(want), "missing {want:?} in {body}");
     }
@@ -734,7 +734,7 @@ fn new_forms_on_the_next_line_are_rewritten() {
 
 #[test]
 fn near_misses_are_not_rewritten() {
-    let text = "Fixes GH-\nFixes [x](https://github.com/o/r/pull/4)\nFixes <https://example.com/issues/4>\nFixes [x](https://github.com/o/r/issues/4\nFixes <https://github.com/o/r/issues/4\n";
+    let text = "Fixes GH-\nFixes [x](https://github.com/o/r/pull/4)\nFixes <https://example.com/issues/4>\nFixes [x](https://github.com/o/r/issues/4\nFixes <https://github.com/o/r/issues/4\nFixes [x](<https://github.com/o/r/issues/4)\n";
     let body = body_for("T (#1)", Some(text.as_bytes()), text.trim_end());
     assert_eq!(body.matches(text).count(), 2, "{body}");
 }
