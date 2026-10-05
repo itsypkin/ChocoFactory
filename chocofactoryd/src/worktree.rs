@@ -639,9 +639,11 @@ mod tests {
     }
 
     fn tempdir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "chocofactoryd-worktree-test-{}-{}",
+            "chocofactoryd-worktree-test-{}-{}-{}",
             std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

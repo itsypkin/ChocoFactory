@@ -3210,8 +3210,9 @@ impl WorkflowEngine {
     /// remote-tracking ref); cancel passes `false`.
     ///
     /// The tip goes on the timeline *before* `git branch -D` runs
-    /// (`worktree::delete_branch`'s hook), so a deleted branch is always
-    /// recoverable from the branch tip SHA.
+    /// (`worktree::delete_branch`'s hook), so a deleted branch is
+    /// recoverable from the recorded SHA until `git gc` prunes it (about
+    /// two weeks); if the note can't be written the branch is kept.
     async fn cleanup_branch(self: &Arc<Self>, task_id: &str, only_if_safe: bool) {
         let task = match tasks::get(&self.pool, task_id).await {
             Ok(Some(task)) => task,
@@ -13242,6 +13243,34 @@ stages:
         engine.cancel_task(&task_id, false).await.unwrap();
         assert!(!path.exists());
         assert!(!branch_exists_in(&repo, &task_id).await);
+    }
+
+    /// If the `deleting` note can't be written, `git branch -D` must not
+    /// run: the recorded SHA is the only way back to the work.
+    #[tokio::test]
+    async fn cancel_keeps_the_branch_when_the_tip_cannot_be_recorded() {
+        let (_root, engine, pool, repo, path, task_id, tip) =
+            cancellable_worktree_task(false).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_deleting BEFORE INSERT ON events \
+             WHEN NEW.event_type='branch_cleanup' \
+             AND json_extract(NEW.payload,'$.action')='deleting' \
+             BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
+        assert!(!path.exists());
+        assert!(branch_exists_in(&repo, &task_id).await);
+        let notes = branch_events(&pool, &task_id).await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0]["action"], "kept");
+        assert_eq!(notes[0]["sha"], tip.as_str());
+        assert_eq!(
+            notes[0]["reason"],
+            "could not record the branch tip on the timeline"
+        );
     }
 
     /// A failing `git branch -D` is logged and put on the timeline after
