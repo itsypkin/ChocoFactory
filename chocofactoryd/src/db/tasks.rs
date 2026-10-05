@@ -1,4 +1,4 @@
-use chocofactory_core::models::Task;
+use chocofactory_core::models::{PullRequestRef, Task, TaskSummary};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::types::Json;
@@ -121,6 +121,98 @@ pub async fn list(
     qb.push(" ORDER BY id");
     let rows = qb.build_query_as::<TaskRow>().fetch_all(pool).await?;
     Ok(rows.into_iter().map(Into::into).collect())
+}
+
+/// Row order for [`list_summaries`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryOrder {
+    /// By id — the order `GET /tasks` has always used.
+    Id,
+    /// `updated_at` newest first, then id.
+    UpdatedDesc,
+}
+
+#[derive(FromRow)]
+struct SummaryRow {
+    #[sqlx(flatten)]
+    task: TaskRow,
+    current_stage: Option<String>,
+    stage_entered_at: Option<DateTime<Utc>>,
+    loop_counters: Option<Json<Value>>,
+    pr_url: Option<String>,
+}
+
+/// The pull-request number at the end of a pull URL (`…/pull/42`, with an
+/// optional trailing slash). Anything else is `None`.
+fn pr_ref(url: String) -> Option<PullRequestRef> {
+    static PULL: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"/pull/(\d+)/?$").expect("valid regex"));
+    let number = PULL.captures(&url)?.get(1)?.as_str().parse().ok()?;
+    Some(PullRequestRef { number, url })
+}
+
+/// One query for `GET /tasks`: each task with its workflow facts and the
+/// first pull-request URL any stage captured. The URL is picked inside
+/// SQLite so the (large) payloads never reach Rust.
+///
+/// `statuses` empty means "any status".
+pub async fn list_summaries(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    statuses: &[String],
+    order: SummaryOrder,
+    limit: Option<i64>,
+) -> Result<Vec<TaskSummary>, sqlx::Error> {
+    let task_columns = COLUMNS
+        .split(',')
+        .map(|c| format!("t.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut qb = QueryBuilder::new(format!(
+        "SELECT {task_columns}, w.current_stage, w.stage_entered_at, w.loop_counters, \
+         (SELECT json_extract(j.value, '$.url') \
+            FROM json_each(w.payload, '$.stages') j \
+           WHERE j.type = 'object' \
+             AND json_extract(j.value, '$.url') LIKE '%/pull/%' \
+           LIMIT 1) AS pr_url \
+         FROM tasks t LEFT JOIN workflow_state w ON w.task_id = t.id"
+    ));
+    let mut sep = " WHERE ";
+    if let Some(project_id) = project_id {
+        qb.push(sep)
+            .push("t.project_id = ")
+            .push_bind(project_id.to_string());
+        sep = " AND ";
+    }
+    if !statuses.is_empty() {
+        qb.push(sep).push("t.status IN (");
+        let mut list = qb.separated(", ");
+        for status in statuses {
+            list.push_bind(status.clone());
+        }
+        qb.push(")");
+    }
+    qb.push(match order {
+        SummaryOrder::Id => " ORDER BY t.id",
+        SummaryOrder::UpdatedDesc => " ORDER BY t.updated_at DESC, t.id",
+    });
+    if let Some(limit) = limit {
+        qb.push(" LIMIT ").push_bind(limit);
+    }
+    let rows = qb.build_query_as::<SummaryRow>().fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| TaskSummary {
+            task: row.task.into(),
+            current_stage: row.current_stage,
+            stage_entered_at: row.stage_entered_at,
+            loop_counters: row
+                .loop_counters
+                .map(|j| j.0)
+                .unwrap_or_else(|| serde_json::json!({})),
+            pr: row.pr_url.and_then(pr_ref),
+        })
+        .collect())
 }
 
 /// How many `open` or `stuck` tasks have a `workflow_path` starting with

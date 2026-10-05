@@ -634,6 +634,40 @@ impl Client {
         self.decode(resp).await
     }
 
+    /// `GET /tasks` summary rows with the dashboard's filters: `status` may
+    /// be a comma-separated list, `order` is `id` or `updated_desc`.
+    pub async fn list_task_summaries(
+        &self,
+        project_id: Option<&str>,
+        status: &str,
+        order: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<chocofactory_core::models::TaskSummary>, ClientError> {
+        let mut query: Vec<(&str, String)> = vec![("status", status.to_string())];
+        if let Some(project_id) = project_id {
+            query.push(("project_id", project_id.to_string()));
+        }
+        if let Some(order) = order {
+            query.push(("order", order.to_string()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let resp = self
+            .send(
+                self.http
+                    .get(format!("{}/tasks", self.base_url))
+                    .query(&query),
+            )
+            .await?;
+        let resp = self.check_status(resp).await?;
+        self.decode(resp).await
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub async fn send_message(&self, id: &str, text: &str) -> Result<(), ClientError> {
         let resp = self
             .send(

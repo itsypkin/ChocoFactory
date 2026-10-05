@@ -395,6 +395,26 @@ pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<Event
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// The last `n` events of a task, oldest first — the tail of
+/// [`list_for_task`], in the same total order.
+pub async fn list_last_for_task(
+    pool: &SqlitePool,
+    task_id: &str,
+    n: i64,
+) -> Result<Vec<Event>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, EventRow>(&format!(
+        "SELECT {COLUMNS} FROM events
+         WHERE task_id = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?"
+    ))
+    .bind(task_id)
+    .bind(n)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().rev().map(Into::into).collect())
+}
+
 /// Just the `stage_entered` slice of [`list_for_task`], same order — the
 /// task's stage trail.
 ///

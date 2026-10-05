@@ -472,7 +472,7 @@ pub fn events(page: &EventsPage) -> String {
 /// transcript, so dumping their raw JSON here would defeat the point of
 /// this view. The engine's own task-scoped events (`stage_entered`,
 /// `shell_output`) are composed for the same reason.
-fn event_summary(event: &Event) -> String {
+pub(crate) fn event_summary(event: &Event) -> String {
     let summary = event_summary_body(event);
     // #90: output from a sub-agent, or arriving after the turn had already
     // completed, is recorded on the same session as the main agent's. Marked

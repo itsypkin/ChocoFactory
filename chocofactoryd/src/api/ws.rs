@@ -8,9 +8,10 @@
 //! this is a single shared `Notify`, not a per-task registry).
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 
 use super::{ApiError, AppState};
 use crate::db::{events, tasks};
@@ -20,19 +21,40 @@ use crate::db::{events, tasks};
 /// yet" from "no such task" — both are an empty `Vec`, not an error — so
 /// without this check a bad `task_id` would silently open a socket that
 /// then waits forever for events that can never arrive, instead of a 404.
+/// `tail=N` replays only the last `N` backlog events (clamped to
+/// `1..=MAX_TAIL`); absent means the whole backlog.
+#[derive(Deserialize)]
+pub struct LiveQuery {
+    pub tail: Option<usize>,
+}
+
+const MAX_TAIL: usize = 500;
+
 pub async fn task_events(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
+    Query(query): Query<LiveQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     if tasks::get(&state.pool, &task_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("no such task '{task_id}'")));
     }
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, task_id)))
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, task_id, query.tail)))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, task_id: String) {
-    let Ok(backlog) = events::list_for_task(&state.pool, &task_id).await else {
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    task_id: String,
+    tail: Option<usize>,
+) {
+    let backlog = match tail {
+        Some(n) => {
+            events::list_last_for_task(&state.pool, &task_id, n.clamp(1, MAX_TAIL) as i64).await
+        }
+        None => events::list_for_task(&state.pool, &task_id).await,
+    };
+    let Ok(backlog) = backlog else {
         return;
     };
     let mut cursor: Option<(DateTime<Utc>, String)> =
@@ -384,5 +406,89 @@ stages:
             result.is_err(),
             "connecting to a nonexistent task should not succeed"
         );
+    }
+
+    /// #164: `?tail=N` replays only the last `N` backlog events, oldest
+    /// first, and then live-tails from the last one sent.
+    #[tokio::test]
+    async fn tail_replays_only_the_last_events_then_streams_live() {
+        let server = TestServer::start().await;
+        server.write_workflow(
+            "tail-gate",
+            r#"
+name: tail-gate
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#,
+        );
+        let project: Value = server
+            .post("/projects", json!({ "name": "demo" }))
+            .await
+            .json();
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project["id"],
+                    "workflow_def": "tail-gate",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
+        for i in 0..4 {
+            crate::db::events::append_for_task(
+                server.pool(),
+                &task_id,
+                chocofactory_core::models::EventType::HumanMessage,
+                json!({ "text": format!("m{i}") }),
+            )
+            .await
+            .unwrap();
+        }
+        let all = crate::db::events::list_for_task(server.pool(), &task_id)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 5);
+
+        let (mut ws, _) = connect_async(format!(
+            "{}/tasks/{task_id}/events/live?tail=2",
+            server.ws_url
+        ))
+        .await
+        .unwrap();
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let Ok(Some(Ok(WsMessage::Text(text)))) =
+                tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
+            else {
+                panic!("tail event missing");
+            };
+            let e: Value = serde_json::from_str(&text).unwrap();
+            got.push(e["id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(got, vec![all[3].id.clone(), all[4].id.clone()]);
+
+        let response = server
+            .post(
+                &format!("/tasks/{task_id}/messages"),
+                json!({ "text": "go" }),
+            )
+            .await;
+        assert_eq!(response.status(), 202);
+        let Ok(Some(Ok(WsMessage::Text(text)))) =
+            tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
+        else {
+            panic!("live event missing after the tail");
+        };
+        let e: Value = serde_json::from_str(&text).unwrap();
+        assert!(!all.iter().any(|a| a.id == e["id"].as_str().unwrap()));
+        let _ = ws.close(None).await;
     }
 }

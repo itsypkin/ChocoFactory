@@ -2248,6 +2248,8 @@ impl WorkflowEngine {
                     current_stage: current_stage.clone(),
                     loop_counters: state.loop_counters.clone(),
                     payload,
+                    // A retry re-runs the stage without re-entering it.
+                    enters_stage: false,
                 },
             )
             .await?
@@ -2874,6 +2876,9 @@ impl WorkflowEngine {
                         current_stage: next_stage.clone(),
                         loop_counters,
                         payload,
+                        // Also true for an `on:` edge back to the same
+                        // stage: that is a new entry.
+                        enters_stage: true,
                     },
                 )
                 .await?
@@ -7940,6 +7945,7 @@ stages:
                 current_stage: state.current_stage,
                 loop_counters: json!({ "review": { "entered_from": "coding", "count": 2 } }),
                 payload: state.payload,
+                enters_stage: false,
             },
         )
         .await
@@ -8031,6 +8037,51 @@ stages:
             "retry_task must not touch loop_counters, byte-for-byte"
         );
         assert_eq!(after.current_stage, "escalate");
+    }
+
+    /// #164: a transition stamps `stage_entered_at`; a retry of a stuck task
+    /// re-runs the stage without re-entering it, so it stays put.
+    #[tokio::test]
+    async fn transition_stamps_stage_entered_at_and_retry_leaves_it() {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let marker = dir.join("marker"); // never created -> `run` stays stuck
+        let yaml = format!(
+            r#"
+name: stamp
+stages:
+  gate:
+    kind: human_gate
+    on: {{ resumed: run }}
+  run:
+    kind: shell
+    command: "test -f {}"
+    on: {{ done: done }}
+  done:
+    kind: terminal
+"#,
+            marker.display()
+        );
+        std::fs::write(dir.join("stamp.yaml"), &yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let task_id = seed_task(&pool, &def.name).await;
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        let at_gate = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(at_gate.stage_entered_at, Some(at_gate.updated_at));
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        let stuck = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(stuck.current_stage, "run");
+        assert!(stuck.stage_entered_at > at_gate.stage_entered_at);
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "stuck").await;
+        let retried = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(retried.stage_entered_at, stuck.stage_entered_at);
     }
 
     #[tokio::test]
