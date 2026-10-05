@@ -67,6 +67,19 @@ strip_markers() {
 # copied text. Only the first reference after a keyword is rewritten (the
 # only one GitHub closes), and a reference at the start of the next line is
 # rewritten when a line ends with a keyword. Bare references stay links.
+# Forms rewritten, all verified to close on real GitHub (2026-10-05): `#N`,
+# `o/r#N`, `GH-N` (any case) -> `issue N`; a bare issue URL, an autolink
+# `<issue URL>` and a markdown link `[any text](issue URL)` (the whole link,
+# text included, since the link target counts and the text may say `#N`)
+# -> `o/r issue N`. Verified NOT to close, so deliberately not handled:
+# emphasis around the keyword or the reference (`**Fixes** #N`, `Fixes
+# **#N**`, `_Fixes_ #N`) and a non-breaking space (U+00A0 or `&nbsp;`)
+# between them. Don't add those.
+# `GH-N` is tried before `o/r#N`, so `Fixes gh-1/repo#3` becomes `Fixes issue
+# 1/repo#3`: the other order would leave `GH-1` right after the keyword.
+# Reference-style links (`[x][1]` plus a definition) are not handled; unverified.
+# Link text containing brackets (`[a [b]](URL)`, `[a\]b](URL)`) is not handled
+# either: the text stops at the first `]`. Unverified.
 # Code blocks and inline code are rewritten too, deliberately: GitHub doesn't
 # document whether it skips code, agent text quotes commit messages where
 # `Fixes #N` lives, and a cosmetic edit costs far less than a closed issue.
@@ -80,24 +93,59 @@ neutralize_closing_refs() {
             URLRE = "^(https?://)?(www\\.)?github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[0-9]+"
             pending = 0
         }
+        # Length of an issue URL at the start of u (0 if none); sets REPL to
+        # "o/r issue N". stop is a bracket class of the characters that end
+        # the optional "/", "#..." or "?..." tail.
+        function urlat(u, ul, stop,    n, s, i, a, rest) {
+            if (!match(ul, URLRE)) return 0
+            n = RLENGTH
+            s = substr(u, 1, n)
+            i = index(tolower(s), "github.com/")
+            split(substr(s, i + 11), a, "/")
+            REPL = a[1] "/" a[2] " issue " a[4]
+            rest = substr(u, n + 1)
+            if (substr(rest, 1, 1) == "/") { n++; rest = substr(rest, 2) }
+            if (match(rest, "^[#?][^ \t\r" stop "]*")) n += RLENGTH
+            return n
+        }
         # Length of the issue reference at index j of t (0 if none); sets REPL.
-        function refat(t, tl, j,    u, ul, n, s, i, a, rest, p) {
+        function refat(t, tl, j,    u, ul, n, s, p, m, ang, rest) {
             u = substr(t, j); ul = substr(tl, j)
             if (match(u, /^#[0-9]+/)) {
                 REPL = "issue " substr(u, 2, RLENGTH - 1)
                 return RLENGTH
             }
-            if (match(ul, URLRE)) {
-                n = RLENGTH
-                s = substr(u, 1, n)
-                i = index(tolower(s), "github.com/")
-                split(substr(s, i + 11), a, "/")
-                REPL = a[1] "/" a[2] " issue " a[4]
-                rest = substr(u, n + 1)
-                if (substr(rest, 1, 1) == "/") { n++; rest = substr(rest, 2) }
-                if (match(rest, /^[#?][^ \t\r]*/)) n += RLENGTH
-                return n
+            if (match(ul, /^gh-[0-9]+/)) {
+                REPL = "issue " substr(u, 4, RLENGTH - 3)
+                return RLENGTH
             }
+            if (substr(u, 1, 1) == "<") {
+                n = urlat(substr(u, 2), substr(ul, 2), ">")
+                if (n > 0 && substr(u, n + 2, 1) == ">") return n + 2
+                return 0
+            }
+            if (substr(u, 1, 1) == "[") {
+                if (!match(u, /^\[[^]]*\]\(/)) return 0
+                m = RLENGTH
+                while (substr(u, m + 1, 1) ~ /[ \t]/) m++
+                ang = (substr(u, m + 1, 1) == "<")
+                if (ang) m++
+                n = urlat(substr(u, m + 1), substr(ul, m + 1), ")>")
+                if (n == 0) return 0
+                m += n
+                if (ang) {
+                    if (substr(u, m + 1, 1) != ">") return 0
+                    m++
+                }
+                rest = substr(u, m + 1)
+                if (match(rest, /^[ \t]*\)/)) return m + RLENGTH
+                if (match(rest, /^[ \t]+"[^"]*"[ \t]*\)/)) return m + RLENGTH
+                if (match(rest, /^[ \t]+\047[^\047]*\047[ \t]*\)/)) return m + RLENGTH
+                if (match(rest, /^[ \t]+\([^()]*\)[ \t]*\)/)) return m + RLENGTH
+                return 0
+            }
+            n = urlat(u, ul, "")
+            if (n > 0) return n
             if (match(u, /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[0-9]+/)) {
                 n = RLENGTH
                 s = substr(u, 1, n)
