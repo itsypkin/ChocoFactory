@@ -75,6 +75,9 @@ strip_markers() {
 # emphasis around the keyword or the reference (`**Fixes** #N`, `Fixes
 # **#N**`, `_Fixes_ #N`) and a non-breaking space (U+00A0 or `&nbsp;`)
 # between them. Don't add those.
+# `GH-N` is tried before `o/r#N`, so `Fixes gh-1/repo#3` becomes `Fixes issue
+# 1/repo#3`: the other order would leave `GH-1` right after the keyword.
+# Reference-style links (`[x][1]` plus a definition) are not handled; unverified.
 # Code blocks and inline code are rewritten too, deliberately: GitHub doesn't
 # document whether it skips code, agent text quotes commit messages where
 # `Fixes #N` lives, and a cosmetic edit costs far less than a closed issue.
@@ -104,7 +107,7 @@ neutralize_closing_refs() {
             return n
         }
         # Length of the issue reference at index j of t (0 if none); sets REPL.
-        function refat(t, tl, j,    u, ul, n, s, p, m) {
+        function refat(t, tl, j,    u, ul, n, s, p, m, ang, rest) {
             u = substr(t, j); ul = substr(tl, j)
             if (match(u, /^#[0-9]+/)) {
                 REPL = "issue " substr(u, 2, RLENGTH - 1)
@@ -122,8 +125,20 @@ neutralize_closing_refs() {
             if (substr(u, 1, 1) == "[") {
                 if (!match(u, /^\[[^]]*\]\(/)) return 0
                 m = RLENGTH
-                n = urlat(substr(u, m + 1), substr(ul, m + 1), ")")
-                if (n > 0 && substr(u, m + n + 1, 1) == ")") return m + n + 1
+                while (substr(u, m + 1, 1) ~ /[ \t]/) m++
+                ang = (substr(u, m + 1, 1) == "<")
+                if (ang) m++
+                n = urlat(substr(u, m + 1), substr(ul, m + 1), ")>")
+                if (n == 0) return 0
+                m += n
+                if (ang) {
+                    if (substr(u, m + 1, 1) != ">") return 0
+                    m++
+                }
+                rest = substr(u, m + 1)
+                if (match(rest, /^[ \t]*\)/)) return m + RLENGTH
+                if (match(rest, /^[ \t]+"[^"]*"[ \t]*\)/)) return m + RLENGTH
+                if (match(rest, /^[ \t]+\047[^\047]*\047[ \t]*\)/)) return m + RLENGTH
                 return 0
             }
             n = urlat(u, ul, "")
