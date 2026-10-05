@@ -804,6 +804,70 @@ When stdout is piped, the output is one line per change, with no escape
 sequences. With `--json` it is NDJSON: one full task object per line, per
 change.
 
+### Watching all tasks
+
+`choco dashboard` (alias `choco dash`) is an interactive terminal view of every
+task on the daemon. It needs a terminal: with a pipe, a redirect or `--json` it
+exits 1 and points to `choco task list` and `choco task status --live`.
+
+```
+$ choco dashboard [--project <name|id>] [--interval <dur>] [--closed <N>]
+```
+
+`--interval` is how often it polls (default `2s`); `--closed` is how many
+recently closed or cancelled tasks to show (default 10). The screen is one
+scrollable list in four sections:
+
+| Section | Holds | Ordered |
+|---|---|---|
+| Needs you | `open` tasks waiting on a person: for the built-in workflows, the `awaiting_human_review`, `escalate_to_human` and `spec_questions` stages | longest waiting first |
+| In progress | every other `open` task, with its laps (the largest loop counter, `×N`) | longest in its stage first |
+| Stuck | `stuck` tasks, whatever their stage, with the first line of the reason | longest stuck first |
+| Recently closed | the latest `closed` and `cancelled` tasks | newest first |
+
+"Needs you" is decided by stage name, so it only knows the built-in workflows
+(`coding-task` and `coding-task-planned`); a task of a custom workflow shows
+under In progress even while it waits on a person.
+
+**Two modes.** Without `--project` every row has a `project` column (the
+project's name) and the header says `all projects`. With `--project` the column
+is gone and the header names the project. Narrow terminals drop columns: below
+80 columns the laps and PR columns, below 60 the stage and project columns too.
+Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off.
+
+| Key | Action |
+|---|---|
+| `↑` `k` / `↓` `j` | move, across section boundaries |
+| `PgUp` `PgDn`, `g` `G` | page; top / bottom |
+| `Tab` / `Shift-Tab` | next / previous non-empty section |
+| `⏎` | open the task's detail: header, stage history and its last 200 events, following new ones (`PgUp`/`PgDn` scroll back, `End` follows again, `Esc` returns) |
+| `o` | open the task's pull request |
+| `r` | retry a `stuck` task |
+| `c` | cancel an `open` or `stuck` task |
+| `?` | list the keys |
+| `q`, `Ctrl-C` | quit |
+
+The selection follows the task, not the row, so it stays put when a refresh
+re-sorts the list.
+
+Actions apply to the selected task (the open one, in the detail view):
+
+- `r` asks `Retry "<title>"? Its stage runs again. [y/N]`; `y` runs
+  `choco task retry` (resuming the agent session when it can) and reports
+  `retried: resumed` or `retried: fresh`. On a task that is not stuck it says so
+  and sends nothing.
+- `c` asks `Cancel "<title>"? This kills its agent and deletes its worktree and
+  branch. It cannot be undone. [y/N]`; `y` cancels the task. The dashboard never
+  keeps the work (`--keep` is `choco task cancel` only).
+- Any key but `y` closes the question and sends nothing. A daemon error is shown
+  verbatim on the bottom line, and a success refreshes the list at once.
+- `o` opens the PR with `open` (macOS) or `xdg-open`. Over SSH (`SSH_CONNECTION`
+  or `SSH_TTY` set) it launches nothing and prints `PR #N: <url>` instead.
+
+If the daemon goes away the last data stays on screen, the bottom line turns red
+(`daemon unreachable: …; retrying every 2s (data 34s old)`) and polling goes on,
+so the dashboard recovers on its own.
+
 ### Per-role config
 
 A workflow can declare more than one role — a `coder` and a `reviewer`, say —

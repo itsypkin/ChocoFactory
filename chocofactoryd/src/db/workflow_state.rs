@@ -4,7 +4,8 @@ use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{FromRow, SqlitePool};
 
-const COLUMNS: &str = "task_id, current_stage, loop_counters, payload, updated_at";
+const COLUMNS: &str =
+    "task_id, current_stage, loop_counters, payload, updated_at, stage_entered_at";
 
 #[derive(FromRow)]
 struct WorkflowStateRow {
@@ -13,6 +14,7 @@ struct WorkflowStateRow {
     loop_counters: Json<Value>,
     payload: Json<Value>,
     updated_at: DateTime<Utc>,
+    stage_entered_at: Option<DateTime<Utc>>,
 }
 
 impl From<WorkflowStateRow> for WorkflowState {
@@ -23,6 +25,7 @@ impl From<WorkflowStateRow> for WorkflowState {
             loop_counters: row.loop_counters.0,
             payload: row.payload.0,
             updated_at: row.updated_at,
+            stage_entered_at: row.stage_entered_at,
         }
     }
 }
@@ -43,13 +46,14 @@ pub async fn create(
 ) -> Result<WorkflowState, sqlx::Error> {
     let now = Utc::now();
     let row = sqlx::query_as::<_, WorkflowStateRow>(&format!(
-        "INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, updated_at)
-         VALUES (?, ?, '{{}}', ?, ?)
+        "INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, updated_at, stage_entered_at)
+         VALUES (?, ?, '{{}}', ?, ?, ?)
          RETURNING {COLUMNS}"
     ))
     .bind(task_id)
     .bind(current_stage)
     .bind(Json(payload))
+    .bind(now)
     .bind(now)
     .fetch_one(pool)
     .await?;
@@ -70,6 +74,9 @@ pub struct WorkflowStateUpdate {
     pub current_stage: String,
     pub loop_counters: Value,
     pub payload: Value,
+    /// `true` stamps `stage_entered_at` with the same instant as
+    /// `updated_at`, in the same UPDATE; `false` leaves it as it is.
+    pub enters_stage: bool,
 }
 
 pub async fn update(
@@ -80,13 +87,16 @@ pub async fn update(
     let now = Utc::now();
     let row = sqlx::query_as::<_, WorkflowStateRow>(&format!(
         "UPDATE workflow_state
-         SET current_stage = ?, loop_counters = ?, payload = ?, updated_at = ?
+         SET current_stage = ?, loop_counters = ?, payload = ?, updated_at = ?,
+             stage_entered_at = CASE WHEN ? THEN ? ELSE stage_entered_at END
          WHERE task_id = ?
          RETURNING {COLUMNS}"
     ))
     .bind(update.current_stage)
     .bind(Json(update.loop_counters))
     .bind(Json(update.payload))
+    .bind(now)
+    .bind(update.enters_stage)
     .bind(now)
     .bind(task_id)
     .fetch_optional(pool)
@@ -142,6 +152,7 @@ mod tests {
                 current_stage: "internal_review".to_string(),
                 loop_counters: json!({"internal_review": 1}),
                 payload: json!({"pr_url": null}),
+                enters_stage: true,
             },
         )
         .await
@@ -155,6 +166,50 @@ mod tests {
 
         assert!(delete(&pool, &task_id).await.unwrap());
         assert!(get(&pool, &task_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_entered_at_is_stamped_only_when_entering() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+
+        let created = create(&pool, &task_id, "coding", json!({})).await.unwrap();
+        assert_eq!(created.stage_entered_at, Some(created.updated_at));
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let entered = update(
+            &pool,
+            &task_id,
+            WorkflowStateUpdate {
+                current_stage: "review".into(),
+                loop_counters: json!({}),
+                payload: json!({}),
+                enters_stage: true,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(entered.stage_entered_at, Some(entered.updated_at));
+        assert!(entered.stage_entered_at > created.stage_entered_at);
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let kept = update(
+            &pool,
+            &task_id,
+            WorkflowStateUpdate {
+                current_stage: "review".into(),
+                loop_counters: json!({}),
+                payload: json!({"changed": true}),
+                enters_stage: false,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(kept.stage_entered_at, entered.stage_entered_at);
+        assert!(kept.updated_at > entered.updated_at);
+        assert_eq!(kept.payload, json!({"changed": true}));
     }
 
     #[tokio::test]

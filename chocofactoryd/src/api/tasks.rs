@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use chocofactory_core::models::{Event, RetryMode, RetryOutcome, Task, WorkflowState};
+use chocofactory_core::models::{Event, RetryMode, RetryOutcome, Task, TaskSummary, WorkflowState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -61,20 +61,56 @@ pub async fn create(
 #[derive(Deserialize)]
 pub struct ListTasksQuery {
     pub project_id: Option<String>,
+    /// One status, or a comma-separated list (`open,stuck`).
     pub status: Option<String>,
+    /// `id` (default) or `updated_desc`.
+    pub order: Option<String>,
+    /// Clamped to `1..=MAX_LIST_LIMIT`; absent means no limit.
+    pub limit: Option<usize>,
 }
+
+/// Same ceiling `api/events.rs` puts on its `limit`.
+const MAX_LIST_LIMIT: usize = 500;
 
 pub async fn list(
     State(state): State<AppState>,
     Query(query): Query<ListTasksQuery>,
-) -> Result<Json<Vec<Task>>, ApiError> {
-    let tasks = tasks::list(
+) -> Result<Json<Vec<TaskSummary>>, ApiError> {
+    let statuses: Vec<String> = match query.status.as_deref() {
+        None => Vec::new(),
+        Some(raw) => raw
+            .split(',')
+            .map(|item| {
+                let item = item.trim();
+                if item.is_empty() {
+                    Err(ApiError::BadRequest(format!(
+                        "empty item in status '{raw}'"
+                    )))
+                } else {
+                    Ok(item.to_string())
+                }
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    let order = match query.order.as_deref() {
+        None | Some("id") => tasks::SummaryOrder::Id,
+        Some("updated_desc") => tasks::SummaryOrder::UpdatedDesc,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown order '{other}': expected 'id' or 'updated_desc'"
+            )));
+        }
+    };
+    let limit = query.limit.map(|l| l.clamp(1, MAX_LIST_LIMIT) as i64);
+    let rows = tasks::list_summaries(
         &state.pool,
         query.project_id.as_deref(),
-        query.status.as_deref(),
+        &statuses,
+        order,
+        limit,
     )
     .await?;
-    Ok(Json(tasks))
+    Ok(Json(rows))
 }
 
 /// A task plus its current `workflow_state` — bare `Task.status` is
@@ -981,6 +1017,169 @@ stages:
 
         let open: Value = server.get("/tasks?status=open").await.json();
         assert!(open.as_array().unwrap().is_empty());
+    }
+
+    // ---- #164: summary rows, status lists, order, limit ----
+
+    async fn make_task(server: &TestServer, project_id: &str, title: &str) -> String {
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "gate-only",
+                    "title": title,
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        task["id"].as_str().unwrap().to_string()
+    }
+
+    fn seed_gate_only(server: &TestServer) {
+        server.write_workflow(
+            "gate-only",
+            r#"
+name: gate-only
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#,
+        );
+    }
+
+    fn ids(listed: &Value) -> Vec<String> {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_rows_carry_workflow_facts_and_the_pull_request() {
+        let server = TestServer::start().await;
+        seed_gate_only(&server);
+        let project_id = create_project(&server).await;
+        let with_pr = make_task(&server, &project_id, "with pr").await;
+        let without = make_task(&server, &project_id, "without").await;
+        let odd = make_task(&server, &project_id, "odd url").await;
+
+        let set_payload = |id: String, payload: Value| {
+            let pool = server.pool().clone();
+            async move {
+                sqlx::query(
+                    "UPDATE workflow_state SET payload = ?, loop_counters = ? WHERE task_id = ?",
+                )
+                .bind(payload.to_string())
+                .bind(json!({"gate": {"count": 2}}).to_string())
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        set_payload(
+            with_pr.clone(),
+            json!({"stages": {
+                "plain": "text",
+                "review": {"text": "huge", "url": "https://example.com/build/1"},
+                "open_pr": {"url": "https://github.com/o/r/pull/171"},
+            }}),
+        )
+        .await;
+        set_payload(
+            odd.clone(),
+            json!({"stages": {"open_pr": {"url": "https://github.com/o/r/pull/abc"}}}),
+        )
+        .await;
+
+        let listed: Value = server.get("/tasks").await.json();
+        let rows = listed.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap();
+
+        let r = row(&with_pr);
+        assert_eq!(r["current_stage"], "gate");
+        assert!(r["stage_entered_at"].is_string());
+        assert_eq!(r["loop_counters"], json!({"gate": {"count": 2}}));
+        assert_eq!(
+            r["pr"],
+            json!({"number": 171, "url": "https://github.com/o/r/pull/171"})
+        );
+        assert_eq!(r["title"], "with pr");
+        assert!(row(&without)["pr"].is_null());
+        assert!(row(&odd)["pr"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_status_accepts_a_comma_separated_list() {
+        let server = TestServer::start().await;
+        seed_gate_only(&server);
+        let project_id = create_project(&server).await;
+        let open = make_task(&server, &project_id, "a").await;
+        let stuck = make_task(&server, &project_id, "b").await;
+        let cancelled = make_task(&server, &project_id, "c").await;
+        crate::db::tasks::mark_stuck(server.pool(), &stuck, "x")
+            .await
+            .unwrap();
+        server
+            .post(&format!("/tasks/{cancelled}/cancel"), json!({}))
+            .await;
+
+        let both: Value = server.get("/tasks?status=open,%20stuck").await.json();
+        let mut got = ids(&both);
+        got.sort();
+        let mut want = vec![open.clone(), stuck.clone()];
+        want.sort();
+        assert_eq!(got, want);
+
+        let single: Value = server.get("/tasks?status=cancelled").await.json();
+        assert_eq!(ids(&single), vec![cancelled]);
+
+        assert_eq!(server.get("/tasks?status=open,").await.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn list_order_and_limit() {
+        let server = TestServer::start().await;
+        seed_gate_only(&server);
+        let project_id = create_project(&server).await;
+        let a = make_task(&server, &project_id, "a").await;
+        let b = make_task(&server, &project_id, "b").await;
+        let c = make_task(&server, &project_id, "c").await;
+        for (id, ts) in [
+            (&a, "2026-01-01T00:00:03+00:00"),
+            (&b, "2026-01-01T00:00:01+00:00"),
+            (&c, "2026-01-01T00:00:02+00:00"),
+        ] {
+            sqlx::query("UPDATE tasks SET updated_at = ? WHERE id = ?")
+                .bind(ts)
+                .bind(id)
+                .execute(server.pool())
+                .await
+                .unwrap();
+        }
+
+        let listed: Value = server.get("/tasks?order=updated_desc&limit=2").await.json();
+        assert_eq!(ids(&listed), vec![a.clone(), c.clone()]);
+
+        let by_id: Value = server.get("/tasks?order=id").await.json();
+        let mut sorted = vec![a, b, c];
+        sorted.sort();
+        assert_eq!(ids(&by_id), sorted);
+
+        let zero: Value = server.get("/tasks?limit=0").await.json();
+        assert_eq!(ids(&zero).len(), 1, "limit clamps up to 1");
+
+        let bad = server.get("/tasks?order=bogus").await;
+        assert_eq!(bad.status(), 400);
+        assert!(bad.json().to_string().contains("updated_desc"));
     }
 
     // ---- X-4: stuck tasks and retry (#61) ----

@@ -520,6 +520,28 @@ pub struct WorkflowState {
     /// whichever stage kind is currently active.
     pub payload: Value,
     pub updated_at: DateTime<Utc>,
+    /// When `current_stage` was last entered. `None` only for a row that
+    /// predates the column and has no matching `stage_entered` event.
+    pub stage_entered_at: Option<DateTime<Utc>>,
+}
+
+/// One row of `GET /tasks`: the task plus the few workflow facts a
+/// dashboard needs, so it needs no per-task request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    #[serde(flatten)]
+    pub task: Task,
+    pub current_stage: Option<String>,
+    pub stage_entered_at: Option<DateTime<Utc>>,
+    /// `{}` when the task has no workflow_state row.
+    pub loop_counters: Value,
+    pub pr: Option<PullRequestRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PullRequestRef {
+    pub number: u64,
+    pub url: String,
 }
 
 #[cfg(test)]

@@ -2382,3 +2382,25 @@ async fn task_status_renders_a_builtin_workflow_record() {
         status.stdout
     );
 }
+
+/// #164: the dashboard refuses to run without a terminal, before it touches
+/// one or the daemon (nothing listens on this base URL).
+#[tokio::test]
+async fn dashboard_needs_an_interactive_terminal() {
+    for args in [&["dashboard"][..], &["dash"][..]] {
+        let out = run_choco("http://127.0.0.1:1", args).await;
+        assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+        assert!(
+            out.stderr.contains("needs an interactive terminal"),
+            "{}",
+            out.stderr
+        );
+        assert!(out.stderr.contains("choco task list"), "{}", out.stderr);
+        assert!(
+            out.stderr.contains("choco task status --live"),
+            "{}",
+            out.stderr
+        );
+        assert!(out.stdout.is_empty());
+    }
+}

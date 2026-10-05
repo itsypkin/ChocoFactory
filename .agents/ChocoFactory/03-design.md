@@ -775,6 +775,10 @@ Both human-scriptable and agent-callable (Q12) — an HTTP client against
 - `choco task status <id>`
 - `choco task send <id> --text <text>`
 - `choco task list [--project <p>] [--status <s>]`
+- `choco dashboard [--project <p>] [--interval <dur>] [--closed <N>]` (alias `dash`) — an
+  interactive terminal view of every task (needs you, in progress, stuck, recently closed)
+  with retry, cancel and open-PR actions; built on `GET /tasks` summary rows and the
+  `events/live?tail=N` socket, so a later web UI can reuse them (#164)
 
 Only the external-automation half of Q12 remains. The agent-to-agent half
 — `--parent-task`, which tagged `tasks.parent_task_id` so the UI could

@@ -4,6 +4,7 @@
 
 mod cli;
 mod client;
+mod dashboard;
 mod mcp;
 mod render;
 mod server;
@@ -147,6 +148,26 @@ async fn main() -> ExitCode {
     } = cli.command
     {
         return update::run(check, version, force).await;
+    }
+
+    if let Command::Dashboard(args) = cli.command {
+        use std::io::IsTerminal;
+        // Checked before anything touches the terminal or the daemon.
+        if cli.json || !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            eprintln!(
+                "error: the dashboard needs an interactive terminal; use `choco task list` \
+                 or `choco task status --live` instead"
+            );
+            return ExitCode::FAILURE;
+        }
+        let base_url = match resolve_base_url(cli.base_url) {
+            Ok(url) => url,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return dashboard::run(base_url, args).await;
     }
 
     let base_url = match resolve_base_url(cli.base_url) {
@@ -422,6 +443,7 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         Command::McpServe(_) => unreachable!("McpServe is handled in main() before run()"),
         Command::Server(_) => unreachable!("Server is handled in main() before run()"),
         Command::Update { .. } => unreachable!("Update is handled in main() before run()"),
+        Command::Dashboard(_) => unreachable!("Dashboard is handled in main() before run()"),
     }
 }
 

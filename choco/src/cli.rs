@@ -104,6 +104,10 @@ pub enum Command {
     /// Start, stop, restart or inspect the chocofactoryd daemon.
     #[command(subcommand)]
     Server(ServerCmd),
+    /// Interactive terminal dashboard of every task: what needs you, what is
+    /// running, what is stuck and what just finished. Needs a terminal.
+    #[command(alias = "dash")]
+    Dashboard(DashboardArgs),
     /// Update choco and chocofactoryd to the latest release (only for copies
     /// installed by install.sh). Refuses, exit 3, while an agent turn or shell
     /// step is running unless `--force`. Exit codes: 0 updated or up to date;
@@ -127,6 +131,20 @@ pub enum Command {
     /// meant to be run by hand, hence hidden from `--help`.
     #[command(hide = true)]
     McpServe(McpServeArgs),
+}
+
+/// `choco dashboard` (#164).
+#[derive(Args, Debug)]
+pub struct DashboardArgs {
+    /// Show only this project (name or id).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// How often to poll the daemon.
+    #[arg(long, value_parser = parse_duration_arg, default_value = "2s")]
+    pub interval: DurationArg,
+    /// How many recently closed or cancelled tasks to show.
+    #[arg(long, default_value_t = 10)]
+    pub closed: usize,
 }
 
 /// `choco server ...`: manages the local daemon through its lock file.
