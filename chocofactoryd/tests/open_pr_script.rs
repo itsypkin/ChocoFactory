@@ -563,14 +563,17 @@ const KEYWORDS: &str = "closes|closed|close|fixes|fixed|fix|resolves|resolved|re
 /// any reference form. Built here from the documented syntax, independent of
 /// the script.
 fn closing_regex() -> regex::Regex {
-    let refs = r"(?:https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|[\w.-]+/[\w.-]+#\d+|#\d+)";
+    let refs = r"(?:https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+|[\w.-]+/[\w.-]+#\d+|#\d+|GH-\d+|<URL>|\[[^\]\n]*\]\(URL\))";
+    // `URL` stands for the issue-URL alternation (scheme and www optional).
+    let url = r"(?:https?://)?(?:www\.)?github\.com/[\w.-]+/[\w.-]+/issues/\d+";
+    let refs = refs.replace("URL", url);
     regex::Regex::new(&format!(
         r"(?i)(?:^|[^A-Za-z0-9_])(?:{KEYWORDS})\b:?[ \t]*\r?\n?[ \t]*{refs}"
     ))
     .unwrap()
 }
 
-const AGENT_LINES: &str = "Its message has no Closes/Fixes/Resolves #84.\nfixes: #12\nCloses owner/repo#3\ncloses https://github.com/o/r/issues/5\nFIXED #6\nresolved:#7\ncloses http://www.github.com/o/r/issues/55/\nfixes https://github.com/o/r/issues/6#issuecomment-1 tail\nresolves github.com/o/r/issues/7?x=1\nfixed:\n#78\nfixes #1 and closes #2";
+const AGENT_LINES: &str = "Its message has no Closes/Fixes/Resolves #84.\nfixes: #12\nCloses owner/repo#3\ncloses https://github.com/o/r/issues/5\nFIXED #6\nresolved:#7\ncloses http://www.github.com/o/r/issues/55/\nfixes https://github.com/o/r/issues/6#issuecomment-1 tail\nresolves github.com/o/r/issues/7?x=1\nfixed:\n#78\nfixes #1 and closes #2\nFixes GH-13\nfixes gh-17\nFixes <https://github.com/o/r/issues/21>\nFixes [#12](https://github.com/o/r/issues/12)\nFixes [issue 18](https://github.com/o/r/issues/18)";
 
 fn body_for(title: &str, desc: Option<&[u8]>, report: &str) -> String {
     let fx = Fixture::new();
@@ -595,6 +598,11 @@ fn assert_rewritten(body: &str) {
         "resolves o/r issue 7\n",
         "fixed:\nissue 78",
         "fixes issue 1 and closes issue 2",
+        "Fixes issue 13\n",
+        "fixes issue 17\n",
+        "Fixes o/r issue 21\n",
+        "Fixes o/r issue 12\n",
+        "Fixes o/r issue 18",
     ] {
         assert!(body.contains(want), "missing {want:?} in {body}");
     }
@@ -696,10 +704,57 @@ fn crlf_and_indented_next_line_references_are_rewritten() {
     );
 }
 
+// Checked against real GitHub on 2026-10-05: none of these closes an issue,
+// so the filter must leave them alone.
 #[test]
-fn a_failing_filter_aborts_before_any_pr_is_opened() {
+fn verified_non_linking_forms_pass_through_byte_for_byte() {
+    let text = "**Fixes** #1\n_Fixes_ #2\nFixes **#3**\n*Fixes* #15\nFixes _#16_\nFixes&nbsp;#19\nFixes\u{a0}#7\n";
+    let body = body_for("T (#1)", Some(text.as_bytes()), text.trim_end());
+    assert_eq!(body.matches(text).count(), 2, "{body}");
+}
+
+#[test]
+fn new_forms_on_the_next_line_are_rewritten() {
+    for (input, want) in [
+        ("This fixes\nGH-77 too\n", "This fixes\nissue 77 too\n"),
+        (
+            "This fixes\n<https://github.com/o/r/issues/77>\n",
+            "This fixes\no/r issue 77\n",
+        ),
+        (
+            "This fixes\n[x](https://github.com/o/r/issues/77)\n",
+            "This fixes\no/r issue 77\n",
+        ),
+    ] {
+        let body = body_for("T (#1)", Some(input.as_bytes()), "r");
+        assert!(body.contains(want), "{body}");
+    }
+}
+
+#[test]
+fn near_misses_are_not_rewritten() {
+    let text = "Fixes GH-\nFixes [x](https://github.com/o/r/pull/4)\nFixes <https://example.com/issues/4>\nFixes [x](https://github.com/o/r/issues/4\nFixes <https://github.com/o/r/issues/4\n";
+    let body = body_for("T (#1)", Some(text.as_bytes()), text.trim_end());
+    assert_eq!(body.matches(text).count(), 2, "{body}");
+}
+
+#[test]
+fn new_forms_keep_the_tail_and_only_the_first_reference() {
+    let text = "Fixes <https://github.com/o/r/issues/5#c-1> and GH-6\nFixes [a](https://github.com/o/r/issues/7?x=1) then [b](https://github.com/o/r/issues/8)\n";
+    let body = body_for("T (#1)", Some(text.as_bytes()), "r");
+    assert!(body.contains("Fixes o/r issue 5 and GH-6\n"), "{body}");
+    assert!(
+        body.contains("Fixes o/r issue 7 then [b](https://github.com/o/r/issues/8)\n"),
+        "{body}"
+    );
+}
+
+/// Runs the script with an awk that fails whenever the filter's program runs.
+fn run_with_failing_filter(desc: Option<&[u8]>, report: &str) {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    if let Some(d) = desc {
+        fx.write_description(d);
+    }
     let fake = fx.root.join("bin/awk");
     let real = Command::new("sh")
         .args(["-c", "command -v awk"])
@@ -713,9 +768,19 @@ fn a_failing_filter_aborts_before_any_pr_is_opened() {
     )
     .unwrap();
     make_executable(&fake);
-    let out = fx.run("T (#131)", "approved", "r");
+    let out = fx.run("T (#131)", "approved", report);
     assert!(!out.status.success(), "{}", stdout(&out));
     assert!(fx.calls_to("pr create").is_empty());
+}
+
+#[test]
+fn a_failing_filter_aborts_on_the_description_alone() {
+    run_with_failing_filter(Some(b"d\n"), "");
+}
+
+#[test]
+fn a_failing_filter_aborts_on_the_report_alone() {
+    run_with_failing_filter(None, "r");
 }
 
 #[test]
