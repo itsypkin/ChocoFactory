@@ -24,7 +24,7 @@ indexmap = { version = "2", features = ["serde"] }
 # whole process group, not just the `sh` the daemon spawned (§5.2).
 # Already in the tree via tokio, so this pulls in nothing new.
 libc = "0.2"
-ratatui = "0.30"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
