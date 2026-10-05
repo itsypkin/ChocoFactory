@@ -802,7 +802,9 @@ scrollable list in four sections:
 
 "Needs you" is decided by stage name, so it only knows the built-in
 `coding-task`; a task of another workflow shows under In progress even while it
-waits on a person.
+waits on a person. That includes a `coding-task-planned` task waiting at its
+`spec_questions` gate (its `awaiting_human_review` and `escalate_to_human`
+stages do show under Needs you).
 
 **Two modes.** Without `--project` every row has a `project` column (the
 project's name) and the header says `all projects`. With `--project` the column

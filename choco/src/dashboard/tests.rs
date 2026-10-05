@@ -845,6 +845,8 @@ fn detail_events_follow_until_scrolled() {
 struct Fake {
     tasks: Arc<Vec<TaskSummary>>,
     cancels: Arc<Mutex<Vec<String>>>,
+    /// When set, the detail, cancel and retry endpoints never answer.
+    hang: bool,
 }
 
 async fn fake_server(state: Fake) -> String {
@@ -879,12 +881,24 @@ async fn fake_server(state: Fake) -> String {
         axum::Json(serde_json::to_value(rows).unwrap())
     }
     async fn task(State(s): State<Fake>, Path(id): Path<String>) -> axum::Json<Value> {
+        if s.hang {
+            std::future::pending::<()>().await;
+        }
         let t = s.tasks.iter().find(|t| t.task.id == id).unwrap();
         let mut v = serde_json::to_value(t).unwrap();
         v["stage_trail"] = json!([{"payload": {"stage": "coding", "outcome": null}}]);
         axum::Json(v)
     }
+    async fn retry(State(s): State<Fake>) -> StatusCode {
+        if s.hang {
+            std::future::pending::<()>().await;
+        }
+        StatusCode::OK
+    }
     async fn cancel(State(s): State<Fake>, Path(id): Path<String>) -> StatusCode {
+        if s.hang {
+            std::future::pending::<()>().await;
+        }
         s.cancels.lock().unwrap().push(id);
         StatusCode::ACCEPTED
     }
@@ -913,6 +927,7 @@ async fn fake_server(state: Fake) -> String {
         .route("/tasks", get(tasks))
         .route("/tasks/{id}", get(task))
         .route("/tasks/{id}/cancel", post(cancel))
+        .route("/tasks/{id}/retry", post(retry))
         .route("/tasks/{id}/events/live", get(live))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -960,6 +975,7 @@ async fn the_real_loop_against_a_fake_daemon() {
     let fake = Fake {
         tasks: Arc::new(tasks),
         cancels: Arc::new(Mutex::new(Vec::new())),
+        hang: false,
     };
     let base_url = fake_server(fake.clone()).await;
     let client = Arc::new(Client::new(base_url.clone()).without_version_check());
@@ -1259,5 +1275,83 @@ async fn a_request_that_times_out_is_shown_as_unreachable() {
         tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(run, driver) })
             .await
             .expect("the loop should report the timeout and quit");
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn detail_cancel_and_retry_requests_time_out_visibly() {
+    let fake = Fake {
+        tasks: Arc::new(vec![
+            summary(
+                "aaaa1111-0",
+                "Busy one",
+                "open",
+                Some("coding"),
+                Some(3),
+                "p-alpha",
+            ),
+            summary(
+                "bbbb2222-0",
+                "Stuck one",
+                "stuck",
+                Some("coding"),
+                Some(9),
+                "p-alpha",
+            ),
+        ]),
+        cancels: Arc::new(Mutex::new(Vec::new())),
+        hang: true,
+    };
+    let base_url = fake_server(fake).await;
+    let client = Arc::new(Client::new(base_url).without_version_check());
+    let mut app = new_app(Scope::AllProjects);
+    app.now = Utc::now();
+    app.ssh = false;
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout: Duration::from_millis(300),
+    };
+    let (ktx, mut krx) = mpsc::unbounded_channel();
+    let latest = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&latest);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    let driver = async {
+        let k = |c| {
+            ktx.send(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap()
+        };
+        wait_for(&latest, "Busy one").await;
+        k('c');
+        wait_for(&latest, "Cancel \"Busy one\"?").await;
+        k('y');
+        wait_for(&latest, "cancel failed: request timed out").await;
+        k('j');
+        k('r');
+        wait_for(&latest, "Retry \"Stuck one\"?").await;
+        k('y');
+        wait_for(&latest, "retry failed: request timed out").await;
+        ktx.send(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&latest, "could not load history: request timed out").await;
+        ktx.send(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&latest, "RECENTLY CLOSED").await;
+        k('q');
+    };
+    let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let run = run_loop(
+        &mut terminal,
+        &mut app,
+        client,
+        &config,
+        &mut krx,
+        &mut on_frame,
+    );
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(40), async { tokio::join!(run, driver) })
+            .await
+            .expect("every hung request should time out and the loop should quit");
     result.unwrap();
 }
