@@ -415,6 +415,78 @@ pub async fn remove(repo: &Path, project: &str, task_id: &str) -> Result<(), Wor
     remove_locked(repo, &path).await
 }
 
+/// What [`delete_branch`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchOutcome {
+    /// `git branch -D` removed the branch; `sha` is the tip it had.
+    Deleted { sha: String },
+    /// `only_if_safe` was set and the tip is not known to be anywhere else.
+    Kept { sha: String, reason: String },
+    /// There was no such branch to begin with.
+    Absent,
+}
+
+/// Deletes the task's local branch `task/<task_id>` from `repo` (#102), under
+/// the same per-path lock as [`remove`], and only once the worktree is gone:
+/// git refuses to delete a branch that is checked out, and deleting beneath a
+/// live worktree would strand it. If the worktree path still exists this
+/// returns [`WorktreeError::PathOccupied`] and deletes nothing.
+///
+/// With `only_if_safe`, the branch is deleted only if its tip is reachable
+/// from some remote-tracking ref (`git for-each-ref --contains <tip>
+/// refs/remotes`): that covers both "pushed" and "already merged into a
+/// fetched `origin/main`". Decided from local refs only, never the network.
+/// Any git error while checking counts as *not safe*.
+///
+/// `before_delete` is awaited with the tip SHA immediately before `git
+/// branch -D`, so the caller can record the tip somewhere durable first.
+pub async fn delete_branch<F, Fut>(
+    repo: &Path,
+    project: &str,
+    task_id: &str,
+    only_if_safe: bool,
+    before_delete: F,
+) -> Result<BranchOutcome, WorktreeError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let path = worktree_path(repo, project, task_id)?;
+    ensure_git_repo(repo).await?;
+    let _lock = KeyLock::acquire(&path).await;
+    if path.exists() {
+        return Err(WorktreeError::PathOccupied(path));
+    }
+    let branch = branch_name(task_id);
+    if !branch_exists(repo, &branch).await {
+        return Ok(BranchOutcome::Absent);
+    }
+    let sha = run_git_stdout(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    )
+    .await?;
+    if only_if_safe {
+        let reason =
+            match run_git_stdout(repo, &["for-each-ref", "--contains", &sha, "refs/remotes"]).await
+            {
+                Ok(out) if !out.is_empty() => None,
+                Ok(_) => Some("not on any remote: no remote-tracking ref contains it".to_string()),
+                Err(err) => Some(format!("not on any remote: could not check ({err})")),
+            };
+        if let Some(reason) = reason {
+            return Ok(BranchOutcome::Kept { sha, reason });
+        }
+    }
+    before_delete(sha.clone()).await;
+    run_git(repo, &["branch", "-D", "--", &branch]).await?;
+    Ok(BranchOutcome::Deleted { sha })
+}
+
 async fn remove_locked(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
     if !path.exists() {
         return Ok(());
@@ -1000,6 +1072,142 @@ mod tests {
             other => panic!("expected NotAGitRepo, got {other:?}"),
         }
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ---- delete_branch (#102) ----
+
+    async fn git_out(repo: &Path, args: &[&str]) -> String {
+        run_git_stdout(repo, args).await.unwrap()
+    }
+
+    /// A repo whose `origin` is a bare repo it has pushed `main` to, with a
+    /// task worktree holding one extra commit on `task/<id>`.
+    async fn repo_with_origin_and_task(root: &Path, id: &str) -> (PathBuf, PathBuf, String) {
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+        git(&repo, &["branch", "-M", "main"]).await;
+        let bare = root.join("origin.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare"]).await;
+        git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).await;
+        git(&repo, &["push", "-q", "-u", "origin", "main"]).await;
+        let wt = ensure(&repo, "myrepo", id).await.unwrap();
+        std::fs::write(wt.join("work.txt"), "work\n").unwrap();
+        git(&wt, &["add", "."]).await;
+        git(&wt, &["commit", "-q", "-m", "work"]).await;
+        let tip = git_out(&wt, &["rev-parse", "HEAD"]).await;
+        (repo, wt, tip)
+    }
+
+    async fn no_hook(_: String) {}
+
+    #[tokio::test]
+    async fn delete_branch_removes_a_pushed_branch() {
+        let root = tempdir();
+        let (repo, wt, tip) = repo_with_origin_and_task(&root, "task-1").await;
+        git(&wt, &["push", "-q", "-u", "origin", "HEAD"]).await;
+        remove(&repo, "myrepo", "task-1").await.unwrap();
+        let mut seen = None;
+        let out = delete_branch(&repo, "myrepo", "task-1", true, |sha| {
+            seen = Some(sha);
+            async {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, BranchOutcome::Deleted { sha: tip.clone() });
+        assert_eq!(seen, Some(tip));
+        assert!(!branch_exists(&repo, "task/task-1").await);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_branch_removes_a_branch_merged_into_a_remote_main() {
+        let root = tempdir();
+        let (repo, wt, tip) = repo_with_origin_and_task(&root, "task-1").await;
+        // Land the work on main and publish it, without ever pushing the
+        // task branch itself.
+        remove(&repo, "myrepo", "task-1").await.unwrap();
+        let _ = wt;
+        git(&repo, &["merge", "-q", "--ff-only", "task/task-1"]).await;
+        git(&repo, &["push", "-q", "origin", "main"]).await;
+        assert!(
+            git_out(&repo, &["for-each-ref", "refs/remotes/origin/task"])
+                .await
+                .is_empty()
+        );
+        let out = delete_branch(&repo, "myrepo", "task-1", true, no_hook)
+            .await
+            .unwrap();
+        assert_eq!(out, BranchOutcome::Deleted { sha: tip });
+        assert!(!branch_exists(&repo, "task/task-1").await);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_branch_keeps_unpushed_work_when_only_if_safe() {
+        let root = tempdir();
+        let (repo, _wt, tip) = repo_with_origin_and_task(&root, "task-1").await;
+        remove(&repo, "myrepo", "task-1").await.unwrap();
+        let mut hook_ran = false;
+        let out = delete_branch(&repo, "myrepo", "task-1", true, |_| {
+            hook_ran = true;
+            async {}
+        })
+        .await
+        .unwrap();
+        match out {
+            BranchOutcome::Kept { sha, reason } => {
+                assert_eq!(sha, tip);
+                assert!(reason.starts_with("not on any remote"), "{reason}");
+            }
+            other => panic!("expected Kept, got {other:?}"),
+        }
+        assert!(!hook_ran, "nothing is deleted, so nothing is announced");
+        assert!(branch_exists(&repo, "task/task-1").await);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_branch_removes_unpushed_work_when_not_only_if_safe() {
+        let root = tempdir();
+        let (repo, _wt, tip) = repo_with_origin_and_task(&root, "task-1").await;
+        remove(&repo, "myrepo", "task-1").await.unwrap();
+        let out = delete_branch(&repo, "myrepo", "task-1", false, no_hook)
+            .await
+            .unwrap();
+        assert_eq!(out, BranchOutcome::Deleted { sha: tip });
+        assert!(!branch_exists(&repo, "task/task-1").await);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_branch_reports_an_absent_branch() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+        let out = delete_branch(&repo, "myrepo", "task-1", false, no_hook)
+            .await
+            .unwrap();
+        assert_eq!(out, BranchOutcome::Absent);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_branch_refuses_while_the_worktree_exists() {
+        let root = tempdir();
+        let (repo, wt, _tip) = repo_with_origin_and_task(&root, "task-1").await;
+        let mut hook_ran = false;
+        let err = delete_branch(&repo, "myrepo", "task-1", false, |_| {
+            hook_ran = true;
+            async {}
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WorktreeError::PathOccupied(_)), "{err}");
+        assert!(!hook_ran);
+        assert!(wt.exists());
+        assert!(branch_exists(&repo, "task/task-1").await);
         std::fs::remove_dir_all(&root).ok();
     }
 }

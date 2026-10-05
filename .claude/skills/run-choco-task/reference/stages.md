@@ -27,7 +27,9 @@ Read this while watching a task, when its behaviour surprises you.
   `awaiting_human_review` exactly as if CI had passed: no checks at all,
   skipped, cancelled or timed-out checks, and slow CI.
 - **awaiting_human_review.** Polls the PR's comments every minute for your
-  verdict, for up to 6 hours, then parks at `escalate_to_human`.
+  verdict, for up to 6 hours, then parks at `escalate_to_human`. A merged
+  PR counts as approval and moves the task to `done`; a PR closed without
+  merging does not.
 - **escalate_to_human.** Arriving here starts both rejection counts over.
   It waits for `choco task send <id> --text "<note>"`, which moves the task
   into `revising`.

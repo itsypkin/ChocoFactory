@@ -52,6 +52,12 @@ pub struct Task {
     /// `db::tasks::mark_stuck`. `choco task retry <id>` re-runs the current
     /// stage and clears it via `db::tasks::reopen_stuck`.
     pub stuck_reason: Option<String>,
+    /// `true` when the task was cancelled with `--keep` (#102): its agents
+    /// were stopped but its worktree and branch were left in place for a
+    /// person to take over. Written in the same `UPDATE` as the
+    /// `cancelled` status, so the two can never disagree.
+    #[serde(default)]
+    pub kept_work: bool,
     /// The canonical, absolute path of the workflow file this task actually
     /// runs (issue #88) — resolved once at `create_task` time from either
     /// the project's own `.chocofactory/workflows/<workflow_def>.yaml` or
@@ -410,6 +416,13 @@ pub enum EventType {
     /// and was cut (#101). Task-scoped like [`Self::TemplateUnresolved`].
     /// Payload is `{"stage", "message", "env_truncated"}`.
     EnvTruncated,
+    /// The engine deleted, or deliberately kept, a task's git branch when
+    /// the task finished or was cancelled (#102). Task-scoped. Payload is
+    /// `{"branch", "sha", "action", "message"}` plus `"reason"` (kept) or
+    /// `"error"` (failed); `action` is `"deleting"`, `"kept"`,
+    /// `"delete_failed"` or `"cleanup_failed"`. A `deleting` event is
+    /// written before the branch is removed, so the tip is recoverable.
+    BranchCleanup,
     /// The daemon itself acted on an agent session (#90): it nudged a turn
     /// that ended without calling `report_outcome`, gave up on one that
     /// never did, or killed a process that kept running after its turn had
@@ -436,6 +449,7 @@ impl fmt::Display for EventType {
             EventType::TurnOutcome => "turn_outcome",
             EventType::TemplateUnresolved => "template_unresolved",
             EventType::EnvTruncated => "env_truncated",
+            EventType::BranchCleanup => "branch_cleanup",
             EventType::SessionNote => "session_note",
         })
     }
@@ -470,6 +484,7 @@ impl FromStr for EventType {
             "turn_outcome" => Ok(EventType::TurnOutcome),
             "template_unresolved" => Ok(EventType::TemplateUnresolved),
             "env_truncated" => Ok(EventType::EnvTruncated),
+            "branch_cleanup" => Ok(EventType::BranchCleanup),
             "session_note" => Ok(EventType::SessionNote),
             other => Err(ParseEventTypeError(other.to_string())),
         }
@@ -574,6 +589,7 @@ mod tests {
             EventType::TurnOutcome,
             EventType::TemplateUnresolved,
             EventType::EnvTruncated,
+            EventType::BranchCleanup,
             EventType::SessionNote,
         ] {
             assert_eq!(

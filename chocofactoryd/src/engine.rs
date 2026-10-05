@@ -1865,7 +1865,11 @@ impl WorkflowEngine {
     /// `current_stage` deliberately stays where it was, so
     /// `choco task status` can still say *where* a task was cancelled;
     /// `tasks.status` alone carries the "don't run this any more" signal.
-    pub async fn cancel_task(self: &Arc<Self>, task_id: &str) -> Result<(), CancelTaskError> {
+    pub async fn cancel_task(
+        self: &Arc<Self>,
+        task_id: &str,
+        keep: bool,
+    ) -> Result<(), CancelTaskError> {
         let lock = self.lock_for_task(task_id).await;
         let result = {
             let _guard = lock.lock().await;
@@ -1879,7 +1883,7 @@ impl WorkflowEngine {
             if task.status == TASK_STATUS_CANCELLED || task.status == TASK_STATUS_CLOSED {
                 Err(CancelTaskError::NotCancellable(task.status))
             } else {
-                self.cancel_task_locked(&task).await
+                self.cancel_task_locked(&task, keep).await
             }
         };
         self.evict_task_lock_if_unshared(task_id, &lock).await;
@@ -1888,7 +1892,11 @@ impl WorkflowEngine {
 
     /// The body of [`Self::cancel_task`], split out only so the per-task
     /// lock guard's scope stays obvious at the call site above.
-    async fn cancel_task_locked(self: &Arc<Self>, task: &Task) -> Result<(), CancelTaskError> {
+    async fn cancel_task_locked(
+        self: &Arc<Self>,
+        task: &Task,
+        keep: bool,
+    ) -> Result<(), CancelTaskError> {
         let task_id = &task.id;
 
         // Step 1 — the fallible read, before anything is written or
@@ -1908,7 +1916,11 @@ impl WorkflowEngine {
         // will advance, no message will be accepted, and a crash on the
         // very next line leaves a task that is visibly stopped rather than
         // one that silently looks healthy.
-        tasks::update_status(&self.pool, task_id, TASK_STATUS_CANCELLED)
+        //
+        // `keep` (#102) is recorded by this same `UPDATE`: a second
+        // statement could be lost to a crash, leaving a cancelled task whose
+        // kept worktree nobody is told about.
+        tasks::mark_cancelled(&self.pool, task_id, keep)
             .await?
             // `None` means the row vanished between this function's own
             // read and this write — impossible while the lock is held, but
@@ -1986,8 +1998,19 @@ impl WorkflowEngine {
         // that called `worktree::ensure` doesn't trip `remove_worktree`'s
         // "no snapshot to remove" error log for a worktree that was never
         // created.
-        if worktree_snapshot(task).is_some() {
-            self.remove_worktree(task_id).await;
+        //
+        // With `keep` neither the worktree nor the branch is touched: they
+        // are handed to a person (#102). Otherwise the branch goes too,
+        // pushed or not, once the worktree removal has succeeded.
+        if !keep && worktree_snapshot(task).is_some() {
+            if self.remove_worktree(task_id).await {
+                self.cleanup_branch(task_id, false).await;
+            } else {
+                tracing::error!(
+                    task_id,
+                    "worktree was not removed, so the task branch was left in place"
+                );
+            }
         }
         Ok(())
     }
@@ -3073,7 +3096,17 @@ impl WorkflowEngine {
                 // idempotent — `cancel_task` (#69) can safely retry this
                 // exact removal if it raced this one.
                 if definition.worktree {
-                    self.remove_worktree(task_id).await;
+                    if self.remove_worktree(task_id).await {
+                        // Only once the worktree is really gone: git
+                        // can't delete a checked-out branch, and a failed
+                        // removal leaves the work where a person can find it.
+                        self.cleanup_branch(task_id, true).await;
+                    } else {
+                        tracing::error!(
+                            task_id,
+                            "worktree was not removed, so the task branch was left in place"
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -3137,16 +3170,16 @@ impl WorkflowEngine {
     /// exist at all — the terminal arm via `definition.worktree`,
     /// `cancel_task` via `worktree_snapshot` — since this logs an error
     /// when a task it is asked to clean up carries no snapshot.
-    async fn remove_worktree(self: &Arc<Self>, task_id: &str) {
+    async fn remove_worktree(self: &Arc<Self>, task_id: &str) -> bool {
         let task = match tasks::get(&self.pool, task_id).await {
             Ok(Some(task)) => task,
             Ok(None) => {
                 tracing::error!(task_id, "task disappeared before worktree removal");
-                return;
+                return false;
             }
             Err(err) => {
                 tracing::error!(task_id, %err, "failed to load task for worktree removal");
-                return;
+                return false;
             }
         };
         let Some((repo, project)) = worktree_snapshot(&task) else {
@@ -3154,13 +3187,117 @@ impl WorkflowEngine {
                 task_id,
                 "worktree-enabled task has no worktree_repo/worktree_project snapshot to remove"
             );
-            return;
+            return false;
         };
         match worktree::remove(&repo, project, &task.id).await {
-            Ok(()) => tracing::info!(task_id, "worktree removed (task closed)"),
+            Ok(()) => {
+                tracing::info!(task_id, "worktree removed (task closed)");
+                true
+            }
+            Err(err) => {
+                tracing::error!(
+                    task_id, %err,
+                    "failed to remove worktree after entering terminal stage"
+                );
+                false
+            }
+        }
+    }
+
+    /// Deletes the task's local branch after its worktree is gone (#102),
+    /// best-effort like [`Self::remove_worktree`]: never propagated, but
+    /// every failure is logged at `error` *and* put on the timeline.
+    ///
+    /// Lives in the engine rather than in a workflow stage because a
+    /// `worktree: true` workflow's shell stages run inside the worktree, and
+    /// git refuses to delete a branch that is checked out there; the
+    /// worktree is only removed by the terminal stage, after which no stage
+    /// runs. `only_if_safe` is `done`'s rule (delete only if the tip is on a
+    /// remote-tracking ref); cancel passes `false`.
+    ///
+    /// The tip goes on the timeline *before* `git branch -D` runs
+    /// (`worktree::delete_branch`'s hook), so a deleted branch is always
+    /// recoverable from the branch tip SHA.
+    async fn cleanup_branch(self: &Arc<Self>, task_id: &str, only_if_safe: bool) {
+        let task = match tasks::get(&self.pool, task_id).await {
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                tracing::error!(task_id, "task disappeared before branch cleanup");
+                return;
+            }
+            Err(err) => {
+                tracing::error!(task_id, %err, "failed to load task for branch cleanup");
+                return;
+            }
+        };
+        // No snapshot, no worktree, so no branch of ours.
+        let Some((repo, project)) = worktree_snapshot(&task) else {
+            return;
+        };
+        let branch = worktree::branch_name(task_id);
+        let pool_note = |sha: String| {
+            let this = Arc::clone(self);
+            let branch = branch.clone();
+            let task_id = task_id.to_string();
+            async move {
+                this.record_branch_note(
+                    &task_id,
+                    json!({
+                        "branch": branch,
+                        "sha": sha,
+                        "action": "deleting",
+                        "message": format!("deleting branch {branch} at {sha}"),
+                    }),
+                )
+                .await;
+            }
+        };
+        match worktree::delete_branch(&repo, project, task_id, only_if_safe, pool_note).await {
+            Ok(worktree::BranchOutcome::Deleted { sha }) => {
+                tracing::info!(task_id, %branch, %sha, "task branch deleted");
+            }
+            Ok(worktree::BranchOutcome::Absent) => {
+                tracing::info!(task_id, %branch, "task branch already absent");
+            }
+            Ok(worktree::BranchOutcome::Kept { sha, reason }) => {
+                tracing::info!(task_id, %branch, %sha, %reason, "task branch kept");
+                self.record_branch_note(
+                    task_id,
+                    json!({
+                        "branch": branch,
+                        "sha": sha,
+                        "action": "kept",
+                        "reason": reason,
+                        "message": format!("kept branch {branch} at {sha}: {reason}"),
+                    }),
+                )
+                .await;
+            }
+            Err(err) => {
+                tracing::error!(task_id, %branch, %err, "failed to delete task branch");
+                self.record_branch_note(
+                    task_id,
+                    json!({
+                        "branch": branch,
+                        "action": "delete_failed",
+                        "error": err.to_string(),
+                        "message": format!("could not delete branch {branch}: {err}"),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Appends one `branch_cleanup` event, best-effort like every other
+    /// timeline write in this file: a failure is logged at `error`.
+    async fn record_branch_note(&self, task_id: &str, payload: Value) {
+        match events::append_for_task(&self.pool, task_id, EventType::BranchCleanup, payload).await
+        {
+            Ok(_) => self.events_notify.notify_waiters(),
             Err(err) => tracing::error!(
                 task_id, %err,
-                "failed to remove worktree after entering terminal stage"
+                "failed to record a branch-cleanup event"
             ),
         }
     }
@@ -12826,6 +12963,246 @@ stages:
         wait_until_path_gone(&worktree_dir).await;
     }
 
+    // ---- branch cleanup on done and cancel (#102) ----
+
+    /// A repo with a bare `origin` (so a stage can `git push`).
+    async fn repo_with_origin() -> (TempDir, PathBuf) {
+        let root = tempdir();
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo).await;
+        let bare = root.join("origin.git");
+        fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare"]).await;
+        git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).await;
+        (root, repo)
+    }
+
+    async fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    async fn branch_exists_in(repo: &Path, task_id: &str) -> bool {
+        !git_stdout(repo, &["branch", "--list", &format!("task/{task_id}")])
+            .await
+            .is_empty()
+    }
+
+    async fn branch_events(pool: &SqlitePool, task_id: &str) -> Vec<Value> {
+        events::list_for_task(pool, task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::BranchCleanup)
+            .map(|e| e.payload)
+            .collect()
+    }
+
+    /// Runs `shell` in the worktree of a one-shell-stage task and returns
+    /// once the task is closed.
+    async fn run_worktree_task_to_done(repo: &Path, shell: &str) -> (SqlitePool, String) {
+        let pool = connect_in_memory().await.unwrap();
+        let yaml = format!(
+            r#"
+name: branch-done-flow
+worktree: true
+stages:
+  run:
+    kind: shell
+    command: {shell:?}
+    on: {{ done: finished, error: failed }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, Path::new(".")).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, repo).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "closed").await;
+        let path = worktree::worktree_path(repo, "demo", &task_id).unwrap();
+        wait_until_path_gone(&path).await;
+        (pool, task_id)
+    }
+
+    const COMMIT: &str =
+        "echo x > f && git add f && git -c user.email=a@b.c -c user.name=n commit -qm work";
+
+    #[tokio::test]
+    async fn done_deletes_a_pushed_branch_and_records_its_tip_first() {
+        let (_root, repo) = repo_with_origin().await;
+        let (pool, task_id) =
+            run_worktree_task_to_done(&repo, &format!("{COMMIT} && git push -q -u origin HEAD"))
+                .await;
+        let tip = git_stdout(&repo, &["rev-parse", &format!("origin/task/{task_id}")]).await;
+        assert!(!tip.is_empty());
+        crate::test_support::wait_until("the branch to be deleted", || async {
+            if branch_exists_in(&repo, &task_id).await {
+                Err("still there".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        let notes = branch_events(&pool, &task_id).await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0]["action"], "deleting");
+        assert_eq!(notes[0]["branch"], format!("task/{task_id}"));
+        assert_eq!(notes[0]["sha"], tip.as_str());
+        assert_eq!(
+            notes[0]["message"],
+            format!("deleting branch task/{task_id} at {tip}").as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn done_keeps_an_unpushed_branch_and_says_why() {
+        let (_root, repo) = repo_with_origin().await;
+        let (pool, task_id) = run_worktree_task_to_done(&repo, COMMIT).await;
+        crate::test_support::wait_until("a kept note", || async {
+            if branch_events(&pool, &task_id).await.is_empty() {
+                Err("no note yet".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        assert!(branch_exists_in(&repo, &task_id).await);
+        let tip = git_stdout(&repo, &["rev-parse", &format!("task/{task_id}")]).await;
+        let notes = branch_events(&pool, &task_id).await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0]["action"], "kept");
+        assert_eq!(notes[0]["sha"], tip.as_str());
+        assert!(
+            notes[0]["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("not on any remote"),
+            "{notes:?}"
+        );
+    }
+
+    /// A worktree task parked at a human gate, with a commit
+    /// on its branch (pushed iff `push`). Returns what the tests inspect.
+    async fn cancellable_worktree_task(
+        push: bool,
+    ) -> (
+        TempDir,
+        Arc<WorkflowEngine>,
+        SqlitePool,
+        PathBuf,
+        PathBuf,
+        String,
+        String,
+    ) {
+        let pool = connect_in_memory().await.unwrap();
+        let (root, repo) = repo_with_origin().await;
+        let yaml = r#"
+name: wt-cancellable
+worktree: true
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: finished }
+  finished:
+    kind: terminal
+"#;
+        let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &repo).await;
+        let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_stage(&pool, &task_id, "gate").await;
+        let path = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
+        fs::write(path.join("work.txt"), "work\n").unwrap();
+        git(&path, &["add", "."]).await;
+        git(
+            &path,
+            &[
+                "-c",
+                "user.email=a@b.c",
+                "-c",
+                "user.name=n",
+                "commit",
+                "-qm",
+                "work",
+            ],
+        )
+        .await;
+        if push {
+            git(&path, &["push", "-q", "-u", "origin", "HEAD"]).await;
+        }
+        let tip = git_stdout(&path, &["rev-parse", "HEAD"]).await;
+        (root, engine, pool, repo, path, task_id, tip)
+    }
+
+    #[tokio::test]
+    async fn cancel_deletes_worktree_and_unpushed_branch_and_records_the_tip() {
+        let (_root, engine, pool, repo, path, task_id, tip) =
+            cancellable_worktree_task(false).await;
+        engine.cancel_task(&task_id, false).await.unwrap();
+        assert!(!path.exists());
+        assert!(!branch_exists_in(&repo, &task_id).await);
+        let notes = branch_events(&pool, &task_id).await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0]["action"], "deleting");
+        assert_eq!(notes[0]["sha"], tip.as_str());
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+        assert!(!task.kept_work);
+    }
+
+    #[tokio::test]
+    async fn cancel_deletes_a_pushed_branch_too() {
+        let (_root, engine, _pool, repo, path, task_id, _tip) =
+            cancellable_worktree_task(true).await;
+        engine.cancel_task(&task_id, false).await.unwrap();
+        assert!(!path.exists());
+        assert!(!branch_exists_in(&repo, &task_id).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_with_keep_leaves_worktree_and_branch_and_sets_the_flag() {
+        let (_root, engine, pool, repo, path, task_id, _tip) =
+            cancellable_worktree_task(false).await;
+        engine.cancel_task(&task_id, true).await.unwrap();
+        assert!(path.exists(), "the worktree must be kept");
+        assert!(
+            branch_exists_in(&repo, &task_id).await,
+            "the branch must be kept"
+        );
+        assert!(branch_events(&pool, &task_id).await.is_empty());
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+        assert!(task.kept_work);
+    }
+
+    /// The flag and the status are one statement: `mark_cancelled` is the
+    /// only writer, and it sets both. Pinned at the db layer, where a
+    /// second write would have to appear.
+    #[tokio::test]
+    async fn mark_cancelled_sets_status_and_flag_in_one_write() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool, "wf").await;
+        let task = tasks::mark_cancelled(&pool, &task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "cancelled");
+        assert!(
+            task.kept_work,
+            "the row returned by the one UPDATE has both"
+        );
+    }
+
     #[tokio::test]
     async fn a_task_without_worktree_opt_in_never_creates_one() {
         let pool = connect_in_memory().await.unwrap();
@@ -13190,7 +13567,24 @@ case "$1" in
                 fi
                 ;;
             view)
-                echo "0000000000000000000000000000000000000000"
+                # One read of head, state and merge time (#102), answered
+                # like gh would: the call's `-q` filter applied with `jq`.
+                # The PR is OPEN unless the test has created `pr-merged`.
+                q=""; prev=""
+                for a in "$@"; do
+                    if [ "$prev" = "-q" ]; then q=$a; fi
+                    prev=$a
+                done
+                state=OPEN; merged=null
+                if [ -e "{dir}/pr-merged" ]; then
+                    state=MERGED; merged='"2030-01-02T00:00:00Z"'
+                fi
+                if [ -z "$q" ]; then
+                    # `open_pr`'s body read-back (`-t`), not the verdict poll.
+                    echo "0000000000000000000000000000000000000000"
+                else
+                    printf '{{"headRefOid":"0000000000000000000000000000000000000000","state":"%s","mergedAt":%s}}' "$state" "$merged" | jq -r "$q"
+                fi
                 ;;
             checks)
                 echo "SUCCESS"
@@ -13330,6 +13724,50 @@ esac
         // Worktree cleanup (#58) still fires for the real shipped workflow.
         let worktree_dir = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
         wait_until_path_gone(&worktree_dir).await;
+    }
+
+    /// A merged PR counts as approval (#102): `MERGED` routes
+    /// `awaiting_human_review` to `done` through the same `approved` edge as
+    /// `/approve`, and wins over a standing `/request-changes`.
+    #[tokio::test]
+    async fn the_real_coding_task_workflow_treats_a_merged_pr_as_approval() {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+        let _origin = add_bare_origin(&repo).await;
+        let scripts_dir = tempdir();
+        let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+        fs::write(scripts_dir.join("pr-merged"), "").unwrap();
+        fs::write(
+            scripts_dir.join("verdict"),
+            owner_comment_page("not yet\\n/request-changes"),
+        )
+        .unwrap();
+
+        let (task_id, def, claude_wrapper) = seed_coding_task(
+            &pool,
+            &repo,
+            &scripts_dir,
+            r#"{"outcome": "approved", "feedback": ""}"#,
+        )
+        .await;
+        let engine = engine_with_adapter(pool.clone(), &claude_wrapper.to_string_lossy());
+
+        engine
+            .start_task(&task_id, &def, Some("Add a small feature"))
+            .await
+            .unwrap();
+        wait_until_stage(&pool, &task_id, "done").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+
+        let trail = stage_trail(&pool, &task_id).await;
+        let n = trail.len();
+        assert_eq!(trail[n - 2].0, "awaiting_human_review");
+        assert_eq!(trail[n - 1], ("done".to_string(), json!("approved")));
+        assert!(
+            !trail.iter().any(|(stage, _)| stage == "revising"),
+            "a merged PR must not be sent back for revision: {trail:?}"
+        );
     }
 
     /// A `/request-changes` verdict routes back through `revising` *and*
@@ -13655,7 +14093,7 @@ stages:
         engine.start_task(&task_id, &def, Some("go")).await.unwrap();
         let run = wait_until_run_for_stage(&pool, &task_id, "coding").await;
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         assert_eq!(
             tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
@@ -13693,7 +14131,7 @@ stages:
         engine.start_task(&task_id, &def, Some("go")).await.unwrap();
         wait_until_run_for_stage(&pool, &task_id, "coding").await;
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(state.current_stage, "coding");
@@ -13722,7 +14160,7 @@ stages:
         engine.start_task(&task_id, &def, Some("go")).await.unwrap();
         wait_until_run_for_stage(&pool, &task_id, "coding").await;
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         // Long enough for the watcher (100ms poll) to have seen the turn
         // finish and tried to advance several times over.
@@ -13750,7 +14188,7 @@ stages:
         let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
 
         engine.start_task(&task_id, &def, None).await.unwrap();
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         let err = engine.advance(&task_id, &def, "resumed").await.unwrap_err();
         assert!(matches!(err, EngineError::TaskCancelled(_)));
@@ -13791,7 +14229,7 @@ stages:
         );
 
         engine.start_task(&task_id, &def, None).await.unwrap();
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         let err = engine
             .send_message_or_resume(&task_id, "carry on")
@@ -13811,9 +14249,9 @@ stages:
         let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
 
         engine.start_task(&task_id, &def, None).await.unwrap();
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
-        let err = engine.cancel_task(&task_id).await.unwrap_err();
+        let err = engine.cancel_task(&task_id, false).await.unwrap_err();
         assert!(matches!(err, CancelTaskError::NotCancellable(status) if status == "cancelled"));
     }
 
@@ -13831,7 +14269,7 @@ stages:
         engine.advance(&task_id, &def, "resumed").await.unwrap();
         wait_until_task_status(&pool, &task_id, "closed").await;
 
-        let err = engine.cancel_task(&task_id).await.unwrap_err();
+        let err = engine.cancel_task(&task_id, false).await.unwrap_err();
         assert!(matches!(err, CancelTaskError::NotCancellable(status) if status == "closed"));
     }
 
@@ -13840,7 +14278,7 @@ stages:
         let pool = connect_in_memory().await.unwrap();
         let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
 
-        let err = engine.cancel_task("no-such-task").await.unwrap_err();
+        let err = engine.cancel_task("no-such-task", false).await.unwrap_err();
         assert!(matches!(err, CancelTaskError::NoSuchTask));
     }
 
@@ -13860,9 +14298,9 @@ stages:
         for _ in 0..4 {
             let engine = Arc::clone(&engine);
             let task_id = task_id.clone();
-            handles.push(tokio::spawn(
-                async move { engine.cancel_task(&task_id).await },
-            ));
+            handles.push(tokio::spawn(async move {
+                engine.cancel_task(&task_id, false).await
+            }));
         }
 
         let mut ok = 0;
@@ -13913,7 +14351,7 @@ stages:
         let path = worktree::worktree_path(&wt_repo, wt_project, &task_id).unwrap();
         assert!(path.exists(), "the worktree should exist before cancelling");
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         wait_until_path_gone(&path).await;
     }
@@ -14028,7 +14466,7 @@ stages:
         .await;
         assert!(fs::metadata(&marker).is_ok(), "the poll never ran at all");
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
         let at_cancel = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
 
         // Several intervals' worth: a still-running loop would add attempts.
@@ -14086,7 +14524,7 @@ stages:
             "the shell command never started"
         );
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
         // `cancel_task` awaits the aborted runner, so the process group is
         // already killed here. One tick of slack absorbs a `printf` that was
         // in flight; any growth after that means the command survived.
@@ -14156,7 +14594,7 @@ stages:
 
         // Cancel before the task ever started: no workflow_state row yet,
         // which must not be an error (it's the "nothing to kill" case).
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         let err = engine.start_task(&task_id, &def, None).await.unwrap_err();
         assert!(matches!(err, EngineError::TaskCancelled(_)));
@@ -14189,7 +14627,7 @@ stages:
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
         assert!(worktree_snapshot(&task).is_none());
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         assert_eq!(
             tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
@@ -15462,7 +15900,7 @@ stages:
         let task_id = seed_task(&pool, &def.name).await;
         let engine = engine_with_adapter(pool.clone(), "unused");
         engine.start_task(&task_id, &def, None).await.unwrap();
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         let err = engine
             .retry_task(&task_id, RetryMode::Auto)
@@ -15526,7 +15964,7 @@ stages:
         engine.start_task(&task_id, &def, None).await.unwrap();
         wait_until_task_status(&pool, &task_id, "stuck").await;
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "cancelled");
@@ -15879,7 +16317,7 @@ stages:
         assert_eq!(pids.len(), 2, "both sessions should have started a child");
         assert!(pids.iter().all(|pid| process_alive(*pid)));
 
-        engine.cancel_task(&task_id).await.unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
 
         for pid in pids {
             crate::test_support::wait_until(&format!("pid {pid} to die after cancel"), || async {

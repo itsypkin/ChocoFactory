@@ -102,6 +102,34 @@ pub struct TaskDetail {
     /// Computed fresh on every request by re-hashing the file — not cached,
     /// same as every other "resolved right now" value this API serves.
     pub workflow_file_status: Option<&'static str>,
+    /// Where a task cancelled with `--keep` left its work (#102); `None`
+    /// for every other task.
+    pub kept: Option<KeptWork>,
+}
+
+/// The worktree path and branch a `cancel --keep` handed to a person.
+#[derive(Serialize)]
+pub struct KeptWork {
+    pub worktree_path: Option<String>,
+    pub branch: String,
+}
+
+fn kept_work(task: &Task) -> Option<KeptWork> {
+    if !task.kept_work {
+        return None;
+    }
+    let worktree_path = match (&task.worktree_repo, &task.worktree_project) {
+        (Some(repo), Some(project)) => {
+            crate::worktree::worktree_path(std::path::Path::new(repo), project, &task.id)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
+    Some(KeptWork {
+        worktree_path,
+        branch: crate::worktree::branch_name(&task.id),
+    })
 }
 
 /// Computes [`TaskDetail::workflow_file_status`] for `task`. A pure
@@ -168,8 +196,10 @@ pub async fn get(
     let workflow_state = workflow_state::get(&state.pool, &id).await?;
     let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
     let workflow_file_status = workflow_file_status(&state.engine, &task);
+    let kept = kept_work(&task);
     Ok(Json(TaskDetail {
         task,
+        kept,
         workflow_state,
         stage_trail,
         workflow_file_status,
@@ -239,6 +269,15 @@ pub async fn send_message(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// The optional body of `POST …/cancel` (#102). Absent, `{}` and `{"keep":
+/// false}` all mean "clean up as before"; `keep: true` leaves the worktree
+/// and branch in place for a person to take over.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct CancelBody {
+    keep: bool,
+}
+
 /// Stops `id` for good (#69): marks it `cancelled`, kills whatever agent
 /// subprocess group it had running, and removes its worktree.
 ///
@@ -255,8 +294,10 @@ pub async fn send_message(
 pub async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<CancelBody>>,
 ) -> Result<StatusCode, ApiError> {
-    state.engine.cancel_task(&id).await?;
+    let keep = body.map(|Json(body)| body.keep).unwrap_or_default();
+    state.engine.cancel_task(&id, keep).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -805,6 +846,37 @@ stages:
         // The stage the task stopped in is still readable — that's the
         // difference between cancelling a task and deleting it.
         assert_eq!(detail["workflow_state"]["current_stage"], "chatting");
+    }
+
+    /// `POST …/cancel` takes an optional body (#102): no body, `{}` and
+    /// `{"keep": false}` are the old behaviour; `{"keep": true}` also
+    /// records the flag, readable on the task with the kept branch.
+    #[tokio::test]
+    async fn cancel_body_is_optional_and_keep_is_recorded() {
+        let server = TestServer::start().await;
+        for body in [None, Some(json!({})), Some(json!({"keep": false}))] {
+            let task_id = chat_task(&server).await;
+            let path = format!("/tasks/{task_id}/cancel");
+            let response = match body {
+                None => server.post_empty(&path).await,
+                Some(body) => server.post(&path, body).await,
+            };
+            assert_eq!(response.status(), 202);
+            let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+            assert_eq!(detail["status"], "cancelled");
+            assert_eq!(detail["kept_work"], false);
+            assert!(detail["kept"].is_null());
+        }
+
+        let task_id = chat_task(&server).await;
+        let response = server
+            .post(&format!("/tasks/{task_id}/cancel"), json!({"keep": true}))
+            .await;
+        assert_eq!(response.status(), 202);
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        assert_eq!(detail["status"], "cancelled");
+        assert_eq!(detail["kept_work"], true);
+        assert_eq!(detail["kept"]["branch"], format!("task/{task_id}"));
     }
 
     #[tokio::test]

@@ -66,10 +66,13 @@ The other options cost more:
 ## Cancelling a task
 
 `choco task cancel <id>` is final. It kills the task's agents, marks it
-cancelled and removes its worktree, so uncommitted work there is lost: check
-`git -C <worktree> status` and any unpushed commits first. The task's branch
-is left behind, as it is for finished tasks; delete it yourself once it is
-merged.
+cancelled and removes its worktree and its local branch, pushed or not, so
+uncommitted work there and unpushed commits are lost: check
+`git -C <worktree> status` and the branch first. The branch tip is recorded
+on the task's timeline before deletion. To keep the work, use
+`choco task cancel <id> --keep`: it keeps both the worktree and the branch
+for you (`choco task status <id>` shows where). A task that finishes
+(`done`) deletes its branch only if it was pushed or already merged.
 
 ## Stray processes
 

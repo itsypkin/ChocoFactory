@@ -251,14 +251,19 @@ pub enum TaskCmd {
         text: String,
     },
     /// Stop a task: kills its agent subprocess, marks it cancelled, and
-    /// removes its worktree.
+    /// removes its worktree and its local branch, pushed or not.
     ///
     /// Ends the task's work, not its record — its events and the stage it
     /// stopped in stay readable via `choco task status`/`events`. Cannot be
-    /// undone: a cancelled task accepts no further messages.
+    /// undone: a cancelled task accepts no further messages. The branch tip
+    /// is recorded on the task's timeline before the branch is deleted.
     Cancel {
         /// Task id.
         id: String,
+        /// Keep both the worktree and the branch and hand them to a person.
+        /// Anything re-entering the task later would collide with them.
+        #[arg(long)]
+        keep: bool,
     },
     /// Re-run a stuck task's current stage (X-4, issue #61).
     ///

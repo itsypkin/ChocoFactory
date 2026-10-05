@@ -281,6 +281,16 @@ pub fn task_detail(detail: &Value) -> String {
     {
         pairs.push(("Stuck", single_line(reason)));
     }
+    // A task cancelled with `--keep` (#102) handed its worktree and branch to
+    // a person; say where, or the work is as good as lost.
+    if let Some(kept) = detail.get("kept").filter(|k| !k.is_null()) {
+        if let Some(path) = kept.get("worktree_path").and_then(Value::as_str) {
+            pairs.push(("Kept worktree", path.to_string()));
+        }
+        if let Some(branch) = kept.get("branch").and_then(Value::as_str) {
+            pairs.push(("Kept branch", branch.to_string()));
+        }
+    }
     // Same per-role lines `task` renders: `task status` is where an existing
     // task gets inspected, so leaving them out would mean `--json` was the
     // only way to see what `task reconfigure` actually did. `TaskDetail`
@@ -1010,6 +1020,23 @@ mod tests {
         assert!(!rendered.contains("Stage "), "{rendered}");
     }
 
+    #[test]
+    fn task_detail_names_the_kept_worktree_and_branch() {
+        let detail = json!({
+            "id": "t1", "title": "x", "status": "cancelled", "kept_work": true,
+            "created_at": "2030-01-01T00:00:00Z", "stage_trail": [],
+            "kept": {"worktree_path": "/work/demo-wt-t1", "branch": "task/t1"},
+        });
+        let rendered = task_detail(&detail);
+        assert!(rendered.contains("/work/demo-wt-t1"), "{rendered}");
+        assert!(rendered.contains("task/t1"), "{rendered}");
+        let plain = json!({
+            "id": "t1", "title": "x", "status": "cancelled", "kept_work": false,
+            "created_at": "2030-01-01T00:00:00Z", "stage_trail": [], "kept": null,
+        });
+        assert!(!task_detail(&plain).contains("Kept"));
+    }
+
     fn task_with_config(config: Value) -> Task {
         Task {
             id: "t1".to_string(),
@@ -1021,6 +1048,7 @@ mod tests {
             worktree_repo: None,
             worktree_project: None,
             stuck_reason: None,
+            kept_work: false,
             workflow_path: None,
             workflow_sha256: None,
             created_at: Utc::now(),
@@ -1444,6 +1472,7 @@ mod tests {
             worktree_repo: None,
             worktree_project: None,
             stuck_reason: None,
+            kept_work: false,
             workflow_path: None,
             workflow_sha256: None,
             created_at: Utc::now(),

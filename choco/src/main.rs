@@ -364,8 +364,26 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                  event — see `choco task events {id}`."
             )))
         }
-        Command::Task(TaskCmd::Cancel { id }) => {
-            client.cancel_task(&id).await?;
+        Command::Task(TaskCmd::Cancel { id, keep }) => {
+            client.cancel_task(&id, keep).await?;
+            if keep {
+                // The worktree path lives in the daemon's view of the task,
+                // so ask for it rather than recomputing it here.
+                let detail = client.get_task(&id).await?;
+                let kept = detail.get("kept");
+                let path = kept
+                    .and_then(|k| k.get("worktree_path"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("(none was created)");
+                let branch = kept
+                    .and_then(|k| k.get("branch"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                return Ok(Output::Accepted(format!(
+                    "Task {id} cancelled. Kept for you: worktree {path}, branch {branch}. \
+                     Nothing was removed; see `choco task status {id}`."
+                )));
+            }
             // Deliberately doesn't claim an agent was killed or a worktree
             // removed: a task parked on a `human_gate`, or one cancelled
             // before it ever started, has neither, and the 202 carries no
@@ -373,8 +391,8 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             // pointing at `status` beats a confident sentence that is
             // sometimes wrong.
             Ok(Output::Accepted(format!(
-                "Task {id} cancelled. Any running agent process and worktree \
-                 have been cleaned up — see `choco task status {id}`."
+                "Task {id} cancelled. Any running agent process, worktree and \
+                 local branch have been cleaned up — see `choco task status {id}`."
             )))
         }
         Command::Task(TaskCmd::Retry { id, resume, fresh }) => {

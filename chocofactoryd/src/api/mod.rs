@@ -276,6 +276,17 @@ stages:
             Self::to_response(resp).await
         }
 
+        /// A POST with no body and no content type at all.
+        pub async fn post_empty(&self, path: &str) -> TestResponse {
+            let resp = self
+                .client
+                .post(format!("{}{path}", self.base_url))
+                .send()
+                .await
+                .unwrap();
+            Self::to_response(resp).await
+        }
+
         pub async fn post(&self, path: &str, body: Value) -> TestResponse {
             let resp = self
                 .client
