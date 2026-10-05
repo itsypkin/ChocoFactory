@@ -3234,16 +3234,24 @@ impl WorkflowEngine {
             let branch = branch.clone();
             let task_id = task_id.to_string();
             async move {
-                this.record_branch_note(
-                    &task_id,
-                    json!({
-                        "branch": branch,
-                        "sha": sha,
-                        "action": "deleting",
-                        "message": format!("deleting branch {branch} at {sha}"),
-                    }),
-                )
-                .await;
+                let recorded = this
+                    .record_branch_note(
+                        &task_id,
+                        json!({
+                            "branch": branch,
+                            "sha": sha,
+                            "action": "deleting",
+                            "message": format!("deleting branch {branch} at {sha}"),
+                        }),
+                    )
+                    .await;
+                if !recorded {
+                    tracing::error!(
+                        task_id = %task_id, %branch, %sha,
+                        "could not record the branch tip; the branch will not be deleted"
+                    );
+                }
+                recorded
             }
         };
         match worktree::delete_branch(&repo, project, task_id, only_if_safe, pool_note).await {
@@ -3306,14 +3314,21 @@ impl WorkflowEngine {
 
     /// Appends one `branch_cleanup` event, best-effort like every other
     /// timeline write in this file: a failure is logged at `error`.
-    async fn record_branch_note(&self, task_id: &str, payload: Value) {
+    /// Returns whether the event was recorded.
+    async fn record_branch_note(&self, task_id: &str, payload: Value) -> bool {
         match events::append_for_task(&self.pool, task_id, EventType::BranchCleanup, payload).await
         {
-            Ok(_) => self.events_notify.notify_waiters(),
-            Err(err) => tracing::error!(
-                task_id, %err,
-                "failed to record a branch-cleanup event"
-            ),
+            Ok(_) => {
+                self.events_notify.notify_waiters();
+                true
+            }
+            Err(err) => {
+                tracing::error!(
+                    task_id, %err,
+                    "failed to record a branch-cleanup event"
+                );
+                false
+            }
         }
     }
 

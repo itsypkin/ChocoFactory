@@ -468,7 +468,9 @@ pub enum BranchOutcome {
 /// Any git error while checking counts as *not safe*.
 ///
 /// `before_delete` is awaited with the tip SHA immediately before `git
-/// branch -D`, so the caller can record the tip somewhere durable first.
+/// branch -D`, so the caller can record the tip somewhere durable first. It
+/// returns whether it did: if not, the branch is kept (the recorded SHA is the
+/// only way back once the branch and its reflog are gone).
 pub async fn delete_branch<F, Fut>(
     repo: &Path,
     project: &str,
@@ -478,7 +480,7 @@ pub async fn delete_branch<F, Fut>(
 ) -> Result<BranchOutcome, WorktreeError>
 where
     F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = bool>,
 {
     let path = worktree_path(repo, project, task_id)?;
     ensure_git_repo(repo).await?;
@@ -507,7 +509,12 @@ where
             return Ok(BranchOutcome::Kept { sha, reason });
         }
     }
-    before_delete(sha.clone()).await;
+    if !before_delete(sha.clone()).await {
+        return Ok(BranchOutcome::Kept {
+            sha,
+            reason: "could not record the branch tip on the timeline".to_string(),
+        });
+    }
     run_git(repo, &["branch", "-D", "--", &branch]).await?;
     Ok(BranchOutcome::Deleted { sha })
 }
@@ -1136,7 +1143,9 @@ mod tests {
         (repo, wt, tip)
     }
 
-    async fn no_hook(_: String) {}
+    async fn no_hook(_: String) -> bool {
+        true
+    }
 
     #[tokio::test]
     async fn delete_branch_removes_a_pushed_branch() {
@@ -1157,7 +1166,7 @@ mod tests {
                 .success();
             assert!(still_there, "the hook ran after the branch was deleted");
             seen = Some(sha);
-            async {}
+            async { true }
         })
         .await
         .unwrap();
@@ -1228,7 +1237,7 @@ mod tests {
         let mut hook_ran = false;
         let out = delete_branch(&repo, "myrepo", "task-1", true, |_| {
             hook_ran = true;
-            async {}
+            async { true }
         })
         .await
         .unwrap();
@@ -1278,6 +1287,26 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// If the tip could not be recorded, the branch must survive.
+    #[tokio::test]
+    async fn delete_branch_keeps_the_branch_when_the_tip_cannot_be_recorded() {
+        let root = tempdir();
+        let (repo, _wt, tip) = repo_with_origin_and_task(&root, "task-1").await;
+        remove(&repo, "myrepo", "task-1").await.unwrap();
+        let out = delete_branch(&repo, "myrepo", "task-1", false, |_| async { false })
+            .await
+            .unwrap();
+        match out {
+            BranchOutcome::Kept { sha, reason } => {
+                assert_eq!(sha, tip);
+                assert_eq!(reason, "could not record the branch tip on the timeline");
+            }
+            other => panic!("expected Kept, got {other:?}"),
+        }
+        assert!(branch_exists(&repo, "task/task-1").await);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn delete_branch_refuses_while_the_worktree_exists() {
         let root = tempdir();
@@ -1285,7 +1314,7 @@ mod tests {
         let mut hook_ran = false;
         let err = delete_branch(&repo, "myrepo", "task-1", false, |_| {
             hook_ran = true;
-            async {}
+            async { true }
         })
         .await
         .unwrap_err();
