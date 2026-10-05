@@ -2006,10 +2006,7 @@ impl WorkflowEngine {
             if self.remove_worktree(task_id).await {
                 self.cleanup_branch(task_id, false).await;
             } else {
-                tracing::error!(
-                    task_id,
-                    "worktree was not removed, so the task branch was left in place"
-                );
+                self.note_branch_left_in_place(task_id).await;
             }
         }
         Ok(())
@@ -3102,10 +3099,7 @@ impl WorkflowEngine {
                         // removal leaves the work where a person can find it.
                         self.cleanup_branch(task_id, true).await;
                     } else {
-                        tracing::error!(
-                            task_id,
-                            "worktree was not removed, so the task branch was left in place"
-                        );
+                        self.note_branch_left_in_place(task_id).await;
                     }
                 }
                 Ok(())
@@ -3287,6 +3281,27 @@ impl WorkflowEngine {
                 .await;
             }
         }
+    }
+
+    /// The worktree could not be removed, so the branch was not touched:
+    /// logged at `error` and put on the timeline so it is visible why the
+    /// branch is still there.
+    async fn note_branch_left_in_place(&self, task_id: &str) {
+        tracing::error!(
+            task_id,
+            "worktree was not removed, so the task branch was left in place"
+        );
+        let branch = worktree::branch_name(task_id);
+        self.record_branch_note(
+            task_id,
+            json!({
+                "branch": branch,
+                "action": "kept",
+                "reason": "worktree removal failed",
+                "message": format!("kept branch {branch}: worktree removal failed"),
+            }),
+        )
+        .await;
     }
 
     /// Appends one `branch_cleanup` event, best-effort like every other
@@ -13167,6 +13182,48 @@ stages:
         engine.cancel_task(&task_id, false).await.unwrap();
         assert!(!path.exists());
         assert!(!branch_exists_in(&repo, &task_id).await);
+    }
+
+    /// A failing `git branch -D` is logged and put on the timeline after
+    /// the `deleting` note; the cancel itself still succeeds.
+    #[tokio::test]
+    async fn cancel_records_a_failed_branch_delete_on_the_timeline() {
+        let (_root, engine, pool, repo, path, task_id, tip) =
+            cancellable_worktree_task(false).await;
+        fs::write(
+            repo.join(format!(".git/refs/heads/task/{task_id}.lock")),
+            "",
+        )
+        .unwrap();
+        engine.cancel_task(&task_id, false).await.unwrap();
+        assert!(!path.exists());
+        assert!(branch_exists_in(&repo, &task_id).await);
+        let notes = branch_events(&pool, &task_id).await;
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes[0]["action"], "deleting");
+        assert_eq!(notes[0]["sha"], tip.as_str());
+        assert_eq!(notes[1]["action"], "delete_failed");
+        assert!(!notes[1]["error"].as_str().unwrap().is_empty());
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+    }
+
+    /// When the worktree can't be removed the branch is left alone, and the
+    /// timeline says why.
+    #[tokio::test]
+    async fn cancel_leaves_the_branch_when_the_worktree_removal_fails() {
+        let (_root, engine, pool, repo, path, task_id, _tip) =
+            cancellable_worktree_task(false).await;
+        git(&repo, &["worktree", "lock", path.to_str().unwrap()]).await;
+        engine.cancel_task(&task_id, false).await.unwrap();
+        assert!(path.exists());
+        assert!(branch_exists_in(&repo, &task_id).await);
+        let notes = branch_events(&pool, &task_id).await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0]["action"], "kept");
+        assert_eq!(notes[0]["reason"], "worktree removal failed");
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
     }
 
     #[tokio::test]

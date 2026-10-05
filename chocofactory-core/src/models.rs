@@ -419,8 +419,8 @@ pub enum EventType {
     /// The engine deleted, or deliberately kept, a task's git branch when
     /// the task finished or was cancelled (#102). Task-scoped. Payload is
     /// `{"branch", "sha", "action", "message"}` plus `"reason"` (kept) or
-    /// `"error"` (failed); `action` is `"deleting"`, `"kept"`,
-    /// `"delete_failed"` or `"cleanup_failed"`. A `deleting` event is
+    /// `"error"` (failed); `action` is `"deleting"`, `"kept"`
+    /// or `"delete_failed"`. A `deleting` event is
     /// written before the branch is removed, so the tip is recoverable.
     BranchCleanup,
     /// The daemon itself acted on an agent session (#90): it nudged a turn

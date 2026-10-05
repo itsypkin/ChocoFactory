@@ -352,6 +352,35 @@ async fn branch_exists(repo: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
+/// Like [`branch_exists`], but tells "no such branch" (`show-ref` exit 1)
+/// apart from git failing to answer, which is an error rather than "absent".
+async fn branch_present(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(WorktreeError::Spawn)?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(WorktreeError::GitFailed {
+            args: vec![
+                "show-ref".into(),
+                "--verify".into(),
+                format!("refs/heads/{branch}"),
+            ],
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+    }
+}
+
 /// Creates the task's worktree if it doesn't already exist (idempotent, so
 /// re-entering the triggering stage — e.g. after a daemon restart — is
 /// safe). Returns the worktree's path either way.
@@ -458,7 +487,7 @@ where
         return Err(WorktreeError::PathOccupied(path));
     }
     let branch = branch_name(task_id);
-    if !branch_exists(repo, &branch).await {
+    if !branch_present(repo, &branch).await? {
         return Ok(BranchOutcome::Absent);
     }
     let sha = run_git_stdout(
@@ -471,13 +500,9 @@ where
     )
     .await?;
     if only_if_safe {
-        let reason =
-            match run_git_stdout(repo, &["for-each-ref", "--contains", &sha, "refs/remotes"]).await
-            {
-                Ok(out) if !out.is_empty() => None,
-                Ok(_) => Some("not on any remote: no remote-tracking ref contains it".to_string()),
-                Err(err) => Some(format!("not on any remote: could not check ({err})")),
-            };
+        let reason = unsafe_reason(
+            run_git_stdout(repo, &["for-each-ref", "--contains", &sha, "refs/remotes"]).await,
+        );
         if let Some(reason) = reason {
             return Ok(BranchOutcome::Kept { sha, reason });
         }
@@ -485,6 +510,17 @@ where
     before_delete(sha.clone()).await;
     run_git(repo, &["branch", "-D", "--", &branch]).await?;
     Ok(BranchOutcome::Deleted { sha })
+}
+
+/// Turns the answer of `git for-each-ref --contains <tip> refs/remotes` into
+/// "why this branch is not safe to delete", or `None` when some remote ref
+/// contains the tip. A git error is *not safe* (fail closed).
+fn unsafe_reason(refs: Result<String, WorktreeError>) -> Option<String> {
+    match refs {
+        Ok(out) if !out.is_empty() => None,
+        Ok(_) => Some("not on any remote: no remote-tracking ref contains it".to_string()),
+        Err(err) => Some(format!("not on any remote: could not check ({err})")),
+    }
 }
 
 async fn remove_locked(repo: &Path, path: &Path) -> Result<(), WorktreeError> {
@@ -1110,6 +1146,16 @@ mod tests {
         remove(&repo, "myrepo", "task-1").await.unwrap();
         let mut seen = None;
         let out = delete_branch(&repo, "myrepo", "task-1", true, |sha| {
+            // The hook must run while the branch still exists: that is
+            // what lets the caller record the tip before it is deleted.
+            let still_there = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/task/task-1"])
+                .status()
+                .unwrap()
+                .success();
+            assert!(still_there, "the hook ran after the branch was deleted");
             seen = Some(sha);
             async {}
         })
@@ -1118,6 +1164,36 @@ mod tests {
         assert_eq!(out, BranchOutcome::Deleted { sha: tip.clone() });
         assert_eq!(seen, Some(tip));
         assert!(!branch_exists(&repo, "task/task-1").await);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Fail closed: if git can't answer the "is it on a remote" question,
+    /// the branch is not safe to delete.
+    #[test]
+    fn a_failed_safety_check_counts_as_not_safe() {
+        let err = WorktreeError::GitFailed {
+            args: vec!["for-each-ref".into()],
+            stderr: "boom".into(),
+        };
+        let reason = unsafe_reason(Err(err)).expect("an error must not count as safe");
+        assert!(reason.starts_with("not on any remote"), "{reason}");
+        assert!(reason.contains("boom"), "{reason}");
+        assert_eq!(unsafe_reason(Ok("abc refs/remotes/origin/x".into())), None);
+        assert!(unsafe_reason(Ok(String::new())).is_some());
+    }
+
+    /// A failing `git branch -D` is an error, not a silent success.
+    #[tokio::test]
+    async fn delete_branch_reports_a_failed_delete() {
+        let root = tempdir();
+        let (repo, _wt, _tip) = repo_with_origin_and_task(&root, "task-1").await;
+        remove(&repo, "myrepo", "task-1").await.unwrap();
+        std::fs::write(repo.join(".git/refs/heads/task/task-1.lock"), "").unwrap();
+        let err = delete_branch(&repo, "myrepo", "task-1", false, no_hook)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorktreeError::GitFailed { .. }), "{err:?}");
+        assert!(branch_exists(&repo, "task/task-1").await);
         std::fs::remove_dir_all(&root).ok();
     }
 

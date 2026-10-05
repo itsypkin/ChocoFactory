@@ -118,14 +118,15 @@ fn kept_work(task: &Task) -> Option<KeptWork> {
     if !task.kept_work {
         return None;
     }
-    let worktree_path = match (&task.worktree_repo, &task.worktree_project) {
-        (Some(repo), Some(project)) => {
-            crate::worktree::worktree_path(std::path::Path::new(repo), project, &task.id)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        }
-        _ => None,
+    // No worktree snapshot means no worktree and no branch were ever
+    // created, so there is nothing that was kept.
+    let (Some(repo), Some(project)) = (&task.worktree_repo, &task.worktree_project) else {
+        return None;
     };
+    let worktree_path =
+        crate::worktree::worktree_path(std::path::Path::new(repo), project, &task.id)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
     Some(KeptWork {
         worktree_path,
         branch: crate::worktree::branch_name(&task.id),
@@ -876,6 +877,34 @@ stages:
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert_eq!(detail["status"], "cancelled");
         assert_eq!(detail["kept_work"], true);
+        // A chat task never had a worktree, so nothing was kept.
+        assert!(detail["kept"].is_null());
+    }
+
+    /// With a worktree snapshot, `kept` names the worktree path and branch.
+    #[tokio::test]
+    async fn keep_cancel_on_a_worktree_task_exposes_the_kept_path_and_branch() {
+        let server = TestServer::start().await;
+        let task_id = chat_task(&server).await;
+        crate::db::tasks::set_worktree(server.pool(), &task_id, "/tmp/some-repo", "demo")
+            .await
+            .unwrap();
+        let response = server
+            .post(&format!("/tasks/{task_id}/cancel"), json!({"keep": true}))
+            .await;
+        assert_eq!(response.status(), 202);
+        let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
+        let expected = crate::worktree::worktree_path(
+            std::path::Path::new("/tmp/some-repo"),
+            "demo",
+            &task_id,
+        )
+        .unwrap();
+        assert_eq!(detail["kept_work"], true);
+        assert_eq!(
+            detail["kept"]["worktree_path"],
+            expected.to_string_lossy().as_ref()
+        );
         assert_eq!(detail["kept"]["branch"], format!("task/{task_id}"));
     }
 

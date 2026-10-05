@@ -368,17 +368,28 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             client.cancel_task(&id, keep).await?;
             if keep {
                 // The worktree path lives in the daemon's view of the task,
-                // so ask for it rather than recomputing it here.
-                let detail = client.get_task(&id).await?;
-                let kept = detail.get("kept");
+                // so ask for it rather than recomputing it here. The cancel
+                // already succeeded, so a failed lookup must not read as a
+                // failed cancel.
+                let detail = match client.get_task(&id).await {
+                    Ok(detail) => detail,
+                    Err(_) => {
+                        return Ok(Output::Accepted(format!(
+                            "Task {id} cancelled with --keep. Nothing was removed; see \
+                             `choco task status {id}` for the kept worktree and branch."
+                        )));
+                    }
+                };
+                let Some(kept) = detail.get("kept").filter(|k| !k.is_null()) else {
+                    return Ok(Output::Accepted(format!(
+                        "Task {id} cancelled. Nothing to keep: this task had no worktree."
+                    )));
+                };
                 let path = kept
-                    .and_then(|k| k.get("worktree_path"))
+                    .get("worktree_path")
                     .and_then(Value::as_str)
-                    .unwrap_or("(none was created)");
-                let branch = kept
-                    .and_then(|k| k.get("branch"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("-");
+                    .unwrap_or("(unknown)");
+                let branch = kept.get("branch").and_then(Value::as_str).unwrap_or("-");
                 return Ok(Output::Accepted(format!(
                     "Task {id} cancelled. Kept for you: worktree {path}, branch {branch}. \
                      Nothing was removed; see `choco task status {id}`."

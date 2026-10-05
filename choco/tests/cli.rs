@@ -1242,9 +1242,9 @@ async fn task_cancel_confirms_in_human_mode_and_stays_silent_under_json() {
 }
 
 /// `task cancel --keep` (#102) sends the flag; `task status` then names the
-/// kept branch and `--json` carries the flag. (A chat task has no worktree,
-/// so only the branch line appears here; the worktree line is covered in
-/// `render.rs`.)
+/// nothing (a chat task has no worktree or branch, so none is claimed) and
+/// `--json` carries the flag. The kept path/branch lines are covered in
+/// `render.rs` and the daemon's API tests.
 #[tokio::test]
 async fn task_cancel_keep_sends_the_flag_and_status_shows_what_was_kept() {
     let daemon = Daemon::spawn(TempHome::new()).await;
@@ -1278,18 +1278,10 @@ async fn task_cancel_keep_sends_the_flag_and_status_shows_what_was_kept() {
     let kept = make_task().await;
     let out = run_choco(&daemon.base_url, &["task", "cancel", &kept, "--keep"]).await;
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
-    assert!(out.stdout.contains("Kept"), "{:?}", out.stdout);
-    assert!(
-        out.stdout.contains(&format!("task/{kept}")),
-        "{:?}",
-        out.stdout
-    );
+    assert!(out.stdout.contains("Nothing to keep"), "{:?}", out.stdout);
+    assert!(!out.stdout.contains("task/"), "{:?}", out.stdout);
     let human = run_choco(&daemon.base_url, &["task", "status", &kept]).await;
-    assert!(
-        human.stdout.contains(&format!("task/{kept}")),
-        "{}",
-        human.stdout
-    );
+    assert!(!human.stdout.contains("Kept"), "{}", human.stdout);
     let json = run_choco_json(&daemon.base_url, &["task", "status", &kept])
         .await
         .json();

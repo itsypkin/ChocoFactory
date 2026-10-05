@@ -38,7 +38,7 @@ pr)
     # a mergedAt. The `-q` filter is applied like gh does.
     state=$(cat "$DIR/pr-state" 2>/dev/null || echo OPEN)
     merged=null
-    [ "$state" = MERGED ] && merged='"2030-01-02T03:04:05Z"'
+    [ "$state" = MERGED ] && [ ! -e "$DIR/no-merged-at" ] && merged='"2030-01-02T03:04:05Z"'
     printf '{"headRefOid":"0123456789abcdef","state":"%s","mergedAt":%s}' "$state" "$merged" | jq -r "$q"
     ;;
 api)
@@ -726,6 +726,36 @@ fn a_failing_pr_view_fails_the_script_with_empty_stdout() {
         &[list(&[comment(FRESH, "OWNER", Some("me"), "/approve")])],
     );
     fx.fail("pr-view");
+    let out = fx.run();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}
+
+/// The two new guards: `gh pr view` answering without a state, or a merged
+/// PR without a `mergedAt`, is a failure (stderr, non-zero, empty stdout),
+/// never a guess.
+#[test]
+fn an_empty_pr_state_fails_the_script_with_empty_stdout() {
+    let fx = Fixture::new(SINCE, &[list(&[])]);
+    fx.pr_state("");
+    let out = fx.run();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}
+
+#[test]
+fn a_merged_pr_without_merged_at_fails_the_script_with_empty_stdout() {
+    let fx = Fixture::new(SINCE, &[list(&[])]);
+    fx.pr_state("MERGED");
+    fx.fail("no-merged-at");
+    // `fail` writes `fail-<what>`; the fake looks for `no-merged-at`.
+    fs::rename(
+        fx.dir.join("fail-no-merged-at"),
+        fx.dir.join("no-merged-at"),
+    )
+    .unwrap();
     let out = fx.run();
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
