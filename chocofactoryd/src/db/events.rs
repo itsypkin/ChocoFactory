@@ -369,7 +369,8 @@ fn ends_a_message(event_type: &str) -> bool {
         EventType::StageEntered
         | EventType::ShellOutput
         | EventType::TemplateUnresolved
-        | EventType::EnvTruncated => false,
+        | EventType::EnvTruncated
+        | EventType::BranchCleanup => false,
     }
 }
 

@@ -441,6 +441,13 @@ its own line**:
 | `/approve`         | the task moves to `done`        |
 | `/request-changes` | the task goes back to `revising` |
 
+Merging the PR counts as approval too: while the task waits here, a merged
+PR moves it to `done` exactly as `/approve` would, even with no marker
+comment, and even if a `/request-changes` comment is also there, since
+there is nothing left to revise once the work has landed. A PR closed
+without merging is not a verdict; the task keeps reading markers until its
+timeout.
+
 The rest of the comment is yours to write however you like — put the marker
 on the last line and your review above it. A comment that reads "Two
 findings, one worth fixing before merge." followed by your prose, and then
@@ -579,13 +586,30 @@ Message accepted for task bb93ada3-.... The reply is recorded as an event
 
 Stop a task that has gone wrong. This kills its agent process — and
 anything that process started, like a test run or a dev server — marks the
-task `cancelled`, and removes its worktree:
+task `cancelled`, and removes its worktree and its local branch
+(`task/<id>`), pushed or not. The branch's tip commit is written to the
+task's timeline before the branch is deleted, so `choco task events` still
+tells you where it was:
 
 ```
 $ choco task cancel bb93ada3-...
-Task bb93ada3-... cancelled. Any running agent process and worktree have
-been cleaned up — see `choco task status bb93ada3-...`.
+Task bb93ada3-... cancelled. Any running agent process, worktree and local
+branch have been cleaned up — see `choco task status bb93ada3-...`.
 ```
+
+To take the work over yourself, cancel with `--keep`. It stops the agents
+and marks the task cancelled but keeps **both** the worktree and the
+branch, and hands them to you. Anything re-entering the task later would
+collide with them. `choco task status` then shows the kept worktree path
+and branch (and `--json` carries `kept_work: true`).
+
+A task that reaches `done` also removes its worktree, and deletes its
+branch when the work is safe elsewhere: the branch tip is on a
+remote-tracking ref, so it was pushed or is already merged into a fetched
+`origin/main`. This is decided from local refs only, with no fetch. An
+unpushed branch is kept, and the timeline says why. Remote branches are
+never deleted by the daemon, and branches of tasks finished before this
+behaviour existed are left alone.
 
 Cancelling ends the task's *work*, not its record: its events and the
 stage it stopped in stay readable, which is the point of cancelling rather

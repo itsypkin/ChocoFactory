@@ -6,7 +6,7 @@ use sqlx::{FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
 const COLUMNS: &str = "id, project_id, workflow_def, title, status, config, \
-     worktree_repo, worktree_project, stuck_reason, workflow_path, workflow_sha256, \
+     worktree_repo, worktree_project, stuck_reason, kept_work, workflow_path, workflow_sha256, \
      created_at, updated_at";
 
 #[derive(FromRow)]
@@ -20,6 +20,7 @@ struct TaskRow {
     worktree_repo: Option<String>,
     worktree_project: Option<String>,
     stuck_reason: Option<String>,
+    kept_work: bool,
     workflow_path: Option<String>,
     workflow_sha256: Option<String>,
     created_at: DateTime<Utc>,
@@ -38,6 +39,7 @@ impl From<TaskRow> for Task {
             worktree_repo: row.worktree_repo,
             worktree_project: row.worktree_project,
             stuck_reason: row.stuck_reason,
+            kept_work: row.kept_work,
             workflow_path: row.workflow_path,
             workflow_sha256: row.workflow_sha256,
             created_at: row.created_at,
@@ -166,6 +168,29 @@ pub async fn update_status(
          WHERE id = ? RETURNING {COLUMNS}"
     ))
     .bind(status)
+    .bind(now)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
+/// Marks `id` `cancelled` and records, in the *same* `UPDATE`, whether its
+/// worktree and branch were kept for a person (`cancel --keep`, #102).
+/// One statement on purpose: a second write for the flag could be lost to a
+/// crash or interleave with another writer, leaving a cancelled task whose
+/// kept work nobody can find. Clears `stuck_reason`, like `update_status`.
+pub async fn mark_cancelled(
+    pool: &SqlitePool,
+    id: &str,
+    kept_work: bool,
+) -> Result<Option<Task>, sqlx::Error> {
+    let now = Utc::now();
+    let row = sqlx::query_as::<_, TaskRow>(&format!(
+        "UPDATE tasks SET status = 'cancelled', kept_work = ?, stuck_reason = NULL, \
+         updated_at = ? WHERE id = ? RETURNING {COLUMNS}"
+    ))
+    .bind(kept_work)
     .bind(now)
     .bind(id)
     .fetch_optional(pool)

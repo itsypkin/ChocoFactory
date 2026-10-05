@@ -271,7 +271,8 @@ cancelling. In short:
   `choco task retry <id>`.
 - `escalate_to_human` → `choco task send <id> --text "<note>"` is the only
   way on; `/approve` does nothing there.
-- `choco task cancel <id>` is final and deletes the task's worktree.
+- `choco task cancel <id>` is final and deletes the task's worktree and
+  local branch; `--keep` keeps both for you to take over.
 
 ## Cost and safety
 

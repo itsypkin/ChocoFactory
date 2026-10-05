@@ -1076,7 +1076,24 @@ case "$1" in
                 fi
                 ;;
             view)
-                echo "0000000000000000000000000000000000000000"
+                # One read of head, state and merge time (#102), answered
+                # like gh would: the call's `-q` filter applied with `jq`.
+                # The PR is OPEN unless the test has created `pr-merged`.
+                q=""; prev=""
+                for a in "$@"; do
+                    if [ "$prev" = "-q" ]; then q=$a; fi
+                    prev=$a
+                done
+                state=OPEN; merged=null
+                if [ -e "{dir}/pr-merged" ]; then
+                    state=MERGED; merged='"2030-01-02T00:00:00Z"'
+                fi
+                if [ -z "$q" ]; then
+                    # `open_pr`'s body read-back (`-t`), not the verdict poll.
+                    echo "0000000000000000000000000000000000000000"
+                else
+                    printf '{{"headRefOid":"0000000000000000000000000000000000000000","state":"%s","mergedAt":%s}}' "$state" "$merged" | jq -r "$q"
+                fi
                 ;;
             checks)
                 echo "SUCCESS"

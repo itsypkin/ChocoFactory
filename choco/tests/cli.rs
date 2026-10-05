@@ -1241,6 +1241,63 @@ async fn task_cancel_confirms_in_human_mode_and_stays_silent_under_json() {
     assert_eq!(cancelled.stdout, "");
 }
 
+/// `task cancel --keep` (#102) sends the flag; `task status` then names the
+/// nothing (a chat task has no worktree or branch, so none is claimed) and
+/// `--json` carries the flag. The kept path/branch lines are covered in
+/// `render.rs` and the daemon's API tests.
+#[tokio::test]
+async fn task_cancel_keep_sends_the_flag_and_status_shows_what_was_kept() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let make_task = || async {
+        run_choco_json(
+            &daemon.base_url,
+            &[
+                "task",
+                "create",
+                "--project",
+                &project_id,
+                "--workflow",
+                "chat",
+                "--title",
+                "t",
+                "--prompt",
+                "hello",
+            ],
+        )
+        .await
+        .json()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let kept = make_task().await;
+    let out = run_choco(&daemon.base_url, &["task", "cancel", &kept, "--keep"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("Nothing to keep"), "{:?}", out.stdout);
+    assert!(!out.stdout.contains("task/"), "{:?}", out.stdout);
+    let human = run_choco(&daemon.base_url, &["task", "status", &kept]).await;
+    assert!(!human.stdout.contains("Kept"), "{}", human.stdout);
+    let json = run_choco_json(&daemon.base_url, &["task", "status", &kept])
+        .await
+        .json();
+    assert_eq!(json["kept_work"], true);
+
+    // Without --keep the flag stays off and no kept lines appear.
+    let plain = make_task().await;
+    run_choco(&daemon.base_url, &["task", "cancel", &plain]).await;
+    let json = run_choco_json(&daemon.base_url, &["task", "status", &plain])
+        .await
+        .json();
+    assert_eq!(json["kept_work"], false);
+    let human = run_choco(&daemon.base_url, &["task", "status", &plain]).await;
+    assert!(!human.stdout.contains("Kept"), "{}", human.stdout);
+}
+
 /// A cancelled task is a dead end, and the CLI should say so rather than
 /// appearing to accept a message the daemon dropped.
 #[tokio::test]

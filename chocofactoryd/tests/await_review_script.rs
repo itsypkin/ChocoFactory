@@ -23,6 +23,7 @@ const FAKE_GH: &str = r#"#!/bin/sh
 # head commit's date. $DIR/fail-<what> makes that call fail, where <what> is
 # pr-view, commits, or comments-<n> for the nth comments call.
 DIR="$GH_FAKE_DIR"
+echo "$*" >> "$DIR/calls"
 q=""
 prev=""
 for a in "$@"; do
@@ -33,7 +34,12 @@ case "$1" in
 pr)
     [ -e "$DIR/fail-pr-view" ] && { echo "fake gh: pr view failed" >&2; exit 1; }
     [ -e "$DIR/fail-empty-pr-view" ] && exit 0
-    echo "0123456789abcdef"
+    # $DIR/pr-state is OPEN (default), CLOSED or MERGED; a merged PR carries
+    # a mergedAt. The `-q` filter is applied like gh does.
+    state=$(cat "$DIR/pr-state" 2>/dev/null || echo OPEN)
+    merged=null
+    [ "$state" = MERGED ] && [ ! -e "$DIR/no-merged-at" ] && merged='"2030-01-02T03:04:05Z"'
+    printf '{"headRefOid":"0123456789abcdef","state":"%s","mergedAt":%s}' "$state" "$merged" | jq -r "$q"
     ;;
 api)
     case "$2$3" in
@@ -88,6 +94,16 @@ impl Fixture {
             fs::write(dir.join(format!("page-{}.json", i + 1)), page).unwrap();
         }
         Fixture { dir }
+    }
+
+    /// The PR's state as `gh pr view` reports it: OPEN, CLOSED or MERGED.
+    fn pr_state(&self, state: &str) {
+        fs::write(self.dir.join("pr-state"), state).unwrap();
+    }
+
+    /// Every argument line the fake `gh` was called with.
+    fn calls(&self) -> String {
+        fs::read_to_string(self.dir.join("calls")).unwrap_or_default()
     }
 
     fn fail(&self, what: &str) {
@@ -632,6 +648,115 @@ fn empty_head_empty_date_and_missing_pr_number_are_errors() {
         .env_remove("PR_NUMBER")
         .output()
         .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}
+
+// ---- a merged PR counts as approval (#102) ----
+
+fn merged_fixture(comments: &str) -> Fixture {
+    let fx = Fixture::new(SINCE, &[comments.to_string()]);
+    fx.pr_state("MERGED");
+    fx
+}
+
+/// MERGED, a blank line, the merged-at line, exit 0, and the comments are
+/// never read.
+#[test]
+fn a_merged_pr_prints_merged_and_never_reads_the_comments() {
+    let fx = merged_fixture(&list(&[]));
+    let out = fx.run();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "MERGED\n\nThe PR was merged at 2030-01-02T03:04:05Z.\n"
+    );
+    let calls = fx.calls();
+    assert!(!calls.contains("comments"), "comments were read: {calls}");
+    assert!(
+        !calls.contains("commits/"),
+        "nothing else is needed: {calls}"
+    );
+}
+
+/// Merged wins: once the work has landed there is nothing to revise.
+#[test]
+fn a_merged_pr_wins_over_a_fresh_request_changes() {
+    let fx = merged_fixture(&list(&[comment(
+        FRESH,
+        "OWNER",
+        Some("me"),
+        "/request-changes",
+    )]));
+    let out = fx.run();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().next(), Some("MERGED"));
+    assert!(!stdout.contains("REQUEST_CHANGES"));
+}
+
+/// Closed without merging is nothing new: no marker, no verdict; a marker
+/// still counts exactly as on an open PR.
+#[test]
+fn a_closed_unmerged_pr_polls_on_as_before() {
+    let none = Fixture::new(SINCE, &[list(&[])]);
+    none.pr_state("CLOSED");
+    let out = none.run();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+
+    let approved = Fixture::new(
+        SINCE,
+        &[list(&[comment(FRESH, "OWNER", Some("me"), "/approve")])],
+    );
+    approved.pr_state("CLOSED");
+    let out = approved.run();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().next(), Some("APPROVE"));
+}
+
+/// The existing rule on the new call: a `gh pr view` failure is stderr, a
+/// non-zero exit and nothing on stdout.
+#[test]
+fn a_failing_pr_view_fails_the_script_with_empty_stdout() {
+    let fx = Fixture::new(
+        SINCE,
+        &[list(&[comment(FRESH, "OWNER", Some("me"), "/approve")])],
+    );
+    fx.fail("pr-view");
+    let out = fx.run();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}
+
+/// The two new guards: `gh pr view` answering without a state, or a merged
+/// PR without a `mergedAt`, is a failure (stderr, non-zero, empty stdout),
+/// never a guess.
+#[test]
+fn an_empty_pr_state_fails_the_script_with_empty_stdout() {
+    let fx = Fixture::new(SINCE, &[list(&[])]);
+    fx.pr_state("");
+    let out = fx.run();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}
+
+#[test]
+fn a_merged_pr_without_merged_at_fails_the_script_with_empty_stdout() {
+    let fx = Fixture::new(SINCE, &[list(&[])]);
+    fx.pr_state("MERGED");
+    fx.fail("no-merged-at");
+    // `fail` writes `fail-<what>`; the fake looks for `no-merged-at`.
+    fs::rename(
+        fx.dir.join("fail-no-merged-at"),
+        fx.dir.join("no-merged-at"),
+    )
+    .unwrap();
+    let out = fx.run();
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     assert!(!out.stderr.is_empty());

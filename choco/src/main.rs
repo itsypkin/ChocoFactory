@@ -364,8 +364,21 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                  event — see `choco task events {id}`."
             )))
         }
-        Command::Task(TaskCmd::Cancel { id }) => {
-            client.cancel_task(&id).await?;
+        Command::Task(TaskCmd::Cancel { id, keep }) => {
+            client.cancel_task(&id, keep).await?;
+            if keep {
+                // The worktree path lives in the daemon's view of the task,
+                // so ask for it rather than recomputing it here. The cancel
+                // already succeeded, so a failed lookup must not read as a
+                // failed cancel.
+                return Ok(Output::Accepted(match client.get_task(&id).await {
+                    Ok(detail) => keep_cancel_message(&id, &detail),
+                    Err(_) => format!(
+                        "Task {id} cancelled with --keep. Nothing was removed; see \
+                         `choco task status {id}` for what was kept."
+                    ),
+                }));
+            }
             // Deliberately doesn't claim an agent was killed or a worktree
             // removed: a task parked on a `human_gate`, or one cancelled
             // before it ever started, has neither, and the 202 carries no
@@ -373,8 +386,8 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             // pointing at `status` beats a confident sentence that is
             // sometimes wrong.
             Ok(Output::Accepted(format!(
-                "Task {id} cancelled. Any running agent process and worktree \
-                 have been cleaned up — see `choco task status {id}`."
+                "Task {id} cancelled. Any running agent process, worktree and \
+                 local branch have been cleaned up — see `choco task status {id}`."
             )))
         }
         Command::Task(TaskCmd::Retry { id, resume, fresh }) => {
@@ -412,12 +425,46 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
     }
 }
 
+/// The success line for `cancel --keep`, from the task as the daemon
+/// reports it after the cancel.
+fn keep_cancel_message(id: &str, detail: &Value) -> String {
+    let Some(kept) = detail.get("kept").filter(|k| !k.is_null()) else {
+        return format!("Task {id} cancelled. Nothing to keep: this task had no worktree.");
+    };
+    let path = kept
+        .get("worktree_path")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown)");
+    let branch = kept.get("branch").and_then(Value::as_str).unwrap_or("-");
+    format!(
+        "Task {id} cancelled. Kept for you: worktree {path}, branch {branch}. \
+         Nothing was removed; see `choco task status {id}`."
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_base_url_in;
+    use super::{keep_cancel_message, resolve_base_url_in};
     use std::os::unix::fs::PermissionsExt;
 
     const DEFAULT: &str = "http://127.0.0.1:4141";
+
+    #[test]
+    fn keep_message_names_the_kept_worktree_and_branch() {
+        let detail = serde_json::json!({
+            "kept": {"worktree_path": "/w/demo/t1", "branch": "task/t1"}
+        });
+        let msg = keep_cancel_message("t1", &detail);
+        assert!(msg.contains("worktree /w/demo/t1"), "{msg}");
+        assert!(msg.contains("branch task/t1"), "{msg}");
+        let none = keep_cancel_message("t1", &serde_json::json!({"kept": null}));
+        assert!(none.contains("Nothing to keep"), "{none}");
+        let odd = keep_cancel_message("t1", &serde_json::json!({"kept": {}}));
+        assert!(
+            odd.contains("(unknown)") && odd.contains("branch -"),
+            "{odd}"
+        );
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("choco-resolve-{name}-{}", std::process::id()));

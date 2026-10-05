@@ -7,6 +7,17 @@
 # `jq` binary, because the operator's machine may not have one. The filters
 # below run inside gh's embedded jq (gojq) through `-q`.
 #
+# Output, when the PR has been merged (#102):
+#   line 1   MERGED
+#   line 2   blank
+#   line 3   The PR was merged at <mergedAt>.
+# Merged wins over any marker: once the work is merged there is nothing
+# left to revise, so a `/request-changes` comment, even a fresh one, is
+# not read. The comments are not fetched at all. The state and the head
+# commit come from one `gh pr view` read, so they cannot disagree. A PR
+# that is CLOSED without being merged is nothing new: the poll keeps
+# reading markers until its timeout, exactly as for an OPEN one.
+#
 # Output, when there is a verdict:
 #   line 1   REQUEST_CHANGES or APPROVE
 #   line 2   blank
@@ -78,9 +89,24 @@ RENDER="$SELECT"'
     + (if .updated_at != .created_at then ", edited \(.updated_at)" else "" end)
     + "\n\(.html_url)\n\n\(.body // "")\n"'
 
-HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid) ||
+# One read for the head commit, the state and the merge time, so a merge
+# between two calls cannot pair a stale head with a fresh state. One value
+# per line, to a file: no `jq` binary, and `read` below needs no splitting.
+gh pr view "$PR_NUMBER" --json headRefOid,state,mergedAt \
+    -q '.headRefOid, .state, (.mergedAt // "")' > "$TMP/pr" ||
     fail "gh pr view failed"
+{
+    IFS= read -r HEAD_SHA || true
+    IFS= read -r PR_STATE || true
+    IFS= read -r MERGED_AT || true
+} < "$TMP/pr"
 [ -n "$HEAD_SHA" ] || fail "gh pr view returned no head commit"
+[ -n "$PR_STATE" ] || fail "gh pr view returned no state"
+if [ "$PR_STATE" = "MERGED" ]; then
+    [ -n "$MERGED_AT" ] || fail "gh pr view returned a merged PR with no mergedAt"
+    printf 'MERGED\n\nThe PR was merged at %s.\n' "$MERGED_AT"
+    exit 0
+fi
 SINCE=$(gh api "repos/{owner}/{repo}/commits/$HEAD_SHA" -q .commit.committer.date) ||
     fail "gh api commits/$HEAD_SHA failed"
 [ -n "$SINCE" ] || fail "no committer date for $HEAD_SHA"

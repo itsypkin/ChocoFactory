@@ -146,6 +146,12 @@ stages:
   # which is the move a reviewer who already wrote their prose reaches
   # for first.
   #
+  # A merged PR counts as approval (#102): the script prints `MERGED` and
+  # skips the comments, so a PR merged without a marker comment moves on
+  # at the next lap instead of polling until the timeout. Merged wins over
+  # a marker, since there is nothing left to revise once it has landed.
+  # A PR closed without merging is nothing new: polling continues.
+  #
   # Both halves of that bound are read the long way round on purpose.
   # `gh pr view --json commits,comments` caps each at the first 100 with
   # no pagination, so on a long PR `.commits | last` is not the head (a
@@ -199,6 +205,8 @@ stages:
       - match: '\AREQUEST_CHANGES(\n|$)'
         then: changes_requested
       - match: '\AAPPROVE(\n|$)'
+        then: approved
+      - match: '\AMERGED(\n|$)'
         then: approved
     on:
       approved: done
