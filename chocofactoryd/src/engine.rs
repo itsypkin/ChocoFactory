@@ -13106,6 +13106,51 @@ stages:
         );
     }
 
+    #[tokio::test]
+    async fn done_leaves_the_branch_and_says_so_when_the_worktree_removal_fails() {
+        let (_root, repo) = repo_with_origin().await;
+        let pool = connect_in_memory().await.unwrap();
+        // The stage locks its own worktree, so `worktree remove --force`
+        // at the terminal stage fails.
+        let yaml = format!(
+            r#"
+name: branch-done-locked
+worktree: true
+stages:
+  run:
+    kind: shell
+    command: {cmd:?}
+    on: {{ done: finished, error: failed }}
+  finished:
+    kind: terminal
+  failed:
+    kind: human_gate
+    on: {{ resumed: finished }}
+"#,
+            cmd = format!("{COMMIT} && git worktree lock .")
+        );
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, Path::new(".")).unwrap());
+        let task_id = seed_task_in(&pool, &def.name, &repo).await;
+        let engine = engine_with_adapter(pool.clone(), "unused");
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        wait_until_task_status(&pool, &task_id, "closed").await;
+        crate::test_support::wait_until("a kept note", || async {
+            if branch_events(&pool, &task_id).await.is_empty() {
+                Err("no note yet".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        let path = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
+        assert!(path.exists());
+        assert!(branch_exists_in(&repo, &task_id).await);
+        let notes = branch_events(&pool, &task_id).await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0]["action"], "kept");
+        assert_eq!(notes[0]["reason"], "worktree removal failed");
+    }
+
     /// A worktree task parked at a human gate, with a commit
     /// on its branch (pushed iff `push`). Returns what the tests inspect.
     async fn cancellable_worktree_task(

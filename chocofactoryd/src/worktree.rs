@@ -1270,6 +1270,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_present_errors_when_git_cannot_answer() {
+        let root = tempdir();
+        // Not a repository: `show-ref` exits 128, which is not "absent".
+        let err = branch_present(&root, "task/task-1").await.unwrap_err();
+        assert!(matches!(err, WorktreeError::GitFailed { .. }), "{err:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn delete_branch_refuses_while_the_worktree_exists() {
         let root = tempdir();
         let (repo, wt, _tip) = repo_with_origin_and_task(&root, "task-1").await;
