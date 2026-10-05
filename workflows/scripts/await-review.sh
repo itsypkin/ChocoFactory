@@ -99,6 +99,8 @@ gh api --paginate "$URL" -q "$RENDER" > "$TMP/rendered" ||
 # The engine stores a capture only up to 1 MiB; over that, the previous
 # lap's capture would survive and be read as current. Cap well under it.
 MAX=500000
+# Built in a file and printed only at the end: the poll matches outcomes on
+# stdout whatever the exit code, so a failure part-way must print nothing.
 {
     printf '%s\n\n' "$V"
     if [ "$(wc -c < "$TMP/rendered")" -gt "$MAX" ]; then
@@ -120,4 +122,5 @@ MAX=500000
     else
         cat "$TMP/rendered"
     fi
-}
+} > "$TMP/out"
+cat "$TMP/out"

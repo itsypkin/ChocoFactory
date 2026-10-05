@@ -543,6 +543,25 @@ fn an_oversized_rendering_is_truncated_well_under_the_capture_limit() {
     assert!(out.contains("[truncated"), "no truncation note");
 }
 
+/// A failure while building a truncated capture must not leave a verdict on
+/// stdout: the poll matches outcomes on stdout whatever the exit code.
+#[test]
+fn a_failure_mid_truncation_prints_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let big = "x".repeat(60_000);
+    let mut cs: Vec<String> = (0..12)
+        .map(|_| comment(FRESH, "OWNER", Some("me"), &big))
+        .collect();
+    cs.push(comment(LATER, "OWNER", Some("me"), "/request-changes"));
+    let fx = Fixture::new(SINCE, &[list(&cs)]);
+    let sed = fx.dir.join("sed");
+    fs::write(&sed, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&sed, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = fx.run();
+    assert!(!out.status.success(), "a failing sed must fail the script");
+    assert!(out.stdout.is_empty(), "no partial verdict on stdout");
+}
+
 /// Truncation keeps the newest comments: the latest findings must survive.
 #[test]
 fn truncation_keeps_the_newest_comments() {
