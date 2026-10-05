@@ -17145,11 +17145,18 @@ stages:
             .await
             .unwrap();
         tasks::mark_stuck(&pool, &task_id, "x").await.unwrap();
+        let entered_before = state_of(&pool, &task_id).await.stage_entered_at;
+        assert!(entered_before.is_some());
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
         engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
         wait_for_poll_attempt(&pool, &task_id).await;
         let state = state_of(&pool, &task_id).await;
         assert_eq!(state.current_stage, "watch");
+        // #164: this retry rewrites the payload (fresh window) through
+        // `workflow_state::update`, which must not re-stamp the entry time.
+        assert_eq!(state.stage_entered_at, entered_before);
+        assert!(state.updated_at > state.stage_entered_at.unwrap());
         assert_eq!(state.loop_counters, counters);
         assert_eq!(
             state.payload["arrival"],

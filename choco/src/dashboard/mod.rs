@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyEvent};
+use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -31,6 +31,8 @@ use crate::cli::DashboardArgs;
 use crate::client::Client;
 use app::{ActionKind, ActionOk, App, Effect, ListResult, Msg, Scope, SocketMsg, update};
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What the loop needs besides the app and the keys.
 pub struct LoopConfig {
     /// How often to redraw (the timers count between polls).
@@ -38,6 +40,9 @@ pub struct LoopConfig {
     pub closed: usize,
     /// `Some` in one-project mode.
     pub project_id: Option<String>,
+    /// Longest any one request may take before it is reported as failed
+    /// (a hung daemon must never freeze the board or swallow an action).
+    pub timeout: Duration,
 }
 
 pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
@@ -66,6 +71,7 @@ pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
         tick: Duration::from_secs(1),
         closed: args.closed,
         project_id,
+        timeout: REQUEST_TIMEOUT,
     };
 
     let mut terminal = match enter_terminal() {
@@ -185,10 +191,29 @@ pub async fn run_loop<B: Backend>(
     // projects) and both lists.
     // A failure leaves the header on `daemon ?`; the list fetch below
     // reports an unreachable daemon on the status line.
-    if let Ok(status) = client.server_status(Duration::from_secs(5)).await {
-        app.daemon_version = Some(status.version);
-    }
-    let first = fetch(&client, config, app.all_projects()).await;
+    // Keys stay live meanwhile: with a hung daemon the user can still quit.
+    let first = {
+        let startup = async {
+            if let Ok(status) = client
+                .server_status(config.timeout.min(Duration::from_secs(5)))
+                .await
+            {
+                app.daemon_version = Some(status.version);
+            }
+            fetch_bounded(&client, config, app.all_projects()).await
+        };
+        tokio::pin!(startup);
+        loop {
+            tokio::select! {
+                first = &mut startup => break first,
+                key = keys.recv() => match key {
+                    Some(k) if is_quit(k) => return Ok(()),
+                    Some(_) => {}
+                    None => return Ok(()),
+                },
+            }
+        }
+    };
     for effect in update(app, Msg::List(Box::new(first))) {
         if run_effect(effect, &client, config, &tx, &mut socket) {
             abort(&mut socket);
@@ -218,6 +243,28 @@ pub async fn run_loop<B: Backend>(
     }
     abort(&mut socket);
     Ok(())
+}
+
+fn is_quit(key: KeyEvent) -> bool {
+    use ratatui::crossterm::event::KeyModifiers;
+    key.kind != ratatui::crossterm::event::KeyEventKind::Release
+        && (key.code == KeyCode::Char('q')
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
+}
+
+fn timed_out() -> String {
+    "request timed out".to_string()
+}
+
+async fn fetch_bounded(client: &Client, config: &LoopConfig, projects: bool) -> ListResult {
+    tokio::time::timeout(config.timeout, fetch(client, config, projects))
+        .await
+        .unwrap_or_else(|_| ListResult {
+            at: Utc::now(),
+            active: Err(timed_out()),
+            closed: Err(timed_out()),
+            projects: None,
+        })
 }
 
 fn draw<B: Backend>(
@@ -250,42 +297,39 @@ fn run_effect(
         Effect::Quit => return true,
         Effect::Fetch { projects } => {
             let (client, tx) = (Arc::clone(client), tx.clone());
-            let (closed, project_id) = (config.closed, config.project_id.clone());
+            let (closed, project_id, timeout) =
+                (config.closed, config.project_id.clone(), config.timeout);
             tokio::spawn(async move {
                 let cfg = LoopConfig {
                     tick: Duration::ZERO,
                     closed,
                     project_id,
+                    timeout,
                 };
-                // A hung daemon must not freeze polling forever.
-                let result =
-                    tokio::time::timeout(Duration::from_secs(30), fetch(&client, &cfg, projects))
-                        .await
-                        .unwrap_or_else(|_| ListResult {
-                            at: Utc::now(),
-                            active: Err("request timed out".into()),
-                            closed: Err("request timed out".into()),
-                            projects: None,
-                        });
+                let result = fetch_bounded(&client, &cfg, projects).await;
                 let _ = tx.send(Msg::List(Box::new(result)));
             });
         }
         Effect::FetchDetail(id) => {
             let (client, tx) = (Arc::clone(client), tx.clone());
+            let timeout = config.timeout;
             tokio::spawn(async move {
-                let result = client.get_task(&id).await.map_err(|e| e.to_string());
+                let result = tokio::time::timeout(timeout, client.get_task(&id))
+                    .await
+                    .map_err(|_| timed_out())
+                    .and_then(|r| r.map_err(|e| e.to_string()));
                 let _ = tx.send(Msg::Detail { id, result });
             });
         }
         Effect::Cancel(id) => {
             let (client, tx) = (Arc::clone(client), tx.clone());
+            let timeout = config.timeout;
             tokio::spawn(async move {
                 // Never `--keep`: keeping work is a CLI-only handover.
-                let result = client
-                    .cancel_task(&id, false)
+                let result = tokio::time::timeout(timeout, client.cancel_task(&id, false))
                     .await
-                    .map(|()| ActionOk::Cancelled)
-                    .map_err(|e| e.to_string());
+                    .map_err(|_| timed_out())
+                    .and_then(|r| r.map(|()| ActionOk::Cancelled).map_err(|e| e.to_string()));
                 let _ = tx.send(Msg::Action {
                     kind: ActionKind::Cancel,
                     id,
@@ -295,12 +339,12 @@ fn run_effect(
         }
         Effect::Retry(id) => {
             let (client, tx) = (Arc::clone(client), tx.clone());
+            let timeout = config.timeout;
             tokio::spawn(async move {
-                let result = client
-                    .retry_task(&id, RetryMode::Auto)
+                let result = tokio::time::timeout(timeout, client.retry_task(&id, RetryMode::Auto))
                     .await
-                    .map(ActionOk::Retried)
-                    .map_err(|e| e.to_string());
+                    .map_err(|_| timed_out())
+                    .and_then(|r| r.map(ActionOk::Retried).map_err(|e| e.to_string()));
                 let _ = tx.send(Msg::Action {
                     kind: ActionKind::Retry,
                     id,
@@ -326,12 +370,21 @@ fn run_effect(
 async fn fetch(client: &Client, config: &LoopConfig, projects: bool) -> ListResult {
     let pid = config.project_id.as_deref();
     let active = client.list_task_summaries(pid, "open,stuck", None, None);
-    let closed = client.list_task_summaries(
-        pid,
-        "closed,cancelled",
-        Some("updated_desc"),
-        Some(config.closed.max(1)),
-    );
+    // `--closed 0` shows no closed section rows: skip the request.
+    let closed = async {
+        if config.closed == 0 {
+            Ok(Vec::new())
+        } else {
+            client
+                .list_task_summaries(
+                    pid,
+                    "closed,cancelled",
+                    Some("updated_desc"),
+                    Some(config.closed),
+                )
+                .await
+        }
+    };
     let names = async {
         if projects {
             Some(client.list_projects().await.map_err(|e| e.to_string()))
@@ -379,6 +432,7 @@ fn open_url(url: String, tx: &mpsc::UnboundedSender<Msg>) {
 /// Streams a task's last 200 events, reconnecting with a 1 s to 5 s backoff.
 async fn follow_events(base_url: String, id: String, tx: mpsc::UnboundedSender<Msg>) {
     let ws_base = match base_url.split_once("://") {
+        Some(("https", rest)) => format!("wss://{rest}"),
         Some((_, rest)) => format!("ws://{rest}"),
         None => format!("ws://{base_url}"),
     };

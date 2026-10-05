@@ -303,7 +303,8 @@ INSERT INTO events (id, task_id, session_id, event_type, payload, created_at) VA
     ('e2', 't1', NULL, 'stage_entered', '{"stage":"coding"}', '2026-01-01T00:00:02+00:00'),
     ('e3', 't1', NULL, 'stage_entered', '{"stage":"review"}', '2026-01-01T00:00:03.250+00:00'),
     ('e4', 't1', NULL, 'stage_entered', '{"stage":"review"}', '2026-01-01T00:00:03+00:00'),
-    ('e5', 't1', NULL, 'stage_entered', '{"stage":"coding"}', '2026-01-01T00:00:09+00:00');
+    ('e5', 't1', NULL, 'stage_entered', '{"stage":"coding"}', '2026-01-01T00:00:09+00:00'),
+    ('e6', 't1', NULL, 'stage_entered', '{"stage":"review","outcome":"retry"}', '2026-01-01T00:00:08+00:00');
 INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, updated_at)
     VALUES ('t1', 'review', '{}', '{}', '2026-01-01T00:00:10+00:00'),
            ('t2', 'review', '{}', '{}', '2026-01-01T00:00:10+00:00');

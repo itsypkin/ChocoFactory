@@ -977,6 +977,7 @@ async fn the_real_loop_against_a_fake_daemon() {
         tick: Duration::from_millis(50),
         closed: 10,
         project_id: None,
+        timeout: Duration::from_secs(30),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1051,6 +1052,7 @@ async fn an_unreachable_daemon_shows_the_error_and_the_loop_still_quits() {
         tick: Duration::from_millis(50),
         closed: 10,
         project_id: None,
+        timeout: Duration::from_secs(30),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1072,5 +1074,190 @@ async fn an_unreachable_daemon_shows_the_error_and_the_loop_still_quits() {
         &mut on_frame,
     );
     let (result, ()) = tokio::join!(run, driver);
+    result.unwrap();
+}
+
+#[test]
+fn a_failed_cancel_shows_the_daemons_error_and_does_not_refresh() {
+    let mut app = board();
+    let effects = update(
+        &mut app,
+        Msg::Action {
+            kind: ActionKind::Cancel,
+            id: "x".into(),
+            result: Err("409 task is closed".into()),
+        },
+    );
+    assert!(effects.is_empty());
+    let s = app.status.as_ref().unwrap();
+    assert_eq!(s.level, Level::Error);
+    assert_eq!(s.text, "cancel failed: 409 task is closed");
+}
+
+#[test]
+fn a_failed_open_shows_the_error_and_the_url() {
+    let mut app = board();
+    let effects = update(
+        &mut app,
+        Msg::OpenFailed {
+            url: "https://github.com/o/r/pull/9".into(),
+            error: "no such file".into(),
+        },
+    );
+    assert!(effects.is_empty());
+    let s = app.status.as_ref().unwrap();
+    assert_eq!(s.level, Level::Error);
+    assert!(s.text.contains("no such file") && s.text.contains("/pull/9"));
+}
+
+#[test]
+fn cancel_on_a_closed_task_says_why_and_opens_no_prompt() {
+    let mut app = new_app(Scope::AllProjects);
+    load(
+        &mut app,
+        vec![],
+        vec![summary("cccc3333-0", "Old", "closed", None, None, "p")],
+    );
+    let effects = ch(&mut app, 'c');
+    assert!(effects.is_empty());
+    assert!(app.prompt.is_none());
+    assert_eq!(
+        app.status.as_ref().unwrap().text,
+        "cancel: task is closed, not open or stuck"
+    );
+}
+
+#[test]
+fn a_half_failed_poll_keeps_the_rows_and_reports_the_error() {
+    let mut app = board();
+    let before = app.active.len();
+    let closed_before = app.closed.len();
+    update(
+        &mut app,
+        Msg::List(Box::new(ListResult {
+            at: now(),
+            active: Ok(vec![]),
+            closed: Err("boom".into()),
+            projects: None,
+        })),
+    );
+    assert_eq!(app.active.len(), before);
+    assert_eq!(app.closed.len(), closed_before);
+    assert!(render(&app, 120, 30).contains("daemon unreachable: boom"));
+}
+
+#[test]
+fn a_poll_error_is_not_hidden_by_an_info_status() {
+    let mut app = board();
+    update(
+        &mut app,
+        Msg::Action {
+            kind: ActionKind::Cancel,
+            id: "bbbb2222-0".into(),
+            result: Ok(ActionOk::Cancelled),
+        },
+    );
+    update(
+        &mut app,
+        Msg::List(Box::new(ListResult {
+            at: now(),
+            active: Err("refused".into()),
+            closed: Err("refused".into()),
+            projects: None,
+        })),
+    );
+    assert!(render(&app, 120, 30).contains("daemon unreachable: refused"));
+}
+
+#[test]
+fn a_version_mismatch_is_marked_in_the_header() {
+    let mut app = board();
+    app.daemon_version = Some("0.0.1-other".into());
+    let s = render(&app, 120, 30);
+    assert!(
+        s.contains(&format!(
+            "daemon 0.0.1-other (choco {})",
+            chocofactory_core::version::VERSION
+        )),
+        "{s}"
+    );
+}
+
+/// A daemon that accepts connections and never answers.
+async fn hung_daemon() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn a_hung_daemon_does_not_stop_the_first_load_from_quitting() {
+    let client = Arc::new(Client::new(hung_daemon().await).without_version_check());
+    let mut app = new_app(Scope::AllProjects);
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout: Duration::from_secs(30),
+    };
+    let (ktx, mut krx) = mpsc::unbounded_channel();
+    ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    let mut on_frame = |_: &Buffer| {};
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_loop(
+            &mut terminal,
+            &mut app,
+            client,
+            &config,
+            &mut krx,
+            &mut on_frame,
+        ),
+    )
+    .await
+    .expect("q must quit while the first load hangs");
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn a_request_that_times_out_is_shown_as_unreachable() {
+    let client = Arc::new(Client::new(hung_daemon().await).without_version_check());
+    let mut app = new_app(Scope::AllProjects);
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout: Duration::from_millis(300),
+    };
+    let (ktx, mut krx) = mpsc::unbounded_channel();
+    let latest = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&latest);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    let driver = async {
+        wait_for(&latest, "daemon unreachable: request timed out").await;
+        ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+    };
+    let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let run = run_loop(
+        &mut terminal,
+        &mut app,
+        client,
+        &config,
+        &mut krx,
+        &mut on_frame,
+    );
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(run, driver) })
+            .await
+            .expect("the loop should report the timeout and quit");
     result.unwrap();
 }

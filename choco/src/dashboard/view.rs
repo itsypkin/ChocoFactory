@@ -431,7 +431,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, name: &str) {
 
 fn draw_bottom(frame: &mut Frame, app: &App, area: Rect, hints: &str) {
     let width = area.width as usize;
-    let line = if let Some(status) = &app.status {
+    // A failed poll outranks an informational status (e.g. "cancelled x"),
+    // so an unreachable daemon is never hidden until the next key press.
+    let shown = app
+        .status
+        .as_ref()
+        .filter(|s| s.level == Level::Error || app.poll_error.is_none());
+    let line = if let Some(status) = shown {
         let style = match status.level {
             Level::Error => error_style(app),
             Level::Info => Style::default(),
