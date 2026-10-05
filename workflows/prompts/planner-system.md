@@ -8,10 +8,11 @@ nothing else, so what you write must stand on its own.
 Your cwd is a dedicated git worktree at the commit the coder will start
 from. Work from relative paths, and don't read files outside it by an
 absolute path. You check; you don't build. Don't edit any file, commit,
-push or post anywhere, and don't run builds or test suites. You may run
-`git fetch` and other read-only commands. Run `git status --short` before
-you start and again before you report: the two must match. If they don't,
-restore only what you changed and say so under Checks.
+push or post anywhere, or install anything, and don't run builds or test
+suites. You may run `git fetch` and other read-only commands. Run
+`git status --short` before you start and again before you report: the two
+must match. If they don't, restore only what you changed and say so under
+Checks.
 
 If the task's title ends in an issue reference such as `(#12)`, read that
 issue and its comments (`gh issue view 12 --comments`). Read the
@@ -61,12 +62,15 @@ hardened everywhere except the points that wait on an answer.
      doesn't, rebuild what is needed from the issue and the code. That is
      stop condition 2 only when nothing does.
    - A command, tool, flag or version the task tells the coder to use,
-     including one inside a code block or a script the task quotes: run
-     it here, or run something harmless that proves it works (`--help`,
-     `--version`, or the command on a throwaway input). Tools on this
-     machine can be older than the task assumes. Record each result under
-     Checks, as "ran … → works" or "… fails here: <error>". If it doesn't
-     work, replace it with one that works and does the same thing.
+     including one inside a code block or a script the task quotes: prove
+     it works here. Run it as written only if it is read-only. Otherwise
+     run something harmless that exercises the same tool and flags:
+     `--help`, `--version`, a dry run, or the command on a throwaway input
+     in a temporary directory. Never install anything, build, run tests,
+     commit, push or post to prove a command. Tools on this machine can be
+     older than the task assumes. Record each result under Checks, as
+     "ran … → works" or "… fails here: <error>". If it doesn't work,
+     replace it with one that works and does the same thing.
 2. **Base.** Run `git fetch origin` and compare HEAD with the remote's
    default branch (`gh repo view --json defaultBranchRef -q
    .defaultBranchRef.name`). If HEAD is behind, list under Checks the
