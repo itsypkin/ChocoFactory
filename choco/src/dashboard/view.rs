@@ -149,64 +149,131 @@ enum Key {
 
 struct Col {
     key: Key,
-    /// `None` is a flexible column.
-    w: Option<usize>,
+    w: usize,
 }
 
-fn columns(section: Section, cols: Cols, project_w: usize) -> Vec<Col> {
-    let c = |key, w| Col { key, w };
-    let mut v = vec![c(Key::Id, Some(8))];
-    if cols.project {
-        v.push(c(Key::Project, Some(project_w)));
+/// The widths of the whole board's columns, computed once from every row so
+/// each section lines up with the others.
+struct Grid {
+    cols: Cols,
+    project_w: usize,
+    stage_w: usize,
+    /// Left after every other column; titles are cut first.
+    title_w: usize,
+}
+
+const ID_W: usize = 8;
+const PR_W: usize = 6;
+const TIME_W: usize = 9;
+const LAPS_W: usize = 5;
+/// Project and stage shrink before the title drops below this.
+const TITLE_MIN: usize = 20;
+
+fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid {
+    let cols = cols_for(app, width as u16);
+    let mut project_w = if cols.project {
+        sections
+            .iter()
+            .flatten()
+            .map(|t| app.project_label(&t.task.project_id).chars().count())
+            .max()
+            .unwrap_or(7)
+            .clamp(7, 14)
+    } else {
+        0
+    };
+    let mut stage_w = if cols.stage {
+        sections
+            .iter()
+            .zip(Section::ALL)
+            .flat_map(|(ts, s)| ts.iter().map(move |t| (s, t)))
+            .filter_map(|(s, t)| match s {
+                Section::NeedsYou | Section::InProgress => {
+                    Some(t.current_stage.as_deref().unwrap_or("-").chars().count())
+                }
+                Section::Closed => Some(t.task.status.chars().count()),
+                Section::Stuck => None,
+            })
+            .max()
+            .unwrap_or(5)
+            .clamp(6, 22)
+    } else {
+        0
+    };
+    let mut fixed_cols = vec![ID_W, TIME_W];
+    fixed_cols.extend([PR_W].into_iter().filter(|_| cols.pr));
+    fixed_cols.extend([LAPS_W].into_iter().filter(|_| cols.laps));
+    let n = fixed_cols.len() + 1 + usize::from(cols.project) + usize::from(cols.stage);
+    let rest = |project_w: usize, stage_w: usize| {
+        let used: usize = fixed_cols.iter().sum::<usize>() + project_w + stage_w + (n - 1) * 2;
+        width.saturating_sub(2 + used)
+    };
+    // Shrink the project column, then the stage column, before the title.
+    let mut title_w = rest(project_w, stage_w);
+    if title_w < TITLE_MIN && cols.project {
+        let give = (TITLE_MIN - title_w).min(project_w.saturating_sub(7));
+        project_w -= give;
+        title_w = rest(project_w, stage_w);
     }
-    v.push(c(Key::Title, None));
+    if title_w < TITLE_MIN && cols.stage {
+        let give = (TITLE_MIN - title_w).min(stage_w.saturating_sub(8));
+        stage_w -= give;
+        title_w = rest(project_w, stage_w);
+    }
+    Grid {
+        cols,
+        project_w,
+        stage_w,
+        title_w,
+    }
+}
+
+/// The columns of one section's rows. The id, project, title, PR, time and
+/// laps columns sit at the same place in every section; a stuck task's
+/// reason takes the stage and PR columns' room.
+fn columns(section: Section, g: &Grid) -> Vec<Col> {
+    let c = |key, w| Col { key, w };
+    let mut v = vec![c(Key::Id, ID_W)];
+    if g.cols.project {
+        v.push(c(Key::Project, g.project_w));
+    }
+    let mut title_w = g.title_w;
+    let mut mid = None;
+    let mut pr = g.cols.pr;
     match section {
         Section::NeedsYou | Section::InProgress => {
-            if cols.stage {
-                v.push(c(Key::Stage, Some(22)));
+            if g.cols.stage {
+                mid = Some(c(Key::Stage, g.stage_w));
             }
-            if cols.pr {
-                v.push(c(Key::Pr, Some(6)));
-            }
-            v.push(c(Key::Time, Some(8)));
-            if cols.laps && section == Section::InProgress {
-                v.push(c(Key::Laps, Some(5)));
+        }
+        Section::Closed => {
+            if g.cols.stage {
+                mid = Some(c(Key::Status, g.stage_w));
             }
         }
         Section::Stuck => {
-            v.push(c(Key::Reason, None));
-            v.push(c(Key::Time, Some(9)));
-        }
-        Section::Closed => {
-            v.push(c(Key::Status, Some(9)));
-            if cols.pr {
-                v.push(c(Key::Pr, Some(6)));
+            if g.cols.stage {
+                let w = g.stage_w + if pr { 2 + PR_W } else { 0 };
+                mid = Some(c(Key::Reason, w));
+                pr = false;
+            } else {
+                // Narrow: no stage column to borrow, so share the title's room.
+                let reason = (title_w.saturating_sub(2) / 2).min(24);
+                title_w -= reason + 2;
+                mid = Some(c(Key::Reason, reason));
             }
-            v.push(c(Key::Time, Some(10)));
         }
     }
+    v.push(c(Key::Title, title_w));
+    v.extend(mid);
+    if pr {
+        v.push(c(Key::Pr, PR_W));
+    }
+    v.push(c(Key::Time, TIME_W));
+    if g.cols.laps {
+        v.push(c(Key::Laps, LAPS_W));
+    }
     v
-}
-
-/// Resolves flexible widths for a `width`-wide line with a 2-char prefix.
-fn widths(cols: &[Col], width: usize) -> Vec<usize> {
-    let gaps = cols.len().saturating_sub(1) * 2;
-    let fixed: usize = cols.iter().filter_map(|c| c.w).sum();
-    let flex_cols = cols.iter().filter(|c| c.w.is_none()).count().max(1);
-    let flex = width.saturating_sub(2 + fixed + gaps);
-    let mut flex_left = flex;
-    let mut remaining = flex_cols;
-    cols.iter()
-        .map(|c| match c.w {
-            Some(w) => w,
-            None => {
-                let share = flex_left / remaining;
-                flex_left -= share;
-                remaining -= 1;
-                share
-            }
-        })
-        .collect()
 }
 
 fn cell(app: &App, section: Section, t: &TaskSummary, key: Key) -> String {
@@ -234,47 +301,71 @@ fn cell(app: &App, section: Section, t: &TaskSummary, key: Key) -> String {
     }
 }
 
-fn label(section: Section, key: Key) -> &'static str {
-    match (section, key) {
-        (_, Key::Stage) => "stage",
-        (_, Key::Pr) => "PR",
-        (_, Key::Laps) => "laps",
-        (_, Key::Reason) => "reason",
-        (_, Key::Status) => "status",
-        (_, Key::Project) => "project",
-        (Section::NeedsYou, Key::Time) => "waiting",
-        (Section::InProgress, Key::Time) => "in stage",
-        (Section::Stuck, Key::Time) => "stuck for",
-        (Section::Closed, Key::Time) => "closed",
-        _ => "",
-    }
-}
-
-fn task_line(app: &App, section: Section, t: &TaskSummary, cols: &[Col], ws: &[usize]) -> String {
+fn task_line(app: &App, section: Section, t: &TaskSummary, cols: &[Col]) -> String {
     let mut out = String::new();
-    for (i, (col, w)) in cols.iter().zip(ws).enumerate() {
+    for (i, col) in cols.iter().enumerate() {
         if i > 0 {
             out.push_str("  ");
         }
-        out.push_str(&pad(&cell(app, section, t, col.key), *w));
+        let text = if col.key == Key::Laps && section != Section::InProgress {
+            String::new()
+        } else {
+            cell(app, section, t, col.key)
+        };
+        out.push_str(&pad(&text, col.w));
     }
     out.trim_end().to_string()
 }
 
-fn header_line(section: Section, count: usize, cols: &[Col], ws: &[usize]) -> String {
+/// The column headings, once for the whole board.
+fn heading_line(g: &Grid) -> String {
+    // Any non-stuck section has the full set of columns.
+    let cols = columns(Section::NeedsYou, g);
+    let mut out = String::new();
+    for (i, col) in cols.iter().enumerate() {
+        if i > 0 {
+            out.push_str("  ");
+        }
+        let text = match col.key {
+            Key::Id => "id",
+            Key::Project => "project",
+            Key::Title => "title",
+            Key::Stage => "stage",
+            Key::Pr => "PR",
+            Key::Laps => "laps",
+            _ => "",
+        };
+        out.push_str(&pad(text, col.w));
+    }
+    out.trim_end().to_string()
+}
+
+/// The section's title on its own; the labels that only apply to this
+/// section sit at their columns, and only where they clear the title.
+fn header_line(section: Section, count: usize, cols: &[Col]) -> String {
     let title = format!("{} ({count})", section.title());
     let mut line: Vec<char> = title.chars().collect();
     let mut x = 2;
-    for (i, (col, w)) in cols.iter().zip(ws).enumerate() {
+    for (i, col) in cols.iter().enumerate() {
         if i > 0 {
             x += 2;
         }
-        if !matches!(col.key, Key::Id | Key::Title) && x >= line.len() + 2 {
-            let text = fit(label(section, col.key), *w);
+        let text = match col.key {
+            Key::Reason => "reason",
+            Key::Status => "status",
+            Key::Time => match section {
+                Section::NeedsYou => "waiting",
+                Section::InProgress => "in stage",
+                Section::Stuck => "stuck for",
+                Section::Closed => "closed",
+            },
+            _ => "",
+        };
+        if !text.is_empty() && x >= line.len() + 2 {
             line.resize(x, ' ');
-            line.extend(text.chars());
+            line.extend(fit(text, col.w).chars());
         }
-        x += w;
+        x += col.w;
     }
     line.into_iter().collect()
 }
@@ -286,7 +377,7 @@ enum Row<'a> {
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
-    let list_area = Rect::new(area.x, area.y + 1, area.width, area.height - 2);
+    let list_area = Rect::new(area.x, area.y + 2, area.width, area.height - 3);
 
     draw_header(
         frame,
@@ -296,18 +387,14 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let sections = app.sections();
-    let cols = cols_for(app, area.width);
-    let project_w = if cols.project {
-        sections
-            .iter()
-            .flatten()
-            .map(|t| app.project_label(&t.task.project_id).chars().count())
-            .max()
-            .unwrap_or(7)
-            .clamp(7, 14)
-    } else {
-        0
-    };
+    let grid = grid_for(app, &sections, width);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            fit(&format!("  {}", heading_line(&grid)), width),
+            colored(app, Color::DarkGray),
+        )),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
 
     let mut rows: Vec<Row> = Vec::new();
     for (s, tasks) in Section::ALL.iter().zip(&sections) {
@@ -343,18 +430,16 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .take(h)
         .map(|row| match row {
             Row::Header(s, n) => {
-                let c = columns(*s, cols, project_w);
-                let ws = widths(&c, width);
-                Line::styled(header_line(*s, *n, &c, &ws), section_style(app, *s))
+                let c = columns(*s, &grid);
+                Line::styled(header_line(*s, *n, &c), section_style(app, *s))
             }
             Row::Task(s, t) => {
-                let c = columns(*s, cols, project_w);
-                let ws = widths(&c, width);
+                let c = columns(*s, &grid);
                 let selected = Some(&t.task.id) == app.selected.as_ref();
                 let text = format!(
                     "{}{}",
                     if selected { "▶ " } else { "  " },
-                    task_line(app, *s, t, &c, &ws)
+                    task_line(app, *s, t, &c)
                 );
                 let style = if selected {
                     Style::default().add_modifier(Modifier::REVERSED)

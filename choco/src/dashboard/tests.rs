@@ -529,8 +529,23 @@ fn medium_screen_drops_pr_and_laps() {
     let s = render(&app, 70, 20);
     assert!(!s.contains("#171"), "{s}");
     assert!(!s.contains("×2"), "{s}");
-    assert!(s.contains("awaiting_human_review"), "{s}");
-    assert!(s.contains("chocofactory"), "{s}");
+    // One grid: project and stage shrink (cut with `…`) before titles do,
+    // and every section's rows share the same columns.
+    assert!(s.contains("project"), "{s}");
+    assert!(s.contains("awaiting_hum"), "{s}");
+    assert!(s.contains("chocof…"), "{s}");
+    assert!(s.contains("Interactive termina"), "{s}");
+    let col = |needle: &str| {
+        s.lines()
+            .filter_map(|l| l.find(needle).map(|i| l[..i].chars().count()))
+            .collect::<Vec<_>>()
+    };
+    let title_cols: Vec<usize> = ["Interactive", "Checkout", "Per-kind", "Flaky", "Release"]
+        .iter()
+        .flat_map(|t| col(t))
+        .collect();
+    assert_eq!(title_cols.len(), 5, "{s}");
+    assert!(title_cols.windows(2).all(|w| w[0] == w[1]), "{s}");
 }
 
 #[test]
