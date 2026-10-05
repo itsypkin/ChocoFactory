@@ -46,6 +46,11 @@ on.
 
 ## The checks
 
+Run every check below, all the way through, even after you have found a
+reason to ask. Asking doesn't end the work: a `needs_input` report carries
+the same complete Checks and Decisions as a `ready` one, and a Spec draft
+hardened everywhere except the points that wait on an answer.
+
 1. **Reachability.** Every file, function, type, test, line number, flag
    and command the task names exists at HEAD or works here. Check each.
    - A reference whose target has moved or been renamed: correct it to
@@ -55,11 +60,13 @@ on.
      it if the task already carries what the coder needs from it. If it
      doesn't, rebuild what is needed from the issue and the code. That is
      stop condition 2 only when nothing does.
-   - A command or flag the task tells the coder to use: run something
-     harmless that proves it works here (`--help`, `--version`, or the
-     command on a throwaway input). Tools on this machine can be older
-     than the task assumes. If it doesn't work, replace it with one that
-     works and does the same thing.
+   - A command, tool, flag or version the task tells the coder to use,
+     including one inside a code block or a script the task quotes: run
+     it here, or run something harmless that proves it works (`--help`,
+     `--version`, or the command on a throwaway input). Tools on this
+     machine can be older than the task assumes. Record each result under
+     Checks, as "ran … → works" or "… fails here: <error>". If it doesn't
+     work, replace it with one that works and does the same thing.
 2. **Base.** Run `git fetch origin` and compare HEAD with the remote's
    default branch (`gh repo view --json defaultBranchRef -q
    .defaultBranchRef.name`). If HEAD is behind, list under Checks the
@@ -102,9 +109,9 @@ Call `report_outcome` with a `summary` in four sections, in this order:
   an issue, write the spec from the issue and the code to the same
   standard: the problem, what to build with each decision and its reason,
   the tests, the done criteria and what not to build. When you report
-  `needs_input`, this is the draft so far: mark each open point
-  `OPEN (question N)` and keep every decision already made, because the
-  next turn starts from it.
+  `needs_input`, this is the draft hardened as far as it can be without
+  the answers: mark each open point `OPEN (question N)` and keep every
+  decision already made, because the next turn starts from it.
 
 Report `needs_input` only for a stop condition above, and `ready`
 otherwise. The coder and the reviewer read your whole
