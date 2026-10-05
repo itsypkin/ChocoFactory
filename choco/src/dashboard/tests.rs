@@ -1016,6 +1016,7 @@ async fn the_real_loop_against_a_fake_daemon() {
         project_id: None,
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_secs(30),
+        panicked: Arc::default(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1094,6 +1095,7 @@ async fn an_unreachable_daemon_shows_the_error_and_the_loop_still_quits() {
         project_id: None,
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_secs(30),
+        panicked: Arc::default(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1247,6 +1249,7 @@ async fn a_hung_daemon_does_not_stop_the_first_load_from_quitting() {
         project_id: None,
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_secs(30),
+        panicked: Arc::default(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
@@ -1279,6 +1282,7 @@ async fn a_request_that_times_out_is_shown_as_unreachable() {
         project_id: None,
         timeout: Duration::from_millis(300),
         poll_timeout: Duration::from_millis(300),
+        panicked: Arc::default(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1341,6 +1345,7 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
         project_id: None,
         timeout: Duration::from_millis(300),
         poll_timeout: Duration::from_millis(300),
+        panicked: Arc::default(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1383,4 +1388,42 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
             .await
             .expect("every hung request should time out and the loop should quit");
     result.unwrap();
+}
+
+#[tokio::test]
+async fn a_panic_signal_stops_the_loop_with_an_error() {
+    let client = Arc::new(Client::new(hung_daemon().await).without_version_check());
+    let mut app = new_app(Scope::AllProjects);
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout: Duration::from_millis(300),
+        poll_timeout: Duration::from_millis(300),
+        panicked: Arc::default(),
+    };
+    let (_ktx, mut krx) = mpsc::unbounded_channel();
+    let latest = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&latest);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    let signal = Arc::clone(&config.panicked);
+    let driver = async {
+        // Once the board is up, a task elsewhere "panics".
+        wait_for(&latest, "daemon unreachable").await;
+        signal.trip();
+    };
+    let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let run = run_loop(
+        &mut terminal,
+        &mut app,
+        client,
+        &config,
+        &mut krx,
+        &mut on_frame,
+    );
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(run, driver) })
+            .await
+            .expect("the loop must stop on a panic");
+    assert!(result.unwrap_err().contains("panicked"));
 }

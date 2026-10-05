@@ -46,6 +46,34 @@ pub struct LoopConfig {
     /// Longest a list poll may take. At most the poll interval, so the outage banner's "retrying every <interval>" stays true
     /// even when the daemon accepts a connection and never answers.
     pub poll_timeout: Duration,
+    /// Tripped by the panic hook when any thread or task panics, so the loop
+    /// stops instead of drawing on a terminal the hook already restored.
+    pub panicked: Arc<PanicSignal>,
+}
+
+/// Set once from the panic hook; the loop watches it.
+#[derive(Default)]
+pub struct PanicSignal {
+    tripped: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl PanicSignal {
+    pub fn trip(&self) {
+        self.tripped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Stores a permit when nobody waits yet, so the wake-up is not lost.
+        self.wake.notify_one();
+    }
+
+    async fn tripped(&self) {
+        loop {
+            if self.tripped.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            self.wake.notified().await;
+        }
+    }
 }
 
 pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
@@ -76,6 +104,7 @@ pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
         project_id,
         timeout: REQUEST_TIMEOUT,
         poll_timeout: args.interval.duration.min(REQUEST_TIMEOUT),
+        panicked: Arc::new(PanicSignal::default()),
     };
 
     let mut terminal = match enter_terminal() {
@@ -85,7 +114,7 @@ pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let hook = install_panic_hook();
+    let hook = install_panic_hook(Arc::clone(&config.panicked));
     let mut keys = spawn_key_reader();
     let result = run_loop(
         &mut terminal,
@@ -147,12 +176,14 @@ fn restore_terminal() {
 }
 
 /// Restores the terminal before the panic message prints, so it lands on
-/// the normal screen instead of vanishing with the alternate one.
-fn install_panic_hook() -> PanicHook {
+/// the normal screen instead of vanishing with the alternate one. A panic on
+/// any thread also trips `signal`, which stops the loop.
+fn install_panic_hook(signal: Arc<PanicSignal>) -> PanicHook {
     let prev: PanicHook = Arc::from(std::panic::take_hook());
     let chained = Arc::clone(&prev);
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
+        signal.trip();
         chained(info);
     }));
     prev
@@ -210,6 +241,7 @@ pub async fn run_loop<B: Backend>(
         loop {
             tokio::select! {
                 first = &mut startup => break first,
+                () = config.panicked.tripped() => return Err(PANICKED.to_string()),
                 key = keys.recv() => match key {
                     Some(k) if is_quit(k) => return Ok(()),
                     Some(_) => {}
@@ -236,6 +268,10 @@ pub async fn run_loop<B: Backend>(
             },
             Some(msg) = rx.recv() => msg,
             _ = tick.tick() => Msg::Tick(Utc::now()),
+            () = config.panicked.tripped() => {
+                abort(&mut socket);
+                return Err(PANICKED.to_string());
+            }
         };
         for effect in update(app, msg) {
             if run_effect(effect, &client, config, &tx, &mut socket) {
@@ -248,6 +284,8 @@ pub async fn run_loop<B: Backend>(
     abort(&mut socket);
     Ok(())
 }
+
+const PANICKED: &str = "stopped because a background task panicked (see the panic message above)";
 
 fn is_quit(key: KeyEvent) -> bool {
     use ratatui::crossterm::event::KeyModifiers;
@@ -314,6 +352,7 @@ fn run_effect(
                     project_id,
                     timeout,
                     poll_timeout,
+                    panicked: Arc::default(),
                 };
                 let result = fetch_bounded(&client, &cfg, projects).await;
                 let _ = tx.send(Msg::List(Box::new(result)));
