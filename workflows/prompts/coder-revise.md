@@ -13,9 +13,10 @@ follow that entry:
   rejected your last commit. Its summary is quoted below under "Internal
   reviewer's summary", and it is current. Address every finding in it.
   If "The human's review" below has content, it is from an earlier lap and
-  already addressed on this branch: don't redo it, and don't undo it. If a
-  finding would undo a change the human asked for, keep the human's change
-  and say so in your summary.
+  already handled on this branch: each item was either done or declined
+  with a reason. Don't redo it, don't take up a declined item, and don't
+  undo it. If a finding would undo a change the human asked for, keep the
+  human's change and say so in your summary.
 - **`awaiting_human_review` → `changes_requested`**: a human asked for
   changes on the open PR. Their comments are quoted below under "The
   human's review", and that section is current. Address every item in it,
@@ -38,8 +39,8 @@ follow that entry:
   (`gh run view <run-id> --log-failed`) and fix the cause. The internal
   reviewer's summary below is **not** the reason.
   If "The human's review" below has content, it is from an earlier lap and
-  already addressed on this branch: fix the failure without undoing the
-  human's change. If the only fix would undo it, say so in your summary.
+  already handled on this branch (each item done or declined with a
+  reason): fix the failure without undoing the human's change. If the only fix would undo it, say so in your summary.
 - **`escalate_to_human` → `resumed`**: a human stepped in after the task was
   escalated. Their note is quoted below under "A human's note", and it is
   current. Follow it. If this branch has an open PR, also read everything on
@@ -65,7 +66,8 @@ accounts with write access, newer than your last commit, oldest first, and
 its first line is the verdict token. On the `escalate_to_human` path it is
 context: when the escalation came from the review loop guard, it is the
 review that tripped it. On any other path it is from an earlier lap and
-already addressed on this branch: don't redo it, and don't undo it.
+already handled on this branch (each item done or declined with a reason):
+don't redo it, and don't undo it.
 
 {{ stages.awaiting_human_review }}
 

@@ -935,7 +935,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &entry,
             &[
                 "and it is current. Address every finding in it.",
-                "If \"The human's review\" below has content, it is from an earlier lap and already addressed on this branch: don't redo it, and don't undo it. If a finding would undo a change the human asked for, keep the human's change and say so in your summary.",
+                "If \"The human's review\" below has content, it is from an earlier lap and already handled on this branch: each item was either done or declined with a reason. Don't redo it, don't take up a declined item, and don't undo it. If a finding would undo a change the human asked for, keep the human's change and say so in your summary.",
             ],
             "the internal_review entry names its own section as current and the human's review as handled",
         );
@@ -944,12 +944,12 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             &squash(&rendered[human_heading..reviewer_heading]),
             &[HUMAN_LABEL_OTHER_PATHS],
-            "the human's review label must say it is already addressed here",
+            "the human's review label must say it is already handled here",
         );
     }
 
     /// The label's wording for every path but the two that use the review.
-    const HUMAN_LABEL_OTHER_PATHS: &str = "On any other path it is from an earlier lap and already addressed on this branch: don't redo it, and don't undo it.";
+    const HUMAN_LABEL_OTHER_PATHS: &str = "On any other path it is from an earlier lap and already handled on this branch (each item done or declined with a reason): don't redo it, and don't undo it.";
 
     /// On the `checks_polling` → `red` path the human's review is likewise
     /// handled: CI must be fixed without undoing it.
@@ -964,7 +964,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             &entry,
             &[
-                "If \"The human's review\" below has content, it is from an earlier lap and already addressed on this branch: fix the failure without undoing the human's change. If the only fix would undo it, say so in your summary.",
+                "If \"The human's review\" below has content, it is from an earlier lap and already handled on this branch (each item done or declined with a reason): fix the failure without undoing the human's change. If the only fix would undo it, say so in your summary.",
             ],
             "the checks_polling entry says the human's review is handled",
         );
@@ -973,7 +973,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             &squash(&rendered[human_heading..reviewer_heading]),
             &[HUMAN_LABEL_OTHER_PATHS],
-            "the human's review label must say it is already addressed here",
+            "the human's review label must say it is already handled here",
         );
     }
 
