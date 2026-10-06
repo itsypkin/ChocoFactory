@@ -530,7 +530,7 @@ async fn follow_events(base_url: String, id: String, tx: mpsc::UnboundedSender<M
             }
             while let Some(Ok(msg)) = ws.next().await {
                 if let WsMessage::Text(text) = msg
-                    && let Ok(event) = serde_json::from_str(&text.to_string())
+                    && let Ok(event) = serde_json::from_str(&text)
                     && !send(SocketMsg::Event(Box::new(event)))
                 {
                     return;
