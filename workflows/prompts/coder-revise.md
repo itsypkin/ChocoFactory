@@ -97,7 +97,9 @@ left over from an earlier escalation, so ignore it.
 ## When you're done
 
 Commit your revisions, and update the PR description file (step 4 of your
-instructions) so it describes the branch as it now stands. An empty commit
+instructions) so it describes the branch as it now stands.
+The self-check in step 2 of your instructions applies to every branch this
+lap added or changed, including new message text and new tests. An empty commit
 (`git commit --allow-empty -m "Update the PR description: <why>"`) is
 allowed only when every requested change is to the PR's description: the
 PR's review is read against the latest commit, and without a new one the

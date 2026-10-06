@@ -1615,4 +1615,128 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             from += found + name.len();
         }
     }
+
+    fn index_of(text: &str, needle: &str) -> usize {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("expected \"{needle}\" in:\n{text}"))
+    }
+
+    #[test]
+    fn coder_system_asks_for_the_self_check() {
+        let text = squash(embedded_prompt("coder-system.md"));
+        let checks = [
+            "break the line, run that one test, see it fail, restore the line",
+            "\"Hard to trigger\", \"documented\" and \"known gap\" are not reasons.",
+            "A blocking finding is fixed, not documented.",
+            "To dispute one, show it from the code.",
+            "A reviewer's suggested fix is a hint, not a spec.",
+        ];
+        assert_says(
+            &text,
+            &checks,
+            "coder-system.md must ask for the self-check",
+        );
+        let step2 = index_of(&text, "2. When you change code");
+        let step3 = index_of(&text, "3. Commit everything");
+        for c in checks {
+            let at = index_of(&text, c);
+            assert!(step2 < at && at < step3, "'{c}' must sit in step 2");
+        }
+        let step4 = index_of(&text, "4. Write the pull request's description");
+        let step5 = index_of(&text, "5. Call `report_outcome`");
+        let claims = [
+            "Don't claim a test pins something unless you ran that test against the broken code.",
+            "Don't call something untestable.",
+        ];
+        assert_says(&text, &claims, "coder-system.md step 4 must limit claims");
+        for c in claims {
+            let at = index_of(&text, c);
+            assert!(step4 < at && at < step5, "'{c}' must sit in step 4");
+        }
+    }
+
+    #[test]
+    fn coder_revise_applies_the_self_check_to_the_lap() {
+        let raw = embedded_prompt("coder-revise.md");
+        let done = &raw[raw.find("## When you're done").expect("section")..];
+        assert_says(
+            &squash(done),
+            &[
+                "The self-check in step 2 of your instructions applies to every branch this lap \
+               added or changed, including new message text and new tests.",
+            ],
+            "coder-revise.md must apply the self-check to the lap",
+        );
+    }
+
+    #[test]
+    fn planner_system_has_a_sixth_soundness_check() {
+        let raw = embedded_prompt("planner-system.md");
+        let start = raw.find("## The checks").expect("checks section");
+        let rest = &raw[start + "## The checks".len()..];
+        let section = &rest[..rest.find("\n## ").unwrap_or(rest.len())];
+        let numbered: Vec<&str> = section
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| {
+                let digits = l.chars().take_while(|c| c.is_ascii_digit()).count();
+                digits > 0 && l[digits..].starts_with(". **")
+            })
+            .collect();
+        let numbers: Vec<&str> = numbered
+            .iter()
+            .map(|l| &l[..l.find('.').unwrap()])
+            .collect();
+        assert_eq!(numbers, ["1", "2", "3", "4", "5", "6"]);
+        assert!(numbered[5].starts_with("6. **Soundness.**"), "{numbered:?}");
+        let sixth = squash(&section[section.find("6. **Soundness.**").unwrap()..]);
+        assert_says(
+            &sixth,
+            &[
+                "restart sweep",
+                "a resumed retry and a fresh one",
+                "Do not build",
+                "at every size from the minimum up",
+                "one test per fail-closed path",
+                "you fix what you find yourself",
+            ],
+            "planner-system.md check 6",
+        );
+    }
+
+    #[test]
+    fn reviewer_system_calibrates_severity() {
+        let text = squash(embedded_prompt("reviewer-system.md"));
+        assert_says(
+            &text,
+            &[
+                "A branch that only chooses message text (same state written, same routing, same stop) is a minor finding.",
+                "such as calling a retry safe when it isn't",
+                "An untested branch on the path the change is mainly about blocks",
+                "follow the way out (a fresh retry and a resumed one) and check that the protection still holds after it",
+                "carried minors: N, see report of <sha>",
+            ],
+            "reviewer-system.md severity calibration",
+        );
+        assert!(
+            index_of(&text, "## 5. Decide")
+                < index_of(&text, "carried minors: N, see report of <sha>"),
+            "the carried-minors rule belongs in step 5"
+        );
+    }
+
+    #[test]
+    fn reviewer_turn_weighs_pr_claims_both_ways() {
+        let text = squash(embedded_prompt("reviewer-turn.md"));
+        assert_says(
+            &text,
+            &[
+                "A false claim stays blocking when it overstates what the code does or protects.",
+                "already a blocking finding: one finding, not two.",
+                "or show that the branch only chooses message text that wouldn't lead the operator to a wrong action.",
+                "Minor findings carried unchanged collapse into one line",
+            ],
+            "reviewer-turn.md PR claims and item 1",
+        );
+    }
 }

@@ -91,6 +91,25 @@ hardened everywhere except the points that wait on an answer.
    The spec says its test list is a floor, not a ceiling, has an explicit
    list of what not to build, and has done criteria that include the
    repository's own required checks.
+6. **Soundness.** The design holds on every path, not only the one the
+   task describes.
+   - For an enforcement or safety feature, list every way the protected
+     event can end: each exit path, the daemon's restart sweep, a resumed
+     retry and a fresh one. For each, say whether the protection runs and
+     what the next retry does with the state it leaves. Check that "Do not
+     build" doesn't forbid a hook that list needs.
+   - Name what the check can't see: content vs status, ignored paths,
+     `.git`, a mistyped config key that fails open. Mark each as covered
+     or as an accepted cost. An accepted residual says what an agent could
+     do through it and why a plain retry doesn't let that through.
+   - For each message the spec prescribes, say which condition it is true
+     under.
+   - For a layout or fitting algorithm, list the invariants and work
+     through the worst case. Require one test that renders every fixture
+     at every size from the minimum up and asserts the invariants.
+   - The done criteria name one test per fail-closed path they mention.
+   - Like the other checks, you fix what you find yourself. A soundness
+     gap is a reason to stop only under the stop conditions above.
 
 ## What you report
 

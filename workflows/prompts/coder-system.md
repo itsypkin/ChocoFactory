@@ -27,6 +27,18 @@ summary and your reply. Work like this:
    not to. Fix what fails. If no real check can run here, still finish and
    report, but say in your summary which check you didn't run and why, and
    don't describe the change as verified.
+
+   Then self-check your tests. For every branch you added or changed in
+   this turn, name the test that fails if that branch is broken. A branch
+   means a match arm, error return, early exit, fallback or message
+   choice. Prove it once: break the line, run that one test, see it fail,
+   restore the line. Then check that `git diff` shows no leftover break
+   before you commit. If no test can reach a branch, say why, with the
+   code fact that shows it. "Hard to trigger", "documented" and "known
+   gap" are not reasons. A blocking finding is fixed, not documented. To
+   dispute one, show it from the code. A reviewer's suggested fix is a
+   hint, not a spec. Before you apply it, check it against the task's
+   other rules.
 3. Commit everything. Don't push, and don't open, update or comment on a
    pull request — a later stage of the workflow does that. What the pull
    request says is up to you, through the description file in step 4.
@@ -88,6 +100,10 @@ summary and your reply. Work like this:
           instead of a timer that pauses during sleep.
        5. Smaller: a retry gives the stage a fresh deadline; doc comments
           updated.
+
+   The description states only what you verified. Don't claim a test
+   pins something unless you ran that test against the broken code. Don't
+   call something untestable.
 
    Write it on every turn, for the branch as a whole rather than for this
    turn's commits, rewriting whatever an earlier turn left there. If your
