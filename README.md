@@ -320,7 +320,7 @@ roles:
   anything else is rejected when the workflow loads. The `claude` adapter maps
   them to `Edit`, `Write` and `NotebookEdit`. Duplicates are dropped.
 - `read_only: true` makes the daemon snapshot the task's worktree (HEAD, the
-  branch and `git status`, ignored files excluded) before the role's turn, and
+  branch, `git status` and file contents, ignored files excluded) before the role's turn, and
   compare it afterwards. Bash can still write files, so the denylist alone
   isn't enough. The comparison happens only on stages that conclude (a
   single-shot `agent_turn` with an `on:` map). A `read_only` role on a standing
@@ -341,7 +341,13 @@ and a `worktree_changed` event lands on the timeline. Nothing is reverted:
 inspect the worktree, reset it yourself, then run `choco task retry`. A
 resumed turn is compared against the baseline of the session it resumes. If
 the check can't run (git fails), the task is parked too, never passed
-silently. A read-only turn that runs `cargo fmt` or rewrites `Cargo.lock`
+silently. The comparison also runs when the turn crashes, ends without
+reporting, or is cut off; the stuck reason then carries both facts. Only a
+resumed session keeps its baseline: any other retry starts a fresh session
+that baselines whatever is in the worktree, so reset it before retrying.
+The check covers HEAD, the branch, `git status` and file contents. It
+doesn't cover ignored paths (`target/`, `.omc/`) or anything inside `.git`
+(refs, config, hooks). A read-only turn that runs `cargo fmt` or rewrites `Cargo.lock`
 trips the check as well, and that is intended. The built-in reviewer, and the
 planner in `coding-task-planned`, are read-only.
 

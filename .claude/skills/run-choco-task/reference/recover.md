@@ -27,8 +27,11 @@ and `choco task list --status stuck` finds every stuck task.
   `git status` there before retrying.
 - A read-only role changed its worktree (the reason starts `read-only role
   '...' changed the worktree`): the change is still there, nothing was
-  reverted. Inspect it, reset or clean it yourself, then retry. A fresh
-  retry baselines whatever is in the worktree at that point.
+  reverted. Inspect it, reset or clean it yourself, then retry. A retry that
+  resumes the interrupted session keeps its original baseline, but any
+  other retry (a fresh session) baselines whatever is in the worktree at
+  that point, so reset it first. The check also runs when a read-only turn
+  crashes or ends without reporting; the stuck reason then carries both.
 
 ## `escalate_to_human`: send a note
 
