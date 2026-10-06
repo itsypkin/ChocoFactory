@@ -2320,3 +2320,66 @@ fn a_very_long_stuck_reason_is_cut_to_three_lines_with_an_ellipsis() {
     assert!(lines[i + 2].ends_with('…'), "{s}");
     assert!(!lines[i + 3].starts_with("          word"), "{s}");
 }
+
+#[test]
+fn tiny_screens_shrink_wrapped_rows_a_line_at_a_time_and_keep_the_stage_time() {
+    let id = "3f2a91c0-aaaa";
+    let mut app = board();
+    open_detail(&mut app, id);
+    answer(&mut app, id, Err("connection refused".into()));
+    let s = render(&app, 40, 11);
+    let ls: Vec<&str> = s.lines().map(|l| l.trim_end()).collect();
+    let i = ls
+        .iter()
+        .position(|l| l.starts_with("Waiting for"))
+        .unwrap_or_else(|| panic!("{s}"));
+    assert!(ls[i].ends_with('…'), "{s}");
+    assert!(ls[i + 1].starts_with("─ progress"), "{s}");
+
+    // One more row of room: two lines, not one.
+    let s = render(&app, 40, 12);
+    let ls: Vec<&str> = s.lines().map(|l| l.trim_end()).collect();
+    let i = ls
+        .iter()
+        .position(|l| l.starts_with("Waiting for"))
+        .unwrap();
+    assert!(!ls[i + 1].starts_with("─ progress"), "{s}");
+
+    // At 40x10 the label column shrinks once Waiting for is gone.
+    let s = render(&app, 40, 10);
+    assert!(s.contains("awaiting_human_review for 2h"), "{s}");
+    assert!(!s.contains("for …"), "{s}");
+}
+
+#[test]
+fn a_stuck_reason_survives_a_long_error_on_a_tiny_screen() {
+    let mut app = board();
+    let id = "7d22e1a8-dddd";
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == id)
+        .unwrap()
+        .task
+        .stuck_reason = Some("word ".repeat(60));
+    open_detail(&mut app, id);
+    answer(
+        &mut app,
+        id,
+        Err("connection refused: a very long error from the daemon that wraps".into()),
+    );
+    let s = render(&app, 40, 10);
+    assert!(s.contains("Stuck"), "{s}");
+    assert!(s.contains("could not load the task"), "{s}");
+}
+
+#[test]
+fn a_waiting_row_survives_next_to_loop_counters_at_40x12() {
+    let id = "3f2a91c0-aaaa";
+    let mut app = board();
+    open_detail(&mut app, id);
+    let mut data = busy_detail();
+    data["id"] = id.into();
+    answer(&mut app, id, Ok(data));
+    let s = render(&app, 40, 12);
+    assert!(s.contains("Waiting for"), "{s}");
+}

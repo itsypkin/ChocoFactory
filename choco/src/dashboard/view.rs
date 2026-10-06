@@ -811,11 +811,13 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
 
     // ---- status view ----
     let mut rows = field_rows(app, d);
-    let label_w = rows
-        .iter()
-        .map(|r| r.label.chars().count())
-        .max()
-        .unwrap_or(0);
+    let widest = |rows: &[FRow]| {
+        rows.iter()
+            .map(|r| r.label.chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let label_w_cell = std::cell::Cell::new(widest(&rows));
     let has_task = d.snapshot.is_some() || d.data.is_some();
 
     // Progress section: lines, and the separator's title.
@@ -858,7 +860,7 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     let want_tail = events_n.clamp(1, STATUS_TAIL);
     let row_h = |rows: &[FRow]| -> usize {
         rows.iter()
-            .map(|r| row_lines(r, label_w, width).len())
+            .map(|r| row_lines(r, label_w_cell.get(), width).len())
             .sum()
     };
     let block = |rows: &[FRow], prog_h: usize| -> usize {
@@ -903,31 +905,39 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
                 }
                 rows.retain(|r| r.drop != cut);
             }
-            // Still too tall: wrapped rows shrink to one line, then trailing
-            // rows go, so the progress separator and a progress (or error)
-            // line always stay on screen.
-            let h = |keep: usize| if keep < prog.len() { keep + 1 } else { keep };
-            if block(&rows, h(keep_prog)) > body_h {
-                for r in rows.iter_mut().filter(|r| r.wrap) {
-                    r.cap = 1;
+            // Still too tall: wrapped rows shrink a line at a time, then
+            // trailing rows go, so the progress separator and one progress
+            // (or error) line stay on screen. Extra error lines and the
+            // loop counters are left to the bottom clip.
+            let tight = |rows: &[FRow]| {
+                let h = if keep_prog < prog.len() {
+                    keep_prog + 1
+                } else {
+                    1.min(prog.len())
+                };
+                block(rows, h) - usize::from(counters.is_some())
+            };
+            const KEEP: [&str; 5] = ["ID", "Project", "Workflow", "Status", "Stage"];
+            while tight(&rows) > body_h {
+                if let Some(i) = rows.iter().position(|r| r.wrap && r.cap > 1) {
+                    rows[i].cap -= 1;
+                    continue;
                 }
-                const KEEP: [&str; 5] = ["ID", "Project", "Workflow", "Status", "Stage"];
-                while block(&rows, h(keep_prog)) > body_h {
-                    match rows.iter().rposition(|r| !KEEP.contains(&r.label)) {
-                        Some(i) => {
-                            rows.remove(i);
-                        }
-                        None => break,
+                match rows.iter().rposition(|r| !KEEP.contains(&r.label)) {
+                    Some(i) => {
+                        rows.remove(i);
                     }
+                    None => break,
                 }
             }
+            label_w_cell.set(widest(&rows));
         }
     }
 
     if has_task {
         for r in &rows {
             let style = if r.error { error_style(app) } else { plain };
-            for l in row_lines(r, label_w, width) {
+            for l in row_lines(r, label_w_cell.get(), width) {
                 lines.push(Line::styled(l, style));
             }
         }
@@ -939,10 +949,9 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     let hidden = prog.len() - keep_prog;
     if hidden > 0 {
         lines.push(Line::raw(fit(
-            &format!(
-                "  … {hidden} earlier step{}",
-                if hidden == 1 { "" } else { "s" }
-            ),
+            // Never 1: replacing a single line with the "earlier" line saves
+            // nothing, so the cut skips it.
+            &format!("  … {hidden} earlier steps"),
             width,
         )));
     }
