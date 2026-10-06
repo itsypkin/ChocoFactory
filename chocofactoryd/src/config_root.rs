@@ -1630,6 +1630,9 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "A blocking finding is fixed, not documented.",
             "To dispute one, show it from the code.",
             "A reviewer's suggested fix is a hint, not a spec.",
+            "Restore it with `git checkout -- <file>`, never by hand, and never before the work is committed",
+            "Then confirm `git status --short` is empty, re-run the test and see it pass.",
+            "When the self-check ends, the tree must be exactly what you meant to commit, and the tests must prove it.",
         ];
         assert_says(
             &text,
@@ -1664,6 +1667,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &[
                 "The self-check in step 2 of your instructions applies to every branch this lap \
                added or changed, including new message text and new tests.",
+                "restore each break with `git checkout -- <file>`, and confirm `git status --short` \
+               is empty and the test passes again before you finish.",
             ],
             "coder-revise.md must apply the self-check to the lap",
         );

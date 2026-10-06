@@ -99,9 +99,11 @@ left over from an earlier escalation, so ignore it.
 Commit your revisions, and update the PR description file (step 4 of your
 instructions) so it describes the branch as it now stands.
 The self-check in step 2 of your instructions applies to every branch this
-lap added or changed, including new message text and new tests. An empty
-commit
-(`git commit --allow-empty -m "Update the PR description: <why>"`) is
+lap added or changed, including new message text and new tests. Commit the
+lap's work before you run it, restore each break with
+`git checkout -- <file>`, and confirm `git status --short` is empty and the
+test passes again before you finish.
+An empty commit (`git commit --allow-empty -m "Update the PR description: <why>"`) is
 allowed only when every requested change is to the PR's description: the
 PR's review is read against the latest commit, and without a new one the
 same request for changes would be read again. If any requested change is to
