@@ -2571,6 +2571,9 @@ impl WorkflowEngine {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
 
+        // Set once `workflow_state::update` has committed the transition.
+        let committed = std::sync::atomic::AtomicBool::new(false);
+
         // The stage entered on success, so the caller below can tell
         // whether it just became terminal without a second query.
         let result: Result<String, EngineError> =
@@ -2702,6 +2705,7 @@ impl WorkflowEngine {
                 )
                 .await?
                 .ok_or(EngineError::NoWorkflowState)?;
+                committed.store(true, std::sync::atomic::Ordering::Relaxed);
 
                 // `enter_stage` records the transition itself (X-3), so the
                 // trail this used to push onto `workflow_state.stage_history`
@@ -2720,6 +2724,21 @@ impl WorkflowEngine {
                 Ok(next_stage)
             }
             .await;
+        // A reply that fails before the state write for any reason other
+        // than a benign race leaves its caller to mark the task stuck at
+        // the gate. "Stuck" must mean nothing is running for that gate, so
+        // stop the watcher here, still under the task lock: a watcher that
+        // outlived the stuck mark could advance a stuck task, and a retry
+        // would then start a second one. Benign races (`StageMovedOn`,
+        // `UnknownOutcome`, cancelled) leave the task as it was, watcher
+        // included.
+        if stop_watcher
+            && !committed.load(std::sync::atomic::Ordering::Relaxed)
+            && let Err(err) = &result
+            && !err.is_benign_resume_race()
+        {
+            self.abort_detached_runners(task_id).await;
+        }
         // Same rationale as `start_task`'s eviction above: every error
         // branch here either precedes any write (nothing to protect) or
         // follows `workflow_state::update` already having durably

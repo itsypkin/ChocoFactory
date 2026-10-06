@@ -13158,6 +13158,72 @@ async fn a_watching_gate_without_markers_or_a_resumed_edge_keeps_its_watcher_on_
 }
 
 #[tokio::test]
+async fn a_reply_that_fails_before_the_abort_stops_the_watcher_when_it_marks_the_task_stuck() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let counter = dir.join("count");
+    // approved -> next, a poll whose timeout overflows: the advance fails
+    // with a PollWindow error before the old abort point.
+    let yaml = format!(
+        r#"
+name: gate-fail-early
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+{TWO_MARKERS}{}    on: {{ approved: next, changes_requested: next }}
+  next:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    timeout: 3000000000h
+    outcomes:
+      - match: PENDING
+        then: done
+    on: {{ done: done, timeout: done }}
+  done:
+    kind: terminal
+"#,
+        counting_watch(&counter, "")
+    );
+    std::fs::write(dir.join("gate-fail-early.yaml"), &yaml).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&counter, 1).await;
+
+    let err = engine
+        .send_message_or_resume(&task_id, "/approve")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SendMessageOrResumeError::Advance(EngineError::PollWindow { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+        "stuck"
+    );
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "gate");
+    // Nothing runs for the stuck gate: the watcher is gone and stays gone.
+    assert!(!engine.has_detached_runner(&task_id));
+    assert_eq!(runner_slots(&engine, &task_id), 0);
+    let before = count_lines(&counter);
+    tokio::time::sleep(StdDuration::from_secs(3)).await;
+    assert_eq!(count_lines(&counter), before, "the watcher kept running");
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "gate");
+
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    wait_until_count(&counter, before + 1).await;
+    assert_eq!(runner_slots(&engine, &task_id), 1);
+    engine.abort_detached_runners(&task_id).await;
+}
+
+#[tokio::test]
 async fn cancelling_a_watching_gate_stops_the_watcher_and_refuses_later_replies() {
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
