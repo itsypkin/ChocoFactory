@@ -2416,3 +2416,22 @@ fn a_three_step_list_cut_to_one_line_says_two_earlier_steps() {
     assert!(s.contains("  … 2 earlier steps"), "{s}");
     assert!(!s.contains("1 earlier"), "{s}");
 }
+
+#[test]
+fn a_two_step_list_next_to_wrapped_rows_keeps_the_newest_step() {
+    for id in ["3f2a91c0-aaaa", "7d22e1a8-dddd"] {
+        for (w, h) in [(40, 10), (40, 11), (40, 12)] {
+            let mut app = board();
+            open_detail(&mut app, id);
+            let mut d = busy_with_trail(2);
+            d["id"] = id.into();
+            answer(&mut app, id, Ok(d));
+            let s = render(&app, w, h);
+            assert!(
+                s.contains("2. coding --[done]--> internal_review"),
+                "{id} {w}x{h}\n{s}"
+            );
+            assert!(!s.contains("earlier step"), "{id} {w}x{h}\n{s}");
+        }
+    }
+}

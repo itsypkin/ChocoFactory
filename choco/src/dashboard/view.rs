@@ -913,7 +913,7 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
                 let h = if keep_prog < prog.len() {
                     keep_prog + 1
                 } else {
-                    1.min(prog.len())
+                    prog.len().min(if cuttable { 2 } else { 1 })
                 };
                 block(rows, h) - usize::from(counters.is_some())
             };
