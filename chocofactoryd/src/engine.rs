@@ -5331,9 +5331,9 @@ impl WorkflowEngine {
         session_id: &str,
         outcome_pending: bool,
     ) -> ReadOnlyVerdict {
-        let role = match definition.stages.get(stage_name).map(|s| &s.kind) {
-            Some(StageKind::AgentTurn { role, .. }) => role.as_str(),
-            _ => "unknown",
+        let subject = match definition.stages.get(stage_name).map(|s| &s.kind) {
+            Some(StageKind::AgentTurn { role, .. }) => format!("read-only role '{role}'"),
+            _ => format!("stage '{stage_name}'"),
         };
         // A turn that ended abnormally never produced an outcome, so only a
         // turn that did can say its outcome was not applied.
@@ -5344,7 +5344,7 @@ impl WorkflowEngine {
                 "Inspect the worktree, then choco task retry"
             };
             format!(
-                "could not verify that read-only role '{role}' left the worktree unchanged in \
+                "could not verify that {subject} left the worktree unchanged in \
                  stage '{stage_name}': {error}. {tail}"
             )
         };
@@ -5363,6 +5363,10 @@ impl WorkflowEngine {
         if !role_def.read_only {
             return ReadOnlyVerdict::Clean;
         }
+        let role = match definition.stages.get(stage_name).map(|s| &s.kind) {
+            Some(StageKind::AgentTurn { role, .. }) => role.as_str(),
+            _ => return ReadOnlyVerdict::Unverified(unverified("stage lost its role".into())),
+        };
 
         let outcome: Result<Option<String>, String> = async {
             let baseline = events::worktree_baseline_for_session(&self.pool, session_id)
@@ -16523,6 +16527,47 @@ stages:
             .filter(|e| e.event_type == EventType::WorktreeChanged)
             .count();
         assert_eq!(changed, 1, "{reason}");
+    }
+
+    #[tokio::test]
+    async fn an_abnormal_end_that_cannot_be_verified_does_not_claim_an_outcome_was_dropped() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "printf 'gitdir: /nonexistent\\n' > .git && sleep 3"},
+            ]),
+        )
+        .await;
+        for _ in 0..400 {
+            let pointer = std::fs::read_to_string(run.worktree_dir.join(".git"));
+            if pointer.is_ok_and(|p| p.contains("/nonexistent")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        sessions::update_status(
+            &run.pool,
+            &session.id,
+            SessionStatus::Idle,
+            None,
+            Some(SessionEndReason::Reaped),
+        )
+        .await
+        .unwrap();
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("could not verify")
+                && reason.contains("'reviewer'")
+                && reason.contains("Inspect the worktree, then choco task retry"),
+            "{reason}"
+        );
+        assert!(!reason.contains("outcome was not applied"), "{reason}");
     }
 
     #[tokio::test]
