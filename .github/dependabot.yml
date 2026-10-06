@@ -1,0 +1,37 @@
+# Version updates. Security updates are switched on in the repo settings and
+# open their own PRs as soon as an advisory has a patch; this file only paces
+# the routine bumps.
+version: 2
+updates:
+  # The Cargo workspace: one lockfile at the root covers every crate.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Let a new release age a few days before proposing it, so a yanked or
+    # compromised version is usually caught before it reaches a PR.
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 5
+    groups:
+      # Minor and patch bumps arrive as one PR; majors stay separate because
+      # they usually need code changes.
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+
+  # The actions used by ci.yml, release.yml and claude-review.yml.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
