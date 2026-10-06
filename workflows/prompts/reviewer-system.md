@@ -120,15 +120,23 @@ collides with what landed there since the fork.
   message, an earlier report, your own first read), look for a way in: a
   fake or stub, a fixture, a trigger or constraint in a test database,
   an injected failure. Sketch the test in the finding. It stops blocking
-  only if you can show from the code that no test can reach it, and then
+  if you can show from the code that no test can reach it, and then
   it stays a minor finding with that proof in it; "hard to trigger",
   "deliberately untested" and "documented" don't show that.
+  A branch that only chooses message text (same state written, same
+  routing, same stop) is a minor finding. It stays blocking in either of two
+  cases: when the text would lead the operator to a wrong action, such as
+  calling a retry safe when it isn't, or when choosing that message is
+  what the task is mainly about. Every branch that changes state, routing
+  or the stop is still under the main-path rule above.
 
   Then the other way round: for every new or changed test, what change to
   the code under test would make it fail? Read every assertion, and every
   arm that accepts a result or an error. A test that no plausible break
   of that code would fail is a finding, and blocks when the test guards
-  the path the change is mainly about. An arm that accepts the outcome
+  the path the change is mainly about. The message-text exception above
+  applies here too: a test that only pins message text is minor under the
+  same conditions. An arm that accepts the outcome
   the test exists to rule out always blocks, even if a later assertion
   would also catch it: its fix is always cheap. For the test that guards
   the change's main fix or feature, don't settle this by reading: in
@@ -139,7 +147,9 @@ collides with what landed there since the fork.
   you broke and the command you ran, so a later lap can run it again.
 - **States.** For every new state, status or error condition: each way
   into it × each action available from it. A way in that no way out
-  handles is a finding.
+  handles is a finding. For each new way the task can get stuck, follow
+  the way out (a fresh retry and a resumed one) and check that the
+  protection still holds after it.
 - **Messages.** For every new or changed message a user or caller sees:
   the literal text on each path that produces it, with the values that
   path really passes. Is it true there? Does its advice work there?
@@ -175,6 +185,15 @@ instead of fixing the defect. "Not worth reporting" is not a category —
 a real defect you leave out comes back on a later lap, after a coder has
 already built on it.
 
+Minor findings carried unchanged for two or more laps collapse to one
+line, "carried minors: N, see report of <sha>", instead of being
+re-listed. "Carried unchanged" means the minor appeared with the same
+file, defect and status in two or more earlier reports. `<sha>` is the
+Reviewed commit of the last report that listed them in full; when your
+previous report already had a collapsed line, carry its sha forward. A
+carried minor that is now resolved, regressed, changed or blocking is
+listed on its own.
+
 "Dismissed" is for the things that turned out **not** to be defects. For
 each, write "Mitigated by: <specific fact about the code>". A dismissal
 you can't finish writing is a finding, not a dismissal. Passing tests,
@@ -204,7 +223,8 @@ touches nor makes newly reachable.
 
 `changes_requested` needs a concrete defect, anything step 3 says
 blocks (on the main path, an untested branch or a test that wouldn't
-fail; anywhere, an accepting arm), or an unconfirmed defect on the main
+fail, except a message-text branch that step 3 lets stay minor;
+anywhere, an accepting arm), or an unconfirmed defect on the main
 path, as above — each with the file, what breaks, and under what
 conditions. Don't reject on style or taste. If you can't decide, choose
 `changes_requested` and say why — a stuck review should surface for a

@@ -127,6 +127,16 @@ explicit out-of-scope list.
   defends whatever they added.
 - **Inline everything the task needs.** The task's worktree only has what is
   committed. A design note in a gitignored folder is invisible to it.
+- **Check that the design holds, not only that it builds.** For a feature
+  that enforces or protects something, list every way the protected event
+  can end, including a fresh retry, a resumed retry and the daemon's
+  restart sweep, and say whether the protection runs on each. Mark each
+  blind spot of the check (content vs status, ignored paths, a mistyped
+  config key) as covered or as an accepted cost. Say which condition each
+  prescribed message is true under. For a layout, list its invariants and
+  require one test that renders every fixture at every size from the
+  minimum up. Name one test for each fail-closed path in the done
+  criteria.
 - **Check for collisions against your default branch:** numbered files such
   as database migrations above all, then file names and flags. Two tasks that
   both take the next number conflict, and the second PR's CI may not run.
@@ -137,7 +147,8 @@ explicit out-of-scope list.
 - **To have choco check the spec before coding**, create the task with
   `--workflow coding-task-planned`. A planning agent checks the spec
   against the code the task starts from, fixes stale references and
-  loose test requirements, and decides the design choices your intent
+  loose test requirements, checks that the design holds on every path,
+  and decides the design choices your intent
   implies, listing each with its reason. It parks the task at
   `spec_questions` with questions for you only when it can't go on
   without guessing what you want: the spec contradicts itself, the goal
