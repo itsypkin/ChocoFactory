@@ -61,6 +61,7 @@ impl WorkflowDefinition {
     /// existence against the real filesystem).
     pub fn parse(source: &str, base_dir: &Path) -> Result<Self, WorkflowDefError> {
         let raw: RawDefinition = serde_yaml::from_str(source).map_err(WorkflowDefError::Yaml)?;
+        reject_unknown_stage_keys(source)?;
 
         let worktree = raw.worktree;
         let roles = raw
@@ -702,6 +703,64 @@ impl RawRole {
             memory: self.memory.unwrap_or(false),
         })
     }
+}
+
+/// Stage-level keys every kind accepts.
+const COMMON_STAGE_KEYS: &[&str] = &["kind", "on", "loop_guard"];
+
+/// The kind-specific stage keys, mirroring `RawStageKind`.
+fn stage_kind_keys(kind: &str) -> Option<&'static [&'static str]> {
+    Some(match kind {
+        "agent_turn" => &["role", "prompt_file", "capture", "report_sections"],
+        "shell" => &["command", "script_file", "capture", "timeout", "env"],
+        "poll" => &[
+            "command",
+            "script_file",
+            "capture",
+            "env",
+            "interval",
+            "timeout",
+            "outcomes",
+        ],
+        "human_gate" => &["capture", "markers", "watch"],
+        "terminal" => &[],
+        _ => return None,
+    })
+}
+
+/// `RawStage` flattens its internally tagged kind, and serde's
+/// `deny_unknown_fields` does not work through `flatten`, so a misspelt
+/// stage key (`marker:`, `wacth:`) would load and silently change what the
+/// stage does. This second pass over the raw YAML rejects any stage key the
+/// stage's kind does not define. Run after the typed parse, so it only sees
+/// well-formed stages.
+fn reject_unknown_stage_keys(source: &str) -> Result<(), WorkflowDefError> {
+    let value: serde_yaml::Value = serde_yaml::from_str(source).map_err(WorkflowDefError::Yaml)?;
+    let Some(stages) = value.get("stages").and_then(|s| s.as_mapping()) else {
+        return Ok(());
+    };
+    for (name, stage) in stages {
+        let (Some(name), Some(stage)) = (name.as_str(), stage.as_mapping()) else {
+            continue;
+        };
+        let Some(allowed) = stage
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .and_then(stage_kind_keys)
+        else {
+            continue;
+        };
+        for key in stage.keys() {
+            let Some(key) = key.as_str() else { continue };
+            if !COMMON_STAGE_KEYS.contains(&key) && !allowed.contains(&key) {
+                return Err(WorkflowDefError::UnknownStageKey {
+                    stage: name.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1363,6 +1422,10 @@ pub enum WorkflowDefError {
         stage: String,
         outcome: String,
     },
+    UnknownStageKey {
+        stage: String,
+        key: String,
+    },
     InvalidTemplate {
         stage: String,
         field: String,
@@ -1547,6 +1610,10 @@ impl fmt::Display for WorkflowDefError {
             WorkflowDefError::DuplicateReplyMarker { stage, line } => write!(
                 f,
                 "human_gate stage '{stage}' lists the reply marker line {line:?} more than once"
+            ),
+            WorkflowDefError::UnknownStageKey { stage, key } => write!(
+                f,
+                "stage '{stage}' has the key '{key}', which its kind does not define"
             ),
             WorkflowDefError::UnknownReplyMarkerOutcome { stage, outcome } => write!(
                 f,
@@ -3928,6 +3995,24 @@ stages:
             ));
         }
         out
+    }
+
+    #[test]
+    fn a_gate_rejects_unknown_stage_level_keys() {
+        for (key, line) in [
+            ("marker", "    marker: []\n"),
+            ("wacth", "    wacth: {}\n"),
+            ("interval", "    interval: 1s\n"),
+        ] {
+            let err = gate_err(line);
+            assert!(
+                matches!(&err, WorkflowDefError::UnknownStageKey { stage, key: k }
+                    if stage == "gate" && k == key),
+                "{err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("'gate'") && msg.contains(key), "{msg}");
+        }
     }
 
     #[test]
