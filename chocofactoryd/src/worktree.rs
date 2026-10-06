@@ -618,7 +618,9 @@ pub struct WorktreeSnapshot {
     /// The full ref `HEAD` points at (`refs/heads/…`), or `""` when detached.
     pub branch: String,
     /// Lowercase hex SHA-256 of the raw `git status --porcelain=v1 -z
-    /// --untracked-files=all` bytes.
+    /// --untracked-files=all` bytes followed by the id of a tree holding the
+    /// content of every non-ignored file (so rewriting a file that was
+    /// already dirty changes it too).
     pub status_sha256: String,
     pub status_entries: usize,
     /// The first [`STATUS_PREVIEW_LEN`] entries, one line each.
@@ -631,7 +633,19 @@ async fn run_git_raw(
     dir: &Path,
     args: &[&str],
 ) -> Result<(Option<i32>, Vec<u8>, String), WorktreeError> {
-    let output = Command::new("git")
+    run_git_raw_env(dir, args, None).await
+}
+
+async fn run_git_raw_env(
+    dir: &Path,
+    args: &[&str],
+    index_file: Option<&Path>,
+) -> Result<(Option<i32>, Vec<u8>, String), WorktreeError> {
+    let mut command = Command::new("git");
+    if let Some(index_file) = index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    }
+    let output = command
         .arg("-C")
         .arg(dir)
         .arg("--no-optional-locks")
@@ -681,7 +695,13 @@ pub async fn snapshot(dir: &Path) -> Result<WorktreeSnapshot, WorktreeError> {
     if code != Some(0) {
         return Err(git_failed(&args, stderr));
     }
-    let status_sha256 = Sha256::digest(&status)
+    let tree = content_tree(dir).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(&status);
+    hasher.update(b"\0tree:");
+    hasher.update(tree.as_bytes());
+    let status_sha256 = hasher
+        .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
@@ -693,6 +713,36 @@ pub async fn snapshot(dir: &Path) -> Result<WorktreeSnapshot, WorktreeError> {
         status_entries: entries.len(),
         status_preview: entries.into_iter().take(STATUS_PREVIEW_LEN).collect(),
     })
+}
+
+/// The id of a tree holding the current content of every non-ignored file,
+/// built in a throwaway index so the real index is left alone. (It does write
+/// the file contents into the object database as loose objects.)
+async fn content_tree(dir: &Path) -> Result<String, WorktreeError> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "chocofactoryd-snapshot-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&scratch).map_err(WorktreeError::Spawn)?;
+    let index = scratch.join("index");
+    let result = async {
+        let args = ["add", "-A", "--", "."];
+        let (code, _, stderr) = run_git_raw_env(dir, &args, Some(&index)).await?;
+        if code != Some(0) {
+            return Err(git_failed(&args, stderr));
+        }
+        let args = ["write-tree"];
+        let (code, stdout, stderr) = run_git_raw_env(dir, &args, Some(&index)).await?;
+        if code != Some(0) {
+            return Err(git_failed(&args, stderr));
+        }
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
 }
 
 /// Splits `-z` porcelain output into entries. A rename or copy entry carries
@@ -777,6 +827,26 @@ mod tests {
 
         git(&repo, &["checkout", "-q", "--detach"]).await;
         assert_eq!(snapshot(&repo).await.unwrap().branch, "");
+    }
+
+    #[tokio::test]
+    async fn snapshot_sees_a_content_change_to_an_already_dirty_file() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        std::fs::write(repo.join("README.md"), "edited once\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "one\n").unwrap();
+        let before = snapshot(&repo).await.unwrap();
+        assert_eq!(before.status_entries, 2);
+
+        std::fs::write(repo.join("README.md"), "edited twice\n").unwrap();
+        let tracked = snapshot(&repo).await.unwrap();
+        assert_eq!(tracked.status_entries, 2);
+        assert_ne!(tracked.status_sha256, before.status_sha256);
+
+        std::fs::write(repo.join("new.txt"), "two\n").unwrap();
+        let untracked = snapshot(&repo).await.unwrap();
+        assert_ne!(untracked.status_sha256, tracked.status_sha256);
+        assert_eq!(snapshot(&repo).await.unwrap(), untracked);
     }
 
     #[tokio::test]
