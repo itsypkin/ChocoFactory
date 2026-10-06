@@ -300,6 +300,49 @@ Each session's `session_meta` event records what it actually ran with: the
 CLI version, model, tools, MCP servers, plugins, skills, and the isolation
 it was launched under.
 
+### Writing a workflow: read-only roles
+
+A role that must not change the code (a reviewer, a planner) can be enforced
+rather than just asked nicely. Two role fields do it:
+
+```yaml
+worktree: true
+roles:
+  reviewer:
+    cli: claude
+    model: claude-opus-5-5
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+```
+
+- `disallowed_tools` removes tools from the role. The names are
+  adapter-neutral: `edit`, `write` and `notebook_edit`, exact lowercase only;
+  anything else is rejected when the workflow loads. The `claude` adapter maps
+  them to `Edit`, `Write` and `NotebookEdit`. Duplicates are dropped.
+- `read_only: true` makes the daemon snapshot the task's worktree (HEAD, the
+  branch and `git status`, ignored files excluded) before the role's turn, and
+  compare it afterwards. Bash can still write files, so the denylist alone
+  isn't enough.
+
+Two rules are checked at load time: a `read_only` role must list all three
+names in `disallowed_tools`, and `read_only` needs `worktree: true` on the
+workflow, so the check only ever looks at the task's own disposable worktree.
+
+Neither field can be set from task config (`--config`, `--role-*`) or the
+global config file; such keys are ignored. Only the workflow definition can
+set them.
+
+If the turn changed the worktree anyway, the task is marked `stuck` with a
+reason such as `read-only role 'reviewer' changed the worktree in stage
+'internal_review': HEAD 1a2b3c4 → 9f8e7d6; git status changed (3 entries)`,
+and a `worktree_changed` event lands on the timeline. Nothing is reverted:
+inspect the worktree, reset it yourself, then run `choco task retry`. A
+resumed turn is compared against the baseline of the session it resumes. If
+the check can't run (git fails), the task is parked too, never passed
+silently. A read-only turn that runs `cargo fmt` or rewrites `Cargo.lock`
+trips the check as well, and that is intended. The built-in reviewer, and the
+planner in `coding-task-planned`, are read-only.
+
 ### Project workflows
 
 A project can carry a repo of its own (`repo_path`), set at creation or
@@ -647,8 +690,8 @@ finished) is a `409`.
 Sometimes the engine itself can't move a task forward — a stage's outcome
 has no `on:` edge to route through, a transition failed, an agent turn's
 session never started, a run was force-closed before it finished, an agent
-never reported its outcome, or an agent's process kept running after its turn
-ended. When
+never reported its outcome, an agent's process kept running after its turn
+ended, or a read-only role changed its worktree. When
 that happens the task is marked `stuck` rather than silently staying
 `open`, with a human-readable reason attached.
 

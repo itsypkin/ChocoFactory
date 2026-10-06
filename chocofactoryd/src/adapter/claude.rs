@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentHandle, InterruptionEvidence, Isolation,
-    RoleConfig,
+    RoleConfig, RoleTool,
 };
 
 /// Wraps `claude --print --output-format=stream-json --input-format=stream-json
@@ -134,6 +134,21 @@ const TIMER_TOOLS: [&str; 6] = [
 /// stay. Cron and remote triggers start unattended or recurring turns, and
 /// may keep the session from being idle-reaped.
 const CHAT_BLOCKED_TOOLS: [&str; 4] = ["CronCreate", "CronDelete", "CronList", "RemoteTrigger"];
+
+/// Appends the role's neutral tool names (#172), mapped to `claude`'s own,
+/// after the adapter's entries, skipping any already present.
+fn merge_role_tools(disallowed: &mut Vec<&str>, tools: &[RoleTool]) {
+    for tool in tools {
+        let name = match tool {
+            RoleTool::Edit => "Edit",
+            RoleTool::Write => "Write",
+            RoleTool::NotebookEdit => "NotebookEdit",
+        };
+        if !disallowed.contains(&name) {
+            disallowed.push(name);
+        }
+    }
+}
 
 fn spawn(
     binary: &str,
@@ -264,9 +279,9 @@ fn spawn(
     // servers, not tools that start turns nobody supervises.
     let initialize = match &cfg.isolation {
         Isolation::InheritOperatorConfig => {
-            command
-                .arg("--disallowedTools")
-                .arg(CHAT_BLOCKED_TOOLS.join(","));
+            let mut disallowed: Vec<&str> = CHAT_BLOCKED_TOOLS.to_vec();
+            merge_role_tools(&mut disallowed, &cfg.disallowed_tools);
+            command.arg("--disallowedTools").arg(disallowed.join(","));
             None
         }
         Isolation::Isolated { skills, memory: _ } => {
@@ -279,6 +294,7 @@ fn spawn(
             if skills.is_empty() {
                 disallowed.push("Skill");
             }
+            merge_role_tools(&mut disallowed, &cfg.disallowed_tools);
             command.arg("--disallowedTools").arg(disallowed.join(","));
             Some(initialize_line(skills))
         }
@@ -980,6 +996,7 @@ mod tests {
     async fn start_spawns_process_and_streams_events() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
         let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
@@ -1023,6 +1040,7 @@ mod tests {
     async fn resume_passes_session_id_through_to_the_cli() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
         let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
@@ -1053,6 +1071,7 @@ mod tests {
     async fn a_sandboxed_spawn_bypasses_claudes_own_permission_prompts() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
@@ -1085,6 +1104,7 @@ mod tests {
     async fn an_unsandboxed_spawn_leaves_claudes_permission_prompts_enabled() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
@@ -1115,6 +1135,7 @@ mod tests {
     async fn a_turn_with_no_outcomes_still_gets_the_tool_but_no_routing_instruction() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
@@ -1150,6 +1171,7 @@ mod tests {
     async fn a_turn_with_outcomes_gets_a_routing_instruction_naming_them() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
@@ -1213,6 +1235,7 @@ mod tests {
     async fn a_turn_with_report_sections_passes_them_to_the_tool() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
@@ -1264,8 +1287,16 @@ mod tests {
     }
 
     async fn echo_args_for(isolation: Isolation) -> HashMap<String, String> {
+        echo_args_for_tools(isolation, Vec::new()).await
+    }
+
+    async fn echo_args_for_tools(
+        isolation: Isolation,
+        disallowed_tools: Vec<RoleTool>,
+    ) -> HashMap<String, String> {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            disallowed_tools,
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,
@@ -1339,6 +1370,28 @@ mod tests {
     /// the operator's settings, plugins, hooks, output style, MCP servers,
     /// skills or memory, and no `ReportFindings`.
     /// Only `project` settings: `local` is the operator's file (#141).
+    /// #172: a role's neutral tool names are mapped and appended after the
+    /// adapter's own entries, for isolated and inheriting roles alike.
+    #[tokio::test]
+    async fn a_roles_disallowed_tools_are_appended_to_the_denylist() {
+        let fields = echo_args_for_tools(Isolation::default(), RoleTool::ALL.to_vec()).await;
+        assert_eq!(
+            fields["disallowed_tools"],
+            "ReportFindings,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger,Skill,Edit,Write,NotebookEdit"
+        );
+        let fields =
+            echo_args_for_tools(Isolation::InheritOperatorConfig, RoleTool::ALL.to_vec()).await;
+        assert_eq!(
+            fields["disallowed_tools"],
+            "CronCreate,CronDelete,CronList,RemoteTrigger,Edit,Write,NotebookEdit"
+        );
+        let fields = echo_args_for(Isolation::InheritOperatorConfig).await;
+        assert_eq!(
+            fields["disallowed_tools"],
+            "CronCreate,CronDelete,CronList,RemoteTrigger"
+        );
+    }
+
     #[tokio::test]
     async fn an_isolated_spawn_drops_the_operators_setup() {
         let fields = echo_args_for(Isolation::default()).await;

@@ -1329,6 +1329,7 @@ mod tests {
 
     fn role_config() -> RoleConfig {
         RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,

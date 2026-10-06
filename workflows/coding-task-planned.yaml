@@ -12,6 +12,8 @@ roles:
     cli: claude
     model: claude-opus-5-5
     system_prompt_file: prompts/planner-system.md
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
   coder:
     cli: claude
     model: claude-sonnet-5-5
@@ -20,6 +22,8 @@ roles:
     cli: claude
     model: claude-opus-5-5
     system_prompt_file: prompts/reviewer-system.md
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
 
 stages:
   # Checks the task's spec against the code the coder will start from, and

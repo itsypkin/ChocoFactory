@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use chocofactory_core::duration::parse_duration;
 
-use crate::adapter::Isolation;
+use crate::adapter::{Isolation, RoleTool};
 
 /// A parsed, validated workflow definition. `stages` preserves the YAML
 /// file's declaration order because that order carries meaning: the first
@@ -62,11 +62,29 @@ impl WorkflowDefinition {
     pub fn parse(source: &str, base_dir: &Path) -> Result<Self, WorkflowDefError> {
         let raw: RawDefinition = serde_yaml::from_str(source).map_err(WorkflowDefError::Yaml)?;
 
+        let worktree = raw.worktree;
         let roles = raw
             .roles
             .into_iter()
             .map(|(name, role)| -> Result<_, WorkflowDefError> {
                 let isolation = role.isolation(&name)?;
+                let disallowed_tools = role.disallowed_tools(&name)?;
+                if role.read_only {
+                    let missing: Vec<&str> = RoleTool::ALL
+                        .iter()
+                        .filter(|t| !disallowed_tools.contains(t))
+                        .map(|t| t.name())
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(WorkflowDefError::ReadOnlyRoleMissingTools {
+                            role: name,
+                            missing: missing.join(", "),
+                        });
+                    }
+                    if !worktree {
+                        return Err(WorkflowDefError::ReadOnlyRoleWithoutWorktree { role: name });
+                    }
+                }
                 let system_prompt_file = role
                     .system_prompt_file
                     .map(|rel| {
@@ -80,6 +98,8 @@ impl WorkflowDefinition {
                         model: role.model,
                         system_prompt_file,
                         isolation,
+                        disallowed_tools,
+                        read_only: role.read_only,
                     },
                 ))
             })
@@ -470,6 +490,19 @@ pub struct RoleDef {
     /// never task-level config or global config, because every setting it
     /// has loosens what an agent is exposed to.
     pub isolation: Isolation,
+    /// Tools this role may not use (#172), adapter-neutral, deduplicated in
+    /// order of first appearance. Like `isolation`, only a workflow
+    /// definition can set it: a `roles.<name>.disallowed_tools` key in task
+    /// config is ignored (as `inherit_operator_config` is), so a task creator
+    /// cannot loosen enforcement.
+    pub disallowed_tools: Vec<RoleTool>,
+    /// The role must not change the task's worktree (#172): the engine
+    /// snapshots it before the turn and parks the task as stuck if HEAD, the
+    /// branch or `git status` differ afterwards. Workflow-definition only,
+    /// like `disallowed_tools`; task-level keys are ignored. Loader rules: it
+    /// requires all of `RoleTool::ALL` in `disallowed_tools` and a
+    /// `worktree: true` workflow.
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -609,9 +642,30 @@ struct RawRole {
     /// Whether an isolated role may use auto-memory (#90). Absent means no.
     #[serde(default)]
     memory: Option<bool>,
+    /// Neutral tool names this role may not use (#172).
+    #[serde(default)]
+    disallowed_tools: Vec<String>,
+    /// The role must not change the task's worktree (#172).
+    #[serde(default)]
+    read_only: bool,
 }
 
 impl RawRole {
+    fn disallowed_tools(&self, role: &str) -> Result<Vec<RoleTool>, WorkflowDefError> {
+        let mut tools = Vec::new();
+        for name in &self.disallowed_tools {
+            let tool =
+                RoleTool::from_name(name).ok_or_else(|| WorkflowDefError::UnknownRoleTool {
+                    role: role.to_string(),
+                    tool: name.clone(),
+                })?;
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
+        }
+        Ok(tools)
+    }
+
     /// `skills`/`memory` only describe an *isolated* role. Next to
     /// `inherit_operator_config: true` — where every skill and the memory are
     /// already available — either would be silently meaningless, and a role
@@ -1074,6 +1128,17 @@ pub enum WorkflowDefError {
         stage: String,
         name: String,
     },
+    UnknownRoleTool {
+        role: String,
+        tool: String,
+    },
+    ReadOnlyRoleMissingTools {
+        role: String,
+        missing: String,
+    },
+    ReadOnlyRoleWithoutWorktree {
+        role: String,
+    },
 }
 
 impl fmt::Display for WorkflowDefError {
@@ -1241,6 +1306,21 @@ impl fmt::Display for WorkflowDefError {
                  already gives it the operator's full setup; '{field}' only applies to an \
                  isolated role"
             ),
+            WorkflowDefError::UnknownRoleTool { role, tool } => write!(
+                f,
+                "role '{role}' lists unknown tool '{tool}' in 'disallowed_tools'; the allowed \
+                 names are edit, write, notebook_edit"
+            ),
+            WorkflowDefError::ReadOnlyRoleMissingTools { role, missing } => write!(
+                f,
+                "role '{role}' is 'read_only: true' but 'disallowed_tools' doesn't list: \
+                 {missing}; a read-only role must deny edit, write and notebook_edit"
+            ),
+            WorkflowDefError::ReadOnlyRoleWithoutWorktree { role } => write!(
+                f,
+                "role '{role}' is 'read_only: true', which needs 'worktree: true' on the \
+                 workflow: the post-turn check only ever inspects a task's own worktree"
+            ),
         }
     }
 }
@@ -1337,6 +1417,88 @@ stages:
 
     /// #90: a role that says nothing about isolation gets the strict default
     /// — no skills, no memory — rather than the operator's setup.
+    fn role_yaml(worktree: bool, role_fields: &str) -> String {
+        format!(
+            "name: w\nworktree: {worktree}\nroles:\n  reviewer:\n{role_fields}\nstages:\n  review:\n    kind: agent_turn\n    role: reviewer\n    on: {{}}\n"
+        )
+    }
+
+    #[test]
+    fn disallowed_tools_parse_dedupe_and_reject_unknown_names() {
+        let dir = TempDir::new();
+        let def = WorkflowDefinition::parse(
+            &role_yaml(
+                false,
+                "    disallowed_tools: [edit, write, edit, notebook_edit]",
+            ),
+            &dir.path,
+        )
+        .unwrap();
+        assert_eq!(
+            def.roles["reviewer"].disallowed_tools,
+            RoleTool::ALL.to_vec()
+        );
+        assert!(!def.roles["reviewer"].read_only);
+        let def = WorkflowDefinition::parse(&role_yaml(false, "    cli: x"), &dir.path).unwrap();
+        assert!(def.roles["reviewer"].disallowed_tools.is_empty());
+
+        for bad in ["Edit", "bash"] {
+            let err = WorkflowDefinition::parse(
+                &role_yaml(false, &format!("    disallowed_tools: [{bad}]")),
+                &dir.path,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::UnknownRoleTool { role, tool } if role == "reviewer" && tool == bad),
+                "{err}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("reviewer") && message.contains(bad),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_needs_every_edit_tool_denied_and_a_worktree() {
+        let dir = TempDir::new();
+        let err = WorkflowDefinition::parse(
+            &role_yaml(
+                true,
+                "    read_only: true\n    disallowed_tools: [edit, write]",
+            ),
+            &dir.path,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::ReadOnlyRoleMissingTools { role, missing } if role == "reviewer" && missing == "notebook_edit"),
+            "{err}"
+        );
+        let err = WorkflowDefinition::parse(&role_yaml(true, "    read_only: true"), &dir.path)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowDefError::ReadOnlyRoleMissingTools { .. }
+        ));
+        let message = err.to_string();
+        assert!(
+            message.contains("edit, write, notebook_edit") && message.contains("reviewer"),
+            "{message}"
+        );
+
+        let all = "    read_only: true\n    disallowed_tools: [edit, write, notebook_edit]";
+        let err = WorkflowDefinition::parse(&role_yaml(false, all), &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::ReadOnlyRoleWithoutWorktree { role } if role == "reviewer"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("reviewer"));
+
+        let def = WorkflowDefinition::parse(&role_yaml(true, all), &dir.path).unwrap();
+        assert!(def.roles["reviewer"].read_only);
+    }
+
     #[test]
     fn a_role_is_isolated_with_no_skills_or_memory_by_default() {
         let dir = TempDir::new();

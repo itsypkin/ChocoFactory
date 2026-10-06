@@ -323,6 +323,25 @@ pub async fn last_report_outcome_for_session(
     Ok(payload.and_then(|payload| payload.0.get("input").cloned()))
 }
 
+/// The payload of the latest `worktree_baseline` event for a session (#172),
+/// latest by `created_at, id`; `None` when the session has none.
+pub async fn worktree_baseline_for_session(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    let payload: Option<Json<Value>> = sqlx::query_scalar(
+        "SELECT payload FROM events
+         WHERE session_id = ? AND event_type = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(EventType::WorktreeBaseline.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(payload.map(|p| p.0))
+}
+
 /// Whether an event marks the end of the message before it — i.e. whether
 /// scanning back for an agent's final message should stop here.
 ///
@@ -357,7 +376,9 @@ fn ends_a_message(event_type: &str) -> bool {
         EventType::Error
         | EventType::SessionMeta
         | EventType::TurnCompleted
-        | EventType::TurnOutcome => false,
+        | EventType::TurnOutcome
+        | EventType::WorktreeBaseline
+        | EventType::WorktreeChanged => false,
         // The daemon's own intervention (#90). A nudge is a new prompt to
         // the agent, exactly like `HumanMessage`, so whatever it answered
         // before the nudge isn't part of the answer that follows it. The

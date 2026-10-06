@@ -610,6 +610,113 @@ async fn run_git_stdout(repo: &Path, args: &[&str]) -> Result<String, WorktreeEr
     }
 }
 
+/// What a worktree looked like at one moment (#172): enough to tell whether a
+/// read-only role's turn changed it. Ignored files are not part of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSnapshot {
+    pub head: String,
+    /// The full ref `HEAD` points at (`refs/heads/…`), or `""` when detached.
+    pub branch: String,
+    /// Lowercase hex SHA-256 of the raw `git status --porcelain=v1 -z
+    /// --untracked-files=all` bytes.
+    pub status_sha256: String,
+    pub status_entries: usize,
+    /// The first [`STATUS_PREVIEW_LEN`] entries, one line each.
+    pub status_preview: Vec<String>,
+}
+
+pub const STATUS_PREVIEW_LEN: usize = 20;
+
+async fn run_git_raw(
+    dir: &Path,
+    args: &[&str],
+) -> Result<(Option<i32>, Vec<u8>, String), WorktreeError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("--no-optional-locks")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(WorktreeError::Spawn)?;
+    Ok((
+        output.status.code(),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+fn git_failed(args: &[&str], stderr: String) -> WorktreeError {
+    WorktreeError::GitFailed {
+        args: args.iter().map(|s| s.to_string()).collect(),
+        stderr,
+    }
+}
+
+/// Reads HEAD, the branch and `git status` of `dir` (#172).
+pub async fn snapshot(dir: &Path) -> Result<WorktreeSnapshot, WorktreeError> {
+    use sha2::{Digest, Sha256};
+
+    let args = ["rev-parse", "HEAD"];
+    let (code, stdout, stderr) = run_git_raw(dir, &args).await?;
+    if code != Some(0) {
+        return Err(git_failed(&args, stderr));
+    }
+    let head = String::from_utf8_lossy(&stdout).trim().to_string();
+
+    let args = ["symbolic-ref", "-q", "HEAD"];
+    let (code, stdout, stderr) = run_git_raw(dir, &args).await?;
+    let branch = match code {
+        Some(0) => String::from_utf8_lossy(&stdout).trim().to_string(),
+        Some(1) if stdout.is_empty() && stderr.trim().is_empty() => String::new(),
+        _ => return Err(git_failed(&args, stderr)),
+    };
+
+    let args = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+    let (code, status, stderr) = run_git_raw(dir, &args).await?;
+    if code != Some(0) {
+        return Err(git_failed(&args, stderr));
+    }
+    let status_sha256 = Sha256::digest(&status)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let entries = parse_status_entries(&status);
+    Ok(WorktreeSnapshot {
+        head,
+        branch,
+        status_sha256,
+        status_entries: entries.len(),
+        status_preview: entries.into_iter().take(STATUS_PREVIEW_LEN).collect(),
+    })
+}
+
+/// Splits `-z` porcelain output into entries. A rename or copy entry carries
+/// its original path in the next field.
+fn parse_status_entries(raw: &[u8]) -> Vec<String> {
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned());
+    let mut entries = Vec::new();
+    while let Some(field) = fields.next() {
+        let xy: Vec<char> = field.chars().take(2).collect();
+        let renamed = xy.iter().any(|c| matches!(c, 'R' | 'C'));
+        if renamed && let Some(orig) = fields.next() {
+            let path = field.get(3..).unwrap_or("");
+            let status = field.get(..2).unwrap_or("");
+            entries.push(format!("{status} {orig} -> {path}"));
+        } else {
+            entries.push(field);
+        }
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +743,57 @@ mod tests {
         std::fs::write(dir.join("README.md"), "hello\n").unwrap();
         git(dir, &["add", "."]).await;
         git(dir, &["commit", "-q", "-m", "init"]).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_tracks_head_branch_and_status() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        let head = run_git_stdout(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let branch = run_git_stdout(&repo, &["symbolic-ref", "HEAD"])
+            .await
+            .unwrap();
+
+        let clean = snapshot(&repo).await.unwrap();
+        assert_eq!(clean.head, head);
+        assert_eq!(clean.branch, branch);
+        assert!(clean.branch.starts_with("refs/heads/"));
+        assert_eq!(clean.status_entries, 0);
+        assert_eq!(snapshot(&repo).await.unwrap(), clean);
+
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        git(&repo, &["add", ".gitignore"]).await;
+        git(&repo, &["commit", "-q", "-m", "ignore"]).await;
+        let clean = snapshot(&repo).await.unwrap();
+        std::fs::write(repo.join("ignored.txt"), "x").unwrap();
+        assert_eq!(snapshot(&repo).await.unwrap(), clean);
+
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(repo.join("sub/new.txt"), "x").unwrap();
+        let dirty = snapshot(&repo).await.unwrap();
+        assert_eq!(dirty.status_entries, 1);
+        assert_eq!(dirty.status_preview, vec!["?? sub/new.txt".to_string()]);
+        assert_ne!(dirty.status_sha256, clean.status_sha256);
+
+        git(&repo, &["checkout", "-q", "--detach"]).await;
+        assert_eq!(snapshot(&repo).await.unwrap().branch, "");
+    }
+
+    #[tokio::test]
+    async fn snapshot_shows_a_rename_with_its_original_path() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        git(&repo, &["mv", "README.md", "MOVED.md"]).await;
+        let snap = snapshot(&repo).await.unwrap();
+        assert_eq!(snap.status_entries, 1);
+        assert_eq!(snap.status_preview, vec!["R  README.md -> MOVED.md"]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_errors_outside_a_git_repository() {
+        let dir = tempdir();
+        std::fs::write(dir.join(".git"), "gitdir: /nonexistent\n").unwrap();
+        assert!(snapshot(&dir).await.is_err());
     }
 
     fn tempdir() -> PathBuf {

@@ -1465,6 +1465,31 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         }
     }
 
+    /// #172: the roles that must not change the worktree are read-only in the
+    /// built-ins, and the coder is not.
+    #[test]
+    fn builtin_read_only_roles_are_enforced() {
+        use crate::adapter::RoleTool;
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let base = load_seeded(&dir, "coding-task.yaml");
+        let planned = load_seeded(&dir, "coding-task-planned.yaml");
+        for (workflow, role) in [
+            (&base, "reviewer"),
+            (&planned, "reviewer"),
+            (&planned, "planner"),
+        ] {
+            let def = &workflow.roles[role];
+            assert!(def.read_only, "{} {role}", workflow.name);
+            assert_eq!(def.disallowed_tools, RoleTool::ALL.to_vec());
+        }
+        for workflow in [&base, &planned] {
+            let coder = &workflow.roles["coder"];
+            assert!(!coder.read_only);
+            assert!(coder.disallowed_tools.is_empty());
+        }
+    }
+
     /// Drift guard: each `-planned` prompt is its original with the one
     /// `{{ task.input }}` replaced.
     #[test]

@@ -47,6 +47,41 @@ pub struct RoleConfig {
     /// or global config — because every setting here can only *loosen* what
     /// a workflow agent is exposed to.
     pub isolation: Isolation,
+    /// Tools this role must not use (#172), from the workflow definition
+    /// only — never task or global config. Adapter-neutral names; each
+    /// adapter maps them onto its own CLI's tool names.
+    pub disallowed_tools: Vec<RoleTool>,
+}
+
+/// The adapter-neutral tool vocabulary a workflow's `disallowed_tools` may
+/// use (#172). It grows when a use needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleTool {
+    Edit,
+    Write,
+    NotebookEdit,
+}
+
+impl RoleTool {
+    pub const ALL: [RoleTool; 3] = [RoleTool::Edit, RoleTool::Write, RoleTool::NotebookEdit];
+
+    /// Exact lowercase names only.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "edit" => Some(RoleTool::Edit),
+            "write" => Some(RoleTool::Write),
+            "notebook_edit" => Some(RoleTool::NotebookEdit),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RoleTool::Edit => "edit",
+            RoleTool::Write => "write",
+            RoleTool::NotebookEdit => "notebook_edit",
+        }
+    }
 }
 
 /// What a workflow agent's CLI process is allowed to pick up from the

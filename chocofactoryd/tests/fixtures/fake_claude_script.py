@@ -35,6 +35,9 @@ Steps, run in order:
 - `{"op": "sleep", "seconds": 0.5}` — pause without output.
 - `{"op": "emit_forever", "text": "..."}` — ignore stdin and keep emitting
   assistant messages until killed.
+- `{"op": "run", "command": "..."}` — run `command` with `/bin/sh -c` in this
+  process's cwd (the task's worktree), failing the process if it fails. Emits
+  nothing; lets a test make the "agent" change the worktree.
 - `{"op": "exit"}` — exit 0 immediately, without waiting for stdin EOF.
 
 After the last step the process waits for stdin EOF, then exits 0.
@@ -176,6 +179,8 @@ def main():
             while True:
                 assistant_text(session_id, step["text"])
                 time.sleep(0.02)
+        elif op == "run":
+            subprocess.run(["/bin/sh", "-c", step["command"]], check=True)
         elif op == "exit":
             return
         else:

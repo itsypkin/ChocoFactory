@@ -25,6 +25,10 @@ and `choco task list --status stuck` finds every stuck task.
 - `lingered`: a process outlived its reported turn and was killed. Something
   it started may still have been writing to the worktree, so check
   `git status` there before retrying.
+- A read-only role changed its worktree (the reason starts `read-only role
+  '...' changed the worktree`): the change is still there, nothing was
+  reverted. Inspect it, reset or clean it yourself, then retry. A fresh
+  retry baselines whatever is in the worktree at that point.
 
 ## `escalate_to_human`: send a note
 

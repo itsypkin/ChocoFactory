@@ -208,6 +208,14 @@ pub enum EngineError {
         stage: String,
         role: String,
     },
+    /// A `read_only` role's turn could not start because the worktree
+    /// baseline could not be recorded (#172). Failing closed: a turn nobody
+    /// could check afterwards must not run.
+    ReadOnlyBaseline {
+        stage: String,
+        role: String,
+        reason: String,
+    },
     /// A `poll` stage whose `outcomes:` pattern doesn't compile.
     /// `WorkflowDefinition::validate` rejects these at load, so this is
     /// only reachable for a definition built by hand — see `poll::compile`.
@@ -281,6 +289,15 @@ impl fmt::Display for EngineError {
             EngineError::UnknownRole { stage, role } => write!(
                 f,
                 "stage '{stage}' is an agent_turn with unknown role '{role}'"
+            ),
+            EngineError::ReadOnlyBaseline {
+                stage,
+                role,
+                reason,
+            } => write!(
+                f,
+                "could not record the worktree baseline for read-only role '{role}' in stage \
+                 '{stage}': {reason}; the agent was not started"
             ),
             EngineError::InvalidPollPattern { stage, reason } => write!(
                 f,
@@ -971,6 +988,18 @@ const MAX_CONSECUTIVE_RESUMES: usize = 3;
 /// all — from inside the transcript, the limit message is simply the last
 /// thing that happened — so this says what stopped it, that its work is
 /// still on disk, and that the turn still ends the way #90 requires.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+fn branch_label(branch: &str) -> &str {
+    if branch.is_empty() {
+        "(detached)"
+    } else {
+        branch
+    }
+}
+
 fn resume_prompt(resume: &ResumeSession) -> String {
     format!(
         "Your previous turn on this stage was interrupted before you could finish: {}. \
@@ -4883,6 +4912,23 @@ impl WorkflowEngine {
         )
         .map_err(EngineError::RoleConfig)?;
 
+        // #172: a read-only role's baseline is taken (or, for a resumed turn,
+        // looked up) before any session row exists, so a failure here leaves
+        // nothing behind and the agent is never started.
+        let baseline = if role_def.read_only {
+            Some(
+                self.read_only_baseline(
+                    stage_name,
+                    role,
+                    &resolved.role_config.cwd,
+                    resume.map(|r| r.previous_session_id.as_str()),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
         let new_session = sessions::NewSession {
             task_id,
             stage: stage_name,
@@ -4908,6 +4954,40 @@ impl WorkflowEngine {
             }
             None => sessions::create(&self.pool, new_session).await?,
         };
+
+        // Written before the agent is spawned, so it always precedes anything
+        // the turn does.
+        if let Some(baseline) = baseline
+            && let Err(err) = events::append(
+                &self.pool,
+                &session.id,
+                EventType::WorktreeBaseline,
+                baseline,
+            )
+            .await
+        {
+            tracing::error!(session_id = %session.id, %err, "failed to record the worktree baseline");
+            if let Err(update_err) = sessions::update_status(
+                &self.pool,
+                &session.id,
+                SessionStatus::Exited,
+                Some(Utc::now()),
+                Some(SessionEndReason::StartFailed),
+            )
+            .await
+            {
+                tracing::error!(
+                    session_id = %session.id, %update_err,
+                    "failed to mark session exited after a failed baseline write"
+                );
+            }
+            return Err(EngineError::ReadOnlyBaseline {
+                stage: stage_name.to_string(),
+                role: role.to_string(),
+                reason: err.to_string(),
+            });
+        }
+        self.events_notify.notify_waiters();
 
         // Recorded before the session starts, for the same ordering reason
         // as the human message below: this is the one line on the timeline
@@ -5037,6 +5117,231 @@ impl WorkflowEngine {
             );
         }
         Ok(())
+    }
+
+    /// The `worktree_baseline` payload for a read-only role's turn (#172):
+    /// a fresh snapshot of `cwd`, or — for a resumed turn — the baseline of
+    /// the session being resumed, so work done before an interruption is still
+    /// caught. Any failure is an error: the turn must not start unchecked.
+    async fn read_only_baseline(
+        &self,
+        stage: &str,
+        role: &str,
+        cwd: &std::path::Path,
+        resumed_session: Option<&str>,
+    ) -> Result<Value, EngineError> {
+        let fail = |reason: String| EngineError::ReadOnlyBaseline {
+            stage: stage.to_string(),
+            role: role.to_string(),
+            reason,
+        };
+        let (cwd, head, branch, sha, entries, status, inherited_from) = match resumed_session {
+            Some(previous) => {
+                let prev = events::worktree_baseline_for_session(&self.pool, previous)
+                    .await
+                    .map_err(|err| {
+                        fail(format!(
+                            "could not read the worktree baseline of session {previous} being \
+                             resumed: {err}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        fail(format!(
+                            "session {previous} being resumed has no worktree baseline; check \
+                             the worktree, then choco task retry --fresh"
+                        ))
+                    })?;
+                let get = |key: &str| prev.get(key).cloned().unwrap_or(Value::Null);
+                (
+                    get("cwd"),
+                    get("head"),
+                    get("branch"),
+                    get("status_sha256"),
+                    get("status_entries"),
+                    get("status"),
+                    json!(previous),
+                )
+            }
+            None => {
+                let snap = worktree::snapshot(cwd)
+                    .await
+                    .map_err(|err| fail(err.to_string()))?;
+                (
+                    json!(cwd.to_string_lossy()),
+                    json!(snap.head),
+                    json!(snap.branch),
+                    json!(snap.status_sha256),
+                    json!(snap.status_entries),
+                    json!(snap.status_preview),
+                    Value::Null,
+                )
+            }
+        };
+        let message = format!(
+            "worktree baseline for read-only role '{role}': HEAD {} on {}, {} status entries",
+            short_sha(head.as_str().unwrap_or("")),
+            branch_label(branch.as_str().unwrap_or("")),
+            entries
+        );
+        Ok(json!({
+            "stage": stage,
+            "role": role,
+            "cwd": cwd,
+            "head": head,
+            "branch": branch,
+            "status_sha256": sha,
+            "status_entries": entries,
+            "status": status,
+            "inherited_from": inherited_from,
+            "message": message,
+        }))
+    }
+
+    /// The post-turn check for a `read_only` role (#172). Returns `true` when
+    /// the turn may be applied (not read-only, or the worktree is unchanged)
+    /// and `false` once the task has been parked as stuck. A check that can't
+    /// run parks the task too: it never passes silently.
+    async fn read_only_check_passes(
+        &self,
+        task_id: &str,
+        definition: &WorkflowDefinition,
+        stage_name: &str,
+        session_id: &str,
+    ) -> bool {
+        let role = match definition.stages.get(stage_name).map(|s| &s.kind) {
+            Some(StageKind::AgentTurn { role, .. }) => role.as_str(),
+            _ => "unknown",
+        };
+        let unverified = |error: String| {
+            format!(
+                "could not verify that read-only role '{role}' left the worktree unchanged in \
+                 stage '{stage_name}': {error}. The turn's outcome was not applied: inspect the \
+                 worktree, then choco task retry"
+            )
+        };
+        let Some(role_def) = definition
+            .stages
+            .get(stage_name)
+            .and_then(|s| match &s.kind {
+                StageKind::AgentTurn { role, .. } => definition.roles.get(role),
+                _ => None,
+            })
+        else {
+            self.mark_stuck(
+                task_id,
+                &unverified(format!(
+                    "stage '{stage_name}' has no agent_turn role in the workflow definition"
+                )),
+                false,
+            )
+            .await;
+            return false;
+        };
+        if !role_def.read_only {
+            return true;
+        }
+
+        let outcome: Result<Option<String>, String> = async {
+            let baseline = events::worktree_baseline_for_session(&self.pool, session_id)
+                .await
+                .map_err(|err| format!("could not read the worktree baseline: {err}"))?
+                .ok_or_else(|| "this session has no worktree baseline".to_string())?;
+            let field = |key: &str| {
+                baseline
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("the worktree baseline has no '{key}'"))
+            };
+            let (cwd, head, branch, sha) = (
+                field("cwd")?,
+                field("head")?,
+                field("branch")?,
+                field("status_sha256")?,
+            );
+            let before_entries = baseline
+                .get("status_entries")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "the worktree baseline has no 'status_entries'".to_string())?;
+            let now = worktree::snapshot(std::path::Path::new(&cwd))
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let mut changes = Vec::new();
+            let mut parts = Vec::new();
+            if now.head != head {
+                parts.push(format!(
+                    "HEAD {} → {}",
+                    short_sha(&head),
+                    short_sha(&now.head)
+                ));
+                changes.push(json!({"field": "head", "before": head, "after": now.head}));
+            }
+            if now.branch != branch {
+                parts.push(format!(
+                    "branch {} → {}",
+                    branch_label(&branch),
+                    branch_label(&now.branch)
+                ));
+                changes.push(json!({"field": "branch", "before": branch, "after": now.branch}));
+            }
+            if now.status_sha256 != sha {
+                parts.push(format!(
+                    "git status changed ({} entries)",
+                    now.status_entries
+                ));
+                changes.push(json!({
+                    "field": "status",
+                    "before": before_entries,
+                    "after": now.status_entries,
+                    "before_sha256": sha,
+                    "after_sha256": now.status_sha256,
+                }));
+            }
+            if parts.is_empty() {
+                return Ok(None);
+            }
+            let reason = format!(
+                "read-only role '{role}' changed the worktree in stage '{stage_name}': {}. \
+                 Nothing was reverted: inspect the worktree, reset it, then choco task retry",
+                parts.join("; ")
+            );
+            match events::append(
+                &self.pool,
+                session_id,
+                EventType::WorktreeChanged,
+                json!({
+                    "stage": stage_name,
+                    "role": role,
+                    "changes": changes,
+                    "status_entries": now.status_entries,
+                    "status": now.status_preview,
+                    "message": reason,
+                }),
+            )
+            .await
+            {
+                Ok(_) => self.events_notify.notify_waiters(),
+                Err(err) => tracing::error!(
+                    task_id, session_id, %err,
+                    "failed to record the worktree_changed event; parking the task anyway"
+                ),
+            }
+            Ok(Some(reason))
+        }
+        .await;
+
+        match outcome {
+            Ok(None) => true,
+            Ok(Some(reason)) => {
+                self.mark_stuck(task_id, &reason, false).await;
+                false
+            }
+            Err(error) => {
+                self.mark_stuck(task_id, &unverified(error), false).await;
+                false
+            }
+        }
     }
 
     /// Watches a single-shot `agent_turn`'s `session` for completion, takes
@@ -5261,6 +5566,15 @@ impl WorkflowEngine {
         capture: Option<Capture>,
         session_id: &str,
     ) {
+        // #172: before anything is fetched, resolved or routed, a read-only
+        // role's worktree is compared with its baseline.
+        if !self
+            .read_only_check_passes(task_id, definition, stage_name, session_id)
+            .await
+        {
+            return;
+        }
+
         // Issue #73: an explicit `report_outcome` tool call, if the agent
         // made one, is unambiguous where a reply is guesswork, so it's
         // fetched first and preferred whenever a capturing stage has one.
@@ -15428,6 +15742,346 @@ stages:
         );
     }
 
+    // ---- #172: read-only roles ----
+
+    struct ReadOnlyRun {
+        pool: SqlitePool,
+        dir: TempDir,
+        _repo: TempDir,
+        task_id: String,
+        worktree_dir: PathBuf,
+        _engine: Arc<WorkflowEngine>,
+    }
+
+    const READ_ONLY_WORKFLOW: &str = r#"
+name: ro-flow
+worktree: true
+roles:
+  reviewer:
+    cli: claude
+    model: opus
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  prep:
+    kind: shell
+    command: "printf 'gitdir: /nonexistent\n' > .git"
+    on: { done: review, error: verified }
+  review:
+    kind: agent_turn
+    role: ROLE
+    prompt_file: p.md
+    on: { done: verified }
+  verified:
+    kind: human_gate
+    on: { resumed: finished }
+  finished:
+    kind: terminal
+"#;
+
+    /// Creates a task on `ro-flow` (entry stage `review`, or `prep` when
+    /// `with_prep`) in a real repo, and starts it with `steps` as the agent.
+    async fn start_read_only_task(
+        role: &str,
+        with_prep: bool,
+        task_config: Value,
+        steps: Value,
+    ) -> ReadOnlyRun {
+        let pool = connect_in_memory().await.unwrap();
+        let dir = tempdir();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+        fs::write(dir.join("p.md"), "review it").unwrap();
+        let mut yaml = READ_ONLY_WORKFLOW.replace("ROLE", role);
+        if !with_prep {
+            // Drop the `prep` stage so `review` is the entry stage.
+            let start = yaml.find("  prep:").unwrap();
+            let end = yaml.find("  review:").unwrap();
+            yaml.replace_range(start..end, "");
+        }
+        fs::write(dir.join("ro-flow.yaml"), &yaml).unwrap();
+        let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+        let mut config = json!({ "cwd": repo.to_string_lossy() });
+        if let Some(extra) = task_config.as_object() {
+            for (k, v) in extra {
+                config[k] = v.clone();
+            }
+        }
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task_id = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                workflow_def: &def.name,
+                title: "T",
+                config,
+                workflow_path: None,
+                workflow_sha256: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let binary = named_script_binary(&dir, "fake-claude-ro", steps);
+        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        let worktree_dir = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
+        ReadOnlyRun {
+            pool,
+            dir,
+            _repo: repo,
+            task_id,
+            worktree_dir,
+            _engine: engine,
+        }
+    }
+
+    fn ro_steps(commands: &[&str]) -> Value {
+        let mut steps = vec![json!({"op": "read_turn"})];
+        for command in commands {
+            steps.push(json!({"op": "run", "command": command}));
+        }
+        steps.push(json!({"op": "report", "outcome": "done"}));
+        steps.push(json!({"op": "result"}));
+        Value::Array(steps)
+    }
+
+    async fn session_events(pool: &SqlitePool, session: &Session, kind: EventType) -> Vec<Value> {
+        events::list_for_session(pool, &session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == kind)
+            .map(|e| e.payload)
+            .collect()
+    }
+
+    async fn stuck_reason(pool: &SqlitePool, task_id: &str) -> String {
+        wait_until_task_status(pool, task_id, "stuck").await;
+        tasks::get(pool, task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .stuck_reason
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_read_only_turn_that_changes_nothing_advances() {
+        let run = start_read_only_task("reviewer", false, json!({}), ro_steps(&[])).await;
+        wait_until_stage(&run.pool, &run.task_id, "verified").await;
+
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        let baselines = session_events(&run.pool, &session, EventType::WorktreeBaseline).await;
+        assert_eq!(baselines.len(), 1);
+        let head = worktree::snapshot(&run.worktree_dir).await.unwrap().head;
+        assert_eq!(baselines[0]["head"], json!(head));
+        assert!(baselines[0]["inherited_from"].is_null());
+        assert_eq!(baselines[0]["role"], "reviewer");
+        assert!(
+            session_events(&run.pool, &session, EventType::WorktreeChanged)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_turn_that_adds_a_file_parks_the_task() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            ro_steps(&["touch sneaky.txt"]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("'reviewer'")
+                && reason.contains("'review'")
+                && reason.contains("git status changed (1 entries)"),
+            "{reason}"
+        );
+        assert!(run.worktree_dir.join("sneaky.txt").exists());
+        let state = workflow_state::get(&run.pool, &run.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.current_stage, "review");
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        assert!(
+            session_events(&run.pool, &session, EventType::TurnOutcome)
+                .await
+                .is_empty()
+        );
+        let changed = session_events(&run.pool, &session, EventType::WorktreeChanged).await;
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0]["message"], json!(reason));
+        assert_eq!(changed[0]["changes"][0]["field"], "status");
+        assert_eq!(changed[0]["status"], json!(["?? sneaky.txt"]));
+    }
+
+    #[tokio::test]
+    async fn a_read_only_turn_that_commits_parks_the_task() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            ro_steps(&["git commit -q --allow-empty -m sneaky"]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        let baselines = session_events(&run.pool, &session, EventType::WorktreeBaseline).await;
+        let old = baselines[0]["head"].as_str().unwrap().to_string();
+        let new = worktree::snapshot(&run.worktree_dir).await.unwrap().head;
+        assert!(
+            reason.contains(&format!("HEAD {} → {}", &old[..7], &new[..7])),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_turn_that_restores_what_it_touched_advances() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            ro_steps(&["printf changed > README.md && git checkout -q -- README.md"]),
+        )
+        .await;
+        wait_until_stage(&run.pool, &run.task_id, "verified").await;
+    }
+
+    #[tokio::test]
+    async fn task_config_cannot_loosen_a_read_only_role() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({"roles": {"reviewer": {"read_only": false, "disallowed_tools": []}}}),
+            ro_steps(&["touch sneaky.txt"]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(reason.contains("changed the worktree"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_read_only_turn_is_checked_against_the_original_baseline() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "touch sneaky.txt"},
+                {"op": "usage_limit"},
+            ]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(reason.contains("interrupted"), "{reason}");
+        let first = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        let first_baseline = session_events(&run.pool, &first, EventType::WorktreeBaseline)
+            .await
+            .remove(0);
+
+        let binary = named_script_binary(&run.dir, "fake-claude-ro-resumed", ro_steps(&[]));
+        let engine = engine_with_adapter_and_workflows_dir(run.pool.clone(), &binary, &run.dir);
+        let outcome = engine
+            .retry_task(&run.task_id, RetryMode::Auto)
+            .await
+            .unwrap();
+        assert!(outcome.resumed);
+        wait_until_task_status(&run.pool, &run.task_id, "stuck").await;
+        let reason = loop {
+            let reason = stuck_reason(&run.pool, &run.task_id).await;
+            if reason.contains("changed the worktree") {
+                break reason;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(reason.contains("git status changed"), "{reason}");
+
+        let second = run_after(&run.pool, &run.task_id, "review", &first).await;
+        let baseline = session_events(&run.pool, &second, EventType::WorktreeBaseline)
+            .await
+            .remove(0);
+        assert_eq!(baseline["inherited_from"], json!(first.id));
+        assert_eq!(baseline["head"], first_baseline["head"]);
+        assert_eq!(baseline["status_sha256"], first_baseline["status_sha256"]);
+    }
+
+    #[tokio::test]
+    async fn a_baseline_that_cannot_be_taken_stops_the_turn_before_it_starts() {
+        let run = start_read_only_task("reviewer", true, json!({}), ro_steps(&[])).await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("could not record the worktree baseline")
+                && reason.contains("not a git repository"),
+            "{reason}"
+        );
+        assert!(
+            runs_for_stage(&run.pool, &run.task_id, "review")
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_coder_turn_is_never_checked() {
+        let run = start_read_only_task(
+            "coder",
+            false,
+            json!({}),
+            ro_steps(&["git commit -q --allow-empty -m work"]),
+        )
+        .await;
+        wait_until_stage(&run.pool, &run.task_id, "verified").await;
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        assert!(
+            session_events(&run.pool, &session, EventType::WorktreeBaseline)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_that_cannot_run_fails_closed() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            ro_steps(&["printf 'gitdir: /nonexistent\\n' > .git"]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("could not verify") && reason.contains("'reviewer'"),
+            "{reason}"
+        );
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        assert!(
+            session_events(&run.pool, &session, EventType::TurnOutcome)
+                .await
+                .is_empty()
+        );
+    }
+
     // ---- #92: retry resumes an interrupted session ----
 
     /// Writes a `fake_claude_script.py` wrapper, named so several can exist
@@ -16629,6 +17283,7 @@ stages:
         let engine = engine_with_adapter(pool.clone(), &wrapper.display().to_string());
         let task_id = seed_task(&pool, "single").await;
         let cfg = crate::adapter::RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,

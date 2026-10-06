@@ -124,6 +124,8 @@ pub fn resolve(
             // Straight from the workflow definition, never layered: task
             // config and global config must not be able to loosen it (#90).
             isolation: role_def.isolation.clone(),
+            // Same rule (#172): a task creator must not loosen enforcement.
+            disallowed_tools: role_def.disallowed_tools.clone(),
         },
     })
 }
@@ -152,6 +154,8 @@ mod tests {
 
     fn role_def(cli: Option<&str>, model: Option<&str>) -> RoleDef {
         RoleDef {
+            disallowed_tools: Vec::new(),
+            read_only: false,
             cli: cli.map(str::to_string),
             model: model.map(str::to_string),
             system_prompt_file: None,
@@ -218,6 +222,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.role_config.isolation, def.isolation);
+    }
+
+    /// #172: like isolation, enforcement comes from the workflow definition
+    /// only; task-level keys are ignored.
+    #[test]
+    fn disallowed_tools_come_from_the_workflow_definition_not_task_config() {
+        use crate::adapter::RoleTool;
+        let mut def = role_def(Some("cli"), Some("model"));
+        def.disallowed_tools = RoleTool::ALL.to_vec();
+        def.read_only = true;
+        let task_config = json!({"roles":{"reviewer":{"read_only":false,"disallowed_tools":[]}}});
+        let resolved = resolve(
+            "reviewer",
+            &def,
+            &GlobalConfig::default(),
+            &task_config,
+            "/cwd".into(),
+            true,
+            StageReport::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.role_config.disallowed_tools,
+            RoleTool::ALL.to_vec()
+        );
     }
 
     /// #67: `sandboxed` is passed straight through, not resolved against
@@ -393,6 +422,8 @@ mod tests {
     fn a_task_level_system_prompt_file_cannot_override_the_workflow_def_file() {
         let secret = temp_prompt("secret.md", "SHOULD NEVER BE READ");
         let def = RoleDef {
+            disallowed_tools: Vec::new(),
+            read_only: false,
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(temp_prompt("def.md", "from the workflow definition")),
@@ -555,6 +586,8 @@ mod tests {
         let def_path = temp_prompt("def.md", "from the workflow definition");
         let global_path = temp_prompt("global.md", "from global config");
         let def = RoleDef {
+            disallowed_tools: Vec::new(),
+            read_only: false,
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(def_path),
@@ -610,6 +643,8 @@ mod tests {
     fn task_level_system_prompt_beats_a_workflow_def_file() {
         let def_path = temp_prompt("def.md", "from the workflow definition");
         let def = RoleDef {
+            disallowed_tools: Vec::new(),
+            read_only: false,
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(def_path),
@@ -640,12 +675,16 @@ mod tests {
     #[test]
     fn two_roles_resolve_their_own_separate_system_prompt_files() {
         let coder_def = RoleDef {
+            disallowed_tools: Vec::new(),
+            read_only: false,
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(temp_prompt("coder-system.md", "you write code")),
             isolation: crate::adapter::Isolation::default(),
         };
         let reviewer_def = RoleDef {
+            disallowed_tools: Vec::new(),
+            read_only: false,
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(temp_prompt("reviewer-system.md", "you review code")),
@@ -692,6 +731,8 @@ mod tests {
         let path = temp_prompt("gone.md", "text");
         std::fs::remove_file(&path).unwrap();
         let def = RoleDef {
+            disallowed_tools: Vec::new(),
+            read_only: false,
             cli: Some("cli".to_string()),
             model: Some("model".to_string()),
             system_prompt_file: Some(path),
