@@ -379,19 +379,24 @@ fn unverified_note(
     error: &dyn std::fmt::Display,
 ) -> Option<String> {
     let role = match definition.stages.get(stage).map(|s| &s.kind) {
-        Some(StageKind::AgentTurn { role, .. }) => role.as_str(),
-        _ => "unknown",
+        Some(StageKind::AgentTurn { role, .. }) => Some(role.as_str()),
+        _ => None,
     };
-    definition
-        .roles
-        .get(role)
-        .is_none_or(|r| r.read_only)
-        .then(|| {
-            format!(
-                "could not verify that read-only role '{role}' left the worktree unchanged in \
-                 stage '{stage}': {error}; inspect and reset the worktree before retrying"
-            )
-        })
+    let resolved = role.and_then(|r| definition.roles.get(r));
+    if resolved.is_some_and(|r| !r.read_only) {
+        return None;
+    }
+    Some(match role {
+        Some(role) => format!(
+            "could not verify that read-only role '{role}' left the worktree unchanged in \
+             stage '{stage}': {error}; inspect and reset the worktree before retrying"
+        ),
+        None => format!(
+            "could not verify that stage '{stage}' left the worktree unchanged: it is not an \
+             agent_turn stage in the workflow definition ({error}); inspect and reset the \
+             worktree before retrying"
+        ),
+    })
 }
 
 /// What the post-turn check of a read-only role found (#172).
@@ -5404,8 +5409,9 @@ impl WorkflowEngine {
                 changes.push(json!({"field": "branch", "before": branch, "after": now.branch}));
             }
             if now.status_sha256 != sha {
-                // Equal counts mean the paths are the same and the bytes
-                // differ: say so rather than claim the status moved.
+                // Equal counts with different bytes: the entries may be the
+                // same paths with new contents (or renamed ones); say so
+                // rather than claim the status moved.
                 if before_entries == now.status_entries as u64 {
                     parts.push(format!(
                         "git status or file contents changed ({} entries)",
@@ -5442,8 +5448,12 @@ impl WorkflowEngine {
                         .iter()
                         .any(|e| e.event_type == EventType::WorktreeChanged)
                 })
-                // A failed read errs toward recording a second event.
-                .unwrap_or(false);
+                .unwrap_or_else(|err| {
+                    // A failed read errs toward recording a second event.
+                    tracing::error!(task_id, session_id, %err,
+                        "could not list session events to dedupe worktree_changed");
+                    false
+                });
             if already {
                 return Ok(Some(reason));
             }
@@ -15922,7 +15932,7 @@ roles:
 stages:
   prep:
     kind: shell
-    command: "printf 'gitdir: /nonexistent\n' > .git"
+    command: "PREP"
     on: { done: review, error: verified }
   review:
     kind: agent_turn
@@ -15967,6 +15977,28 @@ stages:
         setup_sql: Option<&str>,
         timers: Option<crate::session::TurnTimers>,
     ) -> ReadOnlyRun {
+        start_read_only_task_prepped(
+            role,
+            with_prep,
+            "printf 'gitdir: /nonexistent\\n' > .git",
+            task_config,
+            steps,
+            setup_sql,
+            timers,
+        )
+        .await
+    }
+
+    /// As `start_read_only_task_full`, with the `prep` stage's shell command.
+    async fn start_read_only_task_prepped(
+        role: &str,
+        with_prep: bool,
+        prep: &str,
+        task_config: Value,
+        steps: Value,
+        setup_sql: Option<&str>,
+        timers: Option<crate::session::TurnTimers>,
+    ) -> ReadOnlyRun {
         let pool = connect_in_memory().await.unwrap();
         if let Some(sql) = setup_sql {
             sqlx::query(sql).execute(&pool).await.unwrap();
@@ -15975,7 +16007,9 @@ stages:
         let repo = tempdir();
         init_git_repo(&repo).await;
         fs::write(dir.join("p.md"), "review it").unwrap();
-        let mut yaml = READ_ONLY_WORKFLOW.replace("ROLE", role);
+        let mut yaml = READ_ONLY_WORKFLOW
+            .replace("ROLE", role)
+            .replace("PREP", prep);
         if !with_prep {
             // Drop the `prep` stage so `review` is the entry stage.
             let start = yaml.find("  prep:").unwrap();
@@ -16349,6 +16383,30 @@ stages:
         def.roles.remove("reviewer");
         let note = unverified_note(&def, "review", &"boom").unwrap();
         assert!(note.contains("could not verify"), "{note}");
+        // A stage that is not an agent_turn is unverifiable too, and the
+        // note names the stage rather than an invented role.
+        let note = unverified_note(&def, "verified", &"boom").unwrap();
+        assert!(note.contains("stage 'verified'"), "{note}");
+        assert!(!note.contains("'unknown'"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_content_only_change_to_a_dirty_file_is_named_as_such() {
+        let run = start_read_only_task_prepped(
+            "reviewer",
+            true,
+            "printf a >> README.md",
+            json!({}),
+            ro_steps(&["printf b >> README.md"]),
+            None,
+            None,
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("git status or file contents changed (1 entries)"),
+            "{reason}"
+        );
     }
 
     #[tokio::test]
@@ -16380,6 +16438,11 @@ stages:
         let reason = stuck_reason(&run.pool, &run.task_id).await;
         assert!(
             reason.contains("could not verify that read-only role 'reviewer'"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("inspect and reset the worktree before retrying")
+                && !reason.contains("outcome was not applied"),
             "{reason}"
         );
     }
@@ -16561,6 +16624,10 @@ stages:
         let reason = stuck_reason(&run.pool, &run.task_id).await;
         assert!(
             reason.contains("could not verify") && reason.contains("'reviewer'"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("The turn's outcome was not applied"),
             "{reason}"
         );
         let session = runs_for_stage(&run.pool, &run.task_id, "review")
