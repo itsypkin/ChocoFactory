@@ -2263,6 +2263,27 @@ fn a_failed_first_answer_stays_visible_on_a_short_screen() {
 }
 
 #[test]
+fn a_waiting_task_keeps_its_progress_or_error_on_a_tiny_screen() {
+    let id = "3f2a91c0-aaaa";
+    let mut app = board();
+    open_detail(&mut app, id);
+    answer(&mut app, id, Err("connection refused".into()));
+    let s = render(&app, 40, 10);
+    assert!(s.contains("─ progress"), "{s}");
+    assert!(s.contains("could not load the task"), "{s}");
+    assert!(s.contains("Stage"), "{s}");
+
+    let mut app = board();
+    open_detail(&mut app, id);
+    let mut data = busy_detail();
+    data["id"] = id.into();
+    answer(&mut app, id, Ok(data));
+    let s = render(&app, 40, 10);
+    assert!(s.contains("─ progress"), "{s}");
+    assert!(s.contains("4. revising"), "{s}");
+}
+
+#[test]
 fn an_open_task_without_a_stage_time_shows_the_bare_stage() {
     let mut app = board();
     app.active

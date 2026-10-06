@@ -564,6 +564,8 @@ struct FRow {
     value: String,
     error: bool,
     wrap: bool,
+    /// Most screen lines a wrapped row may take (cut with `…` beyond).
+    cap: usize,
     /// Which cut drops this row when the screen is short (1 = first to go).
     drop: u8,
 }
@@ -575,6 +577,7 @@ impl FRow {
             value,
             error: false,
             wrap: false,
+            cap: WRAP_MAX,
             drop: 0,
         }
     }
@@ -720,8 +723,8 @@ fn row_lines(row: &FRow, label_w: usize, width: usize) -> Vec<String> {
     }
     let room = width.saturating_sub(label_w + 2).max(1);
     let mut parts = wrap_chars(&crate::render::single_line(&row.value), room);
-    if parts.len() > WRAP_MAX {
-        parts.truncate(WRAP_MAX);
+    if parts.len() > row.cap {
+        parts.truncate(row.cap);
         let last = parts.last_mut().expect("wrap keeps a line");
         *last = fit(&format!("{last}…"), room);
     }
@@ -899,6 +902,24 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
                     break;
                 }
                 rows.retain(|r| r.drop != cut);
+            }
+            // Still too tall: wrapped rows shrink to one line, then trailing
+            // rows go, so the progress separator and a progress (or error)
+            // line always stay on screen.
+            let h = |keep: usize| if keep < prog.len() { keep + 1 } else { keep };
+            if block(&rows, h(keep_prog)) > body_h {
+                for r in rows.iter_mut().filter(|r| r.wrap) {
+                    r.cap = 1;
+                }
+                const KEEP: [&str; 5] = ["ID", "Project", "Workflow", "Status", "Stage"];
+                while block(&rows, h(keep_prog)) > body_h {
+                    match rows.iter().rposition(|r| !KEEP.contains(&r.label)) {
+                        Some(i) => {
+                            rows.remove(i);
+                        }
+                        None => break,
+                    }
+                }
             }
         }
     }
