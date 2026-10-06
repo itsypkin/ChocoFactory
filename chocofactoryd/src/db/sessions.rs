@@ -3,8 +3,14 @@ use chrono::{DateTime, Utc};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-const COLUMNS: &str = "id, task_id, stage, role, cli_adapter, model, adapter_session_id, status, \
-     end_reason, resumed_from, started_at, ended_at";
+// A macro rather than a const so `concat!` can build each query as the
+// `&'static str` that sqlx 0.9 accepts without `AssertSqlSafe`.
+macro_rules! columns {
+    () => {
+        "id, task_id, stage, role, cli_adapter, model, adapter_session_id, status, \
+     end_reason, resumed_from, started_at, ended_at"
+    };
+}
 
 #[derive(FromRow)]
 struct SessionRow {
@@ -104,11 +110,12 @@ async fn create_inner(
 ) -> Result<Session, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let row = sqlx::query_as::<_, SessionRow>(&format!(
+    let row = sqlx::query_as::<_, SessionRow>(concat!(
         "INSERT INTO sessions (id, task_id, stage, role, cli_adapter, model, adapter_session_id, \
          status, resumed_from, started_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         RETURNING {COLUMNS}"
+         RETURNING ",
+        columns!()
     ))
     .bind(id)
     .bind(new.task_id)
@@ -162,17 +169,22 @@ pub async fn resume_chain_len(
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Session>, sqlx::Error> {
-    let row =
-        sqlx::query_as::<_, SessionRow>(&format!("SELECT {COLUMNS} FROM sessions WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
+    let row = sqlx::query_as::<_, SessionRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM sessions WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(Into::into))
 }
 
 pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<Session>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, SessionRow>(&format!(
-        "SELECT {COLUMNS} FROM sessions WHERE task_id = ? ORDER BY id"
+    let rows = sqlx::query_as::<_, SessionRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM sessions WHERE task_id = ? ORDER BY id"
     ))
     .bind(task_id)
     .fetch_all(pool)
@@ -201,8 +213,10 @@ pub async fn get_current_for_stage(
     // query's result nondeterministic (`fetch_optional` would pick
     // whichever row the engine happened to visit first) rather than
     // merely "arbitrary among ties" the way an explicit tie-break is.
-    let row = sqlx::query_as::<_, SessionRow>(&format!(
-        "SELECT {COLUMNS} FROM sessions WHERE task_id = ? AND stage = ? ORDER BY started_at DESC, id DESC LIMIT 1"
+    let row = sqlx::query_as::<_, SessionRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM sessions WHERE task_id = ? AND stage = ? ORDER BY started_at DESC, id DESC LIMIT 1"
     ))
     .bind(task_id)
     .bind(stage)
@@ -217,8 +231,9 @@ pub async fn set_adapter_session_id(
     id: &str,
     adapter_session_id: &str,
 ) -> Result<Option<Session>, sqlx::Error> {
-    let row = sqlx::query_as::<_, SessionRow>(&format!(
-        "UPDATE sessions SET adapter_session_id = ? WHERE id = ? RETURNING {COLUMNS}"
+    let row = sqlx::query_as::<_, SessionRow>(concat!(
+        "UPDATE sessions SET adapter_session_id = ? WHERE id = ? RETURNING ",
+        columns!()
     ))
     .bind(adapter_session_id)
     .bind(id)
@@ -246,8 +261,9 @@ pub async fn update_status(
     ended_at: Option<DateTime<Utc>>,
     end_reason: Option<SessionEndReason>,
 ) -> Result<Option<Session>, sqlx::Error> {
-    let row = sqlx::query_as::<_, SessionRow>(&format!(
-        "UPDATE sessions SET status = ?, ended_at = ?, end_reason = ? WHERE id = ? RETURNING {COLUMNS}"
+    let row = sqlx::query_as::<_, SessionRow>(concat!(
+        "UPDATE sessions SET status = ?, ended_at = ?, end_reason = ? WHERE id = ? RETURNING ",
+        columns!()
     ))
     .bind(status.to_string())
     .bind(ended_at)

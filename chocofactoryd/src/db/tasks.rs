@@ -5,9 +5,15 @@ use sqlx::types::Json;
 use sqlx::{FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
-const COLUMNS: &str = "id, project_id, workflow_def, title, status, config, \
+// A macro rather than a const so `concat!` can build each query as the
+// `&'static str` that sqlx 0.9 accepts without `AssertSqlSafe`.
+macro_rules! columns {
+    () => {
+        "id, project_id, workflow_def, title, status, config, \
      worktree_repo, worktree_project, stuck_reason, kept_work, workflow_path, workflow_sha256, \
-     created_at, updated_at";
+     created_at, updated_at"
+    };
+}
 
 #[derive(FromRow)]
 struct TaskRow {
@@ -68,11 +74,12 @@ pub struct NewTask<'a> {
 pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let row = sqlx::query_as::<_, TaskRow>(&format!(
+    let row = sqlx::query_as::<_, TaskRow>(concat!(
         "INSERT INTO tasks (id, project_id, workflow_def, title, status, config, \
          workflow_path, workflow_sha256, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
-         RETURNING {COLUMNS}"
+         RETURNING ",
+        columns!()
     ))
     .bind(id)
     .bind(new.project_id)
@@ -89,10 +96,11 @@ pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::E
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Task>, sqlx::Error> {
-    let row = sqlx::query_as::<_, TaskRow>(&format!("SELECT {COLUMNS} FROM tasks WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query_as::<_, TaskRow>(concat!("SELECT ", columns!(), " FROM tasks WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(Into::into))
 }
 
@@ -103,7 +111,7 @@ pub async fn list(
     project_id: Option<&str>,
     status: Option<&str>,
 ) -> Result<Vec<Task>, sqlx::Error> {
-    let mut qb = QueryBuilder::new(format!("SELECT {COLUMNS} FROM tasks"));
+    let mut qb = QueryBuilder::new(concat!("SELECT ", columns!(), " FROM tasks"));
     let mut has_where = false;
     if let Some(project_id) = project_id {
         qb.push(" WHERE project_id = ")
@@ -163,7 +171,7 @@ pub async fn list_summaries(
     order: SummaryOrder,
     limit: Option<i64>,
 ) -> Result<Vec<TaskSummary>, sqlx::Error> {
-    let task_columns = COLUMNS
+    let task_columns = columns!()
         .split(',')
         .map(|c| format!("t.{}", c.trim()))
         .collect::<Vec<_>>()
@@ -255,9 +263,10 @@ pub async fn update_status(
     status: &str,
 ) -> Result<Option<Task>, sqlx::Error> {
     let now = Utc::now();
-    let row = sqlx::query_as::<_, TaskRow>(&format!(
+    let row = sqlx::query_as::<_, TaskRow>(concat!(
         "UPDATE tasks SET status = ?, stuck_reason = NULL, updated_at = ? \
-         WHERE id = ? RETURNING {COLUMNS}"
+         WHERE id = ? RETURNING ",
+        columns!()
     ))
     .bind(status)
     .bind(now)
@@ -278,9 +287,10 @@ pub async fn mark_cancelled(
     kept_work: bool,
 ) -> Result<Option<Task>, sqlx::Error> {
     let now = Utc::now();
-    let row = sqlx::query_as::<_, TaskRow>(&format!(
+    let row = sqlx::query_as::<_, TaskRow>(concat!(
         "UPDATE tasks SET status = 'cancelled', kept_work = ?, stuck_reason = NULL, \
-         updated_at = ? WHERE id = ? RETURNING {COLUMNS}"
+         updated_at = ? WHERE id = ? RETURNING ",
+        columns!()
     ))
     .bind(kept_work)
     .bind(now)
@@ -330,9 +340,10 @@ pub async fn count_by_status(
 /// `WorkflowEngine::retry_task` maps to `NotStuck`.
 pub async fn reopen_stuck(pool: &SqlitePool, id: &str) -> Result<Option<Task>, sqlx::Error> {
     let now = Utc::now();
-    let row = sqlx::query_as::<_, TaskRow>(&format!(
+    let row = sqlx::query_as::<_, TaskRow>(concat!(
         "UPDATE tasks SET status = 'open', stuck_reason = NULL, updated_at = ? \
-         WHERE id = ? AND status = 'stuck' RETURNING {COLUMNS}"
+         WHERE id = ? AND status = 'stuck' RETURNING ",
+        columns!()
     ))
     .bind(now)
     .bind(id)
@@ -371,9 +382,10 @@ pub async fn merge_config(
     patch: Value,
 ) -> Result<Option<Task>, sqlx::Error> {
     let now = Utc::now();
-    let row = sqlx::query_as::<_, TaskRow>(&format!(
+    let row = sqlx::query_as::<_, TaskRow>(concat!(
         "UPDATE tasks SET config = json_patch(config, ?), updated_at = ? \
-         WHERE id = ? RETURNING {COLUMNS}"
+         WHERE id = ? RETURNING ",
+        columns!()
     ))
     .bind(Json(patch))
     .bind(now)
@@ -396,9 +408,10 @@ pub async fn set_worktree(
     project: &str,
 ) -> Result<Option<Task>, sqlx::Error> {
     let now = Utc::now();
-    let row = sqlx::query_as::<_, TaskRow>(&format!(
+    let row = sqlx::query_as::<_, TaskRow>(concat!(
         "UPDATE tasks SET worktree_repo = ?, worktree_project = ?, updated_at = ? \
-         WHERE id = ? RETURNING {COLUMNS}"
+         WHERE id = ? RETURNING ",
+        columns!()
     ))
     .bind(repo)
     .bind(project)
