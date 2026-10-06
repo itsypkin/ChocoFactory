@@ -1,6 +1,5 @@
 pub mod adapter;
 pub mod api;
-pub mod capture;
 pub mod config_root;
 pub mod daemon_lock;
 pub mod db;
