@@ -10,9 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::app::{
-    App, Detail, Level, PromptKind, Scope, Section, View, fmt_duration, laps_by_stage, max_laps,
-};
+use super::app::{App, Detail, Level, PromptKind, Scope, Section, View, fmt_duration, max_laps};
 
 pub const MIN_WIDTH: u16 = 40;
 pub const MIN_HEIGHT: u16 = 10;
@@ -555,106 +553,234 @@ fn separator(title: &str, width: usize) -> String {
     format!("{head}{}", "─".repeat(width.saturating_sub(n)))
 }
 
-fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
-    let width = area.width as usize;
-    let mut head: Vec<(String, Style)> = Vec::new();
-    let plain = Style::default();
+/// Most events the status view's tail shows.
+const STATUS_TAIL: usize = 5;
+/// Lines a wrapping field (`Stuck`, `Waiting for`) may take.
+const WRAP_MAX: usize = 3;
 
-    match &d.snapshot {
-        None => head.push(("(task is no longer listed)".into(), plain)),
-        Some(t) => {
-            let right = "Esc back · ? help";
-            let title = pad(
-                &t.task.title,
-                width.saturating_sub(right.chars().count() + 2),
-            );
-            head.push((
-                format!("{title}  {right}"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            let project = app.project_label(&t.task.project_id);
-            head.extend(
-                wrap_chars(
-                    &format!(
-                        "id {} · project {} · workflow {} · status {}",
-                        t.task.id, project, t.task.workflow_def, t.task.status
-                    ),
-                    width,
-                )
-                .into_iter()
-                .map(|l| (l, plain)),
-            );
-            let mut stage = format!(
-                "stage {} for {}",
-                t.current_stage.as_deref().unwrap_or("-"),
-                age(app, t.stage_entered_at)
-            );
-            let laps = laps_by_stage(t);
-            if !laps.is_empty() {
-                let parts: Vec<String> = laps.iter().map(|(s, n)| format!("{s} ×{n}")).collect();
-                stage.push_str(&format!(" · laps {}", parts.join(", ")));
-            }
-            match &t.pr {
-                Some(pr) => stage.push_str(&format!(" · PR {}", pr.url)),
-                None => stage.push_str(" · PR none yet"),
-            }
-            head.extend(wrap_chars(&stage, width).into_iter().map(|l| (l, plain)));
-            if let Some(reason) = &t.task.stuck_reason {
-                head.extend(
-                    wrap_chars(&format!("stuck: {reason}"), width)
-                        .into_iter()
-                        .map(|l| (l, error_style(app))),
-                );
-            }
+/// One field row of the status view.
+struct FRow {
+    label: &'static str,
+    value: String,
+    error: bool,
+    wrap: bool,
+    /// Most screen lines a wrapped row may take (cut with `…` beyond).
+    cap: usize,
+    /// Which cut drops this row when the screen is short (1 = first to go).
+    drop: u8,
+}
+
+impl FRow {
+    fn new(label: &'static str, value: String) -> Self {
+        FRow {
+            label,
+            value,
+            error: false,
+            wrap: false,
+            cap: WRAP_MAX,
+            drop: 0,
         }
     }
+}
 
-    // History: the last few wrapped lines of the trail.
-    let (hist, hist_style): (Vec<String>, Style) = match &d.trail {
-        None => (vec!["loading…".into()], plain),
-        Some(Err(e)) => (
-            wrap_chars(&format!("could not load history: {e}"), width),
-            error_style(app),
+fn waiting_text(stage: &str, id: &str) -> Option<String> {
+    match stage {
+        "awaiting_human_review" => Some(
+            "your verdict: a PR comment with /approve or /request-changes on its own line"
+                .to_string(),
         ),
-        Some(Ok(steps)) if steps.is_empty() => (vec!["(none)".into()], plain),
-        Some(Ok(steps)) => {
-            let text = steps
-                .iter()
-                .map(|s| match &s.outcome {
-                    Some(o) => format!("{} (via {o})", s.stage),
-                    None => s.stage.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(" → ");
-            let mut lines = wrap_chars(&text, width.saturating_sub(2));
-            if lines.len() > 3 {
-                lines = lines.split_off(lines.len() - 3);
-                lines[0] = format!("…{}", lines[0]);
+        "escalate_to_human" => Some(format!(
+            "a note to resume it: choco task send {id} --text \"…\""
+        )),
+        "spec_questions" => Some(format!(
+            "your answers to the spec check's questions: choco task send {id} --text \"…\""
+        )),
+        _ => None,
+    }
+}
+
+/// The rows of the fields block: `choco task status`'s rows from the last
+/// answer when there is one, adjusted for the dashboard; else what the
+/// snapshot can give.
+fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
+    let snap = d.snapshot.as_ref();
+    let mut rows: Vec<FRow> = Vec::new();
+    let mut paths = 0;
+    if let Some(v) = &d.data {
+        for (label, value) in crate::render::task_fields(v) {
+            let mut row = FRow::new(label, value);
+            match label {
+                "Title" => continue,
+                "Project" => {
+                    let pid = snap
+                        .map(|t| t.task.project_id.as_str())
+                        .or_else(|| v.get("project_id").and_then(|p| p.as_str()));
+                    if let Some(pid) = pid {
+                        row.value = app.project_label(pid);
+                    }
+                }
+                "Workflow" | "Workflow file" => {
+                    paths += 1;
+                    if label == "Workflow file" || paths == 2 {
+                        row.drop = 4;
+                    }
+                }
+                "Status" => {
+                    if let Some(t) = snap {
+                        row.value = t.task.status.clone();
+                    }
+                }
+                // The snapshot is fresher: rebuilt after Status below.
+                "Stuck" if snap.is_some() => continue,
+                "Stuck" => {
+                    row.error = true;
+                    row.wrap = true;
+                }
+                "Role" => row.drop = 1,
+                "Created" => row.drop = 2,
+                "Repo" => row.drop = 3,
+                _ => {}
             }
-            (lines, plain)
+            rows.push(row);
+        }
+    } else if let Some(t) = snap {
+        rows.push(FRow::new("ID", t.task.id.clone()));
+        rows.push(FRow::new("Project", app.project_label(&t.task.project_id)));
+        rows.push(FRow::new("Workflow", t.task.workflow_def.clone()));
+        rows.push(FRow::new("Status", t.task.status.clone()));
+    }
+    if let Some(t) = snap
+        && let Some(pos) = rows.iter().position(|r| r.label == "Status")
+        && t.task.status == "stuck"
+        && let Some(reason) = &t.task.stuck_reason
+    {
+        let mut row = FRow::new("Stuck", crate::render::single_line(reason));
+        row.error = true;
+        row.wrap = true;
+        rows.insert(pos + 1, row);
+    }
+
+    // Stage, with the time in it (or how long ago it ended), then PR and
+    // what the task waits for.
+    let stage_name = snap
+        .and_then(|t| t.current_stage.as_deref())
+        .or_else(|| d.data.as_ref().and_then(crate::render::detail_stage));
+    let stage_value = match (snap, stage_name) {
+        (Some(t), name) => {
+            let name = name.unwrap_or("-");
+            match t.task.status.as_str() {
+                "closed" | "cancelled" => format!(
+                    "{name} ({} {} ago)",
+                    t.task.status,
+                    fmt_duration(app.now - t.task.updated_at)
+                ),
+                _ => match t.stage_entered_at {
+                    Some(at) => format!("{name} for {}", fmt_duration(app.now - at)),
+                    None => name.to_string(),
+                },
+            }
+        }
+        (None, Some(name)) => name.to_string(),
+        (None, None) => String::new(),
+    };
+    let at = match rows.iter().position(|r| r.label == "Stage") {
+        Some(pos) => {
+            rows[pos].value = stage_value;
+            pos
+        }
+        None => {
+            if snap.is_some() || !stage_value.is_empty() {
+                rows.push(FRow::new("Stage", stage_value));
+            }
+            rows.len().saturating_sub(1)
         }
     };
-
-    let fixed = head.len() + 1 + hist.len() + 1 + 1;
-    let ev_h = (area.height as usize).saturating_sub(fixed);
-    d.page.set(ev_h.max(1));
-
-    let n = d.events.len();
-    let back = d.scroll_back.min(n.saturating_sub(ev_h));
-    let end = n - back;
-    let start = end.saturating_sub(ev_h);
-
-    let mut lines: Vec<Line> = Vec::new();
-    for (text, style) in &head {
-        lines.push(Line::styled(fit(text, width), *style));
+    let mut extra = Vec::new();
+    if let Some(t) = snap {
+        if let Some(pr) = &t.pr {
+            extra.push(FRow::new("PR", format!("#{} {}", pr.number, pr.url)));
+        }
+        if t.task.status == "open"
+            && let Some(stage) = t.current_stage.as_deref()
+            && super::app::NEEDS_YOU_STAGES.contains(&stage)
+            && let Some(text) = waiting_text(stage, &t.task.id)
+        {
+            let mut row = FRow::new("Waiting for", text);
+            row.wrap = true;
+            extra.push(row);
+        }
     }
-    lines.push(Line::raw(separator("stage history", width)));
-    for l in &hist {
-        lines.push(Line::styled(
-            format!("  {}", fit(l, width.saturating_sub(2))),
-            hist_style,
-        ));
+    let at = (at + 1).min(rows.len());
+    rows.splice(at..at, extra);
+    rows
+}
+
+/// A row as screen lines: cut to the width, or wrapped for `wrap` rows.
+fn row_lines(row: &FRow, label_w: usize, width: usize) -> Vec<String> {
+    let head = format!("{:<label_w$}  ", row.label);
+    if !row.wrap {
+        return vec![fit(format!("{head}{}", row.value).trim_end(), width)];
     }
+    let room = width.saturating_sub(label_w + 2).max(1);
+    let mut parts = wrap_chars(&crate::render::single_line(&row.value), room);
+    if parts.len() > row.cap {
+        parts.truncate(row.cap);
+        let last = parts.last_mut().expect("wrap keeps a line");
+        *last = fit(&format!("{last}…"), room);
+    }
+    let pad = " ".repeat(label_w + 2);
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i == 0 {
+                fit(&format!("{head}{p}"), width)
+            } else {
+                fit(&format!("{pad}{p}"), width)
+            }
+        })
+        .collect()
+}
+
+fn event_line(e: &chocofactory_core::models::Event, width: usize) -> String {
+    let time = e.created_at.with_timezone(&Local).format("%H:%M:%S");
+    let text = format!(
+        "  {time}  {:<14} {}",
+        e.event_type,
+        crate::render::event_summary(e)
+    );
+    fit(&text, width)
+}
+
+fn title_line(app: &App, d: &Detail, width: usize) -> Line<'static> {
+    let right = if d.expanded {
+        "e status · Esc back · ? help"
+    } else {
+        "e events · Esc back · ? help"
+    };
+    let title = match (&d.snapshot, &d.data) {
+        (Some(t), _) => t.task.title.clone(),
+        (None, Some(v)) => v
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("-")
+            .to_string(),
+        (None, None) => "(task is no longer listed)".to_string(),
+    };
+    let _ = app;
+    let title = pad(&title, width.saturating_sub(right.chars().count() + 2));
+    Line::styled(
+        format!("{title}  {right}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )
+}
+
+fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
+    let width = area.width as usize;
+    let body_h = area.height.saturating_sub(1) as usize;
+    let plain = Style::default();
+    let mut lines: Vec<Line> = vec![title_line(app, d, width)];
+
     let ev_title = if d.reconnecting {
         "events: reconnecting"
     } else if d.following {
@@ -662,23 +788,205 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     } else {
         "events (scrolled · End follows)"
     };
-    lines.push(Line::styled(
-        separator(ev_title, width),
-        if d.reconnecting {
-            error_style(app)
-        } else {
-            plain
-        },
-    ));
-    for e in &d.events[start..end] {
-        let time = e.created_at.with_timezone(&Local).format("%H:%M:%S");
-        let text = format!(
-            "  {time}  {:<14} {}",
-            e.event_type,
-            crate::render::event_summary(e)
-        );
-        lines.push(Line::raw(fit(&text, width)));
+    let ev_sep_style = if d.reconnecting {
+        error_style(app)
+    } else {
+        plain
+    };
+
+    if d.expanded {
+        let ev_h = body_h.saturating_sub(2);
+        d.page.set(ev_h.max(1));
+        let n = d.events.len();
+        let back = d.scroll_back.min(n.saturating_sub(ev_h));
+        let end = n - back;
+        let start = end.saturating_sub(ev_h);
+        lines.push(Line::styled(separator(ev_title, width), ev_sep_style));
+        for e in &d.events[start..end] {
+            lines.push(Line::raw(event_line(e, width)));
+        }
+        draw_detail_body(frame, app, lines, area, EXPANDED_HINTS);
+        return;
     }
+
+    // ---- status view ----
+    let mut rows = field_rows(app, d);
+    let widest = |rows: &[FRow]| {
+        rows.iter()
+            .map(|r| r.label.chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let label_w_cell = std::cell::Cell::new(widest(&rows));
+    let has_task = d.snapshot.is_some() || d.data.is_some();
+
+    // Progress section: lines, and the separator's title.
+    let mut prog_title = "progress".to_string();
+    let mut prog_err = false;
+    let mut prog: Vec<(String, Style)> = Vec::new();
+    let mut cuttable = true;
+    match (&d.data, &d.error) {
+        (None, None) => prog.push(("  loading…".into(), plain)),
+        (None, Some(e)) => {
+            // An error is never "cut to earlier steps": it keeps its head
+            // and the bottom clip takes the rest.
+            cuttable = false;
+            prog.extend(
+                wrap_chars(
+                    &format!("could not load the task: {e}"),
+                    width.saturating_sub(2).max(1),
+                )
+                .into_iter()
+                .map(|l| (format!("  {l}"), error_style(app))),
+            )
+        }
+        (Some(v), err) => {
+            if let Some(e) = err {
+                prog_title = format!("progress (refresh failed: {e})");
+                prog_err = true;
+            }
+            match crate::render::detail_progress(v) {
+                Some(l) => prog.extend(l.into_iter().map(|l| (l, plain))),
+                None => prog.push((
+                    "  (no workflow state — the task has not started)".into(),
+                    plain,
+                )),
+            }
+        }
+    }
+    let counters = d.data.as_ref().and_then(crate::render::loop_counters_line);
+
+    let events_n = d.events.len();
+    let want_tail = events_n.clamp(1, STATUS_TAIL);
+    let row_h = |rows: &[FRow]| -> usize {
+        rows.iter()
+            .map(|r| row_lines(r, label_w_cell.get(), width).len())
+            .sum()
+    };
+    let block = |rows: &[FRow], prog_h: usize| -> usize {
+        1 + if has_task { row_h(rows) } else { 0 } + 1 + prog_h + usize::from(counters.is_some())
+    };
+
+    let mut keep_prog = prog.len();
+    let mut tail = 0;
+    if !has_task {
+        rows.clear();
+    }
+    if block(&rows, keep_prog) + 1 + want_tail <= body_h {
+        tail = want_tail;
+    } else {
+        // The tail shrinks first, one event at a time; without room for an
+        // event line its separator goes too.
+        let avail = body_h.saturating_sub(block(&rows, keep_prog));
+        if avail >= 2 {
+            tail = (avail - 1).min(want_tail);
+        }
+        if tail == 0 {
+            // Then the status block: older progress lines first...
+            let fits = |m: usize, rows: &[FRow]| {
+                let h = if m < prog.len() { m + 1 } else { m };
+                block(rows, h) <= body_h
+            };
+            if cuttable {
+                keep_prog = (1..=prog.len())
+                    .rev()
+                    .find(|&m| m != prog.len().saturating_sub(1) && fits(m, &rows))
+                    .unwrap_or(if prog.len() <= 2 { prog.len() } else { 1 });
+            }
+            // ...then the Role, Created, Repo and workflow path rows.
+            for cut in 1..=4u8 {
+                let h = if keep_prog < prog.len() {
+                    keep_prog + 1
+                } else {
+                    keep_prog
+                };
+                if block(&rows, h) <= body_h {
+                    break;
+                }
+                rows.retain(|r| r.drop != cut);
+            }
+            // Still too tall: wrapped rows shrink a line at a time, then
+            // trailing rows go, so the progress separator and one progress
+            // (or error) line stay on screen. Extra error lines and the
+            // loop counters are left to the bottom clip.
+            let tight = |rows: &[FRow]| {
+                let h = if keep_prog < prog.len() {
+                    keep_prog + 1
+                } else {
+                    prog.len().min(if cuttable { 2 } else { 1 })
+                };
+                block(rows, h) - usize::from(counters.is_some())
+            };
+            const KEEP: [&str; 5] = ["ID", "Project", "Workflow", "Status", "Stage"];
+            while tight(&rows) > body_h {
+                if let Some(i) = rows.iter().position(|r| r.wrap && r.cap > 1) {
+                    rows[i].cap -= 1;
+                    continue;
+                }
+                match rows.iter().rposition(|r| !KEEP.contains(&r.label)) {
+                    Some(i) => {
+                        rows.remove(i);
+                    }
+                    None => break,
+                }
+            }
+            label_w_cell.set(widest(&rows));
+        }
+    }
+
+    if has_task {
+        for r in &rows {
+            let style = if r.error { error_style(app) } else { plain };
+            for l in row_lines(r, label_w_cell.get(), width) {
+                lines.push(Line::styled(l, style));
+            }
+        }
+    }
+    lines.push(Line::styled(
+        fit(&separator(&prog_title, width), width),
+        if prog_err { error_style(app) } else { plain },
+    ));
+    let hidden = prog.len() - keep_prog;
+    if hidden > 0 {
+        lines.push(Line::raw(fit(
+            // Never 1: replacing a single line with the "earlier" line saves
+            // nothing, so the cut skips it.
+            &format!("  … {hidden} earlier steps"),
+            width,
+        )));
+    }
+    for (l, st) in &prog[hidden..] {
+        lines.push(Line::styled(fit(l, width), *st));
+    }
+    if let Some(c) = &counters {
+        lines.push(Line::raw(fit(c, width)));
+    }
+    if tail > 0 {
+        lines.push(Line::styled(
+            separator(
+                if d.reconnecting {
+                    "events: reconnecting"
+                } else {
+                    "last events (e expands)"
+                },
+                width,
+            ),
+            ev_sep_style,
+        ));
+        if events_n == 0 {
+            lines.push(Line::raw("  (no events yet)"));
+        }
+        for e in &d.events[events_n.saturating_sub(tail)..] {
+            lines.push(Line::raw(event_line(e, width)));
+        }
+    }
+    draw_detail_body(frame, app, lines, area, STATUS_HINTS);
+}
+
+const STATUS_HINTS: &str = "e events  o PR  r retry  c cancel  Esc back";
+const EXPANDED_HINTS: &str = "PgUp/PgDn scroll  End follow  e status  o PR  r retry  c cancel";
+
+fn draw_detail_body(frame: &mut Frame, app: &App, lines: Vec<Line>, area: Rect, hints: &str) {
     let body_h = area.height.saturating_sub(1);
     frame.render_widget(
         Paragraph::new(lines),
@@ -688,7 +996,7 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
         frame,
         app,
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
-        "PgUp/PgDn scroll  End follow  o PR  r retry  c cancel  Esc back",
+        hints,
     );
 }
 
@@ -763,6 +1071,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("⇥ / ⇧⇥      next section    r     retry stuck"),
         Line::from("?           this help       c     cancel"),
         Line::from("q  Ctrl-C   quit"),
+        Line::from("e           events / status"),
     ];
     let r = centered(area, 52, lines.len() as u16 + 2);
     frame.render_widget(Clear, r);

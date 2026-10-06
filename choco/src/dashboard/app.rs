@@ -85,21 +85,19 @@ pub struct StatusLine {
     pub level: Level,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrailStep {
-    pub stage: String,
-    pub outcome: Option<String>,
-}
-
 /// State of the full-screen detail view.
 pub struct Detail {
     pub id: String,
     /// The task's latest summary, kept so the view survives the task
     /// dropping out of the lists (e.g. beyond `--closed`).
     pub snapshot: Option<TaskSummary>,
-    /// `Ok(trail)` once `GET /tasks/{id}` answered; the error text if it
-    /// failed; `None` before the first answer.
-    pub trail: Option<Result<Vec<TrailStep>, String>>,
+    /// The last good `GET /tasks/{id}` answer; `None` before one arrived.
+    pub data: Option<Value>,
+    /// Why the latest `GET /tasks/{id}` failed; cleared by the next success.
+    /// With `data` set it is a refresh that failed, never silently dropped.
+    pub error: Option<String>,
+    /// The expanded event view (`e`) instead of the status view.
+    pub expanded: bool,
     pub events: Vec<Event>,
     pub reconnecting: bool,
     pub following: bool,
@@ -385,15 +383,7 @@ impl App {
     }
 }
 
-/// The loop count of one `loop_counters` value: a bare number, or the
-/// engine's `{count: N, ...}` object.
-pub fn loop_count(v: &Value) -> u64 {
-    match v {
-        Value::Number(n) => n.as_u64().unwrap_or(0),
-        Value::Object(o) => o.get("count").and_then(Value::as_u64).unwrap_or(0),
-        _ => 0,
-    }
-}
+pub use crate::render::loop_count;
 
 /// Every non-zero loop counter, by stage name.
 pub fn laps_by_stage(t: &TaskSummary) -> Vec<(String, u64)> {
@@ -475,7 +465,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             if let View::Detail(d) = &mut app.view
                 && d.id == id
             {
-                d.trail = Some(result.map(|v| trail_from(&v)));
+                match result {
+                    Ok(v) => {
+                        d.data = Some(v);
+                        d.error = None;
+                    }
+                    Err(e) => d.error = Some(e),
+                }
             }
             Vec::new()
         }
@@ -541,28 +537,6 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
     }
-}
-
-fn trail_from(v: &Value) -> Vec<TrailStep> {
-    v.get("stage_trail")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .map(|e| TrailStep {
-                    stage: e
-                        .pointer("/payload/stage")
-                        .and_then(Value::as_str)
-                        .unwrap_or("?")
-                        .to_string(),
-                    outcome: e
-                        .pointer("/payload/outcome")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn on_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
@@ -702,7 +676,9 @@ fn list_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
                 app.view = View::Detail(Detail {
                     id: id.clone(),
                     snapshot,
-                    trail: None,
+                    data: None,
+                    error: None,
+                    expanded: false,
                     events: Vec::new(),
                     reconnecting: false,
                     following: true,
@@ -757,10 +733,24 @@ fn detail_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     let page = d.page.get().max(1);
     let max_back = d.events.len().saturating_sub(1);
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Char('q') => {
             app.view = View::List;
             return vec![Effect::CloseSocket];
         }
+        KeyCode::Esc if !d.expanded => {
+            app.view = View::List;
+            return vec![Effect::CloseSocket];
+        }
+        KeyCode::Esc => d.expanded = false,
+        KeyCode::Char('e') => {
+            d.expanded = !d.expanded;
+            if d.expanded {
+                d.following = true;
+                d.scroll_back = 0;
+            }
+        }
+        // The status view has no scrolling.
+        _ if !d.expanded => {}
         KeyCode::PageUp => {
             d.following = false;
             d.scroll_back = (d.scroll_back + page).min(max_back);
@@ -780,7 +770,8 @@ fn detail_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     Vec::new()
 }
 
-/// `45s`, `12m`, `2h05m`, `3d04h`.
+/// `45s`, `12m`, `2h05m`, `3d04h`; whole days from 100 on (`123d`), so the
+/// time column's width holds.
 pub fn fmt_duration(d: chrono::Duration) -> String {
     let s = d.num_seconds().max(0);
     if s < 60 {
@@ -789,6 +780,8 @@ pub fn fmt_duration(d: chrono::Duration) -> String {
         format!("{}m", s / 60)
     } else if s < 86_400 {
         format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 100 * 86_400 {
+        format!("{}d", s / 86_400)
     } else {
         format!("{}d{:02}h", s / 86_400, (s % 86_400) / 3600)
     }
