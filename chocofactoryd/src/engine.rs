@@ -3973,6 +3973,18 @@ impl WorkflowEngine {
                                  retry will start the stage fresh"
                             ));
                         }
+                        // A read-only role may have changed the worktree
+                        // before the daemon stopped (#172).
+                        match self
+                            .read_only_verdict(task_id, &definition, &stage, &session.id)
+                            .await
+                        {
+                            ReadOnlyVerdict::Clean => {}
+                            ReadOnlyVerdict::Violation(found)
+                            | ReadOnlyVerdict::Unverified(found) => {
+                                reason.push_str(&format!("; {found}"));
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(err) => reason.push_str(&format!(
@@ -16180,9 +16192,16 @@ stages:
         .await;
         let reason = stuck_reason(&run.pool, &run.task_id).await;
         assert!(reason.contains("interrupted"), "{reason}");
+        assert!(reason.contains("changed the worktree"), "{reason}");
         let first = runs_for_stage(&run.pool, &run.task_id, "review")
             .await
             .remove(0);
+        assert_eq!(
+            session_events(&run.pool, &first, EventType::WorktreeChanged)
+                .await
+                .len(),
+            1
+        );
         let first_baseline = session_events(&run.pool, &first, EventType::WorktreeBaseline)
             .await
             .remove(0);
@@ -16213,6 +16232,33 @@ stages:
         assert_eq!(baseline["inherited_from"], json!(first.id));
         assert_eq!(baseline["head"], first_baseline["head"]);
         assert_eq!(baseline["status_sha256"], first_baseline["status_sha256"]);
+    }
+
+    #[tokio::test]
+    async fn the_restart_sweep_checks_a_read_only_turn_it_strands() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "touch sneaky.txt"},
+                {"op": "usage_limit"},
+            ]),
+        )
+        .await;
+        stuck_reason(&run.pool, &run.task_id).await;
+        // Put the task back as a daemon crash would have left it.
+        sqlx::query("UPDATE tasks SET status = 'open', stuck_reason = NULL WHERE id = ?")
+            .bind(&run.task_id)
+            .execute(&run.pool)
+            .await
+            .unwrap();
+        let binary = named_script_binary(&run.dir, "fake-claude-ro-sweep", ro_steps(&[]));
+        let engine = engine_with_adapter_and_workflows_dir(run.pool.clone(), &binary, &run.dir);
+        engine.park_interrupted_turns().await.unwrap();
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(reason.contains("changed the worktree"), "{reason}");
     }
 
     #[tokio::test]
