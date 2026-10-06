@@ -127,14 +127,16 @@ collides with what landed there since the fork.
   routing, same stop) is a minor finding. It stays blocking in either of two
   cases: when the text would lead the operator to a wrong action, such as
   calling a retry safe when it isn't, or when choosing that message is
-  what the change is mainly about. Every branch that changes state, routing or the stop is
-  still under the main-path rule above.
+  what the task is mainly about. Every branch that changes state, routing
+  or the stop is still under the main-path rule above.
 
   Then the other way round: for every new or changed test, what change to
   the code under test would make it fail? Read every assertion, and every
   arm that accepts a result or an error. A test that no plausible break
   of that code would fail is a finding, and blocks when the test guards
-  the path the change is mainly about. An arm that accepts the outcome
+  the path the change is mainly about. The message-text exception above
+  applies here too: a test that only pins message text is minor under the
+  same conditions. An arm that accepts the outcome
   the test exists to rule out always blocks, even if a later assertion
   would also catch it: its fix is always cheap. For the test that guards
   the change's main fix or feature, don't settle this by reading: in

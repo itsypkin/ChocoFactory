@@ -83,6 +83,9 @@ hardened everywhere except the points that wait on an answer.
    task states is binding: don't reopen it. If it can't be built exactly
    as stated, adapt it as little as possible, keeping its intent, and
    record the change. Decide every choice the task leaves open, as above.
+   The soundness check below wins over this rule: when a stated decision
+   leaves the protection unsound, raise it as a question instead of
+   keeping the decision silently.
 5. **Testability.** Each required test says what it sets up, what it does
    and what it asserts. Where a test may accept more than one outcome or
    error, it names every one it accepts. Replace "or similar", "one of

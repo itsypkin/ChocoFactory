@@ -1738,7 +1738,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &text,
             &[
                 "A false claim stays blocking when it overstates what the code does or protects.",
-                "already a blocking finding: one finding, not two.",
+                "already a finding: one finding, not two.",
                 "or show that the branch only chooses message text that wouldn't lead the operator to a wrong action.",
                 "Minor findings carried unchanged collapse into one line",
             ],
