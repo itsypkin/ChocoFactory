@@ -64,12 +64,17 @@ pub struct PollSweepReport {
     pub already_running: usize,
     /// Could not be resumed, and were marked stuck.
     pub stuck: usize,
+    /// Tasks whose stored `stage_kind` was missing or stale and could not be
+    /// corrected. Each was logged; the sweep carried on with the resume.
+    pub stage_kind_unrecorded: usize,
 }
 
 impl WorkflowEngine {
-    /// Startup sweep (#52): re-enters every `open` task sitting in a `poll`
-    /// stage whose runner died with the previous process, with the
-    /// deadline it already had. Per task it holds the per-task lock, so the
+    /// Startup sweep (#52): re-enters every `open` task sitting in a stage
+    /// with a watcher — a `poll`, or a `human_gate` with a `watch:` (#175) —
+    /// whose runner died with the previous process, with the deadline it
+    /// already had. It also records the `stage_kind` of every open task it
+    /// loads whose stored kind is missing or differs from the workflow's. Per task it holds the per-task lock, so the
     /// ownership check (`has_detached_runner`) and the resume's own spawn
     /// can't be interleaved by another spawner.
     ///
@@ -308,17 +313,39 @@ impl WorkflowEngine {
                 return;
             }
         };
-        let Some(StageKind::Poll { .. }) = definition.stages.get(&stage).map(|def| &def.kind)
-        else {
+        let Some(stage_def) = definition.stages.get(&stage) else {
             if was_polling {
                 let reason = format!(
                     "stage '{stage}' was polling when the daemon stopped, but the workflow no \
-                     longer defines it as a poll stage; retry to run it as defined"
+                     longer defines it; retry to run it as defined"
                 );
                 self.sweep_mark_stuck(task_id, &reason, report).await;
             }
             return;
         };
+
+        // Fills in a row from before `stage_kind` existed, or one a workflow
+        // edit made stale. Single-column write: `updated_at` is untouched, as
+        // the window derivation below reads it. A failure is logged and
+        // counted, never silent, and does not stop the resume.
+        let kind = stage_def.kind.name();
+        if state.stage_kind.as_deref() != Some(kind)
+            && let Err(err) = workflow_state::set_stage_kind(&self.pool, task_id, kind).await
+        {
+            tracing::error!(task_id, stage, %err, "could not record the task's stage kind");
+            report.stage_kind_unrecorded += 1;
+        }
+
+        if stage_def.watch().is_none() {
+            if was_polling {
+                let reason = format!(
+                    "stage '{stage}' was polling when the daemon stopped, but the workflow no \
+                     longer gives it a watcher; retry to run it as defined"
+                );
+                self.sweep_mark_stuck(task_id, &reason, report).await;
+            }
+            return;
+        }
 
         if self.has_detached_runner(task_id) {
             report.already_running += 1;

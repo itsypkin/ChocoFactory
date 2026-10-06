@@ -1407,7 +1407,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert!(spec_check.loop_guard.is_none());
 
         let gate = &def.stages["spec_questions"];
-        let StageKind::HumanGate { capture } = &gate.kind else {
+        let StageKind::HumanGate { capture, .. } = &gate.kind else {
             panic!("spec_questions must be a human_gate");
         };
         assert_eq!(*capture, Some(Capture::Text));

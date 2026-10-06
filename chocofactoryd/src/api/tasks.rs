@@ -1578,4 +1578,141 @@ stages:
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert!(detail["workflow_file_status"].is_null());
     }
+
+    // ---- #175: waiting_on_human and verdict markers ----
+
+    #[tokio::test]
+    async fn list_reports_waiting_on_human_only_for_an_open_task_at_a_gate() {
+        let server = TestServer::start().await;
+        seed_gate_only(&server);
+        let project_id = create_project(&server).await;
+        let at_gate = make_task(&server, &project_id, "gate").await;
+        let at_poll = make_task(&server, &project_id, "poll").await;
+        let stuck = make_task(&server, &project_id, "stuck").await;
+        let unknown = make_task(&server, &project_id, "null kind").await;
+        let no_row = make_task(&server, &project_id, "no row").await;
+
+        let pool = server.pool().clone();
+        sqlx::query("UPDATE workflow_state SET stage_kind = 'poll' WHERE task_id = ?")
+            .bind(&at_poll)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET status = 'stuck', stuck_reason = 'x' WHERE id = ?")
+            .bind(&stuck)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflow_state SET stage_kind = NULL WHERE task_id = ?")
+            .bind(&unknown)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workflow_state WHERE task_id = ?")
+            .bind(&no_row)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let listed: Value = server.get("/tasks").await.json();
+        let waiting = |id: &str| {
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()["waiting_on_human"]
+                .clone()
+        };
+        assert_eq!(waiting(&at_gate), json!(true));
+        assert_eq!(waiting(&at_poll), json!(false));
+        assert_eq!(waiting(&stuck), json!(false));
+        assert_eq!(waiting(&unknown), json!(false));
+        assert_eq!(waiting(&no_row), json!(false));
+    }
+
+    fn seed_marker_gate(server: &TestServer) {
+        server.write_workflow(
+            "marker-gate",
+            r#"
+name: marker-gate
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+    markers:
+      - line: /request-changes
+        then: changes_requested
+      - line: /approve
+        then: approved
+    on: { approved: done, changes_requested: done }
+  done:
+    kind: terminal
+"#,
+        );
+    }
+
+    async fn make_marker_task(server: &TestServer, project_id: &str) -> String {
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "marker-gate",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        task["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_a_marker_is_accepted_and_one_without_is_a_400() {
+        let server = TestServer::start().await;
+        seed_marker_gate(&server);
+        let project_id = create_project(&server).await;
+
+        let accepted = make_marker_task(&server, &project_id).await;
+        let response = server
+            .post(
+                &format!("/tasks/{accepted}/messages"),
+                json!({ "text": "/approve" }),
+            )
+            .await;
+        assert_eq!(response.status(), 202, "{}", response.json());
+        let task: Value = server.get(&format!("/tasks/{accepted}")).await.json();
+        assert_eq!(task["workflow_state"]["current_stage"], "done");
+
+        let refused = make_marker_task(&server, &project_id).await;
+        let response = server
+            .post(
+                &format!("/tasks/{refused}/messages"),
+                json!({ "text": "ok" }),
+            )
+            .await;
+        assert_eq!(response.status(), 400);
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            error.contains("/request-changes") && error.contains("/approve"),
+            "{error}"
+        );
+        assert!(error.contains("Nothing was sent."), "{error}");
+        let task: Value = server.get(&format!("/tasks/{refused}")).await.json();
+        assert_eq!(task["workflow_state"]["current_stage"], "gate");
+
+        let conflict = make_marker_task(&server, &project_id).await;
+        let response = server
+            .post(
+                &format!("/tasks/{conflict}/messages"),
+                json!({ "text": "/approve\n/request-changes" }),
+            )
+            .await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json()["error"],
+            "your reply has both /request-changes and /approve; keep one. Nothing was sent."
+        );
+    }
 }

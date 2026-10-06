@@ -32,7 +32,9 @@ pub(super) struct PollWindow {
 }
 
 /// Stamps `payload.poll_window` for a task entering `stage` (#52), or
-/// removes it when `stage` isn't a `poll` (or isn't defined at all).
+/// removes it when `stage` has no watcher (or isn't defined at all). A
+/// watcher is a `poll`'s loop or a `human_gate`'s `watch:` (#175); the key
+/// keeps its name so tasks already parked in a poll stage still have one.
 ///
 /// Pure, and **the only place a deadline is computed**. The window is a
 /// sibling of `payload.stages`/`payload.task`, never under
@@ -51,9 +53,9 @@ pub(super) fn set_poll_window(
     let Some(object) = payload.as_object_mut() else {
         return Ok(());
     };
-    let timeout = match definition.stages.get(stage).map(|def| &def.kind) {
-        Some(StageKind::Poll { timeout, .. }) => *timeout,
-        _ => {
+    let timeout = match definition.stages.get(stage).and_then(|def| def.watch()) {
+        Some(watch) => watch.timeout,
+        None => {
             object.remove("poll_window");
             return Ok(());
         }
@@ -108,15 +110,29 @@ pub(super) fn remaining_budget(deadline: DateTime<Utc>, now: DateTime<Utc>) -> D
 
 impl WorkflowEngine {
     /// Starts a `poll` stage's loop (§5.2) and returns immediately.
+    pub(super) async fn enter_poll(
+        self: &Arc<Self>,
+        entry: &StageEntry<'_>,
+    ) -> Result<(), EngineError> {
+        let StageKind::Poll { capture, watch } = &entry.stage_def.kind else {
+            unreachable!("enter_poll is only called for Poll stages")
+        };
+        self.start_watch(entry, watch, *capture).await
+    }
+
+    /// Starts a stage's watcher loop and returns immediately. Shared by a
+    /// `poll` stage and a `human_gate` with a `watch:` (#175).
     ///
     /// Everything that should fail the transition that entered the stage —
     /// where a caller can still see the error — is resolved here rather
     /// than in the detached loop: the task's working directory, and the
     /// `outcomes:` patterns, which are compiled once for the whole stage
     /// instead of per attempt.
-    pub(super) async fn enter_poll(
+    pub(super) async fn start_watch(
         self: &Arc<Self>,
         entry: &StageEntry<'_>,
+        watch: &Watch,
+        capture: Option<Capture>,
     ) -> Result<(), EngineError> {
         let StageEntry {
             task_id,
@@ -125,20 +141,10 @@ impl WorkflowEngine {
             payload,
             ..
         } = *entry;
-        let StageKind::Poll {
-            command,
-            capture,
-            interval,
-            timeout: _,
-            outcomes,
-            env,
-        } = &entry.stage_def.kind
-        else {
-            unreachable!("enter_poll is only called for Poll stages")
-        };
-        let capture = *capture;
-        let interval = *interval;
-        let (command, env) = self.render_stage_command(entry, command, env).await?;
+        let interval = watch.interval;
+        let (command, env) = self
+            .render_stage_command(entry, &watch.command, &watch.env)
+            .await?;
         // The deadline was computed once, on entry, and stored in the same
         // write that moved the task here (#52). A missing or malformed
         // window is an invariant violation, not a cue to invent a budget.
@@ -161,10 +167,11 @@ impl WorkflowEngine {
             .await?
             .ok_or(EngineError::NoSuchTask)?;
 
-        let compiled = poll::compile(outcomes).map_err(|err| EngineError::InvalidPollPattern {
-            stage: stage_name.to_string(),
-            reason: err.to_string(),
-        })?;
+        let compiled =
+            poll::compile(&watch.outcomes).map_err(|err| EngineError::InvalidPollPattern {
+                stage: stage_name.to_string(),
+                reason: err.to_string(),
+            })?;
         let cwd = working_dir(&task, definition)?;
 
         self.spawn_poll_runner(

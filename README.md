@@ -351,6 +351,53 @@ doesn't cover ignored paths (`target/`, `.omc/`) or anything inside `.git`
 trips the check as well, and that is intended. The built-in reviewer, and the
 planner in `coding-task-planned`, are read-only.
 
+### Writing a workflow: a human gate that watches for its answer
+
+A `human_gate` normally waits for a reply through `choco task send`. It can
+also watch for its answer somewhere else, and it can require that a reply
+carries a verdict.
+
+```yaml
+awaiting_review:
+  kind: human_gate
+  capture: text
+  watch:
+    command: "gh api …"
+    interval: 30s
+    timeout: 24h
+    outcomes:
+      - match: "APPROVE"
+        then: approved
+  markers:
+    - line: /request-changes
+      then: changes_requested
+    - line: /approve
+      then: approved
+  on: { approved: done, changes_requested: coding, timeout: stalled }
+```
+
+- `watch:` takes the same fields as a `poll` stage (`command` or
+  `script_file`, `env`, `interval`, `timeout`, `outcomes`), and `interval` is
+  required. When an outcome matches, the gate advances on it, keeping the
+  command's output if the gate says `capture: text`. When `timeout` runs out it
+  advances on the `timeout` edge, which `on:` must have. The watcher is the
+  same loop a `poll` runs: it survives a daemon restart with its stored
+  deadline.
+- `markers:` makes a reply through choco carry a verdict. Each entry is a
+  `line` and the outcome (`then`) it chooses. A reply counts a line as a marker
+  when the whole line equals it: case-sensitive, trailing spaces, tabs and
+  carriage returns ignored, leading whitespace not. So `> /approve`,
+  `use /approve here` and `  /approve` are not markers.
+- A reply is refused, with nothing recorded and the watcher still running, when
+  it has no marker line, or when its markers choose different outcomes. The
+  same marker twice is fine.
+- On an accepted reply the gate advances on the marker's outcome. The captured
+  text is the reply without its marker lines. The timeline's `human_message`
+  event keeps the reply as typed, and names the outcome.
+- A gate without `markers:` takes any reply and resumes on `resumed`, as
+  before.
+- An accepted reply stops the watcher.
+
 ### Project workflows
 
 A project can carry a repo of its own (`repo_path`), set at creation or

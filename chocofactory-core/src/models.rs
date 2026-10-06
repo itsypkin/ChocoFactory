@@ -531,6 +531,11 @@ pub struct Event {
 pub struct WorkflowState {
     pub task_id: String,
     pub current_stage: String,
+    /// Kind of `current_stage` as workflow YAML spells it. `None` for a row
+    /// from before the column that no transition, retry or startup sweep has
+    /// reached yet.
+    #[serde(default)]
+    pub stage_kind: Option<String>,
     /// JSON object mapping stage name -> loop count (§5.3).
     pub loop_counters: Value,
     /// Stage-specific data (e.g. PR URL, last check status) owned by
@@ -553,6 +558,9 @@ pub struct TaskSummary {
     /// `{}` when the task has no workflow_state row.
     pub loop_counters: Value,
     pub pr: Option<PullRequestRef>,
+    /// The task is open and its current stage is a `human_gate` (#175).
+    #[serde(default)]
+    pub waiting_on_human: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

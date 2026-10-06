@@ -81,8 +81,12 @@ impl WorkflowEngine {
         }
     }
 
-    /// Aborts every detached `shell`/`poll` runner in flight for `task_id`
-    /// (#69), killing the command each one is running.
+    /// Aborts every detached `shell`/`poll`/gate-watcher runner in flight for
+    /// `task_id`, killing the command each one is running. Used by cancel
+    /// (#69) and by a reply that resolves a watching gate (#175, under the
+    /// task lock, via `advance_from_stage`'s `stop_watcher`). A runner must
+    /// never call this for its own task: it awaits every handle, itself
+    /// included.
     ///
     /// Abort drops the runner's future at its current await point, which
     /// drops `shell::run`'s `ProcessGroup` guard, whose `Drop` SIGKILLs the
@@ -109,7 +113,7 @@ impl WorkflowEngine {
         tracing::info!(
             task_id,
             runners = handles.len(),
-            "cancelling task: aborting its in-flight shell/poll runners"
+            "aborting the task's in-flight detached runners"
         );
         // `abort` only *schedules* the task to be dropped, and the SIGKILL
         // happens in that drop — so awaiting each handle afterwards is what
@@ -196,7 +200,14 @@ impl WorkflowEngine {
         capture: Option<Value>,
     ) {
         match self
-            .advance_from_stage(task_id, definition, outcome, Some(stage_name), capture)
+            .advance_from_stage(
+                task_id,
+                definition,
+                outcome,
+                Some(stage_name),
+                capture,
+                false,
+            )
             .await
         {
             Ok(()) => match kind {
