@@ -370,6 +370,16 @@ fn is_valid_workflow_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// What the post-turn check of a read-only role found (#172).
+enum ReadOnlyVerdict {
+    /// Not a read-only role, or the worktree matches its baseline.
+    Clean,
+    /// The worktree changed; carries the stuck reason.
+    Violation(String),
+    /// The check could not run; carries the stuck reason.
+    Unverified(String),
+}
+
 /// Where a workflow name resolved to at task creation (#129).
 #[derive(Debug, PartialEq, Eq)]
 enum ResolvedWorkflow {
@@ -5211,10 +5221,11 @@ impl WorkflowEngine {
         }))
     }
 
-    /// The post-turn check for a `read_only` role (#172). Returns `true` when
-    /// the turn may be applied (not read-only, or the worktree is unchanged)
-    /// and `false` once the task has been parked as stuck. A check that can't
-    /// run parks the task too: it never passes silently.
+    /// The post-turn check for a `read_only` role (#172), on a turn that
+    /// completed. Returns `true` when the turn may be applied (not read-only,
+    /// or the worktree is unchanged) and `false` once the task has been
+    /// parked as stuck. A check that can't run parks the task too: it never
+    /// passes silently.
     async fn read_only_check_passes(
         &self,
         task_id: &str,
@@ -5222,6 +5233,54 @@ impl WorkflowEngine {
         stage_name: &str,
         session_id: &str,
     ) -> bool {
+        match self
+            .read_only_verdict(task_id, definition, stage_name, session_id)
+            .await
+        {
+            ReadOnlyVerdict::Clean => true,
+            ReadOnlyVerdict::Violation(reason) | ReadOnlyVerdict::Unverified(reason) => {
+                self.mark_stuck(task_id, &reason, false).await;
+                false
+            }
+        }
+    }
+
+    /// Parks a task whose turn did not complete (crash, no report, lingering
+    /// process, usage limit, reaper, daemon stop), after comparing a
+    /// read-only role's worktree with its baseline (#172): a turn that ended
+    /// abnormally may still have changed the worktree, and a plain retry of a
+    /// session that can't be resumed would otherwise take the dirty state as
+    /// its new baseline. A violation, or a check that can't run, is added to
+    /// the stuck reason.
+    async fn park_incomplete_turn(
+        &self,
+        task_id: &str,
+        definition: &WorkflowDefinition,
+        stage_name: &str,
+        session_id: &str,
+        reason: &str,
+    ) {
+        let reason = match self
+            .read_only_verdict(task_id, definition, stage_name, session_id)
+            .await
+        {
+            ReadOnlyVerdict::Clean => reason.to_string(),
+            ReadOnlyVerdict::Violation(found) | ReadOnlyVerdict::Unverified(found) => {
+                format!("{reason}; {found}")
+            }
+        };
+        self.mark_stuck(task_id, &reason, false).await;
+    }
+
+    /// Compares a read-only role's worktree with the baseline of `session_id`.
+    /// Records the `worktree_changed` event on a difference; parks nothing.
+    async fn read_only_verdict(
+        &self,
+        task_id: &str,
+        definition: &WorkflowDefinition,
+        stage_name: &str,
+        session_id: &str,
+    ) -> ReadOnlyVerdict {
         let role = match definition.stages.get(stage_name).map(|s| &s.kind) {
             Some(StageKind::AgentTurn { role, .. }) => role.as_str(),
             _ => "unknown",
@@ -5241,18 +5300,12 @@ impl WorkflowEngine {
                 _ => None,
             })
         else {
-            self.mark_stuck(
-                task_id,
-                &unverified(format!(
-                    "stage '{stage_name}' has no agent_turn role in the workflow definition"
-                )),
-                false,
-            )
-            .await;
-            return false;
+            return ReadOnlyVerdict::Unverified(unverified(format!(
+                "stage '{stage_name}' has no agent_turn role in the workflow definition"
+            )));
         };
         if !role_def.read_only {
-            return true;
+            return ReadOnlyVerdict::Clean;
         }
 
         let outcome: Result<Option<String>, String> = async {
@@ -5346,15 +5399,9 @@ impl WorkflowEngine {
         .await;
 
         match outcome {
-            Ok(None) => true,
-            Ok(Some(reason)) => {
-                self.mark_stuck(task_id, &reason, false).await;
-                false
-            }
-            Err(error) => {
-                self.mark_stuck(task_id, &unverified(error), false).await;
-                false
-            }
+            Ok(None) => ReadOnlyVerdict::Clean,
+            Ok(Some(reason)) => ReadOnlyVerdict::Violation(reason),
+            Err(error) => ReadOnlyVerdict::Unverified(unverified(error)),
         }
     }
 
@@ -5416,14 +5463,16 @@ impl WorkflowEngine {
                             "session was force-closed by the idle reaper before completing its turn; not auto-advancing"
                         );
                         engine
-                            .mark_stuck(
+                            .park_incomplete_turn(
                                 &task_id,
+                                &definition,
+                                &stage_name,
+                                &session_id,
                                 &format!(
                                     "stage '{stage_name}': the agent turn was force-closed by \
                                      the idle reaper before completing; 'choco task retry' will \
                                      resume it"
                                 ),
-                                false,
                             )
                             .await;
                         return;
@@ -5441,14 +5490,16 @@ impl WorkflowEngine {
                             "session was interrupted by a usage limit; not auto-advancing"
                         );
                         engine
-                            .mark_stuck(
+                            .park_incomplete_turn(
                                 &task_id,
+                                &definition,
+                                &stage_name,
+                                &session_id,
                                 &format!(
                                     "stage '{stage_name}': the agent's turn was interrupted by a \
                                      usage limit before it could report; 'choco task retry' will \
                                      resume it"
                                 ),
-                                false,
                             )
                             .await;
                         return;
@@ -5463,7 +5514,13 @@ impl WorkflowEngine {
                             "the daemon stopped during this turn; not auto-advancing"
                         );
                         engine
-                            .mark_stuck(&task_id, &agent_reason(&stage_name), false)
+                            .park_incomplete_turn(
+                                &task_id,
+                                &definition,
+                                &stage_name,
+                                &session_id,
+                                &agent_reason(&stage_name),
+                            )
                             .await;
                         return;
                     }
@@ -5482,13 +5539,15 @@ impl WorkflowEngine {
                             "session ended without reporting its outcome; not auto-advancing"
                         );
                         engine
-                            .mark_stuck(
+                            .park_incomplete_turn(
                                 &task_id,
+                                &definition,
+                                &stage_name,
+                                &session_id,
                                 &format!(
                                     "stage '{stage_name}': the agent's turn ended without \
                                      calling report_outcome"
                                 ),
-                                false,
                             )
                             .await;
                         return;
@@ -5503,14 +5562,16 @@ impl WorkflowEngine {
                             "session's process kept running after its turn ended and was killed; not auto-advancing"
                         );
                         engine
-                            .mark_stuck(
+                            .park_incomplete_turn(
                                 &task_id,
+                                &definition,
+                                &stage_name,
+                                &session_id,
                                 &format!(
                                     "stage '{stage_name}': the agent process kept running after \
                                      its turn ended and was killed; work it started may be \
                                      incomplete"
                                 ),
-                                false,
                             )
                             .await;
                         return;
@@ -5522,13 +5583,15 @@ impl WorkflowEngine {
                             "session exited without completing its turn cleanly; not auto-advancing"
                         );
                         engine
-                            .mark_stuck(
+                            .park_incomplete_turn(
                                 &task_id,
+                                &definition,
+                                &stage_name,
+                                &session_id,
                                 &format!(
                                     "stage '{stage_name}': the agent process exited without \
                                      completing its turn"
                                 ),
-                                false,
                             )
                             .await;
                         return;
@@ -5550,12 +5613,14 @@ impl WorkflowEngine {
                             "failed to poll session while watching for turn completion; not auto-advancing"
                         );
                         engine
-                            .mark_stuck(
+                            .park_incomplete_turn(
                                 &task_id,
+                                &definition,
+                                &stage_name,
+                                &session_id,
                                 &format!(
                                     "stage '{stage_name}': lost track of the agent turn: {err}"
                                 ),
-                                false,
                             )
                             .await;
                         return;
@@ -15816,6 +15881,18 @@ stages:
         steps: Value,
         setup_sql: Option<&str>,
     ) -> ReadOnlyRun {
+        start_read_only_task_full(role, with_prep, task_config, steps, setup_sql, None).await
+    }
+
+    /// As `start_read_only_task_with_sql`, with fast turn timers when given.
+    async fn start_read_only_task_full(
+        role: &str,
+        with_prep: bool,
+        task_config: Value,
+        steps: Value,
+        setup_sql: Option<&str>,
+        timers: Option<crate::session::TurnTimers>,
+    ) -> ReadOnlyRun {
         let pool = connect_in_memory().await.unwrap();
         if let Some(sql) = setup_sql {
             sqlx::query(sql).execute(&pool).await.unwrap();
@@ -15855,7 +15932,10 @@ stages:
         .unwrap()
         .id;
         let binary = named_script_binary(&dir, "fake-claude-ro", steps);
-        let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+        let engine = match timers {
+            Some(timers) => engine_with_turn_timers(pool.clone(), &binary, timers),
+            None => engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir),
+        };
         let started = engine.start_task(&task_id, &def, None).await;
         if setup_sql.is_none() {
             started.unwrap();
@@ -15984,6 +16064,80 @@ stages:
             reason.contains(&format!("HEAD {} → {}", &old[..7], &new[..7])),
             "{reason}"
         );
+    }
+
+    /// A turn that crashes after changing the worktree is still checked, so
+    /// a plain retry (a fresh session) can't take the change as its baseline.
+    #[tokio::test]
+    async fn a_read_only_turn_that_crashes_after_changing_the_worktree_is_caught() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "touch sneaky.txt && false"},
+            ]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("exited without completing")
+                && reason.contains("changed the worktree")
+                && reason.contains("git status changed (1 entries)"),
+            "{reason}"
+        );
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        let changed = session_events(&run.pool, &session, EventType::WorktreeChanged).await;
+        assert_eq!(changed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_turn_that_ends_without_a_report_is_still_checked() {
+        let run = start_read_only_task_full(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "git commit -q --allow-empty -m sneaky"},
+                {"op": "result"},
+                {"op": "answer_every_turn", "text": "still waiting"},
+            ]),
+            None,
+            Some(fast_turn_timers()),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("without calling report_outcome") && reason.contains("HEAD "),
+            "{reason}"
+        );
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        assert_eq!(
+            session_events(&run.pool, &session, EventType::WorktreeChanged)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abnormal_read_only_turn_that_changed_nothing_keeps_its_own_reason() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([{"op": "read_turn"}, {"op": "run", "command": "false"}]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(!reason.contains("changed the worktree"), "{reason}");
+        assert!(!reason.contains("could not verify"), "{reason}");
     }
 
     #[tokio::test]
