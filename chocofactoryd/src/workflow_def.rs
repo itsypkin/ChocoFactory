@@ -625,7 +625,10 @@ struct RawDefinition {
     worktree: bool,
 }
 
+/// `deny_unknown_fields`: a misspelled `read_only` (say `readonly`) must fail
+/// the load, not silently leave a role unprotected (#172).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRole {
     #[serde(default)]
     cli: Option<String>,
@@ -1455,6 +1458,15 @@ stages:
                 message.contains("reviewer") && message.contains(bad),
                 "{message}"
             );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_role_key_is_rejected_at_load() {
+        let dir = TempDir::new();
+        for field in ["    readonly: true", "    disallowed_tool: [edit]"] {
+            let err = WorkflowDefinition::parse(&role_yaml(true, field), &dir.path).unwrap_err();
+            assert!(matches!(err, WorkflowDefError::Yaml(_)), "{err}");
         }
     }
 
