@@ -370,6 +370,30 @@ fn is_valid_workflow_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// The note a restart sweep adds when it cannot compare a stranded turn's
+/// worktree with its baseline. Fails closed like `read_only_verdict`: only a
+/// role that resolves to not-read-only gets no note.
+fn unverified_note(
+    definition: &WorkflowDefinition,
+    stage: &str,
+    error: &dyn std::fmt::Display,
+) -> Option<String> {
+    let role = match definition.stages.get(stage).map(|s| &s.kind) {
+        Some(StageKind::AgentTurn { role, .. }) => role.as_str(),
+        _ => "unknown",
+    };
+    definition
+        .roles
+        .get(role)
+        .is_none_or(|r| r.read_only)
+        .then(|| {
+            format!(
+                "could not verify that read-only role '{role}' left the worktree unchanged in \
+                 stage '{stage}': {error}; inspect and reset the worktree before retrying"
+            )
+        })
+}
+
 /// What the post-turn check of a read-only role found (#172).
 enum ReadOnlyVerdict {
     /// Not a read-only role, or the worktree matches its baseline.
@@ -3976,7 +4000,7 @@ impl WorkflowEngine {
                         // A read-only role may have changed the worktree
                         // before the daemon stopped (#172).
                         match self
-                            .read_only_verdict(task_id, &definition, &stage, &session.id)
+                            .read_only_verdict(task_id, &definition, &stage, &session.id, false)
                             .await
                         {
                             ReadOnlyVerdict::Clean => {}
@@ -3995,15 +4019,8 @@ impl WorkflowEngine {
                         // Without the session there is no baseline to
                         // compare, and a fresh retry would take whatever is
                         // in the worktree as its baseline (#172).
-                        if let Some(StageKind::AgentTurn { role, .. }) =
-                            definition.stages.get(&stage).map(|s| &s.kind)
-                            && definition.roles.get(role).is_some_and(|r| r.read_only)
-                        {
-                            reason.push_str(&format!(
-                                "; could not verify that read-only role '{role}' left the \
-                                 worktree unchanged in stage '{stage}': {err}; inspect and \
-                                 reset the worktree before retrying"
-                            ));
+                        if let Some(note) = unverified_note(&definition, &stage, &err) {
+                            reason.push_str(&format!("; {note}"));
                         }
                     }
                 }
@@ -5261,7 +5278,7 @@ impl WorkflowEngine {
         session_id: &str,
     ) -> bool {
         match self
-            .read_only_verdict(task_id, definition, stage_name, session_id)
+            .read_only_verdict(task_id, definition, stage_name, session_id, true)
             .await
         {
             ReadOnlyVerdict::Clean => true,
@@ -5288,7 +5305,7 @@ impl WorkflowEngine {
         reason: &str,
     ) {
         let reason = match self
-            .read_only_verdict(task_id, definition, stage_name, session_id)
+            .read_only_verdict(task_id, definition, stage_name, session_id, false)
             .await
         {
             ReadOnlyVerdict::Clean => reason.to_string(),
@@ -5307,16 +5324,23 @@ impl WorkflowEngine {
         definition: &WorkflowDefinition,
         stage_name: &str,
         session_id: &str,
+        outcome_pending: bool,
     ) -> ReadOnlyVerdict {
         let role = match definition.stages.get(stage_name).map(|s| &s.kind) {
             Some(StageKind::AgentTurn { role, .. }) => role.as_str(),
             _ => "unknown",
         };
+        // A turn that ended abnormally never produced an outcome, so only a
+        // turn that did can say its outcome was not applied.
         let unverified = |error: String| {
+            let tail = if outcome_pending {
+                "The turn's outcome was not applied: inspect the worktree, then choco task retry"
+            } else {
+                "Inspect the worktree, then choco task retry"
+            };
             format!(
                 "could not verify that read-only role '{role}' left the worktree unchanged in \
-                 stage '{stage_name}': {error}. The turn's outcome was not applied: inspect the \
-                 worktree, then choco task retry"
+                 stage '{stage_name}': {error}. {tail}"
             )
         };
         let Some(role_def) = definition
@@ -5380,10 +5404,19 @@ impl WorkflowEngine {
                 changes.push(json!({"field": "branch", "before": branch, "after": now.branch}));
             }
             if now.status_sha256 != sha {
-                parts.push(format!(
-                    "git status changed ({} entries)",
-                    now.status_entries
-                ));
+                // Equal counts mean the paths are the same and the bytes
+                // differ: say so rather than claim the status moved.
+                if before_entries == now.status_entries as u64 {
+                    parts.push(format!(
+                        "git status or file contents changed ({} entries)",
+                        now.status_entries
+                    ));
+                } else {
+                    parts.push(format!(
+                        "git status changed ({} entries)",
+                        now.status_entries
+                    ));
+                }
                 changes.push(json!({
                     "field": "status",
                     "before": before_entries,
@@ -5400,6 +5433,20 @@ impl WorkflowEngine {
                  Nothing was reverted: inspect the worktree, reset it, then choco task retry",
                 parts.join("; ")
             );
+            // The watcher and the restart sweep can both look at the same
+            // session; record the violation once.
+            let already = events::list_for_session(&self.pool, session_id)
+                .await
+                .map(|events| {
+                    events
+                        .iter()
+                        .any(|e| e.event_type == EventType::WorktreeChanged)
+                })
+                // A failed read errs toward recording a second event.
+                .unwrap_or(false);
+            if already {
+                return Ok(Some(reason));
+            }
             match events::append(
                 &self.pool,
                 session_id,
@@ -16274,6 +16321,34 @@ stages:
         engine.park_interrupted_turns().await.unwrap();
         let reason = stuck_reason(&run.pool, &run.task_id).await;
         assert!(reason.contains("changed the worktree"), "{reason}");
+        // The watcher already recorded the violation; the sweep must not
+        // record it again.
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        assert_eq!(
+            session_events(&run.pool, &session, EventType::WorktreeChanged)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_session_is_unverifiable_unless_the_role_is_not_read_only() {
+        let dir = tempdir();
+        fs::write(dir.join("p.md"), "review it").unwrap();
+        let mut def = WorkflowDefinition::parse(
+            READ_ONLY_WORKFLOW.replace("ROLE", "reviewer").as_str(),
+            &dir,
+        )
+        .unwrap();
+        assert!(unverified_note(&def, "review", &"boom").is_some());
+        def.roles.get_mut("reviewer").unwrap().read_only = false;
+        assert!(unverified_note(&def, "review", &"boom").is_none());
+        def.roles.remove("reviewer");
+        let note = unverified_note(&def, "review", &"boom").unwrap();
+        assert!(note.contains("could not verify"), "{note}");
     }
 
     #[tokio::test]
@@ -16322,7 +16397,7 @@ stages:
             json!({}),
             json!([
                 {"op": "read_turn"},
-                {"op": "run", "command": "touch sneaky.txt && sleep 60"},
+                {"op": "run", "command": "touch sneaky.txt && sleep 3"},
             ]),
         )
         .await;
@@ -16343,6 +16418,48 @@ stages:
         let changed = session_events(&run.pool, &session, EventType::WorktreeChanged).await;
         assert_eq!(changed.len(), 1, "{reason}");
         (run, reason)
+    }
+
+    #[tokio::test]
+    async fn a_read_only_turn_whose_session_cannot_be_read_is_checked() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "touch sneaky.txt && sleep 3"},
+            ]),
+        )
+        .await;
+        for _ in 0..400 {
+            if run.worktree_dir.join("sneaky.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(run.worktree_dir.join("sneaky.txt").exists());
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        // Break reads of the sessions row but leave the event insert (which
+        // selects only `id` and `task_id`) working.
+        sqlx::query("ALTER TABLE sessions RENAME COLUMN model TO model_gone")
+            .execute(&run.pool)
+            .await
+            .unwrap();
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("lost track") && reason.contains("changed the worktree"),
+            "{reason}"
+        );
+        let changed = events::list_for_session(&run.pool, &session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::WorktreeChanged)
+            .count();
+        assert_eq!(changed, 1, "{reason}");
     }
 
     #[tokio::test]

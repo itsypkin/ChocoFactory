@@ -695,9 +695,24 @@ pub async fn snapshot(dir: &Path) -> Result<WorktreeSnapshot, WorktreeError> {
     if code != Some(0) {
         return Err(git_failed(&args, stderr));
     }
+    // The staged content: a partly staged file can be re-staged with other
+    // bytes without moving the status line or the working-tree content.
+    let args = [
+        "diff",
+        "--cached",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+    ];
+    let (code, staged, stderr) = run_git_raw(dir, &args).await?;
+    if code != Some(0) {
+        return Err(git_failed(&args, stderr));
+    }
     let tree = content_tree(dir).await?;
     let mut hasher = Sha256::new();
     hasher.update(&status);
+    hasher.update(b"\0staged:");
+    hasher.update(&staged);
     hasher.update(b"\0tree:");
     hasher.update(tree.as_bytes());
     let status_sha256 = hasher
@@ -726,8 +741,16 @@ async fn content_tree(dir: &Path) -> Result<String, WorktreeError> {
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&scratch).map_err(WorktreeError::Spawn)?;
+    /// Removes the scratch directory even if the future is dropped mid-way.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveOnDrop(scratch.clone());
     let index = scratch.join("index");
-    let result = async {
+    async {
         let args = ["add", "-A", "--", "."];
         let (code, _, stderr) = run_git_raw_env(dir, &args, Some(&index)).await?;
         if code != Some(0) {
@@ -740,9 +763,7 @@ async fn content_tree(dir: &Path) -> Result<String, WorktreeError> {
         }
         Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     }
-    .await;
-    let _ = std::fs::remove_dir_all(&scratch);
-    result
+    .await
 }
 
 /// Splits `-z` porcelain output into entries. A rename or copy entry carries
@@ -847,6 +868,36 @@ mod tests {
         let untracked = snapshot(&repo).await.unwrap();
         assert_ne!(untracked.status_sha256, tracked.status_sha256);
         assert_eq!(snapshot(&repo).await.unwrap(), untracked);
+    }
+
+    #[tokio::test]
+    async fn snapshot_sees_a_restaged_file_whose_working_copy_did_not_change() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        std::fs::write(repo.join("README.md"), "one\n").unwrap();
+        git(&repo, &["add", "README.md"]).await;
+        std::fs::write(repo.join("README.md"), "two\n").unwrap();
+        let before = snapshot(&repo).await.unwrap();
+
+        std::fs::write(repo.join("README.md"), "three\n").unwrap();
+        git(&repo, &["add", "README.md"]).await;
+        std::fs::write(repo.join("README.md"), "two\n").unwrap();
+        let after = snapshot(&repo).await.unwrap();
+        // Same status line (MM), same working copy, different staged bytes.
+        assert_eq!(after.status_preview, before.status_preview);
+        assert_ne!(after.status_sha256, before.status_sha256);
+    }
+
+    #[tokio::test]
+    async fn snapshot_errors_when_the_content_tree_cannot_be_built() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        git(&repo, &["config", "filter.broken.clean", "false"]).await;
+        git(&repo, &["config", "filter.broken.required", "true"]).await;
+        std::fs::write(repo.join(".gitattributes"), "*.dat filter=broken\n").unwrap();
+        std::fs::write(repo.join("x.dat"), "payload\n").unwrap();
+        let err = snapshot(&repo).await.unwrap_err();
+        assert!(err.to_string().contains("add"), "{err}");
     }
 
     #[tokio::test]
