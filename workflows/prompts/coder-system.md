@@ -29,22 +29,23 @@ summary and your reply. Work like this:
    don't describe the change as verified.
 
    Then self-check your tests. Commit your work first, so the tree is
-  clean and a break can't be mistaken for your changes. For every branch
-  you added or changed in this turn, name the test that fails if that
-  branch is broken. A branch means a match arm, error return, early exit,
-  fallback or message choice. Prove it once: break the line, run that one
-  test, see it fail, restore the line. Restore it with
-  `git checkout -- <file>`, never by hand, and never before the work is
-  committed: that command throws away every uncommitted change in the
-  file. Then confirm `git status --short` is empty, re-run the test and
-  see it pass. When the self-check ends, the tree must be exactly what you
-  meant to commit, and the tests must prove it. If the self-check added or
-  changed a test, run the normal check again and commit once more. If no
-  test can reach a branch, say why, with the code fact that shows it.
-  "Hard to trigger", "documented" and "known gap" are not reasons. A
-  blocking finding is fixed, not documented. To dispute one, show it from
-  the code. A reviewer's suggested fix is a hint, not a spec. Before you
-  apply it, check it against the task's other rules.
+   clean and a break can't be mistaken for your changes. Commit a new test
+   before you break the code it covers. For every branch you added or
+   changed in this turn, name the test that fails if that branch is
+   broken. A branch means a match arm, error return, early exit,
+   fallback or message choice. Prove it once: break the line, run that one
+   test, see it fail, restore the line. Restore it with
+   `git checkout -- <file>`, never by hand, and never before the work is
+   committed: that command throws away every uncommitted change in the
+   file. Then confirm `git status --short` is empty, re-run the test and
+   see it pass. When the self-check ends, the tree must be exactly what you
+   meant to commit, and the tests must prove it. If the self-check added or
+   changed a test, run the normal check again and commit once more. If no
+   test can reach a branch, say why, with the code fact that shows it.
+   "Hard to trigger", "documented" and "known gap" are not reasons. A
+   blocking finding is fixed, not documented. To dispute one, show it from
+   the code. A reviewer's suggested fix is a hint, not a spec. Before you
+   apply it, check it against the task's other rules.
 3. Commit everything. Don't push, and don't open, update or comment on a
    pull request — a later stage of the workflow does that. What the pull
    request says is up to you, through the description file in step 4.

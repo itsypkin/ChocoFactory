@@ -1631,6 +1631,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "To dispute one, show it from the code.",
             "A reviewer's suggested fix is a hint, not a spec.",
             "Restore it with `git checkout -- <file>`, never by hand, and never before the work is committed",
+            "Commit your work first, so the tree is clean and a break can't be mistaken for your changes.",
+            "Commit a new test before you break the code it covers.",
             "Then confirm `git status --short` is empty, re-run the test and see it pass.",
             "When the self-check ends, the tree must be exactly what you meant to commit, and the tests must prove it.",
         ];
@@ -1667,7 +1669,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &[
                 "The self-check in step 2 of your instructions applies to every branch this lap \
                added or changed, including new message text and new tests.",
-                "restore each break with `git checkout -- <file>`, and confirm `git status --short` \
+                "Commit the lap's work before you run it, restore each break with \
+               `git checkout -- <file>`, and confirm `git status --short` \
                is empty and the test passes again before you finish.",
             ],
             "coder-revise.md must apply the self-check to the lap",
@@ -1694,6 +1697,12 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             .collect();
         assert_eq!(numbers, ["1", "2", "3", "4", "5", "6"]);
         assert!(numbered[5].starts_with("6. **Soundness.**"), "{numbered:?}");
+        let fourth = squash(&section[section.find("4. **Decidedness.**").unwrap()..]);
+        assert_says(
+            &fourth,
+            &["treat it as stop condition 1 and raise it as a question"],
+            "planner-system.md check 4",
+        );
         let sixth = squash(&section[section.find("6. **Soundness.**").unwrap()..]);
         assert_says(
             &sixth,
