@@ -1180,8 +1180,7 @@ mod tests {
         assert!(rendered.contains("reviewer: model=sonnet"), "{rendered}");
     }
 
-    /// X-4 (#61): `task_detail` renders the `Stuck` line only when the
-    /// status is actually `stuck` and a reason is present.
+    /// Loop counters print as counts, from an object or a bare number.
     #[test]
     fn task_detail_renders_loop_counters_as_counts() {
         let detail = json!({
@@ -1199,6 +1198,8 @@ mod tests {
         assert!(!task_detail(&none).contains("Loop counters"));
     }
 
+    /// X-4 (#61): `task_detail` renders the `Stuck` line only when the
+    /// status is actually `stuck` and a reason is present.
     #[test]
     fn task_detail_renders_the_stuck_line_only_when_stuck() {
         let stuck = json!({

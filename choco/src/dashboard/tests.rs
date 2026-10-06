@@ -2163,11 +2163,17 @@ fn a_task_that_left_the_lists_keeps_its_last_answer() {
     open_detail(&mut app, BUSY);
     answer(&mut app, BUSY, Ok(busy_detail()));
     load(&mut app, vec![], vec![]);
+    app.view = match std::mem::replace(&mut app.view, View::List) {
+        View::Detail(mut d) => {
+            d.snapshot = None;
+            View::Detail(d)
+        }
+        v => v,
+    };
     let s = render(&app, 100, 30);
-    assert!(
-        s.contains("Per-kind") || s.contains("ID        9c03aa17-bbbb"),
-        "{s}"
-    );
+    assert!(s.contains("Per-kind stage execution (#55)"), "{s}");
+    assert!(s.contains("ID        9c03aa17-bbbb"), "{s}");
+    assert!(s.contains("Stage     internal_review"), "{s}");
     assert!(
         s.contains("Repo      /home/dev/chocofactory") && s.contains("1. coding (start)"),
         "{s}"
@@ -2240,4 +2246,56 @@ fn a_closed_row_123_days_old_shows_123d_ago_uncut() {
     let s = render(&app, 120, 30);
     assert!(s.contains("123d ago"), "{s}");
     assert!(!s.contains("123d04h"), "{s}");
+}
+
+#[test]
+fn a_failed_first_answer_stays_visible_on_a_short_screen() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(
+        &mut app,
+        BUSY,
+        Err("error sending request for url (http://127.0.0.1:7777/tasks/9c03aa17-bbbb): connection refused".into()),
+    );
+    let s = render(&app, 40, 10);
+    assert!(s.contains("could not load the task"), "{s}");
+    assert!(!s.contains("earlier step"), "{s}");
+}
+
+#[test]
+fn an_open_task_without_a_stage_time_shows_the_bare_stage() {
+    let mut app = board();
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == BUSY)
+        .unwrap()
+        .stage_entered_at = None;
+    open_detail(&mut app, BUSY);
+    let s = render(&app, 100, 30);
+    assert!(
+        s.lines()
+            .any(|l| l.trim_end() == "Stage     internal_review"),
+        "{s}"
+    );
+}
+
+#[test]
+fn a_very_long_stuck_reason_is_cut_to_three_lines_with_an_ellipsis() {
+    let mut app = board();
+    let id = "7d22e1a8-dddd";
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == id)
+        .unwrap()
+        .task
+        .stuck_reason = Some("word ".repeat(60));
+    open_detail(&mut app, id);
+    let s = render(&app, 60, 30);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let i = lines
+        .iter()
+        .position(|l| l.starts_with("Stuck "))
+        .expect(&s);
+    assert!(lines[i + 2].ends_with('…'), "{s}");
+    assert!(!lines[i + 3].starts_with("          word"), "{s}");
 }

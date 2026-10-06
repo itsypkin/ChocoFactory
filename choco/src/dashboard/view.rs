@@ -819,13 +819,22 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     let mut prog_title = "progress".to_string();
     let mut prog_err = false;
     let mut prog: Vec<(String, Style)> = Vec::new();
+    let mut cuttable = true;
     match (&d.data, &d.error) {
         (None, None) => prog.push(("  loading…".into(), plain)),
-        (None, Some(e)) => prog.extend(
-            wrap_chars(&format!("  could not load the task: {e}"), width)
+        (None, Some(e)) => {
+            // An error is never "cut to earlier steps": it keeps its head
+            // and the bottom clip takes the rest.
+            cuttable = false;
+            prog.extend(
+                wrap_chars(
+                    &format!("could not load the task: {e}"),
+                    width.saturating_sub(2).max(1),
+                )
                 .into_iter()
-                .map(|l| (l, error_style(app))),
-        ),
+                .map(|l| (format!("  {l}"), error_style(app))),
+            )
+        }
         (Some(v), err) => {
             if let Some(e) = err {
                 prog_title = format!("progress (refresh failed: {e})");
@@ -873,10 +882,12 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
                 let h = if m < prog.len() { m + 1 } else { m };
                 block(rows, h) <= body_h
             };
-            keep_prog = (1..=prog.len())
-                .rev()
-                .find(|&m| m != prog.len().saturating_sub(1) && fits(m, &rows))
-                .unwrap_or(1.min(prog.len()));
+            if cuttable {
+                keep_prog = (1..=prog.len())
+                    .rev()
+                    .find(|&m| m != prog.len().saturating_sub(1) && fits(m, &rows))
+                    .unwrap_or(1.min(prog.len()));
+            }
             // ...then the Role, Created, Repo and workflow path rows.
             for cut in 1..=4u8 {
                 let h = if keep_prog < prog.len() {
@@ -907,7 +918,10 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     let hidden = prog.len() - keep_prog;
     if hidden > 0 {
         lines.push(Line::raw(fit(
-            &format!("  … {hidden} earlier steps"),
+            &format!(
+                "  … {hidden} earlier step{}",
+                if hidden == 1 { "" } else { "s" }
+            ),
             width,
         )));
     }
