@@ -1,10 +1,60 @@
 use super::*;
 
 impl WorkflowEngine {
+    pub(super) async fn enter_terminal(
+        self: &Arc<Self>,
+        entry: &StageEntry<'_>,
+    ) -> Result<(), EngineError> {
+        let StageEntry {
+            task_id,
+            definition,
+            stage_name,
+            ..
+        } = *entry;
+        // Best-effort, not `?`: propagating this would skip the
+        // caller's (`advance`/`start_task`) lock-eviction check for
+        // a terminal stage, and `workflow_state` is already
+        // committed to this stage regardless, so a transient
+        // failure here can't be un-done by returning early anyway
+        // (§ review on PR #35). Lock eviction itself happens in
+        // the caller, which knows the stage just entered and can
+        // safely check whether any other overlapping caller still
+        // references it (`evict_task_lock_if_unshared`) — this
+        // function has no access to that `Arc`.
+        if let Err(err) = tasks::update_status(&self.pool, task_id, TASK_STATUS_CLOSED).await {
+            tracing::error!(
+                task_id, %err,
+                "failed to mark task closed after entering a terminal stage"
+            );
+        } else {
+            tracing::info!(
+                task_id,
+                stage = stage_name,
+                "task closed (entered terminal stage)"
+            );
+        }
+        // Same best-effort reasoning as `update_status` above (§5.5
+        // Q7, issue #58): the task is already closed regardless of
+        // whether this succeeds, and `worktree::remove` is itself
+        // idempotent — `cancel_task` (#69) can safely retry this
+        // exact removal if it raced this one.
+        if definition.worktree {
+            if self.remove_worktree(task_id).await {
+                // Only once the worktree is really gone: git
+                // can't delete a checked-out branch, and a failed
+                // removal leaves the work where a person can find it.
+                self.cleanup_branch(task_id, true).await;
+            } else {
+                self.note_branch_left_in_place(task_id).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Removes `task_id`'s worktree, best-effort — logged loudly on
     /// failure, never propagated (§5.5 Q7, issue #58).
     ///
-    /// Called from `dispatch_stage`'s `StageKind::Terminal` arm and from
+    /// Called from `enter_terminal` and from
     /// `cancel_task` (#69) — §5.5's "removed on reaching `done` (or task
     /// cancellation)". Both call it only *after* the task is already
     /// durably `closed`/`cancelled`, so there is nothing left here that a

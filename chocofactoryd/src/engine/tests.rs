@@ -4602,7 +4602,7 @@ stages:
     wait_until_stage(&pool, &task_id, "stalled").await;
 }
 
-/// `finish_poll_stage`'s catch-all (#61) had no test before this task:
+/// `finish_detached`'s catch-all (#61) had no test before this task:
 /// a poll resolves cleanly, but the `agent_turn` its outcome routes
 /// into can't start (a binary that can't be spawned). Kept fast — a
 /// short interval and a command that resolves on its first attempt —
@@ -8179,7 +8179,7 @@ stages:
 /// Two mechanisms stop it, as with
 /// `a_cancelled_task_does_not_advance_when_its_turn_completes`: the
 /// runner abort (which kills the loop outright) and the advisory
-/// `is_cancelled` check in `run_poll_stage` (which ends it at the next
+/// `is_cancelled` check in `run_watch` (which ends it at the next
 /// attempt). The abort alone is enough, so deleting the advisory check
 /// would not fail this test. The check still earns its place for a
 /// runner the registry somehow doesn't hold — and this test does fail
@@ -8459,7 +8459,7 @@ stages:
     // The reason names `coding` — the stage that actually failed to
     // start — not `run`, which completed fine (review, X-4 round 2).
     // `workflow_state.current_stage` already reads `coding` by the time
-    // `finish_shell_stage`'s catch-all runs, so that's also the stage
+    // `finish_detached`'s catch-all runs, so that's also the stage
     // `retry_task` would re-enter; naming `run` here would point a
     // human (and a retry) at the wrong place.
     assert!(
@@ -10350,7 +10350,7 @@ stages:
 /// spawn can't be what trips this), so the second stage is failed a
 /// different way — a prompt template that fails to render, the same
 /// technique `a_template_failure_marks_the_task_stuck_with_exactly_one_error_event`
-/// uses for `finish_shell_stage`'s catch-all.
+/// uses for `finish_detached`'s catch-all.
 #[tokio::test]
 async fn a_turn_completing_into_a_stage_that_cannot_start_marks_the_task_stuck() {
     let pool = connect_in_memory().await.unwrap();

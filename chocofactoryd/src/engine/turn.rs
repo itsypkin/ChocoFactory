@@ -130,21 +130,30 @@ impl ResumeSession {
 }
 
 impl WorkflowEngine {
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn enter_agent_turn(
         self: &Arc<Self>,
-        task_id: &str,
-        definition: &Arc<WorkflowDefinition>,
-        stage_name: &str,
-        stage_def: &StageDef,
-        role: &str,
-        prompt_file: Option<&std::path::Path>,
-        capture: Option<Capture>,
-        report_sections: &[String],
-        input: Option<&str>,
-        payload: &Value,
-        resume: Option<&ResumeSession>,
+        entry: &StageEntry<'_>,
     ) -> Result<(), EngineError> {
+        let StageEntry {
+            task_id,
+            definition,
+            stage_name,
+            stage_def,
+            payload,
+            input,
+            resume,
+        } = *entry;
+        let StageKind::AgentTurn {
+            role,
+            prompt_file,
+            capture,
+            report_sections,
+        } = &stage_def.kind
+        else {
+            unreachable!("enter_agent_turn is only called for AgentTurn stages")
+        };
+        let prompt_file = prompt_file.as_deref();
+        let capture = *capture;
         // `WorkflowDefinition::parse`/`load` reject an agent_turn stage
         // with an unknown role, but `roles`/`stages` are `pub` fields with
         // no private-construction guard — a definition built by hand
@@ -408,8 +417,8 @@ impl WorkflowEngine {
             // This function returns `Err(EngineError::Session(err))` below,
             // which is exactly the signal X-4 (issue #61) needs: whichever
             // caller entered this stage — `create_task`/`start_task` for an
-            // entry-stage `agent_turn`, or `finish_shell_stage`/
-            // `finish_poll_stage`/`finish_turn`'s catch-all `Err(err)` arm
+            // entry-stage `agent_turn`, or `finish_detached`/
+            // `finish_turn`'s catch-all `Err(err)` arm
             // when a prior stage's `advance_from_stage` re-enters this one —
             // marks the *task* stuck with this error, so it's queryable from
             // `choco task status`/`GET /tasks/{id}` rather than only
@@ -993,7 +1002,7 @@ impl WorkflowEngine {
     }
 
     /// Applies a completed turn's capture and outcome. Runs detached, like
-    /// `finish_shell_stage`/`finish_poll_stage`, so there is nothing to
+    /// `finish_detached`, so there is nothing to
     /// return a failure to — it is logged and the task parks.
     pub(super) async fn finish_turn(
         self: &Arc<Self>,
@@ -1248,7 +1257,7 @@ impl WorkflowEngine {
                 None
             }
             // Deliberately parked, not broken — the same classification
-            // `finish_shell_stage` uses. A reviewer stage that declares only
+            // `finish_detached` uses. A reviewer stage that declares only
             // `approved`/`changes_requested` and whose reply carried neither
             // lands here, which is the intended place for a human to pick it
             // up rather than the engine inventing a transition.
@@ -1305,7 +1314,7 @@ impl WorkflowEngine {
                     task_id, stage = stage_name, outcome, %err,
                     "task wedged: its turn completed but the transition failed"
                 );
-                // See `finish_shell_stage`'s identical catch-all for why
+                // See `finish_detached`'s identical catch-all for why
                 // this blames whichever stage actually failed rather than
                 // always `stage_name`.
                 let blamed = self.stage_to_blame(task_id, stage_name).await;

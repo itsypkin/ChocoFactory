@@ -1,3 +1,4 @@
+use super::runners::DetachedKind;
 use super::shell_stage::{describe_command, duration_ms, elapsed_ms, tail, warn_if_escaped};
 use super::stage_capture::derive_capture;
 use super::*;
@@ -8,7 +9,7 @@ use super::*;
 /// the trio hands this straight down untouched, and `outcomes` in
 /// particular must be compiled exactly once for the whole stage rather
 /// than per attempt.
-struct PollRun {
+struct WatchRun {
     command: ShellCommand,
     capture: Option<Capture>,
     interval: Duration,
@@ -113,19 +114,31 @@ impl WorkflowEngine {
     /// than in the detached loop: the task's working directory, and the
     /// `outcomes:` patterns, which are compiled once for the whole stage
     /// instead of per attempt.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn enter_poll(
         self: &Arc<Self>,
-        task_id: &str,
-        definition: &Arc<WorkflowDefinition>,
-        stage_name: &str,
-        command: ShellCommand,
-        capture: Option<Capture>,
-        interval: Duration,
-        outcomes: &[PollOutcome],
-        payload: &Value,
-        env: Vec<(String, String)>,
+        entry: &StageEntry<'_>,
     ) -> Result<(), EngineError> {
+        let StageEntry {
+            task_id,
+            definition,
+            stage_name,
+            payload,
+            ..
+        } = *entry;
+        let StageKind::Poll {
+            command,
+            capture,
+            interval,
+            timeout: _,
+            outcomes,
+            env,
+        } = &entry.stage_def.kind
+        else {
+            unreachable!("enter_poll is only called for Poll stages")
+        };
+        let capture = *capture;
+        let interval = *interval;
+        let (command, env) = self.render_stage_command(entry, command, env).await?;
         // The deadline was computed once, on entry, and stored in the same
         // write that moved the task here (#52). A missing or malformed
         // window is an invariant violation, not a cue to invent a budget.
@@ -158,7 +171,7 @@ impl WorkflowEngine {
             task_id.to_string(),
             Arc::clone(definition),
             stage_name.to_string(),
-            PollRun {
+            WatchRun {
                 command,
                 capture,
                 interval,
@@ -182,20 +195,20 @@ impl WorkflowEngine {
         task_id: String,
         definition: Arc<WorkflowDefinition>,
         stage_name: String,
-        run: PollRun,
+        run: WatchRun,
     ) {
         let engine = Arc::clone(self);
         // Same registration as `spawn_shell_runner`, and more load-bearing
         // here: a `poll` holds its window open for minutes or hours, so
         // without this a cancelled task keeps firing its command every
         // interval until the deadline. The advisory `is_cancelled` check in
-        // `run_poll_stage` only fires *between* attempts; this stops one
+        // `run_watch` only fires *between* attempts; this stops one
         // already in flight.
         let registered_task_id = task_id.clone();
         let spawned =
             self.spawn_registered_runner(&registered_task_id, move |runner_id| async move {
                 engine
-                    .run_poll_stage(&task_id, &definition, &stage_name, run)
+                    .run_watch(&task_id, &definition, &stage_name, run)
                     .await;
                 engine.finish_runner(&task_id, runner_id);
             });
@@ -222,12 +235,12 @@ impl WorkflowEngine {
     /// out. Only the output is matched. The one failure that does end the
     /// loop is a command that could not be started at all, which no amount
     /// of retrying will fix.
-    async fn run_poll_stage(
+    async fn run_watch(
         self: &Arc<Self>,
         task_id: &str,
         definition: &Arc<WorkflowDefinition>,
         stage_name: &str,
-        run: PollRun,
+        run: WatchRun,
     ) {
         let described = describe_command(&run.command);
         // Fixed on stage entry, not here: this runner may be a resumed one.
@@ -325,8 +338,15 @@ impl WorkflowEngine {
                         }),
                     )
                     .await;
-                    self.finish_poll_stage(task_id, definition, stage_name, "error", None)
-                        .await;
+                    self.finish_detached(
+                        DetachedKind::Poll,
+                        task_id,
+                        definition,
+                        stage_name,
+                        "error",
+                        None,
+                    )
+                    .await;
                     return;
                 }
                 // The command *did* run — possibly for a long time — and
@@ -431,8 +451,15 @@ impl WorkflowEngine {
                     }),
                 )
                 .await;
-                self.finish_poll_stage(task_id, definition, stage_name, matched.then, captured)
-                    .await;
+                self.finish_detached(
+                    DetachedKind::Poll,
+                    task_id,
+                    definition,
+                    stage_name,
+                    matched.then,
+                    captured,
+                )
+                .await;
                 return;
             }
 
@@ -556,7 +583,7 @@ impl WorkflowEngine {
     /// it has nothing to be the same as.
     ///
     /// "Changed" is whatever key the caller passes, not the output alone —
-    /// `run_poll_stage` folds the exit code in, so a command that starts
+    /// `run_watch` folds the exit code in, so a command that starts
     /// failing without changing what it prints is still a change worth a
     /// timeline entry.
     async fn record_poll_attempt(
@@ -606,7 +633,7 @@ impl WorkflowEngine {
     /// Ends a poll that ran out of budget with no matching outcome (§5.2's
     /// `on_timeout`). The loader guarantees a `timeout` edge exists
     /// whenever the stage sets a `timeout:`, so this reaches
-    /// `finish_poll_stage`'s park path only for a hand-built definition.
+    /// `finish_detached`'s park path only for a hand-built definition.
     async fn finish_poll_timed_out(
         self: &Arc<Self>,
         task_id: &str,
@@ -653,103 +680,14 @@ impl WorkflowEngine {
         )
         .await;
 
-        self.finish_poll_stage(task_id, definition, stage_name, "timeout", None)
-            .await;
-    }
-
-    /// Applies a finished poll stage's outcome. Nothing is left to return
-    /// it to — this runs detached — so a failure is logged, the task is
-    /// marked stuck (X-4, issue #61), and it parks in its current stage.
-    /// Mirrors `finish_shell_stage`, with its own messages so log
-    /// aggregation can tell the two kinds apart.
-    async fn finish_poll_stage(
-        self: &Arc<Self>,
-        task_id: &str,
-        definition: &Arc<WorkflowDefinition>,
-        stage_name: &str,
-        outcome: &str,
-        capture: Option<Value>,
-    ) {
-        match self
-            .advance_from_stage(task_id, definition, outcome, Some(stage_name), capture)
-            .await
-        {
-            Ok(()) => tracing::debug!(
-                task_id,
-                stage = stage_name,
-                outcome,
-                "poll stage resolved; advanced"
-            ),
-            // Parked and marked stuck so a human can find it and retry it:
-            // a stage that maps no edge for the outcome it just produced —
-            // an `error` with no `on: { error: … }` — is waiting for a
-            // human on purpose.
-            Err(EngineError::UnknownOutcome { stage, outcome }) => {
-                tracing::info!(
-                    task_id,
-                    stage,
-                    outcome,
-                    "poll stage parked: its outcome has no 'on:' edge"
-                );
-                self.mark_stuck(
-                    task_id,
-                    &format!(
-                        "stage '{stage}': command finished with outcome '{outcome}' but the \
-                         stage has no 'on:' edge for it"
-                    ),
-                    false,
-                )
-                .await;
-            }
-            // Reachable here in a way it isn't for `shell`: a poll holds
-            // its stage open for as long as its budget allows, so a human
-            // resuming or closing the task mid-poll really can move it on
-            // between the last `still_in_stage` check and this write.
-            Err(EngineError::StageMovedOn { expected, actual }) => tracing::info!(
-                task_id,
-                expected,
-                actual,
-                outcome,
-                "discarded a poll stage's outcome: the task had already left that stage"
-            ),
-            // Squarely reachable: a poll's advisory cancel check only runs
-            // between attempts, so an outcome resolving in the same window
-            // as a cancel lands here.
-            Err(EngineError::TaskCancelled(_)) => tracing::info!(
-                task_id,
-                stage = stage_name,
-                outcome,
-                "discarded a poll stage's outcome: the task was cancelled"
-            ),
-            // Anything else — a transient DB failure in `advance`, or a
-            // session that failed to start while advancing into the next
-            // stage — leaves the task stuck in that stage with nothing
-            // that will retry it on its own.
-            Err(err) => {
-                tracing::error!(
-                    task_id, stage = stage_name, outcome, %err,
-                    "task wedged: its poll stage resolved but the transition failed"
-                );
-                // See `finish_shell_stage`'s identical catch-all for why
-                // this blames whichever stage actually failed rather than
-                // always `stage_name`.
-                let blamed = self.stage_to_blame(task_id, stage_name).await;
-                let reason = if blamed == stage_name {
-                    format!(
-                        "stage '{stage_name}': command completed but the transition failed: {err}"
-                    )
-                } else {
-                    format!(
-                        "stage '{blamed}': could not be entered after '{stage_name}' completed: {err}"
-                    )
-                };
-                self.mark_stuck(
-                    task_id,
-                    &reason,
-                    matches!(err, EngineError::Template { .. }),
-                )
-                .await;
-            }
-        }
+        self.finish_detached(
+            DetachedKind::Poll,
+            task_id,
+            definition,
+            stage_name,
+            "timeout",
+            None,
+        )
+        .await;
     }
 }

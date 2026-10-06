@@ -91,6 +91,31 @@ pub(super) fn render_env(
 }
 
 impl WorkflowEngine {
+    pub(super) async fn render_stage_command(
+        &self,
+        entry: &StageEntry<'_>,
+        command: &ShellCommand,
+        env: &IndexMap<String, String>,
+    ) -> Result<(ShellCommand, Vec<(String, String)>), EngineError> {
+        let StageEntry {
+            task_id,
+            definition,
+            stage_name,
+            payload,
+            ..
+        } = *entry;
+        let (command, mut unresolved) = render_command(command, payload, stage_name)?;
+        let (env, env_unresolved, truncated) = self
+            .stage_environment(task_id, definition, stage_name, env, payload)
+            .await?;
+        unresolved.extend(env_unresolved);
+        self.record_unresolved_template_note(task_id, stage_name, &unresolved)
+            .await;
+        self.record_env_truncated_note(task_id, stage_name, &truncated)
+            .await;
+        Ok((command, env))
+    }
+
     /// The stage's rendered `env:` followed by the engine's `CHOCO_*`
     /// variables (so the engine's values win), plus what rendering left
     /// unresolved and the names it truncated. Computed on entry and never

@@ -1,3 +1,4 @@
+use super::runners::DetachedKind;
 use super::stage_capture::derive_capture;
 use super::*;
 
@@ -67,17 +68,28 @@ impl WorkflowEngine {
     /// report its outcome, and `tokio::sync::Mutex` is not reentrant. The
     /// `agent_turn` path has the same constraint and resolves it the same
     /// way, via `spawn_turn_watcher`.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn enter_shell(
         self: &Arc<Self>,
-        task_id: &str,
-        definition: &Arc<WorkflowDefinition>,
-        stage_name: &str,
-        command: ShellCommand,
-        capture: Option<Capture>,
-        timeout: Option<Duration>,
-        env: Vec<(String, String)>,
+        entry: &StageEntry<'_>,
     ) -> Result<(), EngineError> {
+        let StageEntry {
+            task_id,
+            definition,
+            stage_name,
+            ..
+        } = *entry;
+        let StageKind::Shell {
+            command,
+            capture,
+            timeout,
+            env,
+        } = &entry.stage_def.kind
+        else {
+            unreachable!("enter_shell is only called for Shell stages")
+        };
+        let capture = *capture;
+        let timeout = *timeout;
+        let (command, env) = self.render_stage_command(entry, command, env).await?;
         // Resolved here rather than in the spawned task so that a missing
         // task fails the transition that caused it, where the caller can
         // still see the error, instead of only reaching a log line.
@@ -206,8 +218,15 @@ impl WorkflowEngine {
                     }),
                 )
                 .await;
-                self.finish_shell_stage(task_id, definition, stage_name, "error", None)
-                    .await;
+                self.finish_detached(
+                    DetachedKind::Shell,
+                    task_id,
+                    definition,
+                    stage_name,
+                    "error",
+                    None,
+                )
+                .await;
                 return;
             }
         };
@@ -276,109 +295,14 @@ impl WorkflowEngine {
         }
         self.append_command_event(task_id, payload).await;
 
-        self.finish_shell_stage(task_id, definition, stage_name, stage_outcome, captured)
-            .await;
-    }
-
-    /// Applies a finished shell stage's outcome. Nothing is left to return
-    /// it to — this runs detached — so a failure is logged, the task is
-    /// marked stuck (X-4, issue #61), and it parks in its current stage.
-    async fn finish_shell_stage(
-        self: &Arc<Self>,
-        task_id: &str,
-        definition: &Arc<WorkflowDefinition>,
-        stage_name: &str,
-        outcome: &str,
-        capture: Option<Value>,
-    ) {
-        match self
-            .advance_from_stage(task_id, definition, outcome, Some(stage_name), capture)
-            .await
-        {
-            Ok(()) => tracing::debug!(
-                task_id,
-                stage = stage_name,
-                outcome,
-                "shell stage completed; advanced"
-            ),
-            // Parked and marked stuck so a human can find it and retry it:
-            // the loader guarantees a `done` edge exists, so this is a
-            // failed command on a stage that maps no `error` edge on
-            // purpose.
-            Err(EngineError::UnknownOutcome { stage, outcome }) => {
-                tracing::info!(
-                    task_id,
-                    stage,
-                    outcome,
-                    "shell stage parked: its outcome has no 'on:' edge"
-                );
-                self.mark_stuck(
-                    task_id,
-                    &format!(
-                        "stage '{stage}': command finished with outcome '{outcome}' but the \
-                         stage has no 'on:' edge for it"
-                    ),
-                    false,
-                )
-                .await;
-            }
-            // Not reachable from any path today (nothing moves a task out
-            // of a shell stage while its command is running), so this is
-            // the invariant announcing itself rather than a known case.
-            Err(EngineError::StageMovedOn { expected, actual }) => tracing::warn!(
-                task_id,
-                expected,
-                actual,
-                outcome,
-                "discarded a shell stage's outcome: the task had already left that stage"
-            ),
-            // Expected, not a wedge: an operator cancelled mid-command and
-            // the guard in `advance_from_stage` refused the transition, so
-            // the task is stopped on purpose and nothing is waiting on it.
-            // Matched ahead of the catch-all below so a routine cancel
-            // isn't reported at `error` as a task needing rescue.
-            Err(EngineError::TaskCancelled(_)) => tracing::info!(
-                task_id,
-                stage = stage_name,
-                outcome,
-                "discarded a shell stage's outcome: the task was cancelled"
-            ),
-            // Anything else — a transient DB failure in `advance`, or a
-            // session that failed to start while advancing into the next
-            // stage (`enter_agent_turn` → `EngineError::Session`, whose
-            // `workflow_state.current_stage` is already the new stage by
-            // the time this returns) — leaves the task stuck in that stage
-            // with nothing that will retry it on its own. Distinguished
-            // from the park above so it doesn't hide among expected
-            // outcomes.
-            Err(err) => {
-                tracing::error!(
-                    task_id, stage = stage_name, outcome, %err,
-                    "task wedged: its shell stage completed but the transition failed"
-                );
-                // `stage_to_blame` names whichever stage actually failed:
-                // `stage_name` itself if the transition failed outright, or
-                // the *next* stage if `stage_name` completed fine but that
-                // next stage couldn't be entered.
-                let blamed = self.stage_to_blame(task_id, stage_name).await;
-                let reason = if blamed == stage_name {
-                    format!(
-                        "stage '{stage_name}': command completed but the transition failed: {err}"
-                    )
-                } else {
-                    format!(
-                        "stage '{blamed}': could not be entered after '{stage_name}' completed: {err}"
-                    )
-                };
-                // `enter_stage` already appends its own `Error` event for a
-                // template failure — see `mark_stuck`'s doc comment.
-                self.mark_stuck(
-                    task_id,
-                    &reason,
-                    matches!(err, EngineError::Template { .. }),
-                )
-                .await;
-            }
-        }
+        self.finish_detached(
+            DetachedKind::Shell,
+            task_id,
+            definition,
+            stage_name,
+            stage_outcome,
+            captured,
+        )
+        .await;
     }
 }

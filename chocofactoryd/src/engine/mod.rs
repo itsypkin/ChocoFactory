@@ -50,7 +50,7 @@ use crate::session::{SessionError, SessionKind, SessionManager};
 use crate::shell;
 use crate::template;
 use crate::workflow_def::{
-    Capture, PollOutcome, ShellCommand, StageDef, StageKind, WorkflowDefError, WorkflowDefinition,
+    Capture, ShellCommand, StageDef, StageKind, WorkflowDefError, WorkflowDefinition,
 };
 use crate::worktree::{self, WorktreeError};
 
@@ -64,9 +64,8 @@ mod turn;
 mod watch;
 pub use sweep::{ParkReport, PollSweepReport, RestartEffect, restart_effect};
 
-use render::render_command;
 #[cfg(test)]
-use render::{MAX_ENV_VALUE_BYTES, render_env};
+use render::{MAX_ENV_VALUE_BYTES, render_command, render_env};
 #[cfg(test)]
 use shell_stage::{EVENT_OUTPUT_TAIL_BYTES, tail};
 #[cfg(test)]
@@ -83,6 +82,17 @@ use turn::{MAX_CONSECUTIVE_RESUMES, ResumeSession};
 use watch::set_poll_window;
 #[cfg(test)]
 use watch::{poll_window_for, remaining_budget};
+
+#[derive(Clone, Copy)]
+struct StageEntry<'a> {
+    task_id: &'a str,
+    definition: &'a Arc<WorkflowDefinition>,
+    stage_name: &'a str,
+    stage_def: &'a StageDef,
+    payload: &'a Value,
+    input: Option<&'a str>,
+    resume: Option<&'a ResumeSession>,
+}
 
 /// In-flight detached `shell`/`poll` runners, keyed by task id and then by
 /// the runner id [`WorkflowEngine::spawn_registered_runner`] hands out (#69).
@@ -1747,7 +1757,7 @@ impl WorkflowEngine {
                     // before failing to enter it (see `stage_to_blame`'s
                     // doc comment), so the task is left `open` with nothing
                     // running unless this marks it `stuck`. Mirrors the
-                    // catch-alls in `finish_shell_stage`/`finish_poll_stage`/
+                    // catch-alls in `finish_detached`/
                     // `finish_turn` — the human-gate path is the one
                     // #61 left without one.
                     Err(err) => {
@@ -1810,7 +1820,7 @@ impl WorkflowEngine {
     ///    a retry starts clean.
     /// 2. `tasks.status` is written **second**, still inside the per-task
     ///    lock. Every guard that makes cancel stick — `advance_from_stage`,
-    ///    `send_message`, `run_poll_stage` — reads that column, so it has
+    ///    `send_message`, `run_watch` — reads that column, so it has
     ///    to land before this function releases the lock. Taking the same
     ///    lock `advance` takes means an in-flight transition either
     ///    completes entirely before this write or observes it; it cannot
@@ -2818,9 +2828,16 @@ impl WorkflowEngine {
             ),
         }
 
-        let entered = self.dispatch_stage(
-            task_id, definition, stage_name, stage_def, input, payload, resume,
-        );
+        let entry = StageEntry {
+            task_id,
+            definition,
+            stage_name,
+            stage_def,
+            payload,
+            input,
+            resume,
+        };
+        let entered = self.dispatch_stage(&entry);
         let entered = entered.await;
 
         // A missing *value* no longer reaches here at all (#60) — it's
@@ -2857,39 +2874,11 @@ impl WorkflowEngine {
 
     /// The per-kind behavior half of `enter_stage`, split out so the caller
     /// can act on the result once rather than at five `return` sites.
-    #[allow(clippy::too_many_arguments)]
-    async fn dispatch_stage(
-        self: &Arc<Self>,
-        task_id: &str,
-        definition: &Arc<WorkflowDefinition>,
-        stage_name: &str,
-        stage_def: &StageDef,
-        input: Option<&str>,
-        payload: &Value,
-        resume: Option<&ResumeSession>,
-    ) -> Result<(), EngineError> {
-        match &stage_def.kind {
-            StageKind::AgentTurn {
-                role,
-                prompt_file,
-                capture,
-                report_sections,
-            } => {
-                self.enter_agent_turn(
-                    task_id,
-                    definition,
-                    stage_name,
-                    stage_def,
-                    role,
-                    prompt_file.as_deref(),
-                    *capture,
-                    report_sections,
-                    input,
-                    payload,
-                    resume,
-                )
-                .await
-            }
+    async fn dispatch_stage(self: &Arc<Self>, entry: &StageEntry<'_>) -> Result<(), EngineError> {
+        match &entry.stage_def.kind {
+            StageKind::AgentTurn { .. } => self.enter_agent_turn(entry).await,
+            StageKind::Shell { .. } => self.enter_shell(entry).await,
+            StageKind::Poll { .. } => self.enter_poll(entry).await,
             // Pauses the task with nothing further to do here; whatever
             // relays the next human message is responsible for advancing
             // this stage on `"resumed"` once it arrives — see
@@ -2897,91 +2886,7 @@ impl WorkflowEngine {
             // threads the message through as this stage's capture (#59)
             // if it declared one.
             StageKind::HumanGate { .. } => Ok(()),
-            StageKind::Terminal => {
-                // Best-effort, not `?`: propagating this would skip the
-                // caller's (`advance`/`start_task`) lock-eviction check for
-                // a terminal stage, and `workflow_state` is already
-                // committed to this stage regardless, so a transient
-                // failure here can't be un-done by returning early anyway
-                // (§ review on PR #35). Lock eviction itself happens in
-                // the caller, which knows the stage just entered and can
-                // safely check whether any other overlapping caller still
-                // references it (`evict_task_lock_if_unshared`) — this
-                // function has no access to that `Arc`.
-                if let Err(err) =
-                    tasks::update_status(&self.pool, task_id, TASK_STATUS_CLOSED).await
-                {
-                    tracing::error!(
-                        task_id, %err,
-                        "failed to mark task closed after entering a terminal stage"
-                    );
-                } else {
-                    tracing::info!(
-                        task_id,
-                        stage = stage_name,
-                        "task closed (entered terminal stage)"
-                    );
-                }
-                // Same best-effort reasoning as `update_status` above (§5.5
-                // Q7, issue #58): the task is already closed regardless of
-                // whether this succeeds, and `worktree::remove` is itself
-                // idempotent — `cancel_task` (#69) can safely retry this
-                // exact removal if it raced this one.
-                if definition.worktree {
-                    if self.remove_worktree(task_id).await {
-                        // Only once the worktree is really gone: git
-                        // can't delete a checked-out branch, and a failed
-                        // removal leaves the work where a person can find it.
-                        self.cleanup_branch(task_id, true).await;
-                    } else {
-                        self.note_branch_left_in_place(task_id).await;
-                    }
-                }
-                Ok(())
-            }
-            StageKind::Shell {
-                command,
-                capture,
-                timeout,
-                env,
-            } => {
-                let (command, mut unresolved) = render_command(command, payload, stage_name)?;
-                let (env, env_unresolved, truncated) = self
-                    .stage_environment(task_id, definition, stage_name, env, payload)
-                    .await?;
-                unresolved.extend(env_unresolved);
-                self.record_unresolved_template_note(task_id, stage_name, &unresolved)
-                    .await;
-                self.record_env_truncated_note(task_id, stage_name, &truncated)
-                    .await;
-                self.enter_shell(
-                    task_id, definition, stage_name, command, *capture, *timeout, env,
-                )
-                .await
-            }
-            StageKind::Poll {
-                command,
-                capture,
-                interval,
-                timeout: _,
-                outcomes,
-                env,
-            } => {
-                let (command, mut unresolved) = render_command(command, payload, stage_name)?;
-                let (env, env_unresolved, truncated) = self
-                    .stage_environment(task_id, definition, stage_name, env, payload)
-                    .await?;
-                unresolved.extend(env_unresolved);
-                self.record_unresolved_template_note(task_id, stage_name, &unresolved)
-                    .await;
-                self.record_env_truncated_note(task_id, stage_name, &truncated)
-                    .await;
-                self.enter_poll(
-                    task_id, definition, stage_name, command, *capture, *interval, outcomes,
-                    payload, env,
-                )
-                .await
-            }
+            StageKind::Terminal => self.enter_terminal(entry).await,
         }
     }
 }
