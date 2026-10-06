@@ -3987,10 +3987,25 @@ impl WorkflowEngine {
                         }
                     }
                     Ok(None) => {}
-                    Err(err) => reason.push_str(&format!(
-                        "; the interrupted session could not be recorded ({err}), so retry \
-                         will start the stage fresh"
-                    )),
+                    Err(err) => {
+                        reason.push_str(&format!(
+                            "; the interrupted session could not be recorded ({err}), so \
+                             retry will start the stage fresh"
+                        ));
+                        // Without the session there is no baseline to
+                        // compare, and a fresh retry would take whatever is
+                        // in the worktree as its baseline (#172).
+                        if let Some(StageKind::AgentTurn { role, .. }) =
+                            definition.stages.get(&stage).map(|s| &s.kind)
+                            && definition.roles.get(role).is_some_and(|r| r.read_only)
+                        {
+                            reason.push_str(&format!(
+                                "; could not verify that read-only role '{role}' left the \
+                                 worktree unchanged in stage '{stage}': {err}; inspect and \
+                                 reset the worktree before retrying"
+                            ));
+                        }
+                    }
                 }
                 self.mark_stuck(task_id, &reason, false).await;
                 report.agent_turns += 1;
@@ -16259,6 +16274,126 @@ stages:
         engine.park_interrupted_turns().await.unwrap();
         let reason = stuck_reason(&run.pool, &run.task_id).await;
         assert!(reason.contains("changed the worktree"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn the_restart_sweep_says_so_when_it_cannot_find_a_read_only_turns_session() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "touch sneaky.txt"},
+                {"op": "usage_limit"},
+            ]),
+        )
+        .await;
+        stuck_reason(&run.pool, &run.task_id).await;
+        sqlx::query("UPDATE tasks SET status = 'open', stuck_reason = NULL WHERE id = ?")
+            .bind(&run.task_id)
+            .execute(&run.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE sessions RENAME TO sessions_gone")
+            .execute(&run.pool)
+            .await
+            .unwrap();
+        let binary = named_script_binary(&run.dir, "fake-claude-ro-sweep-err", ro_steps(&[]));
+        let engine = engine_with_adapter_and_workflows_dir(run.pool.clone(), &binary, &run.dir);
+        engine.park_interrupted_turns().await.unwrap();
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("could not verify that read-only role 'reviewer'"),
+            "{reason}"
+        );
+    }
+
+    /// Runs a read-only turn that touches a file and then hangs, waits for
+    /// the file, and puts the session in the given end state by hand so the
+    /// watcher sees it on its next poll.
+    async fn read_only_turn_cut_off_with(
+        status: SessionStatus,
+        end_reason: SessionEndReason,
+    ) -> (ReadOnlyRun, String) {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "touch sneaky.txt && sleep 60"},
+            ]),
+        )
+        .await;
+        for _ in 0..400 {
+            if run.worktree_dir.join("sneaky.txt").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(run.worktree_dir.join("sneaky.txt").exists());
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        sessions::update_status(&run.pool, &session.id, status, None, Some(end_reason))
+            .await
+            .unwrap();
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        let changed = session_events(&run.pool, &session, EventType::WorktreeChanged).await;
+        assert_eq!(changed.len(), 1, "{reason}");
+        (run, reason)
+    }
+
+    #[tokio::test]
+    async fn a_reaped_read_only_turn_is_checked() {
+        let (_run, reason) =
+            read_only_turn_cut_off_with(SessionStatus::Idle, SessionEndReason::Reaped).await;
+        assert!(
+            reason.contains("idle reaper") && reason.contains("changed the worktree"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_daemon_stopped_read_only_turn_is_checked() {
+        let (_run, reason) =
+            read_only_turn_cut_off_with(SessionStatus::Exited, SessionEndReason::DaemonStopped)
+                .await;
+        assert!(reason.contains("changed the worktree"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_lingering_read_only_turn_is_checked() {
+        let run = start_read_only_task_full(
+            "reviewer",
+            false,
+            json!({}),
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": "touch sneaky.txt"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "emit_forever", "text": "still writing files"},
+            ]),
+            None,
+            Some(fast_turn_timers()),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("kept running") && reason.contains("changed the worktree"),
+            "{reason}"
+        );
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        assert_eq!(
+            session_events(&run.pool, &session, EventType::WorktreeChanged)
+                .await
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
