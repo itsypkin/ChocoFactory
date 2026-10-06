@@ -103,7 +103,8 @@ summary and your reply. Work like this:
 
    The description states only what you verified. Don't claim a test
    pins something unless you ran that test against the broken code. Don't
-   call something untestable.
+   call something untestable. If step 2 let you skip a test, the
+   description gives the code fact that shows no test can reach the branch.
 
    Write it on every turn, for the branch as a whole rather than for this
    turn's commits, rewriting whatever an earlier turn left there. If your

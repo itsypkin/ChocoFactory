@@ -24,12 +24,13 @@ findings exist, from either source:
    withdrawn, with the file and line that settles it. Judge the code
    against the defect the finding describes. Anything short of resolved
    is still a finding: repeat it under Findings, blocking if it blocked
-   before or if step 3 of your instructions says it blocks now. Minor
-   findings carried unchanged collapse into one line, as step 5 of your
-   instructions says. The only ways to lower its weight are the two step 3
-   gives: show from the code that no test can reach the branch, or show
-   that the branch only chooses message text that wouldn't lead the
-   operator to a wrong action. A finding that turns out not to have
+   before or if step 3 of your instructions says it blocks now. The only
+   ways to lower its weight are the two step 3 gives: show from the code
+   that no test can reach the branch, or show that the branch only chooses
+   message text that wouldn't lead the operator to a wrong action. Step 3
+   still keeps such a branch blocking when that message is what the change
+   is mainly about. Minor findings carried unchanged collapse into one
+   line, as step 5 of your instructions says. A finding that turns out not to have
    been a defect is "withdrawn" and moves to Dismissed with its
    "Mitigated by:" fact.
    Commit messages, code comments and pull-request replies written by the
@@ -62,7 +63,7 @@ A claim in it that the code doesn't bear out is a blocking finding, because
 the human will rely on it. A false claim stays blocking when it
 overstates what the code does or protects. It's minor when it's about
 tests, known gaps or wording and the defect it describes is already a
-blocking finding: one finding, not two. These are non-blocking findings: a missing
-description; one that leaves out a change or a trade-off the diff makes;
+blocking finding: one finding, not two. These are non-blocking findings:
+a missing description; one that leaves out a change or a trade-off the diff makes;
 a change list that doesn't follow the path a request takes through the
 code; and one that isn't short and in plain English.

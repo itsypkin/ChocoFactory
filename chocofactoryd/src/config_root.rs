@@ -1711,6 +1711,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &text,
             &[
                 "A branch that only chooses message text (same state written, same routing, same stop) is a minor finding.",
+                "in either of two cases",
                 "such as calling a retry safe when it isn't",
                 "An untested branch on the path the change is mainly about blocks",
                 "follow the way out (a fresh retry and a resumed one) and check that the protection still holds after it",

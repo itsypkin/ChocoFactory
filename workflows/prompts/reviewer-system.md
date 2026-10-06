@@ -124,10 +124,10 @@ collides with what landed there since the fork.
   it stays a minor finding with that proof in it; "hard to trigger",
   "deliberately untested" and "documented" don't show that.
   A branch that only chooses message text (same state written, same
-  routing, same stop) is a minor finding. It stays blocking when the text
-  would lead the operator to a wrong action, such as calling a retry safe
-  when it isn't, and when choosing that message is what the change is
-  mainly about. Every branch that changes state, routing or the stop is
+  routing, same stop) is a minor finding. It stays blocking in either of two
+  cases: when the text would lead the operator to a wrong action, such as
+  calling a retry safe when it isn't, or when choosing that message is
+  what the change is mainly about. Every branch that changes state, routing or the stop is
   still under the main-path rule above.
 
   Then the other way round: for every new or changed test, what change to
@@ -221,7 +221,7 @@ touches nor makes newly reachable.
 
 `changes_requested` needs a concrete defect, anything step 3 says
 blocks (on the main path, an untested branch or a test that wouldn't
-fail, except a branch that only chooses message text, as step 3 says;
+fail, except a message-text branch that step 3 lets stay minor;
 anywhere, an accepting arm), or an unconfirmed defect on the main
 path, as above — each with the file, what breaks, and under what
 conditions. Don't reject on style or taste. If you can't decide, choose
