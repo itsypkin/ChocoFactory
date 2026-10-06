@@ -891,7 +891,7 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
                 keep_prog = (1..=prog.len())
                     .rev()
                     .find(|&m| m != prog.len().saturating_sub(1) && fits(m, &rows))
-                    .unwrap_or(1.min(prog.len()));
+                    .unwrap_or(if prog.len() <= 2 { prog.len() } else { 1 });
             }
             // ...then the Role, Created, Repo and workflow path rows.
             for cut in 1..=4u8 {

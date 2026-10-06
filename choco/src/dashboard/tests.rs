@@ -2383,3 +2383,36 @@ fn a_waiting_row_survives_next_to_loop_counters_at_40x12() {
     let s = render(&app, 40, 12);
     assert!(s.contains("Waiting for"), "{s}");
 }
+
+fn busy_with_trail(n: usize) -> Value {
+    let mut d = busy_detail();
+    let t = d["stage_trail"].as_array().unwrap()[..n].to_vec();
+    d["stage_trail"] = Value::Array(t);
+    d
+}
+
+#[test]
+fn a_two_step_progress_list_is_never_cut_to_one_hidden_step() {
+    for (w, h) in [(40, 10), (40, 13)] {
+        let mut app = board();
+        open_detail(&mut app, BUSY);
+        answer(&mut app, BUSY, Ok(busy_with_trail(2)));
+        let s = render(&app, w, h);
+        assert!(!s.contains("earlier step"), "{s}");
+        if h == 13 {
+            assert!(s.contains("1. coding (start)"), "{s}");
+        }
+    }
+}
+
+#[test]
+fn a_three_step_list_cut_to_one_line_says_two_earlier_steps() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let mut d = busy_with_trail(3);
+    d["workflow_state"]["current_stage"] = "revising".into();
+    answer(&mut app, BUSY, Ok(d));
+    let s = render(&app, 40, 10);
+    assert!(s.contains("  … 2 earlier steps"), "{s}");
+    assert!(!s.contains("1 earlier"), "{s}");
+}
