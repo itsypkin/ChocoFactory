@@ -1415,8 +1415,6 @@ stages:
         assert_eq!(def.roles["chat"].model, None);
     }
 
-    /// #90: a role that says nothing about isolation gets the strict default
-    /// — no skills, no memory — rather than the operator's setup.
     fn role_yaml(worktree: bool, role_fields: &str) -> String {
         format!(
             "name: w\nworktree: {worktree}\nroles:\n  reviewer:\n{role_fields}\nstages:\n  review:\n    kind: agent_turn\n    role: reviewer\n    on: {{}}\n"
@@ -1499,6 +1497,8 @@ stages:
         assert!(def.roles["reviewer"].read_only);
     }
 
+    /// #90: a role that says nothing about isolation gets the strict default
+    /// — no skills, no memory — rather than the operator's setup.
     #[test]
     fn a_role_is_isolated_with_no_skills_or_memory_by_default() {
         let dir = TempDir::new();

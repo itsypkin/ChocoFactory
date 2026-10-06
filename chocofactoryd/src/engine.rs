@@ -980,14 +980,6 @@ impl From<LoadTaskWorkflowError> for RetryTaskError {
 /// chain resets whenever a stage starts a fresh session.
 const MAX_CONSECUTIVE_RESUMES: usize = 3;
 
-/// What the daemon says to a turn it has just resumed (#92).
-///
-/// Deliberately short, and deliberately not the stage's prompt: the agent
-/// still has that, and everything it did before the interruption, in the
-/// session being resumed. What it cannot know is that it was interrupted at
-/// all — from inside the transcript, the limit message is simply the last
-/// thing that happened — so this says what stopped it, that its work is
-/// still on disk, and that the turn still ends the way #90 requires.
 fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
@@ -1000,6 +992,14 @@ fn branch_label(branch: &str) -> &str {
     }
 }
 
+/// What the daemon says to a turn it has just resumed (#92).
+///
+/// Deliberately short, and deliberately not the stage's prompt: the agent
+/// still has that, and everything it did before the interruption, in the
+/// session being resumed. What it cannot know is that it was interrupted at
+/// all — from inside the transcript, the limit message is simply the last
+/// thing that happened — so this says what stopped it, that its work is
+/// still on disk, and that the turn still ends the way #90 requires.
 fn resume_prompt(resume: &ResumeSession) -> String {
     format!(
         "Your previous turn on this stage was interrupted before you could finish: {}. \
@@ -5151,6 +5151,20 @@ impl WorkflowEngine {
                              the worktree, then choco task retry --fresh"
                         ))
                     })?;
+                for key in ["cwd", "head", "branch", "status_sha256"] {
+                    if !prev.get(key).is_some_and(Value::is_string) {
+                        return Err(fail(format!(
+                            "the worktree baseline of session {previous} being resumed has no \
+                             '{key}'; check the worktree, then choco task retry --fresh"
+                        )));
+                    }
+                }
+                if !prev.get("status_entries").is_some_and(Value::is_u64) {
+                    return Err(fail(format!(
+                        "the worktree baseline of session {previous} being resumed has no \
+                         'status_entries'; check the worktree, then choco task retry --fresh"
+                    )));
+                }
                 let get = |key: &str| prev.get(key).cloned().unwrap_or(Value::Null);
                 (
                     get("cwd"),
@@ -15750,6 +15764,7 @@ stages:
         _repo: TempDir,
         task_id: String,
         worktree_dir: PathBuf,
+        def: Arc<WorkflowDefinition>,
         _engine: Arc<WorkflowEngine>,
     }
 
@@ -15790,7 +15805,21 @@ stages:
         task_config: Value,
         steps: Value,
     ) -> ReadOnlyRun {
+        start_read_only_task_with_sql(role, with_prep, task_config, steps, None).await
+    }
+
+    /// As `start_read_only_task`, running `setup_sql` on the pool first.
+    async fn start_read_only_task_with_sql(
+        role: &str,
+        with_prep: bool,
+        task_config: Value,
+        steps: Value,
+        setup_sql: Option<&str>,
+    ) -> ReadOnlyRun {
         let pool = connect_in_memory().await.unwrap();
+        if let Some(sql) = setup_sql {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
         let dir = tempdir();
         let repo = tempdir();
         init_git_repo(&repo).await;
@@ -15827,7 +15856,14 @@ stages:
         .id;
         let binary = named_script_binary(&dir, "fake-claude-ro", steps);
         let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
-        engine.start_task(&task_id, &def, None).await.unwrap();
+        let started = engine.start_task(&task_id, &def, None).await;
+        if setup_sql.is_none() {
+            started.unwrap();
+        } else if let Err(err) = started {
+            // An entry-stage failure is returned to the caller as well as
+            // parking the task; the tests read the parked state.
+            eprintln!("start_task: {err}");
+        }
         let worktree_dir = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
         ReadOnlyRun {
             pool,
@@ -15835,6 +15871,7 @@ stages:
             _repo: repo,
             task_id,
             worktree_dir,
+            def,
             _engine: engine,
         }
     }
@@ -16004,13 +16041,15 @@ stages:
             .unwrap();
         assert!(outcome.resumed);
         wait_until_task_status(&run.pool, &run.task_id, "stuck").await;
-        let reason = loop {
-            let reason = stuck_reason(&run.pool, &run.task_id).await;
+        let mut reason = String::new();
+        for _ in 0..200 {
+            reason = stuck_reason(&run.pool, &run.task_id).await;
             if reason.contains("changed the worktree") {
-                break reason;
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
+        }
+        assert!(reason.contains("changed the worktree"), "{reason}");
         assert!(reason.contains("git status changed"), "{reason}");
 
         let second = run_after(&run.pool, &run.task_id, "review", &first).await;
@@ -16079,6 +16118,143 @@ stages:
             session_events(&run.pool, &session, EventType::TurnOutcome)
                 .await
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_turn_that_switches_branch_parks_the_task() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            ro_steps(&["git checkout -q -b sneaky-branch"]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(
+            reason.contains("branch refs/heads/") && reason.contains("→ refs/heads/sneaky-branch"),
+            "{reason}"
+        );
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        let changed = session_events(&run.pool, &session, EventType::WorktreeChanged).await;
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0]["changes"][0]["field"], "branch");
+    }
+
+    /// Deletes the baseline of a finished clean read-only turn, then runs
+    /// the post-turn check by hand against `stage`.
+    async fn recheck_without_baseline(stage: &str) -> String {
+        let run = start_read_only_task("reviewer", false, json!({}), ro_steps(&[])).await;
+        wait_until_stage(&run.pool, &run.task_id, "verified").await;
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        sqlx::query("DELETE FROM events WHERE session_id = ? AND event_type = 'worktree_baseline'")
+            .bind(&session.id)
+            .execute(&run.pool)
+            .await
+            .unwrap();
+        run._engine
+            .finish_turn(&run.task_id, &run.def, stage, None, &session.id)
+            .await;
+        stuck_reason(&run.pool, &run.task_id).await
+    }
+
+    #[tokio::test]
+    async fn a_check_with_no_baseline_fails_closed() {
+        let reason = recheck_without_baseline("review").await;
+        assert!(
+            reason.contains("could not verify") && reason.contains("no worktree baseline"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_for_an_unknown_stage_fails_closed() {
+        let reason = recheck_without_baseline("no_such_stage").await;
+        assert!(
+            reason.contains("could not verify") && reason.contains("no_such_stage"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_baseline_that_cannot_be_written_marks_the_session_start_failed() {
+        let run = start_read_only_task_with_sql(
+            "reviewer",
+            false,
+            json!({}),
+            ro_steps(&[]),
+            Some(
+                "CREATE TRIGGER no_baseline BEFORE INSERT ON events \
+                 WHEN NEW.event_type = 'worktree_baseline' \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END",
+            ),
+        )
+        .await;
+        // An entry stage's start failure is returned to the caller of
+        // `start_task` (which parks the task); the session is what's pinned.
+        let session = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        assert_eq!(session.status, SessionStatus::Exited);
+        assert_eq!(session.end_reason, Some(SessionEndReason::StartFailed));
+    }
+
+    #[tokio::test]
+    async fn a_failed_worktree_changed_write_still_parks_the_task() {
+        let run = start_read_only_task_with_sql(
+            "reviewer",
+            false,
+            json!({}),
+            ro_steps(&["touch sneaky.txt"]),
+            Some(
+                "CREATE TRIGGER no_changed BEFORE INSERT ON events \
+                 WHEN NEW.event_type = 'worktree_changed' \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END",
+            ),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(reason.contains("git status changed"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn resuming_a_session_with_no_baseline_does_not_start_the_agent() {
+        let run = start_read_only_task(
+            "reviewer",
+            false,
+            json!({}),
+            json!([{"op": "read_turn"}, {"op": "usage_limit"}]),
+        )
+        .await;
+        let reason = stuck_reason(&run.pool, &run.task_id).await;
+        assert!(reason.contains("interrupted"), "{reason}");
+        let first = runs_for_stage(&run.pool, &run.task_id, "review")
+            .await
+            .remove(0);
+        sqlx::query("DELETE FROM events WHERE session_id = ? AND event_type = 'worktree_baseline'")
+            .bind(&first.id)
+            .execute(&run.pool)
+            .await
+            .unwrap();
+
+        let binary = named_script_binary(&run.dir, "fake-claude-ro-nobase", ro_steps(&[]));
+        let engine = engine_with_adapter_and_workflows_dir(run.pool.clone(), &binary, &run.dir);
+        let result = engine.retry_task(&run.task_id, RetryMode::Auto).await;
+        let text = match result {
+            Err(err) => err.to_string(),
+            Ok(_) => stuck_reason(&run.pool, &run.task_id).await,
+        };
+        assert!(text.contains("no worktree baseline"), "{text}");
+        assert_eq!(
+            runs_for_stage(&run.pool, &run.task_id, "review")
+                .await
+                .len(),
+            1,
+            "no second session may be spawned"
         );
     }
 

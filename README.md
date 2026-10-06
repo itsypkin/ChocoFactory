@@ -322,7 +322,9 @@ roles:
 - `read_only: true` makes the daemon snapshot the task's worktree (HEAD, the
   branch and `git status`, ignored files excluded) before the role's turn, and
   compare it afterwards. Bash can still write files, so the denylist alone
-  isn't enough.
+  isn't enough. The comparison happens only on stages that conclude (a
+  single-shot `agent_turn` with an `on:` map). A `read_only` role on a standing
+  stage (`on: {}`, as in a chat) gets a baseline but its turns are not checked.
 
 Two rules are checked at load time: a `read_only` role must list all three
 names in `disallowed_tools`, and `read_only` needs `worktree: true` on the
