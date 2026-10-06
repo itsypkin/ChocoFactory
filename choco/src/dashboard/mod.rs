@@ -43,8 +43,11 @@ pub struct LoopConfig {
     /// Longest any one request may take before it is reported as failed
     /// (a hung daemon must never freeze the board or swallow an action).
     pub timeout: Duration,
-    /// Longest a list poll may take. At most the poll interval, so the outage banner's "retrying every <interval>" stays true
-    /// even when the daemon accepts a connection and never answers.
+    /// Longest a list poll after the first load may take (see
+    /// [`poll_timeout_for`]). Polls never overlap and the next starts one
+    /// interval after the last ended, so "retrying every <interval>" stays
+    /// true even when the daemon accepts a connection and never answers.
+    /// The first load uses `timeout` instead.
     pub poll_timeout: Duration,
     /// Tripped by the panic hook when any thread or task panics, so the loop
     /// stops instead of drawing on a terminal the hook already restored.
@@ -187,10 +190,16 @@ fn install_panic_hook(signal: Arc<PanicSignal>) -> PanicHook {
     install_panic_hook_with(signal, restore_terminal)
 }
 
-/// How long a list poll may take: the poll interval, so "retrying every
-/// <interval>" stays true, but never longer than the general request timeout.
+/// The shortest a list poll is given, so a short `--interval` against a slow
+/// daemon still shows data.
+const MIN_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a list poll may take: the poll interval, but at least
+/// [`MIN_POLL_TIMEOUT`] and at most the general request timeout. Polls never
+/// overlap (`fetching`) and the next one starts one interval after the last
+/// ended, which is what the outage line's "retrying every <interval>" means.
 pub(crate) fn poll_timeout_for(interval: Duration) -> Duration {
-    interval.min(REQUEST_TIMEOUT)
+    interval.clamp(MIN_POLL_TIMEOUT, REQUEST_TIMEOUT)
 }
 
 fn install_panic_hook_with(signal: Arc<PanicSignal>, restore: fn()) -> PanicHook {
@@ -250,7 +259,9 @@ pub async fn run_loop<B: Backend>(
             {
                 app.daemon_version = Some(status.version);
             }
-            fetch_bounded(&client, config, app.all_projects()).await
+            // The first load gets the full request timeout: a short
+            // `--interval` must not stop a slow daemon's first answer.
+            fetch_bounded(&client, config.timeout, config, app.all_projects()).await
         };
         tokio::pin!(startup);
         loop {
@@ -313,18 +324,20 @@ fn timed_out() -> String {
     "request timed out".to_string()
 }
 
-async fn fetch_bounded(client: &Client, config: &LoopConfig, projects: bool) -> ListResult {
-    tokio::time::timeout(
-        config.poll_timeout.min(config.timeout),
-        fetch(client, config, projects),
-    )
-    .await
-    .unwrap_or_else(|_| ListResult {
-        at: Utc::now(),
-        active: Err(timed_out()),
-        closed: Err(timed_out()),
-        projects: None,
-    })
+async fn fetch_bounded(
+    client: &Client,
+    limit: Duration,
+    config: &LoopConfig,
+    projects: bool,
+) -> ListResult {
+    tokio::time::timeout(limit, fetch(client, config, projects))
+        .await
+        .unwrap_or_else(|_| ListResult {
+            at: Utc::now(),
+            active: Err(timed_out()),
+            closed: Err(timed_out()),
+            projects: None,
+        })
 }
 
 fn draw<B: Backend>(
@@ -369,7 +382,8 @@ fn run_effect(
                     poll_timeout,
                     panicked: Arc::default(),
                 };
-                let result = fetch_bounded(&client, &cfg, projects).await;
+                let result =
+                    fetch_bounded(&client, poll_timeout.min(timeout), &cfg, projects).await;
                 let _ = tx.send(Msg::List(Box::new(result)));
             });
         }

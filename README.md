@@ -840,7 +840,8 @@ Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off
 | `↑` `k` / `↓` `j` | move, across section boundaries |
 | `PgUp` `PgDn`, `g` `G` | page; top / bottom |
 | `Tab` / `Shift-Tab` | next / previous non-empty section |
-| `⏎` | open the task's detail: header, stage history and its last 200 events, following new ones (`PgUp`/`PgDn` scroll back, `End` follows again, `Esc` returns) |
+| `⏎` | open the task's status view: the fields and progress `choco task status` shows, the loop counters, what the task is waiting for, its PR and the last 5 events, following new ones (`Esc` returns) |
+| `e` | in the detail: the full event stream (the last 200 events, following new ones; `PgUp`/`PgDn` scroll back, `End` follows again); `e` or `Esc` returns to the status view |
 | `o` | open the task's pull request |
 | `r` | retry a `stuck` task |
 | `c` | cancel an `open` or `stuck` task |

@@ -242,9 +242,10 @@ pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
     format!("{what} See `choco task status {task_id}`.")
 }
 
-/// Renders the daemon's `TaskDetail` (a `Task` flattened alongside
-/// `workflow_state`) from raw JSON — it has no exported Rust type.
-pub fn task_detail(detail: &Value) -> String {
+/// The field rows `choco task status` prints for the daemon's `TaskDetail`
+/// JSON, as `(label, value)` pairs: the order and wording are the CLI's, and
+/// the dashboard's status view starts from the same rows.
+pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
     let get = |key: &str| detail.get(key).and_then(Value::as_str).unwrap_or("-");
 
     let mut pairs = vec![
@@ -305,43 +306,74 @@ pub fn task_detail(detail: &Value) -> String {
     }
     pairs.push(("Created", timestamp_str(get("created_at"))));
 
-    let state = detail.get("workflow_state");
-    let current = state
-        .and_then(|s| s.get("current_stage"))
-        .and_then(Value::as_str);
-    if let Some(current) = current {
+    if let Some(current) = detail_stage(detail) {
         pairs.push(("Stage", current.to_string()));
     }
+    pairs
+}
 
-    let mut out = fields(&pairs);
+/// The stage named by the detail's `workflow_state`, when it has one.
+pub fn detail_stage(detail: &Value) -> Option<&str> {
+    detail
+        .get("workflow_state")
+        .and_then(|s| s.get("current_stage"))
+        .and_then(Value::as_str)
+}
 
-    if let Some(state) = state.filter(|s| !s.is_null()) {
-        // The trail is a sibling of `workflow_state`, not a field inside
-        // it: X-3 moved it out of `stage_history` and into the events
-        // timeline, which the daemon re-exposes here as `stage_trail`.
-        let trail = detail
-            .get("stage_trail")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        out.push_str("\n\nProgress\n");
-        out.push_str(&stage_progress(trail, current));
+/// The detail's progress lines (see [`stage_progress_lines`]); `None` when
+/// the task has no workflow state yet.
+pub fn detail_progress(detail: &Value) -> Option<Vec<String>> {
+    detail.get("workflow_state").filter(|s| !s.is_null())?;
+    // The trail is a sibling of `workflow_state`, not a field inside
+    // it: X-3 moved it out of `stage_history` and into the events
+    // timeline, which the daemon re-exposes here as `stage_trail`.
+    let trail = detail
+        .get("stage_trail")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    Some(stage_progress_lines(trail, detail_stage(detail)))
+}
 
-        let counters = state.get("loop_counters");
-        if let Some(counters) = counters
-            .and_then(Value::as_object)
-            .filter(|c| !c.is_empty())
-        {
-            let rendered: Vec<String> = counters
-                .iter()
-                .map(|(stage, count)| format!("{stage}={count}"))
-                .collect();
-            out.push_str(&format!("\n\nLoop counters  {}", rendered.join(" ")));
-        }
-    } else {
-        out.push_str("\n\n(no workflow state — the task has not started)");
+/// The loop count of one `loop_counters` value: a bare number, or the
+/// engine's `{count: N, ...}` object.
+pub fn loop_count(v: &Value) -> u64 {
+    match v {
+        Value::Number(n) => n.as_u64().unwrap_or(0),
+        Value::Object(o) => o.get("count").and_then(Value::as_u64).unwrap_or(0),
+        _ => 0,
     }
+}
 
+/// `Loop counters  internal_review=2 revising=1`, or `None` when there are
+/// no counters.
+pub fn loop_counters_line(detail: &Value) -> Option<String> {
+    let counters = detail
+        .get("workflow_state")
+        .and_then(|s| s.get("loop_counters"))
+        .and_then(Value::as_object)
+        .filter(|c| !c.is_empty())?;
+    let rendered: Vec<String> = counters
+        .iter()
+        .map(|(stage, count)| format!("{stage}={}", loop_count(count)))
+        .collect();
+    Some(format!("Loop counters  {}", rendered.join(" ")))
+}
+
+/// Renders the daemon's `TaskDetail` (a `Task` flattened alongside
+/// `workflow_state`) from raw JSON — it has no exported Rust type.
+pub fn task_detail(detail: &Value) -> String {
+    let mut out = fields(&task_fields(detail));
+    match detail_progress(detail) {
+        Some(lines) => {
+            out.push_str("\n\nProgress\n");
+            out.push_str(&lines.join("\n"));
+            if let Some(line) = loop_counters_line(detail) {
+                out.push_str(&format!("\n\n{line}"));
+            }
+        }
+        None => out.push_str("\n\n(no workflow state — the task has not started)"),
+    }
     out
 }
 
@@ -359,7 +391,13 @@ pub fn task_detail(detail: &Value) -> String {
 /// backfill, so its trail is legitimately empty and renders as "no
 /// transitions yet" rather than being reconstructed from data that isn't
 /// there.
+#[cfg(test)]
 fn stage_progress(trail: &[Value], current: Option<&str>) -> String {
+    stage_progress_lines(trail, current).join("\n")
+}
+
+/// [`stage_progress`] as one string per line.
+pub fn stage_progress_lines(trail: &[Value], current: Option<&str>) -> Vec<String> {
     let stage_of = |entry: &Value| {
         entry
             .get("payload")
@@ -410,7 +448,7 @@ fn stage_progress(trail: &[Value], current: Option<&str>) -> String {
 
     match current {
         Some(current) if lines.is_empty() => {
-            format!("  → {current} (current, no transitions yet)")
+            vec![format!("  → {current} (current, no transitions yet)")]
         }
         // The last entry *is* the current stage — `enter_stage` records on
         // entry — so this marks it in place rather than repeating it on a
@@ -425,10 +463,10 @@ fn stage_progress(trail: &[Value], current: Option<&str>) -> String {
             } else {
                 lines.push(format!("  → {current} (current)"));
             }
-            lines.join("\n")
+            lines
         }
-        None if lines.is_empty() => "  (none)".to_string(),
-        None => lines.join("\n"),
+        None if lines.is_empty() => vec!["  (none)".to_string()],
+        None => lines,
     }
 }
 
@@ -1144,6 +1182,23 @@ mod tests {
 
     /// X-4 (#61): `task_detail` renders the `Stuck` line only when the
     /// status is actually `stuck` and a reason is present.
+    #[test]
+    fn task_detail_renders_loop_counters_as_counts() {
+        let detail = json!({
+            "id": "t1", "title": "T", "workflow_state": {
+                "current_stage": "revising",
+                "loop_counters": {"internal_review": {"count": 2}, "revising": 1}
+            }
+        });
+        let rendered = task_detail(&detail);
+        assert!(
+            rendered.ends_with("\n\nLoop counters  internal_review=2 revising=1"),
+            "{rendered}"
+        );
+        let none = json!({"id": "t1", "workflow_state": {"loop_counters": {}}});
+        assert!(!task_detail(&none).contains("Loop counters"));
+    }
+
     #[test]
     fn task_detail_renders_the_stuck_line_only_when_stuck() {
         let stuck = json!({

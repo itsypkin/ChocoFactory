@@ -769,56 +769,10 @@ fn overlays_draw() {
 }
 
 #[test]
-fn detail_view_shows_header_trail_and_events() {
-    let mut app = board();
-    ch(&mut app, 'G');
-    press(&mut app, KeyCode::Up);
-    let effects = press(&mut app, KeyCode::Enter);
-    assert_eq!(
-        effects,
-        vec![
-            Effect::FetchDetail("7d22e1a8-dddd".into()),
-            Effect::OpenSocket("7d22e1a8-dddd".into())
-        ]
-    );
-    update(
-        &mut app,
-        Msg::Detail {
-            id: "7d22e1a8-dddd".into(),
-            result: Ok(json!({"stage_trail": [
-                {"payload": {"stage": "coding", "outcome": null}},
-                {"payload": {"stage": "revising", "outcome": "changes_requested"}},
-            ]})),
-        },
-    );
-    update(
-        &mut app,
-        Msg::Socket {
-            id: "7d22e1a8-dddd".into(),
-            msg: SocketMsg::Down,
-        },
-    );
-    let s = render(&app, 100, 24);
-    for want in [
-        "Flaky lock test (#98)",
-        "7d22e1a8-dddd",
-        "project chocofactory",
-        "workflow coding-task",
-        "stuck: interrupted by a usage limit",
-        "coding → revising (via changes_requested)",
-        "events: reconnecting",
-        "Esc back",
-    ] {
-        assert!(s.contains(want), "missing {want:?} in:\n{s}");
-    }
-    assert_eq!(press(&mut app, KeyCode::Esc), vec![Effect::CloseSocket]);
-    assert!(matches!(app.view, View::List));
-}
-
-#[test]
 fn detail_events_follow_until_scrolled() {
     let mut app = board();
     press(&mut app, KeyCode::Enter);
+    ch(&mut app, 'e');
     let id = app.selected.clone().unwrap();
     let ev = |n: usize| Msg::Socket {
         id: id.clone(),
@@ -916,7 +870,11 @@ async fn fake_server(state: Fake) -> String {
         }
         let t = s.tasks.iter().find(|t| t.task.id == id).unwrap();
         let mut v = serde_json::to_value(t).unwrap();
-        v["stage_trail"] = json!([{"payload": {"stage": "coding", "outcome": null}}]);
+        v["workflow_state"] = json!({"current_stage": t.current_stage, "loop_counters": {}});
+        v["stage_trail"] = json!([{
+            "created_at": "2026-01-01T09:00:00Z",
+            "payload": {"stage": "coding", "outcome": null}
+        }]);
         axum::Json(v)
     }
     async fn retry(State(s): State<Fake>) -> StatusCode {
@@ -1068,9 +1026,17 @@ async fn the_real_loop_against_a_fake_daemon() {
         // Enter: streamed events.
         ktx.send(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
+        // The status view: the daemon's progress line, and the last events.
+        wait_for(&latest, "1. coding (start)").await;
         wait_for(&latest, "hello streamed").await;
         wait_for(&latest, "second streamed").await;
+        // `e` expands to the full stream.
+        k('e');
         wait_for(&latest, "events (following)").await;
+        // Esc returns to the status view, a second one to the list.
+        ktx.send(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&latest, "last events (e expands)").await;
         ktx.send(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
         wait_for(&latest, "RECENTLY CLOSED").await;
@@ -1383,7 +1349,7 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
         wait_for(&latest, "retry failed: request timed out").await;
         ktx.send(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        wait_for(&latest, "could not load history: request timed out").await;
+        wait_for(&latest, "could not load the task: request timed out").await;
         ktx.send(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
         wait_for(&latest, "RECENTLY CLOSED").await;
@@ -1443,27 +1409,66 @@ async fn a_panic_signal_stops_the_loop_with_an_error() {
     assert!(result.unwrap_err().contains("panicked"));
 }
 
-#[tokio::test]
-async fn list_polls_time_out_at_the_poll_timeout_not_the_request_timeout() {
-    let client = Arc::new(Client::new(hung_daemon().await).without_version_check());
+/// A daemon whose list endpoint answers after `delay`, and never once `hang`
+/// is set. Everything else answers at once.
+async fn slow_daemon(delay: Duration, hang: Arc<std::sync::atomic::AtomicBool>) -> String {
+    #[derive(Clone)]
+    struct S {
+        delay: Duration,
+        hang: Arc<std::sync::atomic::AtomicBool>,
+    }
+    async fn server() -> axum::Json<Value> {
+        axum::Json(json!({
+            "version": chocofactory_core::version::VERSION, "commit": null, "pid": 1,
+            "port": 1, "started_at": "2026-01-01T00:00:00Z", "config_root": "/x",
+            "exe": "/x", "exe_replaced": false, "choco_binary": "choco",
+            "choco_binary_found": true, "tasks": {}, "in_flight": []
+        }))
+    }
+    async fn projects() -> axum::Json<Value> {
+        axum::Json(json!([]))
+    }
+    async fn tasks(State(s): State<S>) -> axum::Json<Value> {
+        if s.hang.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(s.delay).await;
+        let t = summary(
+            "aaaa1111-0",
+            "Slow but there",
+            "open",
+            Some("coding"),
+            Some(3),
+            "p-alpha",
+        );
+        axum::Json(json!([t]))
+    }
+    let app = Router::new()
+        .route("/server", get(server))
+        .route("/projects", get(projects))
+        .route("/tasks", get(tasks))
+        .with_state(S { delay, hang });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// Runs the loop against `url` until `driver` is done; `driver` sees the
+/// latest screen and quits through the key channel.
+async fn run_against<F, Fut>(url: String, config: LoopConfig, driver: F)
+where
+    F: FnOnce(Arc<Mutex<String>>, mpsc::UnboundedSender<KeyEvent>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let client = Arc::new(Client::new(url).without_version_check());
     let mut app = new_app(Scope::AllProjects);
-    let config = LoopConfig {
-        tick: Duration::from_millis(50),
-        closed: 10,
-        project_id: None,
-        timeout: Duration::from_secs(30),
-        poll_timeout: Duration::from_millis(200),
-        panicked: Arc::default(),
-    };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&latest);
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-    let driver = async {
-        wait_for(&latest, "daemon unreachable: request timed out").await;
-        ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
-            .unwrap();
-    };
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
     let run = run_loop(
         &mut terminal,
@@ -1473,23 +1478,75 @@ async fn list_polls_time_out_at_the_poll_timeout_not_the_request_timeout() {
         &mut krx,
         &mut on_frame,
     );
-    let (result, ()) =
-        tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(run, driver) })
-            .await
-            .expect("a hung list poll must time out at the poll timeout");
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(run, driver(latest, ktx))
+    })
+    .await
+    .expect("the loop should end on q");
     result.unwrap();
 }
 
+fn quit(ktx: &mpsc::UnboundedSender<KeyEvent>) {
+    ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn list_polls_time_out_at_the_poll_timeout_not_the_request_timeout() {
+    // The first load works; every poll after it hangs.
+    let hang = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let url = slow_daemon(Duration::ZERO, Arc::clone(&hang)).await;
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout: Duration::from_secs(30),
+        poll_timeout: Duration::from_millis(200),
+        panicked: Arc::default(),
+    };
+    run_against(url, config, |latest, ktx| async move {
+        wait_for(&latest, "Slow but there").await;
+        hang.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_for(&latest, "daemon unreachable: request timed out").await;
+        quit(&ktx);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_first_load_waits_for_a_slow_daemon_past_the_poll_timeout() {
+    let url = slow_daemon(
+        Duration::from_millis(300),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await;
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout: Duration::from_secs(5),
+        poll_timeout: Duration::from_millis(100),
+        panicked: Arc::default(),
+    };
+    run_against(url, config, |latest, ktx| async move {
+        wait_for(&latest, "Slow but there").await;
+        // The first frame already has the rows, not the outage line.
+        assert!(
+            !latest.lock().unwrap().contains("daemon unreachable"),
+            "{}",
+            latest.lock().unwrap()
+        );
+        quit(&ktx);
+    })
+    .await;
+}
+
 #[test]
-fn the_poll_timeout_follows_the_interval_up_to_the_request_timeout() {
-    assert_eq!(
-        super::poll_timeout_for(Duration::from_secs(2)),
-        Duration::from_secs(2)
-    );
-    assert_eq!(
-        super::poll_timeout_for(Duration::from_secs(600)),
-        super::REQUEST_TIMEOUT
-    );
+fn the_poll_timeout_is_the_interval_between_ten_and_thirty_seconds() {
+    let t = |s| super::poll_timeout_for(Duration::from_secs(s));
+    assert_eq!(t(1), Duration::from_secs(10));
+    assert_eq!(t(20), Duration::from_secs(20));
+    assert_eq!(t(600), Duration::from_secs(30));
 }
 
 #[test]
@@ -1500,4 +1557,687 @@ fn a_panic_on_any_thread_trips_the_signal_through_the_hook() {
     super::restore_panic_hook(prev);
     assert!(joined.is_err());
     assert!(signal.is_tripped());
+}
+
+// ---- the status view (#178) ---------------------------------------------
+
+const BUSY: &str = "9c03aa17-bbbb";
+const SHA: &str = "0123456789abcdef0123456789abcdef";
+
+/// The `GET /tasks/{id}` answer for the in-progress task of `board()`.
+fn busy_detail() -> Value {
+    json!({
+        "id": BUSY, "project_id": "p-alpha", "workflow_def": "coding-task",
+        "title": "Per-kind stage execution (#55)", "status": "open",
+        "stuck_reason": null,
+        "config": {"cwd": "/home/dev/chocofactory", "roles": {"coder": {"model": "opus"}}},
+        "created_at": "2026-01-01T03:40:00Z",
+        "workflow_path": "builtin:coding-task", "workflow_sha256": SHA,
+        "workflow_file_status": "unchanged",
+        "workflow_state": {
+            "current_stage": "internal_review",
+            "loop_counters": {"internal_review": {"count": 2}}
+        },
+        "stage_trail": [
+            {"created_at": "2026-01-01T03:41:00Z", "payload": {"stage": "coding", "outcome": null}},
+            {"created_at": "2026-01-01T04:10:00Z", "payload": {"stage": "internal_review", "outcome": "done"}},
+            {"created_at": "2026-01-01T04:50:00Z", "payload": {"stage": "revising", "outcome": "changes_requested"}},
+            {"created_at": "2026-01-01T11:48:00Z", "payload": {"stage": "internal_review", "outcome": "done"}},
+        ]
+    })
+}
+
+fn open_detail(app: &mut App, id: &str) {
+    app.selected = Some(id.to_string());
+    press(app, KeyCode::Enter);
+}
+
+fn answer(app: &mut App, id: &str, result: Result<Value, String>) {
+    update(
+        app,
+        Msg::Detail {
+            id: id.to_string(),
+            result,
+        },
+    );
+}
+
+fn event_at(id: &str, n: usize) -> chocofactory_core::models::Event {
+    chocofactory_core::models::Event {
+        id: format!("e{n}"),
+        task_id: id.to_string(),
+        session_id: None,
+        event_type: chocofactory_core::models::EventType::HumanMessage,
+        payload: json!({"text": format!("message {n}")}),
+        created_at: now() + chrono::Duration::seconds(n as i64),
+    }
+}
+
+fn push_events(app: &mut App, id: &str, n: usize) {
+    update(
+        app,
+        Msg::Socket {
+            id: id.to_string(),
+            msg: SocketMsg::Connected,
+        },
+    );
+    for i in 0..n {
+        update(
+            app,
+            Msg::Socket {
+                id: id.to_string(),
+                msg: SocketMsg::Event(Box::new(event_at(id, i))),
+            },
+        );
+    }
+}
+
+/// Local-time text of the `n`th test event, as the view prints it.
+fn at(n: usize) -> String {
+    (now() + chrono::Duration::seconds(n as i64))
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S")
+        .to_string()
+}
+
+/// Compares whole screens, ignoring trailing spaces and trailing blank lines.
+fn assert_screen(actual: &str, expected: &str) {
+    let norm = |s: &str| {
+        let mut v: Vec<String> = s.lines().map(|l| l.trim_end().to_string()).collect();
+        while v.last().is_some_and(String::is_empty) {
+            v.pop();
+        }
+        v.join("\n")
+    };
+    assert_eq!(norm(actual), norm(expected), "\nactual:\n{actual}");
+}
+
+fn busy_view() -> App {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    push_events(&mut app, BUSY, 7);
+    app
+}
+
+/// `─ title ─…` filled to `w` columns.
+fn sep(title: &str, w: usize) -> String {
+    let head = format!("─ {title} ");
+    format!("{head}{}", "─".repeat(w - head.chars().count()))
+}
+
+fn title_row(title: &str, right: &str, w: usize) -> String {
+    format!(
+        "{title:<width$}  {right}",
+        width = w - right.chars().count() - 2
+    )
+}
+
+#[test]
+fn the_status_view_shows_fields_progress_counters_and_the_last_five_events() {
+    let app = busy_view();
+    let expected = [
+        title_row(
+            "Per-kind stage execution (#55)",
+            "e events · Esc back · ? help",
+            100,
+        ),
+        "ID        9c03aa17-bbbb".into(),
+        "Project   chocofactory".into(),
+        "Workflow  coding-task".into(),
+        "Workflow  builtin:coding-task  [0123456789ab]".into(),
+        "Status    open".into(),
+        "Repo      /home/dev/chocofactory".into(),
+        "Role      coder: model=opus".into(),
+        "Created   2026-01-01 03:40:00 UTC".into(),
+        "Stage     internal_review for 12m".into(),
+        sep("progress", 100),
+        "  1. coding (start)   2026-01-01 03:41:00 UTC".into(),
+        "  2. coding --[done]--> internal_review   2026-01-01 04:10:00 UTC".into(),
+        "  3. internal_review --[changes_requested]--> revising   2026-01-01 04:50:00 UTC".into(),
+        "  4. revising --[done]--> internal_review   2026-01-01 11:48:00 UTC   (current)".into(),
+        "Loop counters  internal_review=2".into(),
+        sep("last events (e expands)", 100),
+        format!("  {}  human_message message 2", at(2)),
+        format!("  {}  human_message message 3", at(3)),
+        format!("  {}  human_message message 4", at(4)),
+        format!("  {}  human_message message 5", at(5)),
+        format!("  {}  human_message message 6", at(6)),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        "e events  o PR  r retry  c cancel  Esc back".into(),
+    ]
+    .join("\n");
+    assert_screen(&render(&app, 100, 30), &expected);
+}
+
+fn with_detail_status(mut v: Value, status: &str, stage: &str) -> Value {
+    v["status"] = json!(status);
+    v["workflow_state"]["current_stage"] = json!(stage);
+    v
+}
+
+#[test]
+fn a_task_waiting_on_you_shows_the_pr_and_what_it_waits_for() {
+    let mut app = board();
+    let id = "3f2a91c0-aaaa";
+    open_detail(&mut app, id);
+    answer(
+        &mut app,
+        id,
+        Ok(with_detail_status(
+            busy_detail(),
+            "open",
+            "awaiting_human_review",
+        )),
+    );
+    let s = render(&app, 100, 30);
+    let want_stage = "Stage        awaiting_human_review for 2h05m";
+    let want_pr = "PR           #171 https://github.com/o/r/pull/171";
+    let want_wait =
+        "Waiting for  your verdict: a PR comment with /approve or /request-changes on its own line";
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let i = lines.iter().position(|l| *l == want_stage).expect(&s);
+    assert_eq!(lines[i + 1], want_pr, "{s}");
+    assert_eq!(lines[i + 2], want_wait, "{s}");
+
+    {
+        let (id, stage) = ("b81e0d44-cccc", "escalate_to_human");
+        let want = "Waiting for  a note to resume it: choco task send b81e0d44-cccc --text \"…\"";
+        let mut app = board();
+        open_detail(&mut app, id);
+        answer(
+            &mut app,
+            id,
+            Ok(with_detail_status(busy_detail(), "open", stage)),
+        );
+        let s = render(&app, 120, 30);
+        assert!(s.lines().any(|l| l.trim_end() == want), "{s}");
+    }
+
+    // `spec_questions` needs a task at that stage.
+    let mut app = new_app(Scope::AllProjects);
+    let t = summary(
+        "5e5e5e5e-ffff",
+        "Spec it",
+        "open",
+        Some("spec_questions"),
+        Some(5),
+        "p-alpha",
+    );
+    load(&mut app, vec![t], vec![]);
+    open_detail(&mut app, "5e5e5e5e-ffff");
+    let s = render(&app, 120, 30);
+    let want = "Waiting for  your answers to the spec check's questions: choco task send 5e5e5e5e-ffff --text \"…\"";
+    assert!(s.lines().any(|l| l.trim_end() == want), "{s}");
+    // No PR yet: no PR row.
+    assert!(!s.lines().any(|l| l.starts_with("PR ")), "{s}");
+}
+
+#[test]
+fn a_task_that_is_not_waiting_has_no_waiting_for_row() {
+    let app = busy_view();
+    assert!(!render(&app, 100, 30).contains("Waiting for"));
+    // Nor does a stuck or closed task at a waiting stage.
+    let mut app = new_app(Scope::AllProjects);
+    let t = summary(
+        "5e5e5e5e-ffff",
+        "Spec it",
+        "closed",
+        Some("spec_questions"),
+        Some(5),
+        "p-alpha",
+    );
+    load(&mut app, vec![], vec![t]);
+    open_detail(&mut app, "5e5e5e5e-ffff");
+    assert!(!render(&app, 100, 30).contains("Waiting for"));
+}
+
+#[test]
+fn a_stuck_task_shows_the_reason_wrapped_in_the_error_style() {
+    let mut app = board();
+    app.color = true;
+    let id = "7d22e1a8-dddd";
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == id)
+        .unwrap()
+        .task
+        .stuck_reason = Some(
+        "the agent hit a usage limit and could not continue; resume it once the limit resets overnight please"
+            .into(),
+    );
+    open_detail(&mut app, id);
+    let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    terminal.draw(|f| draw(f, &app)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let s = screen(&buf);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let i = lines
+        .iter()
+        .position(|l| l.starts_with("Stuck "))
+        .expect(&s);
+    assert_eq!(
+        lines[i],
+        "Stuck     the agent hit a usage limit and could not continue"
+    );
+    assert!(
+        lines[i + 1].starts_with("          ") && !lines[i + 1].starts_with("           "),
+        "{s}"
+    );
+    assert!(lines[i + 1].trim().len() > 5, "{s}");
+    assert_eq!(buf[(0, i as u16)].fg, ratatui::style::Color::Red);
+    assert_eq!(buf[(12, i as u16 + 1)].fg, ratatui::style::Color::Red);
+    assert!(s.contains("r retry"), "{s}");
+}
+
+#[test]
+fn a_closed_task_says_how_long_ago_it_closed() {
+    let mut app = board();
+    let id = "61b0f2e3-eeee";
+    {
+        let t = app.closed.iter_mut().find(|t| t.task.id == id).unwrap();
+        t.task.updated_at = now() - chrono::Duration::minutes(27 * 60);
+        t.current_stage = Some("done".into());
+    }
+    open_detail(&mut app, id);
+    answer(
+        &mut app,
+        id,
+        Ok(with_detail_status(busy_detail(), "closed", "done")),
+    );
+    push_events(&mut app, id, 2);
+    let s = render(&app, 100, 30);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let i = lines
+        .iter()
+        .position(|l| *l == "Stage     done (closed 1d03h ago)")
+        .expect(&s);
+    assert_eq!(
+        lines[i + 1],
+        "PR        #163 https://github.com/o/r/pull/163",
+        "{s}"
+    );
+    assert!(
+        s.contains(&format!("  {}  human_message message 1", at(1))),
+        "{s}"
+    );
+}
+
+#[test]
+fn the_expanded_view_has_the_full_stream_and_its_own_footer() {
+    let mut app = busy_view();
+    ch(&mut app, 'e');
+    let mut expected = vec![
+        title_row(
+            "Per-kind stage execution (#55)",
+            "e status · Esc back · ? help",
+            100,
+        ),
+        sep("events (following)", 100),
+    ];
+    for n in 0..7 {
+        expected.push(format!("  {}  human_message message {n}", at(n)));
+    }
+    expected.extend(std::iter::repeat_n(String::new(), 20));
+    expected.push("PgUp/PgDn scroll  End follow  e status  o PR  r retry  c cancel".into());
+    assert_screen(&render(&app, 100, 30), &expected.join("\n"));
+    // Scrolling still works there.
+    push_events(&mut app, BUSY, 60);
+    let s = render(&app, 80, 20);
+    assert!(
+        s.contains("message 59") && !s.contains("message 0\n"),
+        "{s}"
+    );
+    press(&mut app, KeyCode::PageUp);
+    let s = render(&app, 80, 20);
+    assert!(
+        s.contains("End follows") && !s.contains("message 59"),
+        "{s}"
+    );
+    press(&mut app, KeyCode::End);
+    assert!(render(&app, 80, 20).contains("events (following)"));
+}
+
+fn detail_state(app: &App) -> (bool, bool, usize) {
+    let View::Detail(d) = &app.view else {
+        panic!("not in the detail view")
+    };
+    (d.expanded, d.following, d.scroll_back)
+}
+
+#[test]
+fn e_toggles_the_expanded_view_and_esc_and_q_leave_as_documented() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    assert!(!detail_state(&app).0, "Enter opens the status view");
+    assert!(ch(&mut app, 'e').is_empty());
+    assert!(detail_state(&app).0);
+    assert!(ch(&mut app, 'e').is_empty());
+    assert!(!detail_state(&app).0);
+    ch(&mut app, 'e');
+    assert!(press(&mut app, KeyCode::Esc).is_empty());
+    assert!(!detail_state(&app).0, "Esc in the expanded view -> status");
+    assert_eq!(press(&mut app, KeyCode::Esc), vec![Effect::CloseSocket]);
+    assert!(matches!(app.view, View::List));
+    // `q` leaves from either view.
+    open_detail(&mut app, BUSY);
+    assert_eq!(ch(&mut app, 'q'), vec![Effect::CloseSocket]);
+    assert!(matches!(app.view, View::List));
+    open_detail(&mut app, BUSY);
+    ch(&mut app, 'e');
+    assert_eq!(ch(&mut app, 'q'), vec![Effect::CloseSocket]);
+    assert!(matches!(app.view, View::List));
+}
+
+#[test]
+fn the_status_view_does_not_scroll_and_expanding_starts_following() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    push_events(&mut app, BUSY, 30);
+    for code in [
+        KeyCode::PageUp,
+        KeyCode::Up,
+        KeyCode::Char('k'),
+        KeyCode::Home,
+    ] {
+        assert!(press(&mut app, code).is_empty());
+    }
+    assert_eq!(detail_state(&app), (false, true, 0));
+    ch(&mut app, 'e');
+    press(&mut app, KeyCode::PageUp);
+    assert!(!detail_state(&app).1);
+    ch(&mut app, 'e');
+    ch(&mut app, 'e');
+    assert_eq!(detail_state(&app), (true, true, 0));
+}
+
+#[test]
+fn s_does_nothing_in_either_view_or_the_help() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let before = render(&app, 100, 30);
+    assert!(ch(&mut app, 's').is_empty());
+    assert_eq!(render(&app, 100, 30), before);
+    ch(&mut app, 'e');
+    let before = render(&app, 100, 30);
+    assert!(ch(&mut app, 's').is_empty());
+    assert_eq!(render(&app, 100, 30), before);
+    assert_eq!(detail_state(&app), (true, true, 0));
+    ch(&mut app, '?');
+    let help = render(&app, 100, 30);
+    assert!(help.contains("e           events / status"), "{help}");
+    assert!(!help.contains(" s "), "{help}");
+}
+
+#[test]
+fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
+    let app = busy_view();
+    // 20 rows: the whole status block, and two of the five events.
+    let s = render(&app, 100, 20);
+    for want in [
+        "Role      coder",
+        "1. coding (start)",
+        "Loop counters",
+        "message 5",
+        "message 6",
+    ] {
+        assert!(s.contains(want), "{want}\n{s}");
+    }
+    assert!(!s.contains("message 4"), "{s}");
+    assert!(s.contains("last events (e expands)"));
+    // 18 rows: no room for an event line, so no tail at all.
+    let s = render(&app, 100, 18);
+    assert!(!s.contains("last events") && !s.contains("message"), "{s}");
+    assert!(
+        s.contains("Role      coder") && s.contains("1. coding (start)"),
+        "{s}"
+    );
+
+    // 12 rows: no events; the progress list keeps its newest line.
+    let expected = [
+        title_row(
+            "Per-kind stage execution (#55)",
+            "e events · Esc back · ? help",
+            100,
+        ),
+        "ID        9c03aa17-bbbb".into(),
+        "Project   chocofactory".into(),
+        "Workflow  coding-task".into(),
+        "Workflow  builtin:coding-task  [0123456789ab]".into(),
+        "Status    open".into(),
+        "Stage     internal_review for 12m".into(),
+        sep("progress", 100),
+        "  … 3 earlier steps".into(),
+        "  4. revising --[done]--> internal_review   2026-01-01 11:48:00 UTC   (current)".into(),
+        "Loop counters  internal_review=2".into(),
+        "e events  o PR  r retry  c cancel  Esc back".into(),
+    ]
+    .join("\n");
+    assert_screen(&render(&app, 100, 12), &expected);
+
+    // 40x10: the rows a typical task needs.
+    let s = render(&app, 40, 10);
+    for want in [
+        "Per-kind …  e events",
+        "ID        9c03aa17-bbbb",
+        "Project   chocofactory",
+        "Workflow  coding-task",
+        "Status    open",
+        "Stage     internal_review for 12m",
+        "4. revising",
+    ] {
+        assert!(s.contains(want), "{want}\n{s}");
+    }
+}
+
+#[test]
+fn a_cut_progress_list_leaves_room_before_rows_go() {
+    // Rows are dropped Role, Created, Repo, path - and only as far as needed.
+    let app = busy_view();
+    let s = render(&app, 100, 14);
+    assert!(!s.contains("Role") && s.contains("Created"), "{s}");
+    let s = render(&app, 100, 13);
+    assert!(!s.contains("Created") && s.contains("Repo"), "{s}");
+    let s = render(&app, 100, 12);
+    assert!(
+        !s.contains("Repo") && s.contains("builtin:coding-task"),
+        "{s}"
+    );
+    let s = render(&app, 100, 11);
+    assert!(
+        !s.contains("builtin:coding-task") && s.contains("Stage"),
+        "{s}"
+    );
+}
+
+#[test]
+fn there_is_a_line_when_there_are_no_events_yet() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    let s = render(&app, 100, 30);
+    assert!(s.contains("  (no events yet)"), "{s}");
+    update(
+        &mut app,
+        Msg::Socket {
+            id: BUSY.into(),
+            msg: SocketMsg::Down,
+        },
+    );
+    assert!(render(&app, 100, 30).contains("─ events: reconnecting ─"));
+}
+
+#[test]
+fn before_the_answer_the_view_loads_from_the_snapshot_and_the_answer_replaces_it() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let s = render(&app, 100, 30);
+    for want in [
+        "ID        9c03aa17-bbbb",
+        "Project   chocofactory",
+        "Workflow  coding-task",
+        "Status    open",
+        "Stage     internal_review for 12m",
+        "  loading…",
+    ] {
+        assert!(s.contains(want), "{want}\n{s}");
+    }
+    assert!(!s.contains("Repo"), "{s}");
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    let s = render(&app, 100, 30);
+    assert!(
+        !s.contains("loading…") && s.contains("1. coding (start)"),
+        "{s}"
+    );
+    assert!(s.contains("Repo      /home/dev/chocofactory"), "{s}");
+}
+
+#[test]
+fn a_failed_first_answer_is_shown_and_the_next_success_replaces_it() {
+    let mut app = board();
+    app.color = true;
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Err("request timed out".into()));
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|f| draw(f, &app)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let s = screen(&buf);
+    let i = s
+        .lines()
+        .position(|l| l.starts_with("  could not load the task: request timed out"))
+        .expect(&s);
+    assert_eq!(buf[(4, i as u16)].fg, ratatui::style::Color::Red);
+    assert!(!s.contains("loading…"));
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    let s = render(&app, 100, 30);
+    assert!(
+        !s.contains("could not load") && s.contains("1. coding (start)"),
+        "{s}"
+    );
+}
+
+#[test]
+fn a_failed_refresh_keeps_the_rows_and_says_so_on_the_separator() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    answer(&mut app, BUSY, Err("request timed out".into()));
+    let s = render(&app, 100, 30);
+    assert!(
+        s.contains("─ progress (refresh failed: request timed out) ─"),
+        "{s}"
+    );
+    assert!(
+        s.contains("1. coding (start)") && s.contains("Repo      /home/dev"),
+        "{s}"
+    );
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    let s = render(&app, 100, 30);
+    assert!(
+        !s.contains("refresh failed") && s.contains("─ progress ─"),
+        "{s}"
+    );
+}
+
+#[test]
+fn an_answer_for_a_task_the_view_has_left_is_ignored() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    press(&mut app, KeyCode::Esc);
+    open_detail(&mut app, "b81e0d44-cccc");
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    answer(&mut app, BUSY, Err("late failure".into()));
+    let View::Detail(d) = &app.view else { panic!() };
+    assert!(d.data.is_none() && d.error.is_none());
+}
+
+#[test]
+fn a_task_that_left_the_lists_keeps_its_last_answer() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    load(&mut app, vec![], vec![]);
+    let s = render(&app, 100, 30);
+    assert!(
+        s.contains("Per-kind") || s.contains("ID        9c03aa17-bbbb"),
+        "{s}"
+    );
+    assert!(
+        s.contains("Repo      /home/dev/chocofactory") && s.contains("1. coding (start)"),
+        "{s}"
+    );
+    // With neither a snapshot nor an answer there is only the notice.
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    load(&mut app, vec![], vec![]);
+    app.view = match std::mem::replace(&mut app.view, View::List) {
+        View::Detail(mut d) => {
+            d.snapshot = None;
+            View::Detail(d)
+        }
+        v => v,
+    };
+    assert!(render(&app, 100, 30).contains("(task is no longer listed)"));
+}
+
+#[test]
+fn a_workflow_without_state_says_the_task_has_not_started() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let mut v = busy_detail();
+    v["workflow_state"] = Value::Null;
+    answer(&mut app, BUSY, Ok(v));
+    let s = render(&app, 100, 30);
+    assert!(
+        s.contains("(no workflow state — the task has not started)"),
+        "{s}"
+    );
+}
+
+#[test]
+fn a_changed_workflow_and_kept_work_show_as_in_task_status() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let mut v = busy_detail();
+    v["workflow_file_status"] = json!("changed");
+    v["kept"] = json!({"worktree_path": "/wt/x", "branch": "task/x"});
+    answer(&mut app, BUSY, Ok(v));
+    let s = render(&app, 100, 30);
+    assert!(
+        s.contains("builtin:coding-task (built-in updated since task start)  [0123456789ab]"),
+        "{s}"
+    );
+    assert!(
+        s.contains("Kept worktree  /wt/x") && s.contains("Kept branch    task/x"),
+        "{s}"
+    );
+}
+
+// ---- #176: the time column, the poll timeout ----------------------------
+
+#[test]
+fn durations_of_a_hundred_days_or_more_are_whole_days() {
+    let d = |days: i64, hours: i64, mins: i64| {
+        fmt_duration(chrono::Duration::minutes(days * 1440 + hours * 60 + mins))
+    };
+    assert_eq!(d(99, 23, 59), "99d23h");
+    assert_eq!(d(100, 0, 0), "100d");
+    assert_eq!(d(123, 4, 0), "123d");
+    assert_eq!(d(3, 4, 0), "3d04h");
+}
+
+#[test]
+fn a_closed_row_123_days_old_shows_123d_ago_uncut() {
+    let mut app = board();
+    app.closed[0].task.updated_at =
+        now() - chrono::Duration::days(123) - chrono::Duration::hours(4);
+    let s = render(&app, 120, 30);
+    assert!(s.contains("123d ago"), "{s}");
+    assert!(!s.contains("123d04h"), "{s}");
 }
