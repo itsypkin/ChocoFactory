@@ -4016,6 +4016,43 @@ stages:
     }
 
     #[test]
+    fn other_stage_kinds_reject_unknown_stage_level_keys() {
+        let cases = [
+            (
+                "poll",
+                "intervall",
+                "    kind: poll\n    command: \"echo hi\"\n    interval: 5s\n    intervall: 5s\n    on: { done: finished }\n",
+            ),
+            (
+                "shell",
+                "intervall",
+                "    kind: shell\n    command: \"echo hi\"\n    intervall: 5s\n    on: { done: finished }\n",
+            ),
+            (
+                "terminal",
+                "capture",
+                "    kind: terminal\n    capture: text\n",
+            ),
+        ];
+        for (kind, key, body) in cases {
+            let yaml = format!("name: x\nstages:\n  s:\n{body}  finished:\n    kind: terminal\n");
+            let yaml = if kind == "terminal" {
+                // `s` itself is the terminal stage under test; keep a start stage valid.
+                format!("name: x\nstages:\n  s:\n{body}")
+            } else {
+                yaml
+            };
+            let dir = TempDir::new();
+            let err = WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::UnknownStageKey { stage, key: k }
+                    if stage == "s" && k == key),
+                "{kind}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn markers_reject_an_empty_list() {
         let err = gate_err("    markers: []\n");
         assert!(
