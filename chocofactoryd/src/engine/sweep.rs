@@ -74,9 +74,10 @@ impl WorkflowEngine {
     /// with a watcher — a `poll`, or a `human_gate` with a `watch:` (#175) —
     /// whose runner died with the previous process, with the deadline it
     /// already had. It also records the `stage_kind` of every open task it
-    /// loads whose stored kind is missing or differs from the workflow's. Per task it holds the per-task lock, so the
-    /// ownership check (`has_detached_runner`) and the resume's own spawn
-    /// can't be interleaved by another spawner.
+    /// loads whose stored kind is missing or differs from the workflow's.
+    /// Per task it holds the per-task lock, so the ownership check
+    /// (`has_detached_runner`) and the resume's own spawn can't be
+    /// interleaved by another spawner.
     ///
     /// Every per-task failure ends in `mark_stuck`; one task's failure
     /// never stops the sweep. Only a failure to list the candidates is

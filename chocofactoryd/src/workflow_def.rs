@@ -1621,6 +1621,46 @@ impl std::error::Error for WorkflowDefError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_kind_names_match_the_yaml_spelling() {
+        let yaml = r#"
+name: names
+roles:
+  coder: { cli: claude, model: sonnet }
+stages:
+  a:
+    kind: agent_turn
+    role: coder
+    on: { done: b }
+  b:
+    kind: shell
+    command: "true"
+    on: { done: c }
+  c:
+    kind: poll
+    command: "true"
+    interval: 1s
+    outcomes:
+      - match: x
+        then: done
+    on: { done: d }
+  d:
+    kind: human_gate
+    on: { resumed: e }
+  e:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, Path::new(".")).unwrap();
+        let names: Vec<_> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| def.stages[*s].kind.name())
+            .collect();
+        assert_eq!(
+            names,
+            ["agent_turn", "shell", "poll", "human_gate", "terminal"]
+        );
+    }
     use std::io::Write;
 
     struct TempDir {

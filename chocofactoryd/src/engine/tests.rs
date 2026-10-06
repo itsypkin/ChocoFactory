@@ -13063,6 +13063,64 @@ async fn the_sweep_parks_a_task_whose_stage_lost_its_watcher_with_the_new_wordin
 }
 
 #[tokio::test]
+async fn retry_records_a_stale_stage_kind_even_when_the_payload_is_unchanged() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_gate_flow(&dir, "retry-kind", "    on: { resumed: done }");
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    // `seed_row` leaves the kind as "agent_turn": stale for a gate.
+    seed_row(&pool, &task_id, "gate", json!({})).await;
+    tasks::mark_stuck(&pool, &task_id, "test").await.unwrap();
+    let before = state_of(&pool, &task_id).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    let after = state_of(&pool, &task_id).await;
+    assert_eq!(after.stage_kind.as_deref(), Some("human_gate"));
+    assert_eq!(after.payload, before.payload);
+
+    // A NULL kind (a row from before the column) is filled in the same way.
+    sqlx::query("UPDATE workflow_state SET stage_kind = NULL WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    tasks::mark_stuck(&pool, &task_id, "test").await.unwrap();
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    assert_eq!(
+        state_of(&pool, &task_id).await.stage_kind.as_deref(),
+        Some("human_gate")
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_parks_a_polling_task_whose_stage_is_gone_from_the_workflow() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_gate_flow(&dir, "gone-stage", "    on: { resumed: done }");
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    seed_row(
+        &pool,
+        &task_id,
+        "removed",
+        json!({ "poll_window": window_json("removed", Utc::now(), None) }),
+    )
+    .await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.stuck, 1);
+    let reason = tasks::get(&pool, &task_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap();
+    assert_eq!(
+        reason,
+        "stage 'removed' was polling when the daemon stopped, but the workflow no longer defines it; retry to run it as defined"
+    );
+}
+
+#[tokio::test]
 async fn a_watching_gate_without_markers_or_a_resumed_edge_keeps_its_watcher_on_a_refused_reply() {
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
