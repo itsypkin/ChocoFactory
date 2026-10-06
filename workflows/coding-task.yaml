@@ -9,6 +9,8 @@ roles:
     cli: claude
     model: claude-opus-5-5
     system_prompt_file: prompts/reviewer-system.md
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
 
 stages:
   # First attempt at the task. Every later return path (a failed review, a

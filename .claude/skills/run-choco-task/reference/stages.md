@@ -7,8 +7,13 @@ Read this while watching a task, when its behaviour surprises you.
   branch, fixes what it finds, and decides the design choices your
   intent implies. It asks only when it would have to guess what you
   want.
-  Its report replaces your `--prompt` for every later stage. It doesn't
-  change the worktree.
+  Its report replaces your `--prompt` for every later stage. The planner
+  can't use the file-editing tools, and a turn that changes HEAD or
+  `git status` anyway parks the task as `stuck`, with the change left in
+  place for you to inspect. The check covers HEAD, the branch, `git status`
+  and file contents; it doesn't cover ignored paths (`target/`, `.omc/`) or
+  anything inside `.git` (refs, config, hooks). It also runs when the turn
+  crashes or ends without reporting.
 - **spec_questions** (`coding-task-planned` only). Waits, with no time
   limit, for `choco task send`. The answer goes back to `spec_check`,
   never straight to the coder.
@@ -18,7 +23,11 @@ Read this while watching a task, when its behaviour surprises you.
   which PR comments are new by comparing their times with its last commit,
   and it can get that wrong across time zones, so a comment of yours may be
   treated as already handled.
-- **internal_review.** The reviewer routes the task on its own verdict. Its
+- **internal_review.** The reviewer can't use the file-editing tools, and a
+  turn that changes HEAD or `git status` anyway parks the task as `stuck`,
+  with the change left in place for you to inspect (same coverage and gaps
+  as `spec_check`: not ignored paths, not anything inside `.git`). It routes the task on
+  its own verdict. Its
   loop guard counts every rejection: the 4th sends the task to
   `escalate_to_human`, and only escalating starts the count over. Your
   `/request-changes` doesn't reset it. It re-reads the PR's comments, so it

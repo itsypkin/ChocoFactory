@@ -76,6 +76,7 @@ mod tests {
 
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_oneshot.py"));
         let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
             system_prompt: None,

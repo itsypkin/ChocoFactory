@@ -431,6 +431,19 @@ pub enum EventType {
     /// `"lingered"`. Without it those interventions would only be visible
     /// in the daemon's logs and in the run's `end_reason`.
     SessionNote,
+    /// The worktree state recorded when a `read_only` role's turn starts
+    /// (#172). Session-scoped. Payload is `{"stage", "role", "cwd", "head",
+    /// "branch", "status_sha256", "status_entries", "status",
+    /// "inherited_from", "message"}`; `status` is the first 20 `git status`
+    /// entries and `inherited_from` is the id of the resumed session whose
+    /// baseline this turn reuses, or null for a fresh one.
+    WorktreeBaseline,
+    /// A `read_only` role's turn left the worktree different from its
+    /// baseline (#172). Session-scoped. Payload is `{"stage", "role",
+    /// "changes", "status_entries", "status", "message"}`; `changes` lists
+    /// `{"field": "head"|"branch"|"status", "before", "after"}` and `message`
+    /// is the reason the task was parked as stuck.
+    WorktreeChanged,
 }
 
 impl fmt::Display for EventType {
@@ -451,6 +464,8 @@ impl fmt::Display for EventType {
             EventType::EnvTruncated => "env_truncated",
             EventType::BranchCleanup => "branch_cleanup",
             EventType::SessionNote => "session_note",
+            EventType::WorktreeBaseline => "worktree_baseline",
+            EventType::WorktreeChanged => "worktree_changed",
         })
     }
 }
@@ -486,6 +501,8 @@ impl FromStr for EventType {
             "env_truncated" => Ok(EventType::EnvTruncated),
             "branch_cleanup" => Ok(EventType::BranchCleanup),
             "session_note" => Ok(EventType::SessionNote),
+            "worktree_baseline" => Ok(EventType::WorktreeBaseline),
+            "worktree_changed" => Ok(EventType::WorktreeChanged),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -613,6 +630,8 @@ mod tests {
             EventType::EnvTruncated,
             EventType::BranchCleanup,
             EventType::SessionNote,
+            EventType::WorktreeBaseline,
+            EventType::WorktreeChanged,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),

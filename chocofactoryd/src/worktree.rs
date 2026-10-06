@@ -610,6 +610,184 @@ async fn run_git_stdout(repo: &Path, args: &[&str]) -> Result<String, WorktreeEr
     }
 }
 
+/// What a worktree looked like at one moment (#172): enough to tell whether a
+/// read-only role's turn changed it. Ignored files are not part of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeSnapshot {
+    pub head: String,
+    /// The full ref `HEAD` points at (`refs/heads/…`), or `""` when detached.
+    pub branch: String,
+    /// Lowercase hex SHA-256 of the raw `git status --porcelain=v1 -z
+    /// --untracked-files=all` bytes followed by the id of a tree holding the
+    /// content of every non-ignored file (so rewriting a file that was
+    /// already dirty changes it too).
+    pub status_sha256: String,
+    pub status_entries: usize,
+    /// The first [`STATUS_PREVIEW_LEN`] entries, one line each.
+    pub status_preview: Vec<String>,
+}
+
+pub const STATUS_PREVIEW_LEN: usize = 20;
+
+async fn run_git_raw(
+    dir: &Path,
+    args: &[&str],
+) -> Result<(Option<i32>, Vec<u8>, String), WorktreeError> {
+    run_git_raw_env(dir, args, None).await
+}
+
+async fn run_git_raw_env(
+    dir: &Path,
+    args: &[&str],
+    index_file: Option<&Path>,
+) -> Result<(Option<i32>, Vec<u8>, String), WorktreeError> {
+    let mut command = Command::new("git");
+    if let Some(index_file) = index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    }
+    let output = command
+        .arg("-C")
+        .arg(dir)
+        .arg("--no-optional-locks")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(WorktreeError::Spawn)?;
+    Ok((
+        output.status.code(),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+fn git_failed(args: &[&str], stderr: String) -> WorktreeError {
+    WorktreeError::GitFailed {
+        args: args.iter().map(|s| s.to_string()).collect(),
+        stderr,
+    }
+}
+
+/// Reads HEAD, the branch and `git status` of `dir` (#172).
+pub async fn snapshot(dir: &Path) -> Result<WorktreeSnapshot, WorktreeError> {
+    use sha2::{Digest, Sha256};
+
+    let args = ["rev-parse", "HEAD"];
+    let (code, stdout, stderr) = run_git_raw(dir, &args).await?;
+    if code != Some(0) {
+        return Err(git_failed(&args, stderr));
+    }
+    let head = String::from_utf8_lossy(&stdout).trim().to_string();
+
+    let args = ["symbolic-ref", "-q", "HEAD"];
+    let (code, stdout, stderr) = run_git_raw(dir, &args).await?;
+    let branch = match code {
+        Some(0) => String::from_utf8_lossy(&stdout).trim().to_string(),
+        Some(1) if stdout.is_empty() && stderr.trim().is_empty() => String::new(),
+        _ => return Err(git_failed(&args, stderr)),
+    };
+
+    let args = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+    let (code, status, stderr) = run_git_raw(dir, &args).await?;
+    if code != Some(0) {
+        return Err(git_failed(&args, stderr));
+    }
+    // The staged content: a partly staged file can be re-staged with other
+    // bytes without moving the status line or the working-tree content.
+    let args = [
+        "diff",
+        "--cached",
+        "--binary",
+        "--no-ext-diff",
+        "--no-textconv",
+    ];
+    let (code, staged, stderr) = run_git_raw(dir, &args).await?;
+    if code != Some(0) {
+        return Err(git_failed(&args, stderr));
+    }
+    let tree = content_tree(dir).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(&status);
+    hasher.update(b"\0staged:");
+    hasher.update(&staged);
+    hasher.update(b"\0tree:");
+    hasher.update(tree.as_bytes());
+    let status_sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let entries = parse_status_entries(&status);
+    Ok(WorktreeSnapshot {
+        head,
+        branch,
+        status_sha256,
+        status_entries: entries.len(),
+        status_preview: entries.into_iter().take(STATUS_PREVIEW_LEN).collect(),
+    })
+}
+
+/// The id of a tree holding the current content of every non-ignored file,
+/// built in a throwaway index so the real index is left alone. (It does write
+/// the file contents into the object database as loose objects.)
+async fn content_tree(dir: &Path) -> Result<String, WorktreeError> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "chocofactoryd-snapshot-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&scratch).map_err(WorktreeError::Spawn)?;
+    /// Removes the scratch directory even if the future is dropped mid-way.
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = RemoveOnDrop(scratch.clone());
+    let index = scratch.join("index");
+    async {
+        let args = ["add", "-A", "--", "."];
+        let (code, _, stderr) = run_git_raw_env(dir, &args, Some(&index)).await?;
+        if code != Some(0) {
+            return Err(git_failed(&args, stderr));
+        }
+        let args = ["write-tree"];
+        let (code, stdout, stderr) = run_git_raw_env(dir, &args, Some(&index)).await?;
+        if code != Some(0) {
+            return Err(git_failed(&args, stderr));
+        }
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    }
+    .await
+}
+
+/// Splits `-z` porcelain output into entries. A rename or copy entry carries
+/// its original path in the next field.
+fn parse_status_entries(raw: &[u8]) -> Vec<String> {
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned());
+    let mut entries = Vec::new();
+    while let Some(field) = fields.next() {
+        let xy: Vec<char> = field.chars().take(2).collect();
+        let renamed = xy.iter().any(|c| matches!(c, 'R' | 'C'));
+        if renamed && let Some(orig) = fields.next() {
+            let path = field.get(3..).unwrap_or("");
+            let status = field.get(..2).unwrap_or("");
+            entries.push(format!("{status} {orig} -> {path}"));
+        } else {
+            entries.push(field);
+        }
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +814,107 @@ mod tests {
         std::fs::write(dir.join("README.md"), "hello\n").unwrap();
         git(dir, &["add", "."]).await;
         git(dir, &["commit", "-q", "-m", "init"]).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_tracks_head_branch_and_status() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        let head = run_git_stdout(&repo, &["rev-parse", "HEAD"]).await.unwrap();
+        let branch = run_git_stdout(&repo, &["symbolic-ref", "HEAD"])
+            .await
+            .unwrap();
+
+        let clean = snapshot(&repo).await.unwrap();
+        assert_eq!(clean.head, head);
+        assert_eq!(clean.branch, branch);
+        assert!(clean.branch.starts_with("refs/heads/"));
+        assert_eq!(clean.status_entries, 0);
+        assert_eq!(snapshot(&repo).await.unwrap(), clean);
+
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        git(&repo, &["add", ".gitignore"]).await;
+        git(&repo, &["commit", "-q", "-m", "ignore"]).await;
+        let clean = snapshot(&repo).await.unwrap();
+        std::fs::write(repo.join("ignored.txt"), "x").unwrap();
+        assert_eq!(snapshot(&repo).await.unwrap(), clean);
+
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(repo.join("sub/new.txt"), "x").unwrap();
+        let dirty = snapshot(&repo).await.unwrap();
+        assert_eq!(dirty.status_entries, 1);
+        assert_eq!(dirty.status_preview, vec!["?? sub/new.txt".to_string()]);
+        assert_ne!(dirty.status_sha256, clean.status_sha256);
+
+        git(&repo, &["checkout", "-q", "--detach"]).await;
+        assert_eq!(snapshot(&repo).await.unwrap().branch, "");
+    }
+
+    #[tokio::test]
+    async fn snapshot_sees_a_content_change_to_an_already_dirty_file() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        std::fs::write(repo.join("README.md"), "edited once\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "one\n").unwrap();
+        let before = snapshot(&repo).await.unwrap();
+        assert_eq!(before.status_entries, 2);
+
+        std::fs::write(repo.join("README.md"), "edited twice\n").unwrap();
+        let tracked = snapshot(&repo).await.unwrap();
+        assert_eq!(tracked.status_entries, 2);
+        assert_ne!(tracked.status_sha256, before.status_sha256);
+
+        std::fs::write(repo.join("new.txt"), "two\n").unwrap();
+        let untracked = snapshot(&repo).await.unwrap();
+        assert_ne!(untracked.status_sha256, tracked.status_sha256);
+        assert_eq!(snapshot(&repo).await.unwrap(), untracked);
+    }
+
+    #[tokio::test]
+    async fn snapshot_sees_a_restaged_file_whose_working_copy_did_not_change() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        std::fs::write(repo.join("README.md"), "one\n").unwrap();
+        git(&repo, &["add", "README.md"]).await;
+        std::fs::write(repo.join("README.md"), "two\n").unwrap();
+        let before = snapshot(&repo).await.unwrap();
+
+        std::fs::write(repo.join("README.md"), "three\n").unwrap();
+        git(&repo, &["add", "README.md"]).await;
+        std::fs::write(repo.join("README.md"), "two\n").unwrap();
+        let after = snapshot(&repo).await.unwrap();
+        // Same status line (MM), same working copy, different staged bytes.
+        assert_eq!(after.status_preview, before.status_preview);
+        assert_ne!(after.status_sha256, before.status_sha256);
+    }
+
+    #[tokio::test]
+    async fn snapshot_errors_when_the_content_tree_cannot_be_built() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        git(&repo, &["config", "filter.broken.clean", "false"]).await;
+        git(&repo, &["config", "filter.broken.required", "true"]).await;
+        std::fs::write(repo.join(".gitattributes"), "*.dat filter=broken\n").unwrap();
+        std::fs::write(repo.join("x.dat"), "payload\n").unwrap();
+        let err = snapshot(&repo).await.unwrap_err();
+        assert!(err.to_string().contains("add"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_shows_a_rename_with_its_original_path() {
+        let repo = tempdir().join("repo");
+        init_repo(&repo).await;
+        git(&repo, &["mv", "README.md", "MOVED.md"]).await;
+        let snap = snapshot(&repo).await.unwrap();
+        assert_eq!(snap.status_entries, 1);
+        assert_eq!(snap.status_preview, vec!["R  README.md -> MOVED.md"]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_errors_outside_a_git_repository() {
+        let dir = tempdir();
+        std::fs::write(dir.join(".git"), "gitdir: /nonexistent\n").unwrap();
+        assert!(snapshot(&dir).await.is_err());
     }
 
     fn tempdir() -> PathBuf {
