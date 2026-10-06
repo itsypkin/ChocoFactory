@@ -4,8 +4,13 @@ use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{FromRow, SqlitePool};
 
-const COLUMNS: &str =
-    "task_id, current_stage, loop_counters, payload, updated_at, stage_entered_at";
+// A macro rather than a const so `concat!` can build each query as the
+// `&'static str` that sqlx 0.9 accepts without `AssertSqlSafe`.
+macro_rules! columns {
+    () => {
+        "task_id, current_stage, loop_counters, payload, updated_at, stage_entered_at"
+    };
+}
 
 #[derive(FromRow)]
 struct WorkflowStateRow {
@@ -45,10 +50,10 @@ pub async fn create(
     payload: Value,
 ) -> Result<WorkflowState, sqlx::Error> {
     let now = Utc::now();
-    let row = sqlx::query_as::<_, WorkflowStateRow>(&format!(
+    let row = sqlx::query_as::<_, WorkflowStateRow>(concat!(
         "INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, updated_at, stage_entered_at)
-         VALUES (?, ?, '{{}}', ?, ?, ?)
-         RETURNING {COLUMNS}"
+         VALUES (?, ?, '{}', ?, ?, ?)
+         RETURNING ", columns!()
     ))
     .bind(task_id)
     .bind(current_stage)
@@ -61,8 +66,10 @@ pub async fn create(
 }
 
 pub async fn get(pool: &SqlitePool, task_id: &str) -> Result<Option<WorkflowState>, sqlx::Error> {
-    let row = sqlx::query_as::<_, WorkflowStateRow>(&format!(
-        "SELECT {COLUMNS} FROM workflow_state WHERE task_id = ?"
+    let row = sqlx::query_as::<_, WorkflowStateRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM workflow_state WHERE task_id = ?"
     ))
     .bind(task_id)
     .fetch_optional(pool)
@@ -85,12 +92,13 @@ pub async fn update(
     update: WorkflowStateUpdate,
 ) -> Result<Option<WorkflowState>, sqlx::Error> {
     let now = Utc::now();
-    let row = sqlx::query_as::<_, WorkflowStateRow>(&format!(
+    let row = sqlx::query_as::<_, WorkflowStateRow>(concat!(
         "UPDATE workflow_state
          SET current_stage = ?, loop_counters = ?, payload = ?, updated_at = ?,
              stage_entered_at = CASE WHEN ? THEN ? ELSE stage_entered_at END
          WHERE task_id = ?
-         RETURNING {COLUMNS}"
+         RETURNING ",
+        columns!()
     ))
     .bind(update.current_stage)
     .bind(Json(update.loop_counters))

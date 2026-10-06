@@ -8899,7 +8899,10 @@ async fn start_read_only_task_prepped(
 ) -> ReadOnlyRun {
     let pool = connect_in_memory().await.unwrap();
     if let Some(sql) = setup_sql {
-        sqlx::query(sql).execute(&pool).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&pool)
+            .await
+            .unwrap();
     }
     let dir = tempdir();
     let repo = tempdir();

@@ -6,7 +6,13 @@ use sqlx::types::Json;
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
-const COLUMNS: &str = "id, task_id, session_id, event_type, payload, created_at";
+// A macro rather than a const so `concat!` can build each query as the
+// `&'static str` that sqlx 0.9 accepts without `AssertSqlSafe`.
+macro_rules! columns {
+    () => {
+        "id, task_id, session_id, event_type, payload, created_at"
+    };
+}
 
 #[derive(FromRow)]
 struct EventRow {
@@ -51,11 +57,12 @@ pub async fn append(
 ) -> Result<Event, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let row = sqlx::query_as::<_, EventRow>(&format!(
+    let row = sqlx::query_as::<_, EventRow>(concat!(
         "INSERT INTO events (id, task_id, session_id, event_type, payload, created_at)
          SELECT ?, s.task_id, s.id, ?, ?, ?
          FROM sessions s WHERE s.id = ?
-         RETURNING {COLUMNS}"
+         RETURNING ",
+        columns!()
     ))
     .bind(id)
     .bind(event_type.to_string())
@@ -82,10 +89,11 @@ pub async fn append_for_task(
 ) -> Result<Event, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let row = sqlx::query_as::<_, EventRow>(&format!(
+    let row = sqlx::query_as::<_, EventRow>(concat!(
         "INSERT INTO events (id, task_id, session_id, event_type, payload, created_at)
          VALUES (?, ?, NULL, ?, ?, ?)
-         RETURNING {COLUMNS}"
+         RETURNING ",
+        columns!()
     ))
     .bind(id)
     .bind(task_id)
@@ -118,10 +126,11 @@ pub async fn append_stage_transition(
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Event>, sqlx::Error> {
-    let row = sqlx::query_as::<_, EventRow>(&format!("SELECT {COLUMNS} FROM events WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query_as::<_, EventRow>(concat!("SELECT ", columns!(), " FROM events WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(Into::into))
 }
 
@@ -129,8 +138,10 @@ pub async fn list_for_session(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Vec<Event>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, EventRow>(&format!(
-        "SELECT {COLUMNS} FROM events WHERE session_id = ? ORDER BY created_at, id"
+    let rows = sqlx::query_as::<_, EventRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM events WHERE session_id = ? ORDER BY created_at, id"
     ))
     .bind(session_id)
     .fetch_all(pool)
@@ -405,8 +416,10 @@ fn ends_a_message(event_type: &str) -> bool {
 /// deterministic tie-break" shape already used by
 /// `sessions::get_current_for_stage`'s `ORDER BY started_at DESC, id DESC`.
 pub async fn list_for_task(pool: &SqlitePool, task_id: &str) -> Result<Vec<Event>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, EventRow>(&format!(
-        "SELECT {COLUMNS} FROM events
+    let rows = sqlx::query_as::<_, EventRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM events
          WHERE task_id = ?
          ORDER BY created_at, id"
     ))
@@ -423,8 +436,10 @@ pub async fn list_last_for_task(
     task_id: &str,
     n: i64,
 ) -> Result<Vec<Event>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, EventRow>(&format!(
-        "SELECT {COLUMNS} FROM events
+    let rows = sqlx::query_as::<_, EventRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM events
          WHERE task_id = ?
          ORDER BY created_at DESC, id DESC
          LIMIT ?"
@@ -450,8 +465,10 @@ pub async fn list_last_for_task(
 /// `stage_history` grew the same way and this version is at least aged out
 /// by retention.
 pub async fn list_stage_trail(pool: &SqlitePool, task_id: &str) -> Result<Vec<Event>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, EventRow>(&format!(
-        "SELECT {COLUMNS} FROM events
+    let rows = sqlx::query_as::<_, EventRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM events
          WHERE task_id = ? AND event_type = ?
          ORDER BY created_at, id"
     ))
@@ -470,8 +487,11 @@ pub async fn list_for_task_after(
     task_id: &str,
     cursor: Option<&(DateTime<Utc>, String)>,
 ) -> Result<Vec<Event>, sqlx::Error> {
-    let mut query =
-        sqlx::QueryBuilder::new(format!("SELECT {COLUMNS} FROM events WHERE task_id = "));
+    let mut query = sqlx::QueryBuilder::new(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM events WHERE task_id = "
+    ));
     query.push_bind(task_id);
     if let Some((created_at, id)) = cursor {
         query.push(" AND (created_at > ");
@@ -498,8 +518,11 @@ pub async fn list_for_task_page(
     cursor: Option<&(DateTime<Utc>, String)>,
     limit: i64,
 ) -> Result<Vec<Event>, sqlx::Error> {
-    let mut query =
-        sqlx::QueryBuilder::new(format!("SELECT {COLUMNS} FROM events WHERE task_id = "));
+    let mut query = sqlx::QueryBuilder::new(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM events WHERE task_id = "
+    ));
     query.push_bind(task_id);
     if let Some((created_at, id)) = cursor {
         query.push(" AND (created_at > ");

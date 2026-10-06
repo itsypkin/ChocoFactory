@@ -3,7 +3,13 @@ use chrono::Utc;
 use sqlx::{FromRow, QueryBuilder, SqlitePool};
 use uuid::Uuid;
 
-const COLUMNS: &str = "id, name, repo_path, created_at";
+// A macro rather than a const so `concat!` can build each query as the
+// `&'static str` that sqlx 0.9 accepts without `AssertSqlSafe`.
+macro_rules! columns {
+    () => {
+        "id, name, repo_path, created_at"
+    };
+}
 
 #[derive(FromRow)]
 struct ProjectRow {
@@ -31,9 +37,10 @@ pub async fn create(
 ) -> Result<Project, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let row = sqlx::query_as::<_, ProjectRow>(&format!(
+    let row = sqlx::query_as::<_, ProjectRow>(concat!(
         "INSERT INTO projects (id, name, repo_path, created_at) VALUES (?, ?, ?, ?) \
-         RETURNING {COLUMNS}"
+         RETURNING ",
+        columns!()
     ))
     .bind(id)
     .bind(name)
@@ -45,19 +52,25 @@ pub async fn create(
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Project>, sqlx::Error> {
-    let row =
-        sqlx::query_as::<_, ProjectRow>(&format!("SELECT {COLUMNS} FROM projects WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
+    let row = sqlx::query_as::<_, ProjectRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM projects WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(Into::into))
 }
 
 pub async fn list(pool: &SqlitePool) -> Result<Vec<Project>, sqlx::Error> {
-    let rows =
-        sqlx::query_as::<_, ProjectRow>(&format!("SELECT {COLUMNS} FROM projects ORDER BY id"))
-            .fetch_all(pool)
-            .await?;
+    let rows = sqlx::query_as::<_, ProjectRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM projects ORDER BY id"
+    ))
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
@@ -101,7 +114,7 @@ pub async fn update(
             .push_bind(repo_path.map(|s| s.to_string()));
     }
     qb.push(" WHERE id = ").push_bind(id.to_string());
-    qb.push(format!(" RETURNING {COLUMNS}"));
+    qb.push(concat!(" RETURNING ", columns!()));
 
     let row = qb
         .build_query_as::<ProjectRow>()
