@@ -18,11 +18,10 @@ summary and your reply. Work like this:
    long build or test run), the one turn you may end without reporting is
    one spent waiting on it: say so in one line, and you will be woken when
    it finishes. Check its result before you report.
-   To check on it, check your own job: its pid (`kill -0 <pid>`) or its own
-   output file. Never wait on `pgrep` for a program name, because other tasks
-   and reviewers on this machine run the same tools, and never loop until a
-   line appears that the job may never print: stop once the job has exited,
-   and read its output.
+   Wait by ending the turn, not by polling. Never wait on `pgrep` for a
+   program name, because other tasks and reviewers on this machine run the
+   same tools, and never check a pid or loop until a line appears that the
+   job may never print.
 2. When you change code that can be run, built or type-checked, run a real
    check that exercises the change: the project's tests, type-checker or
    build, or the changed command itself. A syntax-only check, or a check

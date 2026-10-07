@@ -1976,9 +1976,9 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     #[test]
     fn prompts_wait_on_their_own_job_not_pgrep() {
         let phrases = [
-            "`kill -0 <pid>`",
+            "Wait by ending the turn, not by polling",
             "Never wait on `pgrep` for a program name",
-            "never loop until a line appears that the job may never print",
+            "never check a pid or loop until a line appears that the job may never print",
         ];
         let coder = squash(embedded_prompt("coder-system.md"));
         assert_says(&coder, &phrases, "coder-system.md wait rule");
@@ -1990,8 +1990,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             let at = index_of(&coder, p);
             assert!(from < at && at < to, "'{p}' must sit in coder step 1");
         }
+        assert!(!coder.contains("kill -0"), "no pid polling in coder step 1");
         let reviewer = squash(embedded_prompt("reviewer-system.md"));
         assert_says(&reviewer, &phrases, "reviewer-system.md wait rule");
+        assert!(
+            !reviewer.contains("kill -0"),
+            "no pid polling for the reviewer"
+        );
         let (from, to) = (
             index_of(&reviewer, "Wait for that work before you report."),
             index_of(&reviewer, "If something outside the code stops you"),
@@ -2052,7 +2057,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 "Say which values the filter handles and why the others don't matter",
                 "the state the world may already be in when the operation starts",
                 "A fix the task decides goes through this check too",
-                "stop with a question",
+                "raise it as a question",
             ],
             "planner-system.md check 6",
         );

@@ -113,12 +113,13 @@ hardened everywhere except the points that wait on an answer.
      under.
    - When the spec filters or matches on a value (an outcome name, a
      status, a character set, a check state), grep every place that writes
-     that field and list every value it can take. Say which values the
+     that field (or, for a value an external matcher reads, the matcher's
+     grammar) and list every value it can take. Say which values the
      filter handles and why the others don't matter.
    - Include the state the world may already be in when the operation
      starts (an existing branch, file, row or remote commit), not only
      races during it. A fix the task decides goes through this check too;
-     if it fails, that is check 4's contradiction: stop with a question.
+     if it fails, that is check 4's contradiction: raise it as a question.
    - For a layout or fitting algorithm, list the invariants and work
      through the worst case. Require one test that renders every fixture
      at every size from the minimum up and asserts the invariants.
