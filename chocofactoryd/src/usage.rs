@@ -61,6 +61,26 @@ pub fn reported_models(usage: &TurnUsage) -> Option<ModelMap> {
     })
 }
 
+/// A turn's token counts. `result.usage` holds only the main model's
+/// tokens, while the per-model figures also cover sub-agent models, so when
+/// the CLI reports per-model figures a kind's count is their sum. A kind no
+/// model reports keeps the CLI's own `usage` figure.
+pub fn turn_tokens(reported: &TokenCounts, models: Option<&ModelMap>) -> TokenCounts {
+    let sum = |pick: fn(&ModelFigures) -> Option<u64>, fallback: Option<u64>| {
+        let mut acc: Option<u64> = None;
+        for m in models.into_iter().flat_map(|m| m.values()) {
+            add_u(&mut acc, pick(m));
+        }
+        acc.or(fallback)
+    };
+    TokenCounts {
+        input: sum(|m| m.input_tokens, reported.input),
+        output: sum(|m| m.output_tokens, reported.output),
+        cache_read: sum(|m| m.cache_read_tokens, reported.cache_read),
+        cache_write: sum(|m| m.cache_write_tokens, reported.cache_write),
+    }
+}
+
 fn delta_f64(reported: f64, prev: f64) -> f64 {
     if reported >= prev {
         reported - prev

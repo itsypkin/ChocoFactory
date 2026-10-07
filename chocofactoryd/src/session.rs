@@ -721,7 +721,8 @@ async fn drain_session(
                 }
                 // A top-level `turn_completed` and its usage row commit
                 // together (or not at all); a sub-agent's records no usage,
-                // since the main conversation's totals already include it.
+                // since the main conversation's cost and per-model figures
+                // already include it (its tokens come from those figures).
                 let appended = match &event {
                     AgentEvent::TurnCompleted { usage, .. } => {
                         usage::append_turn_completed(pool, session_id, payload, usage).await

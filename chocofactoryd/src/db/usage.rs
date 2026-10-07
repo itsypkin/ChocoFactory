@@ -85,6 +85,7 @@ pub async fn append_turn_completed(
     let event = events::append_on(&mut tx, session_id, EventType::TurnCompleted, payload).await?;
     let base = baseline(&mut tx, session_id).await?;
     let turn = usage::per_turn(usage, &base);
+    let tokens = usage::turn_tokens(&usage.tokens, turn.models.as_ref());
     sqlx::query(
         "INSERT INTO turn_usage (task_id, session_id, recorded_at, billing, counting,
              reported_cost_usd, cost_usd, input_tokens, output_tokens, cache_read_tokens,
@@ -98,10 +99,10 @@ pub async fn append_turn_completed(
     .bind(usage.counting.as_str())
     .bind(usage.cost_usd)
     .bind(turn.cost_usd)
-    .bind(to_i64(usage.tokens.input))
-    .bind(to_i64(usage.tokens.output))
-    .bind(to_i64(usage.tokens.cache_read))
-    .bind(to_i64(usage.tokens.cache_write))
+    .bind(to_i64(tokens.input))
+    .bind(to_i64(tokens.output))
+    .bind(to_i64(tokens.cache_read))
+    .bind(to_i64(tokens.cache_write))
     .bind(to_i64(usage.wall_time_ms))
     .bind(usage.model_turns.map(i64::from))
     .bind(turn.reported_models.map(Json))
@@ -302,6 +303,33 @@ mod tests {
 
     fn close(a: Option<f64>, b: f64) {
         assert!((a.unwrap() - b).abs() < 1e-9, "{a:?} vs {b}");
+    }
+
+    #[tokio::test]
+    async fn a_turns_tokens_are_the_sum_of_its_per_model_figures() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let s = new_session(&pool, &task, "implement").await;
+        let m = |name: &str, n: u64| ModelUsage {
+            model: name.to_string(),
+            tokens: TokenCounts {
+                input: Some(n),
+                output: Some(n),
+                cache_read: Some(n),
+                cache_write: Some(n),
+            },
+            cost_usd: Some(0.01),
+        };
+        // `usage` holds only the main model's 10; the sub-agent's model
+        // adds 5 more in the per-model figures.
+        let u = usage(Some(0.02), 10, Some(vec![m("main", 10), m("sub", 5)]));
+        turn(&pool, &s, &u).await;
+        let rows = list_rows_for_task(&pool, &task).await.unwrap();
+        let t = rows[0].tokens;
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (Some(15), Some(15), Some(15), Some(15))
+        );
     }
 
     #[tokio::test]
