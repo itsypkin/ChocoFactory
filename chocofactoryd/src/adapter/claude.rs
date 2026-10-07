@@ -552,8 +552,9 @@ fn isolated_settings(cwd: &std::path::Path) -> (String, Vec<String>) {
         }
     };
     let path = utf8_path(&resolved, cwd, &mut warnings);
+    let escaped = glob_escape(&path);
     let settings = json!({
-        "claudeMdExcludes": [format!("!{}/**", glob_escape(&path))],
+        "claudeMdExcludes": [format!("!{}/**", escaped.trim_end_matches('/'))],
         "pluginConfigs": {
             "cc-plugin-agents-md@builtin": {
                 "options": { "instructionFiles": "claude-md-and-agents-md" }
@@ -1431,10 +1432,18 @@ mod tests {
         isolation: Isolation,
         disallowed_tools: Vec<RoleTool>,
     ) -> HashMap<String, String> {
+        echo_args_in(isolation, disallowed_tools, std::env::temp_dir()).await
+    }
+
+    async fn echo_args_in(
+        isolation: Isolation,
+        disallowed_tools: Vec<RoleTool>,
+        cwd: std::path::PathBuf,
+    ) -> HashMap<String, String> {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
             disallowed_tools,
-            cwd: std::env::temp_dir(),
+            cwd,
             model: None,
             system_prompt: None,
             sandboxed: true,
@@ -1727,6 +1736,108 @@ mod tests {
             assert_eq!(warned, expect_warning, "{seen:?}");
         }
         std::fs::remove_file(&script).unwrap();
+    }
+
+    /// Canonicalisation proven on every platform: the cwd is a symlink the
+    /// test makes, with a trailing slash, so the flag must name the real dir.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_isolated_spawn_scopes_to_the_real_path_behind_a_symlink() {
+        let id = uuid::Uuid::new_v4();
+        let real = std::env::temp_dir().join(format!("choco-real-{id}"));
+        let link = std::env::temp_dir().join(format!("choco-link-{id}"));
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let fields = echo_args_in(Isolation::default(), Vec::new(), link.clone()).await;
+        std::fs::remove_file(&link).unwrap();
+        let settings: Value = serde_json::from_str(&fields["settings"]).unwrap();
+        let expected = expected_settings(&real);
+        std::fs::remove_dir(&real).unwrap();
+        assert_eq!(settings, expected);
+        let glob = settings["claudeMdExcludes"][0].as_str().unwrap();
+        assert!(!glob.contains(&format!("choco-link-{id}")), "{glob}");
+    }
+
+    #[test]
+    fn the_scope_glob_has_no_doubled_slash_when_resolution_fails() {
+        let missing = std::env::temp_dir().join(format!("choco-missing-{}/", uuid::Uuid::new_v4()));
+        let (json_str, _) = isolated_settings(&missing);
+        let settings: Value = serde_json::from_str(&json_str).unwrap();
+        let glob = settings["claudeMdExcludes"][0].as_str().unwrap();
+        assert!(glob.ends_with("/**") && !glob.ends_with("//**"), "{glob}");
+    }
+
+    /// The spawn-time warning must reach the event channel, first.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_non_utf8_cwd_sends_its_warning_as_the_first_event() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut name = format!("choco-bad-{}-", uuid::Uuid::new_v4()).into_bytes();
+        name.push(0xff);
+        let dir = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(&name));
+        std::fs::create_dir(&dir).unwrap();
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
+            cwd: dir.clone(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
+            isolation: Isolation::default(),
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        let first = handle.recv().await;
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(
+            matches!(&first, Some(AgentEvent::Error { message }) if message.contains("not valid UTF-8")),
+            "{first:?}"
+        );
+    }
+
+    /// A sub-agent's `init` line (it has a `parent_tool_use_id`) carries its
+    /// own plugin set and must not put a warning on the main role's timeline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sub_agent_init_line_does_not_trigger_the_plugin_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = std::env::temp_dir().join(format!("choco-fake-{}.sh", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nread line\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"parent_tool_use_id\":\"toolu_x\",\"plugins\":[{\"name\":\"cc-plugin-telemetry\",\"source\":\"cc-plugin-telemetry@builtin\"}]}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"session_id\":\"s\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
+        let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
+            isolation: Isolation::default(),
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        let mut seen = Vec::new();
+        while let Some(event) = handle.recv().await {
+            let done = matches!(event, AgentEvent::TurnCompleted { .. });
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+        std::fs::remove_file(&script).unwrap();
+        assert!(
+            !seen.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+            "{seen:?}"
+        );
+        assert!(matches!(
+            seen.last(),
+            Some(AgentEvent::TurnCompleted { .. })
+        ));
     }
 
     fn real_plugins() -> Vec<Value> {
