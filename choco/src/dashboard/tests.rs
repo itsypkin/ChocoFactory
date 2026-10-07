@@ -11,7 +11,9 @@ use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use chocofactory_core::models::{Project, PullRequestRef, RetryOutcome, Task, TaskSummary};
+use chocofactory_core::models::{
+    Project, PullRequestRef, RetryOutcome, Task, TaskSummary, UsageTotal,
+};
 use chrono::{DateTime, TimeZone, Utc};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -63,6 +65,7 @@ fn summary(
         loop_counters: json!({}),
         pr: None,
         waiting_on_human: false,
+        usage_total: None,
     }
 }
 
@@ -527,9 +530,26 @@ fn polling_cadence_and_project_refetch() {
 
 // ---- drawing ------------------------------------------------------------
 
+/// Gives the board's task `id` a recorded cost.
+fn give_usage(app: &mut App, id: &str, cost: f64, label: &str) {
+    let t = app
+        .active
+        .iter_mut()
+        .chain(app.closed.iter_mut())
+        .find(|t| t.task.id == id)
+        .expect("task on the board");
+    t.usage_total = Some(UsageTotal {
+        cost_usd: Some(cost),
+        tokens: Some(405),
+        billing_label: label.to_string(),
+        turns_without_cost: 0,
+    });
+}
+
 #[test]
 fn wide_screen_shows_headers_counts_pr_durations_and_laps() {
-    let app = board();
+    let mut app = board();
+    give_usage(&mut app, "9c03aa17-bbbb", 1.234, "api_equivalent");
     let s = render(&app, 120, 30);
     for want in [
         "NEEDS YOU (2)",
@@ -543,6 +563,9 @@ fn wide_screen_shows_headers_counts_pr_durations_and_laps() {
         "refreshed 0s ago",
         "interrupted by a usage limit",
         "1d06h ago",
+        "cost",
+        "≈$1.23",
+        "no data",
     ] {
         assert!(s.contains(want), "missing {want:?} in:\n{s}");
     }
@@ -557,6 +580,7 @@ fn wide_screen_shows_headers_counts_pr_durations_and_laps() {
 fn medium_screen_drops_pr_and_laps() {
     let app = board();
     let s = render(&app, 70, 20);
+    assert!(!s.contains("cost"), "{s}");
     assert!(!s.contains("#171"), "{s}");
     assert!(!s.contains("×2"), "{s}");
     // One grid: project and stage shrink (cut with `…`) before titles do,
@@ -580,8 +604,10 @@ fn medium_screen_drops_pr_and_laps() {
 
 #[test]
 fn narrow_screen_drops_stage_and_project() {
-    let app = board();
+    let mut app = board();
+    give_usage(&mut app, "9c03aa17-bbbb", 1.234, "api_equivalent");
     let s = render(&app, 55, 15);
+    assert!(!s.contains("cost") && !s.contains("≈$"), "{s}");
     assert!(!s.contains("awaiting_human_review"), "{s}");
     assert!(!s.contains("chocofactory  "), "{s}");
     assert!(!s.contains("webshop"), "{s}");
@@ -1721,6 +1747,7 @@ fn the_status_view_shows_fields_progress_counters_and_the_last_five_events() {
         "Role      coder: model=opus".into(),
         "Created   2026-01-01 03:40:00 UTC".into(),
         "Stage     internal_review for 12m".into(),
+        "Cost      no data".into(),
         sep("progress", 100),
         "  1. coding (start)   2026-01-01 03:41:00 UTC".into(),
         "  2. coding --[done]--> internal_review   2026-01-01 04:10:00 UTC".into(),
@@ -1733,7 +1760,6 @@ fn the_status_view_shows_fields_progress_counters_and_the_last_five_events() {
         format!("  {}  human_message message 4", at(4)),
         format!("  {}  human_message message 5", at(5)),
         format!("  {}  human_message message 6", at(6)),
-        String::new(),
         String::new(),
         String::new(),
         String::new(),
@@ -2024,8 +2050,8 @@ fn s_does_nothing_in_either_view_or_the_help() {
 #[test]
 fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
     let app = busy_view();
-    // 20 rows: the whole status block, and two of the five events.
-    let s = render(&app, 100, 20);
+    // 21 rows: the whole status block, and two of the five events.
+    let s = render(&app, 100, 21);
     for want in [
         "Role      coder",
         "1. coding (start)",
@@ -2037,8 +2063,8 @@ fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
     }
     assert!(!s.contains("message 4"), "{s}");
     assert!(s.contains("last events (e expands)"));
-    // 18 rows: no room for an event line, so no tail at all.
-    let s = render(&app, 100, 18);
+    // 19 rows: no room for an event line, so no tail at all.
+    let s = render(&app, 100, 19);
     assert!(!s.contains("last events") && !s.contains("message"), "{s}");
     assert!(
         s.contains("Role      coder") && s.contains("1. coding (start)"),
@@ -2478,6 +2504,198 @@ fn a_two_step_list_next_to_wrapped_rows_keeps_the_newest_step() {
                 "{id} {w}x{h}\n{s}"
             );
             assert!(!s.contains("earlier step"), "{id} {w}x{h}\n{s}");
+        }
+    }
+}
+
+// ---- cost -----------------------------------------------------------------
+
+#[test]
+fn the_cost_column_shows_only_from_width_91_and_leaves_the_other_columns() {
+    let mut app = board();
+    give_usage(&mut app, "9c03aa17-bbbb", 1.234, "api_equivalent");
+    for w in [90, 80] {
+        let s = render(&app, w, 30);
+        assert!(!s.contains("cost") && !s.contains("≈$"), "{w}\n{s}");
+        // Everything present at 80 before the cost column existed.
+        for want in [
+            "id", "project", "title", "stage", "PR", "laps", "#171", "×2", "2h05m",
+        ] {
+            assert!(s.contains(want), "{w}: missing {want:?}\n{s}");
+        }
+    }
+    let s = render(&app, 91, 30);
+    assert!(s.contains("cost") && s.contains("≈$1.23"), "{s}");
+}
+
+#[test]
+fn the_cost_cell_says_no_data_or_unknown() {
+    let mut app = board();
+    let s = render(&app, 120, 30);
+    assert!(!s.contains("≈$"), "{s}");
+    assert_eq!(s.matches("no data").count(), 5, "{s}");
+    app.active[0].usage_total = Some(UsageTotal {
+        cost_usd: None,
+        tokens: None,
+        billing_label: "estimated".into(),
+        turns_without_cost: 0,
+    });
+    let s = render(&app, 120, 30);
+    assert!(s.contains("unknown"), "{s}");
+}
+
+#[test]
+fn every_width_keeps_id_title_and_time_and_the_title_never_loses_room_to_cost() {
+    let mut app = board();
+    for t in app.active.iter_mut().chain(app.closed.iter_mut()) {
+        t.task.title = "Q".repeat(150);
+    }
+    for id in [
+        "3f2a91c0-aaaa",
+        "9c03aa17-bbbb",
+        "b81e0d44-cccc",
+        "7d22e1a8-dddd",
+        "61b0f2e3-eeee",
+    ] {
+        give_usage(&mut app, id, 1.234, "api_equivalent");
+    }
+    let title_chars = |app: &App, w: u16| -> usize {
+        let s = render(app, w, 30);
+        let line = s
+            .lines()
+            .find(|l| l.contains("3f2a91c0"))
+            .unwrap_or_else(|| panic!("no row at {w}\n{s}"));
+        line.matches('Q').count()
+    };
+    let at_80 = title_chars(&app, 80);
+    for w in 40..=140u16 {
+        let s = render(&app, w, 30);
+        for line in s.lines() {
+            assert!(line.trim_end().chars().count() <= w as usize, "{w}\n{s}");
+        }
+        assert_eq!(s.contains("cost"), w >= 91, "{w}\n{s}");
+        assert_eq!(s.contains("≈$1.23"), w >= 91, "{w}\n{s}");
+        for want in [
+            "3f2a91c0", "9c03aa17", "b81e0d44", "7d22e1a8", "61b0f2e3", "Q", "2h05m",
+        ] {
+            assert!(s.contains(want), "{w}: missing {want:?}\n{s}");
+        }
+        let q = title_chars(&app, w);
+        if w >= 91 {
+            assert!(q >= at_80, "{w}: title {q} < {at_80}");
+        }
+    }
+}
+
+fn usage_data(id: &str) -> Value {
+    let mut d = busy_detail();
+    d["id"] = id.into();
+    d["usage"] = json!({
+        "cost_usd": 0.09, "billing_label": "api_equivalent",
+        "tokens": {"input": 30, "output": 15, "cache_read": 300, "cache_write": 60},
+        "wall_time_ms": 7_500_000, "active_time_ms": 4_200_000,
+        "sessions_without_data": 0,
+        "by_stage": [], "by_role": [], "by_lap": [], "by_model": [],
+    });
+    d
+}
+
+#[test]
+fn the_detail_view_shows_the_cost_row() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(usage_data(BUSY)));
+    let s = render(&app, 100, 30);
+    assert!(
+        s.lines()
+            .any(|l| l.trim_end()
+                == "Cost      ≈ $0.09 (API-equivalent) · wall 2h05m · active 1h10m"),
+        "{s}"
+    );
+
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let mut d = usage_data(BUSY);
+    d["usage"]["active_time_ms"] = Value::Null;
+    d["usage"]["billing_label"] = "estimated".into();
+    answer(&mut app, BUSY, Ok(d));
+    let s = render(&app, 100, 30);
+    assert!(
+        s.contains("≈ $0.09 (estimated) · wall 2h05m · active no data"),
+        "{s}"
+    );
+
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(busy_detail()));
+    let s = render(&app, 100, 30);
+    assert!(
+        s.lines().any(|l| l.trim_end() == "Cost      no data"),
+        "{s}"
+    );
+}
+
+#[test]
+fn partial_totals_are_marked_in_the_dashboard() {
+    // Detail: sessions without data and turns without a cost.
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let mut d = usage_data(BUSY);
+    d["usage"]["sessions_without_data"] = 2.into();
+    d["usage"]["turns_without_cost"] = 1.into();
+    answer(&mut app, BUSY, Ok(d));
+    let s = render(&app, 140, 30);
+    assert!(
+        s.contains("(API-equivalent)  (2 sessions without data)  (1 turn without a cost) · wall"),
+        "{s}"
+    );
+    // Snapshot-only detail and the list cell mark unknown-cost turns.
+    let mut app = board();
+    give_usage(&mut app, BUSY, 1.234, "estimated");
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == BUSY)
+        .unwrap()
+        .usage_total
+        .as_mut()
+        .unwrap()
+        .turns_without_cost = 3;
+    let s = render(&app, 120, 30);
+    assert!(s.contains("≈$1.23+"), "{s}");
+    open_detail(&mut app, BUSY);
+    let s = render(&app, 140, 30);
+    assert!(s.contains("(3 turns without a cost)"), "{s}");
+}
+
+#[test]
+fn before_the_detail_arrives_the_cost_row_comes_from_the_snapshot() {
+    let mut app = board();
+    give_usage(&mut app, BUSY, 1.234, "estimated");
+    open_detail(&mut app, BUSY);
+    let s = render(&app, 100, 30);
+    assert!(s.contains("Cost      ≈ $1.23 (estimated)"), "{s}");
+
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let s = render(&app, 100, 30);
+    assert!(s.contains("Cost      no data"), "{s}");
+}
+
+#[test]
+fn the_cost_row_is_dropped_with_the_role_row_at_every_height() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(usage_data(BUSY)));
+    push_events(&mut app, BUSY, 7);
+    for h in 10..=40u16 {
+        let s = render(&app, 100, h);
+        assert_eq!(s.contains("Role "), s.contains("Cost "), "height {h}\n{s}");
+    }
+    assert!(render(&app, 100, 40).contains("Cost "));
+    assert!(!render(&app, 100, 14).contains("Cost "));
+    for w in [40, 60, 100] {
+        for h in 10..=40u16 {
+            let _ = render(&app, w, h);
         }
     }
 }

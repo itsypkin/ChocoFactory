@@ -103,6 +103,10 @@ pub async fn create_resumed(
     create_inner(pool, new, Some(from)).await
 }
 
+// `lap` (set by the same INSERT, so there is one write per fact): the nth
+// time the task entered this stage. A retry is not an entry, and a resumed
+// session belongs to the lap it resumed. Stored on the row so it survives
+// the pruning of the `stage_entered` events it was counted from.
 async fn create_inner(
     pool: &SqlitePool,
     new: NewSession<'_>,
@@ -112,8 +116,15 @@ async fn create_inner(
     let now = Utc::now();
     let row = sqlx::query_as::<_, SessionRow>(concat!(
         "INSERT INTO sessions (id, task_id, stage, role, cli_adapter, model, adapter_session_id, \
-         status, resumed_from, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         status, resumed_from, started_at, lap)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+             CASE WHEN ?9 IS NOT NULL
+                 THEN (SELECT lap FROM sessions WHERE id = ?9)
+                 ELSE MAX(1, (SELECT COUNT(*) FROM events
+                     WHERE task_id = ?2 AND event_type = 'stage_entered'
+                       AND json_extract(payload, '$.stage') = ?3
+                       AND COALESCE(json_extract(payload, '$.outcome'), '') NOT IN ('retry', 'retry_resume')))
+             END)
          RETURNING ",
         columns!()
     ))

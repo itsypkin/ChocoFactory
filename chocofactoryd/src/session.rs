@@ -11,7 +11,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, RoleConfig};
-use crate::db::{events, sessions};
+use crate::db::{events, sessions, usage};
 
 /// Drives the active ⇄ idle ⇄ resume state machine (§4.1) on top of
 /// `sessions`: keeps a live `AgentHandle` per active `session_id`,
@@ -719,7 +719,17 @@ async fn drain_session(
                 {
                     map.insert("after_completion".to_string(), Value::Bool(true));
                 }
-                match events::append(pool, session_id, event_type, payload).await {
+                // A top-level `turn_completed` and its usage row commit
+                // together (or not at all); a sub-agent's records no usage,
+                // since the main conversation's cost and per-model figures
+                // already include it (its tokens come from those figures).
+                let appended = match &event {
+                    AgentEvent::TurnCompleted { usage, .. } => {
+                        usage::append_turn_completed(pool, session_id, payload, usage).await
+                    }
+                    _ => events::append(pool, session_id, event_type, payload).await,
+                };
+                match appended {
                     Ok(appended) => {
                         tracing::debug!(session_id, event_type = %appended.event_type, "appended event");
                         events_notify.notify_waiters();
@@ -1125,17 +1135,21 @@ impl SingleShotTurn {
                 }
                 TurnStep::Continue
             }
-            AgentEvent::TurnCompleted { is_error: true } => {
+            AgentEvent::TurnCompleted { is_error: true, .. } => {
                 self.errored = true;
                 self.waiting_for_report = false;
                 TurnStep::EndedWithError
             }
-            AgentEvent::TurnCompleted { is_error: false } if self.reported => {
+            AgentEvent::TurnCompleted {
+                is_error: false, ..
+            } if self.reported => {
                 self.completed = true;
                 self.waiting_for_report = false;
                 TurnStep::Completed
             }
-            AgentEvent::TurnCompleted { is_error: false } => {
+            AgentEvent::TurnCompleted {
+                is_error: false, ..
+            } => {
                 self.waiting_for_report = true;
                 TurnStep::WaitingForReport
             }
@@ -1436,6 +1450,54 @@ mod tests {
         let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(run.status, SessionStatus::Active);
         assert!(run.adapter_session_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_result_records_no_usage_row() {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
+            "fake_claude_subagent_result.py",
+        )));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        manager
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .await
+            .unwrap();
+
+        // The sub-agent result and the top-level one both become events;
+        // only the top-level one may leave a usage row.
+        crate::test_support::wait_until("both result events", || async {
+            let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+            let n = stored
+                .iter()
+                .filter(|e| e.event_type == chocofactory_core::models::EventType::TurnCompleted)
+                .count();
+            if n >= 2 {
+                Ok(())
+            } else {
+                Err(format!("{n} turn events"))
+            }
+        })
+        .await;
+        let rows = crate::db::usage::list_rows_for_task(&pool, &task_of(&pool, &session_id).await)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cost_usd, Some(0.01));
+    }
+
+    async fn task_of(pool: &SqlitePool, session_id: &str) -> String {
+        sessions::get(pool, session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id
     }
 
     #[tokio::test]

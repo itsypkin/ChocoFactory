@@ -3,6 +3,7 @@ pub mod pool;
 pub mod projects;
 pub mod sessions;
 pub mod tasks;
+pub mod usage;
 pub mod workflow_state;
 
 pub use pool::{connect, connect_in_memory};

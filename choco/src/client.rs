@@ -621,7 +621,7 @@ impl Client {
         &self,
         project_id: Option<&str>,
         status: Option<&str>,
-    ) -> Result<Vec<Task>, ClientError> {
+    ) -> Result<Vec<chocofactory_core::models::TaskSummary>, ClientError> {
         let query = Self::list_tasks_query(project_id, status);
         let resp = self
             .send(

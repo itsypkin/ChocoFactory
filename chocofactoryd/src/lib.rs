@@ -15,5 +15,6 @@ pub mod shell;
 pub mod template;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod usage;
 pub mod workflow_def;
 pub mod worktree;

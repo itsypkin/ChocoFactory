@@ -561,6 +561,26 @@ pub struct TaskSummary {
     /// The task is open and its current stage is a `human_gate` (#175).
     #[serde(default)]
     pub waiting_on_human: bool,
+    /// What the task has cost so far; `None` when no turn has recorded
+    /// usage (every task from before usage was recorded).
+    #[serde(default)]
+    pub usage_total: Option<UsageTotal>,
+}
+
+/// A task's cost and token total as `GET /tasks` reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageTotal {
+    /// `None` when every turn's cost is unknown.
+    pub cost_usd: Option<f64>,
+    /// All four token kinds summed; `None` when none is known.
+    pub tokens: Option<u64>,
+    /// `"api_equivalent"` when every turn ran under a subscription login,
+    /// else `"estimated"`.
+    pub billing_label: String,
+    /// Turns whose cost is unknown and so missing from `cost_usd`; when
+    /// above 0 the cost is a lower bound.
+    #[serde(default)]
+    pub turns_without_cost: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -8825,6 +8825,39 @@ stages:
 }
 
 #[tokio::test]
+async fn stage_entered_events_carry_the_stage_kind() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let marker = dir.join("marker");
+    std::fs::write(&marker, "").unwrap();
+    let def = write_marker_shell_workflow(&dir, &marker);
+    let task_id = seed_task(&pool, &def.name).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "closed").await;
+
+    let kinds: Vec<(String, Value)> = events::list_stage_trail(&pool, &task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| {
+            (
+                e.payload["stage"].as_str().unwrap().to_string(),
+                e.payload["kind"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("run".to_string(), json!("shell")),
+            ("finished".to_string(), json!("terminal")),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn retry_task_reruns_a_stuck_shell_stage_and_it_can_succeed() {
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();

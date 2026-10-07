@@ -374,6 +374,165 @@ pub fn task_detail(detail: &Value) -> String {
         }
         None => out.push_str("\n\n(no workflow state — the task has not started)"),
     }
+    out.push_str("\n\n");
+    out.push_str(&cost_and_time(detail));
+    out
+}
+
+/// Money to two decimals, always marked approximate: `≈ $1.23`.
+pub fn money(cost: f64) -> String {
+    format!("≈ ${cost:.2}")
+}
+
+/// What a billing label means for the reader.
+pub fn billing_text(label: &str) -> &'static str {
+    if label == "api_equivalent" {
+        "API-equivalent"
+    } else {
+        "estimated"
+    }
+}
+
+/// `≈ $1.23 (API-equivalent)`, or `cost unknown` when no turn's cost is known.
+pub fn cost_with_label(cost: Option<f64>, label: &str) -> String {
+    match cost {
+        Some(cost) => format!("{} ({})", money(cost), billing_text(label)),
+        None => "cost unknown".to_string(),
+    }
+}
+
+/// What makes a task's total partial, as trailing notes: sessions that
+/// ended without recording a turn, and turns whose cost is unknown (their
+/// cost is left out of the total).
+pub fn partial_notes(usage: &Value) -> String {
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let mut out = String::new();
+    match count("sessions_without_data") {
+        0 => {}
+        1 => out.push_str("  (1 session without data)"),
+        n => out.push_str(&format!("  ({n} sessions without data)")),
+    }
+    match count("turns_without_cost") {
+        0 => {}
+        1 => out.push_str("  (1 turn without a cost)"),
+        n => out.push_str(&format!("  ({n} turns without a cost)")),
+    }
+    out
+}
+
+fn token_count(v: Option<&Value>) -> String {
+    v.and_then(Value::as_u64)
+        .map_or_else(|| "?".to_string(), |n| n.to_string())
+}
+
+/// `input 30 · output 15 · cache read 300 · cache write 60`, unknowns as
+/// `?`; `short` abbreviates the first two words (`in`, `out`).
+fn token_line(tokens: &Value, short: bool) -> String {
+    let (input, output) = if short {
+        ("in", "out")
+    } else {
+        ("input", "output")
+    };
+    format!(
+        "{input} {} · {output} {} · cache read {} · cache write {}",
+        token_count(tokens.get("input")),
+        token_count(tokens.get("output")),
+        token_count(tokens.get("cache_read")),
+        token_count(tokens.get("cache_write")),
+    )
+}
+
+/// One breakdown row's value: cost and tokens, or `no data` for a group
+/// none of whose sessions recorded a turn.
+fn usage_group_value(entry: &Value) -> String {
+    let Some(tokens) = entry.get("tokens").filter(|t| t.is_object()) else {
+        return "no data".to_string();
+    };
+    let cost = entry
+        .get("cost_usd")
+        .and_then(Value::as_f64)
+        .map_or_else(|| "cost unknown".to_string(), money);
+    format!("{cost}  ({})", token_line(tokens, true))
+}
+
+fn usage_breakdown(
+    out: &mut String,
+    heading: &str,
+    entries: &[Value],
+    name: impl Fn(&Value) -> String,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    out.push_str(&format!("\n  {heading}"));
+    let names: Vec<String> = entries.iter().map(&name).collect();
+    let width = names
+        .iter()
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(14)
+        + 1;
+    for (entry, name) in entries.iter().zip(names) {
+        out.push_str(&format!("\n    {name:<width$}{}", usage_group_value(entry)));
+    }
+}
+
+/// The "Cost & time" block of `choco task status`, from the detail's
+/// `usage` object (null when the task has no recorded turns).
+pub fn cost_and_time(detail: &Value) -> String {
+    let Some(usage) = detail.get("usage").filter(|u| u.is_object()) else {
+        return "Cost & time  no data".to_string();
+    };
+    let label = usage
+        .get("billing_label")
+        .and_then(Value::as_str)
+        .unwrap_or("estimated");
+    let mut total = cost_with_label(usage.get("cost_usd").and_then(Value::as_f64), label);
+    total.push_str(&partial_notes(usage));
+    let duration = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .map(|ms| crate::dashboard::app::fmt_duration(chrono::Duration::milliseconds(ms)))
+            .unwrap_or_else(|| "no data".to_string())
+    };
+    let mut out = String::from("Cost & time");
+    out.push_str(&format!("\n  Total        {total}"));
+    out.push_str(&format!(
+        "\n  Tokens       {}",
+        token_line(usage.get("tokens").unwrap_or(&Value::Null), false)
+    ));
+    out.push_str(&format!("\n  Wall time    {}", duration("wall_time_ms")));
+    out.push_str(&format!("\n  Active time  {}", duration("active_time_ms")));
+    let list = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let text = |entry: &Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    usage_breakdown(&mut out, "By stage", &list("by_stage"), |e| {
+        text(e, "stage")
+    });
+    usage_breakdown(&mut out, "By role", &list("by_role"), |e| text(e, "role"));
+    usage_breakdown(&mut out, "By lap", &list("by_lap"), |e| {
+        let lap = e
+            .get("lap")
+            .and_then(Value::as_i64)
+            .map_or_else(|| "?".to_string(), |n| n.to_string());
+        format!("{} #{lap}", text(e, "stage"))
+    });
+    usage_breakdown(&mut out, "By model", &list("by_model"), |e| {
+        text(e, "model")
+    });
     out
 }
 
@@ -1191,7 +1350,7 @@ mod tests {
         });
         let rendered = task_detail(&detail);
         assert!(
-            rendered.ends_with("\n\nLoop counters  internal_review=2 revising=1"),
+            rendered.contains("\n\nLoop counters  internal_review=2 revising=1\n\nCost & time"),
             "{rendered}"
         );
         let none = json!({"id": "t1", "workflow_state": {"loop_counters": {}}});
@@ -1559,5 +1718,119 @@ mod tests {
             assert_eq!(line, line.trim_end(), "line has trailing space: {line:?}");
         }
         assert!(rendered.contains("longer  2"), "{rendered}");
+    }
+
+    fn usage_detail(label: &str, without_data: u64) -> Value {
+        json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+            "usage": {
+                "cost_usd": 0.09, "billing_label": label,
+                "tokens": {"input": 30, "output": 15, "cache_read": 300, "cache_write": null},
+                "wall_time_ms": 7_500_000, "active_time_ms": 4_200_000,
+                "sessions_without_data": without_data,
+                "by_stage": [
+                    {"stage": "implement", "cost_usd": 0.05,
+                     "tokens": {"input": 20, "output": 10, "cache_read": 200, "cache_write": 40}},
+                    {"stage": "review", "cost_usd": null, "tokens": null},
+                ],
+                "by_role": [
+                    {"role": "coder", "cost_usd": 0.05,
+                     "tokens": {"input": 20, "output": 10, "cache_read": 200, "cache_write": 40}},
+                ],
+                "by_lap": [
+                    {"stage": "implement", "lap": 1, "cost_usd": 0.03,
+                     "tokens": {"input": 1, "output": 2, "cache_read": 3, "cache_write": 4}},
+                    {"stage": "implement", "lap": null, "cost_usd": null, "tokens": null},
+                ],
+                "by_model": [
+                    {"model": "mock-model", "cost_usd": 0.09,
+                     "tokens": {"input": 30, "output": 15, "cache_read": 300, "cache_write": 60}},
+                ],
+            },
+        })
+    }
+
+    #[test]
+    fn task_detail_renders_the_cost_and_time_block() {
+        let rendered = task_detail(&usage_detail("api_equivalent", 0));
+        let block = rendered.split("Cost & time").nth(1).expect("block present");
+        for expected in [
+            "  Total        ≈ $0.09 (API-equivalent)\n",
+            "  Tokens       input 30 · output 15 · cache read 300 · cache write ?\n",
+            "  Wall time    2h05m\n",
+            "  Active time  1h10m\n",
+            "  By stage\n",
+            "    implement      ≈ $0.05  (in 20 · out 10 · cache read 200 · cache write 40)\n",
+            "    review         no data\n",
+            "  By role\n",
+            "    coder          ≈ $0.05  (in 20",
+            "  By lap\n",
+            "    implement #1   ≈ $0.03  (in 1 · out 2 · cache read 3 · cache write 4)\n",
+            "    implement #?   no data",
+            "  By model\n",
+            "    mock-model     ≈ $0.09  (in 30",
+        ] {
+            assert!(block.contains(expected), "missing {expected:?} in {block}");
+        }
+        assert!(!block.contains("without data)"), "{block}");
+    }
+
+    #[test]
+    fn an_estimated_total_says_so() {
+        let rendered = task_detail(&usage_detail("estimated", 0));
+        assert!(
+            rendered.contains("Total        ≈ $0.09 (estimated)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn turns_without_a_cost_are_counted_on_the_total_line() {
+        let mut d = serde_json::json!({"usage": {
+            "cost_usd": 0.09, "billing_label": "estimated",
+            "tokens": {"input": 1, "output": 1, "cache_read": 1, "cache_write": 1},
+            "wall_time_ms": 1000, "active_time_ms": null,
+            "sessions_without_data": 0, "turns_without_cost": 2,
+            "by_stage": [], "by_role": [], "by_lap": [], "by_model": []}});
+        let block = cost_and_time(&d);
+        assert!(
+            block.contains("(estimated)  (2 turns without a cost)"),
+            "{block}"
+        );
+        d["usage"]["turns_without_cost"] = 1.into();
+        assert!(cost_and_time(&d).contains("(1 turn without a cost)"));
+        d["usage"]["turns_without_cost"] = 0.into();
+        assert!(!cost_and_time(&d).contains("without a cost"));
+    }
+
+    #[test]
+    fn sessions_without_data_are_counted_on_the_total_line() {
+        let one = task_detail(&usage_detail("estimated", 1));
+        assert!(
+            one.contains("(estimated)  (1 session without data)"),
+            "{one}"
+        );
+        let two = task_detail(&usage_detail("estimated", 2));
+        assert!(two.contains("(2 sessions without data)"), "{two}");
+    }
+
+    #[test]
+    fn a_task_without_usage_says_no_data_on_one_line() {
+        let mut detail = usage_detail("estimated", 0);
+        detail["usage"] = Value::Null;
+        let rendered = task_detail(&detail);
+        assert!(rendered.ends_with("\n\nCost & time  no data"), "{rendered}");
+    }
+
+    #[test]
+    fn a_null_active_time_prints_no_data_and_unknown_cost_says_so() {
+        let mut detail = usage_detail("estimated", 0);
+        detail["usage"]["active_time_ms"] = Value::Null;
+        detail["usage"]["cost_usd"] = Value::Null;
+        let rendered = task_detail(&detail);
+        assert!(rendered.contains("Active time  no data"), "{rendered}");
+        assert!(rendered.contains("Total        cost unknown"), "{rendered}");
     }
 }

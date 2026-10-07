@@ -1,4 +1,4 @@
-use chocofactory_core::models::{PullRequestRef, Task, TaskSummary};
+use chocofactory_core::models::{PullRequestRef, Task, TaskSummary, UsageTotal};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::types::Json;
@@ -149,6 +149,10 @@ struct SummaryRow {
     loop_counters: Option<Json<Value>>,
     pr_url: Option<String>,
     waiting_on_human: bool,
+    usage_cost_usd: Option<f64>,
+    usage_tokens: Option<i64>,
+    usage_all_subscription: Option<bool>,
+    usage_turns_without_cost: Option<i64>,
 }
 
 /// The pull-request number at the end of a pull URL (`…/pull/42`, with an
@@ -184,8 +188,21 @@ pub async fn list_summaries(
            WHERE j.type = 'object' \
              AND json_extract(j.value, '$.url') LIKE '%/pull/%' \
            LIMIT 1) AS pr_url, \
-         COALESCE(t.status = 'open' AND w.stage_kind = 'human_gate', 0) AS waiting_on_human \
-         FROM tasks t LEFT JOIN workflow_state w ON w.task_id = t.id"
+         COALESCE(t.status = 'open' AND w.stage_kind = 'human_gate', 0) AS waiting_on_human, \
+         u.cost_usd AS usage_cost_usd, u.tokens AS usage_tokens, \
+         u.all_subscription AS usage_all_subscription, \
+         u.turns_without_cost AS usage_turns_without_cost \
+         FROM tasks t LEFT JOIN workflow_state w ON w.task_id = t.id \
+         LEFT JOIN (SELECT task_id, SUM(cost_usd) AS cost_usd, \
+                CASE WHEN COUNT(input_tokens) + COUNT(output_tokens) \
+                          + COUNT(cache_read_tokens) + COUNT(cache_write_tokens) = 0 \
+                     THEN NULL \
+                     ELSE SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) \
+                          + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)) \
+                END AS tokens, \
+                MIN(billing = 'subscription') AS all_subscription, \
+                SUM(cost_usd IS NULL) AS turns_without_cost \
+              FROM turn_usage GROUP BY task_id) u ON u.task_id = t.id"
     ));
     let mut sep = " WHERE ";
     if let Some(project_id) = project_id {
@@ -222,6 +239,22 @@ pub async fn list_summaries(
                 .unwrap_or_else(|| serde_json::json!({})),
             pr: row.pr_url.and_then(pr_ref),
             waiting_on_human: row.waiting_on_human,
+            usage_total: row
+                .usage_all_subscription
+                .map(|all_subscription| UsageTotal {
+                    cost_usd: row.usage_cost_usd,
+                    tokens: row.usage_tokens.and_then(|n| u64::try_from(n).ok()),
+                    billing_label: if all_subscription {
+                        "api_equivalent"
+                    } else {
+                        "estimated"
+                    }
+                    .to_string(),
+                    turns_without_cost: row
+                        .usage_turns_without_cost
+                        .and_then(|n| u64::try_from(n).ok())
+                        .unwrap_or(0),
+                }),
         })
         .collect())
 }

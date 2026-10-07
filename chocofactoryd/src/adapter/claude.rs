@@ -8,8 +8,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use super::{
-    AdapterError, AgentAdapter, AgentEvent, AgentHandle, InterruptionEvidence, Isolation,
-    RoleConfig, RoleTool,
+    AdapterError, AgentAdapter, AgentEvent, AgentHandle, BillingMode, InterruptionEvidence,
+    Isolation, ModelUsage, RoleConfig, RoleTool, TokenCounts, TurnUsage, UsageCounting,
 };
 
 /// Wraps `claude --print --output-format=stream-json --input-format=stream-json
@@ -476,6 +476,7 @@ async fn run_stdout_reader(
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut billing = BillingMode::Unknown;
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
@@ -483,7 +484,7 @@ async fn run_stdout_reader(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        for mut event in normalize(&value, &mut tool_names) {
+        for mut event in normalize(&value, &mut tool_names, &mut billing) {
             if let AgentEvent::SessionMeta {
                 details: Value::Object(details),
                 ..
@@ -624,9 +625,20 @@ fn user_turn_line(text: &str) -> String {
 /// more `AgentEvent`s (§4.2). `tool_names` correlates a later `tool_result`
 /// back to the tool name from its matching `tool_use` block, since the
 /// result block only carries the call's id.
-fn normalize(value: &Value, tool_names: &mut HashMap<String, String>) -> Vec<AgentEvent> {
+fn normalize(
+    value: &Value,
+    tool_names: &mut HashMap<String, String>,
+    billing: &mut BillingMode,
+) -> Vec<AgentEvent> {
     let events = match value.get("type").and_then(Value::as_str) {
         Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
+            if value.get("parent_tool_use_id").is_none_or(Value::is_null) {
+                *billing = match value.get("apiKeySource").and_then(Value::as_str) {
+                    Some("none") => BillingMode::Subscription,
+                    Some(_) => BillingMode::ApiKey,
+                    None => BillingMode::Unknown,
+                };
+            }
             let adapter_session_id = value
                 .get("session_id")
                 .and_then(Value::as_str)
@@ -639,7 +651,7 @@ fn normalize(value: &Value, tool_names: &mut HashMap<String, String>) -> Vec<Age
         }
         Some("assistant") => normalize_assistant(value, tool_names),
         Some("user") => normalize_user(value, tool_names),
-        Some("result") => normalize_result(value),
+        Some("result") => normalize_result(value, *billing),
         Some("control_response") => normalize_control_response(value),
         Some("rate_limit_event") => normalize_rate_limit_event(value),
         _ => Vec::new(),
@@ -681,7 +693,7 @@ fn normalize(value: &Value, tool_names: &mut HashMap<String, String>) -> Vec<Age
 /// instead of having to be dug out of the CLI's own transcript. Key names are
 /// the CLI's own, as seen on a real 2.1.272 `init` line.
 fn init_summary(init: &Value) -> Value {
-    const KEYS: [&str; 9] = [
+    const KEYS: [&str; 10] = [
         "claude_code_version",
         "model",
         "permissionMode",
@@ -691,6 +703,7 @@ fn init_summary(init: &Value) -> Value {
         "plugins",
         "skills",
         "agents",
+        "apiKeySource",
     ];
     let summary = KEYS
         .iter()
@@ -801,13 +814,16 @@ fn normalize_user(value: &Value, tool_names: &HashMap<String, String>) -> Vec<Ag
 // `TurnCompleted`. Whether that turn *completed* is `drain_session`'s call:
 // only a clean finish after a `report_outcome` call does (#90), which is why
 // the flag rides along rather than being collapsed here.
-fn normalize_result(value: &Value) -> Vec<AgentEvent> {
+fn normalize_result(value: &Value, billing: BillingMode) -> Vec<AgentEvent> {
     let is_error = value
         .get("is_error")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if !is_error {
-        return vec![AgentEvent::TurnCompleted { is_error: false }];
+        return vec![AgentEvent::TurnCompleted {
+            is_error: false,
+            usage: result_usage(value, billing),
+        }];
     }
     let message = value
         .get("result")
@@ -826,7 +842,67 @@ fn normalize_result(value: &Value) -> Vec<AgentEvent> {
         },
         false => AgentEvent::Error { message },
     };
-    vec![first, AgentEvent::TurnCompleted { is_error: true }]
+    vec![
+        first,
+        AgentEvent::TurnCompleted {
+            is_error: true,
+            usage: result_usage(value, billing),
+        },
+    ]
+}
+
+fn u64_field(value: &Value, key: &str) -> Option<u64> {
+    let n = value.get(key)?;
+    n.as_u64().or_else(|| {
+        n.as_f64()
+            .filter(|f| *f >= 0.0 && f.fract() == 0.0)
+            .map(|f| f as u64)
+    })
+}
+
+/// The usage fields of a `result` line. Each missing or non-numeric field
+/// is `None` on its own; nothing here can fail the turn.
+fn result_usage(value: &Value, billing: BillingMode) -> TurnUsage {
+    let tokens = match value.get("usage") {
+        Some(usage) if usage.is_object() => TokenCounts {
+            input: u64_field(usage, "input_tokens"),
+            output: u64_field(usage, "output_tokens"),
+            cache_read: u64_field(usage, "cache_read_input_tokens"),
+            cache_write: u64_field(usage, "cache_creation_input_tokens"),
+        },
+        _ => TokenCounts {
+            input: None,
+            output: None,
+            cache_read: None,
+            cache_write: None,
+        },
+    };
+    let models = value
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(model, m)| ModelUsage {
+                    model: model.clone(),
+                    tokens: TokenCounts {
+                        input: u64_field(m, "inputTokens"),
+                        output: u64_field(m, "outputTokens"),
+                        cache_read: u64_field(m, "cacheReadInputTokens"),
+                        cache_write: u64_field(m, "cacheCreationInputTokens"),
+                    },
+                    cost_usd: m.get("costUSD").and_then(Value::as_f64),
+                })
+                .collect()
+        });
+    TurnUsage {
+        cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
+        tokens,
+        models,
+        wall_time_ms: u64_field(value, "duration_ms"),
+        model_turns: u64_field(value, "num_turns").and_then(|n| u32::try_from(n).ok()),
+        billing,
+        counting: UsageCounting::CumulativePerConversation,
+    }
 }
 
 /// The CLI's `rate_limit_event` line (#92). `allowed` is the ordinary
@@ -902,6 +978,179 @@ mod tests {
 
     use chocofactory_core::models::EventType;
 
+    /// The usage of a `result` line that carries none of the usage fields,
+    /// with no `init` seen before it.
+    fn unknown_usage() -> TurnUsage {
+        TurnUsage {
+            cost_usd: None,
+            tokens: TokenCounts {
+                input: None,
+                output: None,
+                cache_read: None,
+                cache_write: None,
+            },
+            models: None,
+            wall_time_ms: None,
+            model_turns: None,
+            billing: BillingMode::Unknown,
+            counting: UsageCounting::CumulativePerConversation,
+        }
+    }
+
+    const FULL_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"pong","duration_ms":1234,"num_turns":3,"total_cost_usd":0.02927,"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":20},"modelUsage":{"claude-sonnet-5":{"inputTokens":20,"outputTokens":9,"cacheReadInputTokens":200,"cacheCreationInputTokens":40,"costUSD":0.02927,"costBasis":"list"}},"session_id":"s"}"#;
+
+    fn usage_of(events: Vec<AgentEvent>) -> TurnUsage {
+        match events.last() {
+            Some(AgentEvent::TurnCompleted { usage, .. }) => usage.clone(),
+            other => panic!("expected TurnCompleted last, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_result_line_yields_full_usage() {
+        let usage = usage_of(normalize(
+            &parse(FULL_RESULT),
+            &mut HashMap::new(),
+            &mut BillingMode::Unknown,
+        ));
+        assert_eq!(usage.cost_usd, Some(0.02927));
+        assert_eq!(
+            usage.tokens,
+            TokenCounts {
+                input: Some(10),
+                output: Some(5),
+                cache_read: Some(100),
+                cache_write: Some(20)
+            }
+        );
+        assert_eq!(
+            usage.models,
+            Some(vec![ModelUsage {
+                model: "claude-sonnet-5".to_string(),
+                tokens: TokenCounts {
+                    input: Some(20),
+                    output: Some(9),
+                    cache_read: Some(200),
+                    cache_write: Some(40)
+                },
+                cost_usd: Some(0.02927),
+            }])
+        );
+        assert_eq!(usage.wall_time_ms, Some(1234));
+        assert_eq!(usage.model_turns, Some(3));
+        assert_eq!(usage.counting, UsageCounting::CumulativePerConversation);
+    }
+
+    #[test]
+    fn missing_result_fields_are_none_each_on_their_own() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"pong","num_turns":1,"usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20}}"#;
+        let events = normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown);
+        assert_eq!(events.len(), 1);
+        let usage = usage_of(events);
+        assert_eq!(usage.cost_usd, None);
+        assert_eq!(usage.tokens.input, Some(10));
+        assert_eq!(usage.tokens.output, None);
+        assert_eq!(usage.tokens.cache_read, Some(100));
+        assert_eq!(usage.models, None);
+        assert_eq!(usage.wall_time_ms, None);
+        assert_eq!(usage.model_turns, Some(1));
+    }
+
+    #[test]
+    fn an_error_result_with_missing_usage_still_emits_error_then_turn_completed() {
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}"#;
+        let events = normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown);
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::Error {
+                    message: "boom".to_string()
+                },
+                AgentEvent::TurnCompleted {
+                    is_error: true,
+                    usage: unknown_usage()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_object_usage_gives_no_token_counts() {
+        let line = r#"{"type":"result","is_error":false,"usage":"lots","total_cost_usd":0.5}"#;
+        let usage = usage_of(normalize(
+            &parse(line),
+            &mut HashMap::new(),
+            &mut BillingMode::Unknown,
+        ));
+        assert_eq!(usage.tokens, unknown_usage().tokens);
+        assert_eq!(usage.cost_usd, Some(0.5));
+    }
+
+    #[test]
+    fn billing_follows_the_latest_top_level_init() {
+        let result = r#"{"type":"result","is_error":false}"#;
+        let run = |init: Option<&str>| {
+            let mut billing = BillingMode::Unknown;
+            let mut names = HashMap::new();
+            if let Some(init) = init {
+                normalize(&parse(init), &mut names, &mut billing);
+            }
+            usage_of(normalize(&parse(result), &mut names, &mut billing)).billing
+        };
+        assert_eq!(
+            run(Some(
+                r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none"}"#
+            )),
+            BillingMode::Subscription
+        );
+        assert_eq!(
+            run(Some(
+                r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"ANTHROPIC_API_KEY"}"#
+            )),
+            BillingMode::ApiKey
+        );
+        assert_eq!(
+            run(Some(
+                r#"{"type":"system","subtype":"init","session_id":"s"}"#
+            )),
+            BillingMode::Unknown
+        );
+        assert_eq!(
+            run(Some(
+                r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":7}"#
+            )),
+            BillingMode::Unknown
+        );
+        assert_eq!(run(None), BillingMode::Unknown);
+    }
+
+    #[test]
+    fn a_sub_agent_init_does_not_change_billing() {
+        let mut billing = BillingMode::Unknown;
+        let mut names = HashMap::new();
+        normalize(
+            &parse(r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none"}"#),
+            &mut names,
+            &mut billing,
+        );
+        normalize(
+            &parse(
+                r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"KEY","parent_tool_use_id":"toolu_1"}"#,
+            ),
+            &mut names,
+            &mut billing,
+        );
+        assert_eq!(billing, BillingMode::Subscription);
+    }
+
+    #[test]
+    fn init_summary_keeps_api_key_source() {
+        let summary = init_summary(&parse(
+            r#"{"type":"system","subtype":"init","apiKeySource":"none","model":"m"}"#,
+        ));
+        assert_eq!(summary["apiKeySource"], "none");
+    }
+
     fn parse(line: &str) -> Value {
         serde_json::from_str(line).unwrap()
     }
@@ -913,7 +1162,7 @@ mod tests {
     fn normalizes_system_init_to_session_meta() {
         let line = r#"{"type":"system","subtype":"init","cwd":"/tmp","session_id":"9bf8db32-b723-41f6-8963-ea3ece07cb1a","tools":["Bash"],"model":"claude-sonnet-5"}"#;
         let mut tool_names = HashMap::new();
-        let events = normalize(&parse(line), &mut tool_names);
+        let events = normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown);
         assert_eq!(
             events,
             vec![AgentEvent::SessionMeta {
@@ -927,7 +1176,7 @@ mod tests {
     fn normalizes_assistant_text_block() {
         let line = r#"{"type":"assistant","message":{"model":"claude-sonnet-5","id":"msg_01FpcJagDvX9Hv2LF9yLsdF7","type":"message","role":"assistant","content":[{"type":"text","text":"pong"}],"stop_reason":null},"session_id":"9bf8db32-b723-41f6-8963-ea3ece07cb1a"}"#;
         let mut tool_names = HashMap::new();
-        let events = normalize(&parse(line), &mut tool_names);
+        let events = normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown);
         assert_eq!(
             events,
             vec![AgentEvent::AssistantMessage {
@@ -942,7 +1191,11 @@ mod tests {
         let tool_result_line = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01115SPXiWWzz1P1dPhHbWAe","type":"tool_result","content":"hello-from-tool","is_error":false}]},"session_id":"0259e0c8-5b32-4044-a69a-4bd21257621d"}"#;
 
         let mut tool_names = HashMap::new();
-        let call_events = normalize(&parse(tool_use_line), &mut tool_names);
+        let call_events = normalize(
+            &parse(tool_use_line),
+            &mut tool_names,
+            &mut BillingMode::Unknown,
+        );
         assert_eq!(
             call_events,
             vec![AgentEvent::ToolCall {
@@ -955,7 +1208,11 @@ mod tests {
             }]
         );
 
-        let result_events = normalize(&parse(tool_result_line), &mut tool_names);
+        let result_events = normalize(
+            &parse(tool_result_line),
+            &mut tool_names,
+            &mut BillingMode::Unknown,
+        );
         assert_eq!(
             result_events,
             vec![AgentEvent::ToolResult {
@@ -972,8 +1229,11 @@ mod tests {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"pong","session_id":"9bf8db32-b723-41f6-8963-ea3ece07cb1a"}"#;
         let mut tool_names = HashMap::new();
         assert_eq!(
-            normalize(&parse(line), &mut tool_names),
-            vec![AgentEvent::TurnCompleted { is_error: false }]
+            normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown),
+            vec![AgentEvent::TurnCompleted {
+                is_error: false,
+                usage: unknown_usage()
+            }]
         );
     }
 
@@ -982,12 +1242,15 @@ mod tests {
         let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","session_id":"abc"}"#;
         let mut tool_names = HashMap::new();
         assert_eq!(
-            normalize(&parse(line), &mut tool_names),
+            normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown),
             vec![
                 AgentEvent::Error {
                     message: "boom".to_string()
                 },
-                AgentEvent::TurnCompleted { is_error: true },
+                AgentEvent::TurnCompleted {
+                    is_error: true,
+                    usage: unknown_usage()
+                },
             ]
         );
     }
@@ -998,7 +1261,7 @@ mod tests {
         // own text in the message, and `error`/`apiErrorStatus` beside it.
         let line = r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 3:40pm (Europe/Berlin)"}]},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"session_id":"s"}"#;
         assert_eq!(
-            normalize(&parse(line), &mut HashMap::new()),
+            normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown),
             vec![
                 AgentEvent::AssistantMessage {
                     text: "You've hit your session limit · resets 3:40pm (Europe/Berlin)"
@@ -1017,7 +1280,7 @@ mod tests {
     fn a_429_assistant_line_without_text_still_says_what_happened() {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[]},"apiErrorStatus":429,"session_id":"s"}"#;
         assert_eq!(
-            normalize(&parse(line), &mut HashMap::new()),
+            normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown),
             vec![AgentEvent::Interrupted {
                 message: "the CLI reported that the account's usage limit is exhausted".to_string(),
                 detected_by: InterruptionEvidence::Structured,
@@ -1029,7 +1292,7 @@ mod tests {
     fn an_ordinary_assistant_line_is_not_an_interruption() {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on it"}]},"session_id":"s"}"#;
         assert_eq!(
-            normalize(&parse(line), &mut HashMap::new()),
+            normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown),
             vec![AgentEvent::AssistantMessage {
                 text: "working on it".to_string()
             }]
@@ -1040,7 +1303,7 @@ mod tests {
     fn a_rejected_rate_limit_event_is_an_interruption() {
         let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1789652400},"session_id":"abc"}"#;
         assert_eq!(
-            normalize(&parse(line), &mut HashMap::new()),
+            normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown),
             vec![AgentEvent::Interrupted {
                 message: "the CLI reported that the account's usage limit is exhausted".to_string(),
                 detected_by: InterruptionEvidence::Structured,
@@ -1054,14 +1317,17 @@ mod tests {
         // received. Recognised by text, and labelled as such.
         let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"You've hit your session limit · resets 3:40pm (Europe/Berlin)","session_id":"abc"}"#;
         assert_eq!(
-            normalize(&parse(line), &mut HashMap::new()),
+            normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown),
             vec![
                 AgentEvent::Interrupted {
                     message: "You've hit your session limit · resets 3:40pm (Europe/Berlin)"
                         .to_string(),
                     detected_by: InterruptionEvidence::MessageText,
                 },
-                AgentEvent::TurnCompleted { is_error: true },
+                AgentEvent::TurnCompleted {
+                    is_error: true,
+                    usage: unknown_usage()
+                },
             ]
         );
     }
@@ -1074,7 +1340,7 @@ mod tests {
         // again when the limit really does stop the turn.
         let line = r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"role":"assistant","content":[]},"error":"rate_limit","session_id":"s"}"#;
         assert_eq!(
-            normalize(&parse(line), &mut HashMap::new()),
+            normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown),
             vec![AgentEvent::Subagent {
                 parent_tool_use_id: "toolu_agent".to_string(),
                 event: Box::new(AgentEvent::Interrupted {
@@ -1107,7 +1373,10 @@ mod tests {
     fn ignores_rate_limit_events() {
         let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"},"session_id":"abc"}"#;
         let mut tool_names = HashMap::new();
-        assert_eq!(normalize(&parse(line), &mut tool_names), Vec::new());
+        assert_eq!(
+            normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown),
+            Vec::new()
+        );
     }
 
     fn fixture_binary(name: &str) -> String {
@@ -1160,7 +1429,13 @@ mod tests {
         // like the real CLI (#70) — normalized to `TurnCompleted` rather
         // than discarded.
         let third = handle.recv().await.unwrap();
-        assert_eq!(third, AgentEvent::TurnCompleted { is_error: false });
+        assert_eq!(
+            third,
+            AgentEvent::TurnCompleted {
+                is_error: false,
+                usage: unknown_usage()
+            }
+        );
 
         handle.send("again").unwrap();
         let fourth = handle.recv().await.unwrap();
@@ -1935,7 +2210,7 @@ mod tests {
     fn a_sub_agents_lines_are_wrapped_with_their_parent_tool_use_id() {
         let line = r#"{"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"content":[{"type":"tool_use","id":"toolu_sub","name":"Bash","input":{"command":"echo hi"}},{"type":"text","text":"ran it"}]},"session_id":"s"}"#;
         let mut tool_names = HashMap::new();
-        let events = normalize(&parse(line), &mut tool_names);
+        let events = normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown);
         assert_eq!(
             events,
             vec![
@@ -1965,7 +2240,7 @@ mod tests {
         let line = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"hi"}]},"session_id":"s"}"#;
         let mut tool_names = HashMap::new();
         assert_eq!(
-            normalize(&parse(line), &mut tool_names),
+            normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown),
             vec![AgentEvent::AssistantMessage {
                 text: "hi".to_string()
             }]
@@ -1978,7 +2253,7 @@ mod tests {
     fn init_keeps_the_sessions_real_environment() {
         let line = r#"{"type":"system","subtype":"init","session_id":"s","claude_code_version":"2.1.272","model":"claude-haiku-4-5","permissionMode":"bypassPermissions","output_style":"default","tools":["Bash","mcp__chocofactory__report_outcome"],"mcp_servers":[{"name":"chocofactory","status":"connected"}],"plugins":[],"skills":["allowed-skill"],"agents":["general-purpose"],"messaging_socket_path":"/tmp/x","analytics_disabled":false}"#;
         let mut tool_names = HashMap::new();
-        let events = normalize(&parse(line), &mut tool_names);
+        let events = normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown);
         let AgentEvent::SessionMeta { details, .. } = &events[0] else {
             panic!("expected session_meta, got {events:?}");
         };
@@ -2006,13 +2281,16 @@ mod tests {
         let accepted = r#"{"type":"control_response","response":{"subtype":"success","request_id":"chocofactory-initialize","response":{}}}"#;
         let mut tool_names = HashMap::new();
         assert_eq!(
-            normalize(&parse(rejected), &mut tool_names),
+            normalize(&parse(rejected), &mut tool_names, &mut BillingMode::Unknown),
             vec![AgentEvent::Error {
                 message: "the CLI rejected the session's initialize request: unknown field"
                     .to_string()
             }]
         );
-        assert_eq!(normalize(&parse(accepted), &mut tool_names), Vec::new());
+        assert_eq!(
+            normalize(&parse(accepted), &mut tool_names, &mut BillingMode::Unknown),
+            Vec::new()
+        );
     }
 
     /// Removes a scratch tree and the transcript folder a probe created, even

@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{ApiError, AppState};
+use crate::db::usage as usage_db;
 use crate::db::{events, tasks, workflow_state};
 use crate::engine::{WorkflowEngine, WorkflowRef};
+use crate::usage::{self, TaskTimes, TaskUsage};
 
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
@@ -141,6 +143,9 @@ pub struct TaskDetail {
     /// Where a task cancelled with `--keep` left its work (#102); `None`
     /// for every other task.
     pub kept: Option<KeptWork>,
+    /// What the task has cost and how long it ran; `null` when no turn has
+    /// recorded usage.
+    pub usage: Option<TaskUsage>,
 }
 
 /// The worktree path and branch a `cancel --keep` handed to a person.
@@ -223,6 +228,29 @@ fn workflow_file_status(engine: &WorkflowEngine, task: &Task) -> Option<&'static
 /// A poll one moment later shows the settled pair. Wrapping this in a
 /// transaction would not fix it either — the engine's own two writes aren't
 /// atomic, so the skew is in the data, not in the read.
+async fn read_usage(
+    state: &AppState,
+    id: &str,
+    task: &chocofactory_core::models::Task,
+    stage_trail: &[chocofactory_core::models::Event],
+) -> Result<Option<TaskUsage>, sqlx::Error> {
+    // Rows first: every row's session exists, so the session list read
+    // afterwards can only be a superset of what the rows refer to.
+    let usage_rows = usage_db::list_rows_for_task(&state.pool, id).await?;
+    let usage_sessions = usage_db::list_session_facts(&state.pool, id).await?;
+    Ok(usage::aggregate(
+        TaskTimes {
+            status: &task.status,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+        },
+        &usage_sessions,
+        &usage_rows,
+        stage_trail,
+        chrono::Utc::now(),
+    ))
+}
+
 pub async fn get(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -234,7 +262,18 @@ pub async fn get(
     let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
     let workflow_file_status = workflow_file_status(&state.engine, &task);
     let kept = kept_work(&task);
+    // Usage is an add-on: a read that fails (say, an undecodable row) is
+    // logged and the task is returned with `usage: null`, so the status and
+    // the dashboard detail never depend on it.
+    let usage = match read_usage(&state, &id, &task, &stage_trail).await {
+        Ok(usage) => usage,
+        Err(err) => {
+            tracing::error!(task_id = %id, %err, "failed to read task usage");
+            None
+        }
+    };
     Ok(Json(TaskDetail {
+        usage,
         task,
         kept,
         workflow_state,
@@ -636,6 +675,164 @@ mod tests {
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert_eq!(detail["id"], task_id);
         assert_eq!(detail["workflow_state"]["current_stage"], "chatting");
+    }
+
+    /// A task written straight to the database (no engine, so no session of
+    /// its own racing the test), with one session and one usage turn.
+    async fn seed_task_with_usage(server: &TestServer, with_usage: bool) -> String {
+        use crate::adapter::{BillingMode, TokenCounts, TurnUsage, UsageCounting};
+        use crate::db::{projects, sessions, tasks, usage};
+
+        let pool = server.pool();
+        let project = projects::create(pool, &format!("p{}", uuid::Uuid::new_v4()), None)
+            .await
+            .unwrap();
+        let task = tasks::create(
+            pool,
+            tasks::NewTask {
+                project_id: &project.id,
+                workflow_def: "chat",
+                title: "t",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+        if with_usage {
+            let session = sessions::create(
+                pool,
+                sessions::NewSession {
+                    task_id: &task.id,
+                    stage: "implement",
+                    role: "coder",
+                    cli_adapter: "claude",
+                    model: "sonnet",
+                },
+            )
+            .await
+            .unwrap();
+            let turn = TurnUsage {
+                cost_usd: Some(0.09),
+                tokens: TokenCounts {
+                    input: Some(30),
+                    output: Some(15),
+                    cache_read: Some(300),
+                    cache_write: Some(60),
+                },
+                models: None,
+                wall_time_ms: Some(1),
+                model_turns: Some(1),
+                billing: BillingMode::Subscription,
+                counting: UsageCounting::CumulativePerConversation,
+            };
+            usage::append_turn_completed(pool, &session.id, json!({ "is_error": false }), &turn)
+                .await
+                .unwrap();
+        }
+        task.id
+    }
+
+    #[tokio::test]
+    async fn get_task_carries_usage_and_list_rows_carry_the_total() {
+        let server = TestServer::start().await;
+        let with = seed_task_with_usage(&server, true).await;
+        let without = seed_task_with_usage(&server, false).await;
+
+        let detail: Value = server.get(&format!("/tasks/{with}")).await.json();
+        let usage = &detail["usage"];
+        assert!((usage["cost_usd"].as_f64().unwrap() - 0.09).abs() < 1e-9);
+        assert_eq!(usage["billing_label"], "api_equivalent");
+        assert_eq!(
+            usage["tokens"],
+            json!({"input": 30, "output": 15, "cache_read": 300, "cache_write": 60})
+        );
+        assert!(usage["wall_time_ms"].is_i64());
+        assert_eq!(usage["active_time_ms"], Value::Null);
+        assert_eq!(usage["sessions_without_data"], 0);
+        assert_eq!(usage["by_stage"][0]["stage"], "implement");
+        assert_eq!(usage["by_role"][0]["role"], "coder");
+        assert_eq!(usage["by_lap"][0]["lap"], 1);
+        assert_eq!(usage["by_model"], json!([]));
+
+        let detail: Value = server.get(&format!("/tasks/{without}")).await.json();
+        assert_eq!(detail["usage"], Value::Null);
+
+        let list: Value = server.get("/tasks").await.json();
+        let row = |id: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let total = &row(&with)["usage_total"];
+        assert!((total["cost_usd"].as_f64().unwrap() - 0.09).abs() < 1e-9);
+        assert_eq!(total["tokens"], 405);
+        assert_eq!(total["billing_label"], "api_equivalent");
+        assert_eq!(row(&without)["usage_total"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_a_cost_is_counted_in_the_detail_and_the_list_total() {
+        use crate::adapter::{BillingMode, TokenCounts, TurnUsage, UsageCounting};
+        let server = TestServer::start().await;
+        let id = seed_task_with_usage(&server, true).await;
+        let session: String = sqlx::query_scalar("SELECT id FROM sessions WHERE task_id = ?")
+            .bind(&id)
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+        let turn = TurnUsage {
+            cost_usd: None,
+            tokens: TokenCounts {
+                input: Some(1),
+                output: Some(1),
+                cache_read: Some(1),
+                cache_write: Some(1),
+            },
+            models: None,
+            wall_time_ms: None,
+            model_turns: None,
+            billing: BillingMode::Subscription,
+            counting: UsageCounting::PerTurn,
+        };
+        crate::db::usage::append_turn_completed(
+            server.pool(),
+            &session,
+            json!({ "is_error": false }),
+            &turn,
+        )
+        .await
+        .unwrap();
+        let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
+        assert_eq!(detail["usage"]["turns_without_cost"], 1);
+        let list: Value = server.get("/tasks").await.json();
+        let row = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(row["usage_total"]["turns_without_cost"], 1);
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_usage_row_still_returns_the_task_with_null_usage() {
+        let server = TestServer::start().await;
+        let id = seed_task_with_usage(&server, true).await;
+        sqlx::query("UPDATE turn_usage SET models = 'not json' WHERE task_id = ?")
+            .bind(&id)
+            .execute(server.pool())
+            .await
+            .unwrap();
+        let resp = server.get(&format!("/tasks/{id}")).await;
+        assert_eq!(resp.status(), 200);
+        let detail: Value = resp.json();
+        assert_eq!(detail["id"], id.as_str());
+        assert_eq!(detail["usage"], Value::Null);
     }
 
     #[tokio::test]

@@ -493,6 +493,71 @@ async fn real_binary_serves_a_chat_task_end_to_end_over_http_and_ws() {
     );
 }
 
+/// Cost and tokens through the real binary: `mock-claude` reports its cost
+/// as a running total (0.01, 0.02, ...) like the real CLI, so a task's cost
+/// is 0.01 per turn only if the daemon stores each turn's own share rather
+/// than summing the totals.
+#[tokio::test]
+async fn real_binary_records_per_turn_usage_not_the_running_totals() {
+    let daemon = Daemon::spawn().await;
+    let (_, project) = daemon.post("/projects", json!({ "name": "demo" })).await;
+    let (status, task) = daemon
+        .post(
+            "/tasks",
+            json!({
+                "project_id": project["id"].as_str().unwrap(),
+                "workflow_def": "chat",
+                "title": "usage",
+                "prompt": "hello",
+            }),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let task_id = task["id"].as_str().unwrap().to_string();
+    let (mut ws, _) = connect_async(format!("{}/tasks/{task_id}/events/live", daemon.ws_url))
+        .await
+        .expect("failed to open the events websocket");
+    assert!(wait_for_echo(&mut ws, "echo:hello").await);
+    for text in ["again", "and again"] {
+        let (status, _) = daemon
+            .post(
+                &format!("/tasks/{task_id}/messages"),
+                json!({ "text": text }),
+            )
+            .await;
+        assert_eq!(status, 202);
+        assert!(wait_for_echo(&mut ws, &format!("echo:{text}")).await);
+    }
+
+    // The `result` line follows the reply, so wait for all three turns.
+    let mut turns = 0;
+    let mut detail = Value::Null;
+    for _ in 0..100 {
+        let events = daemon.get(&format!("/tasks/{task_id}/events")).await;
+        turns = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"] == "turn_completed")
+            .count();
+        detail = daemon.get(&format!("/tasks/{task_id}")).await;
+        if turns == 3 && !detail["usage"].is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(turns, 3, "expected three turn_completed events");
+    let usage = &detail["usage"];
+    let cost = usage["cost_usd"].as_f64().unwrap();
+    assert!(
+        (cost - 0.01 * turns as f64).abs() < 1e-9,
+        "cost {cost} should be 0.01 x {turns}, not the sum of the running totals"
+    );
+    assert_eq!(usage["tokens"]["input"], 10 * turns as u64);
+    assert_eq!(usage["billing_label"], "api_equivalent");
+    let _ = ws.close(None).await;
+}
+
 /// X-3's headline behavior, against the real binary: a stage transition is
 /// an event on the task's timeline and reaches a live subscriber.
 ///
