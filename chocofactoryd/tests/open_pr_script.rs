@@ -1055,7 +1055,10 @@ fn the_latest_record_wins_across_several_rebases() {
     pr_exists(&fx);
     for lap in 0..3 {
         fx.cfg("pr-head", &format!("{}\n", origin_tip(&fx)));
-        amend_local(&fx);
+        // A different tree each lap, so every amend makes a new commit.
+        fs::write(fx.wt.join("f1"), format!("lap {lap}\n")).unwrap();
+        git(&fx.wt, &["add", "."]);
+        git(&fx.wt, &["commit", "-q", "--amend", "-m", "amended"]);
         let out = fx.run("T (#1)", "approved", "r");
         assert!(out.status.success(), "lap {lap}: {}", stderr(&out));
         assert_eq!(origin_tip(&fx), git(&fx.wt, &["rev-parse", "HEAD"]).trim());
