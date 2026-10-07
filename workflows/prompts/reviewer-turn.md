@@ -16,8 +16,7 @@ on a first review:
 </previous_review>
 
 Before step 1, also read the branch's full commit messages and, if a pull
-request for this branch already exists, its comments (`gh pr view
---comments`) — a human's findings live there, not above. If earlier
+request for this branch already exists, its comments (`gh pr view --json comments,reviews`) — a human's findings live there, not above. If earlier
 findings exist, from either source:
 
 1. For each one, report resolved / partial / not resolved / regressed /

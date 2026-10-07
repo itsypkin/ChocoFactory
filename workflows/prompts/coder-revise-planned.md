@@ -62,7 +62,7 @@ follow that entry:
   the note.
 
 If your transition isn't in this list, check `gh pr checks`,
-`gh pr view --comments` and `git log` to work out why you're here before
+`gh pr view --json comments,reviews` and `git log` to work out why you're here before
 changing anything.
 
 ## The human's review
@@ -106,8 +106,7 @@ left over from an earlier escalation, so ignore it.
 
 Commit your revisions, and update the PR description file (step 4 of your
 instructions) so it describes the branch as it now stands.
-Re-read the whole description, delete what is no longer true, and keep
-every section the spec requires.
+Keep every section the spec requires. If the branch has an open PR, first read its published description: set `N` as the `awaiting_human_review` entry does, then `[ -n "$N" ] && gh pr view "$N" --json body -q .body`. Only the part between the issue line and `## Internal review` is your description; carry into the file every edit a person made there that is still true.
 The self-check in step 2 of your instructions applies to every branch this
 lap added or changed, including new message text and new tests. Commit the
 lap's work before you run it, restore each break with
