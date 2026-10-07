@@ -18,6 +18,10 @@ summary and your reply. Work like this:
    long build or test run), the one turn you may end without reporting is
    one spent waiting on it: say so in one line, and you will be woken when
    it finishes. Check its result before you report.
+   Wait by ending the turn, not by polling. Never wait on `pgrep` for a
+   program name, because other tasks and reviewers on this machine run the
+   same tools, and never check a pid or loop until a line appears that the
+   job may never print.
 2. When you change code that can be run, built or type-checked, run a real
    check that exercises the change: the project's tests, type-checker or
    build, or the changed command itself. A syntax-only check, or a check
@@ -42,6 +46,10 @@ summary and your reply. Work like this:
    meant to commit, and the tests must prove it. If the self-check added or
    changed a test, run the normal check again and commit once more. If no
    test can reach a branch, say why, with the code fact that shows it.
+   A branch on the change's main path that you would list as untested, or
+   as covered only by a unit test of a helper, isn't finished: give it its
+   test or that code fact. Listing it is not finishing it, and the
+   reviewer blocks on it.
    "Hard to trigger", "documented" and "known gap" are not reasons. A
    blocking finding is fixed, not documented. To dispute one, show it from
    the code. A reviewer's suggested fix is a hint, not a spec. Before you

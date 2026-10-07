@@ -1922,6 +1922,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "Commit a new test before you break the code it covers.",
             "Then confirm `git status --short` is empty, re-run the test and see it pass.",
             "When the self-check ends, the tree must be exactly what you meant to commit, and the tests must prove it.",
+            "isn't finished: give it its test or that code fact",
+            "Listing it is not finishing it",
         ];
         assert_says(
             &text,
@@ -1962,6 +1964,50 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             ],
             "coder-revise.md must apply the self-check to the lap",
         );
+        assert_says(
+            &squash(done),
+            &[
+                "Re-read the whole description, delete what is no longer true, and keep every section the spec requires.",
+            ],
+            "coder-revise.md must keep the description current",
+        );
+    }
+
+    #[test]
+    fn prompts_wait_on_their_own_job_not_pgrep() {
+        let phrases = [
+            "Wait by ending the turn, not by polling",
+            "Never wait on `pgrep` for a program name",
+            "never check a pid or loop until a line appears that the job may never print",
+        ];
+        let coder = squash(embedded_prompt("coder-system.md"));
+        assert_says(&coder, &phrases, "coder-system.md wait rule");
+        let (from, to) = (
+            index_of(&coder, "1. Do the work yourself"),
+            index_of(&coder, "2. When you change code"),
+        );
+        for p in phrases {
+            let at = index_of(&coder, p);
+            assert!(from < at && at < to, "'{p}' must sit in coder step 1");
+        }
+        assert!(!coder.contains("kill -0"), "no pid polling in coder step 1");
+        let reviewer = squash(embedded_prompt("reviewer-system.md"));
+        assert_says(&reviewer, &phrases, "reviewer-system.md wait rule");
+        assert!(
+            !reviewer.contains("kill -0"),
+            "no pid polling for the reviewer"
+        );
+        let (from, to) = (
+            index_of(&reviewer, "Wait for that work before you report."),
+            index_of(&reviewer, "If something outside the code stops you"),
+        );
+        for p in phrases {
+            let at = index_of(&reviewer, p);
+            assert!(
+                from < at && at < to,
+                "'{p}' must sit in the waiting paragraph"
+            );
+        }
     }
 
     #[test]
@@ -1984,10 +2030,17 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             .collect();
         assert_eq!(numbers, ["1", "2", "3", "4", "5", "6"]);
         assert!(numbered[5].starts_with("6. **Soundness.**"), "{numbered:?}");
-        let fourth = squash(&section[section.find("4. **Decidedness.**").unwrap()..]);
+        let from = section.find("4. **Decidedness.**").unwrap();
+        let to = section.find("5. **Testability.**").unwrap();
+        let fourth = squash(&section[from..to]);
         assert_says(
             &fourth,
-            &["treat it as stop condition 1 and raise it as a question"],
+            &[
+                "treat it as stop condition 1 and raise it as a question",
+                "cites the command you ran and its output",
+                "**unverified**",
+                "name the probe the coder must run before relying on it",
+            ],
             "planner-system.md check 4",
         );
         let sixth = squash(&section[section.find("6. **Soundness.**").unwrap()..]);
@@ -2000,8 +2053,21 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 "at every size from the minimum up",
                 "one test per fail-closed path",
                 "you fix what you find yourself",
+                "grep every place that writes that field",
+                "Say which values the filter handles and why the others don't matter",
+                "the state the world may already be in when the operation starts",
+                "A fix the task decides goes through this check too",
+                "raise it as a question",
             ],
             "planner-system.md check 6",
+        );
+        assert!(
+            index_of(&sixth, "the state the world may already be in")
+                < index_of(
+                    &sixth,
+                    "Like the other checks, you fix what you find yourself"
+                ),
+            "the 'Like the other checks' bullet must stay last"
         );
     }
 
