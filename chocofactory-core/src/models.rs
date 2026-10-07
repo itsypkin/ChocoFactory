@@ -577,6 +577,10 @@ pub struct UsageTotal {
     /// `"api_equivalent"` when every turn ran under a subscription login,
     /// else `"estimated"`.
     pub billing_label: String,
+    /// Turns whose cost is unknown and so missing from `cost_usd`; when
+    /// above 0 the cost is a lower bound.
+    #[serde(default)]
+    pub turns_without_cost: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

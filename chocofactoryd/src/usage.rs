@@ -226,6 +226,8 @@ pub struct TaskUsage {
     pub wall_time_ms: i64,
     pub active_time_ms: Option<i64>,
     pub sessions_without_data: usize,
+    /// Turns whose cost is unknown: the total leaves them out.
+    pub turns_without_cost: usize,
     pub by_stage: Vec<StageUsage>,
     pub by_role: Vec<RoleUsage>,
     pub by_lap: Vec<LapUsage>,
@@ -367,6 +369,7 @@ pub fn aggregate(
     } else {
         "estimated"
     };
+    let turns_without_cost = rows.iter().filter(|r| r.cost_usd.is_none()).count();
     let open = task.status == "open";
     let live = open || task.status == "stuck";
     let wall_time_ms = clamp_ms(task.created_at, if live { now } else { task.updated_at });
@@ -451,6 +454,7 @@ pub fn aggregate(
         wall_time_ms,
         active_time_ms,
         sessions_without_data,
+        turns_without_cost,
         by_stage,
         by_role,
         by_lap,
@@ -820,6 +824,19 @@ mod tests {
         let u = aggregate(times("open"), &sessions, &[r], &[], at(1)).unwrap();
         assert_eq!(u.cost_usd, None);
         assert_eq!(u.tokens.input, None);
+    }
+
+    #[test]
+    fn a_turn_with_tokens_but_no_cost_is_counted_as_missing_from_the_total() {
+        let sessions = vec![session("a", "s", "r", Some(1), 0, false)];
+        let rows = [
+            row("a", "subscription", Some(0.5), 10, None),
+            row("a", "subscription", None, 10, None),
+        ];
+        let u = aggregate(times("open"), &sessions, &rows, &[], at(1)).unwrap();
+        assert_eq!(u.cost_usd, Some(0.5));
+        assert_eq!(u.turns_without_cost, 1);
+        assert_eq!(u.tokens.input, Some(20));
     }
 
     #[test]

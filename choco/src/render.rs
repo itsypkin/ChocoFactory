@@ -401,6 +401,25 @@ pub fn cost_with_label(cost: Option<f64>, label: &str) -> String {
     }
 }
 
+/// What makes a task's total partial, as trailing notes: sessions that
+/// ended without recording a turn, and turns whose cost is unknown (their
+/// cost is left out of the total).
+pub fn partial_notes(usage: &Value) -> String {
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let mut out = String::new();
+    match count("sessions_without_data") {
+        0 => {}
+        1 => out.push_str("  (1 session without data)"),
+        n => out.push_str(&format!("  ({n} sessions without data)")),
+    }
+    match count("turns_without_cost") {
+        0 => {}
+        1 => out.push_str("  (1 turn without a cost)"),
+        n => out.push_str(&format!("  ({n} turns without a cost)")),
+    }
+    out
+}
+
 fn token_count(v: Option<&Value>) -> String {
     v.and_then(Value::as_u64)
         .map_or_else(|| "?".to_string(), |n| n.to_string())
@@ -470,11 +489,7 @@ pub fn cost_and_time(detail: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("estimated");
     let mut total = cost_with_label(usage.get("cost_usd").and_then(Value::as_f64), label);
-    match usage.get("sessions_without_data").and_then(Value::as_u64) {
-        Some(0) | None => {}
-        Some(1) => total.push_str("  (1 session without data)"),
-        Some(n) => total.push_str(&format!("  ({n} sessions without data)")),
-    }
+    total.push_str(&partial_notes(usage));
     let duration = |key: &str| {
         usage
             .get(key)
@@ -1769,6 +1784,25 @@ mod tests {
             rendered.contains("Total        ≈ $0.09 (estimated)"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn turns_without_a_cost_are_counted_on_the_total_line() {
+        let mut d = serde_json::json!({"usage": {
+            "cost_usd": 0.09, "billing_label": "estimated",
+            "tokens": {"input": 1, "output": 1, "cache_read": 1, "cache_write": 1},
+            "wall_time_ms": 1000, "active_time_ms": null,
+            "sessions_without_data": 0, "turns_without_cost": 2,
+            "by_stage": [], "by_role": [], "by_lap": [], "by_model": []}});
+        let block = cost_and_time(&d);
+        assert!(
+            block.contains("(estimated)  (2 turns without a cost)"),
+            "{block}"
+        );
+        d["usage"]["turns_without_cost"] = 1.into();
+        assert!(cost_and_time(&d).contains("(1 turn without a cost)"));
+        d["usage"]["turns_without_cost"] = 0.into();
+        assert!(!cost_and_time(&d).contains("without a cost"));
     }
 
     #[test]

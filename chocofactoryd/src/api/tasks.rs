@@ -776,6 +776,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_without_a_cost_is_counted_in_the_detail_and_the_list_total() {
+        use crate::adapter::{BillingMode, TokenCounts, TurnUsage, UsageCounting};
+        let server = TestServer::start().await;
+        let id = seed_task_with_usage(&server, true).await;
+        let session: String = sqlx::query_scalar("SELECT id FROM sessions WHERE task_id = ?")
+            .bind(&id)
+            .fetch_one(server.pool())
+            .await
+            .unwrap();
+        let turn = TurnUsage {
+            cost_usd: None,
+            tokens: TokenCounts {
+                input: Some(1),
+                output: Some(1),
+                cache_read: Some(1),
+                cache_write: Some(1),
+            },
+            models: None,
+            wall_time_ms: None,
+            model_turns: None,
+            billing: BillingMode::Subscription,
+            counting: UsageCounting::PerTurn,
+        };
+        crate::db::usage::append_turn_completed(
+            server.pool(),
+            &session,
+            json!({ "is_error": false }),
+            &turn,
+        )
+        .await
+        .unwrap();
+        let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
+        assert_eq!(detail["usage"]["turns_without_cost"], 1);
+        let list: Value = server.get("/tasks").await.json();
+        let row = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(row["usage_total"]["turns_without_cost"], 1);
+    }
+
+    #[tokio::test]
     async fn an_undecodable_usage_row_still_returns_the_task_with_null_usage() {
         let server = TestServer::start().await;
         let id = seed_task_with_usage(&server, true).await;

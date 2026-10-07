@@ -317,6 +317,8 @@ fn list_cost(t: &TaskSummary) -> String {
         None => "no data".to_string(),
         Some(u) => match u.cost_usd {
             None => "unknown".to_string(),
+            // A `+` marks a total that leaves out turns of unknown cost.
+            Some(c) if u.turns_without_cost > 0 => format!("≈${c:.2}+"),
             Some(c) => format!("≈${c:.2}"),
         },
     }
@@ -765,16 +767,28 @@ fn cost_value(d: &Detail) -> Option<String> {
                 .map(|ms| fmt_duration(chrono::Duration::milliseconds(ms)))
                 .unwrap_or_else(|| "no data".to_string())
         };
-        return Some(format!(
-            "{} · wall {} · active {}",
+        let cost = format!(
+            "{}{}",
             cost_with_label(usage.get("cost_usd").and_then(|c| c.as_f64()), label),
+            crate::render::partial_notes(usage)
+        );
+        return Some(format!(
+            "{cost} · wall {} · active {}",
             duration("wall_time_ms"),
             duration("active_time_ms"),
         ));
     }
     let snap = d.snapshot.as_ref()?;
     Some(match &snap.usage_total {
-        Some(u) => cost_with_label(u.cost_usd, &u.billing_label),
+        Some(u) => {
+            let mut s = cost_with_label(u.cost_usd, &u.billing_label);
+            if u.cost_usd.is_some() {
+                s.push_str(&crate::render::partial_notes(
+                    &serde_json::json!({ "turns_without_cost": u.turns_without_cost }),
+                ));
+            }
+            s
+        }
         None => "no data".to_string(),
     })
 }

@@ -542,6 +542,7 @@ fn give_usage(app: &mut App, id: &str, cost: f64, label: &str) {
         cost_usd: Some(cost),
         tokens: Some(405),
         billing_label: label.to_string(),
+        turns_without_cost: 0,
     });
 }
 
@@ -2537,6 +2538,7 @@ fn the_cost_cell_says_no_data_or_unknown() {
         cost_usd: None,
         tokens: None,
         billing_label: "estimated".into(),
+        turns_without_cost: 0,
     });
     let s = render(&app, 120, 30);
     assert!(s.contains("unknown"), "{s}");
@@ -2631,6 +2633,38 @@ fn the_detail_view_shows_the_cost_row() {
         s.lines().any(|l| l.trim_end() == "Cost      no data"),
         "{s}"
     );
+}
+
+#[test]
+fn partial_totals_are_marked_in_the_dashboard() {
+    // Detail: sessions without data and turns without a cost.
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let mut d = usage_data(BUSY);
+    d["usage"]["sessions_without_data"] = 2.into();
+    d["usage"]["turns_without_cost"] = 1.into();
+    answer(&mut app, BUSY, Ok(d));
+    let s = render(&app, 140, 30);
+    assert!(
+        s.contains("(API-equivalent)  (2 sessions without data)  (1 turn without a cost) · wall"),
+        "{s}"
+    );
+    // Snapshot-only detail and the list cell mark unknown-cost turns.
+    let mut app = board();
+    give_usage(&mut app, BUSY, 1.234, "estimated");
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == BUSY)
+        .unwrap()
+        .usage_total
+        .as_mut()
+        .unwrap()
+        .turns_without_cost = 3;
+    let s = render(&app, 120, 30);
+    assert!(s.contains("≈$1.23+"), "{s}");
+    open_detail(&mut app, BUSY);
+    let s = render(&app, 140, 30);
+    assert!(s.contains("(3 turns without a cost)"), "{s}");
 }
 
 #[test]

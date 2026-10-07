@@ -152,6 +152,7 @@ struct SummaryRow {
     usage_cost_usd: Option<f64>,
     usage_tokens: Option<i64>,
     usage_all_subscription: Option<bool>,
+    usage_turns_without_cost: Option<i64>,
 }
 
 /// The pull-request number at the end of a pull URL (`…/pull/42`, with an
@@ -189,7 +190,8 @@ pub async fn list_summaries(
            LIMIT 1) AS pr_url, \
          COALESCE(t.status = 'open' AND w.stage_kind = 'human_gate', 0) AS waiting_on_human, \
          u.cost_usd AS usage_cost_usd, u.tokens AS usage_tokens, \
-         u.all_subscription AS usage_all_subscription \
+         u.all_subscription AS usage_all_subscription, \
+         u.turns_without_cost AS usage_turns_without_cost \
          FROM tasks t LEFT JOIN workflow_state w ON w.task_id = t.id \
          LEFT JOIN (SELECT task_id, SUM(cost_usd) AS cost_usd, \
                 CASE WHEN COUNT(input_tokens) + COUNT(output_tokens) \
@@ -198,7 +200,8 @@ pub async fn list_summaries(
                      ELSE SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) \
                           + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0)) \
                 END AS tokens, \
-                MIN(billing = 'subscription') AS all_subscription \
+                MIN(billing = 'subscription') AS all_subscription, \
+                SUM(cost_usd IS NULL) AS turns_without_cost \
               FROM turn_usage GROUP BY task_id) u ON u.task_id = t.id"
     ));
     let mut sep = " WHERE ";
@@ -247,6 +250,10 @@ pub async fn list_summaries(
                         "estimated"
                     }
                     .to_string(),
+                    turns_without_cost: row
+                        .usage_turns_without_cost
+                        .and_then(|n| u64::try_from(n).ok())
+                        .unwrap_or(0),
                 }),
         })
         .collect())
