@@ -1811,6 +1811,44 @@ async fn a_rejected_follow_up_does_not_end_the_running_turn() {
 }
 
 #[tokio::test]
+async fn a_rejected_follow_up_does_not_end_a_turn_waiting_to_settle() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled,reject_unsettled")]);
+    let mut handle = adapter.start("one", &env.cfg()).unwrap();
+    handle.send("/skill:nope").unwrap();
+    let mut events = until_turn_completed(&mut handle).await;
+    events.extend(drain(&mut handle).await);
+    let completions: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnCompleted { is_error, usage } => Some((*is_error, usage.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions.len(), 1, "{events:?}");
+    assert!(!completions[0].0, "{events:?}");
+    let error_at = events
+        .iter()
+        .position(
+            |e| matches!(e, AgentEvent::Error { message } if message == "no such skill: nope"),
+        )
+        .expect("the rejection is reported");
+    let done_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+        .unwrap();
+    assert!(error_at < done_at, "{events:?}");
+    // The running turn keeps its own messages, background run included.
+    assert!(
+        events[..done_at].iter().any(|e| matches!(
+            e,
+            AgentEvent::AssistantMessage { text } if text == "background result"
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_statistics_timeout_still_starts_the_next_queued_completion() {
     let env = Env::new();
     // Call 0 is the baseline; the first turn's reading never answers.

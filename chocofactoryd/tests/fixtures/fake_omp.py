@@ -43,6 +43,8 @@ wrapper script, never through the test process's own environment):
   reject_followup the first prompt is accepted; the next prompt received
                 (while it runs) is rejected with `success: false`, then the
                 first prompt finishes normally
+  reject_unsettled with `unsettled`: a prompt received after the unsettled
+                `prompt_result` is rejected with `success: false`
   reject_noerror  as `reject_prompt`, but the response carries no `error`
   bad_host_call a `host_tool_call` with an id but no toolCallId or toolName
                 precedes the turn; the daemon's reply is reported as text
@@ -382,6 +384,9 @@ def run_prompt(request):
     if unsettled:
         # Background work wakes the agent after the yield; its run streams
         # before `session_settled`.
+        if "reject_unsettled" in MODES:
+            second = read_frame()
+            respond(second, success=False, error="no such skill: nope")
         assistant([{"type": "text", "text": "background result"}])
         time.sleep(0.3)
         emit({"type": "session_settled"})

@@ -1273,9 +1273,10 @@ impl Driver {
                 self.emit(AgentEvent::Error { message });
                 // Another prompt of ours is still running: a completion
                 // carries no prompt id, so ending a turn here would end
-                // that running turn early. Report the rejection only; the
+                // that running turn early (also one parked in
+                // `awaiting_settle`). Report the rejection only; the
                 // running prompt completes the turn.
-                if self.prompts.is_empty() {
+                if self.prompts.is_empty() && self.awaiting_settle.is_empty() {
                     self.ready_completions.push_back(Completion {
                         is_error: true,
                         sent_at,
