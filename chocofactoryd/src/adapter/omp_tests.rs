@@ -7,7 +7,7 @@
 use std::os::unix::fs::PermissionsExt;
 
 use super::*;
-use crate::adapter::ClaudeAdapter;
+use crate::adapter::{ClaudeAdapter, TokenCounts};
 use tokio::io::AsyncWriteExt;
 
 fn fixture_binary(name: &str) -> String {
@@ -204,9 +204,10 @@ async fn a_valid_report_completes_the_turn_with_the_captured_outcome() {
             "glob",
             "grep",
             "todo",
-            "report_outcome"
+            "mcp__chocofactory__report_outcome"
         ]
     );
+    assert!(!tools.contains(&"report_outcome"));
 
     // Tool correlation, thinking, and the report as a ToolCall/ToolResult
     // pair under the qualified name with the arguments verbatim.
@@ -1181,7 +1182,7 @@ async fn a_turns_usage_is_the_statistics_delta_with_per_model_figures() {
     let models = usage.models.unwrap();
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].model, "openai-codex/gpt-5.6-terra");
-    assert_eq!(models[0].tokens.input, Some(300));
+    assert_eq!(models[0].tokens, usage.tokens);
     close(models[0].cost_usd, 0.0369);
     assert!(usage.wall_time_ms.is_some());
     drain(&mut handle).await;
@@ -1200,7 +1201,189 @@ async fn side_call_tokens_are_counted_and_a_resumed_first_turn_is_a_delta() {
     // 200 from the two messages + 1000 nobody reported; the 5000 the
     // resumed session already had is not this turn's.
     assert_eq!(usage.tokens.input, Some(1200));
+    let models = usage.models.unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].model, "openai-codex/gpt-5.6-terra");
+    assert_eq!(models[0].tokens.input, Some(1200));
     drain(&mut handle).await;
+}
+
+fn full_counts() -> TokenCounts {
+    TokenCounts {
+        input: Some(300),
+        output: Some(60),
+        cache_read: Some(90),
+        cache_write: Some(15),
+    }
+}
+
+#[tokio::test]
+async fn a_response_omp_discards_does_not_inflate_the_by_model_figures() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "discarded")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let usage = usage_of(&until_turn_completed(&mut handle).await);
+    assert_eq!(usage.model_turns, Some(4));
+    assert_eq!(usage.tokens, full_counts());
+    close(usage.cost_usd, 0.0369);
+    let models = usage.models.unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].model, "openai-codex/gpt-5.6-terra");
+    assert_eq!(models[0].tokens, usage.tokens);
+    close(models[0].cost_usd, 0.0369);
+    drain(&mut handle).await;
+}
+
+#[tokio::test]
+async fn two_models_split_the_delta_and_add_up() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,second_model")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let usage = usage_of(&until_turn_completed(&mut handle).await);
+    assert_eq!(usage.model_turns, Some(3));
+    assert_eq!(usage.tokens, full_counts());
+    close(usage.cost_usd, 0.0369);
+    let models = usage.models.unwrap();
+    assert_eq!(models.len(), 2);
+    let other = models
+        .iter()
+        .find(|m| m.model == "other-provider/other-model")
+        .unwrap();
+    let main = models
+        .iter()
+        .find(|m| m.model == "openai-codex/gpt-5.6-terra")
+        .unwrap();
+    assert_eq!(
+        other.tokens,
+        TokenCounts {
+            input: Some(100),
+            output: Some(20),
+            cache_read: Some(30),
+            cache_write: Some(5)
+        }
+    );
+    close(other.cost_usd, 0.0123);
+    assert_eq!(
+        main.tokens,
+        TokenCounts {
+            input: Some(200),
+            output: Some(40),
+            cache_read: Some(60),
+            cache_write: Some(10)
+        }
+    );
+    close(main.cost_usd, 0.0246);
+    let sum: f64 = models.iter().filter_map(|m| m.cost_usd).sum();
+    close(Some(sum), 0.0369);
+    drain(&mut handle).await;
+}
+
+#[tokio::test]
+async fn a_discarded_response_from_the_second_model_leaves_the_main_the_remainder() {
+    let env = Env::new();
+    let adapter = env.adapter(&[
+        ("FAKE_OMP_MODES", "noreport,second_model,discarded"),
+        ("FAKE_OMP_DISCARD_SECOND", "1"),
+    ]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let usage = usage_of(&until_turn_completed(&mut handle).await);
+    assert_eq!(usage.model_turns, Some(4));
+    let models = usage.models.unwrap();
+    let other = models
+        .iter()
+        .find(|m| m.model == "other-provider/other-model")
+        .unwrap();
+    let main = models
+        .iter()
+        .find(|m| m.model == "openai-codex/gpt-5.6-terra")
+        .unwrap();
+    assert_eq!(other.tokens.input, Some(200));
+    assert_eq!(main.tokens.input, Some(100));
+    drain(&mut handle).await;
+}
+
+#[tokio::test]
+async fn a_turn_with_no_messages_still_gives_the_main_model_its_figures() {
+    let env = Env::new();
+    let adapter = env.adapter(&[
+        ("FAKE_OMP_MODES", "no_messages"),
+        ("FAKE_OMP_SIDE_TOKENS", "1000"),
+    ]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCompleted {
+            is_error: false,
+            ..
+        })
+    ));
+    let usage = usage_of(&events);
+    assert_eq!(usage.model_turns, Some(0));
+    assert_eq!(usage.tokens.input, Some(1000));
+    let models = usage.models.unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].model, "openai-codex/gpt-5.6-terra");
+    assert_eq!(models[0].tokens.input, Some(1000));
+    drain(&mut handle).await;
+}
+
+#[tokio::test]
+async fn a_missing_baseline_gives_no_data_for_the_first_turn() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_STATS_SEQ", "error,ok")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCompleted {
+            is_error: false,
+            ..
+        })
+    ));
+    let usage = usage_of(&events);
+    assert_eq!(usage.tokens, TokenCounts::default());
+    assert_eq!(usage.cost_usd, None);
+    assert!(usage.models.is_none());
+    drain(&mut handle).await;
+}
+
+#[tokio::test]
+async fn no_emitted_event_names_report_outcome_unqualified() {
+    let env = Env::new();
+    let adapter = env.adapter(&[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let mut events = until_turn_completed(&mut handle).await;
+    events.extend(drain(&mut handle).await);
+    let qualified = qualified_report_outcome_tool_name();
+    for event in &events {
+        if let AgentEvent::SessionMeta { details, .. } = event {
+            assert!(
+                !details["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t == "report_outcome")
+            );
+        }
+        if let AgentEvent::ToolCall { tool, .. } | AgentEvent::ToolResult { tool, .. } = event {
+            assert_ne!(tool, "report_outcome");
+        }
+        assert!(
+            !format!("{event:?}").contains("\"report_outcome\""),
+            "{event:?}"
+        );
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { tool, .. } if *tool == qualified))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolResult { tool, .. } if *tool == qualified))
+    );
 }
 
 #[tokio::test]
@@ -1210,7 +1393,9 @@ async fn an_unpriced_model_has_no_cost() {
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
     let usage = usage_of(&until_turn_completed(&mut handle).await);
     assert_eq!(usage.cost_usd, None);
-    assert_eq!(usage.models.unwrap()[0].cost_usd, None);
+    let models = usage.models.unwrap();
+    assert_eq!(models[0].cost_usd, None);
+    assert_eq!(models[0].tokens.input, Some(200));
     assert_eq!(usage.tokens.input, Some(200));
     drain(&mut handle).await;
 }
@@ -1242,9 +1427,9 @@ async fn a_bad_statistics_reading_gives_unknown_fields_and_the_turn_still_comple
             })
         ));
         assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolResult { tool, .. } if tool.contains("report_outcome"))));
-        // Models and model turns come from the messages, not the reading.
+        // Model turns come from the messages; a failed reading is no data.
         assert_eq!(usage.model_turns, Some(3));
-        assert!(usage.models.is_some());
+        assert!(usage.models.is_none(), "{mode}");
         drain(&mut handle).await;
     }
 }

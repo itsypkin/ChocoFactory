@@ -210,6 +210,8 @@ pub struct TurnMessages {
     per_model: BTreeMap<String, ModelAcc>,
     any_priced: bool,
     any_unpriced: bool,
+    /// The model of the last message that carried usage.
+    pub last_model: Option<String>,
 }
 
 impl TurnMessages {
@@ -219,6 +221,7 @@ impl TurnMessages {
             return;
         };
         let unpriced = usage.unpriced();
+        self.last_model = Some(usage.model.clone());
         if unpriced {
             self.any_unpriced = true;
         } else {
@@ -263,6 +266,74 @@ impl TurnMessages {
                 .collect(),
         )
     }
+}
+
+fn sub_opt(delta: Option<u64>, others: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    let delta = delta?;
+    let sum = others.fold(0u64, |acc, n| acc.saturating_add(n.unwrap_or(0)));
+    Some(delta.saturating_sub(sum))
+}
+
+/// A turn's tokens, cost and per-model figures, all from the statistics
+/// `delta` (`None` is a failed reading: no data, never zero). Other models
+/// keep their message sums; the main model gets the remainder, so the
+/// per-model figures add up to the turn total (a single model's figures are
+/// exactly the delta). This also covers usage no main-agent message carries
+/// (sub-agents, side calls).
+pub fn split_turn_usage(
+    main_model: Option<&str>,
+    messages: &TurnMessages,
+    delta: Option<(TokenCounts, Option<f64>)>,
+) -> (TokenCounts, Option<f64>, Option<Vec<ModelUsage>>) {
+    let Some((tokens, delta_cost)) = delta else {
+        return (TokenCounts::default(), None, None);
+    };
+    let cost_usd = if messages.all_unpriced() {
+        None
+    } else {
+        delta_cost
+    };
+    let main = main_model
+        .map(str::to_string)
+        .or_else(|| messages.last_model.clone())
+        .unwrap_or_else(|| "unknown/unknown".to_string());
+    let all = messages.models().unwrap_or_default();
+    let (own, others): (Vec<ModelUsage>, Vec<ModelUsage>) =
+        all.into_iter().partition(|m| m.model == main);
+    // A remainder below zero is possible only when a non-main model's
+    // response was discarded by omp; it clamps at 0, so the per-model sums
+    // then exceed the total by that amount (accepted).
+    let main_tokens = TokenCounts {
+        input: sub_opt(tokens.input, others.iter().map(|m| m.tokens.input)),
+        output: sub_opt(tokens.output, others.iter().map(|m| m.tokens.output)),
+        cache_read: sub_opt(
+            tokens.cache_read,
+            others.iter().map(|m| m.tokens.cache_read),
+        ),
+        cache_write: sub_opt(
+            tokens.cache_write,
+            others.iter().map(|m| m.tokens.cache_write),
+        ),
+    };
+    // An unpriced main model is not shown as $0. In a turn mixing it with a
+    // priced other model, the per-model costs then don't sum to cost_usd
+    // (accepted).
+    let main_unpriced = own.first().is_some_and(|m| m.cost_usd.is_none());
+    let main_cost = match cost_usd {
+        Some(total) if !main_unpriced => {
+            let others_cost: f64 = others.iter().filter_map(|m| m.cost_usd).sum();
+            Some((total - others_cost).max(0.0))
+        }
+        _ => None,
+    };
+    let mut models = others;
+    models.push(ModelUsage {
+        model: main,
+        tokens: main_tokens,
+        cost_usd: main_cost,
+    });
+    models.sort_by(|a, b| a.model.cmp(&b.model));
+    (tokens, cost_usd, Some(models))
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +473,159 @@ pub fn render_instruction_files(files: &[InstructionFile]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn msg_usage(model: &str, input: u64, cost: f64) -> Option<MessageUsage> {
+        Some(MessageUsage {
+            model: model.to_string(),
+            tokens: TokenCounts {
+                input: Some(input),
+                output: Some(0),
+                cache_read: Some(0),
+                cache_write: None,
+            },
+            total_tokens: input,
+            cost_total: Some(cost),
+        })
+    }
+
+    fn counts(i: u64, o: u64, r: u64, w: u64) -> TokenCounts {
+        TokenCounts {
+            input: Some(i),
+            output: Some(o),
+            cache_read: Some(r),
+            cache_write: Some(w),
+        }
+    }
+
+    fn model<'a>(models: &'a [ModelUsage], name: &str) -> &'a ModelUsage {
+        models.iter().find(|m| m.model == name).unwrap()
+    }
+
+    #[test]
+    fn split_one_model_is_exactly_the_delta() {
+        let mut turn = TurnMessages::default();
+        turn.add(msg_usage("p/m", 100, 0.01));
+        turn.add(msg_usage("p/m", 50, 0.01));
+        let delta = (counts(300, 60, 90, 15), Some(0.0369));
+        let (tokens, cost, models) = split_turn_usage(Some("p/m"), &turn, Some(delta));
+        assert_eq!(tokens, delta.0);
+        assert_eq!(cost, Some(0.0369));
+        assert_eq!(
+            models.unwrap(),
+            vec![ModelUsage {
+                model: "p/m".into(),
+                tokens: delta.0,
+                cost_usd: Some(0.0369)
+            }]
+        );
+    }
+
+    #[test]
+    fn split_clamps_the_main_remainder_at_zero() {
+        let mut turn = TurnMessages::default();
+        turn.add(msg_usage("q/x", 500, 0.5));
+        let delta = (counts(300, 0, 0, 0), Some(0.3));
+        let (_, _, models) = split_turn_usage(Some("p/m"), &turn, Some(delta));
+        let models = models.unwrap();
+        assert_eq!(model(&models, "p/m").tokens.input, Some(0));
+        assert_eq!(model(&models, "p/m").cost_usd, Some(0.0));
+        assert_eq!(model(&models, "q/x").tokens.input, Some(500));
+    }
+
+    #[test]
+    fn split_keeps_none_fields_none_and_treats_other_none_as_zero() {
+        let mut turn = TurnMessages::default();
+        turn.add(msg_usage("q/x", 100, 0.1));
+        let delta = (
+            TokenCounts {
+                input: Some(300),
+                output: None,
+                cache_read: Some(0),
+                cache_write: Some(15),
+            },
+            Some(0.3),
+        );
+        let (_, _, models) = split_turn_usage(Some("p/m"), &turn, Some(delta));
+        let models = models.unwrap();
+        let main = model(&models, "p/m");
+        assert_eq!(main.tokens.output, None);
+        assert_eq!(main.tokens.cache_write, Some(15));
+        assert_eq!(main.tokens.input, Some(200));
+    }
+
+    #[test]
+    fn split_with_no_delta_cost_has_no_cost_for_the_main_model() {
+        let mut turn = TurnMessages::default();
+        turn.add(msg_usage("q/x", 100, 0.1));
+        let (_, cost, models) =
+            split_turn_usage(Some("p/m"), &turn, Some((counts(300, 0, 0, 0), None)));
+        let models = models.unwrap();
+        assert_eq!(cost, None);
+        assert_eq!(model(&models, "p/m").cost_usd, None);
+        assert_eq!(model(&models, "q/x").cost_usd, Some(0.1));
+    }
+
+    #[test]
+    fn split_unpriced_other_stays_unpriced() {
+        let mut turn = TurnMessages::default();
+        turn.add(msg_usage("q/x", 100, 0.0));
+        turn.add(msg_usage("p/m", 100, 0.2));
+        let (_, cost, models) =
+            split_turn_usage(Some("p/m"), &turn, Some((counts(300, 0, 0, 0), Some(0.2))));
+        let models = models.unwrap();
+        assert_eq!(cost, Some(0.2));
+        assert_eq!(model(&models, "q/x").cost_usd, None);
+        assert_eq!(model(&models, "p/m").cost_usd, Some(0.2));
+    }
+
+    #[test]
+    fn split_unpriced_main_with_priced_other_has_no_main_cost() {
+        let mut turn = TurnMessages::default();
+        turn.add(msg_usage("p/m", 100, 0.0));
+        turn.add(msg_usage("q/x", 100, 0.2));
+        let (_, cost, models) =
+            split_turn_usage(Some("p/m"), &turn, Some((counts(300, 0, 0, 0), Some(0.5))));
+        let models = models.unwrap();
+        assert_eq!(cost, Some(0.5));
+        assert_eq!(model(&models, "p/m").cost_usd, None);
+        assert_eq!(model(&models, "q/x").cost_usd, Some(0.2));
+    }
+
+    #[test]
+    fn split_main_model_falls_back_to_the_last_message_then_unknown() {
+        let mut turn = TurnMessages::default();
+        turn.add(msg_usage("q/x", 100, 0.1));
+        let delta = Some((counts(100, 0, 0, 0), Some(0.1)));
+        let (_, _, models) = split_turn_usage(None, &turn, delta);
+        let models = models.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "q/x");
+        let (_, _, models) = split_turn_usage(None, &TurnMessages::default(), delta);
+        assert_eq!(models.unwrap()[0].model, "unknown/unknown");
+    }
+
+    #[test]
+    fn split_gives_the_main_model_an_entry_without_messages() {
+        let (_, _, models) = split_turn_usage(
+            Some("p/m"),
+            &TurnMessages::default(),
+            Some((counts(1000, 0, 0, 0), Some(0.0))),
+        );
+        let models = models.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "p/m");
+        assert_eq!(models[0].tokens, counts(1000, 0, 0, 0));
+    }
+
+    #[test]
+    fn split_of_a_failed_reading_is_no_data() {
+        let mut turn = TurnMessages::default();
+        turn.add(msg_usage("p/m", 100, 0.1));
+        assert_eq!(
+            split_turn_usage(Some("p/m"), &turn, None),
+            (TokenCounts::default(), None, None)
+        );
+    }
     use serde_json::json;
 
     use super::*;

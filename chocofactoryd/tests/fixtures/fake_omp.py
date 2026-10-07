@@ -28,6 +28,15 @@ wrapper script, never through the test process's own environment):
   local_command  the prompt is a builtin command: response `agentInvoked: false`, no `prompt_result`
   side_calls the session statistics include FAKE_OMP_SIDE_TOKENS input
              tokens that no message carries
+  discarded  before the final message, one extra empty assistant message with
+             usage that omp then discards: it is not in the session
+             statistics. Its model is the main one, or the second model with
+             FAKE_OMP_DISCARD_SECOND=1
+  second_model  before the final message, one extra assistant message from
+             FAKE_OMP_SECOND_PROVIDER / FAKE_OMP_SECOND_MODEL (default
+             other-provider / other-model), counted in the statistics
+  no_messages  the prompt sends no message_end at all; the statistics gain
+             FAKE_OMP_SIDE_TOKENS input and FAKE_OMP_SIDE_COST cost
   no_ready   the process sleeps instead of speaking (never used for success)
   unknown_tool  the turn first calls a host tool the daemon never registered
                 and reports the daemon's reply as assistant text
@@ -174,13 +183,13 @@ def send_maybe_chunked(frame, chunked):
         )
 
 
-def assistant(content, usage=True, final=False):
+def assistant(content, usage=True, final=False, provider=None, model=None, counted=True):
     unpriced = "unpriced" in MODES
     message = {
         "role": "assistant",
         "content": content,
-        "provider": os.environ.get("FAKE_OMP_PROVIDER", "openai-codex"),
-        "model": os.environ.get("FAKE_OMP_MODEL", "gpt-5.6-terra"),
+        "provider": provider or os.environ.get("FAKE_OMP_PROVIDER", "openai-codex"),
+        "model": model or os.environ.get("FAKE_OMP_MODEL", "gpt-5.6-terra"),
         "stopReason": "stop",
     }
     if usage:
@@ -192,10 +201,11 @@ def assistant(content, usage=True, final=False):
             "totalTokens": sum(USAGE.values()),
             "cost": {"total": 0 if unpriced else COST},
         }
-        for key in USAGE:
-            STATE.totals[key] += USAGE[key]
-        if not unpriced:
-            STATE.cost += COST
+        if counted:
+            for key in USAGE:
+                STATE.totals[key] += USAGE[key]
+            if not unpriced:
+                STATE.cost += COST
     frame = {"type": "message_end", "message": message}
     send_maybe_chunked(frame, final and "chunked" in MODES)
 
@@ -344,6 +354,12 @@ def run_prompt(request):
     if "die" in MODES:
         assistant([{"type": "text", "text": "about to die"}])
         sys.exit(3)
+    if "no_messages" in MODES:
+        STATE.totals["input"] += int(os.environ.get("FAKE_OMP_SIDE_TOKENS", "0"))
+        STATE.cost += float(os.environ.get("FAKE_OMP_SIDE_COST", "0"))
+        emit({"type": "prompt_result", "id": request.get("id"), "agentInvoked": True,
+              "status": "completed", "sessionSettled": True})
+        return
     # A read tool call and its result, to exercise tool correlation.
     assistant(
         [
@@ -366,6 +382,17 @@ def run_prompt(request):
     )
     if "noreport" not in MODES:
         run_reports()
+    if "discarded" in MODES:
+        if os.environ.get("FAKE_OMP_DISCARD_SECOND"):
+            assistant([{"type": "text", "text": ""}], counted=False,
+                      provider=os.environ.get("FAKE_OMP_SECOND_PROVIDER", "other-provider"),
+                      model=os.environ.get("FAKE_OMP_SECOND_MODEL", "other-model"))
+        else:
+            assistant([{"type": "text", "text": ""}], counted=False)
+    if "second_model" in MODES:
+        assistant([{"type": "text", "text": "second"}],
+                  provider=os.environ.get("FAKE_OMP_SECOND_PROVIDER", "other-provider"),
+                  model=os.environ.get("FAKE_OMP_SECOND_MODEL", "other-model"))
     if "side_calls" in MODES:
         STATE.totals["input"] += int(os.environ.get("FAKE_OMP_SIDE_TOKENS", "0"))
     assistant([{"type": "text", "text": final_text(request)}], final=True)
