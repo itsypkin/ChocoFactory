@@ -1334,20 +1334,20 @@ impl WorkflowEngine {
 
     /// Checks a `PATCH` of a task's config before it is merged: every role
     /// the patch points at a CLI is asked whether that CLI can run the role
-    /// as the task's workflow defines it. `Ok(None)` for a task that doesn't
-    /// exist (the caller answers 404). A workflow that can't be loaded skips
+    /// as the task's workflow defines it. A task that doesn't exist passes
+    /// (the merge that follows answers 404). A workflow that can't be loaded skips
     /// the check, since the turn-start check is the one that can't be
     /// skipped and fails closed. `Err` is the adapter's own message.
     pub async fn check_config_patch(
         &self,
         task_id: &str,
         patch: &Value,
-    ) -> Result<Option<()>, ConfigPatchError> {
+    ) -> Result<(), ConfigPatchError> {
         let Some(task) = tasks::get(&self.pool, task_id)
             .await
             .map_err(ConfigPatchError::Db)?
         else {
-            return Ok(None);
+            return Ok(());
         };
         match self.load_task_workflow(&task).await {
             Ok(definition) => {
@@ -1362,7 +1362,7 @@ impl WorkflowEngine {
                 );
             }
         }
-        Ok(Some(()))
+        Ok(())
     }
 
     /// Sets the old global workflows folder, used only to reload pre-#88

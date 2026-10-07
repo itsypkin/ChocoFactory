@@ -329,8 +329,7 @@ pub async fn update_config(
     // `roles.<name>.cli` can change which adapter a role runs on.
     if sets_a_role_cli(&body.config) {
         match state.engine.check_config_patch(&id, &body.config).await {
-            Ok(Some(())) => {}
-            Ok(None) => return Err(ApiError::NotFound(format!("no such task '{id}'"))),
+            Ok(()) => {}
             Err(ConfigPatchError::Rejected(message)) => {
                 return Err(ApiError::BadRequest(message));
             }

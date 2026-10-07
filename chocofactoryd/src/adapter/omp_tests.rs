@@ -460,6 +460,19 @@ async fn prompt_result_errors_become_error_or_interrupted_then_a_failed_turn() {
 }
 
 #[tokio::test]
+async fn an_errored_turn_completes_without_waiting_for_the_session_to_settle() {
+    let env = Env::new();
+    // The fake never sends `session_settled` after an error.
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,error,unsettled")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCompleted { is_error: true, .. })
+    ));
+}
+
+#[tokio::test]
 async fn an_unsettled_session_completes_on_session_settled() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);

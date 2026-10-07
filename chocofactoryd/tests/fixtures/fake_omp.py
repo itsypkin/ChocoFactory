@@ -335,7 +335,7 @@ def run_prompt(request):
         if os.environ.get("FAKE_OMP_ERROR_STATUS"):
             error["httpStatus"] = int(os.environ["FAKE_OMP_ERROR_STATUS"])
         emit({"type": "prompt_result", "id": request.get("id"), "agentInvoked": True,
-              "status": "error", "error": error, "sessionSettled": True})
+              "status": "error", "error": error, "sessionSettled": not unsettled})
         return
     emit({"type": "prompt_result", "id": request.get("id"), "agentInvoked": True,
           "status": "completed", "sessionSettled": not unsettled})
