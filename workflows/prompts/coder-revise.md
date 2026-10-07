@@ -66,10 +66,11 @@ changing anything.
 
 ## The human's review
 
-Current on the `awaiting_human_review` path. It holds the PR comments from
-accounts with write access, newer than your last commit, oldest first.
-When the review came from the PR, its first line is the verdict token; a
-review sent through choco has no verdict line. On the `escalate_to_human` path it is
+Current on the `awaiting_human_review` path. When the review came from the
+PR, it holds the PR comments from accounts with write access, newer than
+your last commit, oldest first, and its first line is the verdict token. A
+review sent through choco is the person's reply as written, with no verdict
+line. On the `escalate_to_human` path it is
 context: when the escalation came from the review loop guard, it is the
 review that tripped it. On any other path it is from an earlier lap and
 already handled on this branch (each item done or declined with a reason):

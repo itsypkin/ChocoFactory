@@ -1829,6 +1829,22 @@ fn a_task_that_is_not_waiting_has_no_waiting_for_row() {
 }
 
 #[test]
+fn an_open_task_the_daemon_does_not_report_waiting_has_no_waiting_for_row() {
+    let mut app = new_app(Scope::AllProjects);
+    let t = summary(
+        "6f6f6f6f-aaaa",
+        "Not a gate here",
+        "open",
+        Some("awaiting_human_review"),
+        Some(6),
+        "p-alpha",
+    );
+    load(&mut app, vec![], vec![t]);
+    open_detail(&mut app, "6f6f6f6f-aaaa");
+    assert!(!render(&app, 100, 30).contains("Waiting for"));
+}
+
+#[test]
 fn a_stuck_task_shows_the_reason_wrapped_in_the_error_style() {
     let mut app = board();
     app.color = true;
