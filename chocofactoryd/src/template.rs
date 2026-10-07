@@ -92,8 +92,11 @@ pub enum TemplateError {
         placeholder: String,
         root: String,
     },
-    /// No capture is stored for that stage — it hasn't run yet, or it
-    /// declares no `capture:` at all.
+    /// No capture is stored for that stage. The loader guarantees the stage
+    /// declares a `capture:`, so this means it hasn't finished a run yet
+    /// (`render` reports that as `UnresolvedKind::StageNotRunYet`), or it
+    /// finished without storing a capture (a shell command that failed to
+    /// spawn, a poll's error or timeout, a capture over the size limit).
     UnresolvedStage {
         placeholder: String,
         stage: String,
@@ -214,10 +217,34 @@ pub fn references(input: &str) -> Result<Vec<TemplateRef>, TemplateError> {
         .collect())
 }
 
+/// Top-level payload key listing the stages that have finished a run, in
+/// first-finish order. Engine-owned (`advance_from_stage` writes it);
+/// templates cannot reference it.
+pub const FINISHED_STAGES: &str = "finished_stages";
+
+/// Why a placeholder fell back to an empty string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedKind {
+    /// A stage with no stored capture that has not finished a run in this
+    /// task: it simply hasn't produced anything yet, which is normal.
+    StageNotRunYet,
+    /// Every other missing value: a stage that finished without storing a
+    /// capture, a field the capture lacks, a missing `task`/`arrival`
+    /// field, or a value that is not a scalar.
+    Missing,
+}
+
+/// A placeholder that rendered as `""`, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unresolved {
+    pub placeholder: String,
+    pub kind: UnresolvedKind,
+}
+
 /// Substitutes every reference in `input` against a task's
 /// `workflow_state.payload`, returning the rendered text alongside every
-/// placeholder that had to fall back to an empty string (#60) — empty when
-/// nothing did.
+/// placeholder that had to fall back to an empty string (#60), each tagged
+/// with an `UnresolvedKind` — empty when nothing did.
 ///
 /// Broken *syntax* (`Malformed`/`UnknownNamespace`) still aborts the whole
 /// render: there's no sensible way to substitute nonsense, and the loader
@@ -230,8 +257,10 @@ pub fn references(input: &str) -> Result<Vec<TemplateRef>, TemplateError> {
 /// the field, so treating that as fatal would kill a task for a condition
 /// nothing earlier could have caught. It substitutes as `""` instead, and
 /// the caller decides how to surface `unresolved` (a note on the task's
-/// event timeline, today — see `engine::record_unresolved_template_note`).
-pub fn render(input: &str, payload: &Value) -> Result<(String, Vec<String>), TemplateError> {
+/// event timeline, today — see `engine::record_unresolved_template_note`,
+/// which leaves out `StageNotRunYet`: a stage not listed in the payload's
+/// `finished_stages` is merely not run yet).
+pub fn render(input: &str, payload: &Value) -> Result<(String, Vec<Unresolved>), TemplateError> {
     // Much the commonest case — most commands and prompts have no
     // placeholders at all — and it keeps the parse off the hot path.
     if !input.contains(OPEN) {
@@ -245,12 +274,32 @@ pub fn render(input: &str, payload: &Value) -> Result<(String, Vec<String>), Tem
             Segment::Literal(text) => rendered.push_str(&text),
             Segment::Reference(reference) => match resolve(&reference, payload) {
                 Ok(text) => rendered.push_str(&text),
-                Err(err) if err.is_missing_value() => unresolved.push(reference.placeholder),
+                Err(err) if err.is_missing_value() => {
+                    let kind = match &err {
+                        TemplateError::UnresolvedStage { stage, .. }
+                            if !stage_finished(payload, stage) =>
+                        {
+                            UnresolvedKind::StageNotRunYet
+                        }
+                        _ => UnresolvedKind::Missing,
+                    };
+                    unresolved.push(Unresolved {
+                        placeholder: reference.placeholder,
+                        kind,
+                    });
+                }
                 Err(err) => return Err(err),
             },
         }
     }
     Ok((rendered, unresolved))
+}
+
+fn stage_finished(payload: &Value, stage: &str) -> bool {
+    payload
+        .get(FINISHED_STAGES)
+        .and_then(Value::as_array)
+        .is_some_and(|done| done.iter().any(|s| s.as_str() == Some(stage)))
 }
 
 fn parse(input: &str) -> Result<Vec<Segment>, TemplateError> {
@@ -446,6 +495,41 @@ mod tests {
         render(input, payload).unwrap().0
     }
 
+    fn placeholders(unresolved: &[Unresolved]) -> Vec<&str> {
+        unresolved.iter().map(|u| u.placeholder.as_str()).collect()
+    }
+
+    #[test]
+    fn unresolved_references_report_their_kind() {
+        let mut p = payload();
+        // Never run: hidden kind, text still empty.
+        let (text, un) = render("{{ stages.later.x }}", &p).unwrap();
+        assert_eq!(text, "");
+        assert_eq!(
+            un,
+            vec![Unresolved {
+                placeholder: "{{ stages.later.x }}".into(),
+                kind: UnresolvedKind::StageNotRunYet
+            }]
+        );
+        // The same stage, listed as finished: a real miss.
+        p["finished_stages"] = json!(["later"]);
+        let (text, un) = render("{{ stages.later.x }}", &p).unwrap();
+        assert_eq!(text, "");
+        assert_eq!(un[0].kind, UnresolvedKind::Missing);
+        // Other misses are always Missing, even for a stage not listed.
+        for input in [
+            "{{ stages.review.nope }}",
+            "{{ task.input }}",
+            "{{ stages.empty.value }}",
+        ] {
+            let (text, un) = render(input, &payload()).unwrap();
+            assert_eq!(text, "", "{input}");
+            assert_eq!(un.len(), 1, "{input}");
+            assert_eq!(un[0].kind, UnresolvedKind::Missing, "{input}");
+        }
+    }
+
     #[test]
     fn renders_a_single_field() {
         let rendered = render_text("gh pr checks {{ stages.open_pr.number }}", &payload());
@@ -495,10 +579,10 @@ mod tests {
         // placeholder text is sliced out of the input to quote back.
         let (rendered, unresolved) = render("🚀 {{ stages.review.née }}", &payload).unwrap();
         assert_eq!(rendered, "🚀 ");
-        assert_eq!(unresolved, vec!["{{ stages.review.née }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ stages.review.née }}"]);
         let (rendered, unresolved) = render("🚀 {{ stages.☕.x }}", &payload).unwrap();
         assert_eq!(rendered, "🚀 ");
-        assert_eq!(unresolved, vec!["{{ stages.☕.x }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ stages.☕.x }}"]);
         // Malformed syntax stays a hard error regardless.
         assert!(render("🚀 {{ stages.review", &payload).is_err());
         assert!(render("🚀 {{ 見.x }}", &payload).is_err());
@@ -593,7 +677,7 @@ mod tests {
     fn an_unknown_task_field_renders_empty_and_is_noted() {
         let (rendered, unresolved) = render("{{ task.id }}", &task_payload()).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ task.id }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ task.id }}"]);
     }
 
     #[test]
@@ -601,21 +685,24 @@ mod tests {
         // e.g. a row from before `start_task` started seeding `payload.task`.
         let (rendered, unresolved) = render("{{ task.input }}", &json!({})).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ task.input }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ task.input }}"]);
     }
 
     #[test]
     fn a_bare_task_reference_renders_empty() {
         let (rendered, unresolved) = render("{{ task }}", &task_payload()).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ task }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ task }}"]);
     }
 
     #[test]
     fn a_stage_that_has_captured_nothing_renders_empty() {
         let (rendered, unresolved) = render("{{ stages.never_ran.url }}", &payload()).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ stages.never_ran.url }}"]);
+        assert_eq!(
+            placeholders(&unresolved),
+            vec!["{{ stages.never_ran.url }}"]
+        );
     }
 
     #[test]
@@ -623,28 +710,31 @@ mod tests {
         let (rendered, unresolved) =
             render("{{ stages.review.detail.missing }}", &payload()).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ stages.review.detail.missing }}"]);
+        assert_eq!(
+            placeholders(&unresolved),
+            vec!["{{ stages.review.detail.missing }}"]
+        );
     }
 
     #[test]
     fn indexing_into_a_text_capture_renders_empty_rather_than_a_panic() {
         let (rendered, unresolved) = render("{{ stages.checks.state }}", &payload()).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ stages.checks.state }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ stages.checks.state }}"]);
     }
 
     #[test]
     fn an_object_renders_empty() {
         let (rendered, unresolved) = render("{{ stages.open_pr }}", &payload()).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ stages.open_pr }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ stages.open_pr }}"]);
     }
 
     #[test]
     fn a_null_capture_renders_empty() {
         let (rendered, unresolved) = render("{{ stages.empty.value }}", &payload()).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ stages.empty.value }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ stages.empty.value }}"]);
     }
 
     #[test]
@@ -655,7 +745,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rendered, "pr 42 status= done");
-        assert_eq!(unresolved, vec!["{{ stages.open_pr.missing }}"]);
+        assert_eq!(
+            placeholders(&unresolved),
+            vec!["{{ stages.open_pr.missing }}"]
+        );
     }
 
     #[test]
@@ -725,7 +818,7 @@ mod tests {
     fn a_missing_arrival_key_renders_empty_and_is_noted() {
         let (rendered, unresolved) = render("{{ arrival.from }}", &json!({})).unwrap();
         assert_eq!(rendered, "");
-        assert_eq!(unresolved, vec!["{{ arrival.from }}"]);
+        assert_eq!(placeholders(&unresolved), vec!["{{ arrival.from }}"]);
     }
 
     /// The empty string is a legitimate *value* (a task's entry stage,

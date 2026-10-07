@@ -19,7 +19,7 @@ pub(super) fn render_command(
     command: &ShellCommand,
     payload: &Value,
     stage_name: &str,
-) -> Result<(ShellCommand, Vec<String>), EngineError> {
+) -> Result<(ShellCommand, Vec<template::Unresolved>), EngineError> {
     match command {
         ShellCommand::Inline(line) => {
             let (rendered, unresolved) =
@@ -40,7 +40,7 @@ pub(super) const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
 
 pub(super) struct RenderedEnv {
     pub(super) pairs: Vec<(String, String)>,
-    pub(super) unresolved: Vec<String>,
+    pub(super) unresolved: Vec<template::Unresolved>,
     pub(super) truncated: Vec<String>,
 }
 
@@ -127,7 +127,14 @@ impl WorkflowEngine {
         stage_name: &str,
         env: &IndexMap<String, String>,
         payload: &Value,
-    ) -> Result<(Vec<(String, String)>, Vec<String>, Vec<String>), EngineError> {
+    ) -> Result<
+        (
+            Vec<(String, String)>,
+            Vec<template::Unresolved>,
+            Vec<String>,
+        ),
+        EngineError,
+    > {
         let rendered = render_env(env, payload, stage_name)?;
         let mut pairs = rendered.pairs;
         pairs.extend(self.engine_env(task_id, definition, stage_name).await?);
@@ -211,20 +218,40 @@ impl WorkflowEngine {
         }
     }
 
-    /// Records every placeholder a stage's template fell back to an empty
+    /// Records the placeholders a stage's template fell back to an empty
     /// string for (#60), best-effort — logged loudly on failure, never
     /// propagated, same pattern as every other event append in this file.
-    /// No-op when nothing was unresolved, so a caller can call this
-    /// unconditionally after every render. Task-scoped (`append_for_task`,
-    /// no `session_id`): a template renders before any turn/session
-    /// exists, whether it's an `agent_turn`'s prompt or a `shell`/`poll`
-    /// stage's `command:`.
+    /// A stage that hasn't finished a run yet (`StageNotRunYet`) is normal
+    /// (a first review has no earlier review), so it is only logged at
+    /// debug level; every other miss is recorded as one `template_unresolved`
+    /// event, in render order. No-op when nothing was recorded, so a caller
+    /// can call this unconditionally after every render. Task-scoped
+    /// (`append_for_task`, no `session_id`): a template renders before any
+    /// turn/session exists, whether it's an `agent_turn`'s prompt or a
+    /// `shell`/`poll` stage's `command:`.
     pub(super) async fn record_unresolved_template_note(
         &self,
         task_id: &str,
         stage_name: &str,
-        placeholders: &[String],
+        unresolved: &[template::Unresolved],
     ) {
+        let placeholders_of = |wanted: template::UnresolvedKind| -> Vec<&str> {
+            unresolved
+                .iter()
+                .filter(|u| u.kind == wanted)
+                .map(|u| u.placeholder.as_str())
+                .collect()
+        };
+        let not_run_yet = placeholders_of(template::UnresolvedKind::StageNotRunYet);
+        if !not_run_yet.is_empty() {
+            tracing::debug!(
+                task_id,
+                stage = stage_name,
+                placeholders = ?not_run_yet,
+                "stage template referenced a stage that hasn't run yet; rendered as empty"
+            );
+        }
+        let placeholders = placeholders_of(template::UnresolvedKind::Missing);
         if placeholders.is_empty() {
             return;
         }
@@ -232,7 +259,7 @@ impl WorkflowEngine {
             task_id,
             stage = stage_name,
             ?placeholders,
-            "stage template referenced a value that isn't there yet; rendered as empty"
+            "stage template referenced a value that isn't there; rendered as empty"
         );
         match events::append_for_task(
             &self.pool,

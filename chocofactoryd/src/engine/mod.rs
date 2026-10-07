@@ -265,11 +265,12 @@ pub enum EngineError {
     /// `command:`/`prompt_file` with genuinely malformed syntax (P2-3,
     /// §5.1) — an unterminated placeholder, whitespace in the path, an
     /// unrecognized root. A *missing value* — a field the referenced
-    /// stage's capture didn't actually carry, or a stage that hasn't
-    /// captured anything yet — is not this: `template::render`/
+    /// stage's capture didn't actually carry, or a stage that finished
+    /// without storing a capture — is not this: `template::render`/
     /// `render_command` substitute an empty string for that instead and
     /// report it via `record_unresolved_template_note` (#60), since there's
-    /// no way for the loader to have caught it ahead of time. Malformed
+    /// no way for the loader to have caught it ahead of time. (A stage that
+    /// simply hasn't run yet is substituted the same way but only logged.) Malformed
     /// syntax specifically *is* caught at load time
     /// (`WorkflowDefinition::validate`), so reaching this variant at all
     /// means a hand-built definition bypassed that check — `roles`/`stages`
@@ -2799,6 +2800,10 @@ impl WorkflowEngine {
                 // Written into this same payload/update so it commits
                 // atomically with `current_stage` — no second write.
                 set_arrival(&mut payload, &from_stage, outcome);
+                // Marks `from_stage` as having finished a run, in the same
+                // payload/update, so a later template can tell "never ran"
+                // from "ran but stored no capture".
+                mark_stage_finished(&mut payload, &from_stage);
                 // Stamps (or clears) the poll window for `next_stage`, in
                 // this same payload so the deadline commits in the one
                 // UPDATE that moves `current_stage` (#52).
@@ -3191,6 +3196,33 @@ fn set_arrival(payload: &mut Value, from_stage: &str, outcome: &str) {
             "arrival".to_string(),
             json!({ "from": from_stage, "outcome": outcome }),
         );
+}
+
+/// Adds `stage` to the engine-owned `payload.finished_stages` array, which
+/// lists every stage that has finished a run (left through
+/// `advance_from_stage`, whatever the outcome) once each, in first-finish
+/// order. `template::render` uses it to tell a stage that hasn't run yet
+/// (normal, not worth a `template_unresolved` event) from one that ran and
+/// stored no capture (a real mismatch). Retry and the restart sweep
+/// re-enter a stage without finishing it, so they never add to it.
+fn mark_stage_finished(payload: &mut Value, stage: &str) {
+    if !payload.is_object() {
+        *payload = json!({});
+    }
+    let list = payload
+        .as_object_mut()
+        .expect("payload was just ensured to be an object")
+        .entry(template::FINISHED_STAGES)
+        .or_insert_with(|| json!([]));
+    if !list.is_array() {
+        *list = json!([]);
+    }
+    let list = list
+        .as_array_mut()
+        .expect("finished_stages was just ensured to be an array");
+    if !list.iter().any(|s| s.as_str() == Some(stage)) {
+        list.push(json!(stage));
+    }
 }
 
 /// Increments the guarded stage's transition count and rewrites its whole

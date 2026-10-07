@@ -401,7 +401,8 @@ pub enum EventType {
     /// A `{{ stages.… }}`/`{{ task.… }}` placeholder in a stage's
     /// `command:`/`prompt_file` named a value that doesn't exist — a field
     /// the referenced stage's capture didn't carry this run, or a stage
-    /// that hasn't captured anything yet (#60). Rendered as an empty
+    /// that finished without storing a capture (#60). A stage that simply
+    /// hasn't finished a run yet is not recorded here. Rendered as an empty
     /// string rather than failing the stage — the loader can only check
     /// that the reference *parses* and names a capturing stage; whether a
     /// captured JSON payload actually carries the field is a run-time

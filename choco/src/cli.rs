@@ -337,8 +337,9 @@ pub enum TaskCmd {
         /// Maximum events to return. The daemon caps this at 500.
         #[arg(long)]
         limit: Option<usize>,
-        /// Opaque `next_token` from a previous page, to continue from there.
-        #[arg(long)]
+        /// Continue from a previous page: pass the `next_token` field of
+        /// `--json` output, or the token in the "More events available" hint.
+        #[arg(long, value_name = "NEXT_TOKEN")]
         after: Option<String>,
     },
 }
@@ -465,6 +466,17 @@ pub enum ProjectCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_help_says_after_takes_next_token() {
+        let err = Cli::try_parse_from(["choco", "task", "events", "--help"])
+            .err()
+            .expect("--help is reported as an error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = err.to_string();
+        assert!(text.contains("--after <NEXT_TOKEN>"), "{text}");
+        assert!(text.contains("next_token"), "{text}");
+    }
 
     #[test]
     fn version_flags_display_version() {

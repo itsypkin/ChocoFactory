@@ -359,6 +359,64 @@ fn a_long_multibyte_title_is_shortened_on_a_character_boundary() {
     assert!(t.ends_with("… (#101)"), "{t}");
 }
 
+fn created_title(title: &str) -> String {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    let out = fx.run(title, "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let create = &fx.calls_to("pr create")[0];
+    let arg = create
+        .args
+        .iter()
+        .find_map(|a| a.strip_prefix(b"--title="))
+        .unwrap();
+    std::str::from_utf8(arg).expect("valid UTF-8").to_string()
+}
+
+#[test]
+fn a_long_title_cut_mid_word_ends_at_the_previous_whole_word() {
+    // Budget is 100 - 3 - 7 = 90 bytes; the 90th byte falls inside "bbbbbbbbbb".
+    let title = format!("{} {} tail (#101)", "a".repeat(80), "b".repeat(30));
+    let t = created_title(&title);
+    assert_eq!(t, format!("{}… (#101)", "a".repeat(80)));
+    assert!(t.len() <= 100);
+}
+
+#[test]
+fn a_long_title_cut_exactly_on_a_space_keeps_the_last_word() {
+    // 89 bytes of words, then a space as the 90th byte... the cut keeps the
+    // whole word before it and REST starts at the space.
+    let word = "a".repeat(84);
+    let title = format!("{word} bbbbb {} (#101)", "c".repeat(30));
+    let t = created_title(&title);
+    assert_eq!(t, format!("{word} bbbbb… (#101)"));
+}
+
+#[test]
+fn a_long_title_of_one_unbroken_word_is_cut_at_the_byte_budget() {
+    let t = created_title(&format!("{} (#101)", "x".repeat(150)));
+    assert_eq!(t, format!("{}… (#101)", "x".repeat(90)));
+    assert_eq!(t.len(), 100);
+}
+
+#[test]
+fn a_long_title_with_multibyte_words_is_cut_at_a_whole_word() {
+    let title = format!("{} {} (#101)", "é".repeat(40), "é".repeat(40)); // 80 + 1 + 80 bytes
+    let t = created_title(&title);
+    assert!(t.len() <= 100, "{} bytes", t.len());
+    assert_eq!(t, format!("{}… (#101)", "é".repeat(40)));
+}
+
+#[test]
+fn a_title_of_exactly_100_bytes_is_unchanged_and_a_long_one_without_a_number_gets_no_suffix() {
+    let exact = format!("{} b", "a".repeat(98));
+    assert_eq!(exact.len(), 100);
+    assert_eq!(created_title(&exact), exact);
+
+    let t = created_title(&format!("{} {}", "a".repeat(60), "b".repeat(60)));
+    assert_eq!(t, format!("{}…", "a".repeat(60)));
+}
+
 #[test]
 fn a_missing_or_blank_description_is_noted_not_fatal() {
     for blank in [None, Some("  \n\t\n")] {

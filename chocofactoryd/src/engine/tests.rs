@@ -542,6 +542,7 @@ stages:
     assert_eq!(before.current_stage, "revising");
     let expected_arrival = json!({ "from": "checks_polling", "outcome": "red" });
     assert_eq!(before.payload["arrival"], expected_arrival);
+    assert_eq!(before.payload["finished_stages"], json!(["checks_polling"]));
 
     // The marker is still missing, so the retried command fails again
     // and the task lands back on `stuck` without ever going through
@@ -552,6 +553,11 @@ stages:
     let after = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
     assert_eq!(after.current_stage, "revising");
     assert_eq!(after.payload["arrival"], expected_arrival);
+    assert_eq!(
+        after.payload["finished_stages"],
+        json!(["checks_polling"]),
+        "a retry re-enters the stage without finishing it"
+    );
 }
 
 /// #112, design point 1: a `loop_guard` reroute still records the
@@ -2037,6 +2043,7 @@ async fn a_stage_without_capture_writes_no_payload() {
         json!({
             "task": {"input": null, "title": "T"},
             "arrival": {"from": "run", "outcome": "done"},
+            "finished_stages": ["run"],
         })
     );
 }
@@ -2398,6 +2405,7 @@ async fn an_outcome_for_a_stage_the_task_has_left_is_discarded() {
         json!({
             "task": {"input": null, "title": "T"},
             "arrival": {"from": "run", "outcome": "done"},
+            "finished_stages": ["run"],
         })
     );
 }
@@ -4914,12 +4922,13 @@ stages:
     wait_until_events_contain(&pool, &run.id, "echo:fix pr 42").await;
 }
 
-/// #60's own motivating case: the same coder prompt is entered both
-/// before and after a review exists, referencing a reviewer's feedback
-/// that hasn't been captured yet on this — the first — pass. Before
-/// #60 this killed the task with `workflow_state.current_stage`
-/// permanently stuck at `coding`; now the turn runs with the
-/// placeholder blanked, and a note on the timeline says which one.
+/// #60's own motivating case: a coder prompt references a reviewer's
+/// feedback, but the review's capture is a plain text with no `feedback`
+/// field. Before #60 this killed the task with
+/// `workflow_state.current_stage` permanently stuck at `coding`; now the
+/// turn runs with the placeholder blanked, and a note on the timeline says
+/// which one. (A stage that hasn't run yet is not noted at all; this is the
+/// field-miss path, through an agent turn's prompt.)
 #[tokio::test]
 async fn an_unresolved_prompt_placeholder_renders_empty_and_the_turn_still_runs() {
     let pool = connect_in_memory().await.unwrap();
@@ -4951,8 +4960,19 @@ stages:
     let task_id = seed_task(&pool, &def.name).await;
     let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
 
-    engine.start_task(&task_id, &def, None).await.unwrap();
-    wait_until_stage(&pool, &task_id, "coding").await;
+    let state = workflow_state::create(
+        &pool,
+        &task_id,
+        "coding",
+        "agent_turn",
+        json!({ "stages": { "internal_review": "looks fine" } }),
+    )
+    .await
+    .unwrap();
+    engine
+        .enter_stage(&task_id, &def, "coding", None, None, &state.payload, None)
+        .await
+        .unwrap();
 
     // The turn ran at all — with the missing feedback blanked, not a
     // stuck task and a dead subprocess.
@@ -4972,6 +4992,52 @@ stages:
         json!(["{{ stages.internal_review.feedback }}"])
     );
     assert_eq!(note.session_id, None);
+}
+
+/// A prompt that references a stage that hasn't run yet renders empty and
+/// records no `template_unresolved` event, on the agent-turn path too.
+#[tokio::test]
+async fn a_prompt_naming_a_stage_that_has_not_run_records_no_note() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    fs::write(
+        dir.join("coder-turn.md"),
+        "address: {{ stages.internal_review.feedback }}",
+    )
+    .unwrap();
+    let yaml = r#"
+name: templated-not-run
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: coder-turn.md
+    on: {}
+  internal_review:
+    kind: agent_turn
+    role: coder
+    capture: text
+    on: { done: coding }
+"#;
+    let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_stage(&pool, &task_id, "coding").await;
+    let runs = sessions::list_for_task(&pool, &task_id).await.unwrap();
+    let run = runs.iter().find(|r| r.stage == "coding").unwrap();
+    wait_until_events_contain(&pool, &run.id, "echo:address: ").await;
+    assert!(
+        events::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|e| e.event_type != EventType::TemplateUnresolved)
+    );
 }
 
 /// P2-7a: this is the gap the issue closes — a `prompt_file` entry
@@ -5399,6 +5465,7 @@ stages:
         json!({
             "task": {"input": null, "title": "T"},
             "arrival": {"from": "coding", "outcome": "done"},
+            "finished_stages": ["coding"],
         })
     );
     let trail = stage_trail(&pool, &task_id).await;
@@ -5996,7 +6063,13 @@ fn render_command_substitutes_empty_for_an_unresolvable_reference() {
     let command = ShellCommand::Inline("echo {{ stages.open_pr.missing }}".to_string());
     let (rendered, unresolved) = render_command(&command, &payload, "report").unwrap();
     assert_eq!(rendered, ShellCommand::Inline("echo ".to_string()));
-    assert_eq!(unresolved, vec!["{{ stages.open_pr.missing }}"]);
+    assert_eq!(
+        unresolved,
+        vec![crate::template::Unresolved {
+            placeholder: "{{ stages.open_pr.missing }}".to_string(),
+            kind: crate::template::UnresolvedKind::Missing,
+        }]
+    );
 }
 
 /// Malformed *syntax* is unaffected by #60 — still a hard error, still
@@ -14655,4 +14728,106 @@ async fn a_memory_role_routed_to_omp_by_the_global_config_fails_the_turn_closed(
         matches!(err, RetryTaskError::Enter(EngineError::RoleRejected(_))),
         "{err:?}"
     );
+}
+
+async fn template_unresolved_events(pool: &SqlitePool, task_id: &str) -> Vec<Value> {
+    events::list_for_task(pool, task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == EventType::TemplateUnresolved)
+        .map(|e| e.payload)
+        .collect()
+}
+
+/// A reference to a later capturing stage, and a stage's own capture on its
+/// first entry, are "not run yet": rendered empty, no event.
+#[tokio::test]
+async fn references_to_stages_that_have_not_run_record_no_note() {
+    let pool = connect_in_memory().await.unwrap();
+    let yaml = r#"
+name: not-run-yet
+stages:
+  first:
+    kind: shell
+    command: "echo [{{ stages.later.x }}] [{{ stages.first }}]"
+    capture: text
+    on: { done: later }
+  later:
+    kind: shell
+    command: "printf '{\"x\": 1}'"
+    capture: json
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+    let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let engine = engine_with_adapter(pool.clone(), "unused");
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_stage(&pool, &task_id, "finished").await;
+    wait_until_task_status(&pool, &task_id, "closed").await;
+
+    let ran = wait_until_shell_event_for(&pool, &task_id, "first").await;
+    assert_eq!(ran["command"], json!("echo [] []"));
+    assert!(template_unresolved_events(&pool, &task_id).await.is_empty());
+
+    // The transitions wrote the marker once per finished stage, in order;
+    // the terminal stage never finishes.
+    let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(state.payload["finished_stages"], json!(["first", "later"]));
+}
+
+/// A capturing stage that finished without storing a capture is a real
+/// mismatch: a later reference to it is recorded.
+#[tokio::test]
+async fn a_stage_that_ran_without_a_capture_is_recorded_when_referenced() {
+    let pool = connect_in_memory().await.unwrap();
+    let yaml = r#"
+name: ran-no-capture
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+    on: { done: report }
+  report:
+    kind: shell
+    command: "echo {{ stages.gate }}"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+    let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let engine = engine_with_adapter(pool.clone(), "unused");
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_stage(&pool, &task_id, "gate").await;
+    engine.advance(&task_id, &def, "done").await.unwrap();
+    wait_until_stage(&pool, &task_id, "finished").await;
+
+    let notes = template_unresolved_events(&pool, &task_id).await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0]["stage"], json!("report"));
+    assert_eq!(notes[0]["placeholders"], json!(["{{ stages.gate }}"]));
+    let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+    assert!(
+        state.payload["finished_stages"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("gate"))
+    );
+}
+
+#[test]
+fn a_malformed_finished_stages_value_is_replaced_by_a_list() {
+    for bad in [json!("oops"), json!(7), json!({"a": 1})] {
+        let mut payload = json!({ "finished_stages": bad, "keep": 1 });
+        mark_stage_finished(&mut payload, "gate");
+        mark_stage_finished(&mut payload, "gate");
+        assert_eq!(payload["finished_stages"], json!(["gate"]));
+        assert_eq!(payload["keep"], json!(1));
+    }
+    let mut not_object = json!("scalar");
+    mark_stage_finished(&mut not_object, "gate");
+    assert_eq!(not_object["finished_stages"], json!(["gate"]));
 }
