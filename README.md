@@ -631,7 +631,9 @@ If no verdict arrives within six hours the task stops waiting and parks at
 `escalate_to_human`, where `choco task send <id> --text "<note>"` resumes it into
 `revising`. A fourth `/request-changes`, after three revise rounds, parks
 it the same way instead of looping, and resuming from there starts the
-count over.
+count over. `internal_review` parks the task there on its 4th rejection in a
+row (an approval starts its count over), and `checks_polling` does the same
+on the 4th red CI result in a row (green or a timeout starts it over).
 
 The PR body `open_pr` publishes holds the coder's description and the
 internal reviewer's report. A closing keyword followed by an issue reference

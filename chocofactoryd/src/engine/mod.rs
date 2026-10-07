@@ -18,9 +18,10 @@
 //!
 //! `loop_guard` bookkeeping (§5.3) lives entirely in `workflow_state.
 //! loop_counters`, keyed by stage name to `{ count }`: `count` is how many
-//! times that stage has been left via its guarded outcome since the task
-//! last arrived at that guard's `then:` stage (#106) — see
-//! `bump_loop_counter`/`clear_guards_escaping_to`.
+//! times in a row that stage has been left through its guarded outcome. It
+//! resets when the stage resolves any other way, or when the task arrives
+//! at the guard's `then:` stage (#106) — see
+//! `bump_loop_counter`/`reset_loop_counter`/`clear_guards_escaping_to`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -2632,12 +2633,16 @@ impl WorkflowEngine {
                 })?;
 
                 let mut loop_counters = state.loop_counters;
-                if let Some(guard) = &stage_def.loop_guard
-                    && guard.on == outcome
-                {
-                    let count = bump_loop_counter(&mut loop_counters, &from_stage);
-                    if count > u64::from(guard.max) {
-                        next_stage = guard.then.clone();
+                if let Some(guard) = &stage_def.loop_guard {
+                    if guard.on == outcome {
+                        let count = bump_loop_counter(&mut loop_counters, &from_stage);
+                        if count > u64::from(guard.max) {
+                            next_stage = guard.then.clone();
+                        }
+                    } else {
+                        // Consecutive-count rule: any other outcome starts
+                        // the count over, in this transition's single write.
+                        reset_loop_counter(&mut loop_counters, &from_stage);
                     }
                 }
                 clear_guards_escaping_to(&mut loop_counters, definition, &next_stage);
@@ -3061,12 +3066,23 @@ fn bump_loop_counter(loop_counters: &mut Value, stage: &str) -> u64 {
     count
 }
 
+/// Removes the guarded stage's `loop_counters` entry (no-op if absent; never
+/// inserts a zero entry). Called when the stage resolves with an outcome
+/// other than its guard's `on:`.
+fn reset_loop_counter(loop_counters: &mut Value, stage: &str) {
+    loop_counters
+        .as_object_mut()
+        .expect("engine always stores loop_counters as a JSON object")
+        .remove(stage);
+}
+
 /// Clears the `loop_counters` entry of every stage whose `loop_guard.then`
-/// is `next_stage` — the §5.3 reset rule (#106): a guard's count starts
-/// over exactly when the task arrives at that guard's `then:` stage,
-/// whichever way it got there (the guard's own reroute, or any other
-/// route: a failed command, a timeout, another guard tripping). Nothing
-/// else resets a count.
+/// is `next_stage` (#106): a guard's count starts over when the task
+/// arrives at that guard's `then:` stage, whichever way it got there (the
+/// guard's own reroute, or any other route: a failed command, a timeout,
+/// another guard tripping). This is one of two resets; the other is the
+/// guarded stage resolving with an outcome other than `on:`, in
+/// `advance_from_stage` (see `reset_loop_counter`).
 fn clear_guards_escaping_to(
     loop_counters: &mut Value,
     definition: &WorkflowDefinition,

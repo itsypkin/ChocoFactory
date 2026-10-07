@@ -23,9 +23,10 @@ Every way back goes through `revising`, which returns to `internal_review`:
 `internal_review` requests changes, `checks_polling` sees a failed check, you
 post `/request-changes`, or someone resumes the task from `escalate_to_human`.
 
-A task parks at `escalate_to_human` after a 4th rejection by
-`internal_review` or a 4th by you (counted separately), after 6 hours with no
-verdict from you, or when `open_pr` fails.
+A task parks at `escalate_to_human` after a 4th rejection in a row by
+`internal_review`, a 4th red CI result in a row from `checks_polling`, a 4th
+`/request-changes` from you since the last escalation (each counted
+separately), after 6 hours with no verdict from you, or when `open_pr` fails.
 
 Copy this checklist and tick it off:
 
@@ -261,11 +262,11 @@ refused, and nothing is posted to the PR.
 **Batch your findings into one `/request-changes`.** Each one costs a coder
 lap and a review lap. Prefer approve-and-file-a-follow-up for minor points.
 
-**Count the internal rejections before you vote.** Your vote doesn't reset
-`internal_review`'s count. A task that reached you after 3 internal
-rejections escalates on the very next one. Count the
-`internal_review --[changes_requested]-->` lines in `choco task status` since
-the last escalation; the counter itself isn't shown.
+**Your vote isn't charged against earlier internal rejections.**
+`internal_review`'s count starts over every time it approves, and a task only
+reaches you after an approval. What does accumulate is your own votes: the 4th
+since the last escalation parks the task. `choco task status` shows the
+current counts on its `Loop counters` line.
 
 **The coder often ignores your `/request-changes` comment** and works from
 the internal reviewer's earlier summary instead. After each lap, check that

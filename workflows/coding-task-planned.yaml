@@ -123,6 +123,12 @@ stages:
       green: awaiting_human_review
       red: revising
       timeout: awaiting_human_review
+    # CI that keeps failing while `internal_review` keeps approving would
+    # otherwise loop forever, one paid coder lap and one paid reviewer lap
+    # per round. The guard parks the task at `escalate_to_human` on the 4th
+    # red in a row. A green result or a timeout resets the count, and both
+    # go to `awaiting_human_review`, where a human has to act.
+    loop_guard: { on: red, max: 3, then: escalate_to_human }
 
   # Same as `coding-task.yaml`'s `awaiting_human_review`.
   awaiting_human_review:

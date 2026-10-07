@@ -763,6 +763,17 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             .unwrap();
         assert_eq!(def.name, "coding-task");
         assert!(def.worktree);
+        for (stage, on, max) in [
+            ("internal_review", "changes_requested", 3),
+            ("checks_polling", "red", 3),
+        ] {
+            let guard = def.stages[stage].loop_guard.as_ref().expect("loop guard");
+            assert_eq!(
+                (guard.on.as_str(), guard.max, guard.then.as_str()),
+                (on, max, "escalate_to_human"),
+                "{stage}"
+            );
+        }
 
         use crate::workflow_def::{Capture, ShellCommand, StageKind};
         let stage = &def.stages["awaiting_human_review"];
@@ -1513,6 +1524,17 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         let def = load_seeded(&dir, "coding-task-planned.yaml");
         assert_eq!(def.name, "coding-task-planned");
         assert!(def.worktree);
+        for (stage, on, max) in [
+            ("internal_review", "changes_requested", 3),
+            ("checks_polling", "red", 3),
+        ] {
+            let guard = def.stages[stage].loop_guard.as_ref().expect("loop guard");
+            assert_eq!(
+                (guard.on.as_str(), guard.max, guard.then.as_str()),
+                (on, max, "escalate_to_human"),
+                "{stage}"
+            );
+        }
         assert_eq!(def.start_stage(), "spec_check");
         assert_eq!(
             def.roles["planner"].model.as_deref(),

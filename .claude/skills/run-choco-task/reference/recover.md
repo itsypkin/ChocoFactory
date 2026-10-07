@@ -60,8 +60,9 @@ earlier summary instead of your comment. Work in this order:
    undone**, post a second `/request-changes`, or run `choco task send <id>`
    with text that lists the items in full and ends with a `/request-changes`
    line. That is the default: one more
-   lap, with the reviewer backing it up again. A 4th vote from you
-   escalates.
+   lap, with the reviewer backing it up again. The internal reviewer has
+   three rejections available after each of your votes; your own 4th vote
+   since the last escalation escalates.
 
 The other options cost more:
 

@@ -28,9 +28,9 @@ Read this while watching a task, when its behaviour surprises you.
   with the change left in place for you to inspect (same coverage and gaps
   as `spec_check`: not ignored paths, not anything inside `.git`). It routes the task on
   its own verdict. Its
-  loop guard counts every rejection: the 4th sends the task to
-  `escalate_to_human`, and only escalating starts the count over. Your
-  `/request-changes` doesn't reset it. It re-reads the PR's comments, so it
+  loop guard counts rejections in a row: the 4th in a row sends the task to
+  `escalate_to_human`. An approval or escalating starts the count over, so
+  your `/request-changes` always gets a fresh internal budget. It re-reads the PR's comments, so it
   can pick up review items the coder ignored.
 - **open_pr.** Pushes the branch `task/<task-id>` and opens or refreshes the
   PR. The title comes from the task title; the body is the coder's own
@@ -42,7 +42,8 @@ Read this while watching a task, when its behaviour surprises you.
   skill catch both.
 - **checks_polling.** Polls for 5 minutes. It goes green only if every check
   reports `SUCCESS`, and red on a `FAILURE` or `ERROR` state (that starts a
-  paid `revising` lap). Everything else times out into
+  paid `revising` lap; the 4th red in a row parks the task at
+  `escalate_to_human`). Everything else times out into
   `awaiting_human_review` exactly as if CI had passed: no checks at all,
   skipped, cancelled or timed-out checks, and slow CI.
 - **awaiting_human_review.** A human gate that watches the PR's comments
@@ -51,6 +52,7 @@ Read this while watching a task, when its behaviour surprises you.
   `/request-changes` on a line of its own; a reply with neither or both is
   refused. A merged PR counts as approval and moves the task to `done`; a PR
   closed without merging does not.
-- **escalate_to_human.** Arriving here starts both rejection counts over.
+- **escalate_to_human.** Arriving here starts all three loop counts over (internal rejections, red CI
+  results, your votes).
   It waits for `choco task send <id> --text "<note>"`, which moves the task
   into `revising`.

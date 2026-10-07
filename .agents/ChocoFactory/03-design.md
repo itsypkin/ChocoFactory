@@ -368,6 +368,7 @@ stages:
       green: awaiting_human_review
       red: coding
       timeout: awaiting_human_review
+    loop_guard: { on: red, max: 3, then: escalate_to_human }
 
   awaiting_human_review:
     kind: poll
@@ -647,12 +648,16 @@ is intentional (§7).
 through outcome `on` up to `max` times; the next time it would, the task goes to `then` instead.
 So `max: 3` allows three laps, and the fourth `on` outcome reroutes.
 
-A guard's count starts over in exactly one situation: when the task arrives at that guard's
-`then:` stage, whichever way it got there. That covers the guard tripping (its reroute lands on
-`then:`), and it covers a task reaching the same escalation stage for another reason — a failed
-command, a timeout, another guard — so a human resuming a task from its escalation point always
-hands it a full budget. Nothing else resets a count: not which stage the guarded stage was
-entered from, not the task leaving the loop and coming back through it later, and not a retry,
+A guard counts consecutive `on` outcomes. Its count starts over in two situations:
+
+- The guarded stage resolves with any other outcome. The count is removed in the same update as
+  that transition, so the next `on` outcome counts as the first.
+- The task arrives at the guard's `then:` stage, whichever way it got there. That covers the guard
+  tripping (its reroute lands on `then:`), and it covers a task reaching the same escalation stage
+  for another reason — a failed command, a timeout, another guard — so a human resuming a task from
+  its escalation point always hands it a full budget.
+
+Nothing else resets a count: not which stage the guarded stage was entered from, and not a retry,
 which re-runs the current stage without taking an `on:` transition.
 
 Counts live in `workflow_state.loop_counters`, keyed by the guarded stage, and are written in the
