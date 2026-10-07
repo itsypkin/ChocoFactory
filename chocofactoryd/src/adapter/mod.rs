@@ -529,6 +529,36 @@ pub fn check_task_config_clis(config: &Value, registry: &Registry) -> Result<(),
     Ok(())
 }
 
+/// Asks each role's adapter whether it can run the role, for every string
+/// `roles.<name>.cli` in a task config whose role the workflow defines. A
+/// role the workflow doesn't define is skipped, and so is a `cli` the
+/// registry doesn't know (that is `check_task_config_clis`'s error to give).
+/// Returns the first rejection, in sorted role-name order.
+pub fn check_task_config_roles(
+    config: &Value,
+    definition: &crate::workflow_def::WorkflowDefinition,
+    registry: &Registry,
+) -> Result<(), String> {
+    let Some(roles) = config.get("roles").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut names: Vec<&String> = roles.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(cli) = roles[name].get("cli").and_then(Value::as_str) else {
+            continue;
+        };
+        let (Some(role), Ok(adapter)) = (
+            definition.roles.get(name.as_str()),
+            registry.lookup(Some(name), cli),
+        ) else {
+            continue;
+        };
+        adapter.validate_role(name, &role.isolation)?;
+    }
+    Ok(())
+}
+
 /// A live (or just-exited) agent subprocess. Streams normalized
 /// `AgentEvent`s and accepts further messages over stdin while the
 /// process is alive (§4, §4.1's active-state behavior).

@@ -185,29 +185,43 @@ stages:
         /// [`Self::start_with_adapter_binary`] that also names the `choco`
         /// binary `GET /server` reports.
         pub async fn start_with_binaries(binary: &str, choco_binary: &str) -> Self {
-            Self::start_inner(binary, choco_binary, None).await
+            Self::start_inner(binary, choco_binary, None, false).await
+        }
+
+        /// [`Self::start`] with an `omp` adapter registered too. Its binary
+        /// doesn't exist, so a test using it must never reach a turn on omp.
+        pub async fn start_with_omp() -> Self {
+            Self::start_inner("fake_claude.py", "choco", None, true).await
         }
 
         /// [`Self::start`] with the engine reading a global config file at
         /// `global_config_path`, which the test writes after boot — the
         /// same as editing the file while the daemon runs.
         pub async fn start_with_global_config(global_config_path: PathBuf) -> Self {
-            Self::start_inner("fake_claude.py", "choco", Some(global_config_path)).await
+            Self::start_inner("fake_claude.py", "choco", Some(global_config_path), false).await
         }
 
         async fn start_inner(
             binary: &str,
             choco_binary: &str,
             global_config_path: Option<PathBuf>,
+            with_omp: bool,
         ) -> Self {
             let pool = db::connect_in_memory().await.unwrap();
             let workflows_dir = TempDir::new();
             let events_notify = Arc::new(Notify::new());
             let adapter: Arc<dyn AgentAdapter> =
                 Arc::new(ClaudeAdapter::with_binary(fixture_binary(binary)));
+            let mut adapters = vec![adapter];
+            if with_omp {
+                adapters.push(Arc::new(crate::adapter::OmpAdapter::with_binary(
+                    "omp-that-is-not-installed",
+                    workflows_dir.0.join("omp-state"),
+                )));
+            }
             let session_manager = SessionManager::new(
                 pool.clone(),
-                Registry::single(adapter),
+                Registry::new(adapters),
                 chrono::Duration::hours(1),
                 Arc::clone(&events_notify),
             );

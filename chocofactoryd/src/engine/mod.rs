@@ -291,6 +291,9 @@ pub enum EngineError {
     /// The role's `cli` (or, on a resume, the session's recorded one) names
     /// no adapter in the registry. Nothing was created or spawned.
     UnknownCli(UnknownCliError),
+    /// The role's adapter can't run the role as configured (for example omp
+    /// with `memory: true`). Nothing was created or spawned.
+    RoleRejected(String),
     Session(SessionError),
     Db(sqlx::Error),
     Io(std::io::Error),
@@ -351,6 +354,7 @@ impl fmt::Display for EngineError {
                 write!(f, "stage '{stage}' has no usable poll window: {reason}")
             }
             EngineError::UnknownCli(err) => write!(f, "{err}"),
+            EngineError::RoleRejected(message) => write!(f, "{message}"),
             EngineError::Session(err) => write!(f, "{err}"),
             EngineError::Db(err) => write!(f, "{err}"),
             EngineError::Io(err) => write!(f, "{err}"),
@@ -562,7 +566,9 @@ pub(crate) fn load_workflow_file(
         if let Some(cli) = &role.cli {
             registry
                 .lookup(Some(name), cli)
-                .map_err(WorkflowDefError::UnknownCli)?;
+                .map_err(WorkflowDefError::UnknownCli)?
+                .validate_role(name, &role.isolation)
+                .map_err(WorkflowDefError::RoleRejected)?;
         }
     }
     Ok((definition, sha256))
@@ -582,10 +588,21 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
+/// Why `WorkflowEngine::check_config_patch` refused a config patch.
+#[derive(Debug)]
+pub enum ConfigPatchError {
+    /// A role's adapter can't run the role as the workflow defines it.
+    Rejected(String),
+    Db(sqlx::Error),
+}
+
 #[derive(Debug)]
 pub enum CreateTaskError {
     /// The task config's `roles.<name>.cli` names no known adapter.
     UnknownCli(UnknownCliError),
+    /// A role's adapter can't run the role as the workflow and the task
+    /// config define it. Nothing was written.
+    RoleRejected(String),
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     /// `WorkflowRef::File` was given a relative path; the daemon's working
@@ -623,6 +640,7 @@ impl fmt::Display for CreateTaskError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CreateTaskError::UnknownCli(err) => write!(f, "{err}"),
+            CreateTaskError::RoleRejected(message) => write!(f, "{message}"),
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowFileNotAbsolute(path) => write!(
@@ -1314,6 +1332,39 @@ impl WorkflowEngine {
         self.session_manager.registry()
     }
 
+    /// Checks a `PATCH` of a task's config before it is merged: every role
+    /// the patch points at a CLI is asked whether that CLI can run the role
+    /// as the task's workflow defines it. `Ok(None)` for a task that doesn't
+    /// exist (the caller answers 404). A workflow that can't be loaded skips
+    /// the check, since the turn-start check is the one that can't be
+    /// skipped and fails closed. `Err` is the adapter's own message.
+    pub async fn check_config_patch(
+        &self,
+        task_id: &str,
+        patch: &Value,
+    ) -> Result<Option<()>, ConfigPatchError> {
+        let Some(task) = tasks::get(&self.pool, task_id)
+            .await
+            .map_err(ConfigPatchError::Db)?
+        else {
+            return Ok(None);
+        };
+        match self.load_task_workflow(&task).await {
+            Ok(definition) => {
+                crate::adapter::check_task_config_roles(patch, &definition, self.registry())
+                    .map_err(ConfigPatchError::Rejected)?;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    task_id,
+                    %err,
+                    "skipping the role check on a config patch: the task's workflow didn't load"
+                );
+            }
+        }
+        Ok(Some(()))
+    }
+
     /// Sets the old global workflows folder, used only to reload pre-#88
     /// tasks that have no recorded `workflow_path`.
     pub fn with_legacy_workflows_dir(mut self: Arc<Self>, dir: PathBuf) -> Arc<Self> {
@@ -1431,6 +1482,11 @@ impl WorkflowEngine {
                 }
             }
         };
+        // The roles the task's own config points at a different CLI: each
+        // adapter has its say on the role as the workflow defines it, still
+        // before anything is written.
+        crate::adapter::check_task_config_roles(&config, &definition, self.registry())
+            .map_err(CreateTaskError::RoleRejected)?;
         let definition = Arc::new(definition);
 
         // An explicit `--repo`/`config.cwd` always wins; this only fills in

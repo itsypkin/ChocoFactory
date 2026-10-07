@@ -129,6 +129,9 @@ pub enum SessionError {
     /// The CLI named for the session isn't in the registry. Nothing was
     /// reserved, spawned or written.
     UnknownCli(UnknownCliError),
+    /// The session's adapter can't run the role as configured now. Nothing
+    /// was reserved, spawned or written.
+    RoleRejected(String),
     Adapter(AdapterError),
     Db(sqlx::Error),
 }
@@ -148,6 +151,7 @@ impl fmt::Display for SessionError {
             }
             SessionError::ShuttingDown => write!(f, "the daemon is shutting down"),
             SessionError::UnknownCli(err) => write!(f, "{err}"),
+            SessionError::RoleRejected(message) => write!(f, "{message}"),
             SessionError::Adapter(err) => write!(f, "{err}"),
             SessionError::Db(err) => write!(f, "{err}"),
         }
@@ -335,6 +339,9 @@ impl SessionManager {
             .lookup(Some(session_row.role.as_str()), &session_row.cli_adapter)
             .map_err(SessionError::UnknownCli)?
             .clone();
+        adapter
+            .validate_role(&session_row.role, &cfg.isolation)
+            .map_err(SessionError::RoleRejected)?;
 
         // Re-checked atomically here (rather than trusting the read
         // above): two concurrent calls for the same not-yet-live
@@ -3642,5 +3649,65 @@ mod tests {
         let row = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(row.status, SessionStatus::Idle);
         assert!(claude.calls().is_empty());
+    }
+
+    fn memory_role_config() -> RoleConfig {
+        RoleConfig {
+            isolation: crate::adapter::Isolation::Isolated {
+                skills: Vec::new(),
+                memory: true,
+            },
+            ..role_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_resume_on_omp_with_memory_is_refused_and_a_claude_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("choco-omp-chat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("omp-was-run");
+        let wrapper = dir.join("omp-wrapper");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pool = connect_in_memory().await.unwrap();
+        let claude = recording("claude");
+        let omp = Arc::new(crate::adapter::OmpAdapter::with_binary(
+            wrapper.to_string_lossy(),
+            dir.join("state"),
+        ));
+        let manager = SessionManager::new(
+            pool.clone(),
+            Registry::new(vec![claude.clone(), omp]),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+
+        let session_id = idle_chat_session_on(&pool, "omp").await;
+        let err = manager
+            .send_message(&session_id, "hi", &memory_role_config())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::RoleRejected(_)), "{err:?}");
+        assert!(err.to_string().contains("can't use memory: true"), "{err}");
+        assert!(!marker.exists(), "omp must not have been started");
+        assert!(!dir.join("state").exists(), "no overlay or session dir was made");
+        let row = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(row.status, SessionStatus::Idle);
+
+        // The same role on claude is fine.
+        let claude_session = idle_chat_session_on(&pool, "claude").await;
+        manager
+            .send_message(&claude_session, "hi", &memory_role_config())
+            .await
+            .unwrap();
+        assert_eq!(claude.calls().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
