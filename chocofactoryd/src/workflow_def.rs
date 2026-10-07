@@ -45,6 +45,10 @@ impl WorkflowDefinition {
             .expect("validated definitions have at least one stage")
     }
 
+    /// Parsing and validation only: whether a role's `cli:` names a known
+    /// adapter is checked by the engine's `load_workflow_file`, which has
+    /// the registry.
+    ///
     /// Reads and parses the definition file at `path`, resolving any
     /// `prompt_file`/`system_prompt_file`/`script_file` references relative
     /// to `path`'s parent directory, then validates the result.
@@ -1466,6 +1470,9 @@ pub enum WorkflowDefError {
     ReadOnlyRoleWithoutWorktree {
         role: String,
     },
+    /// A role's `cli:` names no adapter the daemon has. Raised by the
+    /// engine's `load_workflow_file`, not by `parse` (which has no registry).
+    UnknownCli(crate::adapter::UnknownCliError),
 }
 
 impl fmt::Display for WorkflowDefError {
@@ -1674,6 +1681,7 @@ impl fmt::Display for WorkflowDefError {
                 "role '{role}' is 'read_only: true' but 'disallowed_tools' doesn't list: \
                  {missing}; a read-only role must deny edit, write and notebook_edit"
             ),
+            WorkflowDefError::UnknownCli(err) => write!(f, "{err}"),
             WorkflowDefError::ReadOnlyRoleWithoutWorktree { role } => write!(
                 f,
                 "role '{role}' is 'read_only: true', which needs 'worktree: true' on the \

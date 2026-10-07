@@ -86,7 +86,7 @@ pub mod tests {
     use tokio::sync::Notify;
 
     use super::{AppState, ExeStamp, ServerInfo, router};
-    use crate::adapter::{AgentAdapter, ClaudeAdapter};
+    use crate::adapter::{AgentAdapter, ClaudeAdapter, Registry};
     use crate::db;
     use crate::engine::WorkflowEngine;
     use crate::session::SessionManager;
@@ -192,7 +192,7 @@ stages:
                 Arc::new(ClaudeAdapter::with_binary(fixture_binary(binary)));
             let session_manager = SessionManager::new(
                 pool.clone(),
-                adapter,
+                Registry::single(adapter),
                 chrono::Duration::hours(1),
                 Arc::clone(&events_notify),
             );

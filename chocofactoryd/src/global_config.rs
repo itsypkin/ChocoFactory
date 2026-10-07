@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
+use crate::adapter::{Registry, UnknownCliError};
 use crate::fileref::{self, FileRefError};
 
 /// Shape mirrors the workflow-def `roles:` block deliberately (keyed by
@@ -93,6 +94,31 @@ impl GlobalConfig {
 
         Ok(GlobalConfig { roles })
     }
+}
+
+/// Daemon-start check: every `cli:` in the global config at `path` must
+/// name an adapter in `registry`. A missing file or `None` path is fine; a
+/// file that can't be loaded logs a warning and passes, as it always has
+/// (the error still surfaces when a turn needs the config).
+pub fn check_known_clis(path: Option<&Path>, registry: &Registry) -> Result<(), UnknownCliError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let config = match GlobalConfig::load(path) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(%err, path = %path.display(), "could not load the global config; skipping its cli check");
+            return Ok(());
+        }
+    };
+    let mut roles: Vec<(&String, &GlobalRoleConfig)> = config.roles.iter().collect();
+    roles.sort_by_key(|(name, _)| *name);
+    for (name, role) in roles {
+        if let Some(cli) = &role.cli {
+            registry.lookup(Some(name), cli)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

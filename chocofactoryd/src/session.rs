@@ -10,7 +10,9 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify, mpsc};
 
-use crate::adapter::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, RoleConfig};
+use crate::adapter::{
+    AdapterError, AgentEvent, AgentHandle, Registry, RoleConfig, UnknownCliError,
+};
 use crate::db::{events, sessions, usage};
 
 /// Drives the active ⇄ idle ⇄ resume state machine (§4.1) on top of
@@ -20,7 +22,7 @@ use crate::db::{events, sessions, usage};
 /// run that isn't currently live in memory.
 pub struct SessionManager {
     pool: SqlitePool,
-    adapter: Arc<dyn AgentAdapter>,
+    registry: Registry,
     idle_timeout: chrono::Duration,
     turn_timers: TurnTimers,
     sessions: Mutex<HashMap<String, SessionSlot>>,
@@ -124,6 +126,9 @@ pub enum SessionError {
     AlreadyStarting,
     /// The daemon is shutting down and starts nothing new.
     ShuttingDown,
+    /// The CLI named for the session isn't in the registry. Nothing was
+    /// reserved, spawned or written.
+    UnknownCli(UnknownCliError),
     Adapter(AdapterError),
     Db(sqlx::Error),
 }
@@ -142,6 +147,7 @@ impl fmt::Display for SessionError {
                 write!(f, "this session is already being established")
             }
             SessionError::ShuttingDown => write!(f, "the daemon is shutting down"),
+            SessionError::UnknownCli(err) => write!(f, "{err}"),
             SessionError::Adapter(err) => write!(f, "{err}"),
             SessionError::Db(err) => write!(f, "{err}"),
         }
@@ -167,13 +173,13 @@ impl Default for IdleReaperConfig {
 impl SessionManager {
     pub fn new(
         pool: SqlitePool,
-        adapter: Arc<dyn AgentAdapter>,
+        registry: Registry,
         idle_timeout: chrono::Duration,
         events_notify: Arc<Notify>,
     ) -> Arc<Self> {
         Self::with_turn_timers(
             pool,
-            adapter,
+            registry,
             idle_timeout,
             events_notify,
             TurnTimers::default(),
@@ -184,20 +190,25 @@ impl SessionManager {
     /// nudges and the grace kill in milliseconds rather than minutes.
     pub fn with_turn_timers(
         pool: SqlitePool,
-        adapter: Arc<dyn AgentAdapter>,
+        registry: Registry,
         idle_timeout: chrono::Duration,
         events_notify: Arc<Notify>,
         turn_timers: TurnTimers,
     ) -> Arc<Self> {
         Arc::new(Self {
             pool,
-            adapter,
+            registry,
             idle_timeout,
             turn_timers,
             sessions: Mutex::new(HashMap::new()),
             events_notify,
             shutting_down: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// The adapters this manager can dispatch to.
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Starts a brand-new subprocess for `session_id` and begins
@@ -210,13 +221,19 @@ impl SessionManager {
     pub async fn start(
         self: &Arc<Self>,
         session_id: &str,
+        cli: &str,
         prompt: &str,
         cfg: &RoleConfig,
         kind: SessionKind,
     ) -> Result<(), SessionError> {
+        let adapter = self
+            .registry
+            .lookup(None, cli)
+            .map_err(SessionError::UnknownCli)?
+            .clone();
         self.reserve(session_id).await?;
 
-        let handle = match self.adapter.start(prompt, cfg) {
+        let handle = match adapter.start(prompt, cfg) {
             Ok(handle) => handle,
             Err(err) => {
                 self.sessions.lock().await.remove(session_id);
@@ -244,14 +261,20 @@ impl SessionManager {
     pub async fn resume(
         self: &Arc<Self>,
         session_id: &str,
+        cli: &str,
         adapter_session_id: &str,
         prompt: &str,
         cfg: &RoleConfig,
         kind: SessionKind,
     ) -> Result<(), SessionError> {
+        let adapter = self
+            .registry
+            .lookup(None, cli)
+            .map_err(SessionError::UnknownCli)?
+            .clone();
         self.reserve(session_id).await?;
 
-        let handle = match self.adapter.resume(adapter_session_id, prompt, cfg) {
+        let handle = match adapter.resume(adapter_session_id, prompt, cfg) {
             Ok(handle) => handle,
             Err(err) => {
                 self.sessions.lock().await.remove(session_id);
@@ -305,6 +328,14 @@ impl SessionManager {
             return Err(SessionError::NotResumable(session_row.status));
         }
 
+        // The session's own recorded CLI, never the role's current one: a
+        // session id belongs to the CLI that created it.
+        let adapter = self
+            .registry
+            .lookup(Some(session_row.role.as_str()), &session_row.cli_adapter)
+            .map_err(SessionError::UnknownCli)?
+            .clone();
+
         // Re-checked atomically here (rather than trusting the read
         // above): two concurrent calls for the same not-yet-live
         // session_id can both reach this point, but only one of them
@@ -313,7 +344,7 @@ impl SessionManager {
         // process and corrupt this map (§ review on PR #28).
         self.reserve(session_id).await?;
 
-        let handle = match self.adapter.resume(&adapter_session_id, text, cfg) {
+        let handle = match adapter.resume(&adapter_session_id, text, cfg) {
             Ok(handle) => handle,
             Err(err) => {
                 self.sessions.lock().await.remove(session_id);
@@ -1299,7 +1330,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::adapter::ClaudeAdapter;
+    use crate::adapter::{AgentAdapter, ClaudeAdapter};
     use crate::db::{connect_in_memory, events, projects, sessions, tasks};
 
     fn fixture_binary(name: &str) -> String {
@@ -1409,13 +1440,19 @@ mod tests {
         )));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
 
@@ -1434,13 +1471,19 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
 
@@ -1461,12 +1504,18 @@ mod tests {
         )));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
 
@@ -1508,13 +1557,19 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         wait_until_events_len(&pool, &session_id, 2).await;
@@ -1546,7 +1601,7 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
@@ -1574,13 +1629,19 @@ mod tests {
         // Close below is actually dequeued and re-checked.
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         wait_until_events_len(&pool, &session_id, 2).await;
@@ -1627,7 +1688,7 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
@@ -1657,7 +1718,7 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
@@ -1682,13 +1743,19 @@ mod tests {
         // Zero timeout: the reaper closes the session on its first pass.
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::zero(),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         wait_until_events_len(&pool, &session_id, 2).await;
@@ -1727,13 +1794,19 @@ mod tests {
         // Zero timeout: any session is immediately overdue.
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::zero(),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         wait_until_events_len(&pool, &session_id, 2).await;
@@ -1767,13 +1840,19 @@ mod tests {
         )));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
 
@@ -1796,7 +1875,7 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
@@ -1804,6 +1883,7 @@ mod tests {
         manager
             .start(
                 &session_id,
+                "claude",
                 "hello",
                 &single_shot_role_config(),
                 SessionKind::SingleShot,
@@ -1835,13 +1915,19 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         wait_until_events_len(&pool, &session_id, 2).await;
@@ -1951,13 +2037,19 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         wait_until_events_len(&pool, &session_id, 2).await;
@@ -1988,13 +2080,19 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "go", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "go",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
 
@@ -2037,13 +2135,14 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
         manager
             .start(
                 &session_id,
+                "claude",
                 "go",
                 &single_shot_role_config(),
                 SessionKind::SingleShot,
@@ -2082,14 +2181,16 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager.reserve(&session_id).await.unwrap();
         let handle = manager
-            .adapter
+            .registry()
+            .lookup(None, "claude")
+            .unwrap()
             .start("go", &single_shot_role_config())
             .unwrap();
         let child_pid = read_pid_when_written(&child_pid_path).await;
@@ -2117,20 +2218,27 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
         manager.shutdown(StdDuration::from_millis(100)).await;
 
         let err = manager
-            .start(&session_id, "go", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "go",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SessionError::ShuttingDown), "{err:?}");
         let err = manager
             .resume(
                 &session_id,
+                "claude",
                 "adapter-session",
                 "go",
                 &role_config(),
@@ -2160,13 +2268,19 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "go", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "go",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         read_pid_when_written(&child_pid_path).await;
@@ -2188,7 +2302,7 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
@@ -2209,7 +2323,7 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
@@ -2240,13 +2354,19 @@ mod tests {
         // Zero timeout: the reaper closes this session on its first pass.
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::zero(),
             Arc::new(Notify::new()),
         );
 
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         wait_until_events_len(&pool, &session_id, 2).await;
@@ -2294,7 +2414,7 @@ mod tests {
         )));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
@@ -2302,7 +2422,13 @@ mod tests {
         // Grab the shared pgid handle while the session is live, so it can
         // still be inspected after the map slot is gone.
         manager
-            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .start(
+                &session_id,
+                "claude",
+                "hello",
+                &role_config(),
+                SessionKind::Standing,
+            )
             .await
             .unwrap();
         let pgid = {
@@ -2370,7 +2496,7 @@ mod tests {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::with_turn_timers(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
             timers,
@@ -2378,6 +2504,7 @@ mod tests {
         manager
             .start(
                 &session_id,
+                "claude",
                 "go",
                 &single_shot_role_config(),
                 SessionKind::SingleShot,
@@ -2771,7 +2898,7 @@ mod tests {
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::hours(1),
             Arc::new(Notify::new()),
         );
@@ -2783,7 +2910,7 @@ mod tests {
             ..role_config()
         };
         manager
-            .start(&session_id, "hello", &cfg, SessionKind::Standing)
+            .start(&session_id, "claude", "hello", &cfg, SessionKind::Standing)
             .await
             .unwrap();
 
@@ -3206,7 +3333,7 @@ mod tests {
         // Zero idle timeout: the first reaper pass closes the turn.
         let manager = SessionManager::with_turn_timers(
             pool.clone(),
-            adapter,
+            Registry::single(adapter),
             chrono::Duration::zero(),
             Arc::new(Notify::new()),
             fast_timers(3),
@@ -3214,6 +3341,7 @@ mod tests {
         manager
             .start(
                 &session_id,
+                "claude",
                 "go",
                 &single_shot_role_config(),
                 SessionKind::SingleShot,

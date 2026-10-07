@@ -14,7 +14,7 @@ fn set_arrival_replaces_a_non_object_payload() {
         json!({ "arrival": { "from": "a", "outcome": "b" } })
     );
 }
-use crate::adapter::{AgentAdapter, ClaudeAdapter};
+use crate::adapter::{AgentAdapter, ClaudeAdapter, Registry};
 use crate::db::{connect_in_memory, projects, tasks};
 
 fn fixture_binary(name: &str) -> String {
@@ -48,7 +48,7 @@ fn engine_with_adapter(pool: SqlitePool, binary: &str) -> Arc<WorkflowEngine> {
     let events_notify = Arc::new(Notify::new());
     let session_manager = SessionManager::new(
         pool.clone(),
-        adapter,
+        Registry::single(adapter),
         chrono::Duration::hours(1),
         Arc::clone(&events_notify),
     );
@@ -75,7 +75,7 @@ fn engine_with_adapter_and_workflows_dir(
     let events_notify = Arc::new(Notify::new());
     let session_manager = SessionManager::new(
         pool.clone(),
-        adapter,
+        Registry::single(adapter),
         chrono::Duration::hours(1),
         Arc::clone(&events_notify),
     );
@@ -3106,7 +3106,11 @@ fn the_materialized_coding_task_gives_open_pr_an_executable_script() {
     let root = tempdir();
     let dir = root.join(".builtin-workflows");
     config_root::materialize_builtins(&dir).unwrap();
-    let (def, _) = load_workflow_file(&dir.join("coding-task.yaml")).unwrap();
+    let (def, _) = load_workflow_file(
+        &dir.join("coding-task.yaml"),
+        &Registry::single(Arc::new(ClaudeAdapter::new())),
+    )
+    .unwrap();
     let stage = def.stages.get("open_pr").expect("open_pr stage");
     let crate::workflow_def::StageKind::Shell { command, .. } = &stage.kind else {
         panic!("open_pr should be a shell stage: {:?}", stage.kind);
@@ -6023,7 +6027,7 @@ fn engine_with_global_config(
     let events_notify = Arc::new(Notify::new());
     let session_manager = SessionManager::new(
         pool.clone(),
-        adapter,
+        Registry::single(adapter),
         chrono::Duration::hours(1),
         Arc::clone(&events_notify),
     );
@@ -10368,6 +10372,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     let def = coding_workflow(&dir);
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
     let task_id = seed_task(&pool, &def.name).await;
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
     let coding = &def.stages["coding"];
     let finished = &def.stages["finished"];
 
@@ -10405,11 +10410,12 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     let interrupted = ended(Some("session-a"), Some(SessionEndReason::Interrupted)).await;
     assert_eq!(
         engine
-            .resumable_session(coding, Some(&interrupted))
+            .resumable_session(&task, &def, coding, Some(&interrupted))
             .await
             .unwrap(),
         Ok(ResumeSession {
             adapter_session_id: "session-a".to_string(),
+            cli_adapter: "claude".to_string(),
             previous_session_id: interrupted.id.clone(),
             end_reason: SessionEndReason::Interrupted,
         })
@@ -10419,7 +10425,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     let reaped = ended(Some("session-b"), Some(SessionEndReason::Reaped)).await;
     assert!(
         engine
-            .resumable_session(coding, Some(&reaped))
+            .resumable_session(&task, &def, coding, Some(&reaped))
             .await
             .unwrap()
             .is_ok(),
@@ -10437,7 +10443,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
         let run = ended(Some("session-c"), reason).await;
         assert!(
             engine
-                .resumable_session(coding, Some(&run))
+                .resumable_session(&task, &def, coding, Some(&run))
                 .await
                 .unwrap()
                 .is_err(),
@@ -10449,7 +10455,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     let sessionless = ended(None, Some(SessionEndReason::Interrupted)).await;
     assert!(
         engine
-            .resumable_session(coding, Some(&sessionless))
+            .resumable_session(&task, &def, coding, Some(&sessionless))
             .await
             .unwrap()
             .is_err()
@@ -10458,7 +10464,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     // A stage with no session at all, and a stage with no run yet.
     assert!(
         engine
-            .resumable_session(finished, Some(&interrupted))
+            .resumable_session(&task, &def, finished, Some(&interrupted))
             .await
             .unwrap()
             .is_err(),
@@ -10466,7 +10472,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     );
     assert!(
         engine
-            .resumable_session(coding, None)
+            .resumable_session(&task, &def, coding, None)
             .await
             .unwrap()
             .is_err()
@@ -10480,6 +10486,7 @@ async fn a_session_resumed_too_many_times_in_a_row_has_to_start_over() {
     let def = coding_workflow(&dir);
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
     let task_id = seed_task(&pool, &def.name).await;
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
     let coding = &def.stages["coding"];
 
     let new_run = || sessions::NewSession {
@@ -10513,7 +10520,7 @@ async fn a_session_resumed_too_many_times_in_a_row_has_to_start_over() {
     // Three resumes are allowed; the fourth is where the cap bites.
     for resume in 1..=MAX_CONSECUTIVE_RESUMES + 1 {
         let decision = engine
-            .resumable_session(coding, Some(&previous))
+            .resumable_session(&task, &def, coding, Some(&previous))
             .await
             .unwrap();
         if resume <= MAX_CONSECUTIVE_RESUMES {
@@ -10547,7 +10554,7 @@ async fn a_session_resumed_too_many_times_in_a_row_has_to_start_over() {
     let fresh = interrupt(&fresh).await;
     assert!(
         engine
-            .resumable_session(coding, Some(&fresh))
+            .resumable_session(&task, &def, coding, Some(&fresh))
             .await
             .unwrap()
             .is_ok(),
@@ -10969,7 +10976,7 @@ fn engine_with_turn_timers(
     let events_notify = Arc::new(Notify::new());
     let session_manager = SessionManager::with_turn_timers(
         pool.clone(),
-        adapter,
+        Registry::single(adapter),
         chrono::Duration::hours(1),
         Arc::clone(&events_notify),
         timers,
@@ -11274,7 +11281,7 @@ async fn cancel_kills_every_live_session_of_the_task_not_just_the_current_one() 
         .id;
         engine
             .session_manager
-            .start(&run_id, "go", &cfg, SessionKind::Standing)
+            .start(&run_id, "claude", "go", &cfg, SessionKind::Standing)
             .await
             .unwrap();
         // The earlier stage's run is recorded as finished, exactly as
@@ -11886,7 +11893,7 @@ async fn the_poll_budget_follows_the_wall_clock_not_the_monotonic_one() {
     let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary("unused"));
     let session_manager = SessionManager::new(
         pool.clone(),
-        adapter,
+        Registry::single(adapter),
         chrono::Duration::hours(1),
         Arc::clone(&events_notify),
     );
@@ -12876,7 +12883,7 @@ async fn the_watcher_parks_a_turn_that_ended_daemon_stopped() {
         Arc::new(ClaudeAdapter::with_binary(wrapper.display().to_string()));
     let manager = SessionManager::new(
         pool.clone(),
-        adapter,
+        Registry::single(adapter),
         chrono::Duration::hours(1),
         Arc::clone(&events_notify),
     );
@@ -13606,7 +13613,7 @@ async fn retrying_a_watching_gate_whose_command_could_not_start_restamps_and_res
     let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary("unused"));
     let session_manager = SessionManager::new(
         pool.clone(),
-        adapter,
+        Registry::single(adapter),
         chrono::Duration::hours(1),
         Arc::clone(&events_notify),
     );

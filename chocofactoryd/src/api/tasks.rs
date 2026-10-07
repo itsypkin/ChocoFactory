@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{ApiError, AppState};
+use crate::adapter;
 use crate::db::usage as usage_db;
 use crate::db::{events, tasks, workflow_state};
 use crate::engine::{WorkflowEngine, WorkflowRef};
@@ -321,6 +322,8 @@ pub async fn update_config(
             "'config' must be a JSON object".to_string(),
         ));
     }
+    adapter::check_task_config_clis(&body.config, state.engine.registry())
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     let task = tasks::merge_config(&state.pool, &id, body.config)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;

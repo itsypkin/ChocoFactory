@@ -419,6 +419,9 @@ impl std::error::Error for AdapterError {}
 /// underlying agentic CLI (`claude`, `codex`, `gemini`, ...) and translate
 /// its native output into `AgentEvent`s (§4).
 pub trait AgentAdapter: Send + Sync {
+    /// The name a role's `cli:` uses to select this adapter, and the value
+    /// stored in `sessions.cli_adapter`.
+    fn name(&self) -> &'static str;
     fn start(&self, prompt: &str, cfg: &RoleConfig) -> Result<AgentHandle, AdapterError>;
     fn resume(
         &self,
@@ -426,6 +429,94 @@ pub trait AgentAdapter: Send + Sync {
         prompt: &str,
         cfg: &RoleConfig,
     ) -> Result<AgentHandle, AdapterError>;
+}
+
+/// A `cli:` value that names no adapter in the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCliError {
+    pub role: Option<String>,
+    pub cli: String,
+    pub known: Vec<&'static str>,
+}
+
+impl fmt::Display for UnknownCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let known = self.known.join(", ");
+        match &self.role {
+            Some(role) => write!(
+                f,
+                "role '{role}' uses cli '{}', which this daemon doesn't know; known CLIs: {known}",
+                self.cli
+            ),
+            None => write!(
+                f,
+                "cli '{}' is not one this daemon knows; known CLIs: {known}",
+                self.cli
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnknownCliError {}
+
+/// The adapters this daemon can run, keyed by [`AgentAdapter::name`]. The
+/// valid `cli:` values are exactly its keys.
+#[derive(Clone)]
+pub struct Registry {
+    adapters: std::collections::BTreeMap<&'static str, std::sync::Arc<dyn AgentAdapter>>,
+}
+
+impl Registry {
+    /// Panics if two adapters share a name: a programmer error.
+    pub fn new(adapters: Vec<std::sync::Arc<dyn AgentAdapter>>) -> Self {
+        let mut map = std::collections::BTreeMap::new();
+        for adapter in adapters {
+            let name = adapter.name();
+            if map.insert(name, adapter).is_some() {
+                panic!("two adapters registered under the name '{name}'");
+            }
+        }
+        Self { adapters: map }
+    }
+
+    pub fn single(adapter: std::sync::Arc<dyn AgentAdapter>) -> Self {
+        Self::new(vec![adapter])
+    }
+
+    pub fn lookup(
+        &self,
+        role: Option<&str>,
+        cli: &str,
+    ) -> Result<&std::sync::Arc<dyn AgentAdapter>, UnknownCliError> {
+        self.adapters.get(cli).ok_or_else(|| UnknownCliError {
+            role: role.map(str::to_string),
+            cli: cli.to_string(),
+            known: self.names(),
+        })
+    }
+
+    /// Sorted adapter names.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.adapters.keys().copied().collect()
+    }
+}
+
+/// Checks every string `roles.<name>.cli` in a task config against the
+/// registry, in sorted role-name order. Non-object shapes and non-string
+/// (or `null`) values are skipped: they fall through to the next config
+/// layer, as they always have.
+pub fn check_task_config_clis(config: &Value, registry: &Registry) -> Result<(), UnknownCliError> {
+    let Some(roles) = config.get("roles").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut names: Vec<&String> = roles.keys().collect();
+    names.sort();
+    for name in names {
+        if let Some(cli) = roles[name].get("cli").and_then(Value::as_str) {
+            registry.lookup(Some(name), cli)?;
+        }
+    }
+    Ok(())
 }
 
 /// A live (or just-exited) agent subprocess. Streams normalized
