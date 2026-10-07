@@ -989,3 +989,71 @@ fn other_push_failure_gets_generic_message() {
         "choco open-pr: the push failed; git's output follows"
     );
 }
+
+#[test]
+fn a_commit_someone_else_pushed_before_the_lookup_is_never_removed() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    assert!(fx.run("T (#1)", "approved", "r").status.success());
+    let old = origin_tip(&fx);
+    let theirs = push_from_other_clone(&fx);
+    // GitHub now reports their commit as the PR's head.
+    fx.cfg("pr-head", &format!("{theirs}\n"));
+    pr_exists(&fx);
+    amend_local(&fx);
+    let edits = fx.calls_to("pr edit").len();
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(!out.status.success());
+    assert!(stdout(&out).is_empty());
+    assert_eq!(fx.calls_to("pr edit").len(), edits);
+    assert_eq!(origin_tip(&fx), theirs);
+    assert_eq!(
+        first_line(&out),
+        format!(
+            "choco open-pr: someone else pushed to the task branch: the PR's head is {theirs} but this task last pushed {old}; look before resuming"
+        )
+    );
+}
+
+#[test]
+fn the_lease_is_the_tasks_own_last_push_not_the_remote_tracking_ref() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    assert!(fx.run("T (#1)", "approved", "r").status.success());
+    let old = origin_tip(&fx);
+    fx.cfg("pr-head", &format!("{old}\n"));
+    pr_exists(&fx);
+    let theirs = push_from_other_clone(&fx);
+    // The remote-tracking ref now equals their commit, so a bare lease would
+    // overwrite it; the explicit lease on our own last push must refuse.
+    git(&fx.wt, &["fetch", "-q", "origin"]);
+    amend_local(&fx);
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(!out.status.success());
+    assert!(stdout(&out).is_empty());
+    assert_eq!(origin_tip(&fx), theirs);
+    assert!(
+        first_line(&out).contains("moved since the PR's head"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn an_open_pr_without_a_record_of_our_push_gets_a_plain_push() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    assert!(fx.run("T (#1)", "approved", "r").status.success());
+    let old = origin_tip(&fx);
+    fs::remove_file(fx.git_dir().join("choco-open-pr-pushed")).unwrap();
+    fx.cfg("pr-head", &format!("{old}\n"));
+    pr_exists(&fx);
+    amend_local(&fx);
+    let out = fx.run("T (#1)", "approved", "r");
+    // A rebase cannot be force-pushed without our own record.
+    assert!(!out.status.success());
+    assert_eq!(origin_tip(&fx), old);
+    assert!(
+        first_line(&out).starts_with("choco open-pr: the push was rejected (non-fast-forward)")
+    );
+}

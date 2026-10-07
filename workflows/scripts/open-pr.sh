@@ -273,11 +273,13 @@ T=$(printf '%s' "${PR_TASK_TITLE:-}" | tr '\n\r\t' '   ' | tr -s ' ' | sed 's/^ 
 # escalate does not publish a branch first.
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
-# When the branch already has an open PR, push with a lease on that PR's
-# head commit: a rebased branch is never a fast-forward, and the lease still
-# refuses if anyone else moved the branch. `--state open` for the same
-# reason as the later probe (`gh pr view` matches closed and merged PRs).
-# A failed lookup never falls back to a plain or forced push.
+# When the branch already has an open PR, push with a lease on the commit
+# this task itself last pushed (recorded in the worktree's private git dir),
+# so a rebased branch can be pushed but a commit someone else added to the
+# branch is never removed. If the PR's head is not that commit, someone else
+# pushed: refuse. `--state open` for the same reason as the later probe
+# (`gh pr view` matches closed and merged PRs). A failed lookup never falls
+# back to a plain or forced push.
 if ! HEAD_OID=$(gh pr list --head "$BRANCH" --state open --json number,headRefOid -q '.[0].headRefOid // empty' 2>"$TMP/lookup-err"); then
     printf 'choco open-pr: could not look up the open PR for %s; nothing was pushed\n' "$BRANCH" >&2
     cap 1024 < "$TMP/lookup-err" >&2
@@ -294,16 +296,33 @@ if [ -n "$HEAD_OID" ]; then
     fi
 fi
 
-if [ -n "$HEAD_OID" ]; then
-    git push --force-with-lease="$BRANCH:$HEAD_OID" -u origin HEAD >/dev/null 2>"$TMP/push-err" && PUSHED=1 || PUSHED=0
+GITDIR=$(git rev-parse --absolute-git-dir) || die "cannot find the git dir"
+PUSHED_FILE="$GITDIR/choco-open-pr-pushed"
+LAST_PUSHED=""
+if [ -f "$PUSHED_FILE" ]; then
+    LAST_PUSHED=$(awk -v b="$BRANCH" '$1 == b { v = $2 } END { print v }' "$PUSHED_FILE") || die "cannot read the pushed-commit record"
+fi
+LEASE=""
+if [ -n "$HEAD_OID" ] && [ -n "$LAST_PUSHED" ]; then
+    if [ "$HEAD_OID" != "$LAST_PUSHED" ]; then
+        printf "choco open-pr: someone else pushed to the task branch: the PR's head is %s but this task last pushed %s; look before resuming\n" "$HEAD_OID" "$LAST_PUSHED" >&2
+        exit 1
+    fi
+    LEASE="$LAST_PUSHED"
+fi
+
+# With no record of our own push the lease cannot be tied to this task, so
+# the push is plain and can only fast-forward.
+if [ -n "$LEASE" ]; then
+    git push --force-with-lease="$BRANCH:$LEASE" -u origin HEAD >/dev/null 2>"$TMP/push-err" && PUSHED=1 || PUSHED=0
 else
     git push -u origin HEAD >/dev/null 2>"$TMP/push-err" && PUSHED=1 || PUSHED=0
 fi
 if [ "$PUSHED" != 1 ]; then
     if grep -qF '(stale info)' "$TMP/push-err"; then
-        msg="the branch on GitHub moved since the PR's head $HEAD_OID: someone else pushed; look before resuming"
+        msg="the branch on GitHub moved since the PR's head $LEASE: someone else pushed; look before resuming"
     elif grep -qF -e '(non-fast-forward)' -e '(fetch first)' "$TMP/push-err"; then
-        msg="the push was rejected (non-fast-forward): the branch on GitHub has commits this branch doesn't, and it has no open PR; look at the branch before resuming"
+        msg="the push was rejected (non-fast-forward): the branch on GitHub has commits this branch doesn't, and this task has no push of its own to replace; look at the branch before resuming"
     else
         msg="the push failed; git's output follows"
     fi
@@ -313,6 +332,8 @@ if [ "$PUSHED" != 1 ]; then
 fi
 # Keep git's notes (remote: hints, hook output) from a good push visible in stderr_tail.
 cap 1024 < "$TMP/push-err" >&2
+NEW_TIP=$(git rev-parse HEAD) || die "cannot read HEAD"
+printf '%s %s\n' "$BRANCH" "$NEW_TIP" >> "$PUSHED_FILE" || die "cannot record the pushed commit"
 
 ISSUE=$(printf '%s' "$T" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')
 if [ -n "$ISSUE" ]; then

@@ -43,14 +43,16 @@ moves the task on, into `revising`.
   fresh PR.
 - The note is templated into the coder's prompt verbatim. Make it
   self-contained: list every item in full.
-- `open_pr` force-pushes a rebased branch with a lease on the PR's head
-  commit. If the push is refused because the branch on GitHub moved since
-  the PR's head, someone else pushed: look at the branch on GitHub, keep or
-  bring in their commits, then `choco task send` the note. A plain
-  non-fast-forward rejection (no open PR) means the branch on GitHub has
-  commits the task's branch lacks: inspect it the same way. Read the
-  message from `stderr_tail` in `choco --json task events <id>`; the
-  one-line `choco task events` view cuts it off.
+- On every lap where the branch has an open PR, `open_pr` force-pushes with
+  a lease on the commit the task itself last pushed (recorded in the
+  worktree's git dir), so a rebase goes through. If the PR's head is not
+  that commit, or the lease is refused because the branch on GitHub moved,
+  someone else pushed and nothing is overwritten: look at the branch on
+  GitHub, keep or bring in their commits, then `choco task send` the note.
+  A plain non-fast-forward rejection means the branch on GitHub has commits
+  the task's branch lacks: inspect it the same way. Read the message from
+  `stderr_tail` in `choco --json task events <id>`; the one-line
+  `choco task events` view cuts it off.
 
 ## Getting your review items done when the coder ignores them
 
