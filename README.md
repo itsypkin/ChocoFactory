@@ -1,3 +1,17 @@
+```text
+                       ( (
+                        ) )
+      .-----.          ( (        (@)
+      | | | |   _____   ) )      (@@@)
+      |_|_|_|  |     |  |  |      (@)
+   .--+-+-+-+--+-----+--+--+---------.
+   | [==][==][==][==][==][==][==][==] |
+   | [==][==][==][==][==][==][==][==] |
+   | [==][==][==][==][==][==][==][==] |
+   '-----------------------------------'
+          C  H  O  C  O  F  A  C  T  O  R  Y
+```
+
 # ChocoFactory
 
 ChocoFactory runs AI coding agents as supervised workflows: an agent writes the change, a second agent reviews it, CI runs, and you give the final verdict on the pull request. You can hand it a spec and walk away. It is driven by the `choco` command line, backed by a background daemon, `chocofactoryd`.
