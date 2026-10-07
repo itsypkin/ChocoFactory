@@ -66,6 +66,11 @@ fn summary(
     }
 }
 
+fn waiting(mut t: TaskSummary) -> TaskSummary {
+    t.waiting_on_human = true;
+    t
+}
+
 fn with_pr(mut t: TaskSummary, n: u64) -> TaskSummary {
     t.pr = Some(PullRequestRef {
         number: n,
@@ -141,14 +146,14 @@ fn board() -> App {
     app.projects.insert("p-alpha".into(), "chocofactory".into());
     app.projects.insert("p-beta".into(), "webshop".into());
     let mut review = with_pr(
-        summary(
+        waiting(summary(
             "3f2a91c0-aaaa",
             "Interactive terminal dashboard (#164)",
             "open",
             Some("awaiting_human_review"),
             Some(125),
             "p-alpha",
-        ),
+        )),
         171,
     );
     review.loop_counters = json!({});
@@ -161,14 +166,14 @@ fn board() -> App {
         "p-alpha",
     );
     busy.loop_counters = json!({"internal_review": {"count": 2}});
-    let waiting = summary(
+    let waiting = waiting(summary(
         "b81e0d44-cccc",
         "Checkout totals rounding (#42)",
         "open",
         Some("escalate_to_human"),
         Some(14),
         "p-beta",
-    );
+    ));
     let stuck_task = stuck(
         summary(
             "7d22e1a8-dddd",
@@ -207,31 +212,41 @@ fn board() -> App {
 fn sections_group_and_order_tasks() {
     let mut app = new_app(Scope::AllProjects);
     let active = vec![
-        summary(
+        waiting(summary(
             "a",
             "a",
             "open",
             Some("awaiting_human_review"),
             Some(10),
             "p",
-        ),
-        summary(
+        )),
+        waiting(summary(
             "b",
             "b",
             "open",
-            Some("awaiting_human_review"),
+            Some("my_custom_gate"),
             Some(120),
+            "p",
+        )),
+        // An open task at the old gate name that the daemon does not
+        // report as waiting is In progress.
+        summary(
+            "i",
+            "i",
+            "open",
+            Some("awaiting_human_review"),
+            Some(2),
             "p",
         ),
         stuck(
-            summary(
+            waiting(summary(
                 "c",
                 "c",
                 "stuck",
                 Some("awaiting_human_review"),
                 Some(1),
                 "p",
-            ),
+            )),
             "boom",
             5,
         ),
@@ -242,7 +257,14 @@ fn sections_group_and_order_tasks() {
             "x",
             60,
         ),
-        summary("g", "g", "open", Some("escalate_to_human"), None, "p"),
+        waiting(summary(
+            "g",
+            "g",
+            "open",
+            Some("escalate_to_human"),
+            None,
+            "p",
+        )),
         summary("h", "h", "open", None, None, "p"),
     ];
     let closed = vec![
@@ -255,7 +277,7 @@ fn sections_group_and_order_tasks() {
     assert_eq!(ids(&needs), ["b", "a", "g"]);
     // A stuck task at awaiting_human_review is Stuck, not Needs you; an
     // open task at any other stage (or none) is In progress.
-    assert_eq!(ids(&progress), ["e", "d", "h"]);
+    assert_eq!(ids(&progress), ["e", "d", "i", "h"]);
     // Longest stuck first.
     assert_eq!(ids(&stuck_s), ["f", "c"]);
     assert_eq!(ids(&closed_s), ["z1", "z2"]);
@@ -265,7 +287,14 @@ fn sections_group_and_order_tasks() {
 fn a_task_at_the_planned_workflows_question_gate_needs_you() {
     let mut app = new_app(Scope::AllProjects);
     let active = vec![
-        summary("q", "q", "open", Some("spec_questions"), Some(5), "p"),
+        waiting(summary(
+            "q",
+            "q",
+            "open",
+            Some("spec_questions"),
+            Some(5),
+            "p",
+        )),
         summary("w", "w", "open", Some("coding"), Some(5), "p"),
     ];
     load(&mut app, active, vec![]);
@@ -370,14 +399,14 @@ fn cancel_prompt_only_y_acts_and_uses_the_captured_id() {
     ch(&mut app, 'c');
     let mut active = app.active.clone();
     active.retain(|t| t.task.id != first);
-    active.push(summary(
+    active.push(waiting(summary(
         "0000-new",
         "New",
         "open",
         Some("awaiting_human_review"),
         Some(9999),
         "p-alpha",
-    ));
+    )));
     let closed = app.closed.clone();
     load(&mut app, active, closed);
     assert_ne!(app.flat_ids()[0], first);
@@ -1763,14 +1792,14 @@ fn a_task_waiting_on_you_shows_the_pr_and_what_it_waits_for() {
 
     // `spec_questions` needs a task at that stage.
     let mut app = new_app(Scope::AllProjects);
-    let t = summary(
+    let t = waiting(summary(
         "5e5e5e5e-ffff",
         "Spec it",
         "open",
         Some("spec_questions"),
         Some(5),
         "p-alpha",
-    );
+    ));
     load(&mut app, vec![t], vec![]);
     open_detail(&mut app, "5e5e5e5e-ffff");
     let s = render(&app, 120, 30);
@@ -1786,14 +1815,14 @@ fn a_task_that_is_not_waiting_has_no_waiting_for_row() {
     assert!(!render(&app, 100, 30).contains("Waiting for"));
     // Nor does a stuck or closed task at a waiting stage.
     let mut app = new_app(Scope::AllProjects);
-    let t = summary(
+    let t = waiting(summary(
         "5e5e5e5e-ffff",
         "Spec it",
         "closed",
         Some("spec_questions"),
         Some(5),
         "p-alpha",
-    );
+    ));
     load(&mut app, vec![], vec![t]);
     open_detail(&mut app, "5e5e5e5e-ffff");
     assert!(!render(&app, 100, 30).contains("Waiting for"));

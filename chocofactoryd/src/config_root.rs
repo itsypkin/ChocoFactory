@@ -763,6 +763,114 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             .unwrap();
         assert_eq!(def.name, "coding-task");
         assert!(def.worktree);
+
+        use crate::workflow_def::{Capture, ShellCommand, StageKind};
+        let stage = &def.stages["awaiting_human_review"];
+        let StageKind::HumanGate {
+            capture,
+            markers,
+            watch,
+        } = &stage.kind
+        else {
+            panic!(
+                "awaiting_human_review must be a human_gate: {:?}",
+                stage.kind
+            );
+        };
+        assert_eq!(*capture, Some(Capture::Text));
+        let markers: Vec<(&str, &str)> = markers
+            .iter()
+            .map(|m| (m.line.as_str(), m.then.as_str()))
+            .collect();
+        assert_eq!(
+            markers,
+            [
+                ("/request-changes", "changes_requested"),
+                ("/approve", "approved")
+            ]
+        );
+        let watch = watch.as_ref().expect("awaiting_human_review has a watcher");
+        match &watch.command {
+            ShellCommand::ScriptFile(path) => assert!(path.ends_with("await-review.sh")),
+            other => panic!("expected a script file, got {other:?}"),
+        }
+        let env: Vec<(&str, &str)> = watch
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env, [("PR_NUMBER", "{{ stages.open_pr.number }}")]);
+        assert_eq!(watch.interval, std::time::Duration::from_secs(60));
+        assert_eq!(
+            watch.timeout,
+            Some(std::time::Duration::from_secs(6 * 3600))
+        );
+        let outcomes: Vec<(&str, &str)> = watch
+            .outcomes
+            .iter()
+            .map(|o| (o.pattern.as_str(), o.then.as_str()))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                (r"\AREQUEST_CHANGES(\n|$)", "changes_requested"),
+                (r"\AAPPROVE(\n|$)", "approved"),
+                (r"\AMERGED(\n|$)", "approved"),
+            ]
+        );
+        let on: Vec<(&str, &str)> = stage
+            .on
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            on,
+            [
+                ("approved", "done"),
+                ("changes_requested", "revising"),
+                ("timeout", "escalate_to_human")
+            ]
+        );
+        let guard = stage.loop_guard.as_ref().expect("loop guard");
+        assert_eq!(
+            (guard.on.as_str(), guard.max, guard.then.as_str()),
+            ("changes_requested", 3, "escalate_to_human")
+        );
+    }
+
+    /// The workflow's `markers:` and the shared case table agree: a marker
+    /// renamed in the YAML alone fails here.
+    #[test]
+    fn the_seeded_review_markers_match_the_shared_case_table() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            body: String,
+            choco: String,
+        }
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let def = crate::workflow_def::WorkflowDefinition::load(&dir.path.join("coding-task.yaml"))
+            .unwrap();
+        let crate::workflow_def::StageKind::HumanGate { markers, .. } =
+            &def.stages["awaiting_human_review"].kind
+        else {
+            panic!("awaiting_human_review must be a human_gate");
+        };
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/review-markers.json")).unwrap();
+        assert!(cases.len() >= 16);
+        for case in cases {
+            let label = match crate::engine::reply_verdict(&case.body, markers) {
+                Ok(v) => v.outcome.to_string(),
+                Err(err) => match format!("{err:?}") {
+                    d if d.starts_with("NoMarker") => "refused_no_marker".to_string(),
+                    d if d.starts_with("Conflict") => "refused_conflict".to_string(),
+                    d => panic!("case '{}': unexpected refusal {d}", case.name),
+                },
+            };
+            assert_eq!(label, case.choco, "case '{}'", case.name);
+        }
     }
 
     fn coder_revise_content() -> &'static str {
@@ -944,6 +1052,33 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "the awaiting_human_review entry",
         );
         assert!(!entry.contains("Run `gh pr view --comments`"));
+    }
+
+    /// A review sent through choco has no verdict line; the prompt tells the
+    /// coder to read the PR's top-level comments as well.
+    #[test]
+    fn coder_revise_for_a_choco_review_says_to_read_the_top_level_comments() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "awaiting_human_review",
+            "changes_requested",
+            serde_json::json!({ "awaiting_human_review": "CHOCO REVIEW: fix the build" }),
+        );
+        let human_heading = rendered.find("## The human's review").unwrap();
+        let reviewer_heading = rendered.find("## Internal reviewer's summary").unwrap();
+        assert_eq!(rendered.matches("CHOCO REVIEW: fix the build").count(), 1);
+        let at = rendered.find("CHOCO REVIEW: fix the build").unwrap();
+        assert!(human_heading < at && at < reviewer_heading, "{rendered}");
+
+        let entry = squash(route_entry(&rendered, "awaiting_human_review"));
+        assert_says(
+            &entry,
+            &[
+                r#"gh api --paginate "repos/{owner}/{repo}/issues/$N/comments""#,
+                "If \"The human's review\" doesn't start with the line `REQUEST_CHANGES`, the \
+                 human answered through choco",
+            ],
+            "the awaiting_human_review entry covers a review sent through choco",
+        );
     }
 
     /// On the `internal_review` path the human's review is from an earlier

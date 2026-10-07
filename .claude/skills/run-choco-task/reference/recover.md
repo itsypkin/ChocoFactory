@@ -57,7 +57,9 @@ earlier summary instead of your comment. Work in this order:
    the PR ("same issues", "read the PR") doesn't work: the coder may never
    open the PR, even when told to.
 3. **If the task comes back to `awaiting_human_review` with items still
-   undone**, post a second `/request-changes`. That is the default: one more
+   undone**, post a second `/request-changes`, or run `choco task send <id>`
+   with text that lists the items in full and ends with a `/request-changes`
+   line. That is the default: one more
    lap, with the reviewer backing it up again. A 4th vote from you
    escalates.
 

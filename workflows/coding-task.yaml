@@ -89,7 +89,7 @@ stages:
   # Reached because either loop guard trips (`internal_review`'s or
   # `awaiting_human_review`'s), because `open_pr` itself failed (see
   # below), or because no human review arrives within 6h
-  # (`awaiting_human_review`'s `timeout`). Arriving here restarts both
+  # (the `timeout` of `awaiting_human_review`'s watcher). Arriving here restarts both
   # loop guards' counts (§5.3), whichever of those brought the task here,
   # so a human resuming from this stage always hands the loop a fresh
   # budget. `capture: text` keeps the human's reply so `revising` can see
@@ -132,6 +132,15 @@ stages:
       red: revising
       timeout: awaiting_human_review
 
+  # This stage waits on a person, who answers either on the PR (read by
+  # the watcher below) or with `choco task send`. A choco reply is read
+  # for the same marker lines, by the same rule, as a PR comment. A reply
+  # with no marker, or with both, is refused and changes nothing. An
+  # accepted reply stops the watcher, and its text minus the marker line
+  # is what `revising` gets as the human's review. The line rule is
+  # pinned by `chocofactoryd/tests/fixtures/review-markers.json`, so
+  # `markers:` here and the script's `VERDICT` filter must change together.
+  #
   # Watches the PR's *comments*, not its `reviewDecision`. GitHub refuses
   # a formal review from the account that opened the PR, and `open_pr`
   # pushes under whatever identity the daemon inherited — on a solo repo
@@ -196,20 +205,26 @@ stages:
   # API returns raw markdown, so a marker alone on a line inside a fence
   # still votes.
   awaiting_human_review:
-    kind: poll
-    script_file: scripts/await-review.sh
-    env:
-      PR_NUMBER: "{{ stages.open_pr.number }}"
+    kind: human_gate
     capture: text
-    interval: 60s
-    timeout: 6h
-    outcomes:
-      - match: '\AREQUEST_CHANGES(\n|$)'
+    markers:
+      - line: /request-changes
         then: changes_requested
-      - match: '\AAPPROVE(\n|$)'
+      - line: /approve
         then: approved
-      - match: '\AMERGED(\n|$)'
-        then: approved
+    watch:
+      script_file: scripts/await-review.sh
+      env:
+        PR_NUMBER: "{{ stages.open_pr.number }}"
+      interval: 60s
+      timeout: 6h
+      outcomes:
+        - match: '\AREQUEST_CHANGES(\n|$)'
+          then: changes_requested
+        - match: '\AAPPROVE(\n|$)'
+          then: approved
+        - match: '\AMERGED(\n|$)'
+          then: approved
     on:
       approved: done
       changes_requested: revising

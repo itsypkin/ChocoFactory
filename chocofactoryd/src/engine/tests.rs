@@ -7138,6 +7138,13 @@ case "$1" in
                 if [ "$prev" = "-q" ]; then q=$a; fi
                 prev=$a
             done
+            # A test can hold the comments call: while `hold` exists the stub
+            # touches `held` and waits for `release` before answering. A
+            # no-op unless `hold` exists.
+            if [ -e "{dir}/hold" ]; then
+                touch "{dir}/held"
+                while [ ! -e "{dir}/release" ]; do sleep 0.05; done
+            fi
             jq -r "$q" < "{dir}/verdict"
         else
             echo "2020-01-01T00:00:00Z"
@@ -7331,6 +7338,282 @@ async fn the_real_coding_task_workflow_walks_the_happy_path_to_done() {
     // Worktree cleanup (#58) still fires for the real shipped workflow.
     let worktree_dir = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
     wait_until_path_gone(&worktree_dir).await;
+}
+
+/// #175: the real `coding-task` at `awaiting_human_review` is answered with
+/// `choco task send`: a reply without exactly one marker is refused and
+/// changes nothing; a reply with one is the human's review, minus the marker.
+#[tokio::test]
+async fn the_real_coding_task_review_gate_takes_a_choco_reply() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    // The PR never reports a verdict: only choco answers.
+    fs::write(scripts_dir.join("verdict"), "[]").unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    // Resuming reloads the workflow by name, so seed the shipped ones.
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "awaiting_human_review").await;
+    let trail_before = stage_trail(&pool, &task_id).await.len();
+
+    // No marker: refused, nothing changes.
+    let refused = engine.send_message_or_resume(&task_id, "please fix").await;
+    assert!(
+        matches!(
+            refused,
+            Err(SendMessageOrResumeError::ReplyNeedsMarker { .. })
+        ),
+        "{refused:?}"
+    );
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "open");
+    assert_eq!(
+        state_of(&pool, &task_id).await.current_stage,
+        "awaiting_human_review"
+    );
+    assert_eq!(stage_trail(&pool, &task_id).await.len(), trail_before);
+    assert!(human_messages(&pool, &task_id).await.is_empty());
+
+    // One marker: the review minus the marker goes to `revising`.
+    engine
+        .send_message_or_resume(&task_id, "FIX X\n/request-changes")
+        .await
+        .unwrap();
+    let awaiting_entries = |trail: &[(String, Value)]| {
+        trail
+            .iter()
+            .filter(|(stage, _)| stage == "awaiting_human_review")
+            .count()
+    };
+    crate::test_support::wait_until("a second arrival at awaiting_human_review", || async {
+        let trail = stage_trail(&pool, &task_id).await;
+        if awaiting_entries(&trail) >= 2 {
+            Ok(())
+        } else {
+            Err(format!("trail {trail:?}"))
+        }
+    })
+    .await;
+    let trail = stage_trail(&pool, &task_id).await;
+    let first = trail
+        .iter()
+        .position(|(stage, _)| stage == "awaiting_human_review")
+        .unwrap();
+    assert_eq!(
+        trail[first + 1],
+        ("revising".to_string(), json!("changes_requested"))
+    );
+    let payload = payload_of(&pool, &task_id).await;
+    assert_eq!(payload["stages"]["awaiting_human_review"], "FIX X");
+
+    let mut render_payload = payload.clone();
+    render_payload["arrival"] =
+        json!({ "from": "awaiting_human_review", "outcome": "changes_requested" });
+    let prompt = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/prompts/coder-revise.md"),
+    )
+    .unwrap();
+    let (rendered, _) = crate::template::render(&prompt, &render_payload).unwrap();
+    let from = rendered.find("## The human's review").unwrap();
+    let to = rendered.find("## Internal reviewer's summary").unwrap();
+    let section = &rendered[from..to];
+    assert!(section.contains("FIX X"), "{section}");
+    assert!(!section.contains("/request-changes"), "{section}");
+
+    // Approve at the second arrival.
+    engine
+        .send_message_or_resume(&task_id, "/approve")
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "done").await;
+    wait_until_task_status(&pool, &task_id, "closed").await;
+}
+
+/// #175, the upgrade: a task the previous daemon left waiting for review
+/// (stored `stage_kind` NULL, or `poll`) gets its watcher back with its
+/// stored deadline, and its kind corrected so it shows as waiting on a human.
+#[tokio::test]
+async fn a_task_waiting_for_review_survives_the_upgrade() {
+    for stored_kind in [None, Some("poll")] {
+        let pool = connect_in_memory().await.unwrap();
+        let repo = tempdir();
+        init_git_repo(&repo).await;
+        let _origin = add_bare_origin(&repo).await;
+
+        let scripts_dir = tempdir();
+        let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+        fs::write(scripts_dir.join("hold"), "").unwrap();
+        fs::write(
+            scripts_dir.join("verdict"),
+            owner_comment_page("looks good\\n/approve"),
+        )
+        .unwrap();
+
+        let (task_id, _def, claude_wrapper) = seed_coding_task(
+            &pool,
+            &repo,
+            &scripts_dir,
+            r#"{"outcome": "approved", "feedback": ""}"#,
+        )
+        .await;
+        // Resuming reloads the workflow by name, so seed the shipped ones.
+        let workflows_dir = tempdir();
+        config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+        let engine = engine_with_adapter_and_workflows_dir(
+            pool.clone(),
+            &claude_wrapper.to_string_lossy(),
+            &workflows_dir,
+        );
+
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::hours(1);
+        let window = window_json(
+            "awaiting_human_review",
+            now - chrono::Duration::hours(1),
+            Some(deadline),
+        );
+        let stored_deadline = window["deadline"].clone();
+        workflow_state::create(
+            &pool,
+            &task_id,
+            "awaiting_human_review",
+            "poll",
+            json!({
+                "task": { "title": "Add a small feature", "input": "x" },
+                "poll_window": window,
+                "stages": { "open_pr": { "number": 42, "url": "https://example.test/pr/42" } },
+            }),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE workflow_state SET stage_kind = ? WHERE task_id = ?")
+            .bind(stored_kind)
+            .bind(&task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The previous daemon had started the task, so its worktree snapshot
+        // is recorded and the directory exists.
+        tasks::set_worktree(&pool, &task_id, &repo.to_string_lossy(), "demo")
+            .await
+            .unwrap();
+        fs::create_dir_all(worktree::worktree_path(&repo, "demo", &task_id).unwrap()).unwrap();
+
+        engine.park_interrupted_turns().await.unwrap();
+        let report = engine.resume_interrupted_polls().await.unwrap();
+        let why = tasks::get(&pool, &task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .stuck_reason;
+        assert_eq!(report.resumed, 1, "{stored_kind:?}: {report:?} {why:?}");
+        assert_eq!(report.stuck, 0, "{stored_kind:?}: {report:?}");
+
+        // The stub has been called: the watcher is running again.
+        crate::test_support::wait_until("the gh stub being held", || async {
+            if scripts_dir.join("held").exists() {
+                Ok(())
+            } else {
+                Err("not held yet".to_string())
+            }
+        })
+        .await;
+
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "open", "{stored_kind:?}");
+        let state = state_of(&pool, &task_id).await;
+        assert_eq!(state.stage_kind.as_deref(), Some("human_gate"));
+        let summaries = tasks::list_summaries(&pool, None, &[], tasks::SummaryOrder::Id, None)
+            .await
+            .unwrap();
+        let summary = summaries.iter().find(|t| t.task.id == task_id).unwrap();
+        assert!(summary.waiting_on_human, "{stored_kind:?}");
+        assert_eq!(state.payload["poll_window"]["deadline"], stored_deadline);
+
+        fs::write(scripts_dir.join("release"), "").unwrap();
+        wait_until_stage(&pool, &task_id, "done").await;
+        wait_until_task_status(&pool, &task_id, "closed").await;
+    }
+}
+
+/// #175, the upgrade for a task the previous daemon left at
+/// `escalate_to_human`, a gate with no watcher: the sweep fills in its kind
+/// (which is what keeps it in "Needs you") and starts nothing.
+#[tokio::test]
+async fn an_escalated_task_keeps_waiting_on_a_human_after_the_upgrade() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let scripts_dir = tempdir();
+    let (task_id, _def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    // Resuming reloads the workflow by name, so seed the shipped ones.
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+
+    workflow_state::create(
+        &pool,
+        &task_id,
+        "escalate_to_human",
+        "human_gate",
+        json!({ "task": { "title": "Add a small feature", "input": "x" } }),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE workflow_state SET stage_kind = NULL WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    engine.park_interrupted_turns().await.unwrap();
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.resumed, 0, "{report:?}");
+    assert!(!engine.has_detached_runner(&task_id));
+
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "open");
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "escalate_to_human");
+    assert_eq!(state.stage_kind.as_deref(), Some("human_gate"));
+    let summaries = tasks::list_summaries(&pool, None, &[], tasks::SummaryOrder::Id, None)
+        .await
+        .unwrap();
+    let summary = summaries.iter().find(|t| t.task.id == task_id).unwrap();
+    assert!(summary.waiting_on_human);
 }
 
 /// A planner report carrying the four sections `spec_check` enforces.

@@ -611,6 +611,22 @@ Five things worth knowing:
   distinguishes *you* from an agent acting as you: anything commenting
   under your account counts as you.
 
+**Answering from choco instead.** You can also answer without touching the
+PR, with `choco task send`:
+
+```
+choco task send <id> --text /approve
+choco task send <id> --text $'Two things to fix: …\n/request-changes'
+```
+
+The marker rules are the ones listed above for comments: `/approve` or
+`/request-changes`, alone on its own line. A reply with no marker, or with
+both, is refused and nothing is sent. This differs from a comment carrying
+both, which counts as `/request-changes`. The rest of the reply goes to the
+coder as the review. Nothing is posted to the PR. Use one channel at a time:
+a choco `/approve` sent within a minute of a newer PR `/request-changes`,
+before the task has read it, wins.
+
 If no verdict arrives within six hours the task stops waiting and parks at
 `escalate_to_human`, where `choco task send <id> --text "<note>"` resumes it into
 `revising`. A fourth `/request-changes`, after three revise rounds, parks
@@ -698,6 +714,8 @@ Progress
 ```
 
 Send a message into the task's live session (or resume a `human_gate`).
+At a gate that has markers, such as `awaiting_human_review`, the text must
+carry exactly one of them on a line of its own.
 The daemon accepts it asynchronously — the agent's reply lands as an
 event, not in this response:
 
@@ -918,14 +936,10 @@ scrollable list in four sections:
 
 | Section | Holds | Ordered |
 |---|---|---|
-| Needs you | `open` tasks waiting on a person: for the built-in workflows, the `awaiting_human_review`, `escalate_to_human` and `spec_questions` stages | longest waiting first |
+| Needs you | `open` tasks at a `human_gate`, in any workflow | longest waiting first |
 | In progress | every other `open` task, with its laps (the largest loop counter, `×N`) | longest in its stage first |
 | Stuck | `stuck` tasks, whatever their stage, with the first line of the reason | longest stuck first |
 | Recently closed | the latest `closed` and `cancelled` tasks | newest first |
-
-"Needs you" is decided by stage name, so it only knows the built-in workflows
-(`coding-task` and `coding-task-planned`); a task of a custom workflow shows
-under In progress even while it waits on a person.
 
 **Two modes.** Without `--project` every row has a `project` column (the
 project's name) and the header says `all projects`. With `--project` the column
