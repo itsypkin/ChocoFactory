@@ -1,11 +1,61 @@
 # ChocoFactory
 
-Two binaries:
+ChocoFactory runs AI coding agents as supervised workflows: an agent writes the change, a second agent reviews it, CI runs, and you give the final verdict on the pull request. You can hand it a spec and walk away. It is driven by the `choco` command line, backed by a background daemon, `chocofactoryd`.
 
-- **`chocofactoryd`** — the daemon. Owns the SQLite database, the workflow
-  engine, and an HTTP/WS API on `127.0.0.1:4141`.
-- **`choco`** — a thin CLI client against that API (create/inspect/message
-  tasks and projects).
+Jump to [Install](#install), or see the [Documentation](#documentation) list.
+
+## The problem
+
+Handing a coding task to an AI agent and walking away goes wrong in familiar ways:
+
+- **It stalls.** The agent waits on something, such as a test run, a timer or an answer, and never comes back.
+- **It wanders off the spec.** Nothing checks the result against what you asked for.
+- **It reviews its own work and approves it.** The same agent that wrote the change signs it off.
+- **It loses its place.** A restart, a crash or a closed laptop ends the session, and the work is gone or half done.
+- **It needs a human watching every step** to catch all of the above, which defeats the point.
+
+## How ChocoFactory solves it
+
+- **Workflows as explicit stages.** The built-in `coding-task` workflow goes: code → internal review → open a PR → wait for CI → human review → done. Every way back (a rejected review, red CI, your `/request-changes`, a resumed escalation) goes through a revise stage, so there is one path for fixing things.
+- **A separate reviewer.** A different agent, in its own session and read-only, reviews the change against the spec before any PR exists. Read-only is enforced: the daemon checks that the worktree didn't change.
+- **Loop guards and escalation.** Repeated rejections, repeated red CI, or no verdict from you for six hours park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck.
+- **Tasks survive restarts.** Everything lives in the daemon's database. Waits survive a restart. Interrupted agent turns are parked and can be retried, resuming the agent's session when possible.
+- **Isolation from your personal setup.** On the coding workflows, agents don't see your `~/.claude/CLAUDE.md`, plugins, hooks, MCP servers or memory. They see the repo's own instruction files. (The built-in `chat` workflow deliberately inherits your setup.) Each task works in its own git worktree.
+- **Your verdict lives on the PR.** Comment `/approve` or `/request-changes` on the pull request.
+- **One dashboard** (`choco dashboard`) for every task: what needs you, what's running, what's stuck.
+- **Checking the spec first.** `coding-task-planned` puts a planning agent in front. It checks the spec against the code and asks you only when it must.
+- **Multi-model support.** Each role resolves its own CLI and model, so the coder and the reviewer can run different models. Roles run on Claude Code by default. A role can run on [omp (oh-my-pi)](https://github.com/can1357/oh-my-pi) instead, which reaches other providers' models. For example, a Claude coder with an OpenAI GPT reviewer, using your existing omp login:
+
+  ```
+  choco task create ... --role-cli reviewer=omp --role-model reviewer=openai-codex/gpt-5.6-terra
+  ```
+
+  This has been verified with OpenAI models over omp's OAuth login. An Anthropic model *through omp* needs an Anthropic API key, not a Claude subscription login; see [`cli: omp`](docs/models.md#cli-omp).
+
+## An example
+
+One task, from issue to merged PR. The repo `myapp` and issue 42 are made up.
+
+```
+choco server start
+choco project create myapp --repo ~/code/myapp
+choco task create --project myapp --workflow coding-task \
+  --title "Fix the login redirect (#42)" --prompt "$(cat spec.md)"
+choco dashboard
+gh pr list --head task/<id>
+gh pr comment <number> --body "/approve"
+gh pr merge <number> --squash
+```
+
+1. Start the daemon.
+2. Register your repo as a project.
+3. Create the task. It prints the task's id. The spec in `spec.md` is the agent's whole brief, so make it a real spec, not one line.
+4. Watch it with `choco dashboard`, or block until it needs you: `choco task status <id> --until stage:awaiting_human_review --timeout 2h`.
+5. Find its PR. The branch is named `task/<id>`.
+6. Approve it by commenting `/approve` on the PR (or use the GitHub web UI to comment). The task moves to done.
+7. Merge it, with any merge method. Merging is still yours to do (merging on its own also counts as approval).
+
+Because the title ends in `(#42)`, the PR body says `Closes #42`, so merging closes the issue.
 
 ## Install
 
@@ -13,32 +63,84 @@ Two binaries:
 curl -fsSL https://github.com/itsypkin/ChocoFactory/releases/latest/download/install.sh | sh
 ```
 
-- Installs `choco` and `chocofactoryd` into `~/.local/bin` (override with
-  `CHOCO_INSTALL_DIR`). `CHOCO_VERSION=X.Y.Z` pins a version;
-  `CHOCO_RELEASES_URL` points at another release host; `CHOCO_INSTALL_ARCHIVE`
-  installs from a local archive without downloading.
-- Platforms: macOS arm64 and x86_64, Linux x86_64 and aarch64 (static musl builds).
-- The two binaries always live **side by side** in one directory: `chocofactoryd`
-  hands agents the `choco` next to it, and `choco server start` runs the
-  `chocofactoryd` next to it.
-- Downloads are verified against the release's `SHA256SUMS` before anything is installed.
-- From source: `cargo install --git https://github.com/itsypkin/ChocoFactory --locked choco chocofactoryd`,
-  or clone and `cargo build --workspace` (see Build below).
+- Installs `choco` and `chocofactoryd` into `~/.local/bin`.
+- Platforms: macOS arm64 and x86_64, Linux x86_64 and aarch64.
+- The two binaries always live **side by side** in one directory: `chocofactoryd` hands agents the `choco` next to it, and `choco server start` runs the `chocofactoryd` next to it.
+- The installer's environment variables, checksum verification and installing from source are in [docs/cli.md](docs/cli.md#updating).
 
-## Updating
+What you need first:
+
+- The **`claude` CLI**, logged in. Every agent turn runs it, so tasks cost real money.
+- **`gh`**, authenticated as the account that opens the PRs.
+- **`git`**.
+
+To update, run `choco update`. `choco update --check` only reports whether an update is available. A running daemon is restarted on the same port; the built-in workflows update with the binary.
+
+## Quick start
 
 ```
-choco update [--check] [--version X.Y.Z] [--force]
+choco server start                          # background daemon; waits until it answers
+choco server status                         # version, pid, port, open tasks
+choco project create <name> --repo <path>   # register a repo
 ```
 
-Works for copies installed by `install.sh` (it refuses, with instructions, for
-source builds and cargo installs). `--check` only reports whether an update is
-available. A daemon running from the install directory is stopped and restarted
-on the same port with the new binary; if an agent turn or shell step is in
-flight, `update` refuses (exit 3) unless `--force`, which parks that work like
-`choco server stop --force` (`choco task retry` continues it). A daemon running
-from another directory is left alone. The built-in workflows are inside the
-binary, so they update with it.
+Then create a task as in the example above, and watch it in the [dashboard](#the-dashboard). The full walkthrough (statuses, cost and time, messages, cancelling, events) is in [docs/cli.md](docs/cli.md#a-full-walkthrough). If a task gets stuck, see [Stuck tasks](docs/cli.md#stuck-tasks).
+
+## The dashboard
+
+`choco dashboard` (alias `choco dash`) is an interactive terminal view of every task. Its four sections:
+
+| Section | Holds |
+|---|---|
+| Needs you | tasks waiting at a human gate, such as your PR verdict |
+| In progress | every other open task |
+| Stuck | tasks the engine could not move forward, with the reason |
+| Recently closed | the latest finished and cancelled tasks |
+
+Keys for day one:
+
+| Key | Action |
+|---|---|
+| `⏎` | open the selected task's detail view |
+| `o` | open the task's pull request |
+| `r` | retry a stuck task |
+| `c` | cancel a task |
+| `?` | list all keys |
+| `q` | quit |
+
+The full key table, columns and behaviour are in [docs/cli.md](docs/cli.md#the-dashboard).
+
+## Reviewing a PR
+
+When a `coding-task` reaches `awaiting_human_review` it has already pushed a branch, opened a PR and waited for CI. It wants a verdict from you, and it reads that from the PR's **comments**, not from GitHub's formal review button.
+
+Leave a PR comment containing one of these markers, **alone on its own line**, with your review above it:
+
+| Marker | Effect |
+|---|---|
+| `/approve` | the task moves to `done` |
+| `/request-changes` | the task goes back to `revising`, and the coder gets your comment |
+
+- Only comments newer than the head commit count, so there is nothing to clear between rounds.
+- Only comments from the repo's owners, members and collaborators vote.
+- Merging the PR counts as approval too.
+- `choco task send <id> --text ...` is the other channel: it answers without touching the PR, with the same markers.
+
+The full rules (editing a comment, code blocks, the six-hour window, escalation counts, CI polling, how the PR body is written) are in [docs/coding-task.md](docs/coding-task.md#reviewing-a-coding-task-pr).
+
+## Customising workflows
+
+A task's workflow comes from the first of these that matches:
+
+1. an explicit path: `choco task create --workflow <path-to.yaml>`;
+2. the project repo's `.chocofactory/workflows/<name>.yaml`;
+3. the built-in of that name, which ships inside the daemon.
+
+`choco project init-workflows <project>` copies the built-ins into the project's repo as a starting point, so a team can version its own stages, roles, models and prompts next to the code.
+
+**Trust warning:** a repo's workflows, and any `--workflow` file, can run shell commands as you. Only point choco at repos and files you trust.
+
+More in [docs/workflows.md](docs/workflows.md).
 
 ## Using choco from Claude Code
 
@@ -69,1133 +171,17 @@ d=$(mktemp -d) &&
   `skills/` folder you copied into didn't exist when it started, run
   `/reload-skills` or start a new session.
 
-## Releasing
+## Documentation
 
-Maintainers: the tag must equal `v` + the workspace version and be on `main`,
-and the binaries report the workspace version, so a release candidate needs its
-own version. The workspace version is kept at `X.Y.Z-rc.1` until the final
-release. To cut `X.Y.Z`: merge at `X.Y.Z-rc.1`, push `vX.Y.Z-rc.1` (a
-prerelease) and check its assets; then merge a one-line change setting the
-version to `X.Y.Z` (and `Cargo.lock`) and push `vX.Y.Z`. While only a prerelease
-exists, `releases/latest/download/*` returns 404, so install the rc with
-`CHOCO_VERSION=X.Y.Z-rc.1` and the versioned script, e.g.
-`curl -fsSL <RELEASES>/download/vX.Y.Z-rc.1/install.sh | CHOCO_VERSION=X.Y.Z-rc.1 sh`.
-A copy installed from the rc moves to the final release with `choco update`. **Actions → Release → Run
-workflow** (`workflow_dispatch`) is a dry run: everything except publishing.
+- [docs/cli.md](docs/cli.md): the `choco` CLI: flags, the daemon, updating, a full walkthrough, stuck tasks, scripting, watching tasks, the dashboard.
+- [docs/coding-task.md](docs/coding-task.md): the built-in coding workflows, PR review rules, escalation limits, CI polling and the PR body.
+- [docs/workflows.md](docs/workflows.md): writing and customising workflows: where they come from, routing on a verdict, isolation, read-only roles, human gates.
+- [docs/models.md](docs/models.md): roles, CLIs and models, including running a role on omp.
+- [CONTRIBUTING.md](CONTRIBUTING.md): building, tests, running the daemon by hand, environment variables, releasing.
 
-## Build
+## Contributing
 
-```
-cargo build --workspace
-```
-
-Binaries land in `target/debug/`.
-
-## Running the daemon
-
-Use `choco server` (it expects `chocofactoryd` next to the `choco` binary):
-
-```
-choco server start [--port N]      # background, own session; waits until it answers
-choco server stop [--force]        # graceful stop (SIGTERM)
-choco server restart [--force] [--port N]   # keeps the port unless --port is given
-choco server status                # version, pid, port, uptime, open tasks, in-flight work
-```
-
-- **Log:** `~/.config/chocofactory/logs/chocofactoryd.log`. At start, a log over
-  10 MiB is moved to `chocofactoryd.log.1` (replacing any older one).
-- **Exit codes:** `0` ok; `1` error; `3` means "not running" for `status`, and
-  "refused" for `stop`/`restart`. `restart` also exits `1` when the old daemon
-  had to be killed after 30 s; a new one is started only if the old one's lock was released.
-- **Stop and running tasks:** agent turns and shell steps are killed and the
-  tasks marked `stuck` (`choco task retry <id>` continues them; an agent turn
-  resumes its session). Tasks waiting on a poll or a human are not affected.
-  Without `--force`, `stop` refuses (exit 3) and lists in-flight work instead.
-- **Base URL:** `--base-url` / `CHOCO_BASE_URL` if set; otherwise the port of the
-  running daemon from its lock file (`~/.config/chocofactory/chocofactoryd.lock`);
-  otherwise `http://127.0.0.1:4141`, but only when there is no lock file (a
-  daemon from before it existed). A lock file recording a dead daemon (or an empty one left by a failed start) is an
-  error ("chocofactoryd is not running"), never a fallback. `server` commands
-  always use the lock file.
-- `choco` warns on stderr when the daemon's version differs from its own.
-
-### Running it by hand (development)
-
-Logs go to **stderr**, not stdout: redirect with `chocofactoryd 2> daemon.log`
-(a plain `> log` captures nothing).
-
-> **`chocofactoryd` spawns the real `claude` CLI by default** — running the
-> daemon will hit the real, billable `claude` unless you point it at a
-> stand-in first.
-
-For manual testing, use the bundled `mock-claude` stand-in:
-
-```
-CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude ./target/debug/chocofactoryd
-```
-
-`mock-claude` echoes back whatever it's sent (`echo:{text}`); set
-`MOCK_CLAUDE_REPLY=<text>` to get a fixed reply instead. Point
-`CHOCOFACTORY_CLAUDE_BINARY` at the real `claude` binary only when you
-specifically mean to exercise the real CLI.
-
-The daemon stores its database under `~/.config/chocofactory/`. The
-built-in workflows (`chat`, `coding-task`, `coding-task-planned`) come from the daemon binary: at
-every start it regenerates a private, read-only copy in
-`~/.config/chocofactory/.builtin-workflows/`, so upgrading the binary
-upgrades them. See [Project workflows](#project-workflows) for where a
-workflow can come from. To keep a test run fully isolated from your real
-state, override `HOME`:
-
-```
-HOME=$(mktemp -d) CHOCOFACTORY_CLAUDE_BINARY=$(pwd)/target/debug/mock-claude \
-  ./target/debug/chocofactoryd
-```
-
-Only one daemon runs per config directory. It holds a lock on
-`~/.config/chocofactory/chocofactoryd.lock` for as long as it runs and writes
-a JSON description of itself there: `pid`, `port`, `version`, `commit`,
-`started_at` and `exe`. A second daemon on the same `$HOME` (even on another
-port) refuses to start and names the first one's pid and port. Never delete
-the lock file: the operating system releases the lock when the daemon dies,
-even by `kill -9`, so a leftover file from a dead daemon is harmless.
-
-SIGTERM and Ctrl-C stop the daemon cleanly: every agent and shell process it
-started is stopped with it. Tasks that were in the middle of an agent turn or
-a shell command become `stuck`, and `choco task retry` continues them (an
-agent turn resumes its session when it can; a shell command runs again from
-the start). Waits that live in the database survive a restart untouched:
-poll stages, human gates, and standing chat sessions. The same parking
-happens at the next start if the daemon was killed hard.
-
-`chocofactoryd --version` prints the version and exits without touching
-`$HOME`. `choco --version` (or `-V`) prints the CLI's version the same way,
-without contacting the daemon.
-
-### Daemon environment variables
-
-| Variable | Purpose |
-|---|---|
-| `CHOCOFACTORY_CLAUDE_BINARY` | Path to the agent CLI. Unset = the real, billable `claude`. |
-| `CHOCOFACTORY_OMP_BINARY` | Path to the `omp` CLI used by roles with `cli: omp`. Unset = `omp` from `PATH`. |
-| `CHOCOFACTORY_CHOCO_BINARY` | Path to `choco`, used to serve every agent turn's `report_outcome` tool (see below). Unset = the daemon's own sibling `choco` binary. |
-| `CHOCOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. `0` picks a free port; the bound port is written to the lock file. |
-| `MOCK_CLAUDE_REPLY` | Read by `mock-claude` only — reply with this fixed text instead of echoing. |
-| `MOCK_CLAUDE_REPORT` | Read by `mock-claude` only — the JSON input of the `report_outcome` call a single-shot turn makes (default `{"outcome": "done"}`). |
-| `RUST_LOG` | Log filter, e.g. `error` to quiet startup, `debug` for detail. |
-
-### Writing a workflow: how a stage routes on an agent's verdict
-
-Every agent turn is launched with an MCP tool, `report_outcome`, that lets
-the agent state its verdict explicitly instead of the engine trying to guess
-one from its reply's text. The whole rule a workflow author needs is one
-sentence:
-
-> A stage routes on the agent's own verdict **if and only if** it declares
-> `capture: json`. Its `on:` keys are the allowed verdicts.
-
-That's it — nothing about the tool belongs in a prompt file. Given
-
-```yaml
-internal_review:
-  kind: agent_turn
-  role: reviewer
-  capture: json
-  on: { approved: open_pr, changes_requested: revising }
-```
-
-the daemon derives, from `on:`'s keys alone: the tool's allowed `outcome`
-values, its description, and (via `--append-system-prompt`) the instruction
-telling the agent to call it before ending its turn. There is no second copy
-of `approved`/`changes_requested` to keep in sync — change the `on:` map and
-every agent-facing part of the contract changes with it.
-
-The tool is present on *every* agent turn, and every stage that can finish
-on its own (anything but a standing `on: {}` session like chat) has to call
-it to finish. A stage without `capture: json` may only report `done`, the
-one outcome it advances on.
-
-A stage can also require the report itself to carry named sections:
-
-```yaml
-internal_review:
-  kind: agent_turn
-  role: reviewer
-  capture: json
-  report_sections: [Branches → tests, States, Findings, Dismissed]
-  on: { approved: open_pr, changes_requested: revising }
-```
-
-Each name must appear as a heading in the report's `summary`, with
-something under it (`Findings: none` counts). Headings are matched
-forgivingly — `## Findings`, `**Findings**`, `- Findings`, `1. Findings`
-and `Findings:` are the same thing, `->` and `→` are interchangeable, and
-a bullet that merely *starts* with a section's name ("- Side effects of
-the retry are untested") is a list item, not a heading. A report that
-leaves a section out is rejected with an error the agent can act on and
-call again.
-
-The list reaches the agent through the tool's own schema, so a stage that
-opts in needs no prompt changes to work. A prompt that explains the
-sections anyway — `coding-task`'s reviewer does — is a second copy of the
-list, and a test keeps the two from drifting.
-
-This is how a verdict is kept from being cheaper than the work behind it: a
-reviewer that stops at its first blocking finding has no walk to write down
-(#95). Because parking a turn costs a human, the rule bends before it
-breaks — after two rejections the report is recorded as it stands, with the
-missing sections named in the tool's reply on the task's timeline.
-
-That's because the CLI's end-of-turn line doesn't mean the work is done: an
-agent waiting on a background sub-agent or a long test run ends its turn and
-is woken when that finishes. So the daemon treats a turn as complete only
-when it ends *after* the agent called `report_outcome`:
-
-- A turn that ends without reporting is left open. After 5 minutes with no
-  output it's nudged (up to 3 times); after that it's closed, and the task is
-  marked `stuck`.
-- Once a turn has reported and ended, its process has 30 seconds to exit. If
-  it's still running, its whole process group is killed and the task is
-  marked `stuck`, rather than advancing past work that may still be landing.
-- Output that arrives after a turn completed stays on the timeline, flagged
-  `after_completion`. Nudges and kills appear as `session_note` events.
-
-A sub-agent calling `report_outcome` doesn't count, and neither does a call
-the tool rejected.
-
-### Writing a workflow: what an agent inherits from your Claude setup
-
-By default an agent role runs isolated from the operator's own Claude Code
-setup: no `~/.claude/CLAUDE.md`, no user plugins, hooks or output style, no
-MCP servers other than the daemon's, no skills, no auto-memory, no
-built-in `ReportFindings` tool, and no timer or wait tools (`ScheduleWakeup`,
-`Monitor`, `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`, #115):
-an agent that ends its turn to wait on its own timer races the daemon's
-nudge clock. Chat keeps `ScheduleWakeup` and `Monitor` but can't use the cron
-or remote-trigger tools. The task repo's own `CLAUDE.md` and `AGENTS.md`
-files are read: the root ones at start, nested ones when the agent reads a
-file in that folder. The scope is the role's working directory, not the git
-root, so a custom `worktree: false` workflow whose task runs in a repo
-subfolder doesn't get the repo-root files (the built-ins all use worktrees).
-Instruction files in folders above the repo are not,
-and neither is `~/.claude/CLAUDE.md` (#183). `AGENTS.md` depends on Claude
-Code's built-in agents-md plugin; if a session's plugins don't include it, an
-`error` event on the timeline (and a daemon-log warning) says so. The repo's
-`.claude/settings.json` still applies, including any hooks or plugins that
-repo enables: they belong to the code being worked on. The repo's
-`.claude/settings.local.json` is *not* read: it is the operator's personal
-file, and in a task's linked worktree Claude Code would resolve it to the
-main checkout's (#141). A role can loosen the
-rest in the workflow file:
-
-```yaml
-roles:
-  coder:
-    skills: [run-tests]   # skills it may invoke; omitted = none
-    memory: true          # use auto-memory; omitted = no
-  chat:
-    inherit_operator_config: true   # your full setup, minus cron/remote-trigger tools
-```
-
-`skills`/`memory` can't be combined with `inherit_operator_config`. None of
-these can be set from task config (`--config`, `--role-*`) or the global
-config file: only a workflow definition can loosen what its agents see. The
-built-in `chat` workflow inherits your setup; `coding-task` is isolated. A
-copy of `chat.yaml` you made yourself (in a repo, or run with
-`--workflow <path>`) needs `inherit_operator_config: true` added by hand to
-keep that behaviour.
-
-Each session's `session_meta` event records what it actually ran with: the
-CLI version, model, tools, MCP servers, plugins, skills, and the isolation
-it was launched under.
-
-### Writing a workflow: read-only roles
-
-A role that must not change the code (a reviewer, a planner) can be enforced
-rather than just asked nicely. Two role fields do it:
-
-```yaml
-worktree: true
-roles:
-  reviewer:
-    cli: claude
-    model: claude-opus-5-5
-    read_only: true
-    disallowed_tools: [edit, write, notebook_edit]
-```
-
-- `disallowed_tools` removes tools from the role. The names are
-  adapter-neutral: `edit`, `write` and `notebook_edit`, exact lowercase only;
-  anything else is rejected when the workflow loads. The `claude` adapter maps
-  them to `Edit`, `Write` and `NotebookEdit`. Duplicates are dropped.
-- `read_only: true` makes the daemon snapshot the task's worktree (HEAD, the
-  branch, `git status` and file contents, ignored files excluded) before the role's turn, and
-  compare it afterwards. Bash can still write files, so the denylist alone
-  isn't enough. The comparison happens only on stages that conclude (a
-  single-shot `agent_turn` with an `on:` map). A `read_only` role on a standing
-  stage (`on: {}`, as in a chat) gets a baseline but its turns are not checked.
-
-Two rules are checked at load time: a `read_only` role must list all three
-names in `disallowed_tools`, and `read_only` needs `worktree: true` on the
-workflow, so the check only ever looks at the task's own disposable worktree.
-
-Neither field can be set from task config (`--config`, `--role-*`) or the
-global config file; such keys are ignored. Only the workflow definition can
-set them.
-
-If the turn changed the worktree anyway, the task is marked `stuck` with a
-reason such as `read-only role 'reviewer' changed the worktree in stage
-'internal_review': HEAD 1a2b3c4 → 9f8e7d6; git status changed (3 entries)`,
-and a `worktree_changed` event lands on the timeline. Nothing is reverted:
-inspect the worktree, reset it yourself, then run `choco task retry`. A
-resumed turn is compared against the baseline of the session it resumes. If
-the check can't run (git fails), the task is parked too, never passed
-silently. The comparison also runs when the turn crashes, ends without
-reporting, or is cut off; the stuck reason then carries both facts. Only a
-resumed session keeps its baseline: any other retry starts a fresh session
-that baselines whatever is in the worktree, so reset it before retrying.
-The check covers HEAD, the branch, `git status` and file contents. It
-doesn't cover ignored paths (`target/`, `.omc/`) or anything inside `.git`
-(refs, config, hooks). A read-only turn that runs `cargo fmt` or rewrites `Cargo.lock`
-trips the check as well, and that is intended. The built-in reviewer, and the
-planner in `coding-task-planned`, are read-only.
-
-### Writing a workflow: a human gate that watches for its answer
-
-A `human_gate` normally waits for a reply through `choco task send`. It can
-also watch for its answer somewhere else, and it can require that a reply
-carries a verdict.
-
-```yaml
-awaiting_review:
-  kind: human_gate
-  capture: text
-  watch:
-    command: "gh api …"
-    interval: 30s
-    timeout: 24h
-    outcomes:
-      - match: "APPROVE"
-        then: approved
-  markers:
-    - line: /request-changes
-      then: changes_requested
-    - line: /approve
-      then: approved
-  on: { approved: done, changes_requested: coding, timeout: stalled }
-```
-
-- `watch:` takes the same fields as a `poll` stage (`command` or
-  `script_file`, `env`, `interval`, `timeout`, `outcomes`), and `interval` is
-  required. When an outcome matches, the gate advances on it, keeping the
-  command's output if the gate says `capture: text`. When `timeout` runs out it
-  advances on the `timeout` edge, which `on:` must have. The watcher is the
-  same loop a `poll` runs: it survives a daemon restart with its stored
-  deadline.
-- `markers:` makes a reply through choco carry a verdict. Each entry is a
-  `line` and the outcome (`then`) it chooses. A reply counts a line as a marker
-  when the whole line equals it: case-sensitive, trailing spaces, tabs and
-  carriage returns ignored, leading whitespace not. So `> /approve`,
-  `use /approve here` and `  /approve` are not markers.
-- A reply is refused, with nothing recorded and the watcher still running, when
-  it has no marker line, or when its markers choose different outcomes. The
-  same marker twice is fine.
-- On an accepted reply the gate advances on the marker's outcome. The captured
-  text is the reply without its marker lines. The timeline's `human_message`
-  event keeps the reply as typed, and names the outcome.
-- A gate without `markers:` takes any reply and resumes on `resumed`, as
-  before.
-- An accepted reply stops the watcher.
-
-### Project workflows
-
-A project can carry a repo of its own (`repo_path`), set at creation or
-after the fact:
-
-```
-choco project create acme --repo ~/code/acme
-choco project update acme --repo ~/code/acme   # or: --no-repo, to clear it
-```
-
-`--repo` is resolved to an absolute path client-side (a relative path,
-including `.`, works) before the request is sent, and must already be an
-existing directory — it does not need to be a git repo.
-
-A task's workflow comes from **one of three places, checked in this
-order**:
-
-1. an explicit path: `choco task create --workflow <path-to.yaml>` (anything
-   containing `/` or ending in `.yaml`/`.yml`; its prompts and scripts
-   resolve next to it);
-2. the project's repo: `<repo_path>/.chocofactory/workflows/<name>.yaml`, if
-   the project has a repo;
-3. the built-in of that name, embedded in the daemon binary.
-
-The first match wins. A repo's `.chocofactory/workflows/` has one
-`<name>.yaml` per workflow, plus a
-`prompts/` directory next to it for any prompt files the workflow
-references by relative path (`prompts/coder.md` in a workflow at
-`<repo>/.chocofactory/workflows/coding-task.yaml` resolves to
-`<repo>/.chocofactory/workflows/prompts/coder.md`). This is the whole point of a repo workflow: a team's own
-stages, roles, models and prompts, reviewed and versioned alongside the
-code they work on, rather than living only on whoever's machine runs the
-daemon.
-
-A task created with no `--repo` of its own defaults to the project's
-`repo_path` (as `config.cwd`), so registering a repo on a project is also
-what makes `--repo` optional on every task under it.
-
-`choco project init-workflows <project>` seeds a repo with the built-in
-`chat`/`coding-task` workflows and their prompts as a starting point —
-never overwriting a file already there, so it is always safe to run again:
-
-```
-$ choco project init-workflows acme
-Seeded /Users/you/code/acme/.chocofactory/workflows
-  created   /Users/you/code/acme/.chocofactory/workflows/chat.yaml
-  created   /Users/you/code/acme/.chocofactory/workflows/coding-task.yaml
-  created   /Users/you/code/acme/.chocofactory/workflows/prompts/coder.md
-  ...
-
-Commit this directory so the team shares it: git add .chocofactory/ && git commit
-```
-
-From there, edit the seeded files freely (rename `coding-task.yaml` to
-something like `express-sonnet.yaml`, add a second `deep-opus.yaml` with
-different roles/models — a workflow file *is* the unit of configuration
-here, there is no separate project-settings layer) and commit
-`.chocofactory/` so every teammate's `choco task create --workflow ...`
-resolves the same file.
-
-**Trust implication:** a repo's `.chocofactory/workflows/` can define
-`shell` stages, which the daemon runs as ordinary subprocesses on whatever
-machine it's on. Registering a repo on a project means trusting everything
-under that repo's `.chocofactory/` the same way you'd trust a Makefile or
-CI config in it — there is no separate approval step before those commands
-run.
-
-Every task records the exact workflow file it started from — its
-canonical absolute path and a SHA-256 of its contents at that moment — and
-`choco task status` shows it:
-
-```
-$ choco task status bb93ada3-...
-...
-Workflow       coding-task
-Workflow file  /Users/you/code/acme/.chocofactory/workflows/coding-task.yaml  [3f2a9c1e0b7d]
-Status         open
-```
-
-A task running a built-in records `builtin:<name>@<version>` instead of a
-path, and `choco task status` labels that line `Workflow`. A built-in task
-follows the daemon: it runs whatever the current binary ships, and status
-says "built-in updated since task start" when that differs from what it
-began with.
-
-### Customising workflows
-
-- **Eject.** `choco project init-workflows <project>` copies the built-ins in
-  this version of the daemon into the project's repo as a starting point.
-  Later upgrades don't change the copies.
-- **A file of your own.** `choco task create --workflow <path-to.yaml>` runs
-  that file as is, without putting it in a repo. To try an unmerged change to
-  a built-in, point it at the checkout:
-  `--workflow <checkout>/workflows/coding-task.yaml`.
-- **Migrating from the old global folder.** Earlier versions copied the
-  built-ins into `~/.config/chocofactory/workflows/` and never updated
-  them. That folder is no longer read. At startup the daemon logs how many
-  stale built-in copies it is ignoring, and warns about every other file in
-  it (an edited copy, a custom workflow) with the two ways to keep using it:
-  pass the file with `--workflow <path>`, or move it with its `prompts/` and
-  `scripts/` into a repo's `.chocofactory/workflows/`. It also warns when
-  open or stuck tasks still point into the folder. The daemon never
-  modifies or deletes anything there; delete it yourself once no task uses
-  it. Tasks that already recorded a path into it keep running that file.
-
-**Security:** a repo's `.chocofactory/workflows/` and any `--workflow` file
-can run shell commands as you. Pointing choco at an untrusted repo or file
-trusts its workflows.
-
-If the file has since been edited, the line is suffixed
-`(changed since task start)`; if it has been deleted, `(missing)` — either
-way the task keeps running (or, for a deleted file, keeps failing to
-reload) with no separate warning elsewhere. A task created before this
-existed shows no `Workflow file` line at all.
-
-### Checking the spec first: `coding-task-planned`
-
-`coding-task-planned` is `coding-task` with a spec check in front. Its first
-stage, `spec_check`, has a planning agent read your `--prompt` against the
-code the task starts from. It makes the spec buildable (fixing stale
-references, commands that don't work here and loose test requirements) and
-decides the design choices your intent implies, listing each with its reason.
-It stops and asks you only when it would otherwise have to guess what you
-want: the spec contradicts itself, the goal is missing or unclear, or every
-way forward is irreversible, weakens security or costs far more than the
-spec suggests.
-
-From then on the coder and the internal reviewer work from the planner's
-report, not from your `--prompt`. Read it with:
-
-```
-choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'
-```
-
-A task waiting at `spec_questions` is answered with
-`choco task send <id> --text "..."`. The answer goes back to the planner,
-which folds it into the spec and checks again; you can tell it to decide a
-question itself. The stage has no time limit. The workflow is offered
-alongside `coding-task` so the two can be compared.
-
-### Reviewing a `coding-task` PR
-
-When a `coding-task` reaches `awaiting_human_review` it has already pushed
-a branch, opened a PR and waited for CI. What it wants from you is a
-verdict — and it reads that from the PR's **comments**, not from GitHub's
-formal review (the green *Review changes* button).
-
-That is deliberate rather than a shortcut. `open_pr` pushes under whatever
-identity the daemon inherited, so on a solo repo the PR belongs to the same
-account that would review it, and GitHub refuses a formal review from a
-PR's own author:
-
-```
-failed to create review: GraphQL: Review Can not request changes on your
-own pull request (addPullRequestReview)
-```
-
-Commenting on your own PR is allowed, so the verdict lives in a comment.
-Leave an ordinary PR comment containing one of these markers, **alone on
-its own line**:
-
-| Marker             | Effect                          |
-| ------------------ | ------------------------------- |
-| `/approve`         | the task moves to `done`        |
-| `/request-changes` | the task goes back to `revising` |
-
-Merging the PR counts as approval too: while the task waits here, a merged
-PR moves it to `done` exactly as `/approve` would, even with no marker
-comment, and even if a `/request-changes` comment is also there, since
-there is nothing left to revise once the work has landed. A PR closed
-without merging is not a verdict; the task keeps reading markers until its
-timeout.
-
-The rest of the comment is yours to write however you like — put the marker
-on the last line and your review above it. A comment that reads "Two
-findings, one worth fixing before merge." followed by your prose, and then
-a final line containing only `/request-changes`, sends the coder back round.
-The workflow hands the coder every qualifying comment (see the points
-below), oldest first, in its prompt; the coder doesn't have to fetch them.
-Formal review bodies and inline review comments are not handed over; the
-coder looks those up itself.
-
-Five things worth knowing:
-
-- **Only comments newer than the newest commit count.** Once the coder
-  pushes a fix your previous verdict stops counting on its own, so there is
-  nothing to clear between rounds. The flip side: if a `revising` lap ends
-  without producing a commit, your old verdict is still the newest thing on
-  the PR and will be read again.
-- **Prose does not retract a verdict.** Only the markers are read, so a
-  follow-up comment saying "wait, hold off" does not undo an `/approve` —
-  and `/approve` moves the task to `done` within a minute. To change your
-  mind, post the other marker.
-- **Editing an earlier comment to add the marker works.** The check is on
-  a comment's last-edited time, not the time it was first posted, so
-  appending `/approve` to the review you already wrote counts.
-- **The marker must be the whole line.** It is compared by equality once
-  trailing spaces are stripped, so `> /approve` (GitHub's quote-reply
-  prefix), `use /approve to vote` and `/approved` are all *not* verdicts.
-  A typo is silently not a verdict either; the task just keeps waiting.
-  One thing this does not exempt is a fenced code block — GitHub's API
-  returns raw markdown, so a bare marker line inside triple backticks
-  still votes. Indent it, or break it up, when you are quoting the
-  convention rather than using it.
-- **Only people with standing in the repo can vote.** A comment counts
-  only if GitHub reports its author as `OWNER`, `MEMBER` or `COLLABORATOR`
-  — this repo is public, so without that fence any passer-by could
-  `/approve` a task to `done`, or burn a coder+reviewer lap at a time with
-  `/request-changes`. Comments from `[bot]` accounts are skipped on top of
-  that, so a CI reviewer is never mistaken for your verdict. Neither fence
-  distinguishes *you* from an agent acting as you: anything commenting
-  under your account counts as you.
-
-**Answering from choco instead.** You can also answer without touching the
-PR, with `choco task send`:
-
-```
-choco task send <id> --text /approve
-choco task send <id> --text $'Two things to fix: …\n/request-changes'
-```
-
-The marker rules are the ones listed above for comments: `/approve` or
-`/request-changes`, alone on its own line. A reply with no marker, or with
-both, is refused and nothing is sent. This differs from a comment carrying
-both, which counts as `/request-changes`. The rest of the reply goes to the
-coder as the review. Nothing is posted to the PR. Use one channel at a time:
-a choco `/approve` sent within a minute of a newer PR `/request-changes`,
-before the task has read it, wins.
-
-If no verdict arrives within six hours the task stops waiting and parks at
-`escalate_to_human`, where `choco task send <id> --text "<note>"` resumes it into
-`revising`. A fourth `/request-changes`, after three revise rounds, parks
-it the same way instead of looping, and resuming from there starts the
-count over. `internal_review` parks the task there on its 4th rejection in a
-row (an approval starts its count over), and `checks_polling` does the same
-on the 4th red CI result in a row (any other outcome starts it over).
-`checks_polling` polls every 30 seconds for up to 30 minutes: a timeout, and
-a cancelled, startup-failure or action-required check (`ci_cancelled`,
-`ci_startup_failure`, `ci_action_required`), park the task at
-`escalate_to_human`. Green (every check passed or was skipped) and
-`no_checks` (no check reported for 3 minutes) go to `awaiting_human_review`.
-
-The PR body `open_pr` publishes holds the coder's description and the
-internal reviewer's report. A closing keyword followed by an issue reference
-in either is rewritten (`Resolves #84` becomes `Resolves issue 84`, inside
-code blocks too, since GitHub doesn't say whether it skips code), so only the
-line the script builds from the task title can close an issue.
-
-## Using the `choco` CLI
-
-With a daemon running, in a second shell:
-
-```
-choco [--base-url <url>] <COMMAND>
-```
-
-The base URL defaults to `http://127.0.0.1:4141`, and can also be set via
-the `CHOCO_BASE_URL` environment variable.
-
-Commands print a human-readable summary by default. Pass `--json` to get
-the daemon's raw JSON instead — `choco` is meant to be both human-scriptable
-and agent-callable, and `--json` is the half you pipe into `jq` or parse
-from an agent. On failure it prints `error: <message>` to stderr and exits
-`1`.
-
-### A full walkthrough
-
-Create a project:
-
-```
-$ choco project create acme
-Name     acme
-ID       7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
-Created  2026-08-01 12:33:37 UTC
-```
-
-Create a task in it. `--project` takes **either the project name or its
-id** — a name is resolved against `project list`, and is rejected naming
-the candidates if it matches more than one project (names aren't unique).
-`--workflow` is a workflow name (the project's own repo first, then the
-built-ins — `chat`, `coding-task` and `coding-task-planned` ship in the daemon) or a path to a
-workflow `.yaml` file — see [Project workflows](#project-workflows) above:
-
-```
-$ choco task create --project acme --workflow gated \
-    --title "ship the thing" --prompt "start"
-Title     ship the thing
-ID        bb93ada3-2910-4b94-911d-f6e8aab426dd
-Project   7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
-Workflow  gated
-Status    open
-Created   2026-08-01 12:33:37 UTC
-```
-
-Check where it is. `Progress` shows the stages the task has passed
-through, the outcome that caused each hop, and when it happened —
-starting with the stage it began in:
-
-```
-$ choco task status bb93ada3-...
-Title     ship the thing
-...
-Stage     review
-
-Progress
-  #  from  outcome  to      at (UTC)
-  1        start    gate    2026-08-01 12:33:31
-  2  gate  resumed  review  2026-08-01 12:33:37  ◀ current
-```
-
-Times are UTC. A step from today shows only the time (`12:33:37`); an
-earlier day's step also shows its date, as above.
-
-The trail comes from the task's `stage_entered` events, so the same
-transitions also show up inline in `choco task events` alongside the
-conversation. A task whose history has aged out of retention still gets
-its current stage named: the table ends with a `→` row marked `◀ current`.
-
-A task with no recorded transitions at all says so, rather than showing
-a blank list:
-
-```
-Progress
-  → gate (current, no transitions yet)
-```
-
-**Cost and time.** After the progress list, `choco task status` prints what
-the task has used, recorded from every agent turn's own report:
-
-```
-Cost & time
-  Total        ≈ $0.09 (API-equivalent)
-  Tokens       input 30 · output 15 · cache read 300 · cache write 60
-  Wall time    2h05m
-  Active time  1h10m
-  By stage
-    implement      ≈ $0.05  (in 20 · out 10 · cache read 200 · cache write 40)
-    review         no data
-  By role
-    coder          ≈ $0.05  (…)
-  By lap
-    implement #1   ≈ $0.03  (…)
-    implement #2   ≈ $0.02  (…)
-  By model
-    claude-sonnet  ≈ $0.09  (…)
-```
-
-The cost is the CLI's own list-price figure, so it is always approximate (`≈`).
-It reads `(API-equivalent)` when every turn ran under a subscription login —
-what the same usage would cost on the API — and `(estimated)` otherwise (an API
-key, a mix, or a CLI that does not say). Money has two decimals. A figure the
-CLI did not report prints `?` (tokens), `cost unknown` (cost) or `no data`;
-it is never counted as zero. The total line ends `(N sessions without data)` when
-sessions ended without reporting a turn, such as a killed one, and
-`(N turns without a cost)` when a turn reported tokens but no cost, so the total
-is a lower bound; the dashboard's detail row carries the same notes, and a
-list cell with such turns ends in `+`. A turn's tokens are the sum of its
-per-model figures when the CLI reports them, which includes sub-agent models. A task from before
-usage was recorded prints the single line `Cost & time  no data`.
-
-*Wall time* runs from creation to now while the task is open or stuck, and to its
-last update after that. *Active time* adds up the stages the task spent working,
-leaving out time at a `human_gate` and in a `terminal` stage; it comes from the
-stage trail, so it reads `no data` once that trail has aged out of retention.
-Cost and tokens are kept for good. A *lap* is the nth time the task entered a
-stage; a retry stays in its lap. `choco task list --json` carries each task's
-total as `usage_total`.
-
-Send a message into the task's live session (or resume a `human_gate`).
-At a gate that has markers, such as `awaiting_human_review`, the text must
-carry exactly one of them on a line of its own.
-The daemon accepts it asynchronously — the agent's reply lands as an
-event, not in this response:
-
-```
-$ choco task send bb93ada3-... --text "go"
-Message accepted for task bb93ada3-.... The reply is recorded as an event
-— see `choco task events bb93ada3-...`.
-```
-
-Stop a task that has gone wrong. This kills its agent process — and
-anything that process started, like a test run or a dev server — marks the
-task `cancelled`, and removes its worktree and its local branch
-(`task/<id>`), pushed or not. The branch's tip commit is written to the
-task's timeline before the branch is deleted, so `choco task events` still
-tells you where it was:
-
-```
-$ choco task cancel bb93ada3-...
-Task bb93ada3-... cancelled. Any running agent process, worktree and local
-branch have been cleaned up — see `choco task status bb93ada3-...`.
-```
-
-To take the work over yourself, cancel with `--keep`. It stops the agents
-and marks the task cancelled but keeps **both** the worktree and the
-branch, and hands them to you. Anything re-entering the task later would
-collide with them. `choco task status` then shows the kept worktree path
-and branch (and `--json` carries `kept_work: true`).
-
-A task that reaches `done` also removes its worktree, and deletes its
-branch when the work is safe elsewhere: the branch tip is on a
-remote-tracking ref, so it was pushed or is already merged into a fetched
-`origin/main`. This is decided from local refs only, with no fetch. An
-unpushed branch is kept, and the timeline says why. Remote branches are
-never deleted by the daemon, and branches of tasks finished before this
-behaviour existed are left alone.
-
-Cancelling ends the task's *work*, not its record: its events and the
-stage it stopped in stay readable, which is the point of cancelling rather
-than deleting. It can't be undone — a cancelled task accepts no further
-messages, and cancelling one twice (or cancelling a task that already
-finished) is a `409`.
-
-### Stuck tasks
-
-Sometimes the engine itself can't move a task forward — a stage's outcome
-has no `on:` edge to route through, a transition failed, an agent turn's
-session never started, a run was force-closed before it finished, an agent
-never reported its outcome, an agent's process kept running after its turn
-ended, or a read-only role changed its worktree. When
-that happens the task is marked `stuck` rather than silently staying
-`open`, with a human-readable reason attached.
-
-Find them:
-
-```
-$ choco task list --status stuck
-```
-
-Read the reason:
-
-```
-$ choco task status bb93ada3-...
-Title   t
-ID      bb93ada3-...
-...
-Status  stuck
-Stuck   stage 'run': command finished with outcome 'error' but the stage
-        has no 'on:' edge for it
-...
-```
-
-Recover with a retry, which re-enters the task's current stage — not a
-replay of whatever happened before, since the daemon never persisted an
-outcome to replay:
-
-```
-$ choco task retry bb93ada3-...
-Retrying stage 'run' from scratch, in a fresh session: it is not an agent
-turn, so it has no session. See `choco task status bb93ada3-...`.
-```
-
-A `shell` stage has no agent session, so there is nothing to resume and it
-says so. An agent turn that was cut off from *outside* — the account hitting
-a usage limit, or the daemon closing a session that had gone idle — is
-resumed instead, continuing the same CLI session rather than starting a new
-one over a working tree full of work it knows nothing about:
-
-```
-$ choco task retry bb93ada3-...
-Retrying stage 'coding' by resuming its interrupted session
-(47a18986-...) — it picks up where it left off, with its working tree
-untouched. See `choco task status bb93ada3-...`.
-```
-
-Anything the agent itself got wrong still starts fresh — `Retrying stage
-'coding' from scratch, in a fresh session: its turn ended 'no_report', which
-is the agent's own failure rather than an interruption.` — so a turn that
-crashes deterministically isn't resumed back into the same crash. Use
-`--resume` to insist (it fails, rather than quietly starting fresh, when
-there is nothing safe to resume) or `--fresh` to start over anyway.
-
-Or give up on it the same way as any other task:
-
-```
-$ choco task cancel bb93ada3-...
-```
-
-A stuck task accepts no messages (`choco task send` is a `409`, the same
-shape as sending to a cancelled task) until a retry reopens it.
-
-Read the conversation:
-
-```
-$ choco task events bb93ada3-...
-TIME                     KIND               DETAIL
-2026-08-01 12:33:51 UTC  human_message      explain the plan
-2026-08-01 12:33:51 UTC  session_meta       a4cbce43-e70c-49ab-a407-2ae4701b7838
-2026-08-01 12:33:51 UTC  assistant_message  echo:explain the plan
-```
-
-Long output is paginated — pass `--limit N`, and follow the `--after
-<token>` hint printed when more events remain. There is also a live
-WebSocket stream at `/tasks/{id}/events/live` that the CLI doesn't wrap.
-
-List things:
-
-```
-$ choco task list
-TITLE      ID                                    STATUS  WORKFLOW  CREATED
-chat task  ed9e8a7d-e5d4-4aeb-b04c-b47d14145940  open    chat      2026-08-01 12:33:51 UTC
-
-$ choco task list --project acme          # by name or id
-$ choco task list --status open           # free-form, not a fixed enum
-$ choco task list --status cancelled      # open | closed | cancelled | stuck today
-$ choco project list
-```
-
-### Scripting it
-
-`--json` turns any command into machine-readable output:
-
-```
-$ choco --json task list | jq -r '.[0].id'
-ed9e8a7d-e5d4-4aeb-b04c-b47d14145940
-
-$ choco --json task status <id> | jq -r '.workflow_state.current_stage'
-review
-```
-
-`task send` returns 202 with no body, so under `--json` it prints nothing
-at all rather than a message that would break a pipe.
-
-### Watching a task
-
-`choco task status <id>` can watch a task or wait on it, so scripts need no
-hand-written polling loop. It polls the daemon (`GET /tasks/<id>`).
-
-| Flag | Meaning |
-|---|---|
-| `--live` | Keep the view current until the task closes or is cancelled. |
-| `--until <target>` | Block until the task reaches `<target>`, then exit 0. Implies watching. |
-| `--interval <dur>` | Poll cadence. Default `2s`. Needs `--live` or `--until`. |
-| `--timeout <dur>` | Give up after this long and exit 5. Default: none. Needs `--live` or `--until`. |
-
-`<dur>` is `<integer><s|m|h>`, non-zero, the same spelling as workflow YAML
-(`5s`, `30s`, `5m`, `1h`). `<target>` is `closed`, `cancelled`, `stuck`, or
-`stage:<name>` (the task has entered that stage, even if it already left it
-between two polls). The `stage:` prefix keeps stage names apart from
-statuses. A `--live` watch alone does not stop at `stuck`, since a human may
-`choco task retry` it.
-
-| Exit code | Meaning |
-|---|---|
-| 0 | The target was reached (with `--live` alone: the task closed). |
-| 1 | An error: unknown task, API error, or the daemon is unreachable (a connection lost mid-watch is retried; three failures in a row end it). |
-| 2 | A usage error. |
-| 3 | The task became stuck, and `stuck` was not the target. |
-| 4 | The task was cancelled, and `cancelled` was not the target. |
-| 5 | `--timeout` elapsed first. |
-| 6 | The task closed without reaching the target. |
-
-Every non-zero exit from a watch explains itself on stderr.
-
-```
-$ choco task status "$id" --until closed --timeout 2h
-$ case $? in
-    0) echo "done" ;;
-    3) echo "stuck — needs a human" ;;
-    4) echo "cancelled" ;;
-    5) echo "still running after 2h" ;;
-    *) echo "something else went wrong" ;;
-  esac
-```
-
-Watching in a terminal redraws the status view every poll:
-
-```
-$ choco task status "$id" --live
-```
-
-When stdout is piped, the output is one line per change, with no escape
-sequences. With `--json` it is NDJSON: one full task object per line, per
-change.
-
-### Watching all tasks
-
-`choco dashboard` (alias `choco dash`) is an interactive terminal view of every
-task on the daemon. It needs a terminal: with a pipe, a redirect or `--json` it
-exits 1 and points to `choco task list` and `choco task status --live`.
-
-```
-$ choco dashboard [--project <name|id>] [--interval <dur>] [--closed <N>]
-```
-
-`--interval` is how often it polls (default `2s`); `--closed` is how many
-recently closed or cancelled tasks to show (default 10). The screen is one
-scrollable list in four sections:
-
-| Section | Holds | Ordered |
-|---|---|---|
-| Needs you | `open` tasks at a `human_gate`, in any workflow | longest waiting first |
-| In progress | every other `open` task, with its laps (the largest loop counter, `×N`) | longest in its stage first |
-| Stuck | `stuck` tasks, whatever their stage, with the first line of the reason | longest stuck first |
-| Recently closed | the latest `closed` and `cancelled` tasks | newest first |
-
-**Two modes.** Without `--project` every row has a `project` column (the
-project's name) and the header says `all projects`. With `--project` the column
-is gone and the header names the project. Narrow terminals drop columns: below
-91 columns the `cost` column (the task's total, `≈$1.23`, or `no data`), below
-80 the laps and PR columns, below 60 the stage and project columns too.
-Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off.
-
-| Key | Action |
-|---|---|
-| `↑` `k` / `↓` `j` | move, across section boundaries |
-| `PgUp` `PgDn`, `g` `G` | page; top / bottom |
-| `Tab` / `Shift-Tab` | next / previous non-empty section |
-| `⏎` | open the task's status view: the fields and progress `choco task status` shows, the loop counters, what the task is waiting for, its PR, a `Cost` row (`≈ $0.09 (API-equivalent) · wall 2h05m · active 1h10m`, or `no data`) and the last 5 events, following new ones (`Esc` returns) |
-| `e` | in the detail: the full event stream (the last 200 events, following new ones; `PgUp`/`PgDn` scroll back, `End` follows again); `e` or `Esc` returns to the status view |
-| `o` | open the task's pull request |
-| `r` | retry a `stuck` task |
-| `c` | cancel an `open` or `stuck` task |
-| `?` | list the keys |
-| `q`, `Ctrl-C` | quit |
-
-The selection follows the task, not the row, so it stays put when a refresh
-re-sorts the list.
-
-Actions apply to the selected task (the open one, in the detail view):
-
-- `r` asks `Retry "<title>"? Its stage runs again. [y/N]`; `y` runs
-  `choco task retry` (resuming the agent session when it can) and reports
-  `retried: resumed` or `retried: fresh`. On a task that is not stuck it says so
-  and sends nothing.
-- `c` asks `Cancel "<title>"? This kills its agent and deletes its worktree and
-  branch. It cannot be undone. [y/N]`; `y` cancels the task. The dashboard never
-  keeps the work (`--keep` is `choco task cancel` only).
-- Any key but `y` closes the question and sends nothing. A daemon error is shown
-  verbatim on the bottom line, and a success refreshes the list at once.
-- `o` opens the PR with `open` (macOS) or `xdg-open`. Over SSH (`SSH_CONNECTION`
-  or `SSH_TTY` set) it launches nothing and prints `PR #N: <url>` instead.
-
-If the daemon goes away the last data stays on screen, the bottom line turns red
-(`daemon unreachable: …; retrying every 2s (data 34s old)`) and polling goes on,
-so the dashboard recovers on its own.
-
-### Per-role config
-
-A workflow can declare more than one role — a `coder` and a `reviewer`, say —
-and each resolves its own CLI, model and system prompt from three layers,
-most specific wins, independently per field:
-
-```
-task config (--role-* below)  >  the workflow's roles: block  >  ~/.config/chocofactory/config.yaml
-```
-
-The `--role-*` flags set the task-level layer. Each is `ROLE=VALUE` and each
-is repeatable, so several roles can be configured in one command. Using a
-two-role workflow of your own, passed with `--workflow <path-to.yaml>` (the
-built-in multi-role `coding-task.yaml` is still to come):
-
-```
-$ choco task create --project acme --workflow my-coding-task \
-    --title "fix the flaky test" --prompt "see issue 41" --repo ~/src/acme \
-    --role-model coder=opus \
-    --role-model reviewer=sonnet \
-    --role-system-prompt-file reviewer=./strict-reviewer.md
-```
-
-The role names are whatever that workflow's `roles:` block declares — a name
-that isn't in it is simply not applied to anything.
-
-A role's `cli:` picks the agent adapter that runs it. The adapters are
-`claude` (the default) and `omp`, described below. An unknown name is rejected rather than run as
-`claude`: when a workflow is loaded, when the daemon starts (a bad `cli:` in
-`config.yaml` stops it with the message), and when a task is created or
-reconfigured (`--role-cli`). A value that slips in later, such as `config.yaml`
-edited while the daemon runs, parks the task `stuck` when the turn starts. A
-session can only be resumed by the adapter that created it, so a retry whose
-role's `cli:` has changed starts fresh instead.
-
-| Flag | Sets |
-|---|---|
-| `--role-cli ROLE=CLI` | which agent adapter runs that role (`claude` or `omp`) |
-| `--role-model ROLE=MODEL` | that role's model |
-| `--role-system-prompt ROLE=TEXT` | that role's system prompt, inline |
-| `--role-system-prompt-file ROLE=PATH` | the same, read from a file |
-
-There is deliberately no bare `--model`: with two roles it would be
-ambiguous which one it meant.
-
-`--role-system-prompt-file` is read by `choco` itself and sent as text — the
-daemon is never handed a path from task config, which is the least-trusted
-of the three layers.
-
-`--config '<json>'` is the escape hatch, applied *before* the typed flags
-(which win per field), for agent callers and for anything the flags don't
-cover:
-
-```
-$ choco task create ... --config '{"roles":{"coder":{"model":"opus"}}}'
-```
-
-#### `cli: omp`
-
-`omp` is [oh-my-pi](https://github.com/can1357/oh-my-pi), a fork of the Pi
-coding agent. A role with `cli: omp` runs on whatever models omp offers, such
-as `openai-codex/gpt-5.6-terra`, so a workflow can put one role on a
-non-Anthropic model:
-
-```yaml
-roles:
-  reviewer:
-    cli: omp
-    model: openai-codex/gpt-5.6-terra:high
-```
-
-- **Login.** The role uses your existing omp login. choco takes no extra
-  step: it never logs in, never creates a profile, and never reads or copies
-  omp's credential files. Set `CHOCOFACTORY_OMP_BINARY` to use a different
-  `omp` executable.
-- **Anthropic models.** A role that runs omp with an Anthropic model must
-  authenticate with an Anthropic API key (`ANTHROPIC_API_KEY`, from the Claude
-  Console), not a Claude Free, Pro or Max login. Anthropic's terms allow a
-  subscription login only in Claude Code and Anthropic's own apps; see the
-  [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) (section 3,
-  item 7) and
-  [Authentication and credential use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).
-  Roles on `cli: claude` are not affected.
-- **What a role sees.** An isolated role (the default) gets the model, the
-  tools `read`, `bash`, `edit`, `write`, `glob`, `grep` and `todo` (minus any
-  `disallowed_tools`), the skills its `skills:` list names, and the repo's own
-  instruction files: the root `CLAUDE.md` and `AGENTS.md`, and
-  `.omp/AGENTS.md` and `.omp/RULES.md`, each only if present. omp's own
-  `claude` provider also loads the repo's `.claude/CLAUDE.md` (the repo's own
-  file; there is no walk up to parent folders). It does not see
-  anything from folders above the repo, your home folder, `~/.claude`, `~/.omp`
-  or your own omp setup (settings that don't load instructions, tools or
-  extensions, such as retry and compaction, still apply), and `.omp/mcp.json`
-  is not loaded. Instruction files in subfolders (`sub/CLAUDE.md`) are not
-  loaded either: a known gap. A role with `inherit_operator_config: true` (the
-  chat role) keeps your omp setup and the repo's files, as it does on claude.
-- **Outside a disposable worktree.** A role that doesn't run in a
-  `worktree: true` checkout can read files but has its edits and commands
-  refused, and the agent sees the refusal. A role in a worktree has full
-  tool access there, like a claude role.
-- **No memory.** `memory: true` on an omp role is rejected, with the role's
-  name, when the workflow loads, when a task is created or reconfigured, and
-  when a turn starts. A skill name containing `,` `*` `?` `[` `]` `{` or `}`
-  is rejected for the same reason: omp would read it as a pattern.
-- **Thinking level.** `medium`, unless the model string ends in a level, such
-  as `:high` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
-  `auto` or `inherit`).
-- **Cost.** omp's list price is recorded as the turn's cost. On a subscription
-  login it is shown as the API-equivalent price, like a claude subscription's;
-  for a model omp has no price for, the cost is unknown rather than zero.
-  Usage is best-effort: a failed read never changes how a turn ends.
-- **Telemetry.** No telemetry is sent: omp's QA reporting and OpenTelemetry
-  export are switched off for every omp process choco starts.
-
-### Changing a task's config later
-
-`task reconfigure` merges into a task's existing config, so changing one
-role leaves the task-wide `--repo` and every other role alone:
-
-```
-$ choco task reconfigure <task-id> --role-model coder=haiku
-```
-
-It takes effect on the task's **next** turn: role config is re-read from the
-database on every stage entry and never cached, so a session already running
-keeps the config it started with.
-
-### Other flags
-
-- `--repo <path>` on `task create` sets the working directory for the
-  task's agent subprocess (stored as `config.cwd`). Defaults to the
-  daemon's own working directory.
-- `--base-url <url>` targets a daemon on a non-default port, e.g. one
-  started with `CHOCOFACTORY_PORT=41500`.
-
-## Tests
-
-```
-cargo build --workspace --all-targets   # test harnesses spawn these binaries
-cargo test --workspace
-```
-
-`jq` must be installed to run `cargo test --workspace`: the `gh` stubs in
-`chocofactoryd/src/engine/tests.rs`, `chocofactoryd/tests/e2e_smoke.rs` and
-`chocofactoryd/tests/await_review_script.rs` apply `-q` filters with it, so
-those tests fail on a machine without it.
-CI has it.
-
-Tests never spawn the real `claude` — the integration suites point the
-daemon at `mock-claude` or a Python fixture instead. `scripts/probe-setting-sources.sh` is an opt-in
-check against the real CLI that `local` settings don't leak into a linked
-worktree (#141); it costs a little (two tiny haiku turns) and is not part of CI.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building from source, running the tests and releasing.
 
 ## License
 
