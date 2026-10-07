@@ -7160,7 +7160,11 @@ case "$1" in
                 # `open_pr`'s probe and its read-back, both scoped to open
                 # PRs. Empty until `pr create` has run, so the first lap
                 # creates and every later lap reuses.
-                if [ -s "$created" ]; then
+                if printf '%s\n' "$@" | grep -q headRefOid && ! printf '%s\n' "$@" | grep -q url; then
+                    # `open_pr`'s pre-push head lookup: no head commit, so
+                    # the push stays a plain one (a later lap only adds commits).
+                    :
+                elif [ -s "$created" ]; then
                     if printf '%s\n' "$@" | grep -q url; then
                         echo '{{"number": 42, "url": "https://example.test/pr/42"}}'
                     else
