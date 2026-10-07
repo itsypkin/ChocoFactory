@@ -1000,6 +1000,29 @@ async fn wait_for(screen: &Arc<Mutex<String>>, what: &str) {
     );
 }
 
+/// Whether some screen line's whitespace-split tokens contain `tokens`
+/// consecutively (the progress table pads its columns, so exact spacing is
+/// not worth asserting in a loose check).
+fn row_has(screen: &str, tokens: &[&str]) -> bool {
+    screen.lines().any(|l| {
+        let t: Vec<&str> = l.split_whitespace().collect();
+        t.windows(tokens.len()).any(|w| w == tokens)
+    })
+}
+
+async fn wait_for_row(screen: &Arc<Mutex<String>>, tokens: &[&str]) {
+    for _ in 0..300 {
+        if row_has(&screen.lock().unwrap(), tokens) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "never saw a row {tokens:?}; last screen:\n{}",
+        screen.lock().unwrap()
+    );
+}
+
 #[tokio::test]
 async fn the_real_loop_against_a_fake_daemon() {
     let tasks = vec![
@@ -1083,7 +1106,7 @@ async fn the_real_loop_against_a_fake_daemon() {
         ktx.send(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         // The status view: the daemon's progress line, and the last events.
-        wait_for(&latest, "1. coding (start)").await;
+        wait_for_row(&latest, &["1", "start", "coding"]).await;
         wait_for(&latest, "hello streamed").await;
         wait_for(&latest, "second streamed").await;
         // `e` expands to the full stream.
@@ -1730,7 +1753,7 @@ fn title_row(title: &str, right: &str, w: usize) -> String {
 }
 
 #[test]
-fn the_status_view_shows_fields_progress_counters_and_the_last_five_events() {
+fn the_status_view_shows_fields_progress_counters_and_the_event_tail() {
     let app = busy_view();
     let expected = [
         title_row(
@@ -1749,20 +1772,20 @@ fn the_status_view_shows_fields_progress_counters_and_the_last_five_events() {
         "Stage     internal_review for 12m".into(),
         "Cost      no data".into(),
         sep("progress", 100),
-        "  1. coding (start)   2026-01-01 03:41:00 UTC".into(),
-        "  2. coding --[done]--> internal_review   2026-01-01 04:10:00 UTC".into(),
-        "  3. internal_review --[changes_requested]--> revising   2026-01-01 04:50:00 UTC".into(),
-        "  4. revising --[done]--> internal_review   2026-01-01 11:48:00 UTC   (current)".into(),
+        "  #  from             outcome            to               at (UTC)".into(),
+        "  1                   start              coding           03:41:00".into(),
+        "  2  coding           done               internal_review  04:10:00".into(),
+        "  3  internal_review  changes_requested  revising         04:50:00".into(),
+        "  4  revising         done               internal_review  11:48:00  ◀ current".into(),
         "Loop counters  internal_review=2".into(),
         sep("last events (e expands)", 100),
+        format!("  {}  human_message message 0", at(0)),
+        format!("  {}  human_message message 1", at(1)),
         format!("  {}  human_message message 2", at(2)),
         format!("  {}  human_message message 3", at(3)),
         format!("  {}  human_message message 4", at(4)),
         format!("  {}  human_message message 5", at(5)),
         format!("  {}  human_message message 6", at(6)),
-        String::new(),
-        String::new(),
-        String::new(),
         String::new(),
         String::new(),
         String::new(),
@@ -1896,7 +1919,7 @@ fn a_stuck_task_shows_the_reason_wrapped_in_the_error_style() {
         .expect(&s);
     assert_eq!(
         lines[i],
-        "Stuck     the agent hit a usage limit and could not continue"
+        "Stuck     the agent hit a usage limit and could not"
     );
     assert!(
         lines[i + 1].starts_with("          ") && !lines[i + 1].starts_with("           "),
@@ -1948,7 +1971,7 @@ fn the_expanded_view_has_the_full_stream_and_its_own_footer() {
     let mut expected = vec![
         title_row(
             "Per-kind stage execution (#55)",
-            "e status · Esc back · ? help",
+            "e/Esc status · ? help",
             100,
         ),
         sep("events (following)", 100),
@@ -1957,7 +1980,7 @@ fn the_expanded_view_has_the_full_stream_and_its_own_footer() {
         expected.push(format!("  {}  human_message message {n}", at(n)));
     }
     expected.extend(std::iter::repeat_n(String::new(), 20));
-    expected.push("PgUp/PgDn scroll  End follow  e status  o PR  r retry  c cancel".into());
+    expected.push("PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  c cancel".into());
     assert_screen(&render(&app, 100, 30), &expected.join("\n"));
     // Scrolling still works there.
     push_events(&mut app, BUSY, 60);
@@ -2050,28 +2073,29 @@ fn s_does_nothing_in_either_view_or_the_help() {
 #[test]
 fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
     let app = busy_view();
-    // 21 rows: the whole status block, and two of the five events.
-    let s = render(&app, 100, 21);
+    // 22 rows: the whole status block, and two of the events.
+    let s = render(&app, 100, 22);
     for want in [
         "Role      coder",
-        "1. coding (start)",
         "Loop counters",
         "message 5",
         "message 6",
     ] {
         assert!(s.contains(want), "{want}\n{s}");
     }
+    assert!(row_has(&s, &["1", "start", "coding"]), "{s}");
     assert!(!s.contains("message 4"), "{s}");
     assert!(s.contains("last events (e expands)"));
     // 19 rows: no room for an event line, so no tail at all.
     let s = render(&app, 100, 19);
     assert!(!s.contains("last events") && !s.contains("message"), "{s}");
     assert!(
-        s.contains("Role      coder") && s.contains("1. coding (start)"),
+        s.contains("Role      coder") && row_has(&s, &["1", "start", "coding"]),
         "{s}"
     );
 
-    // 12 rows: no events; the progress list keeps its newest line.
+    // 12 rows: no events; the path row goes, and the progress list keeps its
+    // header and its newest line.
     let expected = [
         title_row(
             "Per-kind stage execution (#55)",
@@ -2081,12 +2105,12 @@ fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
         "ID        9c03aa17-bbbb".into(),
         "Project   chocofactory".into(),
         "Workflow  coding-task".into(),
-        "Workflow  builtin:coding-task  [0123456789ab]".into(),
         "Status    open".into(),
         "Stage     internal_review for 12m".into(),
         sep("progress", 100),
+        "  #  from             outcome            to               at (UTC)".into(),
         "  … 3 earlier steps".into(),
-        "  4. revising --[done]--> internal_review   2026-01-01 11:48:00 UTC   (current)".into(),
+        "  4  revising         done               internal_review  11:48:00  ◀ current".into(),
         "Loop counters  internal_review=2".into(),
         "e events  o PR  r retry  c cancel  Esc back".into(),
     ]
@@ -2102,7 +2126,7 @@ fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
         "Workflow  coding-task",
         "Status    open",
         "Stage     internal_review for 12m",
-        "4. revising",
+        "◀",
     ] {
         assert!(s.contains(want), "{want}\n{s}");
     }
@@ -2110,18 +2134,19 @@ fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
 
 #[test]
 fn a_cut_progress_list_leaves_room_before_rows_go() {
-    // Rows are dropped Role, Created, Repo, path - and only as far as needed.
+    // Rows are dropped Role, Created, Repo, path - and only as far as needed,
+    // with every progress step (and its header row) still counted.
     let app = busy_view();
-    let s = render(&app, 100, 14);
+    let s = render(&app, 100, 17);
     assert!(!s.contains("Role") && s.contains("Created"), "{s}");
-    let s = render(&app, 100, 13);
+    let s = render(&app, 100, 16);
     assert!(!s.contains("Created") && s.contains("Repo"), "{s}");
-    let s = render(&app, 100, 12);
+    let s = render(&app, 100, 15);
     assert!(
         !s.contains("Repo") && s.contains("builtin:coding-task"),
         "{s}"
     );
-    let s = render(&app, 100, 11);
+    let s = render(&app, 100, 14);
     assert!(
         !s.contains("builtin:coding-task") && s.contains("Stage"),
         "{s}"
@@ -2164,7 +2189,7 @@ fn before_the_answer_the_view_loads_from_the_snapshot_and_the_answer_replaces_it
     answer(&mut app, BUSY, Ok(busy_detail()));
     let s = render(&app, 100, 30);
     assert!(
-        !s.contains("loading…") && s.contains("1. coding (start)"),
+        !s.contains("loading…") && row_has(&s, &["1", "start", "coding"]),
         "{s}"
     );
     assert!(s.contains("Repo      /home/dev/chocofactory"), "{s}");
@@ -2189,7 +2214,7 @@ fn a_failed_first_answer_is_shown_and_the_next_success_replaces_it() {
     answer(&mut app, BUSY, Ok(busy_detail()));
     let s = render(&app, 100, 30);
     assert!(
-        !s.contains("could not load") && s.contains("1. coding (start)"),
+        !s.contains("could not load") && row_has(&s, &["1", "start", "coding"]),
         "{s}"
     );
 }
@@ -2206,7 +2231,7 @@ fn a_failed_refresh_keeps_the_rows_and_says_so_on_the_separator() {
         "{s}"
     );
     assert!(
-        s.contains("1. coding (start)") && s.contains("Repo      /home/dev"),
+        row_has(&s, &["1", "start", "coding"]) && s.contains("Repo      /home/dev"),
         "{s}"
     );
     answer(&mut app, BUSY, Ok(busy_detail()));
@@ -2247,7 +2272,7 @@ fn a_task_that_left_the_lists_keeps_its_last_answer() {
     assert!(s.contains("ID        9c03aa17-bbbb"), "{s}");
     assert!(s.contains("Stage     internal_review"), "{s}");
     assert!(
-        s.contains("Repo      /home/dev/chocofactory") && s.contains("1. coding (start)"),
+        s.contains("Repo      /home/dev/chocofactory") && row_has(&s, &["1", "start", "coding"]),
         "{s}"
     );
     // With neither a snapshot nor an answer there is only the notice.
@@ -2352,7 +2377,7 @@ fn a_waiting_task_keeps_its_progress_or_error_on_a_tiny_screen() {
     answer(&mut app, id, Ok(data));
     let s = render(&app, 40, 10);
     assert!(s.contains("─ progress"), "{s}");
-    assert!(s.contains("4. revising"), "{s}");
+    assert!(row_has(&s, &["4", "revi…", "done", "inte…"]), "{s}");
 }
 
 #[test]
@@ -2472,7 +2497,7 @@ fn a_two_step_progress_list_is_never_cut_to_one_hidden_step() {
         let s = render(&app, w, h);
         assert!(!s.contains("earlier step"), "{s}");
         if h == 13 {
-            assert!(s.contains("1. coding (start)"), "{s}");
+            assert!(row_has(&s, &["1", "start", "codi…"]), "{s}");
         }
     }
 }
@@ -2500,7 +2525,7 @@ fn a_two_step_list_next_to_wrapped_rows_keeps_the_newest_step() {
             answer(&mut app, id, Ok(d));
             let s = render(&app, w, h);
             assert!(
-                s.contains("2. coding --[done]--> internal_review"),
+                row_has(&s, &["2", "codi…", "done", "inte…"]),
                 "{id} {w}x{h}\n{s}"
             );
             assert!(!s.contains("earlier step"), "{id} {w}x{h}\n{s}");

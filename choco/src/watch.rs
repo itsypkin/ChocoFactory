@@ -287,7 +287,7 @@ pub fn outcome(target: Option<&Until>, now: &Snapshot) -> Option<WatchEnd> {
 pub fn frame(detail: &Value, interval: &str, now: DateTime<Utc>) -> String {
     format!(
         "\x1b[2J\x1b[H{}\n\nwatching every {interval} · updated {} UTC · Ctrl-C to stop",
-        render::task_detail(detail),
+        render::task_detail(detail, now),
         clock(now)
     )
 }
@@ -736,7 +736,7 @@ mod tests {
             .with_timezone(&Utc);
         let f = frame(&detail, "2s", now);
         assert!(f.starts_with("\x1b[2J\x1b[H"));
-        assert!(f.contains(&render::task_detail(&detail)));
+        assert!(f.contains(&render::task_detail(&detail, now)));
         assert!(f.ends_with("watching every 2s · updated 14:22:55 UTC · Ctrl-C to stop"));
     }
 }

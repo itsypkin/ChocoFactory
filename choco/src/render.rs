@@ -123,7 +123,7 @@ pub fn init_workflows(result: &crate::client::InitWorkflowsResult) -> String {
 
 pub fn task(t: &Task) -> String {
     let mut pairs = vec![
-        ("Title", single_line(&t.title)),
+        (LABEL_TITLE, single_line(&t.title)),
         ("ID", t.id.clone()),
         ("Project", t.project_id.clone()),
         ("Workflow", t.workflow_def.clone()),
@@ -134,18 +134,18 @@ pub fn task(t: &Task) -> String {
     if t.status == "stuck"
         && let Some(reason) = &t.stuck_reason
     {
-        pairs.push(("Stuck", single_line(reason)));
+        pairs.push((LABEL_STUCK, single_line(reason)));
     }
     if let Some(cwd) = t.config.get("cwd").and_then(Value::as_str) {
-        pairs.push(("Repo", cwd.to_string()));
+        pairs.push((LABEL_REPO, cwd.to_string()));
     }
     // Without this, `task create --role-model coder=opus` and
     // `task reconfigure` would both print nothing about the override that
     // was just applied, leaving `--json` as the only way to confirm it.
     for (role, settings) in role_summaries(&t.config) {
-        pairs.push(("Role", format!("{role}: {settings}")));
+        pairs.push((LABEL_ROLE, format!("{role}: {settings}")));
     }
-    pairs.push(("Created", timestamp(&t.created_at)));
+    pairs.push((LABEL_CREATED, timestamp(&t.created_at)));
     fields(&pairs)
 }
 
@@ -242,6 +242,23 @@ pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
     format!("{what} See `choco task status {task_id}`.")
 }
 
+/// Labels of the rows [`task_fields`] produces. The dashboard matches on
+/// these (to drop rows on a short screen), so a rename here can't silently
+/// break it.
+pub const LABEL_TITLE: &str = "Title";
+pub const LABEL_ID: &str = "ID";
+pub const LABEL_PROJECT: &str = "Project";
+pub const LABEL_WORKFLOW: &str = "Workflow";
+pub const LABEL_WORKFLOW_FILE: &str = "Workflow file";
+pub const LABEL_STATUS: &str = "Status";
+pub const LABEL_STUCK: &str = "Stuck";
+pub const LABEL_KEPT_WORKTREE: &str = "Kept worktree";
+pub const LABEL_KEPT_BRANCH: &str = "Kept branch";
+pub const LABEL_REPO: &str = "Repo";
+pub const LABEL_ROLE: &str = "Role";
+pub const LABEL_CREATED: &str = "Created";
+pub const LABEL_STAGE: &str = "Stage";
+
 /// The field rows `choco task status` prints for the daemon's `TaskDetail`
 /// JSON, as `(label, value)` pairs: the order and wording are the CLI's, and
 /// the dashboard's status view starts from the same rows.
@@ -250,9 +267,9 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
 
     let mut pairs = vec![
         ("Title", single_line(get("title"))),
-        ("ID", get("id").to_string()),
-        ("Project", get("project_id").to_string()),
-        ("Workflow", get("workflow_def").to_string()),
+        (LABEL_ID, get("id").to_string()),
+        (LABEL_PROJECT, get("project_id").to_string()),
+        (LABEL_WORKFLOW, get("workflow_def").to_string()),
     ];
     // Only present for a task created after issue #88 — a legacy task
     // (`workflow_path: null`) shows no such line, exactly as if this field
@@ -272,9 +289,9 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
         if let Some(sha) = detail.get("workflow_sha256").and_then(Value::as_str) {
             line.push_str(&format!("  [{}]", &sha[..sha.len().min(12)]));
         }
-        pairs.push((if builtin { "Workflow" } else { "Workflow file" }, line));
+        pairs.push((if builtin { LABEL_WORKFLOW } else { LABEL_WORKFLOW_FILE }, line));
     }
-    pairs.push(("Status", get("status").to_string()));
+    pairs.push((LABEL_STATUS, get("status").to_string()));
     // Right after Status, so the reason for a stuck task (X-4, #61) reads
     // next to the status value that explains it needs one.
     if get("status") == "stuck"
@@ -286,10 +303,10 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
     // a person; say where, or the work is as good as lost.
     if let Some(kept) = detail.get("kept").filter(|k| !k.is_null()) {
         if let Some(path) = kept.get("worktree_path").and_then(Value::as_str) {
-            pairs.push(("Kept worktree", path.to_string()));
+            pairs.push((LABEL_KEPT_WORKTREE, path.to_string()));
         }
         if let Some(branch) = kept.get("branch").and_then(Value::as_str) {
-            pairs.push(("Kept branch", branch.to_string()));
+            pairs.push((LABEL_KEPT_BRANCH, branch.to_string()));
         }
     }
     // Same per-role lines `task` renders: `task status` is where an existing
@@ -307,7 +324,7 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
     pairs.push(("Created", timestamp_str(get("created_at"))));
 
     if let Some(current) = detail_stage(detail) {
-        pairs.push(("Stage", current.to_string()));
+        pairs.push((LABEL_STAGE, current.to_string()));
     }
     pairs
 }
@@ -320,9 +337,13 @@ pub fn detail_stage(detail: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-/// The detail's progress lines (see [`stage_progress_lines`]); `None` when
+/// The detail's progress table (see [`stage_progress_table`]); `None` when
 /// the task has no workflow state yet.
-pub fn detail_progress(detail: &Value) -> Option<Vec<String>> {
+pub fn detail_progress(
+    detail: &Value,
+    now: DateTime<Utc>,
+    width: Option<usize>,
+) -> Option<ProgressTable> {
     detail.get("workflow_state").filter(|s| !s.is_null())?;
     // The trail is a sibling of `workflow_state`, not a field inside
     // it: X-3 moved it out of `stage_history` and into the events
@@ -332,7 +353,12 @@ pub fn detail_progress(detail: &Value) -> Option<Vec<String>> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    Some(stage_progress_lines(trail, detail_stage(detail)))
+    Some(stage_progress_table(
+        trail,
+        detail_stage(detail),
+        now,
+        width,
+    ))
 }
 
 /// The loop count of one `loop_counters` value: a bare number, or the
@@ -362,12 +388,16 @@ pub fn loop_counters_line(detail: &Value) -> Option<String> {
 
 /// Renders the daemon's `TaskDetail` (a `Task` flattened alongside
 /// `workflow_state`) from raw JSON — it has no exported Rust type.
-pub fn task_detail(detail: &Value) -> String {
+pub fn task_detail(detail: &Value, now: DateTime<Utc>) -> String {
     let mut out = fields(&task_fields(detail));
-    match detail_progress(detail) {
-        Some(lines) => {
+    match detail_progress(detail, now, None) {
+        Some(table) => {
             out.push_str("\n\nProgress\n");
-            out.push_str(&lines.join("\n"));
+            for line in table.header.iter().chain(&table.rows) {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.pop();
             if let Some(line) = loop_counters_line(detail) {
                 out.push_str(&format!("\n\n{line}"));
             }
@@ -550,82 +580,242 @@ pub fn cost_and_time(detail: &Value) -> String {
 /// backfill, so its trail is legitimately empty and renders as "no
 /// transitions yet" rather than being reconstructed from data that isn't
 /// there.
-#[cfg(test)]
-fn stage_progress(trail: &[Value], current: Option<&str>) -> String {
-    stage_progress_lines(trail, current).join("\n")
+///
+/// Rendered as an aligned table (#211): `#`, `from`, `outcome`, `to`, `at
+/// (UTC)`, then a `◀ current` marker. The header comes back separately so
+/// the dashboard can style it and keep it out of its "earlier steps" cut.
+/// Column widths are computed over the whole trail and the header titles, so
+/// they don't depend on which rows a caller shows.
+///
+/// `width`: `None` never truncates. With `Some(w)` the `from`/`outcome`/`to`
+/// columns shrink (widest first, leftmost on a tie, to a floor of five
+/// characters) until the widest line fits; failing that `◀ current` becomes
+/// `◀`. Lines still wider than `w` are the caller's to cut.
+pub struct ProgressTable {
+    /// Column titles; `None` when there is no table (no trail).
+    pub header: Option<String>,
+    /// One line per step (or the single no-table line).
+    pub rows: Vec<String>,
 }
 
-/// [`stage_progress`] as one string per line.
-pub fn stage_progress_lines(trail: &[Value], current: Option<&str>) -> Vec<String> {
+/// One row's cells, before layout.
+struct StepCells {
+    num: String,
+    from: String,
+    outcome: String,
+    to: String,
+    at: String,
+    current: bool,
+}
+
+const MARKER: &str = "◀ current";
+const MARKER_SHORT: &str = "◀";
+
+/// Cuts `s` to `w` characters, ending in `…` when something was dropped.
+fn cut_cell(s: &str, w: usize) -> String {
+    if s.chars().count() <= w {
+        return s.to_string();
+    }
+    if w == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(w - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Lays the cells out at the given column widths `[num, from, outcome, to,
+/// at]`. The `at` column is padded only on a row carrying the marker, so
+/// the marker lines up and nothing else has trailing spaces.
+fn layout_row(cells: [&str; 5], widths: &[usize; 5], marker: Option<&str>) -> String {
+    let mut line = format!("  {:>w$}", cells[0], w = widths[0]);
+    for i in 1..4 {
+        line.push_str(&format!("  {:<w$}", cut_cell(cells[i], widths[i]), w = widths[i]));
+    }
+    line.push_str("  ");
+    line.push_str(cells[4]);
+    if let Some(marker) = marker {
+        let pad = widths[4].saturating_sub(cells[4].chars().count());
+        line.push_str(&" ".repeat(pad));
+        line.push_str("  ");
+        line.push_str(marker);
+    }
+    line.trim_end().to_string()
+}
+
+pub fn stage_progress_table(
+    trail: &[Value],
+    current: Option<&str>,
+    now: DateTime<Utc>,
+    width: Option<usize>,
+) -> ProgressTable {
     let stage_of = |entry: &Value| {
-        entry
-            .get("payload")
-            .and_then(|p| p.get("stage"))
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_string()
+        single_line(
+            entry
+                .get("payload")
+                .and_then(|p| p.get("stage"))
+                .and_then(Value::as_str)
+                .unwrap_or("?"),
+        )
     };
 
-    let mut lines = Vec::new();
+    let mut steps: Vec<StepCells> = Vec::new();
     for (i, entry) in trail.iter().enumerate() {
-        let step = i + 1;
         let stage = stage_of(entry);
+        // A missing or unparseable time is an empty cell, by design: the
+        // step is still real, only its time is unknown.
         let at = entry
             .get("created_at")
             .and_then(Value::as_str)
-            .map(timestamp_str)
-            .map(|at| format!("   {at}"))
+            .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+            .map(|t| t.with_timezone(&Utc))
+            .map(|t| {
+                if t.date_naive() == now.date_naive() {
+                    t.format("%H:%M:%S").to_string()
+                } else {
+                    t.format("%Y-%m-%d %H:%M:%S").to_string()
+                }
+            })
             .unwrap_or_default();
 
         // A null `outcome` — not a missing predecessor — is what marks a
         // starting point: the engine writes `entered_via: None` only for a
         // stage nothing transitioned into. Keying on the predecessor
-        // instead would label the *first surviving* entry "(start)" on a
+        // instead would label the *first surviving* entry "start" on a
         // trail whose head has been truncated, inventing a beginning that
         // never happened and discarding the recorded outcome with it.
         // Retention prunes `stage_entered` rows like any other event, and
         // the entry-stage append is best-effort, so a trail that opens
         // mid-flight is reachable, not hypothetical.
-        let hop = match (
+        let (from, outcome) = match (
             entry
                 .get("payload")
                 .and_then(|p| p.get("outcome"))
                 .and_then(Value::as_str),
             i.checked_sub(1).and_then(|p| trail.get(p)),
         ) {
-            (Some(outcome), Some(previous)) => {
-                format!("{} --[{outcome}]--> {stage}", stage_of(previous))
-            }
+            (Some(outcome), Some(previous)) => (stage_of(previous), single_line(outcome)),
             // Something carried the task here, but whatever it departed is
             // no longer on record — say so rather than guessing or dropping
             // the outcome.
-            (Some(outcome), None) => format!("… --[{outcome}]--> {stage}"),
-            (None, _) => format!("{stage} (start)"),
+            (Some(outcome), None) => ("…".to_string(), single_line(outcome)),
+            (None, _) => (String::new(), "start".to_string()),
         };
-        lines.push(format!("  {step}. {hop}{at}"));
+        steps.push(StepCells {
+            num: (i + 1).to_string(),
+            from,
+            outcome,
+            to: stage,
+            at,
+            current: false,
+        });
     }
 
-    match current {
-        Some(current) if lines.is_empty() => {
-            vec![format!("  → {current} (current, no transitions yet)")]
-        }
+    if steps.is_empty() {
+        let line = match current {
+            Some(current) => format!("  → {current} (current, no transitions yet)"),
+            None => "  (none)".to_string(),
+        };
+        return ProgressTable {
+            header: None,
+            rows: vec![line],
+        };
+    }
+
+    if let Some(current) = current {
         // The last entry *is* the current stage — `enter_stage` records on
         // entry — so this marks it in place rather than repeating it on a
-        // trailing arrow line. It's still worth stating: a mismatch means
+        // trailing arrow row. It's still worth stating: a mismatch means
         // the trail was truncated by retention, and silently rendering a
         // stale last hop as "where the task is" would be a lie.
-        Some(current) => {
-            if let Some(last) = lines.last_mut()
-                && trail.last().map(stage_of).as_deref() == Some(current)
-            {
-                last.push_str("   (current)");
-            } else {
-                lines.push(format!("  → {current} (current)"));
+        if trail.last().map(stage_of).as_deref() == Some(current) {
+            if let Some(last) = steps.last_mut() {
+                last.current = true;
             }
-            lines
+        } else {
+            steps.push(StepCells {
+                num: "→".to_string(),
+                from: String::new(),
+                outcome: String::new(),
+                to: single_line(current),
+                at: String::new(),
+                current: true,
+            });
         }
-        None if lines.is_empty() => vec!["  (none)".to_string()],
-        None => lines,
+    }
+
+    let titles = ["#", "from", "outcome", "to", "at (UTC)"];
+    let cells_of = |s: &StepCells| -> [String; 5] {
+        [
+            s.num.clone(),
+            s.from.clone(),
+            s.outcome.clone(),
+            s.to.clone(),
+            s.at.clone(),
+        ]
+    };
+    let all: Vec<[String; 5]> = steps.iter().map(cells_of).collect();
+    let mut natural = [0usize; 5];
+    for (i, t) in titles.iter().enumerate() {
+        natural[i] = t.chars().count();
+    }
+    for row in &all {
+        for (i, c) in row.iter().enumerate() {
+            natural[i] = natural[i].max(c.chars().count());
+        }
+    }
+
+    let render = |widths: &[usize; 5], marker: &str| -> (String, Vec<String>) {
+        let header = layout_row(titles, widths, None);
+        let rows = steps
+            .iter()
+            .zip(&all)
+            .map(|(s, c)| {
+                let cells = [
+                    c[0].as_str(),
+                    c[1].as_str(),
+                    c[2].as_str(),
+                    c[3].as_str(),
+                    c[4].as_str(),
+                ];
+                layout_row(cells, widths, s.current.then_some(marker))
+            })
+            .collect();
+        (header, rows)
+    };
+    let widest = |(header, rows): &(String, Vec<String>)| {
+        rows.iter()
+            .chain(std::iter::once(header))
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+
+    let mut widths = natural;
+    let mut marker = MARKER;
+    let mut laid = render(&widths, marker);
+    if let Some(limit) = width {
+        let floor = |i: usize| natural[i].min(5);
+        while widest(&laid) > limit {
+            // Widest of from/outcome/to; the leftmost of a tie.
+            let pick = (1..=3)
+                .filter(|&i| widths[i] > floor(i))
+                .fold(None::<usize>, |best, i| match best {
+                    Some(b) if widths[b] >= widths[i] => Some(b),
+                    _ => Some(i),
+                });
+            let Some(i) = pick else { break };
+            widths[i] -= 1;
+            laid = render(&widths, marker);
+        }
+        if widest(&laid) > limit {
+            marker = MARKER_SHORT;
+            laid = render(&widths, marker);
+        }
+    }
+    ProgressTable {
+        header: Some(laid.0),
+        rows: laid.1,
     }
 }
 
@@ -1093,87 +1283,270 @@ mod tests {
         })
     }
 
+    fn test_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn table_of(trail: &[Value], current: Option<&str>, width: Option<usize>) -> ProgressTable {
+        stage_progress_table(trail, current, test_now(), width)
+    }
+
+    /// Header and rows, as the CLI prints them.
+    fn lines_of(t: &ProgressTable) -> Vec<String> {
+        t.header.iter().chain(&t.rows).cloned().collect()
+    }
+
+    /// Character offset of `needle` in `line`.
+    fn col(line: &str, needle: &str) -> usize {
+        let byte = line.find(needle).unwrap_or_else(|| panic!("{needle:?} in {line:?}"));
+        line[..byte].chars().count()
+    }
+
+    fn long_trail() -> Vec<Value> {
+        let stages = ["coding", "internal_review", "awaiting_human_review", "ci"];
+        let mut trail = vec![stage_entry("coding", Value::Null, "2026-08-01T08:00:00Z")];
+        for i in 1..12 {
+            trail.push(stage_entry(
+                stages[i % 4],
+                json!(["done", "changes_requested", "green"][i % 3]),
+                &format!("2026-08-01T08:{i:02}:00Z"),
+            ));
+        }
+        trail
+    }
+
+    /// The `to` and `at` cells of every row start at the header's offsets,
+    /// and the `#` cells end where the header's `#` does.
+    fn assert_aligned(t: &ProgressTable) {
+        let header = t.header.as_deref().unwrap();
+        let to = col(header, "to");
+        let at = col(header, "at (UTC)");
+        let num_end = col(header, "#") + 1;
+        for row in &t.rows {
+            // A row with an empty time cell is trimmed short.
+            let mut chars: Vec<char> = row.chars().collect();
+            chars.resize(chars.len().max(at + 1), ' ');
+            assert_eq!(chars[to - 2..to], [' ', ' '], "to column: {row:?}");
+            assert_eq!(chars[at - 2..at], [' ', ' '], "at column: {row:?}");
+            // The `#` cell is right-aligned: a digit (or arrow) right before
+            // the two-space gutter that ends at the `from` column.
+            assert_ne!(chars[num_end - 1], ' ', "# column: {row:?}");
+            assert_eq!(chars[num_end..num_end + 2], [' ', ' '], "# gutter: {row:?}");
+        }
+    }
+
+    /// `task status` prints the helper's header and rows, unshrunk, right
+    /// under `Progress`.
     #[test]
-    fn stage_progress_reconstructs_each_hop_from_consecutive_entries() {
+    fn task_detail_prints_the_progress_table_under_the_heading() {
+        let trail = long_trail();
+        let detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": {
+                "task_id": "t1", "current_stage": "ci", "loop_counters": {},
+                "payload": {}, "updated_at": "2026-08-01T12:00:00Z",
+            },
+            "stage_trail": trail,
+        });
+        let table = stage_progress_table(&trail, Some("ci"), test_now(), None);
+        let expected = format!("Progress\n{}", lines_of(&table).join("\n"));
+        assert!(
+            task_detail(&detail, test_now()).contains(&expected),
+            "{}",
+            task_detail(&detail, test_now())
+        );
+    }
+
+    #[test]
+    fn the_table_aligns_columns_for_mixed_width_stages_and_two_digit_steps() {
+        let mut trail = long_trail();
+        trail.push(stage_entry("ci", json!("green"), "2026-08-01T09:00:00Z"));
+        let t = table_of(&trail, Some("ci"), None);
+        assert_eq!(t.rows.len(), 13);
+        assert_aligned(&t);
+        assert!(t.header.as_deref().unwrap().ends_with("at (UTC)"));
+        for line in lines_of(&t) {
+            assert_eq!(line, line.trim_end(), "trailing space");
+        }
+    }
+
+    #[test]
+    fn a_start_row_has_no_from_and_says_start() {
+        let trail = [stage_entry("chatting", Value::Null, "2026-08-02T09:00:00Z")];
+        let t = table_of(&trail, Some("chatting"), None);
+        let tokens: Vec<&str> = t.rows[0].split_whitespace().collect();
+        assert_eq!(tokens, ["1", "start", "chatting", "09:00:00", "◀", "current"]);
+        assert!(!t.rows[0].contains('?'), "no phantom predecessor");
+    }
+
+    #[test]
+    fn a_hop_names_the_previous_stage_the_outcome_and_the_stage() {
         let trail = [
-            stage_entry("gate", Value::Null, "2026-08-01T11:58:00Z"),
-            stage_entry("review", json!("resumed"), "2026-08-01T11:58:18.972857783Z"),
+            stage_entry("gate", Value::Null, "2026-08-02T09:00:00Z"),
+            stage_entry("review", json!("resumed"), "2026-08-02T09:01:00Z"),
         ];
-        let rendered = stage_progress(&trail, Some("review"));
-        assert!(
-            rendered.contains("gate --[resumed]--> review"),
-            "{rendered}"
+        let t = table_of(&trail, Some("review"), None);
+        let tokens: Vec<&str> = t.rows[1].split_whitespace().collect();
+        assert_eq!(
+            tokens,
+            ["2", "gate", "resumed", "review", "09:01:00", "◀", "current"]
         );
-        assert!(rendered.contains("2026-08-01 11:58:18 UTC"), "{rendered}");
-        // The last entry *is* the current stage, so it's marked in place
-        // rather than repeated on a trailing arrow line.
-        assert!(rendered.contains("(current)"), "{rendered}");
-        assert!(!rendered.contains("→ review"), "duplicated: {rendered}");
+        // The marker is on the last row only, in place — no trailing arrow.
+        assert!(!t.rows[0].contains('◀'));
+        assert_eq!(t.rows.len(), 2);
     }
 
-    /// The stage a task *starts* in was never in `stage_history`, which only
-    /// appended on the way out. It has no predecessor and no outcome, so it
-    /// must render as a starting point rather than an arrow from "?".
+    /// Retention prunes `stage_entered` rows like any other event, so the
+    /// first surviving entry can be one the task was transitioned into.
+    /// Labelling it "start" would assert a beginning that never happened and
+    /// throw away the recorded outcome, so the outcome decides.
     #[test]
-    fn stage_progress_shows_the_entry_stage_that_stage_history_never_had() {
-        let trail = [stage_entry("chatting", Value::Null, "2026-08-01T11:58:00Z")];
-        let rendered = stage_progress(&trail, Some("chatting"));
-        assert!(rendered.contains("1. chatting (start)"), "{rendered}");
-        assert!(
-            !rendered.contains("?"),
-            "no phantom predecessor: {rendered}"
-        );
-    }
-
-    /// The other end of the same truncation. Retention prunes
-    /// `stage_entered` rows like any other event, so the first *surviving*
-    /// entry can be one the task was transitioned into. Labelling it
-    /// "(start)" would assert a beginning that never happened and throw
-    /// away the recorded outcome, so the outcome — not the presence of a
-    /// predecessor — decides.
-    #[test]
-    fn stage_progress_does_not_claim_a_truncated_trail_head_is_the_start() {
+    fn a_pruned_trail_head_is_not_claimed_to_be_the_start() {
         let trail = [
-            stage_entry("review", json!("changes_requested"), "2026-08-01T11:58:00Z"),
-            stage_entry("gate", json!("rejected"), "2026-08-01T11:59:00Z"),
+            stage_entry("review", json!("changes_requested"), "2026-08-02T09:00:00Z"),
+            stage_entry("gate", json!("rejected"), "2026-08-02T09:01:00Z"),
         ];
-        let rendered = stage_progress(&trail, Some("gate"));
-        assert!(
-            !rendered.contains("(start)"),
-            "nothing here started the task: {rendered}"
-        );
-        assert!(
-            rendered.contains("changes_requested"),
-            "the outcome that carried it here was dropped: {rendered}"
-        );
-        assert!(
-            rendered.contains("… --[changes_requested]--> review"),
-            "{rendered}"
-        );
-        // The hop that *does* have its predecessor still renders normally.
-        assert!(
-            rendered.contains("review --[rejected]--> gate"),
-            "{rendered}"
-        );
+        let t = table_of(&trail, Some("gate"), None);
+        let head: Vec<&str> = t.rows[0].split_whitespace().collect();
+        assert_eq!(head[..4], ["1", "…", "changes_requested", "review"]);
+        assert!(!t.rows[0].contains("start"), "{}", t.rows[0]);
+        let next: Vec<&str> = t.rows[1].split_whitespace().collect();
+        assert_eq!(next[..4], ["2", "review", "rejected", "gate"]);
     }
 
-    /// Retention ages events out, so a long-lived task's trail can lose its
-    /// head. Rendering the surviving last hop as "where the task is" would
-    /// be a lie whenever it disagrees with `current_stage`.
+    /// Retention ages events out, so a stale last hop must not be rendered
+    /// as "where the task is" when it disagrees with `current_stage`.
     #[test]
-    fn stage_progress_still_names_the_current_stage_when_the_trail_is_stale() {
-        let trail = [stage_entry("gate", Value::Null, "2026-08-01T11:58:00Z")];
-        let rendered = stage_progress(&trail, Some("done"));
-        assert!(rendered.contains("→ done (current)"), "{rendered}");
+    fn a_stale_trail_gets_an_arrow_row_for_the_current_stage() {
+        let trail = [stage_entry("gate", Value::Null, "2026-08-02T09:00:00Z")];
+        let t = table_of(&trail, Some("done"), None);
+        assert_eq!(t.rows.len(), 2);
+        assert!(!t.rows[0].contains('◀'), "{}", t.rows[0]);
+        let tokens: Vec<&str> = t.rows[1].split_whitespace().collect();
+        assert_eq!(tokens, ["→", "done", "◀", "current"]);
+        assert_aligned(&t);
     }
 
     /// A task that ran before X-3 has no `stage_entered` events and no
-    /// backfill, so an absent trail must read as "nothing recorded" rather
-    /// than being invented.
+    /// backfill, so an absent trail must read as "nothing recorded".
     #[test]
-    fn stage_progress_reports_a_task_that_has_not_transitioned_yet() {
-        let rendered = stage_progress(&[], Some("chatting"));
-        assert!(rendered.contains("no transitions yet"), "{rendered}");
+    fn an_empty_trail_has_no_table() {
+        let t = table_of(&[], Some("chatting"), None);
+        assert!(t.header.is_none());
+        assert_eq!(t.rows, ["  → chatting (current, no transitions yet)"]);
+        let t = table_of(&[], None, None);
+        assert!(t.header.is_none());
+        assert_eq!(t.rows, ["  (none)"]);
+    }
+
+    #[test]
+    fn a_trail_without_a_current_stage_marks_nothing() {
+        let trail = [stage_entry("gate", Value::Null, "2026-08-02T09:00:00Z")];
+        let t = table_of(&trail, None, None);
+        assert_eq!(t.rows.len(), 1);
+        assert!(!t.rows[0].contains('◀'));
+    }
+
+    #[test]
+    fn times_are_clock_only_today_and_dated_otherwise() {
+        let trail = [
+            stage_entry("a", Value::Null, "2026-08-02T09:00:00Z"),
+            stage_entry("b", json!("done"), "2026-08-01T08:00:00Z"),
+            stage_entry("c", json!("done"), "2026-08-01T23:59:59Z"),
+            stage_entry("d", json!("done"), "2026-08-02T11:30:00+02:00"),
+        ];
+        let t = table_of(&trail, None, None);
+        assert!(t.rows[0].ends_with("  09:00:00"), "{}", t.rows[0]);
+        assert!(t.rows[1].ends_with("2026-08-01 08:00:00"), "{}", t.rows[1]);
+        assert!(t.rows[2].ends_with("2026-08-01 23:59:59"), "{}", t.rows[2]);
+        // An offset time is converted to UTC before comparing dates.
+        assert!(t.rows[3].ends_with("  09:30:00"), "{}", t.rows[3]);
+        assert!(!t.rows[3].contains("2026-08-02"), "{}", t.rows[3]);
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_time_is_an_empty_cell() {
+        let mut no_time = stage_entry("b", json!("done"), "x");
+        no_time.as_object_mut().unwrap().remove("created_at");
+        let trail = [
+            stage_entry("a", Value::Null, "not-a-time"),
+            no_time,
+            stage_entry("c", json!("done"), "2026-08-02T09:00:00Z"),
+        ];
+        let t = table_of(&trail, Some("c"), None);
+        assert_eq!(t.rows.len(), 3);
+        assert_eq!(t.rows[0].split_whitespace().last(), Some("a"));
+        assert!(!t.rows[0].contains("not-a-time"));
+        assert_eq!(t.rows[1].split_whitespace().last(), Some("b"));
+        assert_aligned(&t);
+    }
+
+    fn wide_trail() -> Vec<Value> {
+        let a = "a_very_long_stage_name_one";
+        let b = "a_very_long_stage_name_two";
+        let c = "a_very_long_stage_name_three";
+        vec![
+            stage_entry(a, Value::Null, "2026-08-01T08:00:00Z"),
+            stage_entry(b, json!("outcome_that_is_long_too"), "2026-08-01T09:00:00Z"),
+            stage_entry(c, json!("another_long_outcome_here"), "2026-08-01T10:00:00Z"),
+        ]
+    }
+
+    #[test]
+    fn a_width_shrinks_stage_columns_but_keeps_every_time() {
+        let trail = wide_trail();
+        let t = table_of(&trail, Some("a_very_long_stage_name_three"), Some(60));
+        for line in lines_of(&t) {
+            assert!(line.chars().count() <= 60, "{line:?}");
+        }
+        assert!(t.rows.iter().any(|r| r.contains('…')), "{:?}", t.rows);
+        for (row, time) in t.rows.iter().zip(["08:00:00", "09:00:00", "10:00:00"]) {
+            assert!(row.contains(&format!("2026-08-01 {time}")), "{row}");
+        }
+        assert!(t.rows[2].ends_with("◀ current"), "{}", t.rows[2]);
+        assert_aligned(&t);
+    }
+
+    #[test]
+    fn no_width_never_truncates() {
+        let trail = wide_trail();
+        let t = table_of(&trail, Some("a_very_long_stage_name_three"), None);
+        assert!(t.rows.iter().all(|r| !r.contains('…')), "{:?}", t.rows);
+        assert!(t.rows.iter().any(|r| r.chars().count() > 60));
+    }
+
+    #[test]
+    fn shrinking_takes_from_the_widest_column_leftmost_first() {
+        let trail = [
+            stage_entry("aaaaaaaaaa", Value::Null, "2026-08-01T08:00:00Z"),
+            stage_entry("bbbbbbbbbb", json!("cccccccccc"), "2026-08-01T09:00:00Z"),
+        ];
+        let full = table_of(&trail, None, None);
+        let natural = full.rows[1].chars().count();
+        // One character too wide: the leftmost of the tied columns (from)
+        // loses it, not outcome or to.
+        let t = table_of(&trail, None, Some(natural - 1));
+        assert!(t.rows[1].contains("aaaaaaaa…"), "{}", t.rows[1]);
+        assert!(t.rows[1].contains("cccccccccc"), "{}", t.rows[1]);
+        assert!(t.rows[1].contains("bbbbbbbbbb"), "{}", t.rows[1]);
+    }
+
+    #[test]
+    fn the_marker_shortens_only_once_the_columns_are_at_their_floors() {
+        let trail = wide_trail();
+        let cur = Some("a_very_long_stage_name_three");
+        // Floors: from/outcome/to at 5 each.
+        let floors = table_of(&trail, cur, Some(0));
+        let floor_marker = floors.rows[2].chars().count();
+        assert!(floors.rows[2].ends_with("◀"), "{}", floors.rows[2]);
+        assert!(!floors.rows[2].ends_with("current"), "{}", floors.rows[2]);
+        // With room for the long marker once shrunk, it stays whole.
+        let fits = table_of(&trail, cur, Some(floor_marker + "◀ current".len() - 1 + 1));
+        assert!(fits.rows[2].ends_with("◀ current"), "{}", fits.rows[2]);
+        assert_aligned(&floors);
     }
 
     /// The trail is a sibling of `workflow_state`, not a field inside it —
@@ -1194,10 +1567,15 @@ mod tests {
                 stage_entry("review", json!("resumed"), "2026-08-01T11:58:18Z"),
             ],
         });
-        let rendered = task_detail(&detail);
-        assert!(
-            rendered.contains("gate --[resumed]--> review"),
-            "{rendered}"
+        let rendered = task_detail(&detail, test_now());
+        let row = rendered
+            .lines()
+            .find(|l| l.contains("resumed"))
+            .unwrap_or_else(|| panic!("no hop row: {rendered}"));
+        let tokens: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(
+            tokens,
+            ["2", "gate", "resumed", "review", "2026-08-01", "11:58:18", "◀", "current"]
         );
         assert!(
             !rendered.contains("no transitions yet"),
@@ -1212,7 +1590,7 @@ mod tests {
             "status": "open", "created_at": "2026-08-01T12:00:00Z",
             "workflow_state": null,
         });
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
         assert!(rendered.contains("has not started"), "{rendered}");
         assert!(!rendered.contains("Stage "), "{rendered}");
     }
@@ -1224,14 +1602,14 @@ mod tests {
             "created_at": "2030-01-01T00:00:00Z", "stage_trail": [],
             "kept": {"worktree_path": "/work/demo-wt-t1", "branch": "task/t1"},
         });
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
         assert!(rendered.contains("/work/demo-wt-t1"), "{rendered}");
         assert!(rendered.contains("task/t1"), "{rendered}");
         let plain = json!({
             "id": "t1", "title": "x", "status": "cancelled", "kept_work": false,
             "created_at": "2030-01-01T00:00:00Z", "stage_trail": [], "kept": null,
         });
-        assert!(!task_detail(&plain).contains("Kept"));
+        assert!(!task_detail(&plain, test_now()).contains("Kept"));
     }
 
     fn task_with_config(config: Value) -> Task {
@@ -1329,7 +1707,7 @@ mod tests {
             "workflow_state": null,
         });
 
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
 
         assert!(rendered.contains("/src/app"), "{rendered}");
         assert!(
@@ -1348,13 +1726,13 @@ mod tests {
                 "loop_counters": {"internal_review": {"count": 2}, "revising": 1}
             }
         });
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
         assert!(
             rendered.contains("\n\nLoop counters  internal_review=2 revising=1\n\nCost & time"),
             "{rendered}"
         );
         let none = json!({"id": "t1", "workflow_state": {"loop_counters": {}}});
-        assert!(!task_detail(&none).contains("Loop counters"));
+        assert!(!task_detail(&none, test_now()).contains("Loop counters"));
     }
 
     /// X-4 (#61): `task_detail` renders the `Stuck` line only when the
@@ -1367,7 +1745,7 @@ mod tests {
             "created_at": "2026-08-01T12:00:00Z",
             "workflow_state": null,
         });
-        let rendered = task_detail(&stuck);
+        let rendered = task_detail(&stuck, test_now());
         assert!(rendered.contains("Stuck"), "{rendered}");
         assert!(rendered.contains("stage 'run': it broke"), "{rendered}");
 
@@ -1377,7 +1755,7 @@ mod tests {
             "status": "open", "created_at": "2026-08-01T12:00:00Z",
             "workflow_state": null,
         });
-        let rendered = task_detail(&open);
+        let rendered = task_detail(&open, test_now());
         assert!(!rendered.contains("Stuck"), "{rendered}");
     }
 
@@ -1397,7 +1775,7 @@ mod tests {
         // unchanged: the path and short hash show, with no drift suffix.
         let mut unchanged = base.clone();
         unchanged["workflow_file_status"] = json!("unchanged");
-        let rendered = task_detail(&unchanged);
+        let rendered = task_detail(&unchanged, test_now());
         assert!(
             rendered.contains("Workflow file"),
             "expected a Workflow file line: {rendered}"
@@ -1413,13 +1791,13 @@ mod tests {
         // changed: the drift suffix is appended to the same line.
         let mut changed = base.clone();
         changed["workflow_file_status"] = json!("changed");
-        let rendered = task_detail(&changed);
+        let rendered = task_detail(&changed, test_now());
         assert!(rendered.contains("changed since task start"), "{rendered}");
 
         // missing: a different suffix, not "changed since task start".
         let mut missing = base.clone();
         missing["workflow_file_status"] = json!("missing");
-        let rendered = task_detail(&missing);
+        let rendered = task_detail(&missing, test_now());
         assert!(rendered.contains("(missing)"), "{rendered}");
         assert!(!rendered.contains("changed since task start"), "{rendered}");
     }
@@ -1434,7 +1812,7 @@ mod tests {
             "workflow_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
             "workflow_file_status": "changed",
         });
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
         assert!(!rendered.contains("Workflow file"), "{rendered}");
         assert!(rendered.contains("builtin:chat@1.0.0"), "{rendered}");
         assert!(
@@ -1454,7 +1832,7 @@ mod tests {
             "workflow_state": null,
             "workflow_path": null,
         });
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
         assert!(!rendered.contains("Workflow file"), "{rendered}");
     }
 
@@ -1467,7 +1845,7 @@ mod tests {
             "workflow_state": null,
         });
 
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
 
         assert!(!rendered.contains("Role"), "{rendered}");
         assert!(!rendered.contains("Repo"), "{rendered}");
@@ -1754,7 +2132,7 @@ mod tests {
 
     #[test]
     fn task_detail_renders_the_cost_and_time_block() {
-        let rendered = task_detail(&usage_detail("api_equivalent", 0));
+        let rendered = task_detail(&usage_detail("api_equivalent", 0), test_now());
         let block = rendered.split("Cost & time").nth(1).expect("block present");
         for expected in [
             "  Total        ≈ $0.09 (API-equivalent)\n",
@@ -1779,7 +2157,7 @@ mod tests {
 
     #[test]
     fn an_estimated_total_says_so() {
-        let rendered = task_detail(&usage_detail("estimated", 0));
+        let rendered = task_detail(&usage_detail("estimated", 0), test_now());
         assert!(
             rendered.contains("Total        ≈ $0.09 (estimated)"),
             "{rendered}"
@@ -1807,12 +2185,12 @@ mod tests {
 
     #[test]
     fn sessions_without_data_are_counted_on_the_total_line() {
-        let one = task_detail(&usage_detail("estimated", 1));
+        let one = task_detail(&usage_detail("estimated", 1), test_now());
         assert!(
             one.contains("(estimated)  (1 session without data)"),
             "{one}"
         );
-        let two = task_detail(&usage_detail("estimated", 2));
+        let two = task_detail(&usage_detail("estimated", 2), test_now());
         assert!(two.contains("(2 sessions without data)"), "{two}");
     }
 
@@ -1820,7 +2198,7 @@ mod tests {
     fn a_task_without_usage_says_no_data_on_one_line() {
         let mut detail = usage_detail("estimated", 0);
         detail["usage"] = Value::Null;
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
         assert!(rendered.ends_with("\n\nCost & time  no data"), "{rendered}");
     }
 
@@ -1829,7 +2207,7 @@ mod tests {
         let mut detail = usage_detail("estimated", 0);
         detail["usage"]["active_time_ms"] = Value::Null;
         detail["usage"]["cost_usd"] = Value::Null;
-        let rendered = task_detail(&detail);
+        let rendered = task_detail(&detail, test_now());
         assert!(rendered.contains("Active time  no data"), "{rendered}");
         assert!(rendered.contains("Total        cost unknown"), "{rendered}");
     }
