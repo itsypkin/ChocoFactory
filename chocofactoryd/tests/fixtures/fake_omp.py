@@ -342,6 +342,9 @@ def run_prompt(request):
     if "unsettled_die" in MODES:
         sys.exit(0)
     if unsettled:
+        # Background work wakes the agent after the yield; its run streams
+        # before `session_settled`.
+        assistant([{"type": "text", "text": "background result"}])
         time.sleep(0.3)
         emit({"type": "session_settled"})
 

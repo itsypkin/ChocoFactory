@@ -477,19 +477,19 @@ async fn an_unsettled_session_completes_on_session_settled() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
-    let started = std::time::Instant::now();
     let events = until_turn_completed(&mut handle).await;
+    // The follow-up run that background work started streams before the
+    // session settles, so it comes before the turn completes.
     assert!(
-        started.elapsed() >= Duration::from_millis(250),
-        "completed before session_settled"
+        matches!(
+            &events[events.len() - 2..],
+            [
+                AgentEvent::AssistantMessage { text },
+                AgentEvent::TurnCompleted { is_error: false, .. },
+            ] if text == "background result"
+        ),
+        "{events:?}"
     );
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::TurnCompleted {
-            is_error: false,
-            ..
-        })
-    ));
     drain(&mut handle).await;
 }
 
