@@ -677,9 +677,10 @@ mod tests {
         assert_eq!(entry.payload["stage"], "coding");
         assert_eq!(entry.payload["outcome"], Value::Null);
 
-        let next = append_stage_transition(&pool, &task_id, "review", Some("approved"), "agent_turn")
-            .await
-            .unwrap();
+        let next =
+            append_stage_transition(&pool, &task_id, "review", Some("approved"), "agent_turn")
+                .await
+                .unwrap();
         assert_eq!(next.payload["stage"], "review");
         assert_eq!(next.payload["outcome"], "approved");
 
@@ -724,9 +725,10 @@ mod tests {
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let advanced = append_stage_transition(&pool, &task_id, "done", Some("finished"), "terminal")
-            .await
-            .unwrap();
+        let advanced =
+            append_stage_transition(&pool, &task_id, "done", Some("finished"), "terminal")
+                .await
+                .unwrap();
 
         // Both kinds sort into one `(created_at, id)` order, and the
         // session-scoped row still resolves to the same task.

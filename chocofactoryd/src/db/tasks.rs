@@ -236,16 +236,18 @@ pub async fn list_summaries(
                 .unwrap_or_else(|| serde_json::json!({})),
             pr: row.pr_url.and_then(pr_ref),
             waiting_on_human: row.waiting_on_human,
-            usage_total: row.usage_all_subscription.map(|all_subscription| UsageTotal {
-                cost_usd: row.usage_cost_usd,
-                tokens: row.usage_tokens.and_then(|n| u64::try_from(n).ok()),
-                billing_label: if all_subscription {
-                    "api_equivalent"
-                } else {
-                    "estimated"
-                }
-                .to_string(),
-            }),
+            usage_total: row
+                .usage_all_subscription
+                .map(|all_subscription| UsageTotal {
+                    cost_usd: row.usage_cost_usd,
+                    tokens: row.usage_tokens.and_then(|n| u64::try_from(n).ok()),
+                    billing_label: if all_subscription {
+                        "api_equivalent"
+                    } else {
+                        "estimated"
+                    }
+                    .to_string(),
+                }),
         })
         .collect())
 }

@@ -141,4 +141,103 @@ mod tests {
             1
         );
     }
+
+    #[tokio::test]
+    async fn pruning_events_leaves_usage_totals_and_breakdowns_unchanged() {
+        use crate::adapter::{BillingMode, TokenCounts, TurnUsage, UsageCounting};
+        use crate::db::usage;
+        use crate::usage::{TaskTimes, aggregate};
+
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+        let task = tasks::create(
+            &pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+        events::append_stage_transition(&pool, &task.id, "implement", None, "agent_turn")
+            .await
+            .unwrap();
+        let new = |stage| sessions::NewSession {
+            task_id: &task.id,
+            stage,
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        };
+        let first = sessions::create(&pool, new("implement")).await.unwrap().id;
+        // An ended session with no usage row.
+        let second = sessions::create(&pool, new("review")).await.unwrap().id;
+        sqlx::query("UPDATE sessions SET ended_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now())
+            .bind(&second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let tokens = TokenCounts {
+            input: Some(10),
+            output: Some(5),
+            cache_read: Some(100),
+            cache_write: Some(20),
+        };
+        let turn = TurnUsage {
+            cost_usd: Some(0.25),
+            tokens,
+            models: Some(vec![crate::adapter::ModelUsage {
+                model: "mock".to_string(),
+                tokens,
+                cost_usd: Some(0.25),
+            }]),
+            wall_time_ms: Some(1),
+            model_turns: Some(1),
+            billing: BillingMode::Subscription,
+            counting: UsageCounting::CumulativePerConversation,
+        };
+        usage::append_turn_completed(&pool, &first, json!({ "is_error": false }), &turn)
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now() + chrono::Duration::hours(1);
+        let snapshot = || async {
+            let rows = usage::list_rows_for_task(&pool, &task.id).await.unwrap();
+            let facts = usage::list_session_facts(&pool, &task.id).await.unwrap();
+            let trail = events::list_stage_trail(&pool, &task.id).await.unwrap();
+            let u = aggregate(
+                TaskTimes {
+                    status: "closed",
+                    created_at: task.created_at,
+                    updated_at: task.updated_at,
+                },
+                &facts,
+                &rows,
+                &trail,
+                now,
+            )
+            .unwrap();
+            (serde_json::to_value(&u).unwrap(), trail.len())
+        };
+        let (mut before, trail_before) = snapshot().await;
+        assert_eq!(trail_before, 1);
+
+        let pruned = run_once(&pool, chrono::Duration::zero()).await.unwrap();
+        assert!(pruned >= 2, "the stage entry and turn_completed event go");
+        let (mut after, trail_after) = snapshot().await;
+        assert_eq!(trail_after, 0, "the stage trail really was pruned");
+
+        // Active time comes from the pruned trail and is allowed to go.
+        before["active_time_ms"] = json!(null);
+        after["active_time_ms"] = json!(null);
+        assert_eq!(before, after);
+        assert_eq!(after["cost_usd"], 0.25);
+        assert_eq!(after["sessions_without_data"], 1);
+        assert_eq!(after["by_lap"].as_array().unwrap().len(), 2);
+    }
 }

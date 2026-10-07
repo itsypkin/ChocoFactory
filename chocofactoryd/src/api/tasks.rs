@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use super::{ApiError, AppState};
 use crate::db::usage as usage_db;
 use crate::db::{events, tasks, workflow_state};
-use crate::usage::{self, TaskTimes, TaskUsage};
 use crate::engine::{WorkflowEngine, WorkflowRef};
+use crate::usage::{self, TaskTimes, TaskUsage};
 
 #[derive(Deserialize)]
 pub struct CreateTaskRequest {
@@ -657,6 +657,104 @@ mod tests {
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert_eq!(detail["id"], task_id);
         assert_eq!(detail["workflow_state"]["current_stage"], "chatting");
+    }
+
+    /// A task written straight to the database (no engine, so no session of
+    /// its own racing the test), with one session and one usage turn.
+    async fn seed_task_with_usage(server: &TestServer, with_usage: bool) -> String {
+        use crate::adapter::{BillingMode, TokenCounts, TurnUsage, UsageCounting};
+        use crate::db::{projects, sessions, tasks, usage};
+
+        let pool = server.pool();
+        let project = projects::create(pool, &format!("p{}", uuid::Uuid::new_v4()), None)
+            .await
+            .unwrap();
+        let task = tasks::create(
+            pool,
+            tasks::NewTask {
+                project_id: &project.id,
+                workflow_def: "chat",
+                title: "t",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+        if with_usage {
+            let session = sessions::create(
+                pool,
+                sessions::NewSession {
+                    task_id: &task.id,
+                    stage: "implement",
+                    role: "coder",
+                    cli_adapter: "claude",
+                    model: "sonnet",
+                },
+            )
+            .await
+            .unwrap();
+            let turn = TurnUsage {
+                cost_usd: Some(0.09),
+                tokens: TokenCounts {
+                    input: Some(30),
+                    output: Some(15),
+                    cache_read: Some(300),
+                    cache_write: Some(60),
+                },
+                models: None,
+                wall_time_ms: Some(1),
+                model_turns: Some(1),
+                billing: BillingMode::Subscription,
+                counting: UsageCounting::CumulativePerConversation,
+            };
+            usage::append_turn_completed(pool, &session.id, json!({ "is_error": false }), &turn)
+                .await
+                .unwrap();
+        }
+        task.id
+    }
+
+    #[tokio::test]
+    async fn get_task_carries_usage_and_list_rows_carry_the_total() {
+        let server = TestServer::start().await;
+        let with = seed_task_with_usage(&server, true).await;
+        let without = seed_task_with_usage(&server, false).await;
+
+        let detail: Value = server.get(&format!("/tasks/{with}")).await.json();
+        let usage = &detail["usage"];
+        assert!((usage["cost_usd"].as_f64().unwrap() - 0.09).abs() < 1e-9);
+        assert_eq!(usage["billing_label"], "api_equivalent");
+        assert_eq!(
+            usage["tokens"],
+            json!({"input": 30, "output": 15, "cache_read": 300, "cache_write": 60})
+        );
+        assert!(usage["wall_time_ms"].is_i64());
+        assert_eq!(usage["active_time_ms"], Value::Null);
+        assert_eq!(usage["sessions_without_data"], 0);
+        assert_eq!(usage["by_stage"][0]["stage"], "implement");
+        assert_eq!(usage["by_role"][0]["role"], "coder");
+        assert_eq!(usage["by_lap"][0]["lap"], 1);
+        assert_eq!(usage["by_model"], json!([]));
+
+        let detail: Value = server.get(&format!("/tasks/{without}")).await.json();
+        assert_eq!(detail["usage"], Value::Null);
+
+        let list: Value = server.get("/tasks").await.json();
+        let row = |id: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let total = &row(&with)["usage_total"];
+        assert!((total["cost_usd"].as_f64().unwrap() - 0.09).abs() < 1e-9);
+        assert_eq!(total["tokens"], 405);
+        assert_eq!(total["billing_label"], "api_equivalent");
+        assert_eq!(row(&without)["usage_total"], Value::Null);
     }
 
     #[tokio::test]

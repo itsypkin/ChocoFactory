@@ -2830,7 +2830,8 @@ impl WorkflowEngine {
             entered_via,
             stage_def.kind.name(),
         )
-        .await {
+        .await
+        {
             Ok(_) => self.events_notify.notify_waiters(),
             Err(err) => tracing::error!(
                 task_id, stage = stage_name, %err,

@@ -432,3 +432,422 @@ pub fn aggregate(
         by_model,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use chocofactory_core::models::EventType;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    use super::*;
+    use crate::adapter::{BillingMode, ModelUsage};
+
+    fn tokens(n: Option<u64>) -> TokenCounts {
+        TokenCounts {
+            input: n,
+            output: n,
+            cache_read: n,
+            cache_write: n,
+        }
+    }
+
+    fn usage(
+        cost: Option<f64>,
+        input: Option<u64>,
+        counting: UsageCounting,
+        models: Option<Vec<ModelUsage>>,
+    ) -> TurnUsage {
+        TurnUsage {
+            cost_usd: cost,
+            tokens: tokens(input),
+            models,
+            wall_time_ms: None,
+            model_turns: None,
+            billing: BillingMode::Subscription,
+            counting,
+        }
+    }
+
+    fn cumulative(cost: Option<f64>) -> TurnUsage {
+        usage(
+            cost,
+            Some(10),
+            UsageCounting::CumulativePerConversation,
+            None,
+        )
+    }
+
+    fn model(name: &str, input: u64, cost: f64) -> ModelUsage {
+        ModelUsage {
+            model: name.to_string(),
+            tokens: tokens(Some(input)),
+            cost_usd: Some(cost),
+        }
+    }
+
+    fn base_cost(c: f64) -> Baseline {
+        Baseline {
+            cost_usd: Some(c),
+            models: None,
+        }
+    }
+
+    #[test]
+    fn two_turns_in_one_session_give_each_turns_own_cost() {
+        let first = per_turn(&cumulative(Some(0.02490)), &Baseline::default());
+        assert!((first.cost_usd.unwrap() - 0.02490).abs() < 1e-9);
+        let second = per_turn(&cumulative(Some(0.02927)), &base_cost(0.02490));
+        assert!((second.cost_usd.unwrap() - 0.00437).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_resumed_sessions_first_turn_continues_the_chain() {
+        let third = per_turn(&cumulative(Some(0.03288)), &base_cost(0.02927));
+        assert!((third.cost_usd.unwrap() - 0.00361).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_counter_restart_takes_the_reported_value() {
+        let t = per_turn(&cumulative(Some(0.01)), &base_cost(0.03));
+        assert_eq!(t.cost_usd, Some(0.01));
+    }
+
+    #[test]
+    fn a_fresh_session_starts_from_zero() {
+        let t = per_turn(&cumulative(Some(0.02490)), &Baseline::default());
+        assert_eq!(t.cost_usd, Some(0.02490));
+    }
+
+    #[test]
+    fn a_turn_without_cost_has_no_per_turn_cost() {
+        let t = per_turn(&cumulative(None), &base_cost(0.5));
+        assert_eq!(t.cost_usd, None);
+    }
+
+    #[test]
+    fn per_turn_counting_is_taken_as_reported() {
+        let u = usage(
+            Some(0.5),
+            Some(1),
+            UsageCounting::PerTurn,
+            Some(vec![model("m", 7, 0.5)]),
+        );
+        let t = per_turn(&u, &base_cost(0.4));
+        assert_eq!(t.cost_usd, Some(0.5));
+        assert_eq!(t.models.unwrap()["m"].input_tokens, Some(7));
+    }
+
+    fn cumulative_models(models: Vec<ModelUsage>) -> TurnUsage {
+        usage(
+            None,
+            None,
+            UsageCounting::CumulativePerConversation,
+            Some(models),
+        )
+    }
+
+    #[test]
+    fn per_model_figures_are_differenced_per_field() {
+        let mut baseline = Baseline::default();
+        let mut got = Vec::new();
+        for (input, cost) in [(10, 0.02), (20, 0.04), (30, 0.06)] {
+            let u = cumulative_models(vec![model("m", input, cost)]);
+            let t = per_turn(&u, &baseline);
+            let m = t.models.as_ref().unwrap()["m"];
+            got.push((m.input_tokens.unwrap(), m.cost_usd.unwrap()));
+            baseline.models = t.reported_models;
+        }
+        for (input, cost) in got {
+            assert_eq!(input, 10);
+            assert!((cost - 0.02).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_model_absent_from_the_baseline_keeps_its_full_figures() {
+        let baseline = Baseline {
+            cost_usd: None,
+            models: Some(ModelMap::from([(
+                "old".to_string(),
+                ModelFigures {
+                    input_tokens: Some(5),
+                    ..Default::default()
+                },
+            )])),
+        };
+        let t = per_turn(&cumulative_models(vec![model("new", 9, 0.3)]), &baseline);
+        let m = t.models.unwrap()["new"];
+        assert_eq!(m.input_tokens, Some(9));
+        assert_eq!(m.cost_usd, Some(0.3));
+    }
+
+    #[test]
+    fn a_missing_per_model_field_stays_none() {
+        let mut m = model("m", 9, 0.3);
+        m.tokens.output = None;
+        let t = per_turn(&cumulative_models(vec![m]), &Baseline::default());
+        assert_eq!(t.models.unwrap()["m"].output_tokens, None);
+    }
+
+    // ---- aggregation ----
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    fn session(
+        id: &str,
+        stage: &str,
+        role: &str,
+        lap: Option<i64>,
+        start: i64,
+        ended: bool,
+    ) -> SessionFacts {
+        SessionFacts {
+            id: id.to_string(),
+            stage: stage.to_string(),
+            role: role.to_string(),
+            lap,
+            started_at: at(start),
+            ended,
+        }
+    }
+
+    fn row(
+        session_id: &str,
+        billing: &str,
+        cost: Option<f64>,
+        n: u64,
+        models: Option<ModelMap>,
+    ) -> UsageRow {
+        UsageRow {
+            session_id: session_id.to_string(),
+            billing: billing.to_string(),
+            cost_usd: cost,
+            tokens: tokens(Some(n)),
+            models,
+        }
+    }
+
+    fn entry(secs: i64, outcome: Option<&str>, kind: Option<&str>) -> Event {
+        let mut payload = json!({ "stage": "s", "outcome": outcome });
+        if let Some(kind) = kind {
+            payload["kind"] = json!(kind);
+        }
+        Event {
+            id: format!("e{secs}"),
+            task_id: "t".to_string(),
+            session_id: None,
+            event_type: EventType::StageEntered,
+            payload,
+            created_at: at(secs),
+        }
+    }
+
+    fn times(status: &str) -> TaskTimes<'_> {
+        TaskTimes {
+            status,
+            created_at: at(0),
+            updated_at: at(500),
+        }
+    }
+
+    fn fixture() -> (Vec<SessionFacts>, Vec<UsageRow>) {
+        let sessions = vec![
+            session("a", "implement", "coder", Some(1), 10, true),
+            session("b", "review", "reviewer", Some(1), 20, true),
+            session("c", "implement", "coder", Some(2), 30, true),
+            // resumed from c: same lap
+            session("d", "implement", "coder", Some(2), 40, true),
+            // ended without a result line
+            session("e", "review", "reviewer", Some(2), 50, true),
+        ];
+        let m = |cost: f64, n: u64| {
+            Some(ModelMap::from([(
+                "mock".to_string(),
+                ModelFigures {
+                    input_tokens: Some(n),
+                    cost_usd: Some(cost),
+                    ..Default::default()
+                },
+            )]))
+        };
+        let rows = vec![
+            row("a", "subscription", Some(0.01), 1, m(0.01, 1)),
+            row("b", "subscription", Some(0.02), 2, m(0.02, 2)),
+            row("c", "subscription", Some(0.03), 3, m(0.03, 3)),
+            row("d", "subscription", Some(0.04), 4, m(0.04, 4)),
+        ];
+        (sessions, rows)
+    }
+
+    #[test]
+    fn totals_and_breakdowns_group_by_stage_role_lap_and_model() {
+        let (sessions, rows) = fixture();
+        let u = aggregate(times("closed"), &sessions, &rows, &[], at(900)).unwrap();
+        assert!((u.cost_usd.unwrap() - 0.10).abs() < 1e-9);
+        assert_eq!(u.tokens.input, Some(10));
+        assert_eq!(u.billing_label, "api_equivalent");
+        assert_eq!(u.sessions_without_data, 1);
+
+        assert_eq!(
+            u.by_stage
+                .iter()
+                .map(|s| s.stage.as_str())
+                .collect::<Vec<_>>(),
+            ["implement", "review"]
+        );
+        assert!((u.by_stage[0].cost_usd.unwrap() - 0.08).abs() < 1e-9);
+        assert_eq!(u.by_stage[0].tokens.unwrap().input, Some(8));
+        assert!((u.by_stage[1].cost_usd.unwrap() - 0.02).abs() < 1e-9);
+        assert_eq!(
+            u.by_role
+                .iter()
+                .map(|s| s.role.as_str())
+                .collect::<Vec<_>>(),
+            ["coder", "reviewer"]
+        );
+
+        let laps: Vec<_> = u.by_lap.iter().map(|l| (l.stage.as_str(), l.lap)).collect();
+        assert_eq!(
+            laps,
+            [
+                ("implement", Some(1)),
+                ("review", Some(1)),
+                ("implement", Some(2)),
+                ("review", Some(2))
+            ]
+        );
+        // Session d resumed c, so lap 2 of implement holds both.
+        assert!((u.by_lap[2].cost_usd.unwrap() - 0.07).abs() < 1e-9);
+        // Lap 2 of review: only a session with no rows.
+        assert_eq!(u.by_lap[3].cost_usd, None);
+        assert_eq!(u.by_lap[3].tokens, None);
+
+        assert_eq!(u.by_model.len(), 1);
+        assert_eq!(u.by_model[0].model, "mock");
+        assert!((u.by_model[0].cost_usd.unwrap() - 0.10).abs() < 1e-9);
+        assert_eq!(u.by_model[0].tokens.input, Some(10));
+    }
+
+    #[test]
+    fn a_group_whose_sessions_have_no_rows_shows_null() {
+        let (sessions, rows) = fixture();
+        let rows: Vec<_> = rows.into_iter().filter(|r| r.session_id != "b").collect();
+        let u = aggregate(times("closed"), &sessions, &rows, &[], at(900)).unwrap();
+        // review still has session e without rows, and b has none now.
+        let review = u.by_stage.iter().find(|s| s.stage == "review").unwrap();
+        assert_eq!(review.cost_usd, None);
+        assert_eq!(review.tokens, None);
+        assert_eq!(u.sessions_without_data, 2);
+    }
+
+    #[test]
+    fn by_model_is_ordered_by_cost_highest_first() {
+        let sessions = vec![session("a", "s", "r", Some(1), 0, false)];
+        let fig = |c: f64| ModelFigures {
+            cost_usd: Some(c),
+            ..Default::default()
+        };
+        let rows = vec![row(
+            "a",
+            "subscription",
+            Some(0.3),
+            1,
+            Some(ModelMap::from([
+                ("cheap".to_string(), fig(0.1)),
+                ("dear".to_string(), fig(0.2)),
+            ])),
+        )];
+        let u = aggregate(times("open"), &sessions, &rows, &[], at(10)).unwrap();
+        assert_eq!(u.by_model[0].model, "dear");
+        assert_eq!(u.by_model[1].model, "cheap");
+    }
+
+    #[test]
+    fn no_rows_means_no_usage_not_zero() {
+        let (sessions, _) = fixture();
+        assert!(aggregate(times("open"), &sessions, &[], &[], at(1)).is_none());
+    }
+
+    #[test]
+    fn the_billing_label_is_api_equivalent_only_when_every_row_is_subscription() {
+        let sessions = vec![session("a", "s", "r", Some(1), 0, false)];
+        let label = |billings: &[&str]| {
+            let rows: Vec<_> = billings
+                .iter()
+                .map(|b| row("a", b, Some(0.1), 1, None))
+                .collect();
+            aggregate(times("open"), &sessions, &rows, &[], at(1))
+                .unwrap()
+                .billing_label
+        };
+        assert_eq!(label(&["subscription", "subscription"]), "api_equivalent");
+        assert_eq!(label(&["subscription", "api_key"]), "estimated");
+        assert_eq!(label(&["subscription", "unknown"]), "estimated");
+    }
+
+    #[test]
+    fn unknown_costs_and_tokens_total_to_null() {
+        let sessions = vec![session("a", "s", "r", Some(1), 0, false)];
+        let mut r = row("a", "unknown", None, 0, None);
+        r.tokens = tokens(None);
+        let u = aggregate(times("open"), &sessions, &[r], &[], at(1)).unwrap();
+        assert_eq!(u.cost_usd, None);
+        assert_eq!(u.tokens.input, None);
+    }
+
+    #[test]
+    fn wall_time_runs_to_now_while_open_or_stuck_and_to_updated_at_after() {
+        let (sessions, rows) = fixture();
+        let wall = |status: &str| {
+            aggregate(times(status), &sessions, &rows, &[], at(900))
+                .unwrap()
+                .wall_time_ms
+        };
+        assert_eq!(wall("open"), 900_000);
+        assert_eq!(wall("stuck"), 900_000);
+        assert_eq!(wall("closed"), 500_000);
+        assert_eq!(wall("cancelled"), 500_000);
+    }
+
+    #[test]
+    fn active_time_leaves_out_gates_and_retries_and_counts_unlabelled_entries() {
+        let (sessions, rows) = fixture();
+        // Visits (a retry entry does not split one):
+        //   [0, 100)   agent_turn            counts: 100
+        //   [100, 300) human_gate            left out
+        //   [300, 400) no kind (old entry)   counts: 100
+        //   [400, 500) agent_turn, to updated_at: 100
+        let trail = vec![
+            entry(0, None, Some("agent_turn")),
+            entry(100, Some("go"), Some("human_gate")),
+            entry(300, Some("approved"), None),
+            entry(350, Some("retry"), Some("agent_turn")),
+            entry(400, Some("again"), Some("agent_turn")),
+        ];
+        let u = aggregate(times("closed"), &sessions, &rows, &trail, at(900)).unwrap();
+        assert_eq!(u.active_time_ms, Some(300_000));
+    }
+
+    #[test]
+    fn active_time_ends_at_now_for_an_open_task_and_is_null_for_an_empty_trail() {
+        let (sessions, rows) = fixture();
+        let trail = vec![entry(0, None, Some("agent_turn"))];
+        let u = aggregate(times("open"), &sessions, &rows, &trail, at(900)).unwrap();
+        assert_eq!(u.active_time_ms, Some(900_000));
+        let u = aggregate(times("open"), &sessions, &rows, &[], at(900)).unwrap();
+        assert_eq!(u.active_time_ms, None);
+    }
+
+    #[test]
+    fn a_terminal_visit_is_not_active() {
+        let (sessions, rows) = fixture();
+        let trail = vec![
+            entry(0, None, Some("agent_turn")),
+            entry(100, Some("done"), Some("terminal")),
+        ];
+        let u = aggregate(times("closed"), &sessions, &rows, &trail, at(900)).unwrap();
+        assert_eq!(u.active_time_ms, Some(100_000));
+    }
+}

@@ -192,3 +192,304 @@ pub async fn list_session_facts(
         })
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::adapter::{BillingMode, ModelUsage, UsageCounting};
+    use crate::db::{connect_in_memory, projects, sessions, tasks};
+
+    fn usage(cost: Option<f64>, input: u64, models: Option<Vec<ModelUsage>>) -> TurnUsage {
+        TurnUsage {
+            cost_usd: cost,
+            tokens: TokenCounts {
+                input: Some(input),
+                output: Some(1),
+                cache_read: Some(1),
+                cache_write: Some(1),
+            },
+            models,
+            wall_time_ms: Some(1000),
+            model_turns: Some(1),
+            billing: BillingMode::Subscription,
+            counting: UsageCounting::CumulativePerConversation,
+        }
+    }
+
+    fn one_model(input: u64, cost: f64) -> Option<Vec<ModelUsage>> {
+        Some(vec![ModelUsage {
+            model: "m".to_string(),
+            tokens: TokenCounts {
+                input: Some(input),
+                output: None,
+                cache_read: None,
+                cache_write: None,
+            },
+            cost_usd: Some(cost),
+        }])
+    }
+
+    async fn new_task(pool: &SqlitePool) -> String {
+        let project_id = projects::create(pool, "demo", None).await.unwrap().id;
+        tasks::create(
+            pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn new_session(pool: &SqlitePool, task_id: &str, stage: &str) -> String {
+        sessions::create(
+            pool,
+            sessions::NewSession {
+                task_id,
+                stage,
+                role: "coder",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn resumed(pool: &SqlitePool, task_id: &str, stage: &str, from: &str) -> String {
+        sessions::create_resumed(
+            pool,
+            sessions::NewSession {
+                task_id,
+                stage,
+                role: "coder",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+            sessions::ResumedFrom {
+                session_id: from,
+                adapter_session_id: "adapter",
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn turn(pool: &SqlitePool, session: &str, u: &TurnUsage) {
+        append_turn_completed(pool, session, json!({ "is_error": false }), u)
+            .await
+            .unwrap();
+    }
+
+    async fn costs(pool: &SqlitePool, task_id: &str) -> Vec<Option<f64>> {
+        list_rows_for_task(pool, task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.cost_usd)
+            .collect()
+    }
+
+    fn close(a: Option<f64>, b: f64) {
+        assert!((a.unwrap() - b).abs() < 1e-9, "{a:?} vs {b}");
+    }
+
+    #[tokio::test]
+    async fn a_second_turn_in_the_same_row_is_measured_against_the_first() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let s = new_session(&pool, &task, "implement").await;
+        turn(&pool, &s, &usage(Some(0.02490), 10, one_model(10, 0.02490))).await;
+        turn(&pool, &s, &usage(Some(0.02927), 10, one_model(20, 0.02927))).await;
+        let c = costs(&pool, &task).await;
+        close(c[0], 0.02490);
+        close(c[1], 0.00437);
+        let rows = list_rows_for_task(&pool, &task).await.unwrap();
+        assert_eq!(rows[1].models.as_ref().unwrap()["m"].input_tokens, Some(10));
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_continues_its_parents_chain() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let a = new_session(&pool, &task, "implement").await;
+        turn(&pool, &a, &usage(Some(0.02927), 10, None)).await;
+        let b = resumed(&pool, &task, "implement", &a).await;
+        turn(&pool, &b, &usage(Some(0.03288), 10, None)).await;
+        close(costs(&pool, &task).await[1], 0.00361);
+    }
+
+    #[tokio::test]
+    async fn the_chain_reaches_past_a_middle_session_with_no_rows() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let a = new_session(&pool, &task, "implement").await;
+        turn(&pool, &a, &usage(Some(0.02927), 10, None)).await;
+        let b = resumed(&pool, &task, "implement", &a).await;
+        let c = resumed(&pool, &task, "implement", &b).await;
+        turn(&pool, &c, &usage(Some(0.03288), 10, None)).await;
+        close(costs(&pool, &task).await[1], 0.00361);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_session_does_not_see_another_sessions_totals() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let a = new_session(&pool, &task, "implement").await;
+        turn(&pool, &a, &usage(Some(0.5), 10, None)).await;
+        let b = new_session(&pool, &task, "implement").await;
+        turn(&pool, &b, &usage(Some(0.2), 10, None)).await;
+        close(costs(&pool, &task).await[1], 0.2);
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_cost_is_skipped_by_the_next_baseline() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let a = new_session(&pool, &task, "implement").await;
+        turn(&pool, &a, &usage(Some(0.1), 10, None)).await;
+        turn(&pool, &a, &usage(None, 10, None)).await;
+        turn(&pool, &a, &usage(Some(0.3), 10, None)).await;
+        let c = costs(&pool, &task).await;
+        assert_eq!(c[1], None);
+        close(c[2], 0.2);
+    }
+
+    async fn count(pool: &SqlitePool, sql: &'static str, session: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .bind(session)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    const EVENTS: &str =
+        "SELECT COUNT(*) FROM events WHERE session_id = ? AND event_type = 'turn_completed'";
+    const ROWS: &str = "SELECT COUNT(*) FROM turn_usage WHERE session_id = ?";
+
+    #[tokio::test]
+    async fn success_writes_exactly_one_event_and_one_row() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let s = new_session(&pool, &task, "implement").await;
+        let event = append_turn_completed(
+            &pool,
+            &s,
+            json!({ "is_error": false }),
+            &usage(Some(0.1), 10, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(event.event_type, EventType::TurnCompleted);
+        assert_eq!(count(&pool, EVENTS, &s).await, 1);
+        assert_eq!(count(&pool, ROWS, &s).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_usage_insert_rolls_the_event_back() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let s = new_session(&pool, &task, "implement").await;
+        sqlx::query(
+            "CREATE TRIGGER forced BEFORE INSERT ON turn_usage
+             BEGIN SELECT RAISE(ABORT, 'forced'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let err = append_turn_completed(
+            &pool,
+            &s,
+            json!({ "is_error": false }),
+            &usage(Some(0.1), 10, None),
+        )
+        .await;
+        assert!(err.is_err());
+        assert_eq!(count(&pool, EVENTS, &s).await, 0);
+        assert_eq!(count(&pool, ROWS, &s).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_session_fails_and_leaves_no_row() {
+        let pool = connect_in_memory().await.unwrap();
+        let err = append_turn_completed(
+            &pool,
+            "nope",
+            json!({ "is_error": false }),
+            &usage(Some(0.1), 10, None),
+        )
+        .await;
+        assert!(matches!(err, Err(sqlx::Error::RowNotFound)));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM turn_usage")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    async fn enter(pool: &SqlitePool, task: &str, stage: &str, outcome: Option<&str>) {
+        events::append_stage_transition(pool, task, stage, outcome, "agent_turn")
+            .await
+            .unwrap();
+    }
+
+    async fn lap(pool: &SqlitePool, session: &str) -> Option<i64> {
+        sqlx::query_scalar("SELECT lap FROM sessions WHERE id = ?")
+            .bind(session)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn laps_count_entries_not_retries_and_resumes_keep_their_lap() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        enter(&pool, &task, "implement", None).await;
+        let a = new_session(&pool, &task, "implement").await;
+        assert_eq!(lap(&pool, &a).await, Some(1));
+
+        enter(&pool, &task, "implement", Some("retry")).await;
+        let b = new_session(&pool, &task, "implement").await;
+        assert_eq!(lap(&pool, &b).await, Some(1));
+        let c = resumed(&pool, &task, "implement", &b).await;
+        assert_eq!(lap(&pool, &c).await, Some(1));
+
+        enter(&pool, &task, "review", Some("done")).await;
+        enter(&pool, &task, "implement", Some("changes_requested")).await;
+        let d = new_session(&pool, &task, "implement").await;
+        assert_eq!(lap(&pool, &d).await, Some(2));
+        // A resume of the first lap's session stays in lap 1.
+        let e = resumed(&pool, &task, "implement", &a).await;
+        assert_eq!(lap(&pool, &e).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_stage_entries_is_lap_one() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let a = new_session(&pool, &task, "implement").await;
+        assert_eq!(lap(&pool, &a).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn stage_transitions_record_the_stage_kind() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        events::append_stage_transition(&pool, &task, "gate", None, "human_gate")
+            .await
+            .unwrap();
+        let trail = events::list_stage_trail(&pool, &task).await.unwrap();
+        assert_eq!(trail[0].payload["kind"], "human_gate");
+    }
+}

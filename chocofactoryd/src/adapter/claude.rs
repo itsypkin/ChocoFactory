@@ -853,8 +853,11 @@ fn normalize_result(value: &Value, billing: BillingMode) -> Vec<AgentEvent> {
 
 fn u64_field(value: &Value, key: &str) -> Option<u64> {
     let n = value.get(key)?;
-    n.as_u64()
-        .or_else(|| n.as_f64().filter(|f| *f >= 0.0 && f.fract() == 0.0).map(|f| f as u64))
+    n.as_u64().or_else(|| {
+        n.as_f64()
+            .filter(|f| *f >= 0.0 && f.fract() == 0.0)
+            .map(|f| f as u64)
+    })
 }
 
 /// The usage fields of a `result` line. Each missing or non-numeric field
@@ -1107,7 +1110,9 @@ mod tests {
             BillingMode::ApiKey
         );
         assert_eq!(
-            run(Some(r#"{"type":"system","subtype":"init","session_id":"s"}"#)),
+            run(Some(
+                r#"{"type":"system","subtype":"init","session_id":"s"}"#
+            )),
             BillingMode::Unknown
         );
         assert_eq!(
@@ -1186,7 +1191,11 @@ mod tests {
         let tool_result_line = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01115SPXiWWzz1P1dPhHbWAe","type":"tool_result","content":"hello-from-tool","is_error":false}]},"session_id":"0259e0c8-5b32-4044-a69a-4bd21257621d"}"#;
 
         let mut tool_names = HashMap::new();
-        let call_events = normalize(&parse(tool_use_line), &mut tool_names, &mut BillingMode::Unknown);
+        let call_events = normalize(
+            &parse(tool_use_line),
+            &mut tool_names,
+            &mut BillingMode::Unknown,
+        );
         assert_eq!(
             call_events,
             vec![AgentEvent::ToolCall {
@@ -1199,7 +1208,11 @@ mod tests {
             }]
         );
 
-        let result_events = normalize(&parse(tool_result_line), &mut tool_names, &mut BillingMode::Unknown);
+        let result_events = normalize(
+            &parse(tool_result_line),
+            &mut tool_names,
+            &mut BillingMode::Unknown,
+        );
         assert_eq!(
             result_events,
             vec![AgentEvent::ToolResult {
@@ -1217,7 +1230,10 @@ mod tests {
         let mut tool_names = HashMap::new();
         assert_eq!(
             normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown),
-            vec![AgentEvent::TurnCompleted { is_error: false, usage: unknown_usage() }]
+            vec![AgentEvent::TurnCompleted {
+                is_error: false,
+                usage: unknown_usage()
+            }]
         );
     }
 
@@ -1231,7 +1247,10 @@ mod tests {
                 AgentEvent::Error {
                     message: "boom".to_string()
                 },
-                AgentEvent::TurnCompleted { is_error: true, usage: unknown_usage() },
+                AgentEvent::TurnCompleted {
+                    is_error: true,
+                    usage: unknown_usage()
+                },
             ]
         );
     }
@@ -1305,7 +1324,10 @@ mod tests {
                         .to_string(),
                     detected_by: InterruptionEvidence::MessageText,
                 },
-                AgentEvent::TurnCompleted { is_error: true, usage: unknown_usage() },
+                AgentEvent::TurnCompleted {
+                    is_error: true,
+                    usage: unknown_usage()
+                },
             ]
         );
     }
@@ -1351,7 +1373,10 @@ mod tests {
     fn ignores_rate_limit_events() {
         let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"},"session_id":"abc"}"#;
         let mut tool_names = HashMap::new();
-        assert_eq!(normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown), Vec::new());
+        assert_eq!(
+            normalize(&parse(line), &mut tool_names, &mut BillingMode::Unknown),
+            Vec::new()
+        );
     }
 
     fn fixture_binary(name: &str) -> String {
@@ -2262,7 +2287,10 @@ mod tests {
                     .to_string()
             }]
         );
-        assert_eq!(normalize(&parse(accepted), &mut tool_names, &mut BillingMode::Unknown), Vec::new());
+        assert_eq!(
+            normalize(&parse(accepted), &mut tool_names, &mut BillingMode::Unknown),
+            Vec::new()
+        );
     }
 
     /// Removes a scratch tree and the transcript folder a probe created, even

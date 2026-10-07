@@ -1139,12 +1139,16 @@ impl SingleShotTurn {
                 self.waiting_for_report = false;
                 TurnStep::EndedWithError
             }
-            AgentEvent::TurnCompleted { is_error: false, .. } if self.reported => {
+            AgentEvent::TurnCompleted {
+                is_error: false, ..
+            } if self.reported => {
                 self.completed = true;
                 self.waiting_for_report = false;
                 TurnStep::Completed
             }
-            AgentEvent::TurnCompleted { is_error: false, .. } => {
+            AgentEvent::TurnCompleted {
+                is_error: false, ..
+            } => {
                 self.waiting_for_report = true;
                 TurnStep::WaitingForReport
             }
