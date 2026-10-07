@@ -3697,7 +3697,10 @@ mod tests {
         assert!(matches!(err, SessionError::RoleRejected(_)), "{err:?}");
         assert!(err.to_string().contains("can't use memory: true"), "{err}");
         assert!(!marker.exists(), "omp must not have been started");
-        assert!(!dir.join("state").exists(), "no overlay or session dir was made");
+        assert!(
+            !dir.join("state").exists(),
+            "no overlay or session dir was made"
+        );
         let row = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(row.status, SessionStatus::Idle);
 
@@ -3708,6 +3711,148 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claude.calls().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What one `turn_usage` row holds, as the scripted fixtures report it.
+    struct ExpectedUsage {
+        billing: &'static str,
+        counting: &'static str,
+        model: &'static str,
+        /// `Some` when the fixture scripts the duration; omp measures its
+        /// own wall time, so there it only has to be present.
+        duration_ms: Option<i64>,
+    }
+
+    /// One assertion for every adapter: the `turn_usage` row a scripted
+    /// turn leaves holds exactly the figures both fixtures script (300 /
+    /// 60 / 90 / 15 tokens, 0.0369 USD, three model turns, one model).
+    async fn assert_usage_row(pool: &SqlitePool, task_id: &str, expected: &ExpectedUsage) {
+        type Row = (
+            String,
+            String,
+            Option<f64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT billing, counting, cost_usd, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, duration_ms, model_turns, models
+             FROM turn_usage WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (billing, counting, cost, input, output, read, write, duration, turns, models) =
+            rows.into_iter().next().unwrap();
+        assert_eq!(billing, expected.billing);
+        assert_eq!(counting, expected.counting);
+        assert!((cost.unwrap() - 0.0369).abs() < 1e-9, "{cost:?}");
+        assert_eq!(
+            (input, output, read, write),
+            (Some(300), Some(60), Some(90), Some(15))
+        );
+        assert_eq!(turns, Some(3));
+        match expected.duration_ms {
+            Some(ms) => assert_eq!(duration, Some(ms)),
+            None => assert!(duration.is_some_and(|ms| ms >= 0), "{duration:?}"),
+        }
+        let models: Value = serde_json::from_str(&models.unwrap()).unwrap();
+        let models = models.as_object().unwrap();
+        assert_eq!(models.len(), 1, "{models:?}");
+        let figures = &models[expected.model];
+        assert_eq!(figures["input_tokens"], 300);
+        assert_eq!(figures["output_tokens"], 60);
+        assert_eq!(figures["cache_read_tokens"], 90);
+        assert_eq!(figures["cache_write_tokens"], 15);
+        assert!((figures["cost_usd"].as_f64().unwrap() - 0.0369).abs() < 1e-9);
+    }
+
+    async fn run_scripted_turn(adapter: Arc<dyn AgentAdapter>, name: &str) -> (SqlitePool, String) {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        sqlx::query("UPDATE sessions SET cli_adapter = ? WHERE id = ?")
+            .bind(name)
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let manager = SessionManager::new(
+            pool.clone(),
+            Registry::single(adapter),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        let cfg = RoleConfig {
+            cwd: std::env::temp_dir(),
+            ..role_config()
+        };
+        manager
+            .start(&session_id, name, "go", &cfg, SessionKind::Standing)
+            .await
+            .unwrap();
+        let task_id = task_of(&pool, &session_id).await;
+        crate::test_support::wait_until("a usage row", || async {
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM turn_usage WHERE task_id = ?")
+                .bind(&task_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if n >= 1 {
+                Ok(())
+            } else {
+                Err("no row".to_string())
+            }
+        })
+        .await;
+        (pool, task_id)
+    }
+
+    #[tokio::test]
+    async fn a_claude_turn_stores_the_scripted_usage() {
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
+            "fake_claude_usage.py",
+        )));
+        let (pool, task_id) = run_scripted_turn(adapter, "claude").await;
+        assert_usage_row(
+            &pool,
+            &task_id,
+            &ExpectedUsage {
+                billing: "subscription",
+                counting: "cumulative",
+                model: "scripted-model",
+                duration_ms: Some(1234),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_omp_turn_stores_the_same_scripted_usage() {
+        let dir = std::env::temp_dir().join(format!("choco-omp-usage-{}", uuid::Uuid::new_v4()));
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(crate::adapter::OmpAdapter::with_binary(
+            fixture_binary("fake_omp.py"),
+            &dir,
+        ));
+        let (pool, task_id) = run_scripted_turn(adapter, "omp").await;
+        assert_usage_row(
+            &pool,
+            &task_id,
+            &ExpectedUsage {
+                billing: "subscription",
+                counting: "per_turn",
+                model: "openai-codex/gpt-5.6-terra",
+                duration_ms: None,
+            },
+        )
+        .await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2054,7 +2054,10 @@ stages:
             )
             .await
             .json();
-        let task_id = task["id"].as_str().unwrap_or_else(|| panic!("{task}")).to_string();
+        let task_id = task["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{task}"))
+            .to_string();
         let before = server.get(&format!("/tasks/{task_id}")).await.json()["config"].clone();
 
         let response = server

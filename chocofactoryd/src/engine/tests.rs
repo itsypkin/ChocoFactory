@@ -14586,7 +14586,12 @@ async fn create_task_pointing_a_memory_role_at_omp_in_its_config_creates_nothing
         .unwrap_err();
     assert!(matches!(err, CreateTaskError::RoleRejected(_)), "{err:?}");
     assert_eq!(err.to_string(), OMP_MEMORY_REJECTION);
-    assert!(tasks::list(&pool, Some(&project_id), None).await.unwrap().is_empty());
+    assert!(
+        tasks::list(&pool, Some(&project_id), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(!marker.exists());
 
     // A role the workflow doesn't define is skipped; claude is accepted.
@@ -14634,7 +14639,12 @@ async fn a_memory_role_routed_to_omp_by_the_global_config_fails_the_turn_closed(
         task.stuck_reason.unwrap().contains(OMP_MEMORY_REJECTION),
         "the stuck reason carries the message"
     );
-    assert!(sessions::list_for_task(&pool, &task_id).await.unwrap().is_empty());
+    assert!(
+        sessions::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(!marker.exists(), "omp must not have been started");
 
     let err = engine
