@@ -3151,3 +3151,31 @@ fn lines_freed_by_dropping_rows_go_to_the_event_tail() {
     assert!(lines[i + 1].contains("message 6"), "{s}");
     assert!(lines[i + 2].starts_with("e events"), "{s}");
 }
+
+#[test]
+fn a_long_token_after_words_starts_its_own_line() {
+    let token = "abcdefghij".repeat(10);
+    let mut app = board();
+    let id = "7d22e1a8-dddd";
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == id)
+        .unwrap()
+        .task
+        .stuck_reason = Some(format!("failed at {token} again"));
+    open_detail(&mut app, id);
+    let s = render(&app, 80, 24);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let i = lines
+        .iter()
+        .position(|l| l.starts_with("Stuck "))
+        .expect(&s);
+    assert_eq!(lines[i], "Stuck     failed at", "{s}");
+    assert_eq!(lines[i + 1], format!("          {}", &token[..70]), "{s}");
+    // The last chunk is the current line, so the next word joins it.
+    assert_eq!(
+        lines[i + 2],
+        format!("          {} again", &token[70..]),
+        "{s}"
+    );
+}
