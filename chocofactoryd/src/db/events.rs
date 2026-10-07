@@ -55,6 +55,18 @@ pub async fn append(
     event_type: EventType,
     payload: Value,
 ) -> Result<Event, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    append_on(&mut conn, session_id, event_type, payload).await
+}
+
+/// [`append`] on a caller-supplied connection, so a caller can make the
+/// event part of a larger transaction (`db::usage::append_turn_completed`).
+pub(crate) async fn append_on(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    event_type: EventType,
+    payload: Value,
+) -> Result<Event, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, EventRow>(concat!(
@@ -69,7 +81,7 @@ pub async fn append(
     .bind(Json(payload))
     .bind(now)
     .bind(session_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(row.into())
 }
@@ -115,12 +127,13 @@ pub async fn append_stage_transition(
     task_id: &str,
     stage: &str,
     entered_via: Option<&str>,
+    kind: &str,
 ) -> Result<Event, sqlx::Error> {
     append_for_task(
         pool,
         task_id,
         EventType::StageEntered,
-        json!({ "stage": stage, "outcome": entered_via }),
+        json!({ "stage": stage, "outcome": entered_via, "kind": kind }),
     )
     .await
 }
@@ -653,7 +666,7 @@ mod tests {
         .id;
 
         // An entry stage: nothing transitioned into it, so no outcome.
-        let entry = append_stage_transition(&pool, &task_id, "coding", None)
+        let entry = append_stage_transition(&pool, &task_id, "coding", None, "agent_turn")
             .await
             .unwrap();
         assert_eq!(entry.event_type, EventType::StageEntered);
@@ -664,7 +677,7 @@ mod tests {
         assert_eq!(entry.payload["stage"], "coding");
         assert_eq!(entry.payload["outcome"], Value::Null);
 
-        let next = append_stage_transition(&pool, &task_id, "review", Some("approved"))
+        let next = append_stage_transition(&pool, &task_id, "review", Some("approved"), "agent_turn")
             .await
             .unwrap();
         assert_eq!(next.payload["stage"], "review");
@@ -697,7 +710,7 @@ mod tests {
         .unwrap()
         .id;
 
-        let entered = append_stage_transition(&pool, &task_id, "chatting", None)
+        let entered = append_stage_transition(&pool, &task_id, "chatting", None, "agent_turn")
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -711,7 +724,7 @@ mod tests {
         .await
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let advanced = append_stage_transition(&pool, &task_id, "done", Some("finished"))
+        let advanced = append_stage_transition(&pool, &task_id, "done", Some("finished"), "terminal")
             .await
             .unwrap();
 
@@ -774,13 +787,13 @@ mod tests {
         let first = tasks::create(&pool, new_task("A")).await.unwrap().id;
         let second = tasks::create(&pool, new_task("B")).await.unwrap().id;
 
-        append_stage_transition(&pool, &first, "coding", None)
+        append_stage_transition(&pool, &first, "coding", None, "agent_turn")
             .await
             .unwrap();
-        append_stage_transition(&pool, &second, "triage", None)
+        append_stage_transition(&pool, &second, "triage", None, "agent_turn")
             .await
             .unwrap();
-        append_stage_transition(&pool, &first, "review", Some("approved"))
+        append_stage_transition(&pool, &first, "review", Some("approved"), "agent_turn")
             .await
             .unwrap();
 

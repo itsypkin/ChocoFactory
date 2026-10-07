@@ -11,7 +11,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{AdapterError, AgentAdapter, AgentEvent, AgentHandle, RoleConfig};
-use crate::db::{events, sessions};
+use crate::db::{events, sessions, usage};
 
 /// Drives the active ⇄ idle ⇄ resume state machine (§4.1) on top of
 /// `sessions`: keeps a live `AgentHandle` per active `session_id`,
@@ -719,7 +719,16 @@ async fn drain_session(
                 {
                     map.insert("after_completion".to_string(), Value::Bool(true));
                 }
-                match events::append(pool, session_id, event_type, payload).await {
+                // A top-level `turn_completed` and its usage row commit
+                // together (or not at all); a sub-agent's records no usage,
+                // since the main conversation's totals already include it.
+                let appended = match &event {
+                    AgentEvent::TurnCompleted { usage, .. } => {
+                        usage::append_turn_completed(pool, session_id, payload, usage).await
+                    }
+                    _ => events::append(pool, session_id, event_type, payload).await,
+                };
+                match appended {
                     Ok(appended) => {
                         tracing::debug!(session_id, event_type = %appended.event_type, "appended event");
                         events_notify.notify_waiters();
@@ -1125,17 +1134,17 @@ impl SingleShotTurn {
                 }
                 TurnStep::Continue
             }
-            AgentEvent::TurnCompleted { is_error: true } => {
+            AgentEvent::TurnCompleted { is_error: true, .. } => {
                 self.errored = true;
                 self.waiting_for_report = false;
                 TurnStep::EndedWithError
             }
-            AgentEvent::TurnCompleted { is_error: false } if self.reported => {
+            AgentEvent::TurnCompleted { is_error: false, .. } if self.reported => {
                 self.completed = true;
                 self.waiting_for_report = false;
                 TurnStep::Completed
             }
-            AgentEvent::TurnCompleted { is_error: false } => {
+            AgentEvent::TurnCompleted { is_error: false, .. } => {
                 self.waiting_for_report = true;
                 TurnStep::WaitingForReport
             }

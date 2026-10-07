@@ -13,6 +13,7 @@ pub mod serde_util;
 pub mod session;
 pub mod shell;
 pub mod template;
+pub mod usage;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod workflow_def;

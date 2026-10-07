@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{ApiError, AppState};
+use crate::db::usage as usage_db;
 use crate::db::{events, tasks, workflow_state};
+use crate::usage::{self, TaskTimes, TaskUsage};
 use crate::engine::{WorkflowEngine, WorkflowRef};
 
 #[derive(Deserialize)]
@@ -141,6 +143,9 @@ pub struct TaskDetail {
     /// Where a task cancelled with `--keep` left its work (#102); `None`
     /// for every other task.
     pub kept: Option<KeptWork>,
+    /// What the task has cost and how long it ran; `null` when no turn has
+    /// recorded usage.
+    pub usage: Option<TaskUsage>,
 }
 
 /// The worktree path and branch a `cancel --keep` handed to a person.
@@ -234,7 +239,23 @@ pub async fn get(
     let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
     let workflow_file_status = workflow_file_status(&state.engine, &task);
     let kept = kept_work(&task);
+    // Rows first: every row's session exists, so the session list read
+    // afterwards can only be a superset of what the rows refer to.
+    let usage_rows = usage_db::list_rows_for_task(&state.pool, &id).await?;
+    let usage_sessions = usage_db::list_session_facts(&state.pool, &id).await?;
+    let usage = usage::aggregate(
+        TaskTimes {
+            status: &task.status,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+        },
+        &usage_sessions,
+        &usage_rows,
+        &stage_trail,
+        chrono::Utc::now(),
+    );
     Ok(Json(TaskDetail {
+        usage,
         task,
         kept,
         workflow_state,

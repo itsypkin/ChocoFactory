@@ -55,6 +55,7 @@ fn main() {
         "type": "system",
         "subtype": "init",
         "session_id": session_id,
+        "apiKeySource": "none",
     })) {
         return;
     }
@@ -63,6 +64,11 @@ fn main() {
     let reply_override = std::env::var("MOCK_CLAUDE_REPLY").ok();
     let oneshot = std::env::var_os("MOCK_CLAUDE_ONESHOT").is_some();
     let uses_tool = std::env::var_os("MOCK_CLAUDE_TOOL_USE").is_some();
+    // Results this process has emitted. Like the real CLI, the reported cost
+    // and per-model figures are running totals; a `--resume` process starts
+    // again from 0 (the real one restores its total — a mock limitation the
+    // daemon's counter-restart rule absorbs).
+    let mut results_emitted: u32 = 0;
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line.expect("failed to read a line from stdin");
@@ -145,12 +151,34 @@ fn main() {
             return;
         }
 
+        results_emitted += 1;
+        let n = u64::from(results_emitted);
+        let total_cost = 0.01 * f64::from(results_emitted);
         let result_ok = emit(&json!({
             "type": "result",
             "subtype": "success",
             "is_error": false,
             "result": reply,
             "session_id": session_id,
+            "duration_ms": 1000,
+            "num_turns": 1,
+            "total_cost_usd": total_cost,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 20,
+            },
+            "modelUsage": {
+                "mock-model": {
+                    "inputTokens": 10 * n,
+                    "outputTokens": 5 * n,
+                    "cacheReadInputTokens": 100 * n,
+                    "cacheCreationInputTokens": 20 * n,
+                    "costUSD": total_cost,
+                    "costBasis": "list",
+                },
+            },
         }));
         if !result_ok {
             return;

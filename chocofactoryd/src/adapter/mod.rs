@@ -205,6 +205,9 @@ pub enum AgentEvent {
     /// single-shot `agent_turn`) doesn't have to re-inspect the raw JSON.
     TurnCompleted {
         is_error: bool,
+        /// What the turn cost. Every adapter must fill every field: unknown
+        /// is `None` / `BillingMode::Unknown`, never zero.
+        usage: TurnUsage,
     },
     /// Something a sub-agent did, rather than the main agent (#90). The CLI
     /// streams a sub-agent's tool calls and results on the same stdout as
@@ -216,6 +219,78 @@ pub enum AgentEvent {
         parent_tool_use_id: String,
         event: Box<AgentEvent>,
     },
+}
+
+/// What one turn used, as its CLI reported it. Part of the adapter
+/// contract: every adapter fills every field. There is deliberately no
+/// `Default`, so a new adapter cannot compile without saying, field by
+/// field, what it knows. Unknown is `None` or `BillingMode::Unknown`,
+/// never `0`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnUsage {
+    /// Cost in USD; see `counting` for whether it is this turn's or the
+    /// conversation's running total.
+    pub cost_usd: Option<f64>,
+    /// Always per turn.
+    pub tokens: TokenCounts,
+    /// Per-model breakdown (counted like `cost_usd`). `None` = the adapter
+    /// can't say.
+    pub models: Option<Vec<ModelUsage>>,
+    pub wall_time_ms: Option<u64>,
+    pub model_turns: Option<u32>,
+    pub billing: BillingMode,
+    /// How `cost_usd` and `models` are counted.
+    pub counting: UsageCounting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenCounts {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub cache_read: Option<u64>,
+    pub cache_write: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelUsage {
+    pub model: String,
+    pub tokens: TokenCounts,
+    pub cost_usd: Option<f64>,
+}
+
+/// How the turn was paid for, as far as the adapter can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BillingMode {
+    Subscription,
+    ApiKey,
+    Unknown,
+}
+
+impl BillingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BillingMode::Subscription => "subscription",
+            BillingMode::ApiKey => "api_key",
+            BillingMode::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether a turn's reported cost and per-model figures are its own or a
+/// running total for the whole CLI conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageCounting {
+    CumulativePerConversation,
+    PerTurn,
+}
+
+impl UsageCounting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageCounting::CumulativePerConversation => "cumulative",
+            UsageCounting::PerTurn => "per_turn",
+        }
+    }
 }
 
 /// Which of the claude adapter's rules recognised a usage limit (#92) —
@@ -301,7 +376,7 @@ impl AgentEvent {
                 "interrupted": "usage_limit",
                 "detected_by": detected_by.as_str(),
             }),
-            AgentEvent::TurnCompleted { is_error } => {
+            AgentEvent::TurnCompleted { is_error, .. } => {
                 serde_json::json!({ "is_error": is_error })
             }
             AgentEvent::Subagent {

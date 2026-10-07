@@ -2823,7 +2823,14 @@ impl WorkflowEngine {
         // through this function; deliberately not done here (X-3), since
         // `current_stage` — the value the engine actually reads back — is
         // the one that must be durable, and the failure is logged loudly.
-        match events::append_stage_transition(&self.pool, task_id, stage_name, entered_via).await {
+        match events::append_stage_transition(
+            &self.pool,
+            task_id,
+            stage_name,
+            entered_via,
+            stage_def.kind.name(),
+        )
+        .await {
             Ok(_) => self.events_notify.notify_waiters(),
             Err(err) => tracing::error!(
                 task_id, stage = stage_name, %err,

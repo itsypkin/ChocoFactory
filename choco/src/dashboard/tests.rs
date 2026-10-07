@@ -63,6 +63,7 @@ fn summary(
         loop_counters: json!({}),
         pr: None,
         waiting_on_human: false,
+        usage_total: None,
     }
 }
 
