@@ -108,9 +108,8 @@ impl OmpAdapter {
                 warnings = file_warnings;
                 Some(append_block(&render_instruction_files(&files), cfg))
             }
-            Isolation::InheritOperatorConfig => {
-                (!cfg.report_outcomes.is_empty()).then(|| report_instruction(&cfg.report_outcomes))
-            }
+            Isolation::InheritOperatorConfig => (!cfg.report_outcomes.is_empty())
+                .then(|| with_trailing_newline(&report_instruction(&cfg.report_outcomes))),
         };
 
         let session_dir = self.session_dir();
@@ -255,6 +254,11 @@ fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
 /// The environment every omp process the adapter starts gets: no profile or
 /// config-dir redirect, no OpenTelemetry settings, and the OTel SDK off.
 fn scrub_env(command: &mut Command) {
+    scrub_env_from(command, std::env::vars_os().map(|(name, _)| name));
+}
+
+/// `scrub_env` for an explicit list of the parent's variable names.
+fn scrub_env_from(command: &mut Command, names: impl Iterator<Item = std::ffi::OsString>) {
     for var in [
         "OMP_PROFILE",
         "PI_PROFILE",
@@ -263,7 +267,7 @@ fn scrub_env(command: &mut Command) {
     ] {
         command.env_remove(var);
     }
-    for (name, _) in std::env::vars_os() {
+    for name in names {
         if name.to_string_lossy().starts_with("OTEL_") {
             command.env_remove(name);
         }
@@ -882,7 +886,12 @@ impl Driver {
             Some("host_tool_call") => self.on_host_tool_call(&frame).await,
             Some("prompt_result") => self.on_prompt_result(&frame),
             Some("session_settled") => {
-                let settled = std::mem::take(&mut self.awaiting_settle);
+                let mut settled = std::mem::take(&mut self.awaiting_settle);
+                // The background run's messages belong to the turn that was
+                // waiting for it, not to the next one.
+                if let Some(first) = settled.first_mut() {
+                    first.messages = std::mem::take(&mut self.messages);
+                }
                 self.ready_completions.extend(settled);
                 self.start_next_completion().await;
             }
@@ -932,12 +941,21 @@ impl Driver {
         });
         let check = check_report_call(&self.config.stage, &mut self.thin_reports, &arguments);
         let reply = host_tool_result(id, &check.text, check.is_error);
-        self.send_frame(&reply).await;
+        let delivered = self.send_frame(&reply).await;
+        // A report omp never heard back about is not an accepted report.
+        let (output, is_error) = if delivered {
+            (check.text, check.is_error)
+        } else {
+            (
+                "omp could not be sent the reply to report_outcome".to_string(),
+                true,
+            )
+        };
         self.emit(AgentEvent::ToolResult {
             tool_use_id: tool_call_id.to_string(),
             tool: qualified,
-            output: check.text,
-            is_error: check.is_error,
+            output,
+            is_error,
         });
     }
 
@@ -974,18 +992,23 @@ impl Driver {
             };
             self.emit(event);
         }
-        let completion = Completion {
-            is_error,
-            sent_at,
-            messages: std::mem::take(&mut self.messages),
-        };
         // An error completes at once; anything else waits for the session to
-        // settle when omp says background work can still wake it.
+        // settle when omp says background work can still wake it. A waiting
+        // turn takes its messages when it is released, so the background
+        // run's messages count toward it.
         if status != "error" && frame.get("sessionSettled").and_then(Value::as_bool) == Some(false)
         {
-            self.awaiting_settle.push(completion);
+            self.awaiting_settle.push(Completion {
+                is_error,
+                sent_at,
+                messages: TurnMessages::default(),
+            });
         } else {
-            self.ready_completions.push_back(completion);
+            self.ready_completions.push_back(Completion {
+                is_error,
+                sent_at,
+                messages: std::mem::take(&mut self.messages),
+            });
         }
     }
 
@@ -1007,6 +1030,19 @@ impl Driver {
                 }
             };
             self.finish_stats(reading);
+            return;
+        }
+        if frame.get("command").and_then(Value::as_str) == Some("prompt")
+            && frame.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false)
+            && let Some(sent_at) = id.and_then(|id| self.prompts.remove(id))
+        {
+            // A builtin slash command finished without an agent turn; omp
+            // sends no `prompt_result` for it, so the response completes it.
+            self.ready_completions.push_back(Completion {
+                is_error: false,
+                sent_at,
+                messages: TurnMessages::default(),
+            });
             return;
         }
         if frame.get("success").and_then(Value::as_bool) == Some(false) {
@@ -1083,6 +1119,9 @@ impl Driver {
     fn finish_pending_at_exit(&mut self) {
         if self.stats_wait.is_some() {
             self.finish_stats(None);
+        }
+        if let Some(first) = self.awaiting_settle.first_mut() {
+            first.messages = std::mem::take(&mut self.messages);
         }
         let pending: Vec<Completion> = std::mem::take(&mut self.awaiting_settle)
             .into_iter()

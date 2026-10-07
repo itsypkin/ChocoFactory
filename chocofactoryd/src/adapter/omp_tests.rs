@@ -494,6 +494,40 @@ async fn an_unsettled_session_completes_on_session_settled() {
 }
 
 #[tokio::test]
+async fn a_builtin_command_completes_on_its_response() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "local_command")]);
+    let mut handle = adapter.start("/help", &env.cfg()).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCompleted {
+            is_error: false,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_turn_completes_without_figures_when_stdin_was_closed_first() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    handle.close_stdin();
+    let events = until_turn_completed(&mut handle).await;
+    assert_eq!(usage_of(&events).tokens, TokenCounts::default());
+}
+
+#[tokio::test]
+async fn background_messages_count_toward_the_turn_that_waited_for_them() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    assert_eq!(usage_of(&events).model_turns, Some(4));
+}
+
+#[tokio::test]
 async fn an_unknown_host_tool_is_answered_as_an_error() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unknown_tool")]);
@@ -789,7 +823,7 @@ async fn an_inherit_role_gets_its_system_prompt_and_the_report_instruction_only_
     );
     assert_eq!(
         arg_after(&argv, "--append-system-prompt").unwrap(),
-        report_instruction(&cfg.report_outcomes)
+        with_trailing_newline(&report_instruction(&cfg.report_outcomes))
     );
 }
 
@@ -1015,17 +1049,18 @@ async fn the_child_environment_is_scrubbed_and_the_otel_sdk_is_off() {
 
 #[test]
 fn every_otel_variable_in_the_environment_is_removed() {
-    // A uniquely named variable under the prefix, so no other test can see it.
-    // SAFETY: only this test reads or writes this one name.
-    unsafe { std::env::set_var("OTEL_CHOCO_SCRUB_TEST", "x") };
     let mut command = Command::new("true");
-    scrub_env(&mut command);
-    let removed = command
-        .as_std()
-        .get_envs()
-        .any(|(k, v)| k == "OTEL_CHOCO_SCRUB_TEST" && v.is_none());
-    assert!(removed);
-    unsafe { std::env::remove_var("OTEL_CHOCO_SCRUB_TEST") };
+    let names = ["OTEL_CHOCO_SCRUB_TEST", "PATH"].map(std::ffi::OsString::from);
+    scrub_env_from(&mut command, names.into_iter());
+    let get = |name: &str| {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.map(|v| v.to_owned()))
+    };
+    assert_eq!(get("OTEL_CHOCO_SCRUB_TEST"), Some(None));
+    assert_eq!(get("PATH"), None);
 }
 
 // ---------------------------------------------------------------------------

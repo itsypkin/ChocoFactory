@@ -25,6 +25,7 @@ wrapper script, never through the test process's own environment):
   echo       the final assistant text is a JSON report of argv, env and the
              overlay file's contents
   noreport   no `report_outcome` call is made
+  local_command  the prompt is a builtin command: response `agentInvoked: false`, no `prompt_result`
   side_calls the session statistics include FAKE_OMP_SIDE_TOKENS input
              tokens that no message carries
   no_ready   the process sleeps instead of speaking (never used for success)
@@ -278,6 +279,10 @@ def run_reports():
 
 
 def run_prompt(request):
+    if "local_command" in MODES:
+        # A builtin slash command: no agent turn and no `prompt_result`.
+        respond(request, data={"agentInvoked": False})
+        return
     respond(request, data={"agentInvoked": True})
     if "garbage" in MODES:
         sys.stdout.write("this is not json\n")
