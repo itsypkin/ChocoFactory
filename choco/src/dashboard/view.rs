@@ -677,7 +677,10 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         }
     } else if let Some(t) = snap {
         rows.push(FRow::new(LABEL_ID, t.task.id.clone()));
-        rows.push(FRow::new(LABEL_PROJECT, app.project_label(&t.task.project_id)));
+        rows.push(FRow::new(
+            LABEL_PROJECT,
+            app.project_label(&t.task.project_id),
+        ));
         rows.push(FRow::new(LABEL_WORKFLOW, t.task.workflow_def.clone()));
         rows.push(FRow::new(LABEL_STATUS, t.task.status.clone()));
     }
@@ -995,7 +998,9 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
         } else {
             // Then older progress lines go, the header row kept...
             let largest = |rows: &[FRow], header: bool| {
-                (1..prog.len()).rev().find(|&m| block(rows, m, header) <= body_h)
+                (1..prog.len())
+                    .rev()
+                    .find(|&m| block(rows, m, header) <= body_h)
             };
             if cuttable {
                 keep_prog = largest(&rows, show_header)

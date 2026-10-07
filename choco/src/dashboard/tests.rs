@@ -2075,12 +2075,7 @@ fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
     let app = busy_view();
     // 22 rows: the whole status block, and two of the events.
     let s = render(&app, 100, 22);
-    for want in [
-        "Role      coder",
-        "Loop counters",
-        "message 5",
-        "message 6",
-    ] {
+    for want in ["Role      coder", "Loop counters", "message 5", "message 6"] {
         assert!(s.contains(want), "{want}\n{s}");
     }
     assert!(row_has(&s, &["1", "start", "coding"]), "{s}");
@@ -2723,4 +2718,436 @@ fn the_cost_row_is_dropped_with_the_role_row_at_every_height() {
             let _ = render(&app, w, h);
         }
     }
+    // A long, mixed-width trail and a long event stream, at every size.
+    let long = long_view(34, 60, false);
+    for w in [40, 60, 100] {
+        for h in 10..=40u16 {
+            assert_detail_invariants(&long, w, h, false);
+        }
+    }
+}
+
+// ---- the progress table, accent colour and polish (#211, #187) -----------
+
+/// A detail whose trail has `n` steps with mixed-width stage names. Steps
+/// 1..=5 are dated the day before `now()`, the rest are today. When `stale`,
+/// the current stage is not the trail's last one.
+fn long_detail(n: usize, stale: bool) -> Value {
+    const STAGES: [&str; 5] = [
+        "coding",
+        "internal_review",
+        "awaiting_human_review",
+        "ci",
+        "revising",
+    ];
+    let mut d = busy_detail();
+    let trail: Vec<Value> = (1..=n)
+        .map(|i| {
+            json!({
+                "created_at": step_iso(i),
+                "payload": {
+                    "stage": STAGES[(i - 1) % 5],
+                    "outcome": if i == 1 { Value::Null } else { json!("done") },
+                },
+            })
+        })
+        .collect();
+    d["stage_trail"] = Value::Array(trail);
+    d["workflow_state"]["current_stage"] = json!(if stale {
+        "somewhere_else"
+    } else {
+        STAGES[(n - 1) % 5]
+    });
+    d
+}
+
+fn step_iso(i: usize) -> String {
+    if i <= 5 {
+        format!("2025-12-31T{:02}:00:00Z", 18 + i)
+    } else {
+        format!("2026-01-01T01:{:02}:00Z", i % 60)
+    }
+}
+
+/// The time cell the table prints for step `i` of [`long_detail`].
+fn step_time(i: usize) -> String {
+    if i <= 5 {
+        format!("2025-12-31 {:02}:00:00", 18 + i)
+    } else {
+        format!("01:{:02}:00", i % 60)
+    }
+}
+
+fn long_view(n: usize, events: usize, stale: bool) -> App {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(long_detail(n, stale)));
+    push_events(&mut app, BUSY, events);
+    app
+}
+
+/// The progress table's step rows on a screen: the lines whose first token
+/// is a step number or the `→` of a stale trail.
+fn step_rows(s: &str) -> Vec<&str> {
+    s.lines()
+        .map(str::trim_end)
+        .filter(|l| {
+            l.split_whitespace().next().is_some_and(|t| {
+                t == "→" || (t.chars().all(|c| c.is_ascii_digit()) && l.starts_with("  "))
+            })
+        })
+        .collect()
+}
+
+fn render_buf(app: &App, w: u16, h: u16) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| draw(f, app)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn buf_lines(buf: &Buffer) -> Vec<String> {
+    screen(buf)
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+fn line_index(lines: &[String], starts: &str) -> usize {
+    lines
+        .iter()
+        .position(|l| l.starts_with(starts))
+        .unwrap_or_else(|| panic!("no line starting {starts:?}:\n{}", lines.join("\n")))
+}
+
+#[test]
+fn the_80x24_status_view_shows_the_aligned_table() {
+    let app = busy_view();
+    let expected = [
+        title_row(
+            "Per-kind stage execution (#55)",
+            "e events · Esc back · ? help",
+            80,
+        ),
+        "ID        9c03aa17-bbbb".into(),
+        "Project   chocofactory".into(),
+        "Workflow  coding-task".into(),
+        "Workflow  builtin:coding-task  [0123456789ab]".into(),
+        "Status    open".into(),
+        "Repo      /home/dev/chocofactory".into(),
+        "Role      coder: model=opus".into(),
+        "Created   2026-01-01 03:40:00 UTC".into(),
+        "Stage     internal_review for 12m".into(),
+        "Cost      no data".into(),
+        sep("progress", 80),
+        "  #  from             outcome            to               at (UTC)".into(),
+        "  1                   start              coding           03:41:00".into(),
+        "  2  coding           done               internal_review  04:10:00".into(),
+        "  3  internal_review  changes_requested  revising         04:50:00".into(),
+        "  4  revising         done               internal_review  11:48:00  ◀ current".into(),
+        "Loop counters  internal_review=2".into(),
+        sep("last events (e expands)", 80),
+        format!("  {}  human_message message 3", at(3)),
+        format!("  {}  human_message message 4", at(4)),
+        format!("  {}  human_message message 5", at(5)),
+        format!("  {}  human_message message 6", at(6)),
+        "e events  o PR  r retry  c cancel  Esc back".into(),
+    ]
+    .join("\n");
+    assert_screen(&render(&app, 80, 24), &expected);
+}
+
+/// #187: the tail used to stop at five events and leave the rest blank.
+#[test]
+fn the_event_tail_fills_a_tall_screen() {
+    let app = long_view(4, 40, false);
+    let s = render(&app, 120, 40);
+    let lines: Vec<&str> = s.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| l.starts_with("─ last events"))
+        .expect(&s);
+    let shown = &lines[i + 1..lines.len() - 1];
+    assert!(shown.len() > 5, "{s}");
+    for (n, l) in shown.iter().enumerate() {
+        assert!(l.contains("human_message message"), "line {n}: {l:?}\n{s}");
+    }
+    // The newest event is the last line above the footer.
+    assert!(shown.last().unwrap().contains("message 39"), "{s}");
+}
+
+#[test]
+fn at_80x16_progress_wins_over_role_and_created() {
+    let app = long_view(14, 30, false);
+    let s = render(&app, 80, 16);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("Role ") || l.starts_with("Created ")),
+        "{s}"
+    );
+    // Fields if Role and Created were kept: 10 rows (ID, Project, two
+    // Workflow, Status, Repo, Role, Created, Stage, Cost).
+    let old_budget = 15 - 1 - 10 - 3;
+    assert!(step_rows(&s).len() > old_budget, "{s}");
+    assert!(lines.iter().any(|l| l.contains("earlier steps")), "{s}");
+    // No blank body line: the counters line sits right above the footer,
+    // and the `◀ current` row right above it.
+    assert!(lines[14].starts_with("Loop counters"), "{s}");
+    assert!(lines[13].ends_with("◀ current"), "{s}");
+}
+
+#[test]
+fn at_60_columns_stage_names_are_cut_but_every_time_stays() {
+    let app = long_view(8, 0, false);
+    let s = render(&app, 60, 40);
+    let rows = step_rows(&s);
+    assert_eq!(rows.len(), 8, "{s}");
+    assert!(rows.iter().any(|r| r.contains('…')), "{s}");
+    for r in rows {
+        let n: usize = r.split_whitespace().next().unwrap().parse().unwrap();
+        assert!(r.contains(&step_time(n)), "{r:?}\n{s}");
+    }
+}
+
+#[test]
+fn section_headers_share_one_accent_and_nothing_else_does() {
+    use ratatui::style::{Color, Modifier};
+    let mut app = busy_view();
+    app.color = true;
+    let accent_rows = |lines: &[String], starts: &[&str]| -> Vec<usize> {
+        starts.iter().map(|p| line_index(lines, p)).collect()
+    };
+
+    // Status view.
+    let buf = render_buf(&app, 100, 30);
+    let lines = buf_lines(&buf);
+    let accent = accent_rows(&lines, &["Per-kind", "─ progress", "─ last events"]);
+    for &y in &accent {
+        for x in 0..100u16 {
+            assert_eq!(buf[(x, y as u16)].fg, Color::Cyan, "cell {x},{y}");
+        }
+    }
+    assert!(buf[(0, 0)].modifier.contains(Modifier::BOLD));
+    let hy = lines.iter().position(|l| l.contains("at (UTC)")).unwrap();
+    for x in 0..100u16 {
+        let cell = &buf[(x, hy as u16)];
+        if cell.symbol() != " " {
+            assert_eq!(cell.fg, Color::DarkGray, "header cell {x}");
+        }
+    }
+    for y in 0..30u16 {
+        for x in 0..100u16 {
+            if !accent.contains(&(y as usize)) {
+                assert_ne!(buf[(x, y)].fg, Color::Cyan, "stray accent at {x},{y}");
+            }
+        }
+    }
+
+    // Expanded view.
+    ch(&mut app, 'e');
+    let buf = render_buf(&app, 100, 30);
+    let lines = buf_lines(&buf);
+    let accent = accent_rows(&lines, &["Per-kind", "─ events (following)"]);
+    for &y in &accent {
+        for x in 0..100u16 {
+            assert_eq!(buf[(x, y as u16)].fg, Color::Cyan, "cell {x},{y}");
+        }
+    }
+    for y in 0..30u16 {
+        for x in 0..100u16 {
+            if !accent.contains(&(y as usize)) {
+                assert_ne!(buf[(x, y)].fg, Color::Cyan, "stray accent at {x},{y}");
+            }
+        }
+    }
+}
+
+#[test]
+fn without_colour_no_cell_of_the_detail_view_has_a_foreground() {
+    use ratatui::style::Color;
+    let mut app = busy_view();
+    app.color = false;
+    for expanded in [false, true] {
+        if expanded {
+            ch(&mut app, 'e');
+        }
+        let buf = render_buf(&app, 100, 30);
+        for y in 0..30u16 {
+            for x in 0..100u16 {
+                assert_eq!(buf[(x, y)].fg, Color::Reset, "cell {x},{y}");
+            }
+        }
+    }
+}
+
+#[test]
+fn error_separators_are_red_not_accent() {
+    use ratatui::style::Color;
+    let check = |buf: &Buffer, starts: &str| {
+        let lines = buf_lines(buf);
+        let y = line_index(&lines, starts) as u16;
+        for x in 0..buf.area.width {
+            assert_eq!(buf[(x, y)].fg, Color::Red, "{starts} cell {x}");
+        }
+    };
+    let mut app = busy_view();
+    app.color = true;
+    update(
+        &mut app,
+        Msg::Socket {
+            id: BUSY.into(),
+            msg: SocketMsg::Down,
+        },
+    );
+    check(&render_buf(&app, 100, 30), "─ events: reconnecting");
+    ch(&mut app, 'e');
+    check(&render_buf(&app, 100, 30), "─ events: reconnecting");
+
+    let mut app = busy_view();
+    app.color = true;
+    answer(&mut app, BUSY, Err("request timed out".into()));
+    check(&render_buf(&app, 100, 30), "─ progress (refresh failed");
+}
+
+#[test]
+fn stuck_reasons_wrap_at_word_boundaries() {
+    let reason =
+        "the agent hit 'overloaded_error' and the retry budget is exhausted after three attempts";
+    let mut app = board();
+    let id = "7d22e1a8-dddd";
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == id)
+        .unwrap()
+        .task
+        .stuck_reason = Some(reason.into());
+    open_detail(&mut app, id);
+    let s = render(&app, 60, 24);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let i = lines
+        .iter()
+        .position(|l| l.starts_with("Stuck "))
+        .expect(&s);
+    let mut words = Vec::new();
+    let mut n = 0;
+    for l in &lines[i..] {
+        if n > 0 && !l.starts_with("          ") {
+            break;
+        }
+        words.extend(l.split_whitespace().skip(usize::from(n == 0)));
+        n += 1;
+    }
+    assert!(n >= 2, "the reason should wrap here:\n{s}");
+    assert_eq!(words, reason.split_whitespace().collect::<Vec<_>>(), "{s}");
+}
+
+#[test]
+fn a_token_wider_than_the_line_is_cut_into_consecutive_chunks() {
+    let token = "abcdefghij".repeat(15);
+    let mut app = board();
+    let id = "7d22e1a8-dddd";
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == id)
+        .unwrap()
+        .task
+        .stuck_reason = Some(token.clone());
+    open_detail(&mut app, id);
+    let s = render(&app, 80, 24);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let i = lines
+        .iter()
+        .position(|l| l.starts_with("Stuck "))
+        .expect(&s);
+    let mut joined = String::new();
+    for (k, l) in lines[i..].iter().enumerate() {
+        if k > 0 && !l.starts_with("          ") {
+            break;
+        }
+        joined.push_str(&l[10..]);
+    }
+    let joined = joined.strip_suffix('…').unwrap_or(&joined);
+    assert!(joined.len() > 68, "should span several lines:\n{s}");
+    assert_eq!(joined, &token[..joined.len()], "{s}");
+}
+
+#[test]
+fn the_expanded_view_says_esc_goes_back_to_the_status_view() {
+    let mut app = busy_view();
+    ch(&mut app, 'e');
+    for w in [80u16, 100, 140] {
+        let lines = buf_lines(&render_buf(&app, w, 24));
+        assert!(lines[0].contains("e/Esc status"), "{}", lines[0]);
+        assert!(!lines[0].contains("Esc back"), "{}", lines[0]);
+        assert!(lines[23].contains("Esc status"), "{}", lines[23]);
+    }
+}
+
+/// What every size must show: the progress separator, the current row, and
+/// nothing wider than the terminal; times in full from 60 columns up.
+fn assert_detail_invariants(app: &App, w: u16, h: u16, stale: bool) {
+    let s = render(app, w, h);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let at = format!("{w}x{h}\n{s}");
+    assert!(lines.iter().any(|l| l.starts_with("─ progress")), "{at}");
+    let rows = step_rows(&s);
+    let last = rows.last().unwrap_or_else(|| panic!("no step rows {at}"));
+    let first = last.split_whitespace().next().unwrap();
+    assert_eq!(first, if stale { "→" } else { "34" }, "{at}");
+    if w >= 60 {
+        // Narrower than that a dated row can outgrow the screen, and the
+        // right edge (the marker) is cut.
+        assert!(last.contains('◀'), "{at}");
+    }
+    for l in &lines {
+        assert!(l.chars().count() <= w as usize, "too wide: {l:?}\n{at}");
+    }
+    if w >= 60 {
+        for r in rows.iter().filter(|r| !r.trim_start().starts_with('→')) {
+            let n: usize = r.split_whitespace().next().unwrap().parse().unwrap();
+            assert!(r.contains(&step_time(n)), "{r:?}\n{at}");
+        }
+    }
+}
+
+#[test]
+fn the_detail_view_keeps_its_invariants_at_every_size() {
+    for stale in [false, true] {
+        let app = long_view(34, 60, stale);
+        for w in 40..=140u16 {
+            for h in 10..=40u16 {
+                assert_detail_invariants(&app, w, h, stale);
+            }
+        }
+    }
+}
+
+/// Dropping Role (with Cost) can free several lines at once; the freed
+/// lines go to the events tail rather than to blank space.
+#[test]
+fn lines_freed_by_dropping_rows_go_to_the_event_tail() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let mut d = busy_detail();
+    d["config"]["roles"] = json!({"coder": {"model": "opus"}, "reviewer": {"model": "sonnet"}});
+    answer(&mut app, BUSY, Ok(d));
+    push_events(&mut app, BUSY, 7);
+    // Everything: title 1 + 11 field rows (two Role rows) + separator +
+    // header + 4 steps + counters = 19 lines, plus the footer.
+    let s = render(&app, 100, 20);
+    assert!(s.contains("Role      reviewer"), "{s}");
+    assert!(!s.contains("last events"), "{s}");
+    // One line short: Role x2 and Cost (3 lines) go, and two of the freed
+    // lines become the tail's separator and one event.
+    let s = render(&app, 100, 19);
+    assert!(!s.contains("Role ") && !s.contains("Cost "), "{s}");
+    assert!(s.contains("Created"), "{s}");
+    let lines: Vec<&str> = s.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| l.starts_with("─ last events"))
+        .expect(&s);
+    assert!(lines[i + 1].contains("message 6"), "{s}");
+    assert!(lines[i + 2].starts_with("e events"), "{s}");
 }

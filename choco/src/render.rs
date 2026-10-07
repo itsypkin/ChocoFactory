@@ -289,7 +289,14 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
         if let Some(sha) = detail.get("workflow_sha256").and_then(Value::as_str) {
             line.push_str(&format!("  [{}]", &sha[..sha.len().min(12)]));
         }
-        pairs.push((if builtin { LABEL_WORKFLOW } else { LABEL_WORKFLOW_FILE }, line));
+        pairs.push((
+            if builtin {
+                LABEL_WORKFLOW
+            } else {
+                LABEL_WORKFLOW_FILE
+            },
+            line,
+        ));
     }
     pairs.push((LABEL_STATUS, get("status").to_string()));
     // Right after Status, so the reason for a stuck task (X-4, #61) reads
@@ -630,7 +637,11 @@ fn cut_cell(s: &str, w: usize) -> String {
 fn layout_row(cells: [&str; 5], widths: &[usize; 5], marker: Option<&str>) -> String {
     let mut line = format!("  {:>w$}", cells[0], w = widths[0]);
     for i in 1..4 {
-        line.push_str(&format!("  {:<w$}", cut_cell(cells[i], widths[i]), w = widths[i]));
+        line.push_str(&format!(
+            "  {:<w$}",
+            cut_cell(cells[i], widths[i]),
+            w = widths[i]
+        ));
     }
     line.push_str("  ");
     line.push_str(cells[4]);
@@ -1300,7 +1311,9 @@ mod tests {
 
     /// Character offset of `needle` in `line`.
     fn col(line: &str, needle: &str) -> usize {
-        let byte = line.find(needle).unwrap_or_else(|| panic!("{needle:?} in {line:?}"));
+        let byte = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {line:?}"));
         line[..byte].chars().count()
     }
 
@@ -1378,7 +1391,10 @@ mod tests {
         let trail = [stage_entry("chatting", Value::Null, "2026-08-02T09:00:00Z")];
         let t = table_of(&trail, Some("chatting"), None);
         let tokens: Vec<&str> = t.rows[0].split_whitespace().collect();
-        assert_eq!(tokens, ["1", "start", "chatting", "09:00:00", "◀", "current"]);
+        assert_eq!(
+            tokens,
+            ["1", "start", "chatting", "09:00:00", "◀", "current"]
+        );
         assert!(!t.rows[0].contains('?'), "no phantom predecessor");
     }
 
@@ -1491,7 +1507,11 @@ mod tests {
         vec![
             stage_entry(a, Value::Null, "2026-08-01T08:00:00Z"),
             stage_entry(b, json!("outcome_that_is_long_too"), "2026-08-01T09:00:00Z"),
-            stage_entry(c, json!("another_long_outcome_here"), "2026-08-01T10:00:00Z"),
+            stage_entry(
+                c,
+                json!("another_long_outcome_here"),
+                "2026-08-01T10:00:00Z",
+            ),
         ]
     }
 
@@ -1575,7 +1595,16 @@ mod tests {
         let tokens: Vec<&str> = row.split_whitespace().collect();
         assert_eq!(
             tokens,
-            ["2", "gate", "resumed", "review", "2026-08-01", "11:58:18", "◀", "current"]
+            [
+                "2",
+                "gate",
+                "resumed",
+                "review",
+                "2026-08-01",
+                "11:58:18",
+                "◀",
+                "current"
+            ]
         );
         assert!(
             !rendered.contains("no transitions yet"),

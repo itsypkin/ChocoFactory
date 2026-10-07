@@ -926,6 +926,15 @@ async fn task_events_for_an_unknown_task_is_an_error() {
     assert!(out.stderr.starts_with("error: "), "stderr: {}", out.stderr);
 }
 
+/// Whether some line's whitespace-split tokens contain `tokens` consecutively
+/// (the progress table pads its columns, so exact spacing isn't asserted).
+fn has_row(out: &str, tokens: &[&str]) -> bool {
+    out.lines().any(|l| {
+        let t: Vec<&str> = l.split_whitespace().collect();
+        t.windows(tokens.len()).any(|w| w == tokens)
+    })
+}
+
 /// The headline fix for `task status`: the stage trail carries the outcome
 /// that caused each hop and when it happened, and the human view renders
 /// it as a timeline rather than a bare list of names.
@@ -977,14 +986,14 @@ stages:
     // appended on the way *out* of a stage (X-3).
     let mut fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
     for _ in 0..100 {
-        if fresh.stdout.contains("gate (start)") {
+        if has_row(&fresh.stdout, &["1", "start", "gate"]) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
     }
     assert!(
-        fresh.stdout.contains("1. gate (start)"),
+        has_row(&fresh.stdout, &["1", "start", "gate"]),
         "expected the entry stage in the trail: {:?}",
         fresh.stdout
     );
@@ -1005,12 +1014,14 @@ stages:
     // `workflow_state` before `stage_trail`, so a response can pair
     // `current_stage == "gate"` with a trail already ending at `review`
     // (the skew documented at `api/tasks.rs`). That renders the hop line
-    // without `(current)` — enough to satisfy a break keyed on the hop
+    // without `◀ current` — enough to satisfy a break keyed on the hop
     // alone, and then fail the assertion. Polling for exactly what's
     // asserted costs one extra poll instead.
     let settled = |out: &str| {
-        out.lines()
-            .any(|l| l.contains("gate --[resumed]--> review") && l.contains("(current)"))
+        out.lines().any(|l| {
+            let t: Vec<&str> = l.split_whitespace().collect();
+            t.windows(3).any(|w| w == ["gate", "resumed", "review"]) && l.ends_with("◀ current")
+        })
     };
     let mut status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
     for _ in 0..100 {
@@ -1023,7 +1034,7 @@ stages:
     assert_eq!(status.code, Some(0), "stderr: {}", status.stderr);
     // The stage the task entered is the last trail entry, so it's marked in
     // place instead of repeated on a trailing `→` line. Asserted against
-    // the whole line, not a bare "(current)": the duplicate-line regression
+    // the whole line, not a bare "◀ current": the duplicate-line regression
     // this guards against would still contain that substring.
     assert!(
         settled(&status.stdout),
@@ -1031,7 +1042,10 @@ stages:
         status.stdout
     );
     assert!(
-        !status.stdout.contains("→ review"),
+        !status
+            .stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with('→')),
         "the current stage should not also get a trailing arrow line: {:?}",
         status.stdout
     );
