@@ -1,4 +1,6 @@
 pub mod claude;
+pub mod omp;
+pub mod pi_family;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -8,6 +10,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub use claude::ClaudeAdapter;
+pub use omp::OmpAdapter;
 
 /// Per-role settings an adapter needs to spawn its CLI (§4, §5.5's role
 /// config resolution). `system_prompt` is already-resolved text — reading
@@ -243,7 +246,7 @@ pub struct TurnUsage {
     pub counting: UsageCounting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenCounts {
     pub input: Option<u64>,
     pub output: Option<u64>,
@@ -422,6 +425,13 @@ pub trait AgentAdapter: Send + Sync {
     /// The name a role's `cli:` uses to select this adapter, and the value
     /// stored in `sessions.cli_adapter`.
     fn name(&self) -> &'static str;
+    /// Whether this adapter can run a role with this isolation at all.
+    /// Checked wherever a role's CLI is chosen (workflow load, task create,
+    /// config PATCH) and again at turn start and chat resume, which is the
+    /// check nothing can skip. The default accepts everything.
+    fn validate_role(&self, _role: &str, _isolation: &Isolation) -> Result<(), String> {
+        Ok(())
+    }
     fn start(&self, prompt: &str, cfg: &RoleConfig) -> Result<AgentHandle, AdapterError>;
     fn resume(
         &self,
@@ -524,6 +534,10 @@ pub fn check_task_config_clis(config: &Value, registry: &Registry) -> Result<(),
 /// process is alive (§4, §4.1's active-state behavior).
 pub struct AgentHandle {
     child: tokio::process::Child,
+    /// Dropped after `child` (field order), so a file the process may still
+    /// be watching is only removed once the handle, and with it the process,
+    /// is done.
+    _cleanup: Option<Box<dyn std::any::Any + Send>>,
     events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     stdin_tx: mpsc::UnboundedSender<String>,
 }
@@ -536,6 +550,23 @@ impl AgentHandle {
     ) -> Self {
         Self {
             child,
+            _cleanup: None,
+            events_rx,
+            stdin_tx,
+        }
+    }
+
+    /// Like [`Self::new`], with a guard that is dropped after the child when
+    /// the handle drops (an adapter's per-spawn temporary file).
+    pub(crate) fn with_cleanup(
+        child: tokio::process::Child,
+        events_rx: mpsc::UnboundedReceiver<AgentEvent>,
+        stdin_tx: mpsc::UnboundedSender<String>,
+        guard: Box<dyn std::any::Any + Send>,
+    ) -> Self {
+        Self {
+            child,
+            _cleanup: Some(guard),
             events_rx,
             stdin_tx,
         }
