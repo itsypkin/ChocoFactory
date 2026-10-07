@@ -1,6 +1,6 @@
 ---
 name: run-choco-task
-description: Drives a coding task through a ChocoFactory (choco) daemon end to end — update choco and check its daemon, prepare a base checkout, write the task spec, create and watch the task, review its PR and cast the verdict, and recover a stuck, escalated or interrupted task. Use when asked to have choco implement an issue, or to run, watch, review or rescue a choco task.
+description: Drives a coding task through a ChocoFactory (choco) daemon end to end — check choco and its daemon (updating it when it is yours), prepare a base checkout, write the task spec, create and watch the task, review its PR and cast the verdict, and recover a stuck, escalated or interrupted task. Use when asked to have choco implement an issue, or to run, watch, review or rescue a choco task.
 ---
 
 # Run a choco task
@@ -13,11 +13,15 @@ real money: read [Cost and safety](#cost-and-safety) before you start.
 Flags are in `choco <command> --help`; this skill is the judgement around
 them.
 
-The built-in `coding-task` workflow:
+The built-in `coding-task-planned` workflow is the default for coding work;
+plain `coding-task` is for when you have already checked the spec against the
+code yourself:
 
 ```
-coding → internal_review → open_pr → checks_polling → awaiting_human_review → done
+[spec_check ⇄ spec_questions →] coding → internal_review → open_pr → checks_polling → awaiting_human_review → done
 ```
+
+The bracketed part is `coding-task-planned` only.
 
 Every way back goes through `revising`, which returns to `internal_review`:
 `internal_review` requests changes, `checks_polling` sees a failed check, you
@@ -33,7 +37,7 @@ an action (approval) before it can run, or when `open_pr` fails.
 Copy this checklist and tick it off:
 
 ```
-- [ ] 1. Prepare: choco up to date, daemon running, base checkout on the latest default branch
+- [ ] 1. Prepare: choco up to date, or a shared daemon's version noted; daemon running; your own base checkout on the latest default branch
 - [ ] 2. Write the spec
 - [ ] 3. Create the task and wait for awaiting_human_review (or a parked state)
 - [ ] 4. Review the PR, vote, and run the pre-merge checks
@@ -42,15 +46,20 @@ Copy this checklist and tick it off:
 
 ## 1. Prepare
 
-**Update choco first.** This skill describes the latest release. Agents'
-prompts ship inside the daemon, so an older daemon behaves differently from
-what follows.
+**Update choco first, if the daemon is yours.** This skill describes the
+latest release. Agents' prompts ship inside the daemon, so an older daemon
+behaves differently from what follows.
 
 ```bash
 choco update             # installs the latest release and restarts a daemon running from the install folder
 choco --version
 ```
 
+- **A daemon shared with other operators, or pinned to a version by someone
+  else:** don't update, stop or restart it; that would kill their work. Run
+  `choco server status`, note the daemon's version from its first line
+  (`chocofactoryd <version> … running`), and go on. Behaviour can then
+  differ from what this skill describes.
 - `choco: command not found`: install it as in the
   [README](https://github.com/itsypkin/ChocoFactory#install), then go on.
 - `choco update` refuses while work is in flight; see
@@ -65,9 +74,13 @@ claude --version              # agents run the claude CLI, logged in as you
 gh auth status                # open_pr and the polls run gh as this account; it is who "you" are when voting
 choco server start && choco server status
 choco project list            # or: choco project create <name> --repo .
-git worktree add --detach ../<name>-base origin/main      # once
-BASE_CHECKOUT=$(cd ../<name>-base && pwd)                 # again in each new shell
+git worktree add --detach ../<name>-base-<you> origin/main      # once per operator
+BASE_CHECKOUT=$(cd ../<name>-base-<you> && pwd)                 # again in each new shell
 ```
+
+Make one base checkout per operator (or per concurrent task). Two operators
+sharing one move it under each other between `checkout` and `task create`,
+and a task forks from the wrong commit.
 
 **Before each task**, check the daemon and move the base checkout to the
 latest default branch:
@@ -87,12 +100,15 @@ the pre-merge check in step 4.
 - **`choco server status`** shows the daemon's version, open tasks and
   in-flight work. It warns when `choco` and the daemon differ in version, or
   the daemon binary changed on disk since it started: run
-  `choco server restart` then.
+  `choco server restart` then if the daemon is yours, otherwise tell its
+  owner.
 - **`choco task status <id>`** shows which workflow a task runs
   (`builtin:<name>@<version>`, or a file path with a hash) and marks it
   `(built-in updated since task start)`, or `(changed since task start)` for
   a workflow file, when it changed. Check that line and the
-  daemon's version before blaming a prompt for a run's behaviour.
+  daemon's version before blaming a prompt for a run's behaviour. A workflow
+  file's name line reads like a built-in; see
+  [reference/watch.md](reference/watch.md#the-workflow-file-line).
   It ends with a `Cost & time` block: the task's cost (`≈ $…`, marked
   `(API-equivalent)` when every turn ran under a subscription login and
   `(estimated)` otherwise), tokens, wall and active time, and the same split
@@ -105,7 +121,7 @@ the pre-merge check in step 4.
   the built-in workflows, and every `coding-task` needs `--repo`.
 - **A repo can override a built-in.** If the *project's* repo has
   `.chocofactory/workflows/<name>.yaml`, that file wins over the built-in of
-  that name, and choco updates no longer change it (`choco project
+  that name, and choco updates don't change it (`choco project
   init-workflows` creates exactly that folder). Customising workflows is out
   of scope here; see
   [Customising workflows](https://github.com/itsypkin/ChocoFactory#customising-workflows).
@@ -143,44 +159,43 @@ explicit out-of-scope list.
   when it reads a file in that folder), but not your `~/.claude/CLAUDE.md` or
   instruction files in folders above the repo. Anything from your personal
   setup that the task needs goes in the spec.
-- **Check that the design holds, not only that it builds.** For a feature
-  that enforces or protects something, list every way the protected event
-  can end, including a fresh retry, a resumed retry and the daemon's
-  restart sweep, and say whether the protection runs on each. Mark each
-  blind spot of the check (content vs status, ignored paths, a mistyped
-  config key) as covered or as an accepted cost. Say which condition each
-  prescribed message is true under. For a layout, list its invariants and
-  require one test that renders every fixture at every size from the
-  minimum up. Name one test for each fail-closed path in the done
-  criteria.
+- **Check that the design holds, not only that it builds.** List every way a
+  protected event can end and say whether the protection runs on each; see
+  [reference/spec.md](reference/spec.md#check-that-the-design-holds).
+- **Read the issue with comments:** `gh issue view <n> --json title,body,comments`
+  (`gh issue view <n> --comments` can print nothing and exit 0).
+- **A task that reads an external API:** name the endpoints and fields, check
+  them read-only on a real object, and paste what you saw into the spec. A
+  task whose coder runs a real third-party CLI needs a budget and opt-in
+  tests. Both are in [reference/spec.md](reference/spec.md).
+- **Which `--help`:** the installed `choco --help` matches your daemon. For a
+  task that documents or changes the CLI, build the default branch and use
+  its `--help` (see [reference/spec.md](reference/spec.md#which---help-to-trust)).
 - **Check for collisions against your default branch:** numbered files such
   as database migrations above all, then file names and flags. Two tasks that
   both take the next number conflict, and the second PR's CI may not run.
 - **The title decides what the PR closes.** A title ending in `(#N)` makes
   the PR say `Closes #N`; any other `#N` in it gives `Refs #N`. For one part
   of a multi-part issue, don't end the title with `(#N)`: merging would close
-  the whole issue.
-- **To have choco check the spec before coding**, create the task with
-  `--workflow coding-task-planned`. A planning agent checks the spec
-  against the code the task starts from, fixes stale references and
-  loose test requirements, checks that the design holds on every path,
-  and decides the design choices your intent
-  implies, listing each with its reason. It parks the task at
-  `spec_questions` with questions for you only when it can't go on
-  without guessing what you want: the spec contradicts itself, the goal
-  is unclear, or the only way forward is irreversible, weakens security
-  or costs far more than the spec suggests. From then on, the coder
-  and the reviewer work from its report, not your `--prompt`. Read the
-  report with
-  `choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'`,
-  and answer with `choco task send <id> --text "<answers>"`. The planner
-  folds your answers in and checks again; an answer can tell it to
-  decide a question itself.
+  the whole issue. `open_pr` also keeps PR titles to 100 bytes, cutting at a
+  word boundary and keeping a trailing `(#N)`, so keep the task title well
+  under that.
+- **Recommended: have choco check the spec before coding**, with
+  `--workflow coding-task-planned`. A planning agent checks the spec against
+  the code, fixes stale references, decides the design choices your intent
+  implies, and asks you only when it can't go on without guessing. The coder
+  and reviewer then work from its report, not your `--prompt`. A claim it
+  couldn't run read-only is marked **unverified**: treat it as open until the
+  coder reports the probe's result. Read the report, answer questions and
+  see the rest in [reference/spec.md](reference/spec.md#having-choco-check-the-spec-first-coding-task-planned).
+- **Docs-only task:** the done criteria are links, anchors and commands that
+  resolve and match `--help`, and no lost fact; see
+  [reference/spec.md](reference/spec.md#docs-only-tasks).
 
 ## 3. Create and watch
 
 ```bash
-choco task create --project <p> --workflow coding-task \
+choco task create --project <p> --workflow coding-task-planned \
   --title "<what it does> (#<n>)" --repo "$BASE_CHECKOUT" \
   --prompt "$(cat spec.md)"
 ```
@@ -202,45 +217,18 @@ choco task create --project <p> --workflow coding-task \
   For an existing task, `choco task reconfigure` takes effect on the next
   turn.
 - **Wait for one stage** with `choco task status <id> --until
-  stage:awaiting_human_review --timeout 2h`. The exit code says how it ended:
-
-  | Exit | Meaning |
-  |---|---|
-  | 0 | target reached |
-  | 1 | error (unknown task, daemon unreachable) |
-  | 3 | became `stuck` |
-  | 4 | cancelled |
-  | 5 | `--timeout` elapsed |
-  | 6 | closed without reaching the target |
-
-  A task parked at `escalate_to_human` stays `open`, so an `--until` for
-  another stage runs to its `--timeout`.
-- **To notice every way it can stop** (ready for review, escalated, waiting for your answers, ended),
-  poll the JSON in the background instead (needs `jq`). It prints the status
-  and stage it stopped on, and exits 1 if `choco` or `jq` fails:
-
-  ```bash
-  id=<task-id>
-  (
-    while :; do
-      json=$(choco --json task status "$id") || exit 1
-      state=$(printf '%s\n' "$json" | jq -r '"\(.status) \(.workflow_state.stage_kind) \(.workflow_state.current_stage)"') || exit 1
-      case $state in
-        "open human_gate "* | stuck\ * | cancelled\ * | closed\ *)
-          echo "$state"; exit 0 ;;
-      esac
-      sleep 60
-    done
-  )
-  ```
-
-  The parentheses keep `exit` from closing your shell. After you vote, the
-  task stays at `awaiting_human_review` for up to a minute until the poll
-  reads your comment, so wait for the stage to change first, for example
-  `choco task status <id> --until stage:revising --timeout 5m`.
+  stage:awaiting_human_review --timeout 2h`. Exit codes, a background poll
+  that notices every way a task can stop, and typical stage times for
+  choosing `--timeout` are in [reference/watch.md](reference/watch.md).
+- **Read a stage's verdict text** (the latest lap) with
+  `choco --json task status <id> | jq -r '.workflow_state.payload.stages.<stage>.summary'`
+  for `spec_check` or `internal_review`. Every lap's text, and watching
+  commits while a revise lap is still open, are in
+  [reference/watch.md](reference/watch.md#reading-a-stages-verdict-text).
 - **Find the task's PR** with `gh pr list --head task/<task-id>` (add
-  `--state all` once it is merged or closed). `choco task status` doesn't
-  print it.
+  `--state all` once it is merged or closed). The plain `choco task status`
+  doesn't print it, but `choco --json task status <id>` carries it as
+  `.workflow_state.payload.stages.open_pr.url` once `open_pr` has run.
 - **Read the newest events** by running
   `${CLAUDE_SKILL_DIR}/scripts/tail-events.sh <task-id> [n]` (needs `jq`).
   `choco task events` is oldest first, so `choco task events | tail` shows
@@ -269,33 +257,19 @@ an independent reviewer do it, and look for what agents systematically miss:
 - **New messages and states**: read each one with the values its own path
   passes, and check every new state has a way out.
 - **Your repo's own recurring review findings**, if you know them.
+- **A docs PR** has no tests to break; check it against the
+  [docs-only criteria](reference/spec.md#docs-only-tasks).
 
 **The verdict is a PR comment or a GitHub review**: `/approve` or
 `/request-changes` alone on its own line, with your review above it. A
-collaborator's Approve or Request changes review votes by its state. On the
-PR's own author GitHub only allows a Comment review, so put the marker on a
-line of its body. You can
+collaborator's Approve or Request changes review votes by its state. On your
+own PR, GitHub only allows a Comment review, so put the marker on a line of
+its body. You can
 also answer with `choco task send <id> --text "..."` carrying exactly one of
 the two markers on a line of its own; a reply with neither or both is
-refused, and nothing is posted to the PR.
-
-- Only comments and reviews newer than the head commit count (a review by
-  its submission time). Editing an earlier comment to add the marker counts
-  too; editing a review counts only while the review is newer than the head
-  commit, so after a push post a new comment or review.
-- Pending and dismissed reviews never vote. The newest vote across comments
-  and reviews decides, and a tie resolves to `/request-changes`. A comment
-  votes at the later of its creation and last edit, so editing an older marker
-  comment makes it the newest vote. Reviews and
-  their inline comments are handed to the coder after the comments.
-- A marker inside a fenced code block still votes. When you quote the
-  convention, indent it or break it up.
-- Only `OWNER`, `MEMBER` and `COLLABORATOR` accounts vote (comments and reviews), and `[bot]`
-  accounts never do. Anything commenting under your account, including an
-  agent, votes as you.
-- Prose doesn't retract a verdict, and the first one the poll sees is acted
-  on within a minute. To change your mind, post the other marker inside that
-  minute.
+refused, and nothing is posted to the PR. What counts as a vote (the head
+commit fence, edits, ties, who can vote, fenced markers) is in
+[reference/review.md](reference/review.md).
 
 **Batch your findings into one `/request-changes`.** Each one costs a coder
 lap and a review lap. Prefer approve-and-file-a-follow-up for minor points.
@@ -308,12 +282,19 @@ current counts on its `Loop counters` line.
 
 **The coder often ignores your `/request-changes` comment** and works from
 the internal reviewer's earlier summary instead. After each lap, check that
-each of your items maps to a commit. Watch for an **empty commit**: the coder
+each of your items maps to a commit (while the task is still open, see
+[reference/watch.md](reference/watch.md#watching-commits-in-a-revise-lap)). Watch for an **empty commit**: the coder
 makes one when it decides only the PR description needs changing, and it
 moves the head past your comment without changing anything. What to do next
 is in [reference/recover.md](reference/recover.md).
 
 **`/approve` moves the task to `done`; merging the PR is still your job.**
+Merging the PR also moves the task to `done` within a minute, without a
+vote, so don't post `/approve` after merging; a PR closed without merging
+doesn't move the task. `done` deletes the task's local branch once it was
+pushed or merged; the remote `task/<id>` branch stays unless the repo
+deletes merged head branches.
+
 Before you merge, check what it will close:
 
 1. `gh pr view <n> --json closingIssuesReferences` shows what the PR body
@@ -328,6 +309,13 @@ Before you merge, check what it will close:
    git log --format=%B origin/main..origin/<head-branch> \
      | grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[*_]*:?[*_]* +(([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+|https?://github\.com/[^ ]+/issues/[0-9]+)'
    ```
+
+**When someone else reviews,** drive the task to `awaiting_human_review`
+and run the sanity checks above: the PR merges cleanly, CI passed
+(`gh pr checks <n>`), and what the PR and its commits close. Then hand the PR
+number to the reviewer and stop; don't vote or merge. Anything commenting
+under your account votes as you, so don't paste the markers on their own
+line in a comment.
 
 ## 5. Recover
 

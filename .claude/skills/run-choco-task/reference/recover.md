@@ -102,7 +102,9 @@ uncommitted work there and unpushed commits are lost: check
 on the task's timeline before deletion. To keep the work, use
 `choco task cancel <id> --keep`: it keeps both the worktree and the branch
 for you (`choco task status <id>` shows where). A task that finishes
-(`done`) deletes its branch only if it was pushed or already merged.
+(`done`) deletes its local branch only if it was pushed or already merged;
+the remote `task/<id>` branch stays unless the repo deletes merged head
+branches.
 
 ## Stray processes
 
