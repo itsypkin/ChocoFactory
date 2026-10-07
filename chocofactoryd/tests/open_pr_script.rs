@@ -1010,9 +1010,56 @@ fn a_commit_someone_else_pushed_before_the_lookup_is_never_removed() {
     assert_eq!(
         first_line(&out),
         format!(
-            "choco open-pr: someone else pushed to the task branch: the PR's head is {theirs} but this task last pushed {old}; look before resuming"
+            "choco open-pr: someone else pushed to the task branch: the PR's head is {theirs} but this task last pushed {old}, and this branch doesn't contain it; bring their commits into the branch (git fetch, then merge), then resume"
         )
     );
+}
+
+#[test]
+fn after_their_commit_is_merged_in_the_next_lap_succeeds() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    assert!(fx.run("T (#1)", "approved", "r").status.success());
+    let theirs = push_from_other_clone(&fx);
+    fx.cfg("pr-head", &format!("{theirs}\n"));
+    pr_exists(&fx);
+    amend_local(&fx);
+    assert!(!fx.run("T (#1)", "approved", "r").status.success());
+    assert_eq!(origin_tip(&fx), theirs);
+    git(&fx.wt, &["fetch", "-q", "origin"]);
+    git(
+        &fx.wt,
+        &["merge", "-q", "-m", "merge", "origin/task/branch-name-xyz"],
+    );
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(origin_tip(&fx), git(&fx.wt, &["rev-parse", "HEAD"]).trim());
+    // Their commit is still in the branch.
+    git(
+        &fx.root.join("origin.git"),
+        &["merge-base", "--is-ancestor", &theirs, TASK_REF],
+    );
+    // The record now holds our new push, so the lease path works again.
+    fx.cfg("pr-head", &format!("{}\n", origin_tip(&fx)));
+    amend_local(&fx);
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(origin_tip(&fx), git(&fx.wt, &["rev-parse", "HEAD"]).trim());
+}
+
+#[test]
+fn the_latest_record_wins_across_several_rebases() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    assert!(fx.run("T (#1)", "approved", "r").status.success());
+    pr_exists(&fx);
+    for lap in 0..3 {
+        fx.cfg("pr-head", &format!("{}\n", origin_tip(&fx)));
+        amend_local(&fx);
+        let out = fx.run("T (#1)", "approved", "r");
+        assert!(out.status.success(), "lap {lap}: {}", stderr(&out));
+        assert_eq!(origin_tip(&fx), git(&fx.wt, &["rev-parse", "HEAD"]).trim());
+    }
 }
 
 #[test]

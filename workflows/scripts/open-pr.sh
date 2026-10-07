@@ -277,7 +277,9 @@ BRANCH=$(git rev-parse --abbrev-ref HEAD)
 # this task itself last pushed (recorded in the worktree's private git dir),
 # so a rebased branch can be pushed but a commit someone else added to the
 # branch is never removed. If the PR's head is not that commit, someone else
-# pushed: refuse. `--state open` for the same reason as the later probe
+# pushed: push plainly with no lease, which can only fast-forward, so it
+# succeeds once their commits are in this branch and is rejected otherwise.
+# `--state open` for the same reason as the later probe
 # (`gh pr view` matches closed and merged PRs). A failed lookup never falls
 # back to a plain or forced push.
 if ! HEAD_OID=$(gh pr list --head "$BRANCH" --state open --json number,headRefOid -q '.[0].headRefOid // empty' 2>"$TMP/lookup-err"); then
@@ -303,12 +305,13 @@ if [ -f "$PUSHED_FILE" ]; then
     LAST_PUSHED=$(awk -v b="$BRANCH" '$1 == b { v = $2 } END { print v }' "$PUSHED_FILE") || die "cannot read the pushed-commit record"
 fi
 LEASE=""
+OTHER_PUSH=0
 if [ -n "$HEAD_OID" ] && [ -n "$LAST_PUSHED" ]; then
-    if [ "$HEAD_OID" != "$LAST_PUSHED" ]; then
-        printf "choco open-pr: someone else pushed to the task branch: the PR's head is %s but this task last pushed %s; look before resuming\n" "$HEAD_OID" "$LAST_PUSHED" >&2
-        exit 1
+    if [ "$HEAD_OID" = "$LAST_PUSHED" ]; then
+        LEASE="$LAST_PUSHED"
+    else
+        OTHER_PUSH=1
     fi
-    LEASE="$LAST_PUSHED"
 fi
 
 # With no record of our own push the lease cannot be tied to this task, so
@@ -322,7 +325,11 @@ if [ "$PUSHED" != 1 ]; then
     if grep -qF '(stale info)' "$TMP/push-err"; then
         msg="the branch on GitHub moved since the PR's head $LEASE: someone else pushed; look before resuming"
     elif grep -qF -e '(non-fast-forward)' -e '(fetch first)' "$TMP/push-err"; then
-        msg="the push was rejected (non-fast-forward): the branch on GitHub has commits this branch doesn't, and this task has no push of its own to replace; look at the branch before resuming"
+        if [ "$OTHER_PUSH" = 1 ]; then
+            msg="someone else pushed to the task branch: the PR's head is $HEAD_OID but this task last pushed $LAST_PUSHED, and this branch doesn't contain it; bring their commits into the branch (git fetch, then merge), then resume"
+        else
+            msg="the push was rejected (non-fast-forward): the branch on GitHub has commits this branch doesn't; look at the branch before resuming"
+        fi
     else
         msg="the push failed; git's output follows"
     fi
