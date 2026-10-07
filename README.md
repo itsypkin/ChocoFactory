@@ -273,7 +273,10 @@ an agent that ends its turn to wait on its own timer races the daemon's
 nudge clock. Chat keeps `ScheduleWakeup` and `Monitor` but can't use the cron
 or remote-trigger tools. The task repo's own `CLAUDE.md` and `AGENTS.md`
 files are read: the root ones at start, nested ones when the agent reads a
-file in that folder. Instruction files in folders above the repo are not,
+file in that folder. The scope is the role's working directory, not the git
+root, so a custom `worktree: false` workflow whose task runs in a repo
+subfolder doesn't get the repo-root files (the built-ins all use worktrees).
+Instruction files in folders above the repo are not,
 and neither is `~/.claude/CLAUDE.md` (#183). `AGENTS.md` depends on Claude
 Code's built-in agents-md plugin; if a session's plugins don't include it, an
 `error` event on the timeline (and a daemon-log warning) says so. The repo's

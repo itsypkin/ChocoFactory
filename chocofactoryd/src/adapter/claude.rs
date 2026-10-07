@@ -515,7 +515,7 @@ async fn run_stdout_reader(
 /// Backslash escapes are NOT honoured by Claude Code's `claudeMdExcludes`
 /// matcher (probed on 2.1.292: `\(1\)` and `\[x\]` made the repo's own
 /// files stop loading), but a one-character class is: `[(]` matches `(`.
-/// So each character picomatch treats as syntax (`* ? [ ] { } ( ) + @`) is
+/// So each character picomatch treats as syntax (`* ? [ ] { } ( ) + @ | "`) is
 /// wrapped in `[` `]`. `!` and `\` can't be put in a class (`[!]` is a
 /// negated class, and a backslash inside one is itself an escape), so each
 /// becomes `?`, which matches that one character and nothing longer.
@@ -523,7 +523,7 @@ fn glob_escape(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for c in path.chars() {
         match c {
-            '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '+' | '@' => {
+            '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '+' | '@' | '|' | '"' => {
                 out.push('[');
                 out.push(c);
                 out.push(']');
@@ -1630,7 +1630,7 @@ mod tests {
 
     #[test]
     fn glob_escape_neutralises_each_syntax_character_once() {
-        for c in ['*', '?', '[', ']', '{', '}', '(', ')', '+', '@'] {
+        for c in ['*', '?', '[', ']', '{', '}', '(', ')', '+', '@', '|', '"'] {
             assert_eq!(glob_escape(&format!("/a{c}b")), format!("/a[{c}]b"));
         }
         for c in ['!', '\\'] {
@@ -2181,7 +2181,7 @@ mod tests {
             .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".claude"));
         let uuid = uuid::Uuid::new_v4().to_string();
         probe_instruction_files(format!("choco-agents-md-{uuid}"), &uuid, &config).await;
-        probe_instruction_files(format!("choco-agents-md-{uuid} [x]+(1)"), &uuid, &config).await;
+        probe_instruction_files(format!("choco-agents-md-{uuid} [x]+(1)|"), &uuid, &config).await;
         probe_instruction_files(
             format!("choco-agents-md-{uuid} {{a,b}}!@*]"),
             &uuid,
