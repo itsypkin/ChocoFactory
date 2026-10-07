@@ -111,23 +111,36 @@ stages:
   # Same as `coding-task.yaml`'s `checks_polling`.
   checks_polling:
     kind: poll
-    command: "gh pr checks {{ stages.open_pr.number }} --json state -q '.[].state' | sort -u"
+    script_file: scripts/ci-checks.sh
+    env:
+      PR_NUMBER: "{{ stages.open_pr.number }}"
     interval: 30s
-    timeout: 5m
+    timeout: 30m
     outcomes:
-      - match: "^SUCCESS$"
-        then: green
-      - match: "FAILURE|ERROR"
+      - match: '\ARED(\n|$)'
         then: red
+      - match: '\ASTARTUP_FAILURE(\n|$)'
+        then: ci_startup_failure
+      - match: '\AACTION_REQUIRED(\n|$)'
+        then: ci_action_required
+      - match: '\ACANCELLED(\n|$)'
+        then: ci_cancelled
+      - match: '\AGREEN(\n|$)'
+        then: green
+      - match: '\ANO_CHECKS(\n|$)'
+        then: no_checks
     on:
       green: awaiting_human_review
+      no_checks: awaiting_human_review
       red: revising
-      timeout: awaiting_human_review
+      ci_startup_failure: escalate_to_human
+      ci_action_required: escalate_to_human
+      ci_cancelled: escalate_to_human
+      timeout: escalate_to_human
     # CI that keeps failing while `internal_review` keeps approving would
     # otherwise loop forever, one paid coder lap and one paid reviewer lap
     # per round. The guard parks the task at `escalate_to_human` on the 4th
-    # red in a row. A green result or a timeout resets the count, and both
-    # go to `awaiting_human_review`, where a human has to act.
+    # red in a row. Any other outcome resets the count.
     loop_guard: { on: red, max: 3, then: escalate_to_human }
 
   # Same as `coding-task.yaml`'s `awaiting_human_review`.

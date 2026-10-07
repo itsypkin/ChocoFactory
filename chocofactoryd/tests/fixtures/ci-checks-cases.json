@@ -1,0 +1,191 @@
+[
+  {
+    "name": "success",
+    "states": [
+      "SUCCESS"
+    ],
+    "first_line": "GREEN",
+    "outcome": "green"
+  },
+  {
+    "name": "success and skipped",
+    "states": [
+      "SUCCESS",
+      "SKIPPED"
+    ],
+    "first_line": "GREEN",
+    "outcome": "green"
+  },
+  {
+    "name": "success and neutral",
+    "states": [
+      "SUCCESS",
+      "NEUTRAL"
+    ],
+    "first_line": "GREEN",
+    "outcome": "green"
+  },
+  {
+    "name": "skipped alone",
+    "states": [
+      "SKIPPED"
+    ],
+    "first_line": "GREEN",
+    "outcome": "green"
+  },
+  {
+    "name": "success and pending",
+    "states": [
+      "SUCCESS",
+      "PENDING"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "queued alone",
+    "states": [
+      "QUEUED"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "in progress alone",
+    "states": [
+      "IN_PROGRESS"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "expected alone",
+    "states": [
+      "EXPECTED"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "stale alone",
+    "states": [
+      "STALE"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "unknown state",
+    "states": [
+      "SOMETHING_NEW"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "failure",
+    "states": [
+      "FAILURE"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "error",
+    "states": [
+      "ERROR"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "timed out",
+    "states": [
+      "TIMED_OUT"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "startup failure is not red",
+    "states": [
+      "STARTUP_FAILURE"
+    ],
+    "first_line": "STARTUP_FAILURE",
+    "outcome": "ci_startup_failure"
+  },
+  {
+    "name": "action required",
+    "states": [
+      "ACTION_REQUIRED"
+    ],
+    "first_line": "ACTION_REQUIRED",
+    "outcome": "ci_action_required"
+  },
+  {
+    "name": "cancelled and success",
+    "states": [
+      "CANCELLED",
+      "SUCCESS"
+    ],
+    "first_line": "CANCELLED",
+    "outcome": "ci_cancelled"
+  },
+  {
+    "name": "cancelled and pending",
+    "states": [
+      "CANCELLED",
+      "PENDING"
+    ],
+    "first_line": "CANCELLED",
+    "outcome": "ci_cancelled"
+  },
+  {
+    "name": "failure beats cancelled",
+    "states": [
+      "FAILURE",
+      "CANCELLED"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "failure beats pending",
+    "states": [
+      "SUCCESS",
+      "FAILURE",
+      "PENDING"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "skipped and pending",
+    "states": [
+      "SUCCESS",
+      "SKIPPED",
+      "PENDING"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "startup failure beats the rest",
+    "states": [
+      "CANCELLED",
+      "STARTUP_FAILURE",
+      "ACTION_REQUIRED"
+    ],
+    "first_line": "STARTUP_FAILURE",
+    "outcome": "ci_startup_failure"
+  },
+  {
+    "name": "action required beats cancelled",
+    "states": [
+      "CANCELLED",
+      "ACTION_REQUIRED"
+    ],
+    "first_line": "ACTION_REQUIRED",
+    "outcome": "ci_action_required"
+  }
+]

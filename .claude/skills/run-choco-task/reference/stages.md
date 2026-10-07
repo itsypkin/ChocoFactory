@@ -40,12 +40,16 @@ Read this while watching a task, when its behaviour surprises you.
   verified. Commit messages are not rewritten at all: the coder is told not
   to write `Closes #N` in one, and that is all. The pre-merge checks in the
   skill catch both.
-- **checks_polling.** Polls for 5 minutes. It goes green only if every check
-  reports `SUCCESS`, and red on a `FAILURE` or `ERROR` state (that starts a
-  paid `revising` lap; the 4th red in a row parks the task at
-  `escalate_to_human`). Everything else times out into
-  `awaiting_human_review` exactly as if CI had passed: no checks at all,
-  skipped, cancelled or timed-out checks, and slow CI.
+- **checks_polling.** Polls every 30 seconds for up to 30 minutes.
+  It goes green when every check passed or was skipped. It goes red on a
+  failed, errored or timed-out check (that starts a paid `revising` lap; the
+  4th red in a row parks the task at `escalate_to_human`). It escalates to
+  `escalate_to_human` on a cancelled, startup-failure or action-required
+  check (the outcome name in `choco task status` says which), and when CI
+  has not finished in 30 minutes. A real failure wins over those three. A PR
+  with no checks at all goes to `awaiting_human_review` as `no_checks` after
+  3 minutes, so on a repo without CI, or on a conflicting PR, you review
+  without CI. The timeline lists each check with its state.
 - **awaiting_human_review.** A human gate that watches the PR's comments
   every minute for 6 hours, then parks at `escalate_to_human`. It also takes
   `choco task send <id> --text "..."` carrying `/approve` or
