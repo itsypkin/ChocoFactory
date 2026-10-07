@@ -3179,3 +3179,91 @@ fn a_long_token_after_words_starts_its_own_line() {
         "{s}"
     );
 }
+
+/// Review of #211: with loop counters, a short screen drops the header row
+/// before it hides a step, and the counters line stays.
+#[test]
+fn a_short_screen_drops_the_header_row_and_keeps_the_counters() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(busy_with_trail(4)));
+    let s = render(&app, 40, 11);
+    assert!(!s.contains("at (UTC)"), "{s}");
+    assert!(s.contains("  … 3 earlier steps"), "{s}");
+    assert!(s.contains("Loop counters  internal_review=2"), "{s}");
+    assert!(row_has(&s, &["4", "revi…", "done"]), "{s}");
+}
+
+/// Review of #211: a two-step trail without counters shows both steps at
+/// every height, never "… 1 earlier steps".
+#[test]
+fn a_two_step_list_without_counters_is_never_cut() {
+    for h in 10..=14 {
+        let mut app = board();
+        open_detail(&mut app, BUSY);
+        let mut d = busy_with_trail(2);
+        d["workflow_state"]["loop_counters"] = json!({});
+        answer(&mut app, BUSY, Ok(d));
+        let s = render(&app, 40, h);
+        assert!(!s.contains("earlier step"), "40x{h}\n{s}");
+        assert!(row_has(&s, &["2", "codi…", "done"]), "40x{h}\n{s}");
+        assert!(row_has(&s, &["1", "start"]), "40x{h}\n{s}");
+    }
+}
+
+#[test]
+fn the_120x40_status_view_shows_the_aligned_table() {
+    let app = busy_view();
+    let mut expected = vec![
+        title_row(
+            "Per-kind stage execution (#55)",
+            "e events · Esc back · ? help",
+            120,
+        ),
+        "ID        9c03aa17-bbbb".to_string(),
+        "Project   chocofactory".into(),
+        "Workflow  coding-task".into(),
+        "Workflow  builtin:coding-task  [0123456789ab]".into(),
+        "Status    open".into(),
+        "Repo      /home/dev/chocofactory".into(),
+        "Role      coder: model=opus".into(),
+        "Created   2026-01-01 03:40:00 UTC".into(),
+        "Stage     internal_review for 12m".into(),
+        "Cost      no data".into(),
+        sep("progress", 120),
+        "  #  from             outcome            to               at (UTC)".into(),
+        "  1                   start              coding           03:41:00".into(),
+        "  2  coding           done               internal_review  04:10:00".into(),
+        "  3  internal_review  changes_requested  revising         04:50:00".into(),
+        "  4  revising         done               internal_review  11:48:00  ◀ current".into(),
+        "Loop counters  internal_review=2".into(),
+        sep("last events (e expands)", 120),
+    ];
+    for n in 0..7 {
+        expected.push(format!("  {}  human_message message {n}", at(n)));
+    }
+    let s = render(&app, 120, 40);
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    for (i, e) in expected.iter().enumerate() {
+        assert_eq!(&lines[i], e, "line {i}\n{s}");
+    }
+    assert_eq!(
+        lines[39], "e events  o PR  r retry  c cancel  Esc back",
+        "{s}"
+    );
+}
+
+#[test]
+fn a_stuck_row_with_an_empty_reason_still_renders() {
+    let mut app = board();
+    let id = "7d22e1a8-dddd";
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == id)
+        .unwrap()
+        .task
+        .stuck_reason = Some(String::new());
+    open_detail(&mut app, id);
+    let s = render(&app, 80, 24);
+    assert!(s.lines().any(|l| l.starts_with("Stuck")), "{s}");
+}

@@ -123,7 +123,7 @@ pub fn init_workflows(result: &crate::client::InitWorkflowsResult) -> String {
 
 pub fn task(t: &Task) -> String {
     let mut pairs = vec![
-        (LABEL_TITLE, single_line(&t.title)),
+        ("Title", single_line(&t.title)),
         ("ID", t.id.clone()),
         ("Project", t.project_id.clone()),
         ("Workflow", t.workflow_def.clone()),
@@ -134,18 +134,18 @@ pub fn task(t: &Task) -> String {
     if t.status == "stuck"
         && let Some(reason) = &t.stuck_reason
     {
-        pairs.push((LABEL_STUCK, single_line(reason)));
+        pairs.push(("Stuck", single_line(reason)));
     }
     if let Some(cwd) = t.config.get("cwd").and_then(Value::as_str) {
-        pairs.push((LABEL_REPO, cwd.to_string()));
+        pairs.push(("Repo", cwd.to_string()));
     }
     // Without this, `task create --role-model coder=opus` and
     // `task reconfigure` would both print nothing about the override that
     // was just applied, leaving `--json` as the only way to confirm it.
     for (role, settings) in role_summaries(&t.config) {
-        pairs.push((LABEL_ROLE, format!("{role}: {settings}")));
+        pairs.push(("Role", format!("{role}: {settings}")));
     }
-    pairs.push((LABEL_CREATED, timestamp(&t.created_at)));
+    pairs.push(("Created", timestamp(&t.created_at)));
     fields(&pairs)
 }
 
@@ -266,7 +266,7 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
     let get = |key: &str| detail.get(key).and_then(Value::as_str).unwrap_or("-");
 
     let mut pairs = vec![
-        ("Title", single_line(get("title"))),
+        (LABEL_TITLE, single_line(get("title"))),
         (LABEL_ID, get("id").to_string()),
         (LABEL_PROJECT, get("project_id").to_string()),
         (LABEL_WORKFLOW, get("workflow_def").to_string()),
@@ -304,7 +304,7 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
     if get("status") == "stuck"
         && let Some(reason) = detail.get("stuck_reason").and_then(Value::as_str)
     {
-        pairs.push(("Stuck", single_line(reason)));
+        pairs.push((LABEL_STUCK, single_line(reason)));
     }
     // A task cancelled with `--keep` (#102) handed its worktree and branch to
     // a person; say where, or the work is as good as lost.
@@ -322,13 +322,13 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
     // flattens the `Task`, so `config` is a top-level key here.
     if let Some(config) = detail.get("config") {
         if let Some(cwd) = config.get("cwd").and_then(Value::as_str) {
-            pairs.push(("Repo", cwd.to_string()));
+            pairs.push((LABEL_REPO, cwd.to_string()));
         }
         for (role, settings) in role_summaries(config) {
-            pairs.push(("Role", format!("{role}: {settings}")));
+            pairs.push((LABEL_ROLE, format!("{role}: {settings}")));
         }
     }
-    pairs.push(("Created", timestamp_str(get("created_at"))));
+    pairs.push((LABEL_CREATED, timestamp_str(get("created_at"))));
 
     if let Some(current) = detail_stage(detail) {
         pairs.push((LABEL_STAGE, current.to_string()));
@@ -739,7 +739,7 @@ pub fn stage_progress_table(
         // trailing arrow row. It's still worth stating: a mismatch means
         // the trail was truncated by retention, and silently rendering a
         // stale last hop as "where the task is" would be a lie.
-        if trail.last().map(stage_of).as_deref() == Some(current) {
+        if trail.last().map(stage_of).as_deref() == Some(single_line(current).as_str()) {
             if let Some(last) = steps.last_mut() {
                 last.current = true;
             }
@@ -1456,6 +1456,18 @@ mod tests {
         let t = table_of(&[], None, None);
         assert!(t.header.is_none());
         assert_eq!(t.rows, ["  (none)"]);
+    }
+
+    #[test]
+    fn a_current_stage_with_odd_whitespace_matches_the_last_row() {
+        let trail = [stage_entry(
+            "two  words",
+            Value::Null,
+            "2026-08-02T09:00:00Z",
+        )];
+        let t = table_of(&trail, Some("two  words"), None);
+        assert_eq!(t.rows.len(), 1, "{:?}", t.rows);
+        assert!(t.rows[0].ends_with("◀ current"));
     }
 
     #[test]

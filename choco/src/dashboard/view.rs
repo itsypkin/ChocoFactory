@@ -1007,7 +1007,9 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
                     .or_else(|| {
                         // ...and when even one step doesn't fit with it, the
                         // header goes before anything else is given up.
-                        let m = largest(&rows, false);
+                        let m = (1..=prog.len())
+                            .rev()
+                            .find(|&m| block(&rows, m, false) <= body_h);
                         if m.is_some() {
                             show_header = false;
                         }
@@ -1223,4 +1225,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" keys ")),
         r,
     );
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_words;
+
+    #[test]
+    fn empty_input_is_one_empty_line() {
+        assert_eq!(wrap_words("", 10), [""]);
+        assert_eq!(wrap_words("   ", 0), [""]);
+    }
 }
