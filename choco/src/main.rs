@@ -239,7 +239,9 @@ enum Output {
     Project(Project),
     Projects(Vec<Project>),
     Task(Task),
-    Tasks(Vec<Task>),
+    /// `GET /tasks` rows whole, so `--json` keeps `usage_total` and the
+    /// other summary fields.
+    Tasks(Vec<chocofactory_core::models::TaskSummary>),
     /// The daemon's `TaskDetail` — kept as raw JSON because it has no
     /// exported Rust type, and passing it through verbatim is exactly what
     /// a delegating agent polling `workflow_state.current_stage` wants.
@@ -278,7 +280,10 @@ impl Output {
             Output::Project(p) => render::project(p),
             Output::Projects(p) => render::projects(p),
             Output::Task(t) => render::task(t),
-            Output::Tasks(t) => render::tasks(t),
+            Output::Tasks(t) => {
+                let tasks: Vec<Task> = t.iter().map(|s| s.task.clone()).collect();
+                render::tasks(&tasks)
+            }
             Output::TaskDetail(d) => render::task_detail(d),
             Output::Events(e) => render::events(e),
             Output::InitWorkflows(r) => render::init_workflows(r),
@@ -470,6 +475,35 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     const DEFAULT: &str = "http://127.0.0.1:4141";
+
+    fn summary_row(usage_total: serde_json::Value) -> chocofactory_core::models::TaskSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": "t1", "project_id": "p", "workflow_def": "w", "title": "T",
+            "status": "open", "config": {}, "worktree_repo": null,
+            "worktree_project": null, "stuck_reason": null,
+            "workflow_path": null, "workflow_sha256": null,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "current_stage": null, "stage_entered_at": null, "loop_counters": {},
+            "pr": null, "usage_total": usage_total,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn task_list_json_keeps_each_rows_usage_total() {
+        let out = super::Output::Tasks(vec![
+            summary_row(serde_json::json!({
+                "cost_usd": 0.09, "tokens": 405, "billing_label": "api_equivalent"
+            })),
+            summary_row(serde_json::Value::Null),
+        ]);
+        let v: serde_json::Value = serde_json::from_str(&out.to_json().unwrap()).unwrap();
+        assert_eq!(v[0]["usage_total"]["billing_label"], "api_equivalent");
+        assert_eq!(v[0]["usage_total"]["tokens"], 405);
+        assert!(v[1]["usage_total"].is_null());
+        assert!(v[1].as_object().unwrap().contains_key("usage_total"));
+        assert!(out.to_human().unwrap().contains("t1"));
+    }
 
     #[test]
     fn keep_message_names_the_kept_worktree_and_branch() {
