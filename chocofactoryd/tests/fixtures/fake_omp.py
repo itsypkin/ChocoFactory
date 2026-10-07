@@ -40,6 +40,10 @@ wrapper script, never through the test process's own environment):
                 `prompt_result` follows (omp drops the ticket)
   reject_prompt_late  as `reject_prompt`, then a `prompt_result` error for
                 the same id arrives anyway
+  reject_followup the first prompt is accepted; the next prompt received
+                (while it runs) is rejected with `success: false`, then the
+                first prompt finishes normally
+  reject_noerror  as `reject_prompt`, but the response carries no `error`
   bad_host_call a `host_tool_call` with an id but no toolCallId or toolName
                 precedes the turn; the daemon's reply is reported as text
   state_error   `get_state` fails
@@ -285,6 +289,9 @@ def run_reports():
 
 
 def run_prompt(request):
+    if "reject_noerror" in MODES:
+        respond(request, success=False)
+        return
     if "reject_prompt" in MODES or "reject_prompt_late" in MODES:
         respond(request, success=False, error="no such skill: nope")
         if "reject_prompt_late" in MODES:
@@ -296,6 +303,9 @@ def run_prompt(request):
         respond(request, data={"agentInvoked": False})
         return
     respond(request, data={"agentInvoked": True})
+    if "reject_followup" in MODES:
+        second = read_frame()
+        respond(second, success=False, error="no such skill: nope")
     if "garbage" in MODES:
         sys.stdout.write("this is not json\n")
         emit({"type": "totally_unknown_frame", "n": 1})

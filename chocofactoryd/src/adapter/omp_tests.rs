@@ -1760,6 +1760,57 @@ async fn a_rejected_prompt_ends_the_turn_with_its_error_exactly_once() {
 }
 
 #[tokio::test]
+async fn a_rejected_prompt_without_an_error_field_gets_the_fallback_text() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "reject_noerror")]);
+    let mut handle = adapter.start("/skill:nope", &env.cfg()).unwrap();
+    let mut events = until_turn_completed(&mut handle).await;
+    events.extend(drain(&mut handle).await);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { message } if message == "omp rejected the prompt"
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_follow_up_does_not_end_the_running_turn() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "reject_followup")]);
+    let mut handle = adapter.start("one", &env.cfg()).unwrap();
+    handle.send("/skill:nope").unwrap();
+    let mut events = until_turn_completed(&mut handle).await;
+    events.extend(drain(&mut handle).await);
+    let completions: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnCompleted { is_error, usage } => Some((*is_error, usage.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions.len(), 1, "{events:?}");
+    assert!(!completions[0].0, "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { message } if message == "no such skill: nope"
+        )),
+        "{events:?}"
+    );
+    let error_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Error { .. }))
+        .unwrap();
+    let done_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+        .unwrap();
+    assert!(error_at < done_at, "{events:?}");
+}
+
+#[tokio::test]
 async fn a_statistics_timeout_still_starts_the_next_queued_completion() {
     let env = Env::new();
     // Call 0 is the baseline; the first turn's reading never answers.

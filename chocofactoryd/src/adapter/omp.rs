@@ -1271,11 +1271,17 @@ impl Driver {
                     .unwrap_or("omp rejected the prompt")
                     .to_string();
                 self.emit(AgentEvent::Error { message });
-                self.ready_completions.push_back(Completion {
-                    is_error: true,
-                    sent_at,
-                    messages: std::mem::take(&mut self.messages),
-                });
+                // Another prompt of ours is still running: a completion
+                // carries no prompt id, so ending a turn here would end
+                // that running turn early. Report the rejection only; the
+                // running prompt completes the turn.
+                if self.prompts.is_empty() {
+                    self.ready_completions.push_back(Completion {
+                        is_error: true,
+                        sent_at,
+                        messages: std::mem::take(&mut self.messages),
+                    });
+                }
             }
         }
     }
