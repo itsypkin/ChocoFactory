@@ -1684,6 +1684,51 @@ mod tests {
         }
     }
 
+    /// The reader, not just `agents_md_plugin_warning`, must send the warning:
+    /// a fake CLI whose `init` lists plugins without agents-md, spawned
+    /// isolated, yields `SessionMeta` then the `Error`; a chat spawn doesn't.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_reader_sends_the_plugin_warning_after_the_session_meta_for_isolated_roles() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = std::env::temp_dir().join(format!("choco-fake-{}.sh", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nread line\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"plugins\":[{\"name\":\"cc-plugin-telemetry\",\"source\":\"cc-plugin-telemetry@builtin\"}]}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"session_id\":\"s\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (isolation, expect_warning) in [
+            (Isolation::default(), true),
+            (Isolation::InheritOperatorConfig, false),
+        ] {
+            let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
+            let cfg = RoleConfig {
+                disallowed_tools: Vec::new(),
+                cwd: std::env::temp_dir(),
+                model: None,
+                system_prompt: None,
+                sandboxed: true,
+                report_outcomes: Vec::new(),
+                report_sections: Vec::new(),
+                isolation,
+            };
+            let mut handle = adapter.start("go", &cfg).unwrap();
+            let mut seen = Vec::new();
+            while let Some(event) = handle.recv().await {
+                let done = matches!(event, AgentEvent::TurnCompleted { .. });
+                seen.push(event);
+                if done {
+                    break;
+                }
+            }
+            let warned = matches!(seen.get(1), Some(AgentEvent::Error { message }) if message.contains("AGENTS.md"));
+            assert!(matches!(seen[0], AgentEvent::SessionMeta { .. }));
+            assert_eq!(warned, expect_warning, "{seen:?}");
+        }
+        std::fs::remove_file(&script).unwrap();
+    }
+
     fn real_plugins() -> Vec<Value> {
         ["agents-md", "telemetry", "plugin-authoring"]
             .iter()
