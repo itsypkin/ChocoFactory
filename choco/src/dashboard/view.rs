@@ -121,6 +121,7 @@ struct Cols {
     stage: bool,
     pr: bool,
     laps: bool,
+    cost: bool,
 }
 
 fn cols_for(app: &App, width: u16) -> Cols {
@@ -129,6 +130,9 @@ fn cols_for(app: &App, width: u16) -> Cols {
         stage: width >= 60,
         pr: width >= 80,
         laps: width >= 80,
+        // 80 plus the column and its separator, so the title never has less
+        // room than it has at 80.
+        cost: width >= 91,
     }
 }
 
@@ -143,6 +147,7 @@ enum Key {
     Time,
     Laps,
     Status,
+    Cost,
 }
 
 struct Col {
@@ -164,6 +169,7 @@ const ID_W: usize = 8;
 const PR_W: usize = 6;
 const TIME_W: usize = 10;
 const LAPS_W: usize = 5;
+const COST_W: usize = 9;
 /// Project and stage shrink before the title drops below this.
 const TITLE_MIN: usize = 20;
 
@@ -201,6 +207,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid 
     let mut fixed_cols = vec![ID_W, TIME_W];
     fixed_cols.extend([PR_W].into_iter().filter(|_| cols.pr));
     fixed_cols.extend([LAPS_W].into_iter().filter(|_| cols.laps));
+    fixed_cols.extend([COST_W].into_iter().filter(|_| cols.cost));
     let n = fixed_cols.len() + 1 + usize::from(cols.project) + usize::from(cols.stage);
     let rest = |project_w: usize, stage_w: usize| {
         let used: usize = fixed_cols.iter().sum::<usize>() + project_w + stage_w + (n - 1) * 2;
@@ -271,6 +278,9 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
     if g.cols.laps {
         v.push(c(Key::Laps, LAPS_W));
     }
+    if g.cols.cost {
+        v.push(c(Key::Cost, COST_W));
+    }
     v
 }
 
@@ -296,6 +306,26 @@ fn cell(app: &App, section: Section, t: &TaskSummary, key: Key) -> String {
             n => format!("×{n}"),
         },
         Key::Status => t.task.status.clone(),
+        Key::Cost => list_cost(t),
+    }
+}
+
+/// The list's cost cell: `≈$1.23`, `no data` for a task with no recorded
+/// turns, `unknown` when turns exist but none reported a cost.
+fn list_cost(t: &TaskSummary) -> String {
+    match &t.usage_total {
+        None => "no data".to_string(),
+        Some(u) => match u.cost_usd {
+            None => "unknown".to_string(),
+            Some(c) => {
+                let text = format!("≈${c:.2}");
+                if text.chars().count() <= COST_W {
+                    text
+                } else {
+                    format!("≈${c:.0}")
+                }
+            }
+        },
     }
 }
 
@@ -331,6 +361,7 @@ fn heading_line(g: &Grid) -> String {
             Key::Stage => "stage",
             Key::Pr => "PR",
             Key::Laps => "laps",
+            Key::Cost => "cost",
             _ => "",
         };
         out.push_str(&pad(text, col.w));
@@ -711,8 +742,48 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         }
     }
     let at = (at + 1).min(rows.len());
+    let after = at + extra.len();
     rows.splice(at..at, extra);
+    if let Some(value) = cost_value(d) {
+        let mut row = FRow::new("Cost", value);
+        row.drop = 1;
+        let after = after.min(rows.len());
+        rows.insert(after, row);
+    }
     rows
+}
+
+/// The `Cost` row's value: the full answer's totals when it has arrived,
+/// else the list snapshot's cost; `None` when there is neither.
+fn cost_value(d: &Detail) -> Option<String> {
+    use crate::render::cost_with_label;
+    if let Some(v) = &d.data {
+        let Some(usage) = v.get("usage").filter(|u| u.is_object()) else {
+            return Some("no data".to_string());
+        };
+        let label = usage
+            .get("billing_label")
+            .and_then(|l| l.as_str())
+            .unwrap_or("estimated");
+        let duration = |key: &str| {
+            usage
+                .get(key)
+                .and_then(|ms| ms.as_i64())
+                .map(|ms| fmt_duration(chrono::Duration::milliseconds(ms)))
+                .unwrap_or_else(|| "no data".to_string())
+        };
+        return Some(format!(
+            "{} · wall {} · active {}",
+            cost_with_label(usage.get("cost_usd").and_then(|c| c.as_f64()), label),
+            duration("wall_time_ms"),
+            duration("active_time_ms"),
+        ));
+    }
+    let snap = d.snapshot.as_ref()?;
+    Some(match &snap.usage_total {
+        Some(u) => cost_with_label(u.cost_usd, &u.billing_label),
+        None => "no data".to_string(),
+    })
 }
 
 /// A row as screen lines: cut to the width, or wrapped for `wrap` rows.
