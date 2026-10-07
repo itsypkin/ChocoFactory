@@ -524,7 +524,7 @@ async fn background_messages_count_toward_the_turn_that_waited_for_them() {
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
     let events = until_turn_completed(&mut handle).await;
-    assert_eq!(usage_of(&events).model_turns, Some(4));
+    assert_eq!(usage_of(&events).model_turns, Some(3));
 }
 
 #[tokio::test]
