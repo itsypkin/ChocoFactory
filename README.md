@@ -1069,9 +1069,18 @@ $ choco task create --project acme --workflow my-coding-task \
 The role names are whatever that workflow's `roles:` block declares — a name
 that isn't in it is simply not applied to anything.
 
+A role's `cli:` picks the agent adapter that runs it. `claude` is the only
+adapter in this release. An unknown name is rejected rather than run as
+`claude`: when a workflow is loaded, when the daemon starts (a bad `cli:` in
+`config.yaml` stops it with the message), and when a task is created or
+reconfigured (`--role-cli`). A value that slips in later, such as `config.yaml`
+edited while the daemon runs, parks the task `stuck` when the turn starts. A
+session can only be resumed by the adapter that created it, so a retry whose
+role's `cli:` has changed starts fresh instead.
+
 | Flag | Sets |
 |---|---|
-| `--role-cli ROLE=CLI` | which agent CLI that role runs |
+| `--role-cli ROLE=CLI` | which agent adapter runs that role (`claude` is the only one in this release) |
 | `--role-model ROLE=MODEL` | that role's model |
 | `--role-system-prompt ROLE=TEXT` | that role's system prompt, inline |
 | `--role-system-prompt-file ROLE=PATH` | the same, read from a file |

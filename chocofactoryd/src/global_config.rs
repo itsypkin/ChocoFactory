@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
+use crate::adapter::{Registry, UnknownCliError};
 use crate::fileref::{self, FileRefError};
 
 /// Shape mirrors the workflow-def `roles:` block deliberately (keyed by
@@ -93,6 +94,31 @@ impl GlobalConfig {
 
         Ok(GlobalConfig { roles })
     }
+}
+
+/// Daemon-start check: every `cli:` in the global config at `path` must
+/// name an adapter in `registry`. A missing file or `None` path is fine; a
+/// file that can't be loaded logs a warning and passes, as it always has
+/// (the error still surfaces when a turn needs the config).
+pub fn check_known_clis(path: Option<&Path>, registry: &Registry) -> Result<(), UnknownCliError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let config = match GlobalConfig::load(path) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(%err, path = %path.display(), "could not load the global config; skipping its cli check");
+            return Ok(());
+        }
+    };
+    let mut roles: Vec<(&String, &GlobalRoleConfig)> = config.roles.iter().collect();
+    roles.sort_by_key(|(name, _)| *name);
+    for (name, role) in roles {
+        if let Some(cli) = &role.cli {
+            registry.lookup(Some(name), cli)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,5 +285,45 @@ mod tests {
         let err = GlobalConfig::load(&path).unwrap_err();
         assert!(matches!(err, GlobalConfigError::Yaml(_)));
         assert!(err.to_string().contains("duplicate key"));
+    }
+
+    fn claude_registry() -> Registry {
+        Registry::single(std::sync::Arc::new(crate::adapter::ClaudeAdapter::new()))
+    }
+
+    #[test]
+    fn check_known_clis_rejects_an_unknown_cli_naming_the_role() {
+        let dir = TempDir::new();
+        let path = dir.write("config.yaml", "roles:\n  coder:\n    cli: cluade\n");
+        let err = check_known_clis(Some(&path), &claude_registry()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "role 'coder' uses cli 'cluade', which this daemon doesn't know; known CLIs: claude"
+        );
+    }
+
+    #[test]
+    fn check_known_clis_reports_the_first_bad_role_in_sorted_order() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "config.yaml",
+            "roles:\n  zed:\n    cli: nope\n  alpha:\n    cli: nada\n",
+        );
+        let err = check_known_clis(Some(&path), &claude_registry()).unwrap_err();
+        assert_eq!(err.role.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn check_known_clis_accepts_what_startup_has_always_accepted() {
+        let dir = TempDir::new();
+        let registry = claude_registry();
+        assert!(check_known_clis(None, &registry).is_ok());
+        assert!(check_known_clis(Some(&dir.path.join("missing.yaml")), &registry).is_ok());
+        let ok = dir.write("ok.yaml", "roles:\n  coder:\n    cli: claude\n");
+        assert!(check_known_clis(Some(&ok), &registry).is_ok());
+        let model_only = dir.write("m.yaml", "roles:\n  coder:\n    model: opus\n");
+        assert!(check_known_clis(Some(&model_only), &registry).is_ok());
+        let malformed = dir.write("bad.yaml", "roles: [not, a, map");
+        assert!(check_known_clis(Some(&malformed), &registry).is_ok());
     }
 }

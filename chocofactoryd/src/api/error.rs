@@ -12,6 +12,7 @@ use crate::engine::{
     RetryTaskError, SendMessageError, SendMessageOrResumeError,
 };
 use crate::session::SessionError;
+use crate::workflow_def::WorkflowDefError;
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -49,6 +50,15 @@ impl From<CreateTaskError> for ApiError {
                 ApiError::NotFound(err.to_string())
             }
             CreateTaskError::WorkflowFileNotAbsolute(_) => ApiError::BadRequest(err.to_string()),
+            // The caller picked the workflow or the config that names the
+            // unknown CLI. A task that already exists and is stuck on one
+            // (global config edited since daemon start) is the same fault.
+            CreateTaskError::UnknownCli(_)
+            | CreateTaskError::WorkflowDef(WorkflowDefError::UnknownCli(_))
+            | CreateTaskError::Start {
+                source: EngineError::UnknownCli(_),
+                ..
+            } => ApiError::BadRequest(err.to_string()),
             CreateTaskError::NoSuchProject(_) => ApiError::NotFound(err.to_string()),
             CreateTaskError::Start {
                 source: EngineError::MissingAgentTurnInput(_),
@@ -131,7 +141,11 @@ impl From<SendMessageOrResumeError> for ApiError {
             | SendMessageOrResumeError::BuiltinWorkflowGone(_)
             | SendMessageOrResumeError::SendMessage(
                 SendMessageError::MissingWorkflowFile(_) | SendMessageError::BuiltinWorkflowGone(_),
-            ) => {
+            )
+            // The session was recorded on a CLI this daemon no longer has.
+            | SendMessageOrResumeError::SendMessage(SendMessageError::Session(
+                SessionError::UnknownCli(_),
+            )) => {
                 ApiError::Conflict(err.to_string())
             }
             _ => ApiError::Internal(err.to_string()),
@@ -196,7 +210,13 @@ impl From<RetryTaskError> for ApiError {
             // Same shape, for a task created from a recorded workflow path
             // (issue #88) whose file has since been deleted.
             | RetryTaskError::MissingWorkflowFile(_)
-            | RetryTaskError::BuiltinWorkflowGone(_) => ApiError::Conflict(err.to_string()),
+            | RetryTaskError::BuiltinWorkflowGone(_)
+            // The role's CLI (from the global config edited since daemon
+            // start) is unknown: a conflict with the task's config, not a
+            // server fault. Create reports the same fault as 400.
+            | RetryTaskError::Enter(EngineError::UnknownCli(_)) => {
+                ApiError::Conflict(err.to_string())
+            }
             _ => ApiError::Internal(err.to_string()),
         }
     }

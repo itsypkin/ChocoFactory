@@ -100,6 +100,10 @@ pub(super) struct ResumeSession {
     /// The CLI's own session id to resume, as recorded by the previous
     /// session.
     pub(super) adapter_session_id: String,
+    /// The CLI adapter that session ran on. A resume dispatches to this one
+    /// and never to the role's current `cli`: a session id belongs to the
+    /// CLI that created it.
+    pub(super) cli_adapter: String,
     /// That session, so the new one can point back at it (`resumed_from`)
     /// and the timeline can name it.
     pub(super) previous_session_id: String,
@@ -250,6 +254,22 @@ impl WorkflowEngine {
         )
         .map_err(EngineError::RoleConfig)?;
 
+        // Which adapter runs this turn: the recorded one for a resume (so a
+        // config change between the retry's decision and here can't hand a
+        // session id to another CLI), the resolved `cli` otherwise. Looked up
+        // before any row, baseline or process exists, so a miss leaves
+        // nothing behind.
+        let cli_name = match resume {
+            Some(resume) => resume.cli_adapter.as_str(),
+            None => resolved.cli.as_str(),
+        };
+        let adapter_name = self
+            .session_manager
+            .registry()
+            .lookup(Some(role), cli_name)
+            .map_err(EngineError::UnknownCli)?
+            .name();
+
         // #172: a read-only role's baseline is taken (or, for a resumed turn,
         // looked up) before any session row exists, so a failure here leaves
         // nothing behind and the agent is never started.
@@ -271,7 +291,7 @@ impl WorkflowEngine {
             task_id,
             stage: stage_name,
             role,
-            cli_adapter: &resolved.cli,
+            cli_adapter: adapter_name,
             model: &resolved.model,
         };
         // A resume still opens its own session (#92): the attempt history
@@ -394,6 +414,7 @@ impl WorkflowEngine {
                 self.session_manager
                     .resume(
                         &session.id,
+                        adapter_name,
                         &resume.adapter_session_id,
                         &prompt,
                         &resolved.role_config,
@@ -403,7 +424,13 @@ impl WorkflowEngine {
             }
             None => {
                 self.session_manager
-                    .start(&session.id, &prompt, &resolved.role_config, session_kind)
+                    .start(
+                        &session.id,
+                        adapter_name,
+                        &prompt,
+                        &resolved.role_config,
+                        session_kind,
+                    )
                     .await
             }
         };

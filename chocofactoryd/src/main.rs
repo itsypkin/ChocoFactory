@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chocofactory_core::daemon_lock::LockInfo;
 use chocofactory_core::version;
-use chocofactoryd::adapter::{AgentAdapter, ClaudeAdapter};
+use chocofactoryd::adapter::{ClaudeAdapter, Registry};
 use chocofactoryd::api::{self, AppState, ExeStamp, ServerInfo};
 use chocofactoryd::config_root;
 use chocofactoryd::daemon_lock::DaemonLock;
@@ -101,6 +101,25 @@ async fn main() {
         .expect("chocofactoryd: $HOME is not set, cannot determine ~/.config/chocofactory");
     std::fs::create_dir_all(&root).expect("chocofactoryd: failed to create the config directory");
 
+    let mut claude_adapter = match claude_binary_override() {
+        Some(binary) => ClaudeAdapter::with_binary(binary),
+        None => ClaudeAdapter::new(),
+    };
+    if let Some(choco_binary) = choco_binary_override() {
+        claude_adapter = claude_adapter.with_choco_binary(choco_binary);
+    }
+    let choco_binary = claude_adapter.choco_binary().to_string();
+    let registry = Registry::new(vec![Arc::new(claude_adapter)]);
+
+    // Before the lock: a refused start leaves no lock, port or DB state.
+    if let Err(err) = chocofactoryd::global_config::check_known_clis(
+        GlobalConfig::default_path().as_deref(),
+        &registry,
+    ) {
+        eprintln!("chocofactoryd: {err}");
+        std::process::exit(1);
+    }
+
     // The lock is the single-instance guard per config root; nothing below
     // (seeding, migrations, session recovery) may touch state before it is
     // held and the port is bound.
@@ -188,18 +207,9 @@ async fn main() {
     report_legacy_workflows(&pool, &root.join("workflows")).await;
 
     let events_notify = Arc::new(Notify::new());
-    let mut claude_adapter = match claude_binary_override() {
-        Some(binary) => ClaudeAdapter::with_binary(binary),
-        None => ClaudeAdapter::new(),
-    };
-    if let Some(choco_binary) = choco_binary_override() {
-        claude_adapter = claude_adapter.with_choco_binary(choco_binary);
-    }
-    let choco_binary = claude_adapter.choco_binary().to_string();
-    let adapter: Arc<dyn AgentAdapter> = Arc::new(claude_adapter);
     let session_manager = SessionManager::new(
         pool.clone(),
-        adapter,
+        registry,
         chrono::Duration::minutes(DEFAULT_IDLE_TIMEOUT_MINUTES),
         Arc::clone(&events_notify),
     );

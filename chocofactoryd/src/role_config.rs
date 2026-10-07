@@ -61,6 +61,28 @@ pub struct StageReport {
     pub sections: Vec<String>,
 }
 
+/// The `cli` half of [`resolve`]: task config, then workflow definition,
+/// then global config. `resolve` calls this, so the two can't diverge.
+pub fn resolve_cli(
+    role_name: &str,
+    role_def: &RoleDef,
+    global: &GlobalConfig,
+    task_config: &Value,
+) -> Result<String, RoleConfigError> {
+    let task_role = task_config.get("roles").and_then(|r| r.get(role_name));
+    let global_role = global.roles.get(role_name);
+    resolve_string_field(
+        task_role,
+        "cli",
+        role_def.cli.as_deref(),
+        global_role.and_then(|g| g.cli.as_deref()),
+    )
+    .ok_or_else(|| RoleConfigError::MissingField {
+        role: role_name.to_string(),
+        field: "cli",
+    })
+}
+
 /// Resolves `role_name`'s final `cli`/`model`/system prompt against the
 /// three layers, plus `cwd`/`sandboxed`/`report` (stage- or task-wide, not
 /// per-role — passed straight through, not resolved here).
@@ -76,16 +98,7 @@ pub fn resolve(
     let task_role = task_config.get("roles").and_then(|r| r.get(role_name));
     let global_role = global.roles.get(role_name);
 
-    let cli = resolve_string_field(
-        task_role,
-        "cli",
-        role_def.cli.as_deref(),
-        global_role.and_then(|g| g.cli.as_deref()),
-    )
-    .ok_or_else(|| RoleConfigError::MissingField {
-        role: role_name.to_string(),
-        field: "cli",
-    })?;
+    let cli = resolve_cli(role_name, role_def, global, task_config)?;
 
     let model = resolve_string_field(
         task_role,

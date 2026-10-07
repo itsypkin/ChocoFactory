@@ -2346,3 +2346,41 @@ async fn real_binary_reports_the_old_workflows_folder_and_leaves_it_alone() {
         coding_task
     );
 }
+
+/// A global config naming a CLI the daemon doesn't know stops the daemon at
+/// start, before it takes the lock or touches the database (#166).
+#[tokio::test]
+async fn daemon_refuses_to_start_on_an_unknown_cli_in_the_global_config() {
+    let home = TempHome::new();
+    let config_dir = home.0.join(".config/chocofactory");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.yaml"),
+        "roles:\n  coder:\n    cli: cluade\n",
+    )
+    .unwrap();
+    let mut child = Command::new(workspace_binary("chocofactoryd"))
+        .env("HOME", &home.0)
+        .env("CHOCOFACTORY_PORT", free_port().to_string())
+        .env("RUST_LOG", "error")
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn chocofactoryd");
+    let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
+        .await
+        .expect("daemon should exit")
+        .unwrap();
+    let stderr = read_stderr_to_string(&mut child).await;
+    assert!(!status.success(), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains("role 'coder' uses cli 'cluade'"),
+        "{stderr}"
+    );
+    let mut entries: Vec<String> = std::fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, vec!["config.yaml".to_string()], "{entries:?}");
+}

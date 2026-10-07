@@ -82,6 +82,10 @@ impl Default for ClaudeAdapter {
 }
 
 impl AgentAdapter for ClaudeAdapter {
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+
     fn start(&self, prompt: &str, cfg: &RoleConfig) -> Result<AgentHandle, AdapterError> {
         spawn(&self.binary, &self.choco_binary, cfg, None, prompt)
     }

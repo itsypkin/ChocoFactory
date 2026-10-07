@@ -42,6 +42,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
+use crate::adapter::{Registry, UnknownCliError};
 use crate::config_root;
 use crate::db::{events, projects, sessions, tasks, workflow_state};
 use crate::global_config::{GlobalConfig, GlobalConfigError};
@@ -287,6 +288,9 @@ pub enum EngineError {
         stage: String,
         reason: String,
     },
+    /// The role's `cli` (or, on a resume, the session's recorded one) names
+    /// no adapter in the registry. Nothing was created or spawned.
+    UnknownCli(UnknownCliError),
     Session(SessionError),
     Db(sqlx::Error),
     Io(std::io::Error),
@@ -346,6 +350,7 @@ impl fmt::Display for EngineError {
             EngineError::PollWindow { stage, reason } => {
                 write!(f, "stage '{stage}' has no usable poll window: {reason}")
             }
+            EngineError::UnknownCli(err) => write!(f, "{err}"),
             EngineError::Session(err) => write!(f, "{err}"),
             EngineError::Db(err) => write!(f, "{err}"),
             EngineError::Io(err) => write!(f, "{err}"),
@@ -541,11 +546,25 @@ impl std::error::Error for ResolveError {}
 /// would let the recorded hash describe a different file than the one that
 /// actually ran, if something rewrote `path` in between — a real window on
 /// a shared repo checkout, not a hypothetical one.
-fn load_workflow_file(path: &Path) -> Result<(WorkflowDefinition, String), WorkflowDefError> {
+///
+/// This is also where every role's `cli:` is checked against `registry`,
+/// the one funnel every engine load goes through. The registry is a
+/// required argument, so no load path can skip the check.
+pub(crate) fn load_workflow_file(
+    path: &Path,
+    registry: &Registry,
+) -> Result<(WorkflowDefinition, String), WorkflowDefError> {
     let raw = fs::read_to_string(path).map_err(WorkflowDefError::Io)?;
     let sha256 = sha256_hex(raw.as_bytes());
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let definition = WorkflowDefinition::parse(&raw, base_dir)?;
+    for (name, role) in &definition.roles {
+        if let Some(cli) = &role.cli {
+            registry
+                .lookup(Some(name), cli)
+                .map_err(WorkflowDefError::UnknownCli)?;
+        }
+    }
     Ok((definition, sha256))
 }
 
@@ -565,6 +584,8 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 #[derive(Debug)]
 pub enum CreateTaskError {
+    /// The task config's `roles.<name>.cli` names no known adapter.
+    UnknownCli(UnknownCliError),
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     /// `WorkflowRef::File` was given a relative path; the daemon's working
@@ -601,6 +622,7 @@ pub enum CreateTaskError {
 impl fmt::Display for CreateTaskError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CreateTaskError::UnknownCli(err) => write!(f, "{err}"),
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowFileNotAbsolute(path) => write!(
@@ -1229,7 +1251,10 @@ impl WorkflowEngine {
                 if let Some(name) = parse_builtin_ref(recorded) {
                     // A built-in follows the daemon: the *current* copy in
                     // the built-in directory, not the version it started on.
-                    return match load_workflow_file(&self.builtin_workflow_file(name)) {
+                    return match load_workflow_file(
+                        &self.builtin_workflow_file(name),
+                        self.registry(),
+                    ) {
                         Ok((definition, _sha256)) => Ok(definition),
                         Err(WorkflowDefError::Io(io_err))
                             if io_err.kind() == std::io::ErrorKind::NotFound =>
@@ -1240,7 +1265,7 @@ impl WorkflowEngine {
                     };
                 }
                 let path = PathBuf::from(recorded);
-                match load_workflow_file(&path) {
+                match load_workflow_file(&path, self.registry()) {
                     Ok((definition, _sha256)) => Ok(definition),
                     Err(WorkflowDefError::Io(io_err))
                         if io_err.kind() == std::io::ErrorKind::NotFound =>
@@ -1276,9 +1301,17 @@ impl WorkflowEngine {
                         builtin
                     }
                 };
-                WorkflowDefinition::load(&path).map_err(LoadTaskWorkflowError::WorkflowDef)
+                load_workflow_file(&path, self.registry())
+                    .map(|(definition, _sha256)| definition)
+                    .map_err(LoadTaskWorkflowError::WorkflowDef)
             }
         }
+    }
+
+    /// The adapters this engine's sessions dispatch to; shared with
+    /// validation so the two can't disagree.
+    pub fn registry(&self) -> &Registry {
+        self.session_manager.registry()
     }
 
     /// Sets the old global workflows folder, used only to reload pre-#88
@@ -1336,6 +1369,11 @@ impl WorkflowEngine {
         initial_input: &str,
         mut config: Value,
     ) -> Result<Task, CreateTaskError> {
+        // Before any read or write: an unknown `cli` in the task's own
+        // config is rejected without creating anything.
+        crate::adapter::check_task_config_clis(&config, self.registry())
+            .map_err(CreateTaskError::UnknownCli)?;
+
         // The project is loaded first, before any workflow resolution:
         // resolution needs it to search the project's own repo. Checked
         // explicitly rather than left to surface as a raw FK violation
@@ -1359,8 +1397,8 @@ impl WorkflowEngine {
                     return Err(CreateTaskError::WorkflowFileNotAbsolute(path));
                 }
                 let canonical = canonicalize(&path)?;
-                let (definition, sha) =
-                    load_workflow_file(&canonical).map_err(CreateTaskError::WorkflowDef)?;
+                let (definition, sha) = load_workflow_file(&canonical, self.registry())
+                    .map_err(CreateTaskError::WorkflowDef)?;
                 let name = definition.name.clone();
                 (
                     definition,
@@ -1375,8 +1413,8 @@ impl WorkflowEngine {
                 {
                     ResolvedWorkflow::Repo(path) => {
                         let canonical = canonicalize(&path)?;
-                        let (definition, sha) =
-                            load_workflow_file(&canonical).map_err(CreateTaskError::WorkflowDef)?;
+                        let (definition, sha) = load_workflow_file(&canonical, self.registry())
+                            .map_err(CreateTaskError::WorkflowDef)?;
                         (
                             definition,
                             name,
@@ -1385,8 +1423,8 @@ impl WorkflowEngine {
                         )
                     }
                     ResolvedWorkflow::Builtin(path) => {
-                        let (definition, sha) =
-                            load_workflow_file(&path).map_err(CreateTaskError::WorkflowDef)?;
+                        let (definition, sha) = load_workflow_file(&path, self.registry())
+                            .map_err(CreateTaskError::WorkflowDef)?;
                         let record = builtin_ref(&name);
                         (definition, name, record, sha)
                     }
@@ -2121,7 +2159,7 @@ impl WorkflowEngine {
         let resumable = match mode {
             RetryMode::Fresh => Err("a fresh start was asked for".to_string()),
             RetryMode::Auto | RetryMode::Resume => {
-                self.resumable_session(stage_def, last_session.as_ref())
+                self.resumable_session(&task, &definition, stage_def, last_session.as_ref())
                     .await?
             }
         };
@@ -2264,6 +2302,8 @@ impl WorkflowEngine {
     /// crash" loop that `SessionError::NotResumable` exists to prevent.
     async fn resumable_session(
         &self,
+        task: &Task,
+        definition: &WorkflowDefinition,
         stage_def: &StageDef,
         last_session: Option<&Session>,
     ) -> Result<Result<ResumeSession, String>, RetryTaskError> {
@@ -2290,6 +2330,29 @@ impl WorkflowEngine {
         let Some(session) = last_session else {
             return Ok(Err("the stage has no previous session".to_string()));
         };
+        // A session id belongs to the CLI that created it. Resumable only
+        // when that CLI is still one this daemon has and is still the role's.
+        if self.registry().lookup(None, &session.cli_adapter).is_err() {
+            return Ok(Err(format!(
+                "its session ran on cli '{}', which this daemon doesn't know (known CLIs: {}), \
+                 so it can't be resumed",
+                session.cli_adapter,
+                self.registry().names().join(", ")
+            )));
+        }
+        let current_cli = match self.current_role_cli(task, definition, stage_def) {
+            Ok(cli) => cli,
+            Err(why) => {
+                return Ok(Err(format!("the role's CLI could not be resolved: {why}")));
+            }
+        };
+        if current_cli != session.cli_adapter {
+            return Ok(Err(format!(
+                "the role's CLI changed from '{}' to '{current_cli}' since its session ran, and a \
+                 session can only be resumed by the CLI that created it",
+                session.cli_adapter
+            )));
+        }
         let end_reason = match session.end_reason {
             Some(
                 reason @ (SessionEndReason::Interrupted
@@ -2322,9 +2385,29 @@ impl WorkflowEngine {
         }
         Ok(Ok(ResumeSession {
             adapter_session_id,
+            cli_adapter: session.cli_adapter.clone(),
             previous_session_id: session.id.clone(),
             end_reason,
         }))
+    }
+
+    /// The `cli` the stage's role resolves to right now, as a displayable
+    /// error when it can't be resolved.
+    fn current_role_cli(
+        &self,
+        task: &Task,
+        definition: &WorkflowDefinition,
+        stage_def: &StageDef,
+    ) -> Result<String, String> {
+        let StageKind::AgentTurn { role, .. } = &stage_def.kind else {
+            return Err("the stage is not an agent turn".to_string());
+        };
+        let role_def = definition
+            .roles
+            .get(role)
+            .ok_or_else(|| format!("unknown role '{role}'"))?;
+        let global = self.load_global_config().map_err(|err| err.to_string())?;
+        role_config::resolve_cli(role, role_def, &global, &task.config).map_err(|e| e.to_string())
     }
 
     /// Seeds `project_id`'s repo with the built-in workflows and their

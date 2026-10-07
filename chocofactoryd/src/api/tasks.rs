@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{ApiError, AppState};
+use crate::adapter;
 use crate::db::usage as usage_db;
 use crate::db::{events, tasks, workflow_state};
 use crate::engine::{WorkflowEngine, WorkflowRef};
@@ -321,6 +322,8 @@ pub async fn update_config(
             "'config' must be a JSON object".to_string(),
         ));
     }
+    adapter::check_task_config_clis(&body.config, state.engine.registry())
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     let task = tasks::merge_config(&state.pool, &id, body.config)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;
@@ -405,6 +408,11 @@ pub async fn retry(
     let mode = body.map(|Json(body)| body.mode).unwrap_or_default();
     let outcome = state.engine.retry_task(&id, mode).await?;
     Ok((StatusCode::ACCEPTED, Json(outcome)))
+}
+
+#[cfg(test)]
+fn tests_support_bad_cli_yaml() -> &'static str {
+    "name: bad\nroles:\n  chat:\n    cli: cluade\n    model: sonnet\nstages:\n  chatting:\n    kind: agent_turn\n    role: chat\n    on: {}\n"
 }
 
 #[cfg(test)]
@@ -1911,5 +1919,195 @@ stages:
             response.json()["error"],
             "your reply has both /request-changes and /approve; keep one. Nothing was sent."
         );
+    }
+
+    // ---- #166: an unknown `cli:` is rejected ----
+
+    #[tokio::test]
+    async fn create_task_with_an_unknown_cli_in_its_config_is_400_and_creates_nothing() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hi",
+                    "config": { "cwd": ".", "roles": { "coder": { "cli": "nope" } } },
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            error.contains("'nope'") && error.contains("known CLIs: claude"),
+            "{error}"
+        );
+        let listed = server.get(&format!("/tasks?project_id={project_id}")).await;
+        assert_eq!(listed.json().as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_task_from_a_workflow_file_with_an_unknown_cli_is_400() {
+        let server = TestServer::start().await;
+        let project_id = create_project(&server).await;
+        let file = server.temp_dir().join("bad.yaml");
+        std::fs::write(&file, super::tests_support_bad_cli_yaml()).unwrap();
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_file": file.to_str().unwrap(),
+                    "title": "t",
+                    "prompt": "hi",
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        assert_eq!(
+            response.json()["error"],
+            "role 'chat' uses cli 'cluade', which this daemon doesn't know; known CLIs: claude"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_task_config_with_an_unknown_cli_is_400_and_leaves_the_config_alone() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+        let task_id = create_two_role_task(&server, &project_id).await;
+        let before = server.get(&format!("/tasks/{task_id}")).await.json()["config"].clone();
+
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "cli": "nope" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            error.contains("'nope'") && error.contains("known CLIs: claude"),
+            "{error}"
+        );
+        let after = server.get(&format!("/tasks/{task_id}")).await.json()["config"].clone();
+        assert_eq!(before, after);
+
+        // A non-string `cli` still falls through, as it always has.
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "cli": 1 } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{}", response.json());
+        assert_eq!(response.json()["config"]["roles"]["coder"]["cli"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_chat_message_for_a_session_on_an_unknown_adapter_is_409() {
+        let server = TestServer::start_with_adapter_binary("fake_claude_oneshot.py").await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": { "cwd": "." },
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
+        sqlx::query("UPDATE sessions SET cli_adapter = 'ghost' WHERE task_id = ?")
+            .bind(&task_id)
+            .execute(server.pool())
+            .await
+            .unwrap();
+        // The one-shot fixture exits on its own; once its slot is gone the
+        // message takes the resume path and meets the unknown adapter.
+        let body = crate::test_support::wait_until(
+            &format!("a 409 for a message to task {task_id}"),
+            || async {
+                let response = server
+                    .post(
+                        &format!("/tasks/{task_id}/messages"),
+                        json!({ "text": "hi" }),
+                    )
+                    .await;
+                if response.status() == 409 {
+                    Ok(response.json())
+                } else {
+                    Err(format!("{}: {}", response.status(), response.json()))
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            body["error"],
+            "role 'chat' uses cli 'ghost', which this daemon doesn't know; known CLIs: claude"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_slips_in_after_startup_is_400_at_create_and_409_at_retry() {
+        let dir = std::env::temp_dir().join(format!("choco-gc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        let server = TestServer::start_with_global_config(config_path.clone()).await;
+        // No `cli:` on the role, so the global config's value is the one used.
+        server.write_workflow(
+            "nocli",
+            "name: nocli\nroles:\n  chat:\n    model: sonnet\nstages:\n  chatting:\n    kind: agent_turn\n    role: chat\n    on: {}\n",
+        );
+        // Written after the engine was built, so no start-time check saw it.
+        std::fs::write(&config_path, "roles:\n  chat:\n    cli: bogus\n").unwrap();
+        let project_id = create_project(&server).await;
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "nocli",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": { "cwd": "." },
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(error.contains("'bogus'"), "{error}");
+        assert!(error.contains("known CLIs: claude"), "{error}");
+        let list = server
+            .get(&format!("/tasks?project_id={project_id}"))
+            .await
+            .json();
+        let tasks = list.as_array().unwrap();
+        assert_eq!(tasks.len(), 1, "{list}");
+        assert_eq!(tasks[0]["status"], "stuck");
+        let task_id = tasks[0]["id"].as_str().unwrap().to_string();
+
+        let response = server
+            .post(&format!("/tasks/{task_id}/retry"), json!({}))
+            .await;
+        assert_eq!(response.status(), 409, "{}", response.json());
+        assert!(
+            response.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("known CLIs: claude"),
+            "{}",
+            response.json()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
