@@ -86,10 +86,10 @@ stages:
       changes_requested: revising
     loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
 
-  # Reached because either loop guard trips (`internal_review`'s or
-  # `awaiting_human_review`'s), because `open_pr` itself failed (see
+  # Reached because any of the three loop guards trips (`internal_review`'s,
+  # `checks_polling`'s or `awaiting_human_review`'s), because `open_pr` itself failed (see
   # below), or because no human review arrives within 6h
-  # (the `timeout` of `awaiting_human_review`'s watcher). Arriving here restarts both
+  # (the `timeout` of `awaiting_human_review`'s watcher). Arriving here restarts all three
   # loop guards' counts (§5.3), whichever of those brought the task here,
   # so a human resuming from this stage always hands the loop a fresh
   # budget. `capture: text` keeps the human's reply so `revising` can see
@@ -131,6 +131,12 @@ stages:
       green: awaiting_human_review
       red: revising
       timeout: awaiting_human_review
+    # CI that keeps failing while `internal_review` keeps approving would
+    # otherwise loop forever, one paid coder lap and one paid reviewer lap
+    # per round. The guard parks the task at `escalate_to_human` on the 4th
+    # red in a row. A green result or a timeout resets the count, and both
+    # go to `awaiting_human_review`, where a human has to act.
+    loop_guard: { on: red, max: 3, then: escalate_to_human }
 
   # This stage waits on a person, who answers either on the PR (read by
   # the watcher below) or with `choco task send`. A choco reply is read

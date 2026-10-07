@@ -1016,9 +1016,9 @@ async fn loop_guard_count_does_not_reset_when_the_guarded_stage_is_entered_from_
 
     // start -> review, then one round trip through coding back into
     // review — a different prior stage than last time review was
-    // entered. Under #106's rule that no longer matters: only landing
-    // on the guard's `then:` (here, "escalate") resets the count, and
-    // neither "review" nor "coding" is that stage.
+    // entered. Which stage it came from does not matter: the count only
+    // resets when review resolves with another outcome or the task lands
+    // on the guard's `then:` (here, "escalate"), and neither happened.
     engine.advance(&task_id, &def, "go").await.unwrap();
     engine
         .advance(&task_id, &def, "changes_requested")
@@ -1167,14 +1167,13 @@ async fn loop_guard_still_trips_when_the_guarded_stage_has_only_one_entry_stage(
     assert_eq!(state.current_stage, "escalate");
 }
 
-/// #106, item 6 (must fail on main): the escalation stage can also be
-/// reached from a cause unrelated to the guard (here, `pr`'s `error`
-/// outcome — standing in for `open_pr` failing). Resuming from there
-/// must still hand the guard a fresh budget: under the old
-/// entry-based reset, arriving at `escalate` from `pr` never touched
-/// `review`'s counter (only stages that themselves have a
-/// `loop_guard` were tracked), so the count carried over and the loop
-/// tripped on the 2nd CR after resuming, not the 4th.
+/// #106, item 6: the escalation stage can also be reached from a cause
+/// unrelated to the guard (here, `revising`'s `error` outcome). Resuming
+/// from there must still hand the guard a fresh budget: arriving at
+/// `escalate` clears `review`'s counter. An approval also resets the
+/// count now, so this test reaches `escalate` by a route that doesn't
+/// pass through one; otherwise it would no longer prove the reset on
+/// arrival.
 #[tokio::test]
 async fn a_guard_gets_a_fresh_budget_after_resuming_from_an_escalation_with_another_cause() {
     let pool = connect_in_memory().await.unwrap();
@@ -1186,7 +1185,7 @@ stages:
     on: { resumed: review }
   revising:
     kind: human_gate
-    on: { resumed: review }
+    on: { resumed: review, error: escalate }
   review:
     kind: human_gate
     on:
@@ -1209,19 +1208,23 @@ stages:
 
     engine.advance(&task_id, &def, "resumed").await.unwrap(); // coding -> review
 
-    // 3 CRs, staying under the guard.
-    for _ in 0..3 {
+    // 3 CRs, staying under the guard; the task ends in `revising`.
+    for i in 0..3 {
         engine
             .advance(&task_id, &def, "changes_requested")
             .await
             .unwrap(); // review -> revising
-        engine.advance(&task_id, &def, "resumed").await.unwrap(); // revising -> review
+        if i < 2 {
+            engine.advance(&task_id, &def, "resumed").await.unwrap(); // revising -> review
+        }
     }
 
-    engine.advance(&task_id, &def, "approved").await.unwrap(); // review -> pr
-    engine.advance(&task_id, &def, "error").await.unwrap(); // pr -> escalate
+    // Escalate from `revising` (review's count still 3), not through an
+    // approval, which would reset the count by itself.
+    engine.advance(&task_id, &def, "error").await.unwrap(); // revising -> escalate
     let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
     assert_eq!(state.current_stage, "escalate");
+    assert!(state.loop_counters.get("review").is_none());
 
     engine.advance(&task_id, &def, "resumed").await.unwrap(); // escalate -> revising
     engine.advance(&task_id, &def, "resumed").await.unwrap(); // revising -> review
@@ -1256,15 +1259,15 @@ name: three-guards
 stages:
   g1:
     kind: human_gate
-    on: { loop: g1, next: g2 }
+    on: { loop: g2, next: g2 }
     loop_guard: { on: loop, max: 1, then: escalate }
   g2:
     kind: human_gate
-    on: { loop: g2, next: g3 }
+    on: { loop: g3, next: g3 }
     loop_guard: { on: loop, max: 5, then: escalate }
   g3:
     kind: human_gate
-    on: { loop: g3, next: g1 }
+    on: { loop: g1, next: g1 }
     loop_guard: { on: loop, max: 5, then: elsewhere }
   escalate:
     kind: terminal
@@ -1276,12 +1279,10 @@ stages:
     let engine = engine_with_adapter(pool.clone(), "unused");
     engine.start_task(&task_id, &def, None).await.unwrap();
 
-    engine.advance(&task_id, &def, "loop").await.unwrap(); // g1, count 1 (not tripped)
-    engine.advance(&task_id, &def, "next").await.unwrap(); // -> g2
-    engine.advance(&task_id, &def, "loop").await.unwrap(); // g2, count 1
-    engine.advance(&task_id, &def, "next").await.unwrap(); // -> g3
-    engine.advance(&task_id, &def, "loop").await.unwrap(); // g3, count 1
-    engine.advance(&task_id, &def, "next").await.unwrap(); // -> g1
+    // Each stage leaves through its guarded outcome, so no count resets.
+    engine.advance(&task_id, &def, "loop").await.unwrap(); // g1, count 1 -> g2
+    engine.advance(&task_id, &def, "loop").await.unwrap(); // g2, count 1 -> g3
+    engine.advance(&task_id, &def, "loop").await.unwrap(); // g3, count 1 -> g1
 
     let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
     assert_eq!(
@@ -1376,7 +1377,7 @@ name: retry-at-guard-then
 stages:
   other:
     kind: human_gate
-    on: {{ loop: other, next: review }}
+    on: {{ loop: review, next: review }}
     loop_guard: {{ on: loop, max: 5, then: other_escalate }}
   review:
     kind: human_gate
@@ -1404,8 +1405,7 @@ stages:
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
     engine.start_task(&task_id, &def, None).await.unwrap(); // -> other
 
-    engine.advance(&task_id, &def, "loop").await.unwrap(); // other, count 1
-    engine.advance(&task_id, &def, "next").await.unwrap(); // -> review
+    engine.advance(&task_id, &def, "loop").await.unwrap(); // other, count 1 -> review
     engine
         .advance(&task_id, &def, "changes_requested")
         .await
@@ -13685,4 +13685,288 @@ fn the_conflict_message_lists_two_markers_with_both_and_three_with_commas() {
         needs.to_string(),
         "stage 'gate' reads its verdict from your reply: put /request-changes or /approve alone on its own line. Nothing was sent."
     );
+}
+
+// ---- Consecutive-rejection loop guards (#184) ----
+
+/// `coding-task`'s shape with every stage a `human_gate`, so `advance`
+/// drives it without spawning anything.
+fn coding_task_shape_def() -> Arc<WorkflowDefinition> {
+    let yaml = r#"
+name: coding-task-shape
+stages:
+  coding:
+    kind: human_gate
+    on: { resumed: internal_review }
+  revising:
+    kind: human_gate
+    on: { resumed: internal_review }
+  internal_review:
+    kind: human_gate
+    on: { approved: open_pr, changes_requested: revising }
+    loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+  open_pr:
+    kind: human_gate
+    on: { done: checks_polling, error: escalate_to_human }
+  checks_polling:
+    kind: human_gate
+    on: { green: awaiting_human_review, red: revising, timeout: awaiting_human_review }
+    loop_guard: { on: red, max: 3, then: escalate_to_human }
+  awaiting_human_review:
+    kind: human_gate
+    on: { approved: done, changes_requested: revising, timeout: escalate_to_human }
+    loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+  escalate_to_human:
+    kind: human_gate
+    on: { resumed: revising }
+  done:
+    kind: terminal
+"#;
+    Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap())
+}
+
+async fn shape_task() -> (
+    SqlitePool,
+    Arc<WorkflowDefinition>,
+    Arc<WorkflowEngine>,
+    String,
+) {
+    let pool = connect_in_memory().await.unwrap();
+    let def = coding_task_shape_def();
+    let task_id = seed_task(&pool, &def.name).await;
+    let engine = engine_with_adapter(pool.clone(), "unused");
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    (pool, def, engine, task_id)
+}
+
+async fn go(
+    engine: &Arc<WorkflowEngine>,
+    task_id: &str,
+    def: &Arc<WorkflowDefinition>,
+    outcomes: &[&str],
+) {
+    for outcome in outcomes {
+        engine.advance(task_id, def, outcome).await.unwrap();
+    }
+}
+
+async fn counters(pool: &SqlitePool, task_id: &str) -> (String, Value) {
+    let state = workflow_state::get(pool, task_id).await.unwrap().unwrap();
+    (state.current_stage, state.loop_counters)
+}
+
+/// The #172 sequence: two internal rejections, an approval, a human
+/// `/request-changes`, then two more rejections stay in the loop.
+#[tokio::test]
+async fn internal_rejections_do_not_carry_across_a_human_review_round() {
+    let (pool, def, engine, id) = shape_task().await;
+    go(&engine, &id, &def, &["resumed"]).await;
+    go(
+        &engine,
+        &id,
+        &def,
+        &[
+            "changes_requested",
+            "resumed",
+            "changes_requested",
+            "resumed",
+        ],
+    )
+    .await;
+    let (_, c) = counters(&pool, &id).await;
+    assert_eq!(c["internal_review"], json!({ "count": 2 }));
+
+    go(&engine, &id, &def, &["approved"]).await;
+    let (stage, c) = counters(&pool, &id).await;
+    assert_eq!(stage, "open_pr");
+    assert!(c.get("internal_review").is_none());
+
+    go(&engine, &id, &def, &["done", "green", "changes_requested"]).await;
+    let (stage, c) = counters(&pool, &id).await;
+    assert_eq!(stage, "revising");
+    assert_eq!(c["awaiting_human_review"], json!({ "count": 1 }));
+
+    go(
+        &engine,
+        &id,
+        &def,
+        &[
+            "resumed",
+            "changes_requested",
+            "resumed",
+            "changes_requested",
+            "resumed",
+        ],
+    )
+    .await;
+    let (stage, c) = counters(&pool, &id).await;
+    assert_eq!(stage, "internal_review");
+    assert_eq!(c["internal_review"], json!({ "count": 2 }));
+
+    let trail: Vec<String> = stage_trail(&pool, &id)
+        .await
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert!(!trail.iter().any(|s| s == "escalate_to_human"));
+    assert_eq!(
+        trail,
+        [
+            "coding",
+            "internal_review",
+            "revising",
+            "internal_review",
+            "revising",
+            "internal_review",
+            "open_pr",
+            "checks_polling",
+            "awaiting_human_review",
+            "revising",
+            "internal_review",
+            "revising",
+            "internal_review",
+            "revising",
+            "internal_review",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn four_internal_rejections_in_a_row_still_escalate() {
+    let (pool, def, engine, id) = shape_task().await;
+    go(&engine, &id, &def, &["resumed"]).await;
+    for n in 1..=3u64 {
+        go(&engine, &id, &def, &["changes_requested"]).await;
+        let (stage, c) = counters(&pool, &id).await;
+        assert_eq!(stage, "revising");
+        assert_eq!(c["internal_review"], json!({ "count": n }));
+        go(&engine, &id, &def, &["resumed"]).await;
+    }
+    go(&engine, &id, &def, &["changes_requested"]).await;
+    let (stage, c) = counters(&pool, &id).await;
+    assert_eq!(stage, "escalate_to_human");
+    assert!(c.get("internal_review").is_none());
+    let trail = stage_trail(&pool, &id).await;
+    assert_eq!(
+        trail.last().unwrap(),
+        &("escalate_to_human".to_string(), json!("changes_requested"))
+    );
+}
+
+#[tokio::test]
+async fn four_red_ci_results_in_a_row_escalate() {
+    let (pool, def, engine, id) = shape_task().await;
+    go(&engine, &id, &def, &["resumed", "approved", "done"]).await;
+    for n in 1..=3u64 {
+        go(&engine, &id, &def, &["red"]).await;
+        let (stage, c) = counters(&pool, &id).await;
+        assert_eq!(stage, "revising");
+        assert_eq!(c["checks_polling"], json!({ "count": n }));
+        go(&engine, &id, &def, &["resumed", "approved", "done"]).await;
+    }
+    go(&engine, &id, &def, &["red"]).await;
+    let (stage, c) = counters(&pool, &id).await;
+    assert_eq!(stage, "escalate_to_human");
+    assert!(c.get("checks_polling").is_none());
+    let trail = stage_trail(&pool, &id).await;
+    assert_eq!(
+        trail.last().unwrap(),
+        &("escalate_to_human".to_string(), json!("red"))
+    );
+}
+
+#[tokio::test]
+async fn a_green_ci_result_resets_the_red_count() {
+    let (pool, def, engine, id) = shape_task().await;
+    go(&engine, &id, &def, &["resumed", "approved", "done"]).await;
+    for _ in 0..2 {
+        go(&engine, &id, &def, &["red", "resumed", "approved", "done"]).await;
+    }
+    go(&engine, &id, &def, &["green"]).await;
+    let (stage, c) = counters(&pool, &id).await;
+    assert_eq!(stage, "awaiting_human_review");
+    assert!(c.get("checks_polling").is_none());
+
+    go(
+        &engine,
+        &id,
+        &def,
+        &[
+            "changes_requested",
+            "resumed",
+            "approved",
+            "done",
+            "red",
+            "resumed",
+            "approved",
+            "done",
+            "red",
+        ],
+    )
+    .await;
+    let (stage, c) = counters(&pool, &id).await;
+    assert_eq!(stage, "revising");
+    assert_eq!(c["checks_polling"], json!({ "count": 2 }));
+    let trail = stage_trail(&pool, &id).await;
+    assert!(!trail.iter().any(|(s, _)| s == "escalate_to_human"));
+}
+
+/// The reset is part of the transition's one write: a single read sees
+/// the new stage, the removed counter and the arrival together.
+#[tokio::test]
+async fn the_reset_rides_in_the_transitions_single_write() {
+    let (pool, def, engine, id) = shape_task().await;
+    go(
+        &engine,
+        &id,
+        &def,
+        &[
+            "resumed",
+            "changes_requested",
+            "resumed",
+            "changes_requested",
+            "resumed",
+        ],
+    )
+    .await;
+    let (_, c) = counters(&pool, &id).await;
+    assert_eq!(c["internal_review"], json!({ "count": 2 }));
+    let before = stage_trail(&pool, &id).await.len();
+
+    engine.advance(&id, &def, "approved").await.unwrap();
+    let state = workflow_state::get(&pool, &id).await.unwrap().unwrap();
+    assert_eq!(state.current_stage, "open_pr");
+    assert!(state.loop_counters.get("internal_review").is_none());
+    assert_eq!(
+        state.payload["arrival"],
+        json!({ "from": "internal_review", "outcome": "approved" })
+    );
+    assert_eq!(stage_trail(&pool, &id).await.len(), before + 1);
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_resets_nothing() {
+    let (pool, def, engine, id) = shape_task().await;
+    go(
+        &engine,
+        &id,
+        &def,
+        &[
+            "resumed",
+            "changes_requested",
+            "resumed",
+            "changes_requested",
+            "resumed",
+        ],
+    )
+    .await;
+    let err = engine.advance(&id, &def, "bogus").await.unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::UnknownOutcome { stage, outcome }
+            if stage == "internal_review" && outcome == "bogus"
+    ));
+    let (stage, c) = counters(&pool, &id).await;
+    assert_eq!(stage, "internal_review");
+    assert_eq!(c["internal_review"], json!({ "count": 2 }));
 }
