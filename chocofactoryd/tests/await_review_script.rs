@@ -54,6 +54,8 @@ api)
         n=$((n+1))
         echo "$n" > "$DIR/$2"
         [ -e "$DIR/$3-$n" ] && { echo "fake gh: $3 failed" >&2; exit 1; }
+        # empty-<switch>-<n>: succeed with nothing (the item went away).
+        [ -e "$DIR/empty-$3-$n" ] && exit 0
         # Like gh: only the first page unless --paginate is given.
         found=0
         for page in "$DIR"/$1-*.json; do
@@ -1298,4 +1300,23 @@ fn the_script_agrees_with_the_marker_table_for_review_bodies() {
             case.body
         );
     }
+}
+
+/// A review dismissed between the id list and its header call prints nothing:
+/// it is skipped with its inline comments, and that is not an error.
+#[test]
+fn a_review_that_stops_qualifying_mid_run_is_skipped_with_its_inline_comments() {
+    let fx = review_fixture(
+        &[owner_comment(FRESH, "/request-changes")],
+        &[rev("COMMENTED", FRESH, "")],
+        &[Inline::at_line(11, "a.rs", 1, "GONE-INLINE")],
+    );
+    fs::write(fx.dir.join("empty-fail-reviews-3"), "").unwrap();
+    let out = fx.run();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.starts_with("REQUEST_CHANGES\n\n"), "{stdout}");
+    assert!(!stdout.contains("review COMMENTED"), "{stdout}");
+    assert!(!stdout.contains("GONE-INLINE"), "{stdout}");
+    assert!(!fx.calls().contains("pulls/7/comments"));
 }
