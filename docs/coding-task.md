@@ -107,8 +107,9 @@ Reviews follow these rules:
   to request changes. A comment votes at the later of its creation and its
   last edit, so editing an older marker comment makes it the newest vote.
 - **Inline comments go with their review.** An inline comment is handed over
-  whenever its review qualifies, whatever its own date, and never when its
-  review does not.
+  when its review qualifies and its own author passes the same author check
+  (an owner, member or collaborator, and not a bot), whatever its own date,
+  and never when its review does not qualify.
 - **Editing is limited.** A review has no edited time, so editing its body or
   its inline comments counts only while the review is still newer than the
   head commit. After a push, post a new comment or review.
