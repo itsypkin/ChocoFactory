@@ -41,6 +41,13 @@ moves the task on, into `revising`.
 - If the PR is already good, merge it and then `choco task cancel <id>`.
   Don't send a note after merging by hand: the next `open_pr` would open a
   fresh PR.
+- After 4 red CI results in a row, name the failing check and what it says
+  in the note, or fix CI by hand first.
+- After a CI timeout, or a cancelled, startup-failure or action-required
+  check, fix or re-run CI on GitHub. Once it is green, either merge the PR
+  and cancel the task, or send a note saying CI is green and no code change
+  is needed. The note still costs a coder lap and a review lap, because
+  resuming always goes through `revising`.
 - The note is templated into the coder's prompt verbatim. Make it
   self-contained: list every item in full.
 - On every lap where the branch has an open PR, `open_pr` force-pushes with
@@ -65,7 +72,7 @@ earlier summary instead of your comment. Work in this order:
 1. **Let the next `internal_review` run.** It re-reads the PR's comments. If
    it rejects and names your items, they reach the coder through the
    reviewer's summary, which the coder does follow.
-2. **If that rejection escalates the task**, paste every item in full into
+2. **If `internal_review` keeps rejecting and the task escalates**, paste every item in full into
    the note: `choco task send <id> --text "..."`. A note that only points at
    the PR ("same issues", "read the PR") doesn't work: the coder may never
    open the PR, even when told to.

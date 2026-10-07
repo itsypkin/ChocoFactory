@@ -641,7 +641,12 @@ If no verdict arrives within six hours the task stops waiting and parks at
 it the same way instead of looping, and resuming from there starts the
 count over. `internal_review` parks the task there on its 4th rejection in a
 row (an approval starts its count over), and `checks_polling` does the same
-on the 4th red CI result in a row (green or a timeout starts it over).
+on the 4th red CI result in a row (any other outcome starts it over).
+`checks_polling` polls every 30 seconds for up to 30 minutes: a timeout, and
+a cancelled, startup-failure or action-required check (`ci_cancelled`,
+`ci_startup_failure`, `ci_action_required`), park the task at
+`escalate_to_human`. Green (every check passed or was skipped) and
+`no_checks` (no check reported for 3 minutes) go to `awaiting_human_review`.
 
 The PR body `open_pr` publishes holds the coder's description and the
 internal reviewer's report. A closing keyword followed by an issue reference

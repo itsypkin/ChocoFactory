@@ -92,6 +92,10 @@ const BUILTIN_WORKFLOW_SCRIPTS: &[(&str, &str)] = &[
         "await-review.sh",
         include_str!("../../workflows/scripts/await-review.sh"),
     ),
+    (
+        "ci-checks.sh",
+        include_str!("../../workflows/scripts/ci-checks.sh"),
+    ),
 ];
 
 /// What [`seed_builtin_workflows`] actually did — which files it wrote for
@@ -1512,6 +1516,132 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect()
+    }
+
+    /// The seeded `checks_polling` stage, pinned field by field.
+    #[test]
+    fn the_seeded_checks_polling_stage_is_pinned() {
+        use crate::workflow_def::{ShellCommand, StageKind};
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        for file in ["coding-task.yaml", "coding-task-planned.yaml"] {
+            let def = load_seeded(&dir, file);
+            let stage = &def.stages["checks_polling"];
+            let StageKind::Poll { watch, .. } = &stage.kind else {
+                panic!("checks_polling must be a poll");
+            };
+            match &watch.command {
+                ShellCommand::ScriptFile(path) => {
+                    assert!(path.ends_with("scripts/ci-checks.sh"), "{path:?}")
+                }
+                other => panic!("expected a script file, got {other:?}"),
+            }
+            let env: Vec<(&str, &str)> = watch
+                .env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            assert_eq!(env, [("PR_NUMBER", "{{ stages.open_pr.number }}")]);
+            assert_eq!(watch.interval, std::time::Duration::from_secs(30));
+            assert_eq!(watch.timeout, Some(std::time::Duration::from_secs(30 * 60)));
+            let outcomes: Vec<(&str, &str)> = watch
+                .outcomes
+                .iter()
+                .map(|o| (o.pattern.as_str(), o.then.as_str()))
+                .collect();
+            assert_eq!(
+                outcomes,
+                [
+                    (r"\ARED(\n|$)", "red"),
+                    (r"\ASTARTUP_FAILURE(\n|$)", "ci_startup_failure"),
+                    (r"\AACTION_REQUIRED(\n|$)", "ci_action_required"),
+                    (r"\ACANCELLED(\n|$)", "ci_cancelled"),
+                    (r"\AGREEN(\n|$)", "green"),
+                    (r"\ANO_CHECKS(\n|$)", "no_checks"),
+                ]
+            );
+            assert_eq!(
+                on_map(stage),
+                [
+                    ("green", "awaiting_human_review"),
+                    ("no_checks", "awaiting_human_review"),
+                    ("red", "revising"),
+                    ("ci_startup_failure", "escalate_to_human"),
+                    ("ci_action_required", "escalate_to_human"),
+                    ("ci_cancelled", "escalate_to_human"),
+                    ("timeout", "escalate_to_human"),
+                ]
+            );
+            let guard = stage.loop_guard.as_ref().expect("loop guard");
+            assert_eq!(
+                (guard.on.as_str(), guard.max, guard.then.as_str()),
+                ("red", 3, "escalate_to_human")
+            );
+        }
+    }
+
+    /// The shared CI case table's first lines, through the seeded stage's
+    /// real outcome matching and `on:` map.
+    #[test]
+    fn the_seeded_ci_outcomes_match_the_shared_case_table() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            first_line: String,
+            outcome: Option<String>,
+        }
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let def = load_seeded(&dir, "coding-task.yaml");
+        let stage = &def.stages["checks_polling"];
+        let crate::workflow_def::StageKind::Poll { watch, .. } = &stage.kind else {
+            panic!("checks_polling must be a poll");
+        };
+        let compiled = crate::poll::compile(&watch.outcomes).unwrap();
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/ci-checks-cases.json")).unwrap();
+        assert!(cases.len() >= 20);
+        for case in cases {
+            // The script prints the token, a blank line, then check lines.
+            let stdout = format!("{}\n\nSUCCESS job-0\n", case.first_line);
+            let matched = compiled.matching(&stdout).map(|m| m.then.to_string());
+            assert_eq!(matched, case.outcome, "case '{}'", case.name);
+            if let Some(outcome) = matched {
+                let expected = match outcome.as_str() {
+                    "green" | "no_checks" => "awaiting_human_review",
+                    "red" => "revising",
+                    _ => "escalate_to_human",
+                };
+                assert_eq!(
+                    stage.on.get(&outcome).map(|t| t.to_string()).as_deref(),
+                    Some(expected),
+                    "case '{}'",
+                    case.name
+                );
+            }
+        }
+        // A token must be the whole first line: a check name cannot select one.
+        assert!(compiled.matching("PENDING\n\nFAILURE_x RED\n").is_none());
+        assert!(compiled.matching("REDDISH\n").is_none());
+    }
+
+    #[test]
+    fn the_seeded_ci_checks_script_equals_the_embedded_one() {
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let embedded = BUILTIN_WORKFLOW_SCRIPTS
+            .iter()
+            .find(|(name, _)| *name == "ci-checks.sh")
+            .expect("ci-checks.sh is embedded")
+            .1;
+        assert_eq!(
+            std::fs::read_to_string(dir.path.join("scripts/ci-checks.sh")).unwrap(),
+            embedded
+        );
+        assert_eq!(
+            mode_of(&dir.path.join("scripts/ci-checks.sh")) & 0o111,
+            0o111
+        );
     }
 
     /// `coding-task-planned` (#120): the seeded workflow loads and has the

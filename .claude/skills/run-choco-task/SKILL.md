@@ -26,7 +26,9 @@ post `/request-changes`, or someone resumes the task from `escalate_to_human`.
 A task parks at `escalate_to_human` after a 4th rejection in a row by
 `internal_review`, a 4th red CI result in a row from `checks_polling`, a 4th
 `/request-changes` from you since the last escalation (each counted
-separately), after 6 hours with no verdict from you, or when `open_pr` fails.
+separately), after 6 hours with no verdict from you, when CI has not
+finished in 30 minutes, when a check is cancelled, failed to start or needs
+an action (approval) before it can run, or when `open_pr` fails.
 
 Copy this checklist and tick it off:
 
@@ -234,9 +236,10 @@ an independent reviewer do it, and look for what agents systematically miss:
 
 - **Does the branch still merge into your default branch?** GitHub runs no
   `pull_request` workflows on a conflicting PR, so its checks stay empty.
-- **Did CI actually pass?** `checks_polling` lets a PR with no checks,
-  skipped checks or slow CI through to you as if it were green. Run
-  `gh pr checks <n>`.
+- **Did CI actually pass?** Green from `checks_polling` means every check
+  passed or was skipped. A task that arrives through `no_checks` means no CI
+  ran on the PR (a repo without CI, or a PR GitHub runs no workflows on).
+  Either way, run `gh pr checks <n>`.
 - **Tests for the new branches**, not only the ones the spec listed. Break
   the main fix in a scratch copy and confirm a test fails.
 - **Claims are not evidence.** Code comments ("deliberately untested"),

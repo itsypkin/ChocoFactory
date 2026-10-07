@@ -88,7 +88,10 @@ stages:
 
   # Reached because any of the three loop guards trips (`internal_review`'s,
   # `checks_polling`'s or `awaiting_human_review`'s), because `open_pr` itself failed (see
-  # below), or because no human review arrives within 6h
+  # below), because CI has not finished within 30 minutes (the `timeout` of
+  # `checks_polling`) or has a cancelled, startup-failure or action-required
+  # check (`ci_cancelled`, `ci_startup_failure`, `ci_action_required`), or
+  # because no human review arrives within 6h
   # (the `timeout` of `awaiting_human_review`'s watcher). Arriving here restarts all three
   # loop guards' counts (§5.3), whichever of those brought the task here,
   # so a human resuming from this stage always hands the loop a fresh
@@ -117,25 +120,43 @@ stages:
     timeout: 5m
     on: { done: checks_polling, error: escalate_to_human }
 
+  # `scripts/ci-checks.sh` reads the PR's checks and prints one token per
+  # result (rules in its header). A real failure is `red` and goes back to
+  # the coder; a cancelled, startup-failure or action-required check, and
+  # 30 minutes without a result, need a person and escalate; a PR with no
+  # checks at all reaches review as `no_checks` after 3 minutes.
   checks_polling:
     kind: poll
-    command: "gh pr checks {{ stages.open_pr.number }} --json state -q '.[].state' | sort -u"
+    script_file: scripts/ci-checks.sh
+    env:
+      PR_NUMBER: "{{ stages.open_pr.number }}"
     interval: 30s
-    timeout: 5m
+    timeout: 30m
     outcomes:
-      - match: "^SUCCESS$"
-        then: green
-      - match: "FAILURE|ERROR"
+      - match: '\ARED(\n|$)'
         then: red
+      - match: '\ASTARTUP_FAILURE(\n|$)'
+        then: ci_startup_failure
+      - match: '\AACTION_REQUIRED(\n|$)'
+        then: ci_action_required
+      - match: '\ACANCELLED(\n|$)'
+        then: ci_cancelled
+      - match: '\AGREEN(\n|$)'
+        then: green
+      - match: '\ANO_CHECKS(\n|$)'
+        then: no_checks
     on:
       green: awaiting_human_review
+      no_checks: awaiting_human_review
       red: revising
-      timeout: awaiting_human_review
+      ci_startup_failure: escalate_to_human
+      ci_action_required: escalate_to_human
+      ci_cancelled: escalate_to_human
+      timeout: escalate_to_human
     # CI that keeps failing while `internal_review` keeps approving would
     # otherwise loop forever, one paid coder lap and one paid reviewer lap
     # per round. The guard parks the task at `escalate_to_human` on the 4th
-    # red in a row. A green result or a timeout resets the count, and both
-    # go to `awaiting_human_review`, where a human has to act.
+    # red in a row. Any other outcome resets the count.
     loop_guard: { on: red, max: 3, then: escalate_to_human }
 
   # This stage waits on a person, who answers either on the PR (read by

@@ -1092,11 +1092,17 @@ case "$1" in
                     # `open_pr`'s body read-back (`-t`), not the verdict poll.
                     echo "0000000000000000000000000000000000000000"
                 else
-                    printf '{{"headRefOid":"0000000000000000000000000000000000000000","state":"%s","mergedAt":%s}}' "$state" "$merged" | jq -r "$q"
+                    printf '{{"headRefOid":"0000000000000000000000000000000000000000","state":"%s","mergedAt":%s,"statusCheckRollup":[{{"state":"SUCCESS"}}]}}' "$state" "$merged" | jq -r "$q"
                 fi
                 ;;
             checks)
-                echo "SUCCESS"
+                # `checks_polling`: one SUCCESS check, `-q` applied like gh does.
+                q=""; prev=""
+                for a in "$@"; do
+                    if [ "$prev" = "-q" ]; then q=$a; fi
+                    prev=$a
+                done
+                echo '[{{"name":"build","state":"SUCCESS"}}]' | jq -r "$q"
                 ;;
             *)
                 echo "stub gh: unhandled pr subcommand: $*" >&2
