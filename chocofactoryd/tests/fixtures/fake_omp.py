@@ -28,6 +28,17 @@ wrapper script, never through the test process's own environment):
   side_calls the session statistics include FAKE_OMP_SIDE_TOKENS input
              tokens that no message carries
   no_ready   the process sleeps instead of speaking (never used for success)
+  unknown_tool  the turn first calls a host tool the daemon never registered
+                and reports the daemon's reply as assistant text
+  stray_result  a `prompt_result` for a prompt id nobody sent precedes the turn
+  exit_on_stats the process says one more thing and exits when the turn's
+                statistics are requested (stdout ends while the daemon waits)
+  unsettled_die `prompt_result` says the session is unsettled, then the
+                process exits without `session_settled`
+  state_error   `get_state` fails
+  tools_error   `set_host_tools` fails
+  v1_only       `ready` offers only protocol 1; negotiating kills the process
+  negotiate_error  `negotiate_protocol` fails (the session stays on v1)
 - FAKE_OMP_STATS_SEQ: comma list of `ok|error|garbled|silent`, one per
   `get_session_stats` call (the last repeats). Default `ok`.
 - FAKE_OMP_START_TOKENS: input tokens the session already has at start (a
@@ -102,6 +113,9 @@ def stats_mode():
 
 def handle_stats(request):
     mode = stats_mode()
+    if "exit_on_stats" in MODES and STATE.stats_calls > 1:
+        assistant([{"type": "text", "text": "late text"}])
+        sys.exit(0)
     if mode == "silent":
         return
     if mode == "error":
@@ -269,6 +283,21 @@ def run_prompt(request):
         sys.stdout.write("this is not json\n")
         emit({"type": "totally_unknown_frame", "n": 1})
         sys.stdout.flush()
+    if "stray_result" in MODES:
+        emit({"type": "prompt_result", "id": "nobody-sent-this", "agentInvoked": True,
+              "status": "completed", "sessionSettled": True})
+    if "unknown_tool" in MODES:
+        emit({"type": "host_tool_call", "id": "htc-unknown", "toolCallId": "call-unknown",
+              "toolName": "mystery", "arguments": {}})
+        while True:
+            frame = read_frame()
+            if frame is None:
+                sys.exit(0)
+            if frame.get("type") == "host_tool_result":
+                assistant([{"type": "text",
+                            "text": "unknown-tool-reply:" + json.dumps(frame)}])
+                break
+            dispatch(frame)
     if "bad_chunk" in MODES:
         emit({"type": "rpc_chunk", "chunkId": "bad", "index": 3, "count": 9,
               "byteLength": 5, "data": "AAAA"})
@@ -310,6 +339,8 @@ def run_prompt(request):
         return
     emit({"type": "prompt_result", "id": request.get("id"), "agentInvoked": True,
           "status": "completed", "sessionSettled": not unsettled})
+    if "unsettled_die" in MODES:
+        sys.exit(0)
     if unsettled:
         time.sleep(0.3)
         emit({"type": "session_settled"})
@@ -318,15 +349,26 @@ def run_prompt(request):
 def dispatch(request):
     kind = request.get("type")
     if kind == "negotiate_protocol":
+        if "v1_only" in MODES:
+            sys.exit(9)
+        if "negotiate_error" in MODES:
+            respond(request, success=False, error="no v2 today")
+            return
         STATE.v2 = request.get("protocolVersion") == 2
         respond(request, data={"protocolVersion": 2})
     elif kind == "set_event_filter":
         respond(request, data={"events": request.get("events"),
                                "messageUpdates": request.get("messageUpdates")})
     elif kind == "set_host_tools":
+        if "tools_error" in MODES:
+            respond(request, success=False, error="cannot register tools")
+            return
         names = [tool["name"] for tool in request.get("tools", [])]
         respond(request, data={"toolNames": names})
     elif kind == "get_state":
+        if "state_error" in MODES:
+            respond(request, success=False, error="state unavailable")
+            return
         respond(
             request,
             data={
@@ -357,7 +399,8 @@ def main():
     if "no_ready" in MODES:
         time.sleep(600)
         return
-    emit({"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": [1, 2],
+    emit({"type": "ready", "protocolVersion": 1,
+          "supportedProtocolVersions": [1] if "v1_only" in MODES else [1, 2],
           "maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864})
     while True:
         frame = read_frame()

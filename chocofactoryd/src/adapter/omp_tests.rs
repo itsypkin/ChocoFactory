@@ -481,6 +481,140 @@ async fn an_unsettled_session_completes_on_session_settled() {
 }
 
 #[tokio::test]
+async fn an_unknown_host_tool_is_answered_as_an_error() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unknown_tool")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    let reply = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::AssistantMessage { text } => text.strip_prefix("unknown-tool-reply:"),
+            _ => None,
+        })
+        .expect("the fake saw the daemon's reply");
+    let reply: Value = serde_json::from_str(reply).unwrap();
+    assert_eq!(reply["id"], "htc-unknown");
+    assert_eq!(reply["isError"], true);
+    assert_eq!(reply["result"]["isError"], true);
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "unknown host tool 'mystery'"
+    );
+    // It is not reported as a report_outcome call.
+    assert!(!events.iter().any(
+        |event| matches!(event, AgentEvent::ToolCall { tool, .. } if tool.contains("mystery"))
+    ));
+    drain(&mut handle).await;
+}
+
+#[tokio::test]
+async fn a_prompt_result_for_a_prompt_nobody_sent_completes_nothing() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,stray_result")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let mut events = until_turn_completed(&mut handle).await;
+    events.extend(drain(&mut handle).await);
+    let completed = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::TurnCompleted { .. }))
+        .count();
+    assert_eq!(completed, 1, "{events:?}");
+    // The stray result's figures were not spent on the real turn.
+    assert_eq!(usage_of(&events).model_turns, Some(2));
+}
+
+#[tokio::test]
+async fn stdout_ending_while_the_statistics_are_awaited_completes_the_turn_then_flushes() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,exit_on_stats")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let mut events = until_turn_completed(&mut handle).await;
+    assert_eq!(usage_of(&events).tokens, TokenCounts::default());
+    events.extend(drain(&mut handle).await);
+    let completed = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TurnCompleted { .. }))
+        .unwrap();
+    let late = events
+        .iter()
+        .position(|event| {
+            *event
+                == AgentEvent::AssistantMessage {
+                    text: "late text".to_string(),
+                }
+        })
+        .expect("the event produced while waiting is flushed, not lost");
+    assert!(late > completed, "buffered events follow the TurnCompleted");
+}
+
+#[tokio::test]
+async fn a_process_that_exits_before_the_session_settles_still_completes_the_finished_turn() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled_die")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCompleted {
+            is_error: false,
+            ..
+        })
+    ));
+    assert_eq!(usage_of(&events).tokens, TokenCounts::default());
+}
+
+#[tokio::test]
+async fn a_failed_get_state_or_set_host_tools_ends_the_session_with_an_error() {
+    for (mode, expected) in [
+        ("state_error", "get_state failed: state unavailable"),
+        (
+            "tools_error",
+            "set_host_tools failed: cannot register tools",
+        ),
+    ] {
+        let env = Env::new();
+        let adapter = env.adapter(&[("FAKE_OMP_MODES", mode)]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(30), handle.recv())
+            .await
+            .unwrap()
+        {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { message } if message == expected)),
+            "{mode}: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnCompleted { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn protocol_v2_is_only_negotiated_when_offered_and_a_failure_keeps_v1() {
+    for modes in ["noreport,v1_only", "noreport,chunked,negotiate_error"] {
+        let env = Env::new();
+        let adapter = env.adapter(&[("FAKE_OMP_MODES", modes)]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        let events = until_turn_completed(&mut handle).await;
+        assert!(
+            events.contains(&AgentEvent::AssistantMessage {
+                text: "echo:go|None".to_string()
+            }),
+            "{modes}: {events:?}"
+        );
+        drain(&mut handle).await;
+    }
+}
+
+#[tokio::test]
 async fn the_version_is_null_when_the_version_command_fails() {
     let env = Env::new();
     let adapter = env.adapter(&[
