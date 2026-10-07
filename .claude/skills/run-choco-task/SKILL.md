@@ -95,7 +95,8 @@ the pre-merge check in step 4.
   `(API-equivalent)` when every turn ran under a subscription login and
   `(estimated)` otherwise), tokens, wall and active time, and the same split
   by stage, role, lap and model. A figure the CLI did not report reads `no
-  data`, `cost unknown` or `?`, never zero. `choco --json task list` carries
+  data`, `cost unknown` or `?`, never zero, and a partial total says so
+  (`(N sessions without data)`, `(N turns without a cost)`). `choco --json task list` carries
   each task's total as `usage_total`, and the dashboard shows it in a `cost`
   column on wide terminals.
 - **A project with no repo** (`REPO -` in `choco project list`) always gets

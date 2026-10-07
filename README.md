@@ -750,7 +750,11 @@ what the same usage would cost on the API — and `(estimated)` otherwise (an AP
 key, a mix, or a CLI that does not say). Money has two decimals. A figure the
 CLI did not report prints `?` (tokens), `cost unknown` (cost) or `no data`;
 it is never counted as zero. The total line ends `(N sessions without data)` when
-sessions ended without reporting a turn, such as a killed one. A task from before
+sessions ended without reporting a turn, such as a killed one, and
+`(N turns without a cost)` when a turn reported tokens but no cost, so the total
+is a lower bound; the dashboard's detail row carries the same notes, and a
+list cell with such turns ends in `+`. A turn's tokens are the sum of its
+per-model figures when the CLI reports them, which includes sub-agent models. A task from before
 usage was recorded prints the single line `Cost & time  no data`.
 
 *Wall time* runs from creation to now while the task is open or stuck, and to its
