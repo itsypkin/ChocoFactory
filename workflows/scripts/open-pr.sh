@@ -356,7 +356,7 @@ else
 fi
 
 # GitHub caps a title at 256 characters, and a long one is unreadable in a
-# list: keep it to 100 bytes, preserving a trailing "(#N)".
+# list: keep it to 100 bytes at a word boundary, preserving a trailing "(#N)".
 TLEN=$(printf '%s' "$T" | wc -c | tr -d ' ')
 if [ "$TLEN" -gt 100 ]; then
     SUFFIX=""
@@ -366,6 +366,23 @@ if [ "$TLEN" -gt 100 ]; then
     BASE=${T%"$SUFFIX"}
     SLEN=$(printf '%s' "$SUFFIX" | wc -c | tr -d ' ')
     HEAD=$(printf '%s' "$BASE" | utf8_head "$((100 - 3 - SLEN))")
+    # A cut inside a word (REST continues without a space) goes back to the
+    # previous space, so the title ends at a whole word. One unbroken word
+    # keeps the byte cut.
+    REST=${BASE#"$HEAD"}
+    if [ -n "$REST" ]; then
+        case "$REST" in
+        " "*) ;;
+        *)
+            case "$HEAD" in
+            *" "*) HEAD=${HEAD% *} ;;
+            esac
+            ;;
+        esac
+    fi
+    while [ "${HEAD% }" != "$HEAD" ]; do
+        HEAD=${HEAD% }
+    done
     ELLIPSIS=$(printf '\342\200\246')
     T="$HEAD$ELLIPSIS$SUFFIX"
 fi
