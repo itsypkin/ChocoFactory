@@ -567,7 +567,7 @@ fn a_failure_not_in_the_record_is_red_without_another_rerun() {
     let fx = Fixture::new(&["FAILURE", "FAILURE"]);
     fs::write(fx.record_path(), format!("{HEAD}\n{}\n", link(L100, 0))).unwrap();
     let out = fx.ok();
-    assert_eq!(out, format!("RED\n\nFAILURE job-0\nFAILURE job-1\n"));
+    assert_eq!(out, "RED\n\nFAILURE job-0\nFAILURE job-1\n");
     assert!(fx.reruns().is_empty());
 }
 
