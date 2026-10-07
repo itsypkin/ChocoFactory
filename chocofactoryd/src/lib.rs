@@ -7,6 +7,8 @@ pub mod engine;
 pub mod fileref;
 pub mod global_config;
 pub mod poll;
+#[cfg(test)]
+pub(crate) mod recording_adapter;
 pub mod retention;
 pub mod role_config;
 pub mod serde_util;

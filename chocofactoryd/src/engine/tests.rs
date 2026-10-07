@@ -16,6 +16,7 @@ fn set_arrival_replaces_a_non_object_payload() {
 }
 use crate::adapter::{AgentAdapter, ClaudeAdapter, Registry};
 use crate::db::{connect_in_memory, projects, tasks};
+use crate::recording_adapter::{RecordedCall, RecordingAdapter};
 
 fn fixture_binary(name: &str) -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -6146,11 +6147,22 @@ async fn a_two_role_workflow_resolves_each_role_independently() {
     let global_config_path = write_global_config(&dir);
 
     let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
-    let engine = engine_with_global_config(
-        pool.clone(),
+    // Each role's global `cli` is a distinct adapter (every name a `cli:`
+    // can take is a registry key), so the rows and the recorded calls show
+    // which adapter each role actually ran on.
+    let coder_adapter = RecordingAdapter::new(
+        "coder-global-cli",
         &fixture_binary("fake_claude_echo_args.py"),
+    );
+    let reviewer_adapter = RecordingAdapter::new(
+        "reviewer-global-cli",
+        &fixture_binary("fake_claude_echo_args.py"),
+    );
+    let engine = engine_with_registry(
+        pool.clone(),
+        Registry::new(vec![coder_adapter.clone(), reviewer_adapter.clone()]),
         &workflows_dir,
-        &global_config_path,
+        Some(&global_config_path),
     );
 
     // Overrides for *both* roles at once — the task-level layer #17 is
@@ -6184,6 +6196,8 @@ async fn a_two_role_workflow_resolves_each_role_independently() {
     // `cli` came from the global layer, and each role got its *own* entry.
     assert_eq!(coder_run.cli_adapter, "coder-global-cli");
     assert_eq!(reviewer_run.cli_adapter, "reviewer-global-cli");
+    assert_eq!(coder_adapter.calls(), vec![RecordedCall::Start]);
+    assert_eq!(reviewer_adapter.calls(), vec![RecordedCall::Start]);
 
     // `model`: coder's task-level override beat the workflow-def's
     // `coder-def-model`; reviewer, unmentioned at the task level and
@@ -6962,11 +6976,10 @@ fn write_script(dir: &Path, name: &str, contents: &str) -> PathBuf {
 }
 
 /// A single fake `claude` binary standing in for *both* `coder` and
-/// `reviewer` — `engine_with_adapter` configures one binary for the
-/// whole engine (`ClaudeAdapter::spawn` always uses its own fixed
-/// `binary` field, never `RoleConfig.cli` — a role's `cli:` doesn't
-/// pick the executable), so distinguishing the two roles has to happen
-/// inside the script itself. `adapter/claude.rs::spawn` passes
+/// `reviewer` — both roles run on the one claude adapter, which has one
+/// fixed binary, so distinguishing the two roles *within* that adapter has
+/// to happen inside the script itself. (Which adapter a role runs on is
+/// picked by its `cli:`; see the dispatch tests for that.) `adapter/claude.rs::spawn` passes
 /// `--system-prompt <text>` whenever a role resolves one, and
 /// `coder-system.md`/`reviewer-system.md` open with distinct wording —
 /// the wrapper greps its own argv for that marker. Both roles need
@@ -14019,4 +14032,485 @@ async fn an_unknown_outcome_resets_nothing() {
     let (stage, c) = counters(&pool, &id).await;
     assert_eq!(stage, "internal_review");
     assert_eq!(c["internal_review"], json!({ "count": 2 }));
+}
+
+// ---- #166: a role's `cli:` picks the adapter; an unknown one is rejected ----
+
+/// Like [`engine_with_global_config`], over an arbitrary registry.
+fn engine_with_registry(
+    pool: SqlitePool,
+    registry: Registry,
+    workflows_dir: &Path,
+    global_config_path: Option<&Path>,
+) -> Arc<WorkflowEngine> {
+    let events_notify = Arc::new(Notify::new());
+    let session_manager = SessionManager::new(
+        pool.clone(),
+        registry,
+        chrono::Duration::hours(1),
+        Arc::clone(&events_notify),
+    );
+    WorkflowEngine::new(
+        pool,
+        session_manager,
+        workflows_dir.to_path_buf(),
+        global_config_path.map(Path::to_path_buf),
+        events_notify,
+    )
+}
+
+fn claude_only_registry() -> Registry {
+    Registry::single(Arc::new(ClaudeAdapter::with_binary(fixture_binary(
+        "fake_claude.py",
+    ))))
+}
+
+fn write_cli_workflow(dir: &Path, file: &str, cli_line: &str) -> PathBuf {
+    fs::write(dir.join("coder-turn.md"), "implement the thing").unwrap();
+    let path = dir.join(file);
+    fs::write(
+        &path,
+        format!(
+            "name: cli-flow\nroles:\n  coder:\n{cli_line}    model: sonnet\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    prompt_file: coder-turn.md\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+const UNKNOWN_CLUADE: &str =
+    "role 'coder' uses cli 'cluade', which this daemon doesn't know; known CLIs: claude";
+
+#[test]
+fn load_workflow_file_checks_every_roles_cli_against_the_registry() {
+    let dir = tempdir();
+    let registry = claude_only_registry();
+    let bad = write_cli_workflow(&dir, "bad.yaml", "    cli: cluade\n");
+    let err = load_workflow_file(&bad, &registry).unwrap_err();
+    assert!(matches!(err, WorkflowDefError::UnknownCli(_)), "{err:?}");
+    assert_eq!(err.to_string(), UNKNOWN_CLUADE);
+
+    let none = write_cli_workflow(&dir, "none.yaml", "");
+    assert!(load_workflow_file(&none, &registry).is_ok());
+    let claude = write_cli_workflow(&dir, "claude.yaml", "    cli: claude\n");
+    assert!(load_workflow_file(&claude, &registry).is_ok());
+
+    // The valid set is the registry's own keys.
+    let fake = RecordingAdapter::new("fake", &fixture_binary("fake_claude.py"));
+    let wide = Registry::new(vec![
+        Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"))),
+        fake,
+    ]);
+    let fake_flow = write_cli_workflow(&dir, "fake.yaml", "    cli: fake\n");
+    assert!(load_workflow_file(&fake_flow, &wide).is_ok());
+    assert!(load_workflow_file(&fake_flow, &registry).is_err());
+}
+
+#[test]
+fn every_builtin_workflow_loads_with_the_production_registry() {
+    let root = tempdir();
+    let dir = root.join(".builtin-workflows");
+    config_root::materialize_builtins(&dir).unwrap();
+    let registry = Registry::single(Arc::new(ClaudeAdapter::new()));
+    let mut seen = 0;
+    for entry in fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "yaml") {
+            load_workflow_file(&path, &registry)
+                .unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "no built-in workflows found in {}", dir.display());
+}
+
+#[tokio::test]
+async fn create_task_from_a_workflow_with_an_unknown_cli_creates_nothing() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let bad = write_cli_workflow(&dir, "bad.yaml", "    cli: cluade\n");
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let engine = engine_with_registry(pool.clone(), claude_only_registry(), &dir, None);
+    let err = engine
+        .create_task_from(&project_id, WorkflowRef::File(bad), "T", "go", json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CreateTaskError::WorkflowDef(WorkflowDefError::UnknownCli(_))
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), UNKNOWN_CLUADE);
+    let listed = tasks::list(&pool, Some(&project_id), None).await.unwrap();
+    assert!(listed.is_empty(), "{listed:?}");
+}
+
+#[tokio::test]
+async fn create_task_with_an_unknown_cli_in_its_config_creates_nothing() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let good = write_cli_workflow(&dir, "good.yaml", "    cli: claude\n");
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let engine = engine_with_registry(pool.clone(), claude_only_registry(), &dir, None);
+    let err = engine
+        .create_task_from(
+            &project_id,
+            WorkflowRef::File(good),
+            "T",
+            "go",
+            json!({"roles": {"coder": {"cli": "nope"}}}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CreateTaskError::UnknownCli(_)), "{err:?}");
+    assert!(err.to_string().contains("'nope'"));
+    let listed = tasks::list(&pool, Some(&project_id), None).await.unwrap();
+    assert!(listed.is_empty(), "{listed:?}");
+}
+
+#[tokio::test]
+async fn a_legacy_task_whose_workflow_has_an_unknown_cli_fails_to_load() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    write_cli_workflow(&dir, "cli-flow.yaml", "    cli: cluade\n");
+    let task_id = seed_task(&pool, "cli-flow").await;
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert!(task.workflow_path.is_none());
+    let engine = engine_with_registry(pool.clone(), claude_only_registry(), &dir, None);
+    let err = engine.load_task_workflow(&task).await.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            LoadTaskWorkflowError::WorkflowDef(WorkflowDefError::UnknownCli(_))
+        ),
+        "{err:?}"
+    );
+}
+
+/// The global config can change after the daemon started and validated it.
+/// The turn-time lookup is the backstop: the task goes stuck with the
+/// message, no session row exists, and nothing was spawned.
+#[tokio::test]
+async fn a_cli_that_slips_in_after_startup_fails_the_turn_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let flow = write_cli_workflow(&dir, "flow.yaml", "");
+    let global = dir.join("config.yaml");
+    fs::write(&global, "roles:\n  coder:\n    cli: bogus\n").unwrap();
+    let marker = dir.join("claude-was-run");
+    let wrapper = dir.join("claude-wrapper");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexec '{}' \"$@\"\n",
+            marker.display(),
+            fixture_binary("fake_claude.py")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let engine =
+        engine_with_global_config(pool.clone(), &wrapper.display().to_string(), &dir, &global);
+
+    let err = engine
+        .create_task_from(&project_id, WorkflowRef::File(flow), "T", "go", json!({}))
+        .await
+        .unwrap_err();
+    let task_id = match &err {
+        CreateTaskError::Start {
+            task_id,
+            source: EngineError::UnknownCli(_),
+        } => task_id.clone(),
+        other => panic!("expected Start/UnknownCli, got {other:?}"),
+    };
+    let check = |pool: SqlitePool, task_id: String| {
+        let marker = marker.clone();
+        async move {
+            let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+            assert_eq!(task.status, "stuck");
+            let reason = task.stuck_reason.unwrap();
+            assert!(reason.contains("'bogus'"), "{reason}");
+            assert!(reason.contains("known CLIs: claude"), "{reason}");
+            assert!(
+                sessions::list_for_task(&pool, &task_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!marker.exists(), "claude must not have been spawned");
+        }
+    };
+    check(pool.clone(), task_id.clone()).await;
+
+    let err = engine
+        .retry_task(&task_id, RetryMode::Auto)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RetryTaskError::Enter(EngineError::UnknownCli(_))),
+        "{err:?}"
+    );
+    check(pool.clone(), task_id).await;
+}
+
+fn two_adapter_registry(binary: &str) -> (Registry, Arc<RecordingAdapter>, Arc<RecordingAdapter>) {
+    let claude = RecordingAdapter::new("claude", binary);
+    let fake = RecordingAdapter::new("fake", binary);
+    (
+        Registry::new(vec![claude.clone(), fake.clone()]),
+        claude,
+        fake,
+    )
+}
+
+/// A task stuck at `coding` after an interrupted turn recorded on
+/// `recorded_cli`, whose coder now resolves to `current_cli` (task config).
+async fn stuck_after_session_on(
+    pool: &SqlitePool,
+    dir: &Path,
+    recorded_cli: &str,
+    current_cli: &str,
+) -> (String, Session) {
+    let def = coding_workflow(dir);
+    let task_id = seed_task(pool, &def.name).await;
+    sqlx::query("UPDATE tasks SET config = ?, status = 'stuck' WHERE id = ?")
+        .bind(json!({"roles": {"coder": {"cli": current_cli}}}).to_string())
+        .bind(&task_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    seed_row(pool, &task_id, "coding", json!({})).await;
+    let run = sessions::create(
+        pool,
+        sessions::NewSession {
+            task_id: &task_id,
+            stage: "coding",
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        },
+    )
+    .await
+    .unwrap();
+    sessions::set_adapter_session_id(pool, &run.id, "S1")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sessions SET cli_adapter = ? WHERE id = ?")
+        .bind(recorded_cli)
+        .bind(&run.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let run = sessions::update_status(
+        pool,
+        &run.id,
+        SessionStatus::Exited,
+        Some(Utc::now()),
+        Some(SessionEndReason::Interrupted),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (task_id, run)
+}
+
+fn finishing_binary(dir: &Path) -> String {
+    named_script_binary(
+        dir,
+        "fake-claude-finish",
+        json!([
+            {"op": "read_turn"},
+            {"op": "report", "outcome": "done"},
+            {"op": "result"},
+        ]),
+    )
+}
+
+#[tokio::test]
+async fn each_role_runs_on_the_adapter_its_cli_names() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let flows = dir.join("flows");
+    fs::create_dir_all(&flows).unwrap();
+    write_two_role_workflow(&flows);
+    let binary = fixture_binary("fake_claude.py");
+    let (registry, claude, fake) = two_adapter_registry(&binary);
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let engine = engine_with_registry(pool.clone(), registry, &flows, None);
+    let task = engine
+        .create_task(
+            &project_id,
+            "multi-role",
+            "T",
+            "go",
+            json!({"roles": {
+                "coder": {"cli": "fake", "model": "m"},
+                "reviewer": {"cli": "claude", "model": "m"},
+            }}),
+        )
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task.id, "finished").await;
+    let coder = wait_until_run_for_stage(&pool, &task.id, "coding").await;
+    let reviewer = wait_until_run_for_stage(&pool, &task.id, "internal_review").await;
+    assert_eq!(coder.cli_adapter, "fake");
+    assert_eq!(reviewer.cli_adapter, "claude");
+    assert_eq!(fake.calls(), vec![RecordedCall::Start]);
+    assert_eq!(claude.calls(), vec![RecordedCall::Start]);
+}
+
+#[tokio::test]
+async fn a_retry_resumes_on_the_adapter_that_ran_the_session() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let (registry, claude, fake) = two_adapter_registry(&finishing_binary(&dir));
+    let (task_id, old) = stuck_after_session_on(&pool, &dir, "fake", "fake").await;
+    let engine = engine_with_registry(pool.clone(), registry, &dir, None);
+    let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    assert!(outcome.resumed, "{outcome:?}");
+    assert_eq!(
+        fake.calls(),
+        vec![RecordedCall::Resume {
+            adapter_session_id: "S1".to_string()
+        }]
+    );
+    assert!(claude.calls().is_empty());
+    let new = run_after(&pool, &task_id, "coding", &old).await;
+    assert_eq!(new.cli_adapter, "fake");
+    assert_eq!(new.resumed_from.as_deref(), Some(old.id.as_str()));
+}
+
+#[tokio::test]
+async fn a_changed_cli_starts_fresh_and_a_demanded_resume_is_refused() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let (registry, claude, fake) = two_adapter_registry(&finishing_binary(&dir));
+    let (task_id, old) = stuck_after_session_on(&pool, &dir, "claude", "fake").await;
+    let engine = engine_with_registry(pool.clone(), registry, &dir, None);
+
+    let err = engine
+        .retry_task(&task_id, RetryMode::Resume)
+        .await
+        .unwrap_err();
+    let RetryTaskError::NotResumable(reason) = &err else {
+        panic!("expected NotResumable, got {err:?}");
+    };
+    assert!(
+        reason.contains("changed from 'claude' to 'fake'"),
+        "{reason}"
+    );
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "stuck");
+    assert_eq!(runs_for_stage(&pool, &task_id, "coding").await.len(), 1);
+    assert!(fake.calls().is_empty() && claude.calls().is_empty());
+
+    let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    assert!(!outcome.resumed, "{outcome:?}");
+    assert!(
+        outcome
+            .fresh_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("changed from 'claude' to 'fake'")),
+        "{outcome:?}"
+    );
+    assert_eq!(fake.calls(), vec![RecordedCall::Start]);
+    assert!(claude.calls().is_empty());
+    let new = run_after(&pool, &task_id, "coding", &old).await;
+    assert_eq!(new.cli_adapter, "fake");
+}
+
+#[tokio::test]
+async fn a_recorded_adapter_the_daemon_lacks_is_not_resumable() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let (registry, claude, fake) = two_adapter_registry(&finishing_binary(&dir));
+    let (task_id, old) = stuck_after_session_on(&pool, &dir, "ghost", "claude").await;
+    let engine = engine_with_registry(pool.clone(), registry, &dir, None);
+    let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    assert!(!outcome.resumed, "{outcome:?}");
+    let why = outcome.fresh_reason.clone().unwrap();
+    assert!(
+        why.contains("'ghost'") && why.contains("known CLIs"),
+        "{why}"
+    );
+    assert_eq!(claude.calls(), vec![RecordedCall::Start]);
+    assert!(fake.calls().is_empty());
+    let new = run_after(&pool, &task_id, "coding", &old).await;
+    assert_eq!(new.cli_adapter, "claude");
+}
+
+#[tokio::test]
+async fn a_role_cli_that_cannot_be_resolved_makes_the_session_not_resumable() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = coding_workflow(&dir);
+    let (task_id, _old) = stuck_after_session_on(&pool, &dir, "claude", "claude").await;
+    // A malformed global config can't be loaded, so the role's cli can't be
+    // resolved; the decision says so rather than guessing.
+    let global = dir.join("bad-config.yaml");
+    fs::write(&global, "roles: [not, a, map").unwrap();
+    let (registry, _claude, _fake) = two_adapter_registry(&finishing_binary(&dir));
+    let engine = engine_with_registry(pool.clone(), registry, &dir, Some(&global));
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    let last = sessions::get_current_for_stage(&pool, &task_id, "coding")
+        .await
+        .unwrap();
+    let why = engine
+        .resumable_session(&task, &def, &def.stages["coding"], last.as_ref())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        why.starts_with("the role's CLI could not be resolved:"),
+        "{why}"
+    );
+}
+
+/// The resume path takes the adapter from the recorded session, never from
+/// the role's resolved `cli`, even when the two differ.
+#[tokio::test]
+async fn enter_agent_turn_resumes_on_the_recorded_adapter_not_the_resolved_cli() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let (registry, claude, fake) = two_adapter_registry(&finishing_binary(&dir));
+    let def = coding_workflow(&dir);
+    let (task_id, old) = stuck_after_session_on(&pool, &dir, "fake", "claude").await;
+    sqlx::query("UPDATE tasks SET status = 'open' WHERE id = ?")
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let engine = engine_with_registry(pool.clone(), registry, &dir, None);
+    let resume = ResumeSession {
+        adapter_session_id: "S1".to_string(),
+        cli_adapter: "fake".to_string(),
+        previous_session_id: old.id.clone(),
+        end_reason: SessionEndReason::Interrupted,
+    };
+    engine
+        .enter_stage(
+            &task_id,
+            &def,
+            "coding",
+            None,
+            None,
+            &json!({}),
+            Some(&resume),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls(),
+        vec![RecordedCall::Resume {
+            adapter_session_id: "S1".to_string()
+        }]
+    );
+    assert!(claude.calls().is_empty());
+    let new = run_after(&pool, &task_id, "coding", &old).await;
+    assert_eq!(new.cli_adapter, "fake");
 }

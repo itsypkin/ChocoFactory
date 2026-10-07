@@ -584,3 +584,74 @@ impl AgentHandle {
         self.child.wait().await
     }
 }
+
+#[cfg(test)]
+mod registry_tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::recording_adapter::RecordingAdapter;
+
+    fn registry() -> Registry {
+        Registry::new(vec![
+            RecordingAdapter::new("zeta", "unused"),
+            RecordingAdapter::new("alpha", "unused"),
+        ])
+    }
+
+    #[test]
+    fn lookup_returns_the_adapter_keyed_by_its_own_name() {
+        let registry = registry();
+        assert_eq!(registry.lookup(None, "zeta").unwrap().name(), "zeta");
+        assert_eq!(registry.names(), vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn a_miss_lists_the_known_names_sorted_and_formats_exactly() {
+        let registry = registry();
+        let err = registry.lookup(Some("coder"), "cluade").err().unwrap();
+        assert_eq!(err.known, vec!["alpha", "zeta"]);
+        assert_eq!(
+            err.to_string(),
+            "role 'coder' uses cli 'cluade', which this daemon doesn't know; known CLIs: alpha, zeta"
+        );
+        let err = registry.lookup(None, "cluade").err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "cli 'cluade' is not one this daemon knows; known CLIs: alpha, zeta"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "two adapters registered under the name 'dup'")]
+    fn two_adapters_with_one_name_is_a_programmer_error() {
+        let a: Arc<dyn AgentAdapter> = RecordingAdapter::new("dup", "unused");
+        let b: Arc<dyn AgentAdapter> = RecordingAdapter::new("dup", "unused");
+        Registry::new(vec![a, b]);
+    }
+
+    #[test]
+    fn task_config_check_skips_shapes_that_fall_through_and_rejects_unknown_strings() {
+        let registry = registry();
+        for ok in [
+            json!({"roles": {"coder": {"cli": 1}}}),
+            json!({"roles": {"coder": {"cli": null}}}),
+            json!({"roles": "nope"}),
+            json!({"roles": {"coder": "nope"}}),
+            json!("not an object"),
+            json!({"roles": {"coder": {"cli": "alpha"}}}),
+        ] {
+            assert!(check_task_config_clis(&ok, &registry).is_ok(), "{ok}");
+        }
+        // A role the workflow doesn't define is still an invalid value.
+        let err = check_task_config_clis(
+            &json!({"roles": {"nobody": {"cli": "nope"}, "aaa": {"cli": "zeta"}}}),
+            &registry,
+        )
+        .unwrap_err();
+        assert_eq!(err.role.as_deref(), Some("nobody"));
+        assert_eq!(err.cli, "nope");
+    }
+}

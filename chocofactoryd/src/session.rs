@@ -3524,4 +3524,123 @@ mod tests {
         assert_eq!(run.end_reason, None);
         wait_until_gone(child_pid).await;
     }
+
+    fn recording(name: &'static str) -> Arc<crate::recording_adapter::RecordingAdapter> {
+        crate::recording_adapter::RecordingAdapter::new(name, &fixture_binary("fake_claude.py"))
+    }
+
+    #[tokio::test]
+    async fn start_with_an_unknown_cli_reserves_and_spawns_nothing() {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let claude = recording("claude");
+        let manager = SessionManager::new(
+            pool.clone(),
+            Registry::single(claude.clone()),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        let err = manager
+            .start(
+                &session_id,
+                "ghost",
+                "go",
+                &role_config(),
+                SessionKind::Standing,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::UnknownCli(_)), "{err:?}");
+        let err = manager
+            .resume(
+                &session_id,
+                "ghost",
+                "S1",
+                "go",
+                &role_config(),
+                SessionKind::Standing,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::UnknownCli(_)), "{err:?}");
+        assert!(claude.calls().is_empty());
+        // Nothing was reserved: the same id can still start on a real name.
+        manager
+            .start(
+                &session_id,
+                "claude",
+                "go",
+                &role_config(),
+                SessionKind::Standing,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn idle_chat_session_on(pool: &SqlitePool, cli: &str) -> String {
+        let session_id = seed_session(pool).await;
+        sqlx::query("UPDATE sessions SET cli_adapter = ? WHERE id = ?")
+            .bind(cli)
+            .bind(&session_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sessions::set_adapter_session_id(pool, &session_id, "S9")
+            .await
+            .unwrap();
+        sessions::update_status(pool, &session_id, SessionStatus::Idle, None, None)
+            .await
+            .unwrap();
+        session_id
+    }
+
+    #[tokio::test]
+    async fn chat_resume_dispatches_to_the_sessions_recorded_adapter() {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = idle_chat_session_on(&pool, "fake").await;
+        let claude = recording("claude");
+        let fake = recording("fake");
+        let manager = SessionManager::new(
+            pool.clone(),
+            Registry::new(vec![claude.clone(), fake.clone()]),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        manager
+            .send_message(&session_id, "hi", &role_config())
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.calls(),
+            vec![crate::recording_adapter::RecordedCall::Resume {
+                adapter_session_id: "S9".to_string()
+            }]
+        );
+        assert!(claude.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_resume_of_a_session_on_an_unknown_adapter_is_refused_unchanged() {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = idle_chat_session_on(&pool, "ghost").await;
+        let claude = recording("claude");
+        let manager = SessionManager::new(
+            pool.clone(),
+            Registry::single(claude.clone()),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        let err = manager
+            .send_message(&session_id, "hi", &role_config())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::UnknownCli(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "role 'chat' uses cli 'ghost', which this daemon doesn't know; known CLIs: claude"
+        );
+        let row = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(row.status, SessionStatus::Idle);
+        assert!(claude.calls().is_empty());
+    }
 }
