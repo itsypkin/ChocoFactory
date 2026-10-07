@@ -1131,7 +1131,9 @@ roles:
   tools `read`, `bash`, `edit`, `write`, `glob`, `grep` and `todo` (minus any
   `disallowed_tools`), the skills its `skills:` list names, and the repo's own
   instruction files: the root `CLAUDE.md` and `AGENTS.md`, and
-  `.omp/AGENTS.md` and `.omp/RULES.md`, each only if present. It does not see
+  `.omp/AGENTS.md` and `.omp/RULES.md`, each only if present. omp's own
+  `claude` provider also loads the repo's `.claude/CLAUDE.md` (the repo's own
+  file; there is no walk up to parent folders). It does not see
   anything from folders above the repo, your home folder, `~/.claude`, `~/.omp`
   or your own omp setup (settings that don't load instructions, tools or
   extensions, such as retry and compaction, still apply), and `.omp/mcp.json`
