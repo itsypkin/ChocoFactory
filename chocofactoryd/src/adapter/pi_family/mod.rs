@@ -2,14 +2,13 @@
 //!
 //! Only the parts that are about the family's wire format and its
 //! conventions live here: the line reader, pi-ai message and usage parsing,
-//! session statistics, and the repo instruction files. Spawning, the RPC
+//! session statistics, and reading repo instruction files. Spawning, the RPC
 //! session and everything specific to one CLI stay in that CLI's own module.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::Path;
 
-use base64::Engine as _;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
@@ -32,170 +31,6 @@ pub async fn read_lf_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result
         bytes.pop();
     }
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-}
-
-// ---------------------------------------------------------------------------
-// rpc_chunk reassembly (protocol v2)
-// ---------------------------------------------------------------------------
-
-/// What feeding one frame to a [`ChunkAssembler`] produced.
-#[derive(Debug, PartialEq)]
-pub enum Reassembled {
-    /// A whole logical frame: an ordinary frame passed through, or a chunk
-    /// sequence that has just completed.
-    Frame(Value),
-    /// A chunk accepted into a sequence that isn't complete yet.
-    Pending,
-    /// A chunk, or a sequence, that is invalid. Logged and skipped by the
-    /// caller; never fatal.
-    Rejected(String),
-}
-
-struct Sequence {
-    chunk_id: String,
-    count: u64,
-    byte_length: u64,
-    next_index: u64,
-    bytes: Vec<u8>,
-}
-
-/// Reassembles `rpc_chunk` frames per omp's RPC reference: validates
-/// `chunkId`, `index`, `count` and `byteLength`, rejects interleaved or
-/// interrupted sequences, enforces the advertised reassembly limit,
-/// concatenates the base64-decoded bytes in index order and parses them as
-/// one strict-UTF-8 JSON object.
-pub struct ChunkAssembler {
-    max_reassembled: u64,
-    current: Option<Sequence>,
-}
-
-impl ChunkAssembler {
-    pub fn new(max_reassembled: u64) -> Self {
-        Self {
-            max_reassembled,
-            current: None,
-        }
-    }
-
-    pub fn feed(&mut self, frame: Value) -> Reassembled {
-        if frame.get("type").and_then(Value::as_str) != Some("rpc_chunk") {
-            // A plain frame in the middle of a sequence interrupts it. The
-            // frame itself is fine and still delivered.
-            if let Some(seq) = self.current.take() {
-                tracing::warn!(
-                    "omp: rpc_chunk sequence '{}' interrupted after {} of {} chunks",
-                    seq.chunk_id,
-                    seq.next_index,
-                    seq.count
-                );
-            }
-            return Reassembled::Frame(frame);
-        }
-        match self.feed_chunk(&frame) {
-            Ok(Some(done)) => Reassembled::Frame(done),
-            Ok(None) => Reassembled::Pending,
-            Err(reason) => {
-                self.current = None;
-                Reassembled::Rejected(reason)
-            }
-        }
-    }
-
-    fn feed_chunk(&mut self, frame: &Value) -> Result<Option<Value>, String> {
-        let chunk_id = frame
-            .get("chunkId")
-            .and_then(Value::as_str)
-            .ok_or("rpc_chunk without a string chunkId")?;
-        let index = frame
-            .get("index")
-            .and_then(Value::as_u64)
-            .ok_or("rpc_chunk without an integer index")?;
-        let count = frame
-            .get("count")
-            .and_then(Value::as_u64)
-            .filter(|count| *count > 0)
-            .ok_or("rpc_chunk without a positive integer count")?;
-        let byte_length = frame
-            .get("byteLength")
-            .and_then(Value::as_u64)
-            .ok_or("rpc_chunk without an integer byteLength")?;
-        let data = frame
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or("rpc_chunk without string data")?;
-        if byte_length > self.max_reassembled {
-            return Err(format!(
-                "rpc_chunk '{chunk_id}' declares {byte_length} bytes, over the {} byte limit",
-                self.max_reassembled
-            ));
-        }
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(data)
-            .map_err(|err| format!("rpc_chunk '{chunk_id}' has invalid base64: {err}"))?;
-
-        match self.current.as_mut() {
-            Some(seq) => {
-                if seq.chunk_id != chunk_id {
-                    let other = seq.chunk_id.clone();
-                    return Err(format!(
-                        "rpc_chunk '{chunk_id}' interleaved with unfinished sequence '{other}'"
-                    ));
-                }
-                if seq.count != count || seq.byte_length != byte_length {
-                    return Err(format!(
-                        "rpc_chunk '{chunk_id}' changed count or byteLength"
-                    ));
-                }
-                if index != seq.next_index {
-                    return Err(format!(
-                        "rpc_chunk '{chunk_id}' index {index} out of order (expected {})",
-                        seq.next_index
-                    ));
-                }
-            }
-            None => {
-                if index != 0 {
-                    return Err(format!(
-                        "rpc_chunk '{chunk_id}' starts at index {index}, not 0"
-                    ));
-                }
-                self.current = Some(Sequence {
-                    chunk_id: chunk_id.to_string(),
-                    count,
-                    byte_length,
-                    next_index: 0,
-                    bytes: Vec::new(),
-                });
-            }
-        }
-        let seq = self.current.as_mut().expect("set above");
-        if seq.bytes.len() as u64 + decoded.len() as u64 > seq.byte_length {
-            return Err(format!(
-                "rpc_chunk '{chunk_id}' carries more than byteLength"
-            ));
-        }
-        seq.bytes.extend_from_slice(&decoded);
-        seq.next_index += 1;
-        if seq.next_index < seq.count {
-            return Ok(None);
-        }
-        let seq = self.current.take().expect("set above");
-        if seq.bytes.len() as u64 != seq.byte_length {
-            return Err(format!(
-                "rpc_chunk '{chunk_id}' reassembled to {} bytes, declared {}",
-                seq.bytes.len(),
-                seq.byte_length
-            ));
-        }
-        let text = String::from_utf8(seq.bytes)
-            .map_err(|err| format!("rpc_chunk '{chunk_id}' is not valid UTF-8: {err}"))?;
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|err| format!("rpc_chunk '{chunk_id}' is not JSON: {err}"))?;
-        if !value.is_object() {
-            return Err(format!("rpc_chunk '{chunk_id}' is not a JSON object"));
-        }
-        Ok(Some(value))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -486,42 +321,42 @@ pub fn stats_delta(before: &SessionStats, now: &SessionStats) -> (TokenCounts, O
 // Repo instruction files
 // ---------------------------------------------------------------------------
 
-/// The repo-relative paths read, in this order (the agent gets nothing from
-/// parent folders, `$HOME` or the operator's setup).
-pub const INSTRUCTION_FILES: [&str; 4] =
-    ["CLAUDE.md", "AGENTS.md", ".omp/AGENTS.md", ".omp/RULES.md"];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstructionFile {
-    /// Repo-relative path, as listed in [`INSTRUCTION_FILES`].
+    /// Repo-relative path, as passed to [`read_repo_instructions`].
     pub path: &'static str,
     pub contents: String,
 }
 
-/// Reads the repo's own instruction files from `cwd`, each only if present.
+/// Reads the repo's own instruction files from `cwd`, each of `names` (repo-
+/// relative, in order) only if present. The agent gets nothing from parent
+/// folders, `$HOME` or the operator's setup.
 /// Only a regular file whose canonical path lies inside the canonical `cwd`
 /// is read; one that resolves elsewhere (a symlink out of the repo) is
 /// skipped with a warning message. Non-UTF-8 content is read lossily.
-pub fn read_repo_instructions(cwd: &Path) -> (Vec<InstructionFile>, Vec<String>) {
+pub fn read_repo_instructions(
+    cwd: &Path,
+    names: &[&'static str],
+) -> (Vec<InstructionFile>, Vec<String>) {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
     let canonical_cwd = match cwd.canonicalize() {
         Ok(path) => path,
         Err(err) => {
             warnings.push(format!(
-                "omp: couldn't resolve the working directory {}, so no repo instruction files were read: {err}",
+                "couldn't resolve the working directory {}, so no repo instruction files were read: {err}",
                 cwd.display()
             ));
             return (files, warnings);
         }
     };
-    for rel in INSTRUCTION_FILES {
+    for &rel in names {
         let path = canonical_cwd.join(rel);
         let canonical = match path.canonicalize() {
             Ok(canonical) => canonical,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => {
-                warnings.push(format!("omp: skipped {rel}: {err}"));
+                warnings.push(format!("skipped {rel}: {err}"));
                 continue;
             }
         };
@@ -536,7 +371,7 @@ pub fn read_repo_instructions(cwd: &Path) -> (Vec<InstructionFile>, Vec<String>)
             Ok(meta) if meta.is_file() => {}
             Ok(_) => continue,
             Err(err) => {
-                warnings.push(format!("omp: skipped {rel}: {err}"));
+                warnings.push(format!("skipped {rel}: {err}"));
                 continue;
             }
         }
@@ -545,7 +380,7 @@ pub fn read_repo_instructions(cwd: &Path) -> (Vec<InstructionFile>, Vec<String>)
                 path: rel,
                 contents: String::from_utf8_lossy(&bytes).into_owned(),
             }),
-            Err(err) => warnings.push(format!("omp: skipped {rel}: {err}")),
+            Err(err) => warnings.push(format!("skipped {rel}: {err}")),
         }
     }
     (files, warnings)
@@ -571,14 +406,6 @@ mod tests {
 
     use super::*;
 
-    fn chunk(id: &str, index: u64, count: u64, byte_length: u64, bytes: &[u8]) -> Value {
-        json!({
-            "type": "rpc_chunk", "chunkId": id, "index": index, "count": count,
-            "byteLength": byte_length,
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-        })
-    }
-
     #[tokio::test]
     async fn the_line_reader_splits_on_lf_only() {
         let text = "{\"a\":\"x\u{2028}y\"}\nsecond\r\nlast";
@@ -593,104 +420,6 @@ mod tests {
         );
         assert_eq!(read_lf_line(&mut reader).await.unwrap().unwrap(), "last");
         assert_eq!(read_lf_line(&mut reader).await.unwrap(), None);
-    }
-
-    #[test]
-    fn a_chunk_sequence_reassembles_in_order() {
-        let mut asm = ChunkAssembler::new(1000);
-        let whole = br#"{"type":"response","n":1}"#;
-        let (a, b) = whole.split_at(10);
-        assert_eq!(asm.feed(chunk("c", 0, 2, 25, a)), Reassembled::Pending);
-        assert_eq!(
-            asm.feed(chunk("c", 1, 2, 25, b)),
-            Reassembled::Frame(json!({"type":"response","n":1}))
-        );
-    }
-
-    #[test]
-    fn plain_frames_pass_through() {
-        let mut asm = ChunkAssembler::new(1000);
-        assert_eq!(
-            asm.feed(json!({"type": "x"})),
-            Reassembled::Frame(json!({"type": "x"}))
-        );
-    }
-
-    #[test]
-    fn bad_sequences_are_rejected() {
-        let whole = br#"{"a":1}"#;
-        let new = || ChunkAssembler::new(1000);
-        // Interleaved.
-        let mut asm = new();
-        assert_eq!(
-            asm.feed(chunk("c", 0, 2, 7, &whole[..3])),
-            Reassembled::Pending
-        );
-        assert!(matches!(
-            asm.feed(chunk("d", 0, 2, 7, &whole[..3])),
-            Reassembled::Rejected(_)
-        ));
-        // Out of order.
-        let mut asm = new();
-        assert_eq!(
-            asm.feed(chunk("c", 0, 3, 7, &whole[..2])),
-            Reassembled::Pending
-        );
-        assert!(matches!(
-            asm.feed(chunk("c", 2, 3, 7, &whole[2..])),
-            Reassembled::Rejected(_)
-        ));
-        // Starting mid-sequence.
-        assert!(matches!(
-            new().feed(chunk("c", 1, 2, 7, whole)),
-            Reassembled::Rejected(_)
-        ));
-        // Over the limit.
-        assert!(matches!(
-            ChunkAssembler::new(5).feed(chunk("c", 0, 1, 7, whole)),
-            Reassembled::Rejected(_)
-        ));
-        // Wrong declared length.
-        assert!(matches!(
-            new().feed(chunk("c", 0, 1, 9, whole)),
-            Reassembled::Rejected(_)
-        ));
-        // Not UTF-8, not JSON, not an object.
-        assert!(matches!(
-            new().feed(chunk("c", 0, 1, 2, &[0xff, 0xfe])),
-            Reassembled::Rejected(_)
-        ));
-        assert!(matches!(
-            new().feed(chunk("c", 0, 1, 3, b"abc")),
-            Reassembled::Rejected(_)
-        ));
-        assert!(matches!(
-            new().feed(chunk("c", 0, 1, 1, b"1")),
-            Reassembled::Rejected(_)
-        ));
-        // Missing fields.
-        assert!(matches!(
-            new().feed(json!({"type": "rpc_chunk"})),
-            Reassembled::Rejected(_)
-        ));
-    }
-
-    #[test]
-    fn a_plain_frame_interrupts_a_sequence_and_is_delivered() {
-        let mut asm = ChunkAssembler::new(1000);
-        assert_eq!(
-            asm.feed(chunk("c", 0, 2, 7, b"{\"a\"")),
-            Reassembled::Pending
-        );
-        assert_eq!(
-            asm.feed(json!({"type": "x"})),
-            Reassembled::Frame(json!({"type": "x"}))
-        );
-        // The interrupted sequence is gone: its continuation starts mid-way.
-        assert!(matches!(
-            asm.feed(chunk("c", 1, 2, 7, b":1}")),
-            Reassembled::Rejected(_)
-        ));
     }
 
     #[test]
@@ -810,7 +539,10 @@ mod tests {
         std::fs::write(repo.join(".omp/mcp.json"), "{}").unwrap();
         std::fs::write(dir.join("outside.md"), "secret").unwrap();
         std::os::unix::fs::symlink(dir.join("outside.md"), repo.join(".omp/AGENTS.md")).unwrap();
-        let (files, warnings) = read_repo_instructions(&repo);
+        let (files, warnings) = read_repo_instructions(
+            &repo,
+            &["CLAUDE.md", "AGENTS.md", ".omp/AGENTS.md", ".omp/RULES.md"],
+        );
         let paths: Vec<_> = files.iter().map(|f| f.path).collect();
         assert_eq!(paths, vec!["CLAUDE.md", "AGENTS.md", ".omp/RULES.md"]);
         assert_eq!(files[0].contents, "c\u{fffd}");
@@ -823,7 +555,7 @@ mod tests {
         assert!(!rendered.contains("secret"));
         assert!(!rendered.contains("{}"));
         // An unresolvable directory reads nothing and says so.
-        let (files, warnings) = read_repo_instructions(&dir.join("missing"));
+        let (files, warnings) = read_repo_instructions(&dir.join("missing"), &["CLAUDE.md"]);
         assert!(files.is_empty() && warnings.len() == 1);
     }
 

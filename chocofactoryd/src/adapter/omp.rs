@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine as _;
 use chocofactory_core::mcp::{
     REPORT_OUTCOME_TOOL_NAME, StageReport, check_report_call, qualified_report_outcome_tool_name,
     tool_definition,
@@ -29,9 +30,8 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::pi_family::{
-    ChunkAssembler, MessageNormalizer, Reassembled, SessionStats, TurnMessages,
-    parse_message_usage, parse_session_stats, read_lf_line, read_repo_instructions,
-    render_instruction_files, stats_delta,
+    MessageNormalizer, SessionStats, TurnMessages, parse_message_usage, parse_session_stats,
+    read_lf_line, read_repo_instructions, render_instruction_files, stats_delta,
 };
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentHandle, BillingMode, InterruptionEvidence,
@@ -48,6 +48,9 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 /// The flag is always passed: it stops `~/.omp/agent/APPEND_SYSTEM.md`
 /// from loading.
 const NO_INSTRUCTIONS: &str = "No repository instruction files were found.\n";
+
+/// The repo-relative instruction files an omp role gets, in this order.
+const INSTRUCTION_FILES: [&str; 4] = ["CLAUDE.md", "AGENTS.md", ".omp/AGENTS.md", ".omp/RULES.md"];
 
 const THINKING_LEVELS: [&str; 9] = [
     "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto", "inherit",
@@ -104,7 +107,7 @@ impl OmpAdapter {
         let mut warnings = Vec::new();
         let append = match &cfg.isolation {
             Isolation::Isolated { .. } => {
-                let (files, file_warnings) = read_repo_instructions(&cfg.cwd);
+                let (files, file_warnings) = read_repo_instructions(&cfg.cwd, &INSTRUCTION_FILES);
                 warnings = file_warnings;
                 Some(append_block(&render_instruction_files(&files), cfg))
             }
@@ -479,6 +482,170 @@ pub fn billing_for(provider: &str, env: &dyn Fn(&str) -> Option<String>) -> Bill
         BillingMode::ApiKey
     } else {
         BillingMode::Unknown
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rpc_chunk reassembly (protocol v2)
+// ---------------------------------------------------------------------------
+
+/// What feeding one frame to a [`ChunkAssembler`] produced.
+#[derive(Debug, PartialEq)]
+enum Reassembled {
+    /// A whole logical frame: an ordinary frame passed through, or a chunk
+    /// sequence that has just completed.
+    Frame(Value),
+    /// A chunk accepted into a sequence that isn't complete yet.
+    Pending,
+    /// A chunk, or a sequence, that is invalid. Logged and skipped by the
+    /// caller; never fatal.
+    Rejected(String),
+}
+
+struct Sequence {
+    chunk_id: String,
+    count: u64,
+    byte_length: u64,
+    next_index: u64,
+    bytes: Vec<u8>,
+}
+
+/// Reassembles `rpc_chunk` frames per omp's RPC reference: validates
+/// `chunkId`, `index`, `count` and `byteLength`, rejects interleaved or
+/// interrupted sequences, enforces the advertised reassembly limit,
+/// concatenates the base64-decoded bytes in index order and parses them as
+/// one strict-UTF-8 JSON object.
+struct ChunkAssembler {
+    max_reassembled: u64,
+    current: Option<Sequence>,
+}
+
+impl ChunkAssembler {
+    fn new(max_reassembled: u64) -> Self {
+        Self {
+            max_reassembled,
+            current: None,
+        }
+    }
+
+    fn feed(&mut self, frame: Value) -> Reassembled {
+        if frame.get("type").and_then(Value::as_str) != Some("rpc_chunk") {
+            // A plain frame in the middle of a sequence interrupts it. The
+            // frame itself is fine and still delivered.
+            if let Some(seq) = self.current.take() {
+                tracing::warn!(
+                    "omp: rpc_chunk sequence '{}' interrupted after {} of {} chunks",
+                    seq.chunk_id,
+                    seq.next_index,
+                    seq.count
+                );
+            }
+            return Reassembled::Frame(frame);
+        }
+        match self.feed_chunk(&frame) {
+            Ok(Some(done)) => Reassembled::Frame(done),
+            Ok(None) => Reassembled::Pending,
+            Err(reason) => {
+                self.current = None;
+                Reassembled::Rejected(reason)
+            }
+        }
+    }
+
+    fn feed_chunk(&mut self, frame: &Value) -> Result<Option<Value>, String> {
+        let chunk_id = frame
+            .get("chunkId")
+            .and_then(Value::as_str)
+            .ok_or("rpc_chunk without a string chunkId")?;
+        let index = frame
+            .get("index")
+            .and_then(Value::as_u64)
+            .ok_or("rpc_chunk without an integer index")?;
+        let count = frame
+            .get("count")
+            .and_then(Value::as_u64)
+            .filter(|count| *count > 0)
+            .ok_or("rpc_chunk without a positive integer count")?;
+        let byte_length = frame
+            .get("byteLength")
+            .and_then(Value::as_u64)
+            .ok_or("rpc_chunk without an integer byteLength")?;
+        let data = frame
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or("rpc_chunk without string data")?;
+        if byte_length > self.max_reassembled {
+            return Err(format!(
+                "rpc_chunk '{chunk_id}' declares {byte_length} bytes, over the {} byte limit",
+                self.max_reassembled
+            ));
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|err| format!("rpc_chunk '{chunk_id}' has invalid base64: {err}"))?;
+
+        match self.current.as_mut() {
+            Some(seq) => {
+                if seq.chunk_id != chunk_id {
+                    let other = seq.chunk_id.clone();
+                    return Err(format!(
+                        "rpc_chunk '{chunk_id}' interleaved with unfinished sequence '{other}'"
+                    ));
+                }
+                if seq.count != count || seq.byte_length != byte_length {
+                    return Err(format!(
+                        "rpc_chunk '{chunk_id}' changed count or byteLength"
+                    ));
+                }
+                if index != seq.next_index {
+                    return Err(format!(
+                        "rpc_chunk '{chunk_id}' index {index} out of order (expected {})",
+                        seq.next_index
+                    ));
+                }
+            }
+            None => {
+                if index != 0 {
+                    return Err(format!(
+                        "rpc_chunk '{chunk_id}' starts at index {index}, not 0"
+                    ));
+                }
+                self.current = Some(Sequence {
+                    chunk_id: chunk_id.to_string(),
+                    count,
+                    byte_length,
+                    next_index: 0,
+                    bytes: Vec::new(),
+                });
+            }
+        }
+        let seq = self.current.as_mut().expect("set above");
+        if seq.bytes.len() as u64 + decoded.len() as u64 > seq.byte_length {
+            return Err(format!(
+                "rpc_chunk '{chunk_id}' carries more than byteLength"
+            ));
+        }
+        seq.bytes.extend_from_slice(&decoded);
+        seq.next_index += 1;
+        if seq.next_index < seq.count {
+            return Ok(None);
+        }
+        let seq = self.current.take().expect("set above");
+        if seq.bytes.len() as u64 != seq.byte_length {
+            return Err(format!(
+                "rpc_chunk '{chunk_id}' reassembled to {} bytes, declared {}",
+                seq.bytes.len(),
+                seq.byte_length
+            ));
+        }
+        let text = String::from_utf8(seq.bytes)
+            .map_err(|err| format!("rpc_chunk '{chunk_id}' is not valid UTF-8: {err}"))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|err| format!("rpc_chunk '{chunk_id}' is not JSON: {err}"))?;
+        if !value.is_object() {
+            return Err(format!("rpc_chunk '{chunk_id}' is not a JSON object"));
+        }
+        Ok(Some(value))
     }
 }
 

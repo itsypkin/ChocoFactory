@@ -1396,7 +1396,7 @@ fn the_default_validate_role_accepts_everything() {
 /// to the real omp themselves: the overlay on disk, the arguments, and the
 /// scrubbed command.
 fn real_command(binary: &str, state: &Path, cfg: &RoleConfig) -> (Command, PathBuf) {
-    let (files, _warnings) = read_repo_instructions(&cfg.cwd);
+    let (files, _warnings) = read_repo_instructions(&cfg.cwd, &INSTRUCTION_FILES);
     let append = match &cfg.isolation {
         Isolation::Isolated { .. } => Some(append_block(&render_instruction_files(&files), cfg)),
         Isolation::InheritOperatorConfig => None,
@@ -1600,4 +1600,112 @@ fn dump_probe_spawn() {
         json!({"args": args, "overlay": overlay_path, "env": env_changes}).to_string(),
     )
     .unwrap();
+}
+
+// -- rpc_chunk reassembly --
+
+fn chunk(id: &str, index: u64, count: u64, byte_length: u64, bytes: &[u8]) -> Value {
+    json!({
+        "type": "rpc_chunk", "chunkId": id, "index": index, "count": count,
+        "byteLength": byte_length,
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+#[test]
+fn a_chunk_sequence_reassembles_in_order() {
+    let mut asm = ChunkAssembler::new(1000);
+    let whole = br#"{"type":"response","n":1}"#;
+    let (a, b) = whole.split_at(10);
+    assert_eq!(asm.feed(chunk("c", 0, 2, 25, a)), Reassembled::Pending);
+    assert_eq!(
+        asm.feed(chunk("c", 1, 2, 25, b)),
+        Reassembled::Frame(json!({"type":"response","n":1}))
+    );
+}
+
+#[test]
+fn plain_frames_pass_through() {
+    let mut asm = ChunkAssembler::new(1000);
+    assert_eq!(
+        asm.feed(json!({"type": "x"})),
+        Reassembled::Frame(json!({"type": "x"}))
+    );
+}
+
+#[test]
+fn bad_sequences_are_rejected() {
+    let whole = br#"{"a":1}"#;
+    let new = || ChunkAssembler::new(1000);
+    // Interleaved.
+    let mut asm = new();
+    assert_eq!(
+        asm.feed(chunk("c", 0, 2, 7, &whole[..3])),
+        Reassembled::Pending
+    );
+    assert!(matches!(
+        asm.feed(chunk("d", 0, 2, 7, &whole[..3])),
+        Reassembled::Rejected(_)
+    ));
+    // Out of order.
+    let mut asm = new();
+    assert_eq!(
+        asm.feed(chunk("c", 0, 3, 7, &whole[..2])),
+        Reassembled::Pending
+    );
+    assert!(matches!(
+        asm.feed(chunk("c", 2, 3, 7, &whole[2..])),
+        Reassembled::Rejected(_)
+    ));
+    // Starting mid-sequence.
+    assert!(matches!(
+        new().feed(chunk("c", 1, 2, 7, whole)),
+        Reassembled::Rejected(_)
+    ));
+    // Over the limit.
+    assert!(matches!(
+        ChunkAssembler::new(5).feed(chunk("c", 0, 1, 7, whole)),
+        Reassembled::Rejected(_)
+    ));
+    // Wrong declared length.
+    assert!(matches!(
+        new().feed(chunk("c", 0, 1, 9, whole)),
+        Reassembled::Rejected(_)
+    ));
+    // Not UTF-8, not JSON, not an object.
+    assert!(matches!(
+        new().feed(chunk("c", 0, 1, 2, &[0xff, 0xfe])),
+        Reassembled::Rejected(_)
+    ));
+    assert!(matches!(
+        new().feed(chunk("c", 0, 1, 3, b"abc")),
+        Reassembled::Rejected(_)
+    ));
+    assert!(matches!(
+        new().feed(chunk("c", 0, 1, 1, b"1")),
+        Reassembled::Rejected(_)
+    ));
+    // Missing fields.
+    assert!(matches!(
+        new().feed(json!({"type": "rpc_chunk"})),
+        Reassembled::Rejected(_)
+    ));
+}
+
+#[test]
+fn a_plain_frame_interrupts_a_sequence_and_is_delivered() {
+    let mut asm = ChunkAssembler::new(1000);
+    assert_eq!(
+        asm.feed(chunk("c", 0, 2, 7, b"{\"a\"")),
+        Reassembled::Pending
+    );
+    assert_eq!(
+        asm.feed(json!({"type": "x"})),
+        Reassembled::Frame(json!({"type": "x"}))
+    );
+    // The interrupted sequence is gone: its continuation starts mid-way.
+    assert!(matches!(
+        asm.feed(chunk("c", 1, 2, 7, b":1}")),
+        Reassembled::Rejected(_)
+    ));
 }
