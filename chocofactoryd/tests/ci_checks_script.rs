@@ -70,6 +70,14 @@ impl Fixture {
         let _ = fs::remove_dir_all(&dir);
         let repo = dir.join("repo");
         fs::create_dir_all(&repo).unwrap();
+        // A `date` that honours FAKE_NOW, so the grace boundary is exact.
+        let date = dir.join("date");
+        fs::write(
+            &date,
+            "#!/bin/sh\nif [ -n \"${FAKE_NOW:-}\" ]; then echo \"$FAKE_NOW\"; else exec /bin/date \"$@\"; fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&date, fs::Permissions::from_mode(0o755)).unwrap();
         let gh = dir.join("gh");
         fs::write(&gh, FAKE_GH).unwrap();
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
@@ -107,6 +115,10 @@ impl Fixture {
     }
 
     fn run_in(&self, cwd: &Path) -> Output {
+        self.run_at(cwd, None)
+    }
+
+    fn run_at(&self, cwd: &Path, now: Option<u64>) -> Output {
         let path = format!(
             "{}:{}",
             self.dir.display(),
@@ -119,6 +131,7 @@ impl Fixture {
             .env("GH_FAKE_DIR", &self.dir)
             .env("GIT_CEILING_DIRECTORIES", &self.dir)
             .env("PR_NUMBER", "7")
+            .env("FAKE_NOW", now.map(|n| n.to_string()).unwrap_or_default())
             .output()
             .expect("failed to run ci-checks.sh")
     }
@@ -231,15 +244,23 @@ fn no_checks_before_the_grace_starts_the_clock_and_keeps_polling() {
 
 #[test]
 fn no_checks_after_the_grace_is_no_checks() {
-    for (age, token) in [(181, "NO_CHECKS"), (180, "NO_CHECKS"), (30, "PENDING")] {
+    let t = 1_800_000_000u64;
+    for (age, token) in [
+        (181, "NO_CHECKS"),
+        (180, "NO_CHECKS"),
+        (179, "PENDING"),
+        (30, "PENDING"),
+    ] {
         let fx = Fixture::new(&[]);
-        fx.write_first_seen(&format!("{HEAD} {}\n", now() - age));
-        let out = fx.ok();
+        fx.write_first_seen(&format!("{HEAD} {}\n", t - age));
+        let out = fx.run_at(&fx.repo, Some(t));
+        assert!(out.status.success());
+        let out = String::from_utf8(out.stdout).unwrap();
         assert_eq!(first_line(&out), token, "age {age}");
         if token == "NO_CHECKS" {
             assert!(
                 out.contains(&format!(
-                    "No CI checks reported on this PR's head {HEAD} after "
+                    "No CI checks reported on this PR's head {HEAD} after {age}s."
                 )),
                 "{out}"
             );
