@@ -358,7 +358,9 @@ TIME                     KIND               DETAIL
 ```
 
 Long output is paginated — pass `--limit N`, and follow the `--after
-<token>` hint printed when more events remain. There is also a live
+<token>` hint printed when more events remain. `--after` takes the
+`next_token` field of `--json` output or the token from the "More events
+available" hint. There is also a live
 WebSocket stream at `/tasks/{id}/events/live` that the CLI doesn't wrap.
 
 List things:
