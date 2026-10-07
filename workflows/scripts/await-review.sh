@@ -67,8 +67,9 @@
 # `/request-changes` if some line of the body equals it after trailing
 # whitespace and CR are stripped, else `/approve` likewise, else nothing. A
 # review's state also votes: CHANGES_REQUESTED is a request for changes,
-# APPROVED an approval (a body marker is tested first, so an APPROVED review
-# with a `/request-changes` line requests changes). Marker lines only count
+# APPROVED an approval (requesting changes, by state or marker, is tested
+# first, so an APPROVED review with a `/request-changes` line requests
+# changes). Marker lines only count
 # whole, so a quoted ("> /approve") or inline mention does not vote. Each vote
 # is printed as "<time> <verdict>", time being max(created_at, updated_at) for
 # a comment and submitted_at for a review. The lines of both calls are sorted

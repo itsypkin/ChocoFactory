@@ -284,7 +284,9 @@ refused, and nothing is posted to the PR.
   too; editing a review counts only while the review is newer than the head
   commit, so after a push post a new comment or review.
 - Pending and dismissed reviews never vote. The newest vote across comments
-  and reviews decides, and a tie resolves to `/request-changes`. Reviews and
+  and reviews decides, and a tie resolves to `/request-changes`. A comment
+  votes at the later of its creation and last edit, so editing an older marker
+  comment makes it the newest vote. Reviews and
   their inline comments are handed to the coder after the comments.
 - A marker inside a fenced code block still votes. When you quote the
   convention, indent it or break it up.

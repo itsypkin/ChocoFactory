@@ -94,15 +94,18 @@ Reviews follow these rules:
 - **State or marker.** A collaborator's `Approve` review (`APPROVED`) votes
   `/approve` and `Request changes` (`CHANGES_REQUESTED`) votes
   `/request-changes`, with no marker needed. A `Comment` review votes only
-  through a marker line in its body. A body marker is tested first, so an
-  `Approve` review with a `/request-changes` line requests changes.
+  through a marker line in its body. Requesting changes (by
+  state or by marker) is tested first, so an `Approve` review with a
+  `/request-changes` line requests changes, and a `Request changes` review
+  with an `/approve` line does too.
 - **Newer than the head commit.** A review counts by the time it was
   submitted, the same bound as for comments. Pending (unsubmitted) and
   dismissed reviews never count.
 - **Same author fence** as comments (below).
 - **The newest vote wins** across comments and reviews together. If a comment
   and a review carry different verdicts at the same second, the tie resolves
-  to request changes.
+  to request changes. A comment votes at the later of its creation and its
+  last edit, so editing an older marker comment makes it the newest vote.
 - **Inline comments go with their review.** An inline comment is handed over
   whenever its review qualifies, whatever its own date, and never when its
   review does not.

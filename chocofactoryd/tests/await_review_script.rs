@@ -901,6 +901,7 @@ struct Inline<'a> {
     line: Option<u64>,
     original_line: Option<u64>,
     start_line: Option<u64>,
+    original_start_line: Option<u64>,
     subject: &'a str,
     at: &'a str,
     body: &'a str,
@@ -914,6 +915,7 @@ impl<'a> Inline<'a> {
             line: Some(line),
             original_line: Some(line),
             start_line: None,
+            original_start_line: None,
             subject: "line",
             at: FRESH,
             body,
@@ -922,12 +924,13 @@ impl<'a> Inline<'a> {
 
     fn json(&self) -> String {
         format!(
-            r#"{{"pull_request_review_id": {}, "path": {}, "line": {}, "original_line": {}, "start_line": {}, "original_start_line": null, "subject_type": "{}", "created_at": "{at}", "updated_at": "{at}", "html_url": "https://example.test/i/{}", "body": {}}}"#,
+            r#"{{"pull_request_review_id": {}, "path": {}, "line": {}, "original_line": {}, "start_line": {}, "original_start_line": {}, "subject_type": "{}", "created_at": "{at}", "updated_at": "{at}", "html_url": "https://example.test/i/{}", "body": {}}}"#,
             self.review_id,
             serde_json::json!(self.path),
             serde_json::json!(self.line),
             serde_json::json!(self.original_line),
             serde_json::json!(self.start_line),
+            serde_json::json!(self.original_start_line),
             self.subject,
             self.body.len(),
             serde_json::json!(self.body),
@@ -1039,7 +1042,10 @@ fn the_229_review_with_a_typo_marker_is_not_a_verdict() {
             ..Inline::at_line(11, "src/x.rs", i as u64, "old")
         });
     }
-    inline.push(Inline::at_line(11, "src/y.rs", 31, "current"));
+    inline.push(Inline {
+        at: STALE,
+        ..Inline::at_line(11, "src/y.rs", 31, "current")
+    });
     let out = review_stdout(
         &[],
         &[review("11", "COMMENTED", Some(FRESH), "OWNER", "me", body)],
@@ -1124,6 +1130,69 @@ fn the_newest_item_across_comments_and_reviews_decides() {
         let out = review_stdout(std::slice::from_ref(&c), &[rev(state, at, "")], &[]);
         assert_eq!(first_line(&out), want, "{c} vs {state} at {at}");
     }
+}
+
+/// A comment created at `created` and edited at `updated`.
+fn edited_comment(created: &str, updated: &str, body: &str) -> String {
+    comment(created, "OWNER", Some("me"), body).replace(
+        &format!(r#""updated_at": "{created}""#),
+        &format!(r#""updated_at": "{updated}""#),
+    )
+}
+
+#[test]
+fn a_comment_votes_at_the_time_it_was_last_edited() {
+    // Created before the review, edited after it: the edit is the newest vote.
+    let c = edited_comment(STALE, LATER, "/approve");
+    let out = review_stdout(&[c], &[rev("CHANGES_REQUESTED", FRESH, "")], &[]);
+    assert_eq!(first_line(&out), "APPROVE");
+    // Two comments: the older one, edited last, wins.
+    let a = edited_comment(FRESH, LATER, "/approve");
+    let b = owner_comment("2026-01-03T12:00:00Z", "/request-changes");
+    let out = review_stdout(&[a, b], &[], &[]);
+    assert_eq!(first_line(&out), "APPROVE");
+}
+
+#[test]
+fn inline_positions_cover_ranges_single_lines_and_bare_paths() {
+    let outdated_range = Inline {
+        line: None,
+        original_line: Some(23),
+        original_start_line: Some(20),
+        ..Inline::at_line(11, "p.rs", 0, "A")
+    };
+    let same = Inline {
+        start_line: Some(5),
+        ..Inline::at_line(11, "q.rs", 5, "B")
+    };
+    let bare = Inline {
+        line: None,
+        original_line: None,
+        ..Inline::at_line(11, "r.rs", 0, "C")
+    };
+    let out = review_stdout(
+        &[],
+        &[rev("CHANGES_REQUESTED", FRESH, "")],
+        &[outdated_range, same, bare],
+    );
+    for s in [
+        "#### p.rs:20-23 (outdated)\n",
+        "#### q.rs:5\n",
+        "#### r.rs\n",
+    ] {
+        assert!(out.contains(s), "{s} missing:\n{out}");
+    }
+}
+
+#[test]
+fn reviews_submitted_together_are_ordered_by_id() {
+    let a = review("30", "COMMENTED", Some(FRESH), "OWNER", "me", "THIRTY");
+    let b = review("4", "CHANGES_REQUESTED", Some(FRESH), "OWNER", "me", "FOUR");
+    let out = review_stdout(&[], &[a, b], &[]);
+    assert!(
+        out.find("FOUR").unwrap() < out.find("THIRTY").unwrap(),
+        "{out}"
+    );
 }
 
 #[test]
