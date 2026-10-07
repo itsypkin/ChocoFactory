@@ -52,7 +52,8 @@ Seeded /Users/you/code/acme/.chocofactory/workflows
   created   /Users/you/code/acme/.chocofactory/workflows/chat.yaml
   created   /Users/you/code/acme/.chocofactory/workflows/coding-task.yaml
   created   /Users/you/code/acme/.chocofactory/workflows/coding-task-planned.yaml
-  created   /Users/you/code/acme/.chocofactory/workflows/prompts/coder.md
+  created   /Users/you/code/acme/.chocofactory/workflows/prompts/coder-system.md
+  created   /Users/you/code/acme/.chocofactory/workflows/prompts/coder-turn.md
   ...
 
 Commit this directory so the team shares it: git add .chocofactory/ && git commit

@@ -16,46 +16,49 @@ Handing a coding task to an AI agent and walking away goes wrong in familiar way
 
 ## How ChocoFactory solves it
 
-- **Workflows as explicit stages.** The built-in `coding-task` workflow goes: code → internal review → open a PR → wait for CI → human review → done. Every way back (a rejected review, red CI, your `/request-changes`, a resumed escalation) goes through a revise stage, so there is one path for fixing things.
-- **A separate reviewer.** A different agent, in its own session and read-only, reviews the change against the spec before any PR exists. Read-only is enforced: the daemon checks that the worktree didn't change.
-- **Loop guards and escalation.** Repeated rejections, repeated red CI, or no verdict from you for six hours park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck.
-- **Tasks survive restarts.** Everything lives in the daemon's database. Waits survive a restart. Interrupted agent turns are parked and can be retried, resuming the agent's session when possible.
-- **Isolation from your personal setup.** On the coding workflows, agents don't see your `~/.claude/CLAUDE.md`, plugins, hooks, MCP servers or memory. They see the repo's own instruction files. (The built-in `chat` workflow deliberately inherits your setup.) Each task works in its own git worktree.
-- **Your verdict lives on the PR.** Comment `/approve` or `/request-changes` on the pull request.
-- **One dashboard** (`choco dashboard`) for every task: what needs you, what's running, what's stuck.
-- **Checking the spec first.** `coding-task-planned` puts a planning agent in front. It checks the spec against the code and asks you only when it must.
-- **Multi-model support.** Each role resolves its own CLI and model, so the coder and the reviewer can run different models. Roles run on Claude Code by default. A role can run on [omp (oh-my-pi)](https://github.com/can1357/oh-my-pi) instead, which reaches other providers' models. For example, a Claude coder with an OpenAI GPT reviewer, using your existing omp login:
+- **A workflow is a state machine.** Every task moves through explicit stages, and every transition is a named outcome. The built-in `coding-task` goes: code → internal review → open a PR → wait for CI → human review → done. Every way back (a rejected review, red CI, your `/request-changes`, a resumed escalation) goes through a revise stage, so there is one path for fixing things.
+- **Several workflows come built in.** `coding-task` is the full pipeline above. `coding-task-planned` puts a planning agent in front: it checks the spec against the code and asks you only when it must. `chat` is a deliberately simple example, a single standing conversation with an agent.
+- **A workflow is just a YAML file.** You, or your agents, can write your own workflows from scratch, or copy a built-in and change its stages, roles, models and prompts. Put them in your repo's `.chocofactory/workflows/` and the whole team shares them. See [Customising workflows](#customising-workflows).
+- **Harnesses and models are per role.** Roles run on Claude Code by default. A role can run on [omp (oh-my-pi)](https://github.com/can1357/oh-my-pi) instead, which reaches other providers' models, so the coder and the reviewer can run different models. For example, a Claude coder with an OpenAI GPT reviewer, using your existing omp login:
 
   ```
   choco task create ... --role-cli reviewer=omp --role-model reviewer=openai-codex/gpt-5.6-terra
   ```
 
-  This has been verified with OpenAI models over omp's OAuth login. An Anthropic model *through omp* needs an Anthropic API key, not a Claude subscription login; see [`cli: omp`](docs/models.md#cli-omp).
+  See [Using choco with omp](docs/models.md#using-choco-with-omp).
+- **A separate reviewer.** A different agent, in its own session and read-only, reviews the change against the spec before any PR exists. Read-only is enforced: the daemon checks that the worktree didn't change.
+- **Loop guards and escalation.** Repeated rejections, repeated red CI, or no verdict from you for six hours park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck.
+- **Tasks survive restarts.** Everything lives in the daemon's database. Waits survive a restart. Interrupted agent turns are parked and can be retried, resuming the agent's session when possible.
+- **Your verdict lives on the PR.** Comment `/approve` or `/request-changes` on the pull request.
+- **One dashboard** (`choco dashboard`) for every task: what needs you, what's running, what's stuck.
+- **Each task gets its own git worktree**, so tasks don't step on each other or on your checkout.
 
-## An example
+## How it is used
 
-One task, from issue to merged PR. The repo `myapp` and issue 42 are made up.
+You don't normally type the `choco task create` commands yourself. You work from a coding agent, such as Claude Code, that has been given the [`run-choco-task` skill](#using-choco-from-claude-code), which teaches it how to run choco.
 
-```
-choco server start
-choco project create myapp --repo ~/code/myapp
-choco task create --project myapp --workflow coding-task \
-  --title "Fix the login redirect (#42)" --prompt "$(cat spec.md)"
-choco dashboard
-gh pr list --head task/<id>
-gh pr comment <number> --body "/approve"
-gh pr merge <number> --squash
-```
+1. You ask your agent to have choco implement something, for example "implement issue 42".
+2. The agent writes a real spec for the task. The spec is the coding agent's whole brief, so it should be a spec, not one line.
+3. The agent creates the task through choco's API, using the same command you could type:
 
-1. Start the daemon.
-2. Register your repo as a project.
-3. Create the task. It prints the task's id. The spec in `spec.md` is the agent's whole brief, so make it a real spec, not one line.
-4. Watch it with `choco dashboard`, or block until it needs you: `choco task status <id> --until stage:awaiting_human_review --timeout 2h`.
-5. Find its PR. The branch is named `task/<id>`.
-6. Approve it by commenting `/approve` on the PR (or use the GitHub web UI to comment). The task moves to done.
-7. Merge it, with any merge method. Merging is still yours to do (merging on its own also counts as approval).
+   ```
+   choco task create --project myapp --workflow coding-task \
+     --title "Fix the login redirect (#42)" --prompt "$(cat spec.md)"
+   ```
 
-Because the title ends in `(#42)`, the PR body says `Closes #42`, so merging closes the issue.
+   It prints the task's id. Because the title ends in `(#42)`, the PR body will say `Closes #42`, so merging closes the issue.
+4. The agent monitors the task, for example with `choco task status <id> --until stage:awaiting_human_review --timeout 2h`.
+5. At the same time you can open `choco dashboard` in another terminal and watch the progress yourself.
+6. When the task reaches human review, the PR is open (the branch is `task/<id>`). The agent, or you, reviews it and comments `/approve` (`gh pr comment <number> --body "/approve"`) or `/request-changes`. `/approve` moves the task to done. Merging (`gh pr merge <number> --squash`, or any merge method) is still yours to do, and merging on its own also counts as approval.
+
+`myapp` and issue 42 are made up. The one-time setup before the first task is under [Quick start](#quick-start).
+
+## Prerequisites
+
+- **`claude` CLI**, logged in: see the [Claude Code quickstart](https://code.claude.com/docs/en/quickstart). Every agent turn runs it, so tasks cost real money.
+- **`gh`**, authenticated as the account that opens the PRs: see [installing the GitHub CLI](https://github.com/cli/cli#installation) and run `gh auth login`.
+- **`git`**: see [installing Git](https://git-scm.com/downloads).
+- **`omp`** ([oh-my-pi](https://github.com/can1357/oh-my-pi)), installed and logged in. Needed only for roles that run on `cli: omp`; see [Using choco with omp](docs/models.md#using-choco-with-omp).
 
 ## Install
 
@@ -68,15 +71,11 @@ curl -fsSL https://github.com/itsypkin/ChocoFactory/releases/latest/download/ins
 - The two binaries always live **side by side** in one directory: `chocofactoryd` hands agents the `choco` next to it, and `choco server start` runs the `chocofactoryd` next to it.
 - The installer's environment variables, checksum verification and installing from source are in [docs/cli.md](docs/cli.md#updating).
 
-What you need first:
-
-- The **`claude` CLI**, logged in. Every agent turn runs it, so tasks cost real money.
-- **`gh`**, authenticated as the account that opens the PRs.
-- **`git`**.
-
-To update, run `choco update`. `choco update --check` only reports whether an update is available. A running daemon started from the install directory is restarted on the same port (`update` refuses with exit 3 while an agent turn is running, unless you pass `--force`); the built-in workflows update with the binary.
+To update, run `choco update`. `choco update --check` only reports whether an update is available. A running daemon started from the install directory is restarted on the same port (`update` refuses with exit 3 while any work is in flight, an agent turn or a shell step, unless you pass `--force`); the built-in workflows update with the binary.
 
 ## Quick start
+
+Done once, the first time you use choco:
 
 ```
 choco server start                          # background daemon; waits until it answers
@@ -84,7 +83,7 @@ choco server status                         # version, pid, port, open tasks
 choco project create <name> --repo <path>   # register a repo
 ```
 
-Then create a task as in the example above, and watch it in the [dashboard](#the-dashboard). The full walkthrough (statuses, cost and time, messages, cancelling, events) is in [docs/cli.md](docs/cli.md#a-full-walkthrough). If a task gets stuck, see [Stuck tasks](docs/cli.md#stuck-tasks).
+After that you only create tasks. Create one as in [How it is used](#how-it-is-used), and watch it in the [dashboard](#the-dashboard). The full walkthrough (statuses, cost and time, messages, cancelling, events) is in [docs/cli.md](docs/cli.md#a-full-walkthrough). If a task gets stuck, see [Stuck tasks](docs/cli.md#stuck-tasks).
 
 ## The dashboard
 

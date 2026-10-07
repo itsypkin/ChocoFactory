@@ -227,14 +227,18 @@ stage; a retry stays in its lap. `choco task list --json` carries each task's
 total as `usage_total`.
 
 Send a message to a task. What a task accepts depends on its stage: a
-standing agent stage such as `chat`'s takes a message into the live session,
-and a `human_gate` (or `escalate_to_human`) takes a message that resumes it.
+standing agent stage such as `chat`'s takes a message into the live session
+(the agent's reply is recorded as an event), and a `human_gate` (or
+`escalate_to_human`) takes a message that resumes it.
 A `coding-task` accepts a message only at its human gates; at its other agent
 stages (`coding`, `internal_review`, `revising`) the daemon answers `409`.
 At a gate that has markers, such as `awaiting_human_review`, the text must
 carry exactly one of them on a line of its own.
-The daemon accepts it asynchronously — the agent's reply lands as an
-event, not in this response:
+
+Once the task reaches `awaiting_human_review`, a message with a marker is
+recorded as an event and moves the task on (here `/approve` moves it to done).
+The daemon accepts it asynchronously, so the effect shows up in the task's
+events, not in this response:
 
 ```
 $ choco task send bb93ada3-... --text $'Looks good.\n/approve'

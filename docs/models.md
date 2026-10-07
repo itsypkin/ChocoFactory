@@ -59,6 +59,24 @@ $ choco task create ... --config '{"roles":{"coder":{"model":"opus"}}}'
 ```
 
 
+## Using choco with omp
+
+To run a role on a model from another provider, run it on omp.
+
+1. Install [omp (oh-my-pi)](https://github.com/can1357/oh-my-pi) and log in with the provider you want. choco uses that login as it is.
+2. Pick the role and model for one task:
+
+   ```
+   choco task create --project myapp --workflow coding-task \
+     --title "..." --prompt "$(cat spec.md)" \
+     --role-cli reviewer=omp --role-model reviewer=openai-codex/gpt-5.6-terra
+   ```
+
+   Or set `cli: omp` and `model:` on the role in a workflow file, as in [`cli: omp`](#cli-omp).
+3. Watch the task as usual. The roles you didn't change keep running on Claude Code.
+
+omp has been verified with OpenAI models over its OAuth login. An Anthropic model *through omp* needs an Anthropic API key, not a Claude subscription login; the details are in [`cli: omp`](#cli-omp).
+
 ## `cli: omp`
 
 `omp` is [oh-my-pi](https://github.com/can1357/oh-my-pi), a fork of the Pi
