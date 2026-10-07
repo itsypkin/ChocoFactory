@@ -62,6 +62,7 @@ fn summary(
         stage_entered_at: entered_mins_ago.map(mins_ago),
         loop_counters: json!({}),
         pr: None,
+        waiting_on_human: false,
     }
 }
 

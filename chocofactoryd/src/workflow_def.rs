@@ -61,6 +61,7 @@ impl WorkflowDefinition {
     /// existence against the real filesystem).
     pub fn parse(source: &str, base_dir: &Path) -> Result<Self, WorkflowDefError> {
         let raw: RawDefinition = serde_yaml::from_str(source).map_err(WorkflowDefError::Yaml)?;
+        reject_unknown_stage_keys(source)?;
 
         let worktree = raw.worktree;
         let roles = raw
@@ -185,30 +186,8 @@ impl WorkflowDefinition {
                 });
             }
 
-            if let StageKind::Poll {
-                timeout, outcomes, ..
-            } = &stage.kind
-            {
-                for outcome in outcomes {
-                    if !stage.on.contains_key(&outcome.then) {
-                        return Err(WorkflowDefError::UnknownPollOutcome {
-                            stage: stage_name.clone(),
-                            outcome: outcome.then.clone(),
-                        });
-                    }
-                    if let Err(reason) = Regex::new(&outcome.pattern) {
-                        return Err(WorkflowDefError::InvalidPollPattern {
-                            stage: stage_name.clone(),
-                            pattern: outcome.pattern.clone(),
-                            reason: reason.to_string(),
-                        });
-                    }
-                }
-                if timeout.is_some() && !stage.on.contains_key("timeout") {
-                    return Err(WorkflowDefError::MissingTimeoutOutcome {
-                        stage: stage_name.clone(),
-                    });
-                }
+            if let Some(watch) = stage.watch() {
+                validate_watch(stage_name, stage, watch)?;
             }
 
             // An `agent_turn` with an empty `on:` is chat's open-ended shape
@@ -283,6 +262,7 @@ impl WorkflowDefinition {
             // run time.
             if let StageKind::HumanGate {
                 capture: Some(Capture::Json),
+                ..
             } = &stage.kind
             {
                 return Err(WorkflowDefError::HumanGateCaptureMustBeText {
@@ -290,26 +270,12 @@ impl WorkflowDefinition {
                 });
             }
 
-            if let StageKind::Shell { env, .. } | StageKind::Poll { env, .. } = &stage.kind {
-                for name in env.keys() {
-                    let mut chars = name.chars();
-                    let valid = chars
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-                    if !valid {
-                        return Err(WorkflowDefError::InvalidEnvName {
-                            stage: stage_name.clone(),
-                            name: name.clone(),
-                        });
-                    }
-                    if name.to_ascii_lowercase().starts_with("choco_") {
-                        return Err(WorkflowDefError::ReservedEnvName {
-                            stage: stage_name.clone(),
-                            name: name.clone(),
-                        });
-                    }
-                }
+            if let StageKind::HumanGate { markers, .. } = &stage.kind {
+                validate_markers(stage_name, stage, markers)?;
+            }
+
+            if let StageKind::Shell { env, .. } = &stage.kind {
+                validate_env_names(stage_name, env)?;
             }
 
             self.validate_templates(stage_name, stage)?;
@@ -513,6 +479,30 @@ pub struct StageDef {
     pub loop_guard: Option<LoopGuard>,
 }
 
+impl StageDef {
+    /// The stage's watcher: every `poll`, and a `human_gate` that has one.
+    pub fn watch(&self) -> Option<&Watch> {
+        match &self.kind {
+            StageKind::Poll { watch, .. } => Some(watch),
+            StageKind::HumanGate { watch, .. } => watch.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+impl StageKind {
+    /// The kind's name as YAML spells it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            StageKind::AgentTurn { .. } => "agent_turn",
+            StageKind::Shell { .. } => "shell",
+            StageKind::Poll { .. } => "poll",
+            StageKind::HumanGate { .. } => "human_gate",
+            StageKind::Terminal => "terminal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StageKind {
     AgentTurn {
@@ -552,20 +542,8 @@ pub enum StageKind {
         env: IndexMap<String, String>,
     },
     Poll {
-        command: ShellCommand,
         capture: Option<Capture>,
-        /// As `Shell`'s field of the same name.
-        env: IndexMap<String, String>,
-        /// How long to wait between the end of one attempt and the start
-        /// of the next.
-        interval: Duration,
-        /// How long to keep polling before giving up and emitting
-        /// `timeout`. Unlike `Shell`'s field of the same name this is a
-        /// budget for the whole loop rather than a per-command kill —
-        /// though it doubles as the latter, since each attempt is capped
-        /// at whatever is left of it.
-        timeout: Option<Duration>,
-        outcomes: Vec<PollOutcome>,
+        watch: Watch,
     },
     HumanGate {
         /// Keeps the human's reply that resumed this gate under
@@ -576,6 +554,12 @@ pub enum StageKind {
         /// rejected at load time (`validate`) — a human's reply is free
         /// text, not a command's structured stdout.
         capture: Option<Capture>,
+        /// Verdict lines a reply through choco must carry (#175). Empty
+        /// means the gate takes any reply and resumes on `resumed`.
+        markers: Vec<ReplyMarker>,
+        /// A watcher that runs while the gate waits, the same loop a `poll`
+        /// stage runs (#175).
+        watch: Option<Watch>,
     },
     Terminal,
 }
@@ -594,6 +578,31 @@ pub enum ShellCommand {
 pub enum Capture {
     Json,
     Text,
+}
+
+/// The watcher loop a `poll` stage is, and a `human_gate` may run (#175).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Watch {
+    pub command: ShellCommand,
+    /// As `Shell`'s field of the same name.
+    pub env: IndexMap<String, String>,
+    /// How long to wait between the end of one attempt and the start
+    /// of the next.
+    pub interval: Duration,
+    /// How long to keep polling before giving up and emitting
+    /// `timeout`. Unlike `Shell`'s field of the same name this is a
+    /// budget for the whole loop rather than a per-command kill —
+    /// though it doubles as the latter, since each attempt is capped
+    /// at whatever is left of it.
+    pub timeout: Option<Duration>,
+    pub outcomes: Vec<PollOutcome>,
+}
+
+/// A line a reply to a gate must carry, and the outcome it chooses (#175).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplyMarker {
+    pub line: String,
+    pub then: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -696,6 +705,64 @@ impl RawRole {
     }
 }
 
+/// Stage-level keys every kind accepts.
+const COMMON_STAGE_KEYS: &[&str] = &["kind", "on", "loop_guard"];
+
+/// The kind-specific stage keys, mirroring `RawStageKind`.
+fn stage_kind_keys(kind: &str) -> Option<&'static [&'static str]> {
+    Some(match kind {
+        "agent_turn" => &["role", "prompt_file", "capture", "report_sections"],
+        "shell" => &["command", "script_file", "capture", "timeout", "env"],
+        "poll" => &[
+            "command",
+            "script_file",
+            "capture",
+            "env",
+            "interval",
+            "timeout",
+            "outcomes",
+        ],
+        "human_gate" => &["capture", "markers", "watch"],
+        "terminal" => &[],
+        _ => return None,
+    })
+}
+
+/// `RawStage` flattens its internally tagged kind, and serde's
+/// `deny_unknown_fields` does not work through `flatten`, so a misspelt
+/// stage key (`marker:`, `wacth:`) would load and silently change what the
+/// stage does. This second pass over the raw YAML rejects any stage key the
+/// stage's kind does not define. Run after the typed parse, so it only sees
+/// well-formed stages.
+fn reject_unknown_stage_keys(source: &str) -> Result<(), WorkflowDefError> {
+    let value: serde_yaml::Value = serde_yaml::from_str(source).map_err(WorkflowDefError::Yaml)?;
+    let Some(stages) = value.get("stages").and_then(|s| s.as_mapping()) else {
+        return Ok(());
+    };
+    for (name, stage) in stages {
+        let (Some(name), Some(stage)) = (name.as_str(), stage.as_mapping()) else {
+            continue;
+        };
+        let Some(allowed) = stage
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .and_then(stage_kind_keys)
+        else {
+            continue;
+        };
+        for key in stage.keys() {
+            let Some(key) = key.as_str() else { continue };
+            if !COMMON_STAGE_KEYS.contains(&key) && !allowed.contains(&key) {
+                return Err(WorkflowDefError::UnknownStageKey {
+                    stage: name.to_string(),
+                    key: key.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct RawStage {
     #[serde(flatten)]
@@ -757,8 +824,38 @@ enum RawStageKind {
     HumanGate {
         #[serde(default)]
         capture: Option<Capture>,
+        #[serde(default)]
+        markers: Option<Vec<RawReplyMarker>>,
+        #[serde(default)]
+        watch: Option<RawWatch>,
     },
     Terminal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWatch {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    script_file: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+    )]
+    env: IndexMap<String, String>,
+    interval: String,
+    #[serde(default)]
+    timeout: Option<String>,
+    #[serde(default)]
+    outcomes: Vec<RawPollOutcome>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawReplyMarker {
+    line: String,
+    then: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -836,34 +933,62 @@ impl RawStage {
                 outcomes,
                 env,
             } => StageKind::Poll {
-                command: resolve_command(base_dir, stage_name, command, script_file)?,
                 capture,
-                env,
-                interval: parse_duration(&interval).map_err(|value| {
-                    WorkflowDefError::InvalidDuration {
-                        stage: stage_name.to_string(),
-                        field: "interval",
-                        value,
-                    }
-                })?,
-                timeout: timeout
-                    .map(|value| {
-                        parse_duration(&value).map_err(|value| WorkflowDefError::InvalidDuration {
+                watch: resolve_watch(
+                    base_dir,
+                    stage_name,
+                    WatchFields {
+                        command,
+                        script_file,
+                        env,
+                        interval,
+                        timeout,
+                        outcomes,
+                    },
+                    ("interval", "timeout"),
+                )?,
+            },
+            RawStageKind::HumanGate {
+                capture,
+                markers,
+                watch,
+            } => StageKind::HumanGate {
+                capture,
+                markers: match markers {
+                    None => Vec::new(),
+                    // An explicit `markers: []` can't be told from "no markers"
+                    // once resolved, so it is rejected here.
+                    Some(list) if list.is_empty() => {
+                        return Err(WorkflowDefError::EmptyReplyMarkers {
                             stage: stage_name.to_string(),
-                            field: "timeout",
-                            value,
+                        });
+                    }
+                    Some(list) => list
+                        .into_iter()
+                        .map(|m| ReplyMarker {
+                            line: m.line,
+                            then: m.then,
                         })
+                        .collect(),
+                },
+                watch: watch
+                    .map(|w| {
+                        resolve_watch(
+                            base_dir,
+                            stage_name,
+                            WatchFields {
+                                command: w.command,
+                                script_file: w.script_file,
+                                env: w.env,
+                                interval: w.interval,
+                                timeout: w.timeout,
+                                outcomes: w.outcomes,
+                            },
+                            ("watch.interval", "watch.timeout"),
+                        )
                     })
                     .transpose()?,
-                outcomes: outcomes
-                    .into_iter()
-                    .map(|o| PollOutcome {
-                        pattern: o.pattern,
-                        then: o.then,
-                    })
-                    .collect(),
             },
-            RawStageKind::HumanGate { capture } => StageKind::HumanGate { capture },
             RawStageKind::Terminal => StageKind::Terminal,
         };
 
@@ -873,6 +998,155 @@ impl RawStage {
             loop_guard: self.loop_guard,
         })
     }
+}
+
+struct WatchFields {
+    command: Option<String>,
+    script_file: Option<String>,
+    env: IndexMap<String, String>,
+    interval: String,
+    timeout: Option<String>,
+    outcomes: Vec<RawPollOutcome>,
+}
+
+/// Every check on a watcher's fields, for a `poll` and for a gate's `watch:`.
+fn validate_watch(
+    stage_name: &str,
+    stage: &StageDef,
+    watch: &Watch,
+) -> Result<(), WorkflowDefError> {
+    for outcome in &watch.outcomes {
+        if !stage.on.contains_key(&outcome.then) {
+            return Err(WorkflowDefError::UnknownPollOutcome {
+                stage: stage_name.to_string(),
+                outcome: outcome.then.clone(),
+            });
+        }
+        if let Err(reason) = Regex::new(&outcome.pattern) {
+            return Err(WorkflowDefError::InvalidPollPattern {
+                stage: stage_name.to_string(),
+                pattern: outcome.pattern.clone(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+    if watch.timeout.is_some() && !stage.on.contains_key("timeout") {
+        return Err(WorkflowDefError::MissingTimeoutOutcome {
+            stage: stage_name.to_string(),
+        });
+    }
+    validate_env_names(stage_name, &watch.env)
+}
+
+fn validate_env_names(
+    stage_name: &str,
+    env: &IndexMap<String, String>,
+) -> Result<(), WorkflowDefError> {
+    for name in env.keys() {
+        let mut chars = name.chars();
+        let valid = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(WorkflowDefError::InvalidEnvName {
+                stage: stage_name.to_string(),
+                name: name.clone(),
+            });
+        }
+        if name.to_ascii_lowercase().starts_with("choco_") {
+            return Err(WorkflowDefError::ReservedEnvName {
+                stage: stage_name.to_string(),
+                name: name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks a gate's `markers:` (#175). An empty list is rejected earlier, at
+/// resolve time, where it can still be told from an absent one.
+fn validate_markers(
+    stage_name: &str,
+    stage: &StageDef,
+    markers: &[ReplyMarker],
+) -> Result<(), WorkflowDefError> {
+    let mut seen: Vec<&str> = Vec::new();
+    for marker in markers {
+        let line = marker.line.as_str();
+        let stage_name = stage_name.to_string();
+        if line.is_empty() {
+            return Err(WorkflowDefError::EmptyReplyMarkerLine { stage: stage_name });
+        }
+        if line != line.trim() {
+            return Err(WorkflowDefError::ReplyMarkerLineHasSurroundingWhitespace {
+                stage: stage_name,
+                line: marker.line.clone(),
+            });
+        }
+        if line.contains('\n') || line.contains('\r') {
+            return Err(WorkflowDefError::ReplyMarkerLineHasNewline {
+                stage: stage_name,
+                line: marker.line.clone(),
+            });
+        }
+        if seen.contains(&line) {
+            return Err(WorkflowDefError::DuplicateReplyMarker {
+                stage: stage_name,
+                line: marker.line.clone(),
+            });
+        }
+        seen.push(line);
+        if !stage.on.contains_key(&marker.then) {
+            return Err(WorkflowDefError::UnknownReplyMarkerOutcome {
+                stage: stage_name,
+                outcome: marker.then.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Resolves a watcher's raw fields. `fields` names the duration fields in
+/// `InvalidDuration` errors: `interval`/`timeout` for a poll's flat keys,
+/// `watch.interval`/`watch.timeout` for a gate's map.
+fn resolve_watch(
+    base_dir: &Path,
+    stage_name: &str,
+    raw: WatchFields,
+    fields: (&'static str, &'static str),
+) -> Result<Watch, WorkflowDefError> {
+    let command = resolve_command(base_dir, stage_name, raw.command, raw.script_file)?;
+    let interval =
+        parse_duration(&raw.interval).map_err(|value| WorkflowDefError::InvalidDuration {
+            stage: stage_name.to_string(),
+            field: fields.0,
+            value,
+        })?;
+    let timeout = raw
+        .timeout
+        .map(|value| {
+            parse_duration(&value).map_err(|value| WorkflowDefError::InvalidDuration {
+                stage: stage_name.to_string(),
+                field: fields.1,
+                value,
+            })
+        })
+        .transpose()?;
+    Ok(Watch {
+        command,
+        env: raw.env,
+        interval,
+        timeout,
+        outcomes: raw
+            .outcomes
+            .into_iter()
+            .map(|o| PollOutcome {
+                pattern: o.pattern,
+                then: o.then,
+            })
+            .collect(),
+    })
 }
 
 /// Resolves the `command:`/`script_file:` pair that `shell` and `poll`
@@ -946,15 +1220,22 @@ fn templatable_sources(
 ) -> Result<Vec<(String, String)>, WorkflowDefError> {
     let mut sources = Vec::new();
     match &stage.kind {
-        StageKind::Shell { command, env, .. } | StageKind::Poll { command, env, .. } => {
-            if let ShellCommand::Inline(command) = command {
-                sources.push(("command".to_string(), command.clone()));
-            }
-            // Templated whether the command is inline or a `script_file`:
-            // the script isn't, but its environment is (#101).
-            for (name, value) in env {
-                sources.push((format!("env '{name}'"), value.clone()));
-            }
+        StageKind::Shell { command, env, .. } => {
+            push_command_sources(&mut sources, "command", "env", command, env);
+        }
+        StageKind::Poll { watch, .. } => {
+            push_command_sources(&mut sources, "command", "env", &watch.command, &watch.env);
+        }
+        StageKind::HumanGate {
+            watch: Some(watch), ..
+        } => {
+            push_command_sources(
+                &mut sources,
+                "watch.command",
+                "watch.env",
+                &watch.command,
+                &watch.env,
+            );
         }
         StageKind::AgentTurn {
             prompt_file: Some(path),
@@ -977,6 +1258,23 @@ fn templatable_sources(
         _ => {}
     }
     Ok(sources)
+}
+
+fn push_command_sources(
+    sources: &mut Vec<(String, String)>,
+    command_label: &str,
+    env_label: &str,
+    command: &ShellCommand,
+    env: &IndexMap<String, String>,
+) {
+    if let ShellCommand::Inline(command) = command {
+        sources.push((command_label.to_string(), command.clone()));
+    }
+    // Templated whether the command is inline or a `script_file`:
+    // the script isn't, but its environment is (#101).
+    for (name, value) in env {
+        sources.push((format!("{env_label} '{name}'"), value.clone()));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1101,6 +1399,32 @@ pub enum WorkflowDefError {
     },
     HumanGateCaptureMustBeText {
         stage: String,
+    },
+    EmptyReplyMarkers {
+        stage: String,
+    },
+    EmptyReplyMarkerLine {
+        stage: String,
+    },
+    ReplyMarkerLineHasSurroundingWhitespace {
+        stage: String,
+        line: String,
+    },
+    ReplyMarkerLineHasNewline {
+        stage: String,
+        line: String,
+    },
+    DuplicateReplyMarker {
+        stage: String,
+        line: String,
+    },
+    UnknownReplyMarkerOutcome {
+        stage: String,
+        outcome: String,
+    },
+    UnknownStageKey {
+        stage: String,
+        key: String,
     },
     InvalidTemplate {
         stage: String,
@@ -1265,6 +1589,37 @@ impl fmt::Display for WorkflowDefError {
                 "human_gate stage '{stage}' declares 'capture: json', but a human's reply is free \
                  text, not structured data — only 'capture: text' is supported"
             ),
+            WorkflowDefError::EmptyReplyMarkers { stage } => write!(
+                f,
+                "human_gate stage '{stage}' declares 'markers:' but the list is empty"
+            ),
+            WorkflowDefError::EmptyReplyMarkerLine { stage } => write!(
+                f,
+                "human_gate stage '{stage}' has a reply marker with an empty 'line:'"
+            ),
+            WorkflowDefError::ReplyMarkerLineHasSurroundingWhitespace { stage, line } => write!(
+                f,
+                "human_gate stage '{stage}' has the reply marker line {line:?}, which has leading \
+                 or trailing whitespace"
+            ),
+            WorkflowDefError::ReplyMarkerLineHasNewline { stage, line } => write!(
+                f,
+                "human_gate stage '{stage}' has the reply marker line {line:?}, which spans more \
+                 than one line"
+            ),
+            WorkflowDefError::DuplicateReplyMarker { stage, line } => write!(
+                f,
+                "human_gate stage '{stage}' lists the reply marker line {line:?} more than once"
+            ),
+            WorkflowDefError::UnknownStageKey { stage, key } => write!(
+                f,
+                "stage '{stage}' has the key '{key}', which its kind does not define"
+            ),
+            WorkflowDefError::UnknownReplyMarkerOutcome { stage, outcome } => write!(
+                f,
+                "human_gate stage '{stage}' has a reply marker for the outcome '{outcome}', which \
+                 is not in its 'on:' map"
+            ),
             WorkflowDefError::InvalidTemplate {
                 stage,
                 field,
@@ -1333,6 +1688,46 @@ impl std::error::Error for WorkflowDefError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_kind_names_match_the_yaml_spelling() {
+        let yaml = r#"
+name: names
+roles:
+  coder: { cli: claude, model: sonnet }
+stages:
+  a:
+    kind: agent_turn
+    role: coder
+    on: { done: b }
+  b:
+    kind: shell
+    command: "true"
+    on: { done: c }
+  c:
+    kind: poll
+    command: "true"
+    interval: 1s
+    outcomes:
+      - match: x
+        then: done
+    on: { done: d }
+  d:
+    kind: human_gate
+    on: { resumed: e }
+  e:
+    kind: terminal
+"#;
+        let def = WorkflowDefinition::parse(yaml, Path::new(".")).unwrap();
+        let names: Vec<_> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| def.stages[*s].kind.name())
+            .collect();
+        assert_eq!(
+            names,
+            ["agent_turn", "shell", "poll", "human_gate", "terminal"]
+        );
+    }
     use std::io::Write;
 
     struct TempDir {
@@ -1689,18 +2084,12 @@ stages:
         assert_eq!(def.start_stage(), "coding");
         assert_eq!(def.stages.len(), 7);
 
-        let StageKind::Poll {
-            interval,
-            timeout,
-            outcomes,
-            ..
-        } = &def.stages["checks_polling"].kind
-        else {
-            panic!("expected poll stage");
-        };
-        assert_eq!(*interval, Duration::from_secs(30));
-        assert_eq!(*timeout, Some(Duration::from_secs(300)));
-        assert_eq!(outcomes.len(), 2);
+        let stage = &def.stages["checks_polling"];
+        assert!(matches!(stage.kind, StageKind::Poll { .. }));
+        let watch = stage.watch().expect("a poll has a watch");
+        assert_eq!(watch.interval, Duration::from_secs(30));
+        assert_eq!(watch.timeout, Some(Duration::from_secs(300)));
+        assert_eq!(watch.outcomes.len(), 2);
 
         let guard = def.stages["internal_review"].loop_guard.as_ref().unwrap();
         assert_eq!(guard.on, "changes_requested");
@@ -2125,12 +2514,10 @@ stages:
     kind: terminal
 "#;
         let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
-        let StageKind::Poll {
-            command, capture, ..
-        } = &def.stages["waiting"].kind
-        else {
+        let StageKind::Poll { capture, .. } = &def.stages["waiting"].kind else {
             panic!("expected poll stage");
         };
+        let command = &def.stages["waiting"].watch().unwrap().command;
         assert_eq!(
             *command,
             ShellCommand::ScriptFile(dir.path.join("check.sh"))
@@ -2156,12 +2543,10 @@ stages:
     kind: terminal
 "#;
         let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
-        let StageKind::Poll {
-            command, capture, ..
-        } = &def.stages["waiting"].kind
-        else {
+        let StageKind::Poll { capture, .. } = &def.stages["waiting"].kind else {
             panic!("expected poll stage");
         };
+        let command = &def.stages["waiting"].watch().unwrap().command;
         assert_eq!(*command, ShellCommand::Inline("gh pr checks 1".to_string()));
         assert_eq!(*capture, None);
     }
@@ -2927,7 +3312,7 @@ stages:
     kind: terminal
 "#;
         let def = WorkflowDefinition::parse(yaml, &dir.path).unwrap();
-        let StageKind::HumanGate { capture } = &def.stages["gate"].kind else {
+        let StageKind::HumanGate { capture, .. } = &def.stages["gate"].kind else {
             panic!("expected human_gate stage");
         };
         assert_eq!(*capture, Some(Capture::Text));
@@ -3231,9 +3616,7 @@ stages:
             panic!("expected shell");
         };
         assert_eq!(env.keys().collect::<Vec<_>>(), ["ZED", "ALPHA"]);
-        let StageKind::Poll { env, .. } = &def.stages["wait"].kind else {
-            panic!("expected poll");
-        };
+        let env = &def.stages["wait"].watch().expect("expected poll").env;
         assert_eq!(env.keys().collect::<Vec<_>>(), ["B", "A"]);
     }
 
@@ -3351,5 +3734,400 @@ stages:
                 ("PR_REVIEW_REPORT", "{{ stages.internal_review.summary }}"),
             ]
         );
+    }
+
+    // ---- #175: a human_gate's `watch:` and `markers:` ----
+
+    /// A gate YAML with the given `watch:`/`markers:` blocks, each indented
+    /// under `gate:`; `on:` has `resumed`, `approved`, `changes_requested`
+    /// and `timeout`.
+    fn gate_yaml(extra: &str) -> String {
+        format!(
+            r#"
+name: gated
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+{extra}
+    on: {{ resumed: finished, approved: finished, changes_requested: finished, timeout: finished }}
+  finished:
+    kind: terminal
+"#
+        )
+    }
+
+    const GATE_WATCH: &str = "    watch:\n      command: \"echo hi\"\n      interval: 5s\n";
+
+    fn gate_err(extra: &str) -> WorkflowDefError {
+        let dir = TempDir::new();
+        WorkflowDefinition::parse(&gate_yaml(extra), &dir.path).unwrap_err()
+    }
+
+    #[test]
+    fn a_gate_with_watch_and_markers_loads_every_field() {
+        let dir = TempDir::new();
+        let yaml = gate_yaml(
+            r#"    watch:
+      command: "echo {{ task.title }}"
+      env:
+        B: "b"
+        A: "{{ task.title }}"
+      interval: 5s
+      timeout: 2h
+      outcomes:
+        - match: "GO"
+          then: approved
+    markers:
+      - line: /request-changes
+        then: changes_requested
+      - line: /approve
+        then: approved"#,
+        );
+        let def = WorkflowDefinition::parse(&yaml, &dir.path).unwrap();
+        let StageKind::HumanGate {
+            capture,
+            markers,
+            watch,
+        } = &def.stages["gate"].kind
+        else {
+            panic!("expected human_gate");
+        };
+        assert_eq!(*capture, Some(Capture::Text));
+        let watch = watch.as_ref().expect("watch");
+        assert_eq!(
+            watch.command,
+            ShellCommand::Inline("echo {{ task.title }}".to_string())
+        );
+        assert_eq!(watch.env.keys().collect::<Vec<_>>(), ["B", "A"]);
+        assert_eq!(watch.interval, Duration::from_secs(5));
+        assert_eq!(watch.timeout, Some(Duration::from_secs(7200)));
+        assert_eq!(
+            watch.outcomes,
+            [PollOutcome {
+                pattern: "GO".into(),
+                then: "approved".into()
+            }]
+        );
+        assert_eq!(
+            *markers,
+            [
+                ReplyMarker {
+                    line: "/request-changes".into(),
+                    then: "changes_requested".into()
+                },
+                ReplyMarker {
+                    line: "/approve".into(),
+                    then: "approved".into()
+                }
+            ]
+        );
+        assert_eq!(def.stages["gate"].watch(), Some(watch));
+        assert_eq!(def.stages["gate"].kind.name(), "human_gate");
+    }
+
+    #[test]
+    fn a_gate_watch_script_file_resolves_against_the_definition_directory() {
+        let dir = TempDir::new();
+        dir.write("check.sh", "#!/bin/sh\necho hi\n");
+        let yaml = gate_yaml("    watch:\n      script_file: check.sh\n      interval: 1s\n");
+        let def = WorkflowDefinition::parse(&yaml, &dir.path).unwrap();
+        assert_eq!(
+            def.stages["gate"].watch().unwrap().command,
+            ShellCommand::ScriptFile(dir.path.join("check.sh"))
+        );
+    }
+
+    #[test]
+    fn a_gate_without_watch_or_markers_has_neither() {
+        let dir = TempDir::new();
+        let def = WorkflowDefinition::parse(&gate_yaml(""), &dir.path).unwrap();
+        let StageKind::HumanGate { markers, watch, .. } = &def.stages["gate"].kind else {
+            panic!("expected human_gate");
+        };
+        assert!(markers.is_empty());
+        assert!(watch.is_none());
+        assert!(def.stages["gate"].watch().is_none());
+    }
+
+    #[test]
+    fn a_stage_that_is_not_a_poll_or_watching_gate_has_no_watch() {
+        let dir = TempDir::new();
+        let def = WorkflowDefinition::parse(&gate_yaml(""), &dir.path).unwrap();
+        assert!(def.stages["finished"].watch().is_none());
+        assert_eq!(def.stages["finished"].kind.name(), "terminal");
+    }
+
+    #[test]
+    fn an_unknown_key_inside_a_gates_watch_fails_the_load() {
+        let err = gate_err(&format!("{GATE_WATCH}      retries: 3\n"));
+        assert!(matches!(err, WorkflowDefError::Yaml(_)), "{err}");
+    }
+
+    #[test]
+    fn a_gate_watch_without_an_interval_fails_the_load() {
+        let err = gate_err("    watch:\n      command: \"echo hi\"\n");
+        assert!(matches!(err, WorkflowDefError::Yaml(_)), "{err}");
+    }
+
+    #[test]
+    fn a_gate_watch_reports_its_durations_with_the_watch_prefix() {
+        let err = gate_err("    watch:\n      command: x\n      interval: soon\n");
+        assert!(
+            matches!(&err, WorkflowDefError::InvalidDuration { stage, field: "watch.interval", .. } if stage == "gate"),
+            "{err}"
+        );
+        let err =
+            gate_err("    watch:\n      command: x\n      interval: 1s\n      timeout: later\n");
+        assert!(
+            matches!(&err, WorkflowDefError::InvalidDuration { stage, field: "watch.timeout", .. } if stage == "gate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_polls_durations_keep_their_flat_names() {
+        let dir = TempDir::new();
+        let yaml = "name: p\nstages:\n  w:\n    kind: poll\n    command: x\n    interval: soon\n    on: { a: f }\n  f:\n    kind: terminal\n";
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WorkflowDefError::InvalidDuration {
+                    field: "interval",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_gate_watch_outcome_must_be_an_on_key() {
+        let err = gate_err(&format!(
+            "{GATE_WATCH}      outcomes:\n        - match: GO\n          then: nowhere\n"
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownPollOutcome { stage, outcome } if stage == "gate" && outcome == "nowhere"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_gate_watch_pattern_must_compile() {
+        let err = gate_err(&format!(
+            "{GATE_WATCH}      outcomes:\n        - match: \"(\"\n          then: approved\n"
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::InvalidPollPattern { stage, .. } if stage == "gate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_gate_watch_timeout_needs_a_timeout_edge() {
+        let dir = TempDir::new();
+        let yaml = r#"
+name: g
+stages:
+  gate:
+    kind: human_gate
+    watch:
+      command: x
+      interval: 1s
+      timeout: 1m
+    on: { resumed: finished }
+  finished:
+    kind: terminal
+"#;
+        let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::MissingTimeoutOutcome { stage } if stage == "gate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_gate_watch_env_names_are_checked() {
+        let err = gate_err(&format!("{GATE_WATCH}      env:\n        CHOCO_X: \"1\"\n"));
+        assert!(
+            matches!(&err, WorkflowDefError::ReservedEnvName { stage, .. } if stage == "gate"),
+            "{err}"
+        );
+        let err = gate_err(&format!("{GATE_WATCH}      env:\n        \"1X\": \"1\"\n"));
+        assert!(
+            matches!(&err, WorkflowDefError::InvalidEnvName { stage, .. } if stage == "gate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_gate_watch_command_is_template_checked_with_a_watch_label() {
+        let err = gate_err(
+            "    watch:\n      command: \"echo {{ stages.ghost.out }}\"\n      interval: 1s\n",
+        );
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownTemplateStage { stage, field, .. } if stage == "gate" && field == "watch.command"),
+            "{err}"
+        );
+        let err = gate_err(&format!(
+            "{GATE_WATCH}      env:\n        K: \"{{{{ stages.finished.out }}}}\"\n"
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::TemplateStageCapturesNothing { stage, field, .. } if stage == "gate" && field == "watch.env 'K'"),
+            "{err}"
+        );
+        let err = gate_err(&format!(
+            "{GATE_WATCH}      env:\n        K: \"{{{{ bad\"\n"
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::InvalidTemplate { stage, field, .. } if stage == "gate" && field == "watch.env 'K'"),
+            "{err}"
+        );
+    }
+
+    fn markers_block(lines: &[(&str, &str)]) -> String {
+        let mut out = String::from("    markers:\n");
+        for (line, then) in lines {
+            out.push_str(&format!(
+                "      - line: {}\n        then: {then}\n",
+                serde_json::json!(line)
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn a_gate_rejects_unknown_stage_level_keys() {
+        for (key, line) in [
+            ("marker", "    marker: []\n"),
+            ("wacth", "    wacth: {}\n"),
+            ("interval", "    interval: 1s\n"),
+        ] {
+            let err = gate_err(line);
+            assert!(
+                matches!(&err, WorkflowDefError::UnknownStageKey { stage, key: k }
+                    if stage == "gate" && k == key),
+                "{err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("'gate'") && msg.contains(key), "{msg}");
+        }
+    }
+
+    #[test]
+    fn other_stage_kinds_reject_unknown_stage_level_keys() {
+        let cases = [
+            (
+                "poll",
+                "intervall",
+                "    kind: poll\n    command: \"echo hi\"\n    interval: 5s\n    intervall: 5s\n    on: { done: finished }\n",
+            ),
+            (
+                "shell",
+                "intervall",
+                "    kind: shell\n    command: \"echo hi\"\n    intervall: 5s\n    on: { done: finished }\n",
+            ),
+            (
+                "terminal",
+                "capture",
+                "    kind: terminal\n    capture: text\n",
+            ),
+        ];
+        for (kind, key, body) in cases {
+            let yaml = format!("name: x\nstages:\n  s:\n{body}  finished:\n    kind: terminal\n");
+            let yaml = if kind == "terminal" {
+                // `s` itself is the terminal stage under test; keep a start stage valid.
+                format!("name: x\nstages:\n  s:\n{body}")
+            } else {
+                yaml
+            };
+            let dir = TempDir::new();
+            let err = WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::UnknownStageKey { stage, key: k }
+                    if stage == "s" && k == key),
+                "{kind}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn markers_reject_an_empty_list() {
+        let err = gate_err("    markers: []\n");
+        assert!(
+            matches!(&err, WorkflowDefError::EmptyReplyMarkers { stage } if stage == "gate"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("'gate'"));
+    }
+
+    #[test]
+    fn markers_reject_an_empty_line() {
+        let err = gate_err(&markers_block(&[("", "approved")]));
+        assert!(
+            matches!(&err, WorkflowDefError::EmptyReplyMarkerLine { stage } if stage == "gate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn markers_reject_surrounding_whitespace() {
+        for line in [" /approve", "/approve "] {
+            let err = gate_err(&markers_block(&[(line, "approved")]));
+            assert!(
+                matches!(&err, WorkflowDefError::ReplyMarkerLineHasSurroundingWhitespace { stage, line: l } if stage == "gate" && l == line),
+                "{err}"
+            );
+            assert!(err.to_string().contains("'gate'"));
+        }
+    }
+
+    #[test]
+    fn markers_reject_a_newline_in_a_line() {
+        let err = gate_err(&markers_block(&[("/ap\nprove", "approved")]));
+        assert!(
+            matches!(&err, WorkflowDefError::ReplyMarkerLineHasNewline { stage, line } if stage == "gate" && line == "/ap\nprove"),
+            "{err}"
+        );
+        let err = gate_err(&markers_block(&[("/ap\rprove", "approved")]));
+        assert!(
+            matches!(&err, WorkflowDefError::ReplyMarkerLineHasNewline { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn markers_reject_a_duplicate_line() {
+        let err = gate_err(&markers_block(&[
+            ("/approve", "approved"),
+            ("/approve", "changes_requested"),
+        ]));
+        assert!(
+            matches!(&err, WorkflowDefError::DuplicateReplyMarker { stage, line } if stage == "gate" && line == "/approve"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn markers_reject_an_outcome_that_is_not_an_on_key() {
+        let err = gate_err(&markers_block(&[("/approve", "nowhere")]));
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownReplyMarkerOutcome { stage, outcome } if stage == "gate" && outcome == "nowhere"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("nowhere"));
+    }
+
+    #[test]
+    fn markers_reject_unknown_keys_and_a_gate_with_markers_needs_no_resumed_edge() {
+        let dir = TempDir::new();
+        let yaml = "name: g\nstages:\n  gate:\n    kind: human_gate\n    markers:\n      - line: /a\n        then: ok\n        extra: 1\n    on: { ok: f }\n  f:\n    kind: terminal\n";
+        assert!(matches!(
+            WorkflowDefinition::parse(yaml, &dir.path).unwrap_err(),
+            WorkflowDefError::Yaml(_)
+        ));
+        let yaml = "name: g\nstages:\n  gate:\n    kind: human_gate\n    markers:\n      - line: /a\n        then: ok\n    on: { ok: f }\n  f:\n    kind: terminal\n";
+        WorkflowDefinition::parse(yaml, &dir.path).unwrap();
     }
 }

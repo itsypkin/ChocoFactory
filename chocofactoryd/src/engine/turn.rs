@@ -1242,7 +1242,14 @@ impl WorkflowEngine {
         // and this write, and the capture is keyed by the stage the check
         // confirms is still current.
         let applied = self
-            .advance_from_stage(task_id, definition, &outcome, Some(stage_name), captured)
+            .advance_from_stage(
+                task_id,
+                definition,
+                &outcome,
+                Some(stage_name),
+                captured,
+                false,
+            )
             .await;
 
         let applied_note = match &applied {

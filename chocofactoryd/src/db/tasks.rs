@@ -148,6 +148,7 @@ struct SummaryRow {
     stage_entered_at: Option<DateTime<Utc>>,
     loop_counters: Option<Json<Value>>,
     pr_url: Option<String>,
+    waiting_on_human: bool,
 }
 
 /// The pull-request number at the end of a pull URL (`…/pull/42`, with an
@@ -182,7 +183,8 @@ pub async fn list_summaries(
             FROM json_each(w.payload, '$.stages') j \
            WHERE j.type = 'object' \
              AND json_extract(j.value, '$.url') LIKE '%/pull/%' \
-           LIMIT 1) AS pr_url \
+           LIMIT 1) AS pr_url, \
+         COALESCE(t.status = 'open' AND w.stage_kind = 'human_gate', 0) AS waiting_on_human \
          FROM tasks t LEFT JOIN workflow_state w ON w.task_id = t.id"
     ));
     let mut sep = " WHERE ";
@@ -219,6 +221,7 @@ pub async fn list_summaries(
                 .map(|j| j.0)
                 .unwrap_or_else(|| serde_json::json!({})),
             pr: row.pr_url.and_then(pr_ref),
+            waiting_on_human: row.waiting_on_human,
         })
         .collect())
 }

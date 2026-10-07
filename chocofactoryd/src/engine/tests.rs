@@ -479,7 +479,7 @@ stages:
     let task_id = seed_task(&pool, &def.name).await;
     let engine = engine_with_adapter(pool.clone(), "unused");
 
-    let state = workflow_state::create(&pool, &task_id, "coding", json!({}))
+    let state = workflow_state::create(&pool, &task_id, "coding", "agent_turn", json!({}))
         .await
         .unwrap();
     engine
@@ -1335,6 +1335,7 @@ stages:
         &task_id,
         workflow_state::WorkflowStateUpdate {
             current_stage: state.current_stage,
+            stage_kind: "agent_turn".to_string(),
             loop_counters: json!({ "review": { "entered_from": "coding", "count": 2 } }),
             payload: state.payload,
             enters_stage: false,
@@ -1727,7 +1728,7 @@ async fn a_turn_reaped_by_the_idle_timeout_does_not_auto_advance() {
     let pool = connect_in_memory().await.unwrap();
     let def = human_gate_chain_def();
     let task_id = seed_task(&pool, &def.name).await;
-    workflow_state::create(&pool, &task_id, "gate", json!({}))
+    workflow_state::create(&pool, &task_id, "gate", "human_gate", json!({}))
         .await
         .unwrap();
     let session = sessions::create(
@@ -2371,7 +2372,14 @@ async fn an_outcome_for_a_stage_the_task_has_left_is_discarded() {
     wait_until_stage(&pool, &task_id, "finished").await;
 
     let err = engine
-        .advance_from_stage(&task_id, &def, "done", Some("run"), Some(json!("late")))
+        .advance_from_stage(
+            &task_id,
+            &def,
+            "done",
+            Some("run"),
+            Some(json!("late")),
+            false,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -3557,7 +3565,7 @@ async fn send_message_errors_when_the_open_stage_has_no_session_yet() {
     // (and therefore skipping the session it would have created) —
     // simulates a task whose entry stage never actually got entered.
     let task_id = seed_task(&pool, "chat").await;
-    workflow_state::create(&pool, &task_id, "chatting", json!({}))
+    workflow_state::create(&pool, &task_id, "chatting", "agent_turn", json!({}))
         .await
         .unwrap();
 
@@ -3593,7 +3601,7 @@ async fn send_message_errors_when_workflow_state_references_an_unknown_stage() {
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
 
     let task_id = seed_task(&pool, "chat").await;
-    workflow_state::create(&pool, &task_id, "ghost-stage", json!({}))
+    workflow_state::create(&pool, &task_id, "ghost-stage", "agent_turn", json!({}))
         .await
         .unwrap();
 
@@ -4763,7 +4771,7 @@ async fn finish_review_turn_from_reply(
     task_id: &str,
     reply: &str,
 ) {
-    workflow_state::create(pool, task_id, "review", json!({}))
+    workflow_state::create(pool, task_id, "review", "agent_turn", json!({}))
         .await
         .unwrap();
     let run_id = sessions::create(
@@ -11048,7 +11056,7 @@ async fn seed_in_project(pool: &SqlitePool, project_id: &str, name: &str, cwd: &
 
 /// A row as a dead process leaves it: at `stage`, with `payload`, no runner.
 async fn seed_row(pool: &SqlitePool, task_id: &str, stage: &str, payload: Value) {
-    workflow_state::create(pool, task_id, stage, payload)
+    workflow_state::create(pool, task_id, stage, "agent_turn", payload)
         .await
         .unwrap();
 }
@@ -11299,7 +11307,8 @@ async fn a_restart_mid_poll_resumes_with_the_remaining_budget() {
         PollSweepReport {
             resumed: 1,
             already_running: 0,
-            stuck: 0
+            stuck: 0,
+            stage_kind_unrecorded: 0,
         }
     );
     assert_eq!(
@@ -11369,7 +11378,8 @@ async fn a_sweep_does_not_double_spawn_a_live_poll() {
         PollSweepReport {
             resumed: 0,
             already_running: 1,
-            stuck: 0
+            stuck: 0,
+            stage_kind_unrecorded: 0,
         }
     );
     assert_eq!(runner_slots(&engine, &task_id), 1);
@@ -11423,7 +11433,8 @@ async fn unrecoverable_polls_are_marked_stuck_and_healthy_ones_still_resume() {
         PollSweepReport {
             resumed: 1,
             already_running: 0,
-            stuck: 3
+            stuck: 3,
+            stage_kind_unrecorded: 0,
         }
     );
     for id in [&a, &b, &c] {
@@ -12619,4 +12630,776 @@ async fn in_flight_lists_only_what_a_restart_would_strand() {
     ];
     expected.sort();
     assert_eq!(listed, expected);
+}
+
+// ---- #175: a human_gate that watches for its answer ----
+
+const TWO_MARKERS: &str = r#"    markers:
+      - line: /request-changes
+        then: changes_requested
+      - line: /approve
+        then: approved
+"#;
+
+fn count_lines(path: &Path) -> usize {
+    fs::read_to_string(path).map_or(0, |s| s.lines().count())
+}
+
+async fn wait_until_count(path: &Path, at_least: usize) {
+    crate::test_support::wait_until(
+        &format!("{} lines in {}", at_least, path.display()),
+        || async {
+            let n = count_lines(path);
+            if n >= at_least {
+                Ok(())
+            } else {
+                Err(format!("{n} lines"))
+            }
+        },
+    )
+    .await
+}
+
+/// `gate` is the entry stage; `body` is its YAML (indented under `gate:`).
+/// `approved`, `changes_requested`, `timeout` and `resumed` go to terminal
+/// stages, so nothing after the gate starts a runner.
+fn write_gate_flow(dir: &Path, name: &str, body: &str) -> Arc<WorkflowDefinition> {
+    let yaml = format!(
+        r#"
+name: {name}
+stages:
+  gate:
+    kind: human_gate
+{body}
+  done:
+    kind: terminal
+  timed_out:
+    kind: terminal
+"#
+    );
+    std::fs::write(dir.join(format!("{name}.yaml")), &yaml).unwrap();
+    Arc::new(WorkflowDefinition::parse(&yaml, dir).unwrap())
+}
+
+/// A watcher whose command logs each run to `counter` and never matches.
+fn counting_watch(counter: &Path, extra: &str) -> String {
+    format!(
+        r#"    watch:
+      command: "echo x >> {}; echo WAITING"
+      interval: 1s
+{extra}      outcomes:
+        - match: "NEVER_MATCHES_XYZ"
+          then: approved
+"#,
+        counter.display()
+    )
+}
+
+/// The watching gate with the two markers, `capture: text`.
+fn marker_gate_flow(dir: &Path, name: &str, counter: &Path) -> Arc<WorkflowDefinition> {
+    let body = format!(
+        "    capture: text\n{TWO_MARKERS}{}    on: {{ approved: done, changes_requested: done, timeout: timed_out }}",
+        counting_watch(counter, "")
+    );
+    write_gate_flow(dir, name, &body)
+}
+
+async fn human_messages(pool: &SqlitePool, task_id: &str) -> Vec<Value> {
+    events::list_for_task(pool, task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == EventType::HumanMessage)
+        .map(|e| e.payload)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_watching_gate_advances_on_its_watchers_outcome_and_captures_the_output() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_gate_flow(
+        &dir,
+        "gate-go",
+        r#"    capture: text
+    watch:
+      command: "echo GO"
+      interval: 1s
+      outcomes:
+        - match: "GO"
+          then: go
+    on: { go: done }"#,
+    );
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "closed").await;
+
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "done");
+    assert_eq!(state.payload["stages"]["gate"], json!("GO"));
+    let trail: Vec<String> = stage_trail(&pool, &task_id)
+        .await
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(trail, ["gate", "done"]);
+}
+
+#[tokio::test]
+async fn a_marked_reply_resolves_a_watching_gate_and_stops_its_watcher() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let counter = dir.join("count");
+    let def = marker_gate_flow(&dir, "gate-reply", &counter);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&counter, 1).await;
+    assert!(engine.has_detached_runner(&task_id));
+
+    engine
+        .send_message_or_resume(&task_id, "Looks good.\n/approve")
+        .await
+        .unwrap();
+
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "done");
+    assert_eq!(state.stage_kind.as_deref(), Some("terminal"));
+    assert_eq!(state.payload["stages"]["gate"], json!("Looks good."));
+    let messages = human_messages(&pool, &task_id).await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["text"], json!("Looks good.\n/approve"));
+    assert_eq!(messages[0]["outcome"], json!("approved"));
+    assert!(!engine.has_detached_runner(&task_id));
+    let before = count_lines(&counter);
+    tokio::time::sleep(StdDuration::from_secs(3)).await;
+    assert_eq!(count_lines(&counter), before, "the watcher kept running");
+}
+
+#[tokio::test]
+async fn a_refused_reply_changes_nothing_and_the_watcher_keeps_running() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let counter = dir.join("count");
+    let def = marker_gate_flow(&dir, "gate-refuse", &counter);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&counter, 1).await;
+
+    for (text, conflict) in [("looks fine", false), ("/approve\n/request-changes", true)] {
+        let payload_before = payload_of(&pool, &task_id).await;
+        let messages_before = human_messages(&pool, &task_id).await.len();
+        let err = engine
+            .send_message_or_resume(&task_id, text)
+            .await
+            .unwrap_err();
+        match (conflict, &err) {
+            (false, SendMessageOrResumeError::ReplyNeedsMarker { stage, markers }) => {
+                assert_eq!(stage, "gate");
+                assert_eq!(markers, &["/request-changes", "/approve"]);
+            }
+            (true, SendMessageOrResumeError::ReplyHasConflictingMarkers { stage, found }) => {
+                assert_eq!(stage, "gate");
+                assert_eq!(found, &["/request-changes", "/approve"]);
+            }
+            _ => panic!("unexpected error for {text:?}: {err:?}"),
+        }
+        assert!(err.to_string().ends_with("Nothing was sent."));
+
+        let state = state_of(&pool, &task_id).await;
+        assert_eq!(state.current_stage, "gate");
+        assert_eq!(
+            tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+            "open"
+        );
+        assert!(engine.has_detached_runner(&task_id));
+        assert_eq!(human_messages(&pool, &task_id).await.len(), messages_before);
+        assert_eq!(payload_of(&pool, &task_id).await, payload_before);
+        let seen = count_lines(&counter);
+        wait_until_count(&counter, seen + 1).await;
+    }
+    engine.abort_detached_runners(&task_id).await;
+}
+
+#[tokio::test]
+async fn a_gate_without_markers_still_resumes_on_resumed_with_the_text_verbatim() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_gate_flow(
+        &dir,
+        "gate-plain",
+        "    capture: text\n    on: { resumed: done }",
+    );
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+
+    engine
+        .send_message_or_resume(&task_id, "/approve")
+        .await
+        .unwrap();
+
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "done");
+    assert_eq!(state.payload["stages"]["gate"], json!("/approve"));
+    let messages = human_messages(&pool, &task_id).await;
+    assert_eq!(messages[0]["text"], json!("/approve"));
+    assert_eq!(messages[0]["outcome"], json!("resumed"));
+}
+
+fn timeout_gate_flow(dir: &Path, name: &str, counter: &Path) -> Arc<WorkflowDefinition> {
+    let body = format!(
+        "    capture: text\n{}    on: {{ approved: done, timeout: timed_out }}",
+        counting_watch(counter, "      timeout: 1h\n")
+    );
+    write_gate_flow(dir, name, &body)
+}
+
+#[tokio::test]
+async fn a_restart_at_a_watching_gate_advances_on_timeout_when_the_deadline_passed() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let counter = dir.join("count");
+    let def = timeout_gate_flow(&dir, "gate-expired", &counter);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let now = Utc::now();
+    seed_row(
+        &pool,
+        &task_id,
+        "gate",
+        json!({ "poll_window": window_json("gate", now - chrono::Duration::hours(2), Some(now - chrono::Duration::hours(1))) }),
+    )
+    .await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.resumed, 1);
+    wait_until_stage(&pool, &task_id, "timed_out").await;
+    assert_eq!(count_lines(&counter), 0, "an expired deadline runs nothing");
+}
+
+#[tokio::test]
+async fn a_restart_at_a_watching_gate_keeps_the_stored_deadline() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let counter = dir.join("count");
+    let def = timeout_gate_flow(&dir, "gate-stored", &counter);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let now = Utc::now();
+    let window = window_json(
+        "gate",
+        now - chrono::Duration::minutes(30),
+        Some(now + chrono::Duration::seconds(2)),
+    );
+    seed_row(
+        &pool,
+        &task_id,
+        "gate",
+        json!({ "poll_window": window.clone() }),
+    )
+    .await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.resumed, 1);
+    assert_eq!(
+        state_of(&pool, &task_id).await.payload["poll_window"],
+        window
+    );
+    // The configured timeout is 1h: only the stored deadline can end this.
+    wait_until_stage(&pool, &task_id, "timed_out").await;
+}
+
+async fn upgrade_case(null_kind: bool) {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let yaml = r#"
+name: upgrade-flow
+stages:
+  gate:
+    kind: human_gate
+    on: { resumed: watch }
+  watch:
+    kind: human_gate
+    capture: text
+    watch:
+      command: "echo GREEN"
+      interval: 1s
+      timeout: 1h
+      outcomes:
+        - match: "GREEN"
+          then: green
+    on: { green: finished, timeout: stalled, error: stalled, again: watch }
+  finished:
+    kind: terminal
+  stalled:
+    kind: human_gate
+    on: { resumed: finished }
+"#;
+    std::fs::write(dir.join("upgrade-flow.yaml"), yaml).unwrap();
+    let task_id = seed_task_in(&pool, "upgrade-flow", &dir).await;
+    let now = Utc::now();
+    let window = window_json(
+        "watch",
+        now - chrono::Duration::minutes(5),
+        Some(now + chrono::Duration::hours(1)),
+    );
+    seed_row(
+        &pool,
+        &task_id,
+        "watch",
+        json!({ "poll_window": window.clone() }),
+    )
+    .await;
+    if null_kind {
+        sqlx::query("UPDATE workflow_state SET stage_kind = NULL WHERE task_id = ?")
+            .bind(&task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    } else {
+        assert!(
+            workflow_state::set_stage_kind(&pool, &task_id, "poll")
+                .await
+                .unwrap()
+        );
+    }
+    let before = state_of(&pool, &task_id).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(
+        report,
+        PollSweepReport {
+            resumed: 1,
+            already_running: 0,
+            stuck: 0,
+            stage_kind_unrecorded: 0,
+        }
+    );
+    let after = state_of(&pool, &task_id).await;
+    assert_eq!(after.stage_kind.as_deref(), Some("human_gate"));
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(after.payload["poll_window"], window);
+    wait_until_task_status(&pool, &task_id, "closed").await;
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "finished");
+}
+
+#[tokio::test]
+async fn a_poll_stage_turned_into_a_watching_gate_resumes_and_records_its_kind() {
+    upgrade_case(false).await;
+}
+
+#[tokio::test]
+async fn a_row_from_before_the_stage_kind_column_is_filled_in_by_the_sweep() {
+    upgrade_case(true).await;
+}
+
+#[tokio::test]
+async fn a_failed_stage_kind_write_in_the_sweep_is_counted_and_the_resume_goes_on() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_poll_flow(&dir, "kind-fail", "echo PENDING", Some("6h"), false);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let now = Utc::now();
+    seed_row(
+        &pool,
+        &task_id,
+        "watch",
+        json!({ "poll_window": window_json("watch", now, Some(now + chrono::Duration::hours(1))) }),
+    )
+    .await;
+    // `seed_row` recorded 'agent_turn'; the sweep must correct it to 'poll'.
+    sqlx::query(
+        "CREATE TRIGGER fail_kind BEFORE UPDATE OF stage_kind ON workflow_state
+             BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.stage_kind_unrecorded, 1);
+    assert_eq!(report.resumed, 1);
+    assert_eq!(report.stuck, 0);
+    assert_eq!(
+        tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+        "open"
+    );
+    engine.abort_detached_runners(&task_id).await;
+}
+
+#[tokio::test]
+async fn the_sweep_parks_a_task_whose_stage_lost_its_watcher_with_the_new_wording() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_gate_flow(&dir, "lost-watch", "    on: { resumed: done }");
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let now = Utc::now();
+    seed_row(
+        &pool,
+        &task_id,
+        "gate",
+        json!({ "poll_window": window_json("gate", now, None) }),
+    )
+    .await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.stuck, 1);
+    let reason = tasks::get(&pool, &task_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap();
+    assert_eq!(
+        reason,
+        "stage 'gate' was polling when the daemon stopped, but the workflow no longer gives it a watcher; retry to run it as defined"
+    );
+    // Its kind was still recorded.
+    assert_eq!(
+        state_of(&pool, &task_id).await.stage_kind.as_deref(),
+        Some("human_gate")
+    );
+}
+
+#[tokio::test]
+async fn retry_records_a_stale_stage_kind_even_when_the_payload_is_unchanged() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_gate_flow(&dir, "retry-kind", "    on: { resumed: done }");
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    // `seed_row` leaves the kind as "agent_turn": stale for a gate.
+    seed_row(&pool, &task_id, "gate", json!({})).await;
+    tasks::mark_stuck(&pool, &task_id, "test").await.unwrap();
+    let before = state_of(&pool, &task_id).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    let after = state_of(&pool, &task_id).await;
+    assert_eq!(after.stage_kind.as_deref(), Some("human_gate"));
+    assert_eq!(after.payload, before.payload);
+
+    // A NULL kind (a row from before the column) is filled in the same way.
+    sqlx::query("UPDATE workflow_state SET stage_kind = NULL WHERE task_id = ?")
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    tasks::mark_stuck(&pool, &task_id, "test").await.unwrap();
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    assert_eq!(
+        state_of(&pool, &task_id).await.stage_kind.as_deref(),
+        Some("human_gate")
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_parks_a_polling_task_whose_stage_is_gone_from_the_workflow() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_gate_flow(&dir, "gone-stage", "    on: { resumed: done }");
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    seed_row(
+        &pool,
+        &task_id,
+        "removed",
+        json!({ "poll_window": window_json("removed", Utc::now(), None) }),
+    )
+    .await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.stuck, 1);
+    let reason = tasks::get(&pool, &task_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap();
+    assert_eq!(
+        reason,
+        "stage 'removed' was polling when the daemon stopped, but the workflow no longer defines it; retry to run it as defined"
+    );
+}
+
+#[tokio::test]
+async fn a_watching_gate_without_markers_or_a_resumed_edge_keeps_its_watcher_on_a_refused_reply() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let counter = dir.join("count");
+    let body = format!(
+        "{}    on: {{ approved: done }}",
+        counting_watch(&counter, "")
+    );
+    let def = write_gate_flow(&dir, "gate-no-resumed", &body);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&counter, 1).await;
+
+    let err = engine
+        .send_message_or_resume(&task_id, "anything")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SendMessageOrResumeError::Advance(EngineError::UnknownOutcome { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+        "open"
+    );
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "gate");
+    assert!(engine.has_detached_runner(&task_id));
+    let seen = count_lines(&counter);
+    wait_until_count(&counter, seen + 1).await;
+    engine.abort_detached_runners(&task_id).await;
+}
+
+#[tokio::test]
+async fn a_reply_that_fails_before_the_abort_stops_the_watcher_when_it_marks_the_task_stuck() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let counter = dir.join("count");
+    // approved -> next, a poll whose timeout overflows: the advance fails
+    // with a PollWindow error before the old abort point.
+    let yaml = format!(
+        r#"
+name: gate-fail-early
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+{TWO_MARKERS}{}    on: {{ approved: next, changes_requested: next }}
+  next:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    timeout: 3000000000h
+    outcomes:
+      - match: PENDING
+        then: done
+    on: {{ done: done, timeout: done }}
+  done:
+    kind: terminal
+"#,
+        counting_watch(&counter, "")
+    );
+    std::fs::write(dir.join("gate-fail-early.yaml"), &yaml).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&counter, 1).await;
+
+    let err = engine
+        .send_message_or_resume(&task_id, "/approve")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SendMessageOrResumeError::Advance(EngineError::PollWindow { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+        "stuck"
+    );
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "gate");
+    // Nothing runs for the stuck gate: the watcher is gone and stays gone.
+    assert!(!engine.has_detached_runner(&task_id));
+    assert_eq!(runner_slots(&engine, &task_id), 0);
+    let before = count_lines(&counter);
+    tokio::time::sleep(StdDuration::from_secs(3)).await;
+    assert_eq!(count_lines(&counter), before, "the watcher kept running");
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "gate");
+
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    wait_until_count(&counter, before + 1).await;
+    assert_eq!(runner_slots(&engine, &task_id), 1);
+    engine.abort_detached_runners(&task_id).await;
+}
+
+#[tokio::test]
+async fn cancelling_a_watching_gate_stops_the_watcher_and_refuses_later_replies() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let counter = dir.join("count");
+    let def = marker_gate_flow(&dir, "gate-cancel", &counter);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&counter, 1).await;
+
+    engine.cancel_task(&task_id, false).await.unwrap();
+    assert!(!engine.has_detached_runner(&task_id));
+    let before = count_lines(&counter);
+    tokio::time::sleep(StdDuration::from_secs(3)).await;
+    assert_eq!(count_lines(&counter), before);
+    let err = engine
+        .send_message_or_resume(&task_id, "/approve")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SendMessageOrResumeError::TaskCancelled));
+}
+
+#[tokio::test]
+async fn retrying_a_watching_gate_whose_command_could_not_start_restamps_and_restarts_the_watcher()
+{
+    use std::os::unix::fs::PermissionsExt;
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let script = dir.join("check.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho ran >> \"$(dirname \"$0\")/ran\"\necho WAITING\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let def = write_gate_flow(
+        &dir,
+        "gate-retry",
+        r#"    capture: text
+    watch:
+      script_file: check.sh
+      interval: 1s
+      timeout: 1h
+      outcomes:
+        - match: "NEVER_MATCHES_XYZ"
+          then: approved
+    on: { approved: done, timeout: timed_out }"#,
+    );
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+
+    let offset = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let clock_offset = Arc::clone(&offset);
+    let events_notify = Arc::new(Notify::new());
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary("unused"));
+    let session_manager = SessionManager::new(
+        pool.clone(),
+        adapter,
+        chrono::Duration::hours(1),
+        Arc::clone(&events_notify),
+    );
+    let engine = WorkflowEngine::new_with_clock(
+        pool.clone(),
+        session_manager,
+        dir.to_path_buf(),
+        None,
+        events_notify,
+        Arc::new(move || {
+            Utc::now()
+                + chrono::Duration::seconds(clock_offset.load(std::sync::atomic::Ordering::SeqCst))
+        }),
+    );
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "stuck").await;
+    let first = poll_window_for(&state_of(&pool, &task_id).await.payload, "gate")
+        .unwrap()
+        .unwrap();
+
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    offset.store(100, std::sync::atomic::Ordering::SeqCst);
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+
+    let second = poll_window_for(&state_of(&pool, &task_id).await.payload, "gate")
+        .unwrap()
+        .unwrap();
+    assert!(second.entered_at > first.entered_at);
+    wait_until_count(&dir.join("ran"), 1).await;
+    assert!(engine.has_detached_runner(&task_id));
+    engine.abort_detached_runners(&task_id).await;
+}
+
+#[tokio::test]
+async fn stage_kind_follows_the_stage() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let agent_yaml = r#"
+name: kind-agent
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  chat:
+    kind: agent_turn
+    role: coder
+    on: {}
+"#;
+    let agent_def = Arc::new(WorkflowDefinition::parse(agent_yaml, &dir).unwrap());
+    let agent_task = seed_task_in(&pool, &agent_def.name, &dir).await;
+    let engine = engine_with_adapter(pool.clone(), &fixture_binary("fake_claude.py"));
+    engine
+        .start_task(&agent_task, &agent_def, Some("hello"))
+        .await
+        .unwrap();
+    assert_eq!(
+        state_of(&pool, &agent_task).await.stage_kind.as_deref(),
+        Some("agent_turn")
+    );
+
+    let yaml = r#"
+name: kind-chain
+stages:
+  prep:
+    kind: shell
+    command: "true"
+    on: { done: gate }
+  gate:
+    kind: human_gate
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#;
+    std::fs::write(dir.join("kind-chain.yaml"), yaml).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    assert_eq!(
+        state_of(&pool, &task_id).await.stage_kind.as_deref(),
+        Some("shell")
+    );
+    wait_until_stage(&pool, &task_id, "gate").await;
+    assert_eq!(
+        state_of(&pool, &task_id).await.stage_kind.as_deref(),
+        Some("human_gate")
+    );
+    engine.send_message_or_resume(&task_id, "go").await.unwrap();
+    assert_eq!(
+        state_of(&pool, &task_id).await.stage_kind.as_deref(),
+        Some("terminal")
+    );
+}
+
+#[test]
+fn the_conflict_message_lists_two_markers_with_both_and_three_with_commas() {
+    let two = SendMessageOrResumeError::ReplyHasConflictingMarkers {
+        stage: "gate".into(),
+        found: vec!["/a".into(), "/b".into()],
+    };
+    assert_eq!(
+        two.to_string(),
+        "your reply has both /a and /b; keep one. Nothing was sent."
+    );
+    let three = SendMessageOrResumeError::ReplyHasConflictingMarkers {
+        stage: "gate".into(),
+        found: vec!["/a".into(), "/b".into(), "/c".into()],
+    };
+    assert_eq!(
+        three.to_string(),
+        "your reply has /a, /b and /c; keep one. Nothing was sent."
+    );
+    let needs = SendMessageOrResumeError::ReplyNeedsMarker {
+        stage: "gate".into(),
+        markers: vec!["/request-changes".into(), "/approve".into()],
+    };
+    assert_eq!(
+        needs.to_string(),
+        "stage 'gate' reads its verdict from your reply: put /request-changes or /approve alone on its own line. Nothing was sent."
+    );
 }

@@ -1,0 +1,99 @@
+[
+  {
+    "name": "bare approve",
+    "body": "/approve",
+    "github": "APPROVE",
+    "choco": "approved"
+  },
+  {
+    "name": "bare request",
+    "body": "/request-changes",
+    "github": "REQUEST_CHANGES",
+    "choco": "changes_requested"
+  },
+  {
+    "name": "prose then marker",
+    "body": "Two things.\n\n/request-changes",
+    "github": "REQUEST_CHANGES",
+    "choco": "changes_requested"
+  },
+  {
+    "name": "marker then prose",
+    "body": "/approve\nnice work",
+    "github": "APPROVE",
+    "choco": "approved"
+  },
+  {
+    "name": "trailing whitespace",
+    "body": "/approve \t",
+    "github": "APPROVE",
+    "choco": "approved"
+  },
+  {
+    "name": "CRLF",
+    "body": "ok\r\n/approve\r\n",
+    "github": "APPROVE",
+    "choco": "approved"
+  },
+  {
+    "name": "quoted",
+    "body": "> /approve",
+    "github": "",
+    "choco": "refused_no_marker"
+  },
+  {
+    "name": "inline",
+    "body": "use /approve to vote",
+    "github": "",
+    "choco": "refused_no_marker"
+  },
+  {
+    "name": "indented",
+    "body": "  /approve",
+    "github": "",
+    "choco": "refused_no_marker"
+  },
+  {
+    "name": "typo",
+    "body": "/approved",
+    "github": "",
+    "choco": "refused_no_marker"
+  },
+  {
+    "name": "wrong case",
+    "body": "/Approve",
+    "github": "",
+    "choco": "refused_no_marker"
+  },
+  {
+    "name": "no marker",
+    "body": "looks fine",
+    "github": "",
+    "choco": "refused_no_marker"
+  },
+  {
+    "name": "empty",
+    "body": "",
+    "github": "",
+    "choco": "refused_no_marker"
+  },
+  {
+    "name": "same marker twice",
+    "body": "/approve\n/approve",
+    "github": "APPROVE",
+    "choco": "approved"
+  },
+  {
+    "name": "both markers",
+    "body": "/approve\n/request-changes",
+    "github": "REQUEST_CHANGES",
+    "choco": "refused_conflict",
+    "note": "The one deliberate difference: GitHub cannot refuse a posted comment, so await-review.sh resolves it to REQUEST_CHANGES (never 'merge it'), while a reply through choco can be refused and is."
+  },
+  {
+    "name": "marker in a code fence",
+    "body": "```\n/approve\n```",
+    "github": "APPROVE",
+    "choco": "approved"
+  }
+]

@@ -82,6 +82,13 @@ impl From<SendMessageOrResumeError> for ApiError {
             // formed request, wrong state — `choco task retry` is what
             // fixes it, not a different request shape.
             | SendMessageOrResumeError::TaskStuck { .. } => ApiError::Conflict(err.to_string()),
+            // The reply itself is wrong (#175): it lacks the marker line the
+            // gate reads its verdict from, or carries markers for different
+            // outcomes. Nothing was recorded, so the caller can just resend.
+            SendMessageOrResumeError::ReplyNeedsMarker { .. }
+            | SendMessageOrResumeError::ReplyHasConflictingMarkers { .. } => {
+                ApiError::BadRequest(err.to_string())
+            }
             // A `human_gate`'s `resumed` relay lost a race with another
             // caller resuming the same task concurrently (P1-9 review):
             // `advance()`'s own per-task lock means `workflow_state` is

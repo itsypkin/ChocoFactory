@@ -761,3 +761,81 @@ fn a_merged_pr_without_merged_at_fails_the_script_with_empty_stdout() {
     assert!(out.stdout.is_empty());
     assert!(!out.stderr.is_empty());
 }
+
+/// The case table shared with `reply_verdict` (`engine/gate.rs`): one line
+/// rule, two implementations, one table (#175).
+#[derive(serde::Deserialize)]
+struct MarkerCase {
+    name: String,
+    body: String,
+    github: String,
+    choco: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+fn marker_cases() -> Vec<MarkerCase> {
+    serde_json::from_str(include_str!("fixtures/review-markers.json")).unwrap()
+}
+
+#[test]
+fn the_script_agrees_with_the_shared_marker_case_table() {
+    for case in marker_cases() {
+        let got = verdict(
+            SINCE,
+            &list(&[comment(FRESH, "OWNER", Some("owner"), &case.body)]),
+        );
+        assert_eq!(
+            got, case.github,
+            "case '{}': body {:?}",
+            case.name, case.body
+        );
+    }
+}
+
+#[test]
+fn the_marker_case_table_is_consistent() {
+    let cases = marker_cases();
+    for case in &cases {
+        match case.choco.as_str() {
+            "refused_no_marker" => assert_eq!(case.github, "", "case '{}'", case.name),
+            "approved" => assert_eq!(case.github, "APPROVE", "case '{}'", case.name),
+            "changes_requested" => {
+                assert_eq!(case.github, "REQUEST_CHANGES", "case '{}'", case.name)
+            }
+            "refused_conflict" => assert!(
+                case.note.is_some(),
+                "case '{}': a conflict needs a note",
+                case.name
+            ),
+            other => panic!("case '{}': unknown choco result '{other}'", case.name),
+        }
+        if case.note.is_some() {
+            assert_eq!(case.choco, "refused_conflict", "case '{}'", case.name);
+        }
+    }
+    assert_eq!(cases.iter().filter(|c| c.note.is_some()).count(), 1);
+    for name in [
+        "bare approve",
+        "bare request",
+        "prose then marker",
+        "marker then prose",
+        "trailing whitespace",
+        "CRLF",
+        "quoted",
+        "inline",
+        "indented",
+        "typo",
+        "wrong case",
+        "no marker",
+        "empty",
+        "same marker twice",
+        "both markers",
+        "marker in a code fence",
+    ] {
+        assert!(
+            cases.iter().any(|c| c.name == name),
+            "missing case '{name}'"
+        );
+    }
+}

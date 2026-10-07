@@ -338,6 +338,71 @@ INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, upda
         );
     }
 
+    /// 0012 adds `workflow_state.stage_kind` and leaves existing rows NULL:
+    /// stage kinds live in workflow files, so only a transition, a retry or
+    /// the startup sweep can fill them in.
+    #[tokio::test]
+    async fn stage_kind_migration_leaves_existing_rows_null() {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for sql in [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_task_run_end_reason.sql"),
+            include_str!("../../migrations/0003_stage_transition_events.sql"),
+            include_str!("../../migrations/0004_task_worktree_snapshot.sql"),
+            include_str!("../../migrations/0005_drop_task_parent_task_id.sql"),
+            include_str!("../../migrations/0006_task_stuck_reason.sql"),
+            include_str!("../../migrations/0007_task_run_resumed_from.sql"),
+            include_str!("../../migrations/0008_project_repo_and_task_workflow_file.sql"),
+            include_str!("../../migrations/0009_rename_task_runs_to_sessions.sql"),
+            include_str!("../../migrations/0010_task_cancel_keep.sql"),
+            include_str!("../../migrations/0011_workflow_state_stage_entered_at.sql"),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+        sqlx::raw_sql(
+            r#"
+INSERT INTO projects (id, name, created_at) VALUES ('p1', 'demo', '2026-01-01T00:00:00+00:00');
+INSERT INTO tasks (id, project_id, workflow_def, title, created_at, updated_at)
+    VALUES ('t1', 'p1', 'w', 'T1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+           ('t2', 'p1', 'w', 'T2', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+INSERT INTO workflow_state (task_id, current_stage, loop_counters, payload, updated_at)
+    VALUES ('t1', 'review', '{}', '{}', '2026-01-01T00:00:10+00:00'),
+           ('t2', 'gate', '{}', '{}', '2026-01-01T00:00:10+00:00');
+"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0012_workflow_state_stage_kind.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT task_id, current_stage, stage_kind FROM workflow_state ORDER BY task_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("t1".to_string(), "review".to_string(), None),
+                ("t2".to_string(), "gate".to_string(), None),
+            ]
+        );
+    }
+
     /// 0003 rebuilds `events` and backfills the new `task_id` from
     /// `task_runs`. Every other test migrates an *empty* database, so this
     /// is the only place the backfill actually moves data — and getting it

@@ -50,10 +50,11 @@ use crate::session::{SessionError, SessionKind, SessionManager};
 use crate::shell;
 use crate::template;
 use crate::workflow_def::{
-    Capture, ShellCommand, StageDef, StageKind, WorkflowDefError, WorkflowDefinition,
+    Capture, ShellCommand, StageDef, StageKind, Watch, WorkflowDefError, WorkflowDefinition,
 };
 use crate::worktree::{self, WorktreeError};
 
+mod gate;
 mod render;
 mod runners;
 mod shell_stage;
@@ -65,15 +66,19 @@ mod watch;
 pub use sweep::{ParkReport, PollSweepReport, RestartEffect, restart_effect};
 
 #[cfg(test)]
+pub(crate) use gate::reply_verdict;
+#[cfg(test)]
 use render::{MAX_ENV_VALUE_BYTES, render_command, render_env};
 #[cfg(test)]
 use shell_stage::{EVENT_OUTPUT_TAIL_BYTES, tail};
+#[cfg(test)]
+use stage_capture::derive_capture;
+use stage_capture::merge_stage_capture;
 #[cfg(test)]
 use stage_capture::{
     MAX_CAPTURE_BYTES, outcome_from_report, sole_top_level_json_object, turn_outcome,
     unwrap_code_fence,
 };
-use stage_capture::{derive_capture, merge_stage_capture};
 #[cfg(test)]
 use sweep::agent_reason;
 #[cfg(test)]
@@ -788,6 +793,19 @@ pub enum SendMessageOrResumeError {
         reason: String,
         can_retry: bool,
     },
+    /// The gate reads its verdict from the reply (#175) and the reply has no
+    /// marker line. Nothing was recorded or changed. `markers` are the gate's
+    /// lines, in declared order.
+    ReplyNeedsMarker {
+        stage: String,
+        markers: Vec<String>,
+    },
+    /// The reply carries markers for different outcomes (#175). Nothing was
+    /// recorded or changed. `found` lists the marker lines present.
+    ReplyHasConflictingMarkers {
+        stage: String,
+        found: Vec<String>,
+    },
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     /// This task's recorded `workflow_path` (issue #88) names a file that no
@@ -833,6 +851,20 @@ impl fmt::Display for SendMessageOrResumeError {
                         "task is stuck: {reason}; run 'choco task cancel {task_id}'"
                     )
                 }
+            }
+            SendMessageOrResumeError::ReplyNeedsMarker { stage, markers } => write!(
+                f,
+                "stage '{stage}' reads its verdict from your reply: put {} alone on its own \
+                 line. Nothing was sent.",
+                markers.join(" or ")
+            ),
+            SendMessageOrResumeError::ReplyHasConflictingMarkers { found, .. } => {
+                let listed = match found.as_slice() {
+                    [a, b] => format!("both {a} and {b}"),
+                    [init @ .., last] => format!("{} and {last}", init.join(", ")),
+                    [] => String::new(),
+                };
+                write!(f, "your reply has {listed}; keep one. Nothing was sent.")
             }
             SendMessageOrResumeError::Resolve(err) => write!(f, "{err}"),
             SendMessageOrResumeError::WorkflowDef(err) => write!(f, "{err}"),
@@ -1701,100 +1733,9 @@ impl WorkflowEngine {
             .ok_or_else(|| SendMessageOrResumeError::UnknownStage(current_stage.clone()))?;
 
         match &stage_def.kind {
-            StageKind::HumanGate { capture } => {
-                let (captured, note) = derive_capture(
-                    *capture,
-                    text,
-                    task_id,
-                    &current_stage,
-                    "the human's message",
-                );
-
-                // Best-effort, log-and-continue — same as `send_message`'s
-                // chat-path recording just above it in this file. No
-                // `session` exists for a `human_gate` (it never opens a
-                // session), so this uses `append_for_task` — the same
-                // task-scoped, session-less path `dispatch_stage` already
-                // uses for `StageEntered`/`Error` — rather than `append`,
-                // which needs a `session_id` to derive `task_id` from.
-                let mut payload = json!({ "text": text });
-                if let Some(note) = note {
-                    payload["note"] = json!(note);
-                }
-                match events::append_for_task(&self.pool, task_id, EventType::HumanMessage, payload)
+            StageKind::HumanGate { .. } => {
+                self.reply_to_gate(task_id, &definition, &current_stage, text)
                     .await
-                {
-                    Ok(_) => self.events_notify.notify_waiters(),
-                    Err(err) => {
-                        tracing::error!(task_id, %err, "failed to record human message event")
-                    }
-                }
-
-                match self
-                    .advance_from_stage(
-                        task_id,
-                        &definition,
-                        "resumed",
-                        Some(&current_stage),
-                        captured,
-                    )
-                    .await
-                {
-                    Ok(()) => Ok(()),
-                    // The benign races: another caller already resumed or
-                    // cancelled this task, so there's nothing to rescue.
-                    // `is_benign_resume_race` is also what `api/error.rs`'s
-                    // `SendMessageOrResumeError` → `ApiError` mapping calls,
-                    // which maps these same variants to 409 for exactly this
-                    // reason — see the comments there.
-                    Err(err) if err.is_benign_resume_race() => {
-                        Err(SendMessageOrResumeError::Advance(err))
-                    }
-                    // Anything else — a session that won't spawn, a prompt
-                    // template that fails to render, a transient DB error —
-                    // and the gate has already committed
-                    // `workflow_state.current_stage` to the next stage
-                    // before failing to enter it (see `stage_to_blame`'s
-                    // doc comment), so the task is left `open` with nothing
-                    // running unless this marks it `stuck`. Mirrors the
-                    // catch-alls in `finish_detached`/
-                    // `finish_turn` — the human-gate path is the one
-                    // #61 left without one.
-                    Err(err) => {
-                        tracing::error!(
-                            task_id, stage = current_stage, %err,
-                            "task wedged: its human_gate was resumed but the transition failed"
-                        );
-                        let blamed = self.stage_to_blame(task_id, &current_stage).await;
-                        // `blamed == current_stage` means the failure happened
-                        // before `workflow_state::update` committed the next
-                        // stage — e.g. a DB error updating state inside
-                        // `advance_from_stage` itself. Covered by
-                        // `resuming_a_human_gate_whose_own_transition_fails_marks_the_task_stuck_at_the_gate`,
-                        // which injects exactly that with a SQLite trigger
-                        // on `workflow_state`.
-                        let reason = if blamed == current_stage {
-                            format!(
-                                "stage '{current_stage}': resumed but the transition failed: {err}"
-                            )
-                        } else {
-                            format!(
-                                "stage '{blamed}': could not be entered after '{current_stage}' \
-                                 was resumed: {err}"
-                            )
-                        };
-                        // `enter_stage` already appends its own `Error`
-                        // event for a template failure — see `mark_stuck`'s
-                        // doc comment.
-                        self.mark_stuck(
-                            task_id,
-                            &reason,
-                            matches!(err, EngineError::Template { .. }),
-                        )
-                        .await;
-                        Err(SendMessageOrResumeError::Advance(err))
-                    }
-                }
             }
             StageKind::AgentTurn { .. } if stage_def.on.is_empty() => self
                 .send_message(task_id, text)
@@ -2223,13 +2164,15 @@ impl WorkflowEngine {
         let mut new_payload = state.payload.clone();
         set_poll_window(&mut new_payload, &definition, &current_stage, self.now())
             .map_err(RetryTaskError::Enter)?;
-        let payload = if new_payload != state.payload {
+        let kind = stage_def.kind.name();
+        let payload = if new_payload != state.payload || state.stage_kind.as_deref() != Some(kind) {
             let payload = new_payload;
             workflow_state::update(
                 &self.pool,
                 task_id,
                 workflow_state::WorkflowStateUpdate {
                     current_stage: current_stage.clone(),
+                    stage_kind: kind.to_string(),
                     loop_counters: state.loop_counters.clone(),
                     payload,
                     // A retry re-runs the stage without re-entering it.
@@ -2527,7 +2470,14 @@ impl WorkflowEngine {
             // An entry stage that is a `poll` gets its window in the same
             // INSERT as the row (#52).
             set_poll_window(&mut payload, definition, start, self.now())?;
-            let state = workflow_state::create(&self.pool, task_id, start, payload).await?;
+            let start_kind = definition
+                .stages
+                .get(start)
+                .ok_or_else(|| EngineError::UnknownStage(start.to_string()))?
+                .kind
+                .name();
+            let state =
+                workflow_state::create(&self.pool, task_id, start, start_kind, payload).await?;
             self.enter_stage(
                 task_id,
                 definition,
@@ -2575,7 +2525,7 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         outcome: &str,
     ) -> Result<(), EngineError> {
-        self.advance_from_stage(task_id, definition, outcome, None, None)
+        self.advance_from_stage(task_id, definition, outcome, None, None, false)
             .await
     }
 
@@ -2612,9 +2562,17 @@ impl WorkflowEngine {
         outcome: &str,
         expected_stage: Option<&str>,
         capture: Option<Value>,
+        // `true` only on the reply path (`reply_to_gate`): stops the task's
+        // detached runners — the gate's watcher — as the very last step
+        // before the state write. A runner must never pass `true`: aborting
+        // awaits every runner of the task, itself included.
+        stop_watcher: bool,
     ) -> Result<(), EngineError> {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
+
+        // Set once `workflow_state::update` has committed the transition.
+        let committed = std::sync::atomic::AtomicBool::new(false);
 
         // The stage entered on success, so the caller below can tell
         // whether it just became terminal without a second query.
@@ -2701,6 +2659,29 @@ impl WorkflowEngine {
                 // this same payload so the deadline commits in the one
                 // UPDATE that moves `current_stage` (#52).
                 set_poll_window(&mut payload, definition, &next_stage, self.now())?;
+                // Written in the same UPDATE as `current_stage`, so the two
+                // can never disagree. Looked up after any loop-guard
+                // redirect, and before the watcher is stopped: a missing
+                // stage must fail while the watcher is still running.
+                let stage_kind = definition
+                    .stages
+                    .get(&next_stage)
+                    .ok_or_else(|| EngineError::UnknownStage(next_stage.clone()))?
+                    .kind
+                    .name()
+                    .to_string();
+
+                // The reply path stops the gate's watcher here: under the
+                // task lock, after every check that can refuse the
+                // transition, and immediately before the write. Nothing
+                // fallible may sit between this and `workflow_state::update`
+                // — a refusal after the abort would leave the task open at
+                // the gate with nothing watching it. If the update itself
+                // fails, the caller marks the task stuck at the gate and
+                // `retry` starts a new watcher.
+                if stop_watcher {
+                    self.abort_detached_runners(task_id).await;
+                }
 
                 // The returned row is the authority on what was actually
                 // committed, and it's what the next stage renders its
@@ -2714,6 +2695,7 @@ impl WorkflowEngine {
                     task_id,
                     workflow_state::WorkflowStateUpdate {
                         current_stage: next_stage.clone(),
+                        stage_kind,
                         loop_counters,
                         payload,
                         // Also true for an `on:` edge back to the same
@@ -2723,6 +2705,7 @@ impl WorkflowEngine {
                 )
                 .await?
                 .ok_or(EngineError::NoWorkflowState)?;
+                committed.store(true, std::sync::atomic::Ordering::Relaxed);
 
                 // `enter_stage` records the transition itself (X-3), so the
                 // trail this used to push onto `workflow_state.stage_history`
@@ -2741,6 +2724,21 @@ impl WorkflowEngine {
                 Ok(next_stage)
             }
             .await;
+        // A reply that fails before the state write for any reason other
+        // than a benign race leaves its caller to mark the task stuck at
+        // the gate. "Stuck" must mean nothing is running for that gate, so
+        // stop the watcher here, still under the task lock: a watcher that
+        // outlived the stuck mark could advance a stuck task, and a retry
+        // would then start a second one. Benign races (`StageMovedOn`,
+        // `UnknownOutcome`, cancelled) leave the task as it was, watcher
+        // included.
+        if stop_watcher
+            && !committed.load(std::sync::atomic::Ordering::Relaxed)
+            && let Err(err) = &result
+            && !err.is_benign_resume_race()
+        {
+            self.abort_detached_runners(task_id).await;
+        }
         // Same rationale as `start_task`'s eviction above: every error
         // branch here either precedes any write (nothing to protect) or
         // follows `workflow_state::update` already having durably
@@ -2879,13 +2877,11 @@ impl WorkflowEngine {
             StageKind::AgentTurn { .. } => self.enter_agent_turn(entry).await,
             StageKind::Shell { .. } => self.enter_shell(entry).await,
             StageKind::Poll { .. } => self.enter_poll(entry).await,
-            // Pauses the task with nothing further to do here; whatever
-            // relays the next human message is responsible for advancing
-            // this stage on `"resumed"` once it arrives — see
-            // `send_message_or_resume`'s `HumanGate` arm, which also
-            // threads the message through as this stage's capture (#59)
-            // if it declared one.
-            StageKind::HumanGate { .. } => Ok(()),
+            // Pauses the task for a person. Whatever relays the next human
+            // message advances this stage — see `reply_to_gate`, which also
+            // threads the message through as this stage's capture (#59) —
+            // and a gate with a `watch:` also starts that watcher (#175).
+            StageKind::HumanGate { .. } => self.enter_gate(entry).await,
             StageKind::Terminal => self.enter_terminal(entry).await,
         }
     }

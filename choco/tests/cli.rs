@@ -473,6 +473,82 @@ async fn task_send_confirms_in_human_mode_and_stays_silent_under_json() {
 }
 
 #[tokio::test]
+async fn task_send_to_a_gate_with_markers_needs_a_marker_line() {
+    let home = TempHome::new();
+    let wf_path = home.write_workflow(
+        "marked",
+        r#"
+name: marked
+stages:
+  gate:
+    kind: human_gate
+    markers:
+      - line: /request-changes
+        then: changes_requested
+      - line: /approve
+        then: approved
+    on: { approved: done, changes_requested: done }
+  done:
+    kind: terminal
+"#,
+    );
+    let daemon = Daemon::spawn(home).await;
+    let project = run_choco_json(&daemon.base_url, &["project", "create", "demo"])
+        .await
+        .json();
+    let task = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            project["id"].as_str().unwrap(),
+            "--workflow",
+            wf_path.to_str().unwrap(),
+            "--title",
+            "marked task",
+            "--prompt",
+            "start",
+        ],
+    )
+    .await
+    .json();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let refused = run_choco(
+        &daemon.base_url,
+        &["task", "send", &task_id, "--text", "ok"],
+    )
+    .await;
+    assert_ne!(refused.code, Some(0), "stdout: {}", refused.stdout);
+    assert!(
+        refused.stderr.contains("/request-changes") && refused.stderr.contains("/approve"),
+        "stderr: {}",
+        refused.stderr
+    );
+
+    let accepted = run_choco(
+        &daemon.base_url,
+        &["task", "send", &task_id, "--text", "/approve"],
+    )
+    .await;
+    assert_eq!(accepted.code, Some(0), "stderr: {}", accepted.stderr);
+    let mut status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    for _ in 0..100 {
+        if status.stdout.contains("done") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+    }
+    assert!(
+        status.stdout.contains("done"),
+        "the task should have moved on: {}",
+        status.stdout
+    );
+}
+
+#[tokio::test]
 async fn task_list_filters_by_project_id() {
     let daemon = Daemon::spawn(TempHome::new()).await;
     let project_a = run_choco_json(&daemon.base_url, &["project", "create", "a"])

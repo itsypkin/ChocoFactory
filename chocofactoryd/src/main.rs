@@ -246,6 +246,7 @@ async fn main() {
         resumed = sweep.resumed,
         already_running = sweep.already_running,
         stuck = sweep.stuck,
+        stage_kind_unrecorded = sweep.stage_kind_unrecorded,
         "resumed interrupted poll stages"
     );
 
