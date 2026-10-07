@@ -85,7 +85,11 @@ hardened everywhere except the points that wait on an answer.
    record the change. Decide every choice the task leaves open, as above.
    When a stated decision leaves the protection unsound, the task
    contradicts itself: treat it as stop condition 1 and raise it as a
-   question instead of keeping the decision silently.
+   question instead of keeping the decision silently. A Decision that
+   states how a program behaves at runtime (what it prints, writes,
+   returns or includes) cites the command you ran and its output. If you
+   can't run it read-only, mark the Decision **unverified** and name the
+   probe the coder must run before relying on it.
 5. **Testability.** Each required test says what it sets up, what it does
    and what it asserts. Where a test may accept more than one outcome or
    error, it names every one it accepts. Replace "or similar", "one of
@@ -107,6 +111,14 @@ hardened everywhere except the points that wait on an answer.
      do through it and why a plain retry doesn't let that through.
    - For each message the spec prescribes, say which condition it is true
      under.
+   - When the spec filters or matches on a value (an outcome name, a
+     status, a character set, a check state), grep every place that writes
+     that field and list every value it can take. Say which values the
+     filter handles and why the others don't matter.
+   - Include the state the world may already be in when the operation
+     starts (an existing branch, file, row or remote commit), not only
+     races during it. A fix the task decides goes through this check too;
+     if it fails, that is check 4's contradiction: stop with a question.
    - For a layout or fitting algorithm, list the invariants and work
      through the worst case. Require one test that renders every fixture
      at every size from the minimum up and asserts the invariants.

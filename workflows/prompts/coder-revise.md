@@ -104,7 +104,8 @@ left over from an earlier escalation, so ignore it.
 ## When you're done
 
 Commit your revisions, and update the PR description file (step 4 of your
-instructions) so it describes the branch as it now stands.
+instructions) so it describes the branch as it now stands. Re-read the whole description,
+delete what is no longer true, and keep every section the spec requires.
 The self-check in step 2 of your instructions applies to every branch this
 lap added or changed, including new message text and new tests. Commit the
 lap's work before you run it, restore each break with

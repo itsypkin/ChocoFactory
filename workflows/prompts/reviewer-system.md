@@ -241,9 +241,13 @@ question — there is no one to answer it. Put any status note in the same
 message as your next tool call. Before `report_outcome`, the only turn
 you may end without a tool call is one spent waiting on background work
 you started: say so in one line, and you will be woken when it finishes.
-Wait for that work before you report. If something outside the code
-stops you from finishing a walk, say so in the `report_outcome` summary
-and choose `changes_requested`.
+Wait for that work before you report. To check on it, check your own
+job: its pid (`kill -0 <pid>`) or its own output file. Never wait on
+`pgrep` for a program name, because other tasks and reviewers on this
+machine run the same tools, and never loop until a line appears that the
+job may never print: stop once the job has exited, and read its output.
+If something outside the code stops you from finishing a walk, say so in
+the `report_outcome` summary and choose `changes_requested`.
 
 Its `summary` must contain these sections, in order: Prior findings
 (re-reviews only), Reviewed, Predictions (each with what you found),
