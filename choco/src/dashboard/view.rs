@@ -10,6 +10,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::render::{
+    LABEL_CREATED, LABEL_ID, LABEL_PROJECT, LABEL_REPO, LABEL_ROLE, LABEL_STAGE, LABEL_STATUS,
+    LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW, LABEL_WORKFLOW_FILE,
+};
+
 use super::app::{App, Detail, Level, PromptKind, Scope, Section, View, fmt_duration, max_laps};
 
 pub const MIN_WIDTH: u16 = 40;
@@ -40,6 +45,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 // ---- styles -------------------------------------------------------------
+
+/// The one accent colour of the detail view's section headers (#211).
+const ACCENT: Color = Color::Cyan;
 
 fn colored(app: &App, color: Color) -> Style {
     if app.color {
@@ -579,8 +587,6 @@ fn separator(title: &str, width: usize) -> String {
     format!("{head}{}", "─".repeat(width.saturating_sub(n)))
 }
 
-/// Most events the status view's tail shows.
-const STATUS_TAIL: usize = 5;
 /// Lines a wrapping field (`Stuck`, `Waiting for`) may take.
 const WRAP_MAX: usize = 3;
 
@@ -636,8 +642,8 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         for (label, value) in crate::render::task_fields(v) {
             let mut row = FRow::new(label, value);
             match label {
-                "Title" => continue,
-                "Project" => {
+                LABEL_TITLE => continue,
+                LABEL_PROJECT => {
                     let pid = snap
                         .map(|t| t.task.project_id.as_str())
                         .or_else(|| v.get("project_id").and_then(|p| p.as_str()));
@@ -645,42 +651,45 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
                         row.value = app.project_label(pid);
                     }
                 }
-                "Workflow" | "Workflow file" => {
+                LABEL_WORKFLOW | LABEL_WORKFLOW_FILE => {
                     paths += 1;
-                    if label == "Workflow file" || paths == 2 {
+                    if label == LABEL_WORKFLOW_FILE || paths == 2 {
                         row.drop = 4;
                     }
                 }
-                "Status" => {
+                LABEL_STATUS => {
                     if let Some(t) = snap {
                         row.value = t.task.status.clone();
                     }
                 }
                 // The snapshot is fresher: rebuilt after Status below.
-                "Stuck" if snap.is_some() => continue,
-                "Stuck" => {
+                LABEL_STUCK if snap.is_some() => continue,
+                LABEL_STUCK => {
                     row.error = true;
                     row.wrap = true;
                 }
-                "Role" => row.drop = 1,
-                "Created" => row.drop = 2,
-                "Repo" => row.drop = 3,
+                LABEL_ROLE => row.drop = 1,
+                LABEL_CREATED => row.drop = 2,
+                LABEL_REPO => row.drop = 3,
                 _ => {}
             }
             rows.push(row);
         }
     } else if let Some(t) = snap {
-        rows.push(FRow::new("ID", t.task.id.clone()));
-        rows.push(FRow::new("Project", app.project_label(&t.task.project_id)));
-        rows.push(FRow::new("Workflow", t.task.workflow_def.clone()));
-        rows.push(FRow::new("Status", t.task.status.clone()));
+        rows.push(FRow::new(LABEL_ID, t.task.id.clone()));
+        rows.push(FRow::new(
+            LABEL_PROJECT,
+            app.project_label(&t.task.project_id),
+        ));
+        rows.push(FRow::new(LABEL_WORKFLOW, t.task.workflow_def.clone()));
+        rows.push(FRow::new(LABEL_STATUS, t.task.status.clone()));
     }
     if let Some(t) = snap
-        && let Some(pos) = rows.iter().position(|r| r.label == "Status")
+        && let Some(pos) = rows.iter().position(|r| r.label == LABEL_STATUS)
         && t.task.status == "stuck"
         && let Some(reason) = &t.task.stuck_reason
     {
-        let mut row = FRow::new("Stuck", crate::render::single_line(reason));
+        let mut row = FRow::new(LABEL_STUCK, crate::render::single_line(reason));
         row.error = true;
         row.wrap = true;
         rows.insert(pos + 1, row);
@@ -709,14 +718,14 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         (None, Some(name)) => name.to_string(),
         (None, None) => String::new(),
     };
-    let at = match rows.iter().position(|r| r.label == "Stage") {
+    let at = match rows.iter().position(|r| r.label == LABEL_STAGE) {
         Some(pos) => {
             rows[pos].value = stage_value;
             pos
         }
         None => {
             if snap.is_some() || !stage_value.is_empty() {
-                rows.push(FRow::new("Stage", stage_value));
+                rows.push(FRow::new(LABEL_STAGE, stage_value));
             }
             rows.len().saturating_sub(1)
         }
@@ -800,7 +809,7 @@ fn row_lines(row: &FRow, label_w: usize, width: usize) -> Vec<String> {
         return vec![fit(format!("{head}{}", row.value).trim_end(), width)];
     }
     let room = width.saturating_sub(label_w + 2).max(1);
-    let mut parts = wrap_chars(&crate::render::single_line(&row.value), room);
+    let mut parts = wrap_words(&crate::render::single_line(&row.value), room);
     if parts.len() > row.cap {
         parts.truncate(row.cap);
         let last = parts.last_mut().expect("wrap keeps a line");
@@ -832,7 +841,7 @@ fn event_line(e: &chocofactory_core::models::Event, width: usize) -> String {
 
 fn title_line(app: &App, d: &Detail, width: usize) -> Line<'static> {
     let right = if d.expanded {
-        "e status · Esc back · ? help"
+        "e/Esc status · ? help"
     } else {
         "e events · Esc back · ? help"
     };
@@ -845,11 +854,10 @@ fn title_line(app: &App, d: &Detail, width: usize) -> Line<'static> {
             .to_string(),
         (None, None) => "(task is no longer listed)".to_string(),
     };
-    let _ = app;
     let title = pad(&title, width.saturating_sub(right.chars().count() + 2));
     Line::styled(
         format!("{title}  {right}"),
-        Style::default().add_modifier(Modifier::BOLD),
+        colored(app, ACCENT).add_modifier(Modifier::BOLD),
     )
 }
 
@@ -869,7 +877,7 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     let ev_sep_style = if d.reconnecting {
         error_style(app)
     } else {
-        plain
+        colored(app, ACCENT)
     };
 
     if d.expanded {
@@ -902,6 +910,7 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     let mut prog_title = "progress".to_string();
     let mut prog_err = false;
     let mut prog: Vec<(String, Style)> = Vec::new();
+    let mut prog_header: Option<String> = None;
     let mut cuttable = true;
     match (&d.data, &d.error) {
         (None, None) => prog.push(("  loading…".into(), plain)),
@@ -923,8 +932,11 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
                 prog_title = format!("progress (refresh failed: {e})");
                 prog_err = true;
             }
-            match crate::render::detail_progress(v) {
-                Some(l) => prog.extend(l.into_iter().map(|l| (l, plain))),
+            match crate::render::detail_progress(v, app.now, Some(width)) {
+                Some(t) => {
+                    prog_header = t.header;
+                    prog.extend(t.rows.into_iter().map(|l| (l, plain)));
+                }
                 None => prog.push((
                     "  (no workflow state — the task has not started)".into(),
                     plain,
@@ -935,68 +947,101 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     let counters = d.data.as_ref().and_then(crate::render::loop_counters_line);
 
     let events_n = d.events.len();
-    let want_tail = events_n.clamp(1, STATUS_TAIL);
+    // The tail used to be capped at five events; it now takes whatever
+    // height is left once the fields and the progress block fit (#187).
+    let want_tail = events_n.max(1);
     let row_h = |rows: &[FRow]| -> usize {
         rows.iter()
             .map(|r| row_lines(r, label_w_cell.get(), width).len())
             .sum()
     };
-    let block = |rows: &[FRow], prog_h: usize| -> usize {
-        1 + if has_task { row_h(rows) } else { 0 } + 1 + prog_h + usize::from(counters.is_some())
+    // Height of the status block (without the tail) when `m` of the steps
+    // are shown, with or without the progress header row.
+    let block = |rows: &[FRow], m: usize, header: bool| -> usize {
+        let prog_h = if m < prog.len() { m + 1 } else { m };
+        1 + if has_task { row_h(rows) } else { 0 }
+            + 1
+            + usize::from(header)
+            + prog_h
+            + usize::from(counters.is_some())
+    };
+    // What the tail gets from `spare` lines: its separator plus events.
+    let tail_for = |spare: usize| -> usize {
+        if spare >= 2 {
+            (spare - 1).min(want_tail)
+        } else {
+            0
+        }
     };
 
+    let mut show_header = prog_header.is_some();
     let mut keep_prog = prog.len();
     let mut tail = 0;
     if !has_task {
         rows.clear();
     }
-    if block(&rows, keep_prog) + 1 + want_tail <= body_h {
-        tail = want_tail;
+    if block(&rows, keep_prog, show_header) <= body_h {
+        tail = tail_for(body_h - block(&rows, keep_prog, show_header));
     } else {
-        // The tail shrinks first, one event at a time; without room for an
-        // event line its separator goes too.
-        let avail = body_h.saturating_sub(block(&rows, keep_prog));
-        if avail >= 2 {
-            tail = (avail - 1).min(want_tail);
+        // The tail is already gone. Rows drop first, with every progress
+        // step still counted: the progress path is what the view is for.
+        for cut in 1..=4u8 {
+            if block(&rows, keep_prog, show_header) <= body_h {
+                break;
+            }
+            rows.retain(|r| r.drop != cut);
+            label_w_cell.set(widest(&rows));
         }
-        if tail == 0 {
-            // Then the status block: older progress lines first...
-            let fits = |m: usize, rows: &[FRow]| {
-                let h = if m < prog.len() { m + 1 } else { m };
-                block(rows, h) <= body_h
+        if block(&rows, keep_prog, show_header) <= body_h {
+            // The drops can free several lines at once: the tail gets them.
+            tail = tail_for(body_h - block(&rows, keep_prog, show_header));
+        } else {
+            // Then older progress lines go, the header row kept...
+            let largest = |rows: &[FRow], header: bool| {
+                (1..prog.len())
+                    .rev()
+                    .find(|&m| block(rows, m, header) <= body_h)
             };
             if cuttable {
-                keep_prog = (1..=prog.len())
-                    .rev()
-                    .find(|&m| m != prog.len().saturating_sub(1) && fits(m, &rows))
+                keep_prog = largest(&rows, show_header)
+                    .or_else(|| {
+                        // ...and when even one step doesn't fit with it, the
+                        // header goes before anything else is given up.
+                        let m = (1..=prog.len())
+                            .rev()
+                            .find(|&m| block(&rows, m, false) <= body_h);
+                        if m.is_some() {
+                            show_header = false;
+                        }
+                        m
+                    })
                     .unwrap_or(if prog.len() <= 2 { prog.len() } else { 1 });
             }
-            // ...then the Role, Created, Repo and workflow path rows.
-            for cut in 1..=4u8 {
-                let h = if keep_prog < prog.len() {
-                    keep_prog + 1
-                } else {
+            // Last resort: the header row first, then wrapped rows shrink a
+            // line at a time, then trailing rows go, so the progress
+            // separator and one progress (or error) line stay on screen.
+            // Extra error lines and the loop counters are left to the
+            // bottom clip.
+            let tight = |rows: &[FRow], header: bool| {
+                let m = if keep_prog < prog.len() {
                     keep_prog
-                };
-                if block(&rows, h) <= body_h {
-                    break;
-                }
-                rows.retain(|r| r.drop != cut);
-            }
-            // Still too tall: wrapped rows shrink a line at a time, then
-            // trailing rows go, so the progress separator and one progress
-            // (or error) line stay on screen. Extra error lines and the
-            // loop counters are left to the bottom clip.
-            let tight = |rows: &[FRow]| {
-                let h = if keep_prog < prog.len() {
-                    keep_prog + 1
                 } else {
                     prog.len().min(if cuttable { 2 } else { 1 })
                 };
-                block(rows, h) - usize::from(counters.is_some())
+                let prog_h = if keep_prog < prog.len() { m + 1 } else { m };
+                1 + if has_task { row_h(rows) } else { 0 } + 1 + usize::from(header) + prog_h
             };
-            const KEEP: [&str; 5] = ["ID", "Project", "Workflow", "Status", "Stage"];
-            while tight(&rows) > body_h {
+            const KEEP: [&str; 5] = [
+                LABEL_ID,
+                LABEL_PROJECT,
+                LABEL_WORKFLOW,
+                LABEL_STATUS,
+                LABEL_STAGE,
+            ];
+            if tight(&rows, show_header) > body_h {
+                show_header = false;
+            }
+            while tight(&rows, show_header) > body_h {
                 if let Some(i) = rows.iter().position(|r| r.wrap && r.cap > 1) {
                     rows[i].cap -= 1;
                     continue;
@@ -1022,8 +1067,15 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     }
     lines.push(Line::styled(
         fit(&separator(&prog_title, width), width),
-        if prog_err { error_style(app) } else { plain },
+        if prog_err {
+            error_style(app)
+        } else {
+            colored(app, ACCENT)
+        },
     ));
+    if show_header && let Some(h) = &prog_header {
+        lines.push(Line::styled(fit(h, width), colored(app, Color::DarkGray)));
+    }
     let hidden = prog.len() - keep_prog;
     if hidden > 0 {
         lines.push(Line::raw(fit(
@@ -1062,7 +1114,7 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
 }
 
 const STATUS_HINTS: &str = "e events  o PR  r retry  c cancel  Esc back";
-const EXPANDED_HINTS: &str = "PgUp/PgDn scroll  End follow  e status  o PR  r retry  c cancel";
+const EXPANDED_HINTS: &str = "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  c cancel";
 
 fn draw_detail_body(frame: &mut Frame, app: &App, lines: Vec<Line>, area: Rect, hints: &str) {
     let body_h = area.height.saturating_sub(1);
@@ -1123,11 +1175,27 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &super::app::Prompt, area: 
     );
 }
 
+/// Word wrap. A token longer than a line ends the current line and is split
+/// into `w`-character chunks, the last of which later words may join. Empty
+/// input is one empty line.
 fn wrap_words(s: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
     let mut lines = Vec::new();
     let mut cur = String::new();
     for word in s.split_whitespace() {
-        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > w {
+        let n = word.chars().count();
+        if n > w {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            let mut chunks = chars.chunks(w).map(|c| c.iter().collect::<String>());
+            let last = chunks.next_back().unwrap_or_default();
+            lines.extend(chunks);
+            cur = last;
+            continue;
+        }
+        if !cur.is_empty() && cur.chars().count() + 1 + n > w {
             lines.push(std::mem::take(&mut cur));
         }
         if !cur.is_empty() {
@@ -1135,7 +1203,7 @@ fn wrap_words(s: &str, w: usize) -> Vec<String> {
         }
         cur.push_str(word);
     }
-    if !cur.is_empty() {
+    if !cur.is_empty() || lines.is_empty() {
         lines.push(cur);
     }
     lines
@@ -1157,4 +1225,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" keys ")),
         r,
     );
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_words;
+
+    #[test]
+    fn empty_input_is_one_empty_line() {
+        assert_eq!(wrap_words("", 10), [""]);
+        assert_eq!(wrap_words("   ", 0), [""]);
+    }
 }

@@ -711,14 +711,18 @@ Title     ship the thing
 Stage     review
 
 Progress
-  1. gate (start)   2026-08-01 12:33:31 UTC
-  2. gate --[resumed]--> review   2026-08-01 12:33:37 UTC   (current)
+  #  from  outcome  to      at (UTC)
+  1        start    gate    2026-08-01 12:33:31
+  2  gate  resumed  review  2026-08-01 12:33:37  ◀ current
 ```
+
+Times are UTC. A step from today shows only the time (`12:33:37`); an
+earlier day's step also shows its date, as above.
 
 The trail comes from the task's `stage_entered` events, so the same
 transitions also show up inline in `choco task events` alongside the
 conversation. A task whose history has aged out of retention still gets
-its current stage named on a trailing line.
+its current stage named: the table ends with a `→` row marked `◀ current`.
 
 A task with no recorded transitions at all says so, rather than showing
 a blank list:

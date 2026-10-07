@@ -284,7 +284,7 @@ impl Output {
                 let tasks: Vec<Task> = t.iter().map(|s| s.task.clone()).collect();
                 render::tasks(&tasks)
             }
-            Output::TaskDetail(d) => render::task_detail(d),
+            Output::TaskDetail(d) => render::task_detail(d, chrono::Utc::now()),
             Output::Events(e) => render::events(e),
             Output::InitWorkflows(r) => render::init_workflows(r),
             Output::Accepted(msg) => msg.clone(),
