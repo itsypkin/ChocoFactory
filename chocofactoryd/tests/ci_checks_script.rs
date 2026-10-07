@@ -440,6 +440,26 @@ fn a_failing_awk_never_turns_a_red_pr_into_green() {
 }
 
 #[test]
+fn a_failing_run_id_extraction_fails_closed_without_rerunning() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new(&["FAILURE", "SUCCESS"]);
+    // Passes every sed call except the `-n` run-id extraction.
+    let p = fx.dir.join("sed");
+    fs::write(
+        &p,
+        "#!/bin/sh\nif [ \"$1\" = -n ]; then exit 2; fi\nexec /usr/bin/sed \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(fx.fails().contains("sed failed"));
+    assert!(
+        !fs::read_to_string(fx.dir.join("calls"))
+            .unwrap_or_default()
+            .contains("run rerun")
+    );
+}
+
+#[test]
 fn a_failing_sort_fails_closed() {
     let fx = Fixture::new(&["FAILURE", "PENDING"]);
     fx.broken_tool("sort", 2);

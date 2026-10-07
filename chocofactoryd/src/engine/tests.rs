@@ -14817,3 +14817,17 @@ stages:
             .contains(&json!("gate"))
     );
 }
+
+#[test]
+fn a_malformed_finished_stages_value_is_replaced_by_a_list() {
+    for bad in [json!("oops"), json!(7), json!({"a": 1})] {
+        let mut payload = json!({ "finished_stages": bad, "keep": 1 });
+        mark_stage_finished(&mut payload, "gate");
+        mark_stage_finished(&mut payload, "gate");
+        assert_eq!(payload["finished_stages"], json!(["gate"]));
+        assert_eq!(payload["keep"], json!(1));
+    }
+    let mut not_object = json!("scalar");
+    mark_stage_finished(&mut not_object, "gate");
+    assert_eq!(not_object["finished_stages"], json!(["gate"]));
+}
