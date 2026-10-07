@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::*;
 use crate::adapter::ClaudeAdapter;
+use tokio::io::AsyncWriteExt;
 
 fn fixture_binary(name: &str) -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1181,4 +1182,218 @@ fn the_default_validate_role_accepts_everything() {
             )
             .is_ok()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in tests against the real `omp` (ignored by default)
+// ---------------------------------------------------------------------------
+
+/// Everything `spawn` does before starting the process, for tests that talk
+/// to the real omp themselves: the overlay on disk, the arguments, and the
+/// scrubbed command.
+fn real_command(binary: &str, state: &Path, cfg: &RoleConfig) -> (Command, PathBuf) {
+    let (files, _warnings) = read_repo_instructions(&cfg.cwd);
+    let append = match &cfg.isolation {
+        Isolation::Isolated { .. } => Some(append_block(&render_instruction_files(&files), cfg)),
+        Isolation::InheritOperatorConfig => None,
+    };
+    let overlay_dir = state.join("overlays");
+    let session_dir = state.join("sessions");
+    std::fs::create_dir_all(&overlay_dir).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let overlay_path = overlay_dir.join(format!("{}.yml", uuid::Uuid::new_v4()));
+    write_private_file(
+        &overlay_path,
+        &serde_yaml::to_string(&overlay(cfg)).unwrap(),
+    )
+    .unwrap();
+    let args = build_args(cfg, &overlay_path, &session_dir, append.as_deref(), None);
+    let mut command = Command::new(binary);
+    command
+        .current_dir(&cfg.cwd)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    scrub_env(&mut command);
+    (command, overlay_path)
+}
+
+async fn rpc_request(
+    stdin: &mut ChildStdin,
+    lines: &mut BufReader<ChildStdout>,
+    id: &str,
+    body: Value,
+) -> Value {
+    let mut frame = body;
+    frame["id"] = json!(id);
+    stdin
+        .write_all(format!("{frame}\n").as_bytes())
+        .await
+        .unwrap();
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(60), read_lf_line(lines))
+            .await
+            .expect("omp didn't answer in 60 s")
+            .unwrap()
+            .expect("omp exited");
+        let value: Value = serde_json::from_str(&line).unwrap();
+        if value["type"] == "response" && value["id"] == id {
+            assert_eq!(value["success"], true, "{value}");
+            return value["data"].clone();
+        }
+    }
+}
+
+/// No model call. What the real omp loads under the adapter's own flags and
+/// overlay: only the repo's four instruction files reach the system prompt
+/// (nothing from a parent folder, a nested folder or `.omp/mcp.json`), and
+/// the tool list is exactly the allowlist plus `report_outcome`.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_loads_only_the_repos_own_instructions -- --ignored`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn omp_loads_only_the_repos_own_instructions() {
+    let env = Env::new();
+    let parent = env.dir.join("parent");
+    let repo = parent.join("repo");
+    std::fs::create_dir_all(repo.join(".omp")).unwrap();
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(parent.join("CLAUDE.md"), "PARENT_MARK\n").unwrap();
+    std::fs::write(repo.join("CLAUDE.md"), "REPO_CLAUDE_MARK\n").unwrap();
+    std::fs::write(repo.join("AGENTS.md"), "REPO_AGENTS_MARK\n").unwrap();
+    std::fs::write(repo.join(".omp/AGENTS.md"), "REPO_OMP_AGENTS_MARK\n").unwrap();
+    std::fs::write(repo.join(".omp/RULES.md"), "REPO_OMP_RULES_MARK\n").unwrap();
+    std::fs::write(
+        repo.join(".omp/mcp.json"),
+        r#"{"mcpServers": {"mcp_mark_server": {"command": "true"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(repo.join("sub/CLAUDE.md"), "NESTED_MARK\n").unwrap();
+
+    let mut cfg = env.cfg();
+    cfg.cwd = repo;
+    let (mut command, overlay_path) = real_command("omp", &env.state, &cfg);
+    let mut child = command.spawn().expect("omp must be on PATH");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let tool = tool_definition(&StageReport {
+        outcomes: cfg.report_outcomes.clone(),
+        required_sections: Vec::new(),
+    });
+    rpc_request(
+        &mut stdin,
+        &mut lines,
+        "t",
+        json!({"type": "set_host_tools", "tools": [{
+            "name": "report_outcome", "label": "Report outcome",
+            "description": tool["description"], "parameters": tool["inputSchema"],
+            "loadMode": "essential"}]}),
+    )
+    .await;
+    let state = rpc_request(&mut stdin, &mut lines, "s", json!({"type": "get_state"})).await;
+    drop(stdin);
+    let _ = child.wait().await;
+    let _ = std::fs::remove_file(overlay_path);
+
+    let prompt = state["systemPrompt"].to_string();
+    for present in [
+        "REPO_CLAUDE_MARK",
+        "REPO_AGENTS_MARK",
+        "REPO_OMP_AGENTS_MARK",
+        "REPO_OMP_RULES_MARK",
+    ] {
+        assert!(prompt.contains(present), "{present} missing");
+    }
+    for absent in ["PARENT_MARK", "NESTED_MARK", "mcp_mark_server"] {
+        assert!(
+            !prompt.contains(absent),
+            "{absent} leaked into the system prompt"
+        );
+    }
+    let mut tools: Vec<String> = state["dumpTools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect();
+    tools.sort();
+    let mut expected: Vec<String> = BASE_TOOLS.iter().map(|tool| tool.to_string()).collect();
+    expected.push("report_outcome".to_string());
+    expected.sort();
+    assert_eq!(tools, expected);
+}
+
+/// One real turn on `openai-codex/gpt-5.6-terra` with a one-line prompt,
+/// through the adapter. Uses the operator's existing omp login and costs one
+/// model prompt.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_runs_one_real_turn -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp, its login, and makes one model call"]
+async fn omp_runs_one_real_turn() {
+    let env = Env::new();
+    let adapter = OmpAdapter::new(&env.state);
+    let mut cfg = env.cfg();
+    cfg.report_outcomes = vec!["done".to_string()];
+    let mut handle = adapter
+        .start(
+            "Reply with the single word ok, then report your outcome as done.",
+            &cfg,
+        )
+        .expect("omp must be on PATH");
+    let events = until_turn_completed(&mut handle).await;
+    println!("{events:#?}");
+    let usage = usage_of(&events);
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCompleted {
+            is_error: false,
+            ..
+        })
+    ));
+    assert!(usage.models.is_some());
+    assert_eq!(usage.billing, BillingMode::Subscription);
+    drain(&mut handle).await;
+}
+
+/// Writes the exact spawn (arguments, overlay file, scrubbed environment)
+/// the adapter would use for a role in `CHOCO_PROBE_CWD`, as JSON to
+/// `CHOCO_PROBE_OUT`, so a throwaway probe script can drive the real omp the
+/// way the adapter does. `CHOCO_PROBE_SANDBOXED=1` makes the role sandboxed.
+///
+/// Run with: `CHOCO_PROBE_CWD=<dir> CHOCO_PROBE_OUT=<file> cargo test -p chocofactoryd --lib dump_probe_spawn -- --ignored`
+#[test]
+#[ignore = "a helper for hand-run probes, not a test"]
+fn dump_probe_spawn() {
+    let cwd = PathBuf::from(std::env::var("CHOCO_PROBE_CWD").unwrap());
+    let out = std::env::var("CHOCO_PROBE_OUT").unwrap();
+    let state = PathBuf::from(&out).with_extension("state");
+    let mut cfg = RoleConfig {
+        cwd,
+        model: Some("openai-codex/gpt-5.6-terra".to_string()),
+        system_prompt: None,
+        sandboxed: std::env::var("CHOCO_PROBE_SANDBOXED").as_deref() == Ok("1"),
+        report_outcomes: vec!["done".to_string()],
+        report_sections: Vec::new(),
+        isolation: Isolation::default(),
+        disallowed_tools: Vec::new(),
+    };
+    cfg.report_outcomes = vec!["done".to_string()];
+    let (command, overlay_path) = real_command("omp", &state, &cfg);
+    let std_command = command.as_std();
+    let args: Vec<String> = std_command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let env_changes: Vec<Value> = std_command
+        .get_envs()
+        .map(|(key, value)| json!([key.to_string_lossy(), value.map(|v| v.to_string_lossy())]))
+        .collect();
+    std::fs::write(
+        out,
+        json!({"args": args, "overlay": overlay_path, "env": env_changes}).to_string(),
+    )
+    .unwrap();
 }
