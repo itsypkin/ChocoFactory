@@ -962,6 +962,18 @@ fn malformed_head_oid_pushes_nothing() {
 }
 
 #[test]
+fn non_hex_head_oid_of_right_length_pushes_nothing() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    fx.cfg("pr-head", &format!("{}\n", "g".repeat(40)));
+    let out = fx.run("T (#1)", "approved", "r");
+    assert_failed_cleanly(&fx, &out);
+    let remote = git(&fx.root.join("origin.git"), &["branch", "--list", "task/*"]);
+    assert!(remote.trim().is_empty(), "{remote}");
+    assert!(first_line(&out).starts_with("choco open-pr: gh returned an unexpected head commit"));
+}
+
+#[test]
 fn other_push_failure_gets_generic_message() {
     let fx = Fixture::new();
     fx.write_description(b"d\n");

@@ -311,6 +311,8 @@ if [ "$PUSHED" != 1 ]; then
     cap 1024 < "$TMP/push-err" >&2
     exit 1
 fi
+# Keep git's notes (remote: hints, hook output) from a good push visible in stderr_tail.
+cap 1024 < "$TMP/push-err" >&2
 
 ISSUE=$(printf '%s' "$T" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')
 if [ -n "$ISSUE" ]; then

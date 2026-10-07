@@ -48,7 +48,9 @@ moves the task on, into `revising`.
   the PR's head, someone else pushed: look at the branch on GitHub, keep or
   bring in their commits, then `choco task send` the note. A plain
   non-fast-forward rejection (no open PR) means the branch on GitHub has
-  commits the task's branch lacks: inspect it the same way.
+  commits the task's branch lacks: inspect it the same way. Read the
+  message from `stderr_tail` in `choco --json task events <id>`; the
+  one-line `choco task events` view cuts it off.
 
 ## Getting your review items done when the coder ignores them
 
