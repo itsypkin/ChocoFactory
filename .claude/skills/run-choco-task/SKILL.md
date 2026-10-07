@@ -128,6 +128,11 @@ explicit out-of-scope list.
   defends whatever they added.
 - **Inline everything the task needs.** The task's worktree only has what is
   committed. A design note in a gitignored folder is invisible to it.
+- **Repo-wide rules go in the repo's instruction files.** An agent reads the
+  repo's own `CLAUDE.md` and `AGENTS.md` (the root ones at start, nested ones
+  when it reads a file in that folder), but not your `~/.claude/CLAUDE.md` or
+  instruction files in folders above the repo. Anything from your personal
+  setup that the task needs goes in the spec.
 - **Check that the design holds, not only that it builds.** For a feature
   that enforces or protects something, list every way the protected event
   can end, including a fresh retry, a resumed retry and the daemon's

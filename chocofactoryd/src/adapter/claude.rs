@@ -251,19 +251,27 @@ fn spawn(
     command.arg("--mcp-config").arg(mcp_config);
 
     // #90: what the turn may pick up from the operator's own machine. Each
-    // flag was checked against a real session (Claude Code 2.1.272): with
-    // all of them, the `init` line reported no plugins, the default output
-    // style and only our MCP server, the transcript loaded only the task
-    // repo's `CLAUDE.md`, and no hooks ran.
+    // piece was checked against a real session (Claude Code 2.1.291). The
+    // rule (#183): an isolated role reads the task repo's own `CLAUDE.md`
+    // and `AGENTS.md`, and nothing personal or from above the repo.
     //
-    // - `--setting-sources project` skips user settings (plugins, hooks,
-    //   output style, `~/.claude/CLAUDE.md`) and local settings.
-    //   `.claude/settings.local.json` is the operator's personal,
-    //   uncommitted file, and in a linked worktree (every choco task)
-    //   Claude Code resolves it to the main checkout's (#141). The task
-    //   repo's committed `.claude/settings.json` and `CLAUDE.md` still apply.
+    // - `--setting-sources project` skips user and local *settings*
+    //   (plugins, hooks, output style). `.claude/settings.local.json` is the
+    //   operator's personal, uncommitted file, and in a linked worktree
+    //   (every choco task) Claude Code resolves it to the main checkout's
+    //   (#141). It does NOT stop `~/.claude/CLAUDE.md` or the `CLAUDE.md`
+    //   files in folders above the repo from loading. The task repo's
+    //   committed `.claude/settings.json` still applies.
     // - `--strict-mcp-config` drops the operator's MCP servers, leaving only
     //   ours.
+    // - `--settings` (`isolated_settings`) scopes the instruction files: its
+    //   `claudeMdExcludes` negated glob excludes every `CLAUDE.md` outside
+    //   the canonical working directory, the personal one included. Its
+    //   `pluginConfigs` switches on `AGENTS.md` loading in the built-in
+    //   agents-md plugin, which is otherwise off. The built-in plugins
+    //   (`cc-plugin-agents-md`, `cc-plugin-telemetry`,
+    //   `cc-plugin-plugin-authoring`) do appear on an isolated role's `init`
+    //   line; `agents_md_plugin_warning` checks the first is there.
     // - `ReportFindings` is a built-in verdict tool that reviewers reached
     //   for instead of `report_outcome` (#61).
     // - With no skills allowed, the `Skill` tool is removed outright; with
@@ -277,6 +285,7 @@ fn spawn(
     // only `CHAT_BLOCKED_TOOLS` (see their comments for why). "Inherit the
     // operator's config" means the operator's settings, plugins and MCP
     // servers, not tools that start turns nobody supervises.
+    let mut spawn_warnings: Vec<String> = Vec::new();
     let initialize = match &cfg.isolation {
         Isolation::InheritOperatorConfig => {
             let mut disallowed: Vec<&str> = CHAT_BLOCKED_TOOLS.to_vec();
@@ -285,10 +294,14 @@ fn spawn(
             None
         }
         Isolation::Isolated { skills, memory: _ } => {
+            let (settings, warnings) = isolated_settings(&cfg.cwd);
+            spawn_warnings = warnings;
             command
                 .arg("--setting-sources")
                 .arg("project")
-                .arg("--strict-mcp-config");
+                .arg("--strict-mcp-config")
+                .arg("--settings")
+                .arg(settings);
             let mut disallowed = vec!["ReportFindings"];
             disallowed.extend(TIMER_TOOLS);
             if skills.is_empty() {
@@ -330,6 +343,15 @@ fn spawn(
     let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
     let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
+    // A fallback while building the settings is never silent: it goes to the
+    // daemon log and to the timeline, and the spawn carries on.
+    for message in spawn_warnings {
+        tracing::warn!("{message}");
+        events_tx
+            .send(AgentEvent::Error { message })
+            .expect("events_rx not yet dropped");
+    }
+
     // The initial prompt goes through the same stdin channel as any
     // later `AgentHandle::send`, since claude accepts every turn
     // (including the first) as a stream-json line once
@@ -344,6 +366,7 @@ fn spawn(
         stdout,
         events_tx,
         cfg.isolation.describe(),
+        cfg.isolation.clone(),
     ));
 
     Ok(AgentHandle::new(child, events_rx, stdin_tx))
@@ -449,6 +472,7 @@ async fn run_stdout_reader(
     stdout: tokio::process::ChildStdout,
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     isolation: Value,
+    role_isolation: Isolation,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let mut tool_names: HashMap<String, String> = HashMap::new();
@@ -471,7 +495,121 @@ async fn run_stdout_reader(
                 return;
             }
         }
+        let top_level_init = value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("init")
+            && value.get("parent_tool_use_id").is_none_or(Value::is_null);
+        if top_level_init && let Some(event) = agents_md_plugin_warning(&value, &role_isolation) {
+            if let AgentEvent::Error { message } = &event {
+                let session_id = value.get("session_id").and_then(Value::as_str);
+                tracing::warn!(session_id, "{message}");
+            }
+            if events_tx.send(event).is_err() {
+                return;
+            }
+        }
     }
+}
+
+/// Makes a path match itself literally inside a glob.
+///
+/// Backslash escapes are NOT honoured by Claude Code's `claudeMdExcludes`
+/// matcher (probed on 2.1.292: `\(1\)` and `\[x\]` made the repo's own
+/// files stop loading), but a one-character class is: `[(]` matches `(`.
+/// So each character picomatch treats as syntax (`* ? [ ] { } ( ) + @ | "`) is
+/// wrapped in `[` `]`. `!` and `\` can't be put in a class (`[!]` is a
+/// negated class, and a backslash inside one is itself an escape), so each
+/// becomes `?`, which matches that one character and nothing longer.
+fn glob_escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '+' | '@' | '|' | '"' => {
+                out.push('[');
+                out.push(c);
+                out.push(']');
+            }
+            '!' | '\\' => out.push('?'),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The `--settings` JSON for an isolated role (#183) and any warnings about
+/// falling back while building it. Only instruction files under the role's
+/// canonical working directory load, and the built-in agents-md plugin is
+/// told to read `AGENTS.md` as well as `CLAUDE.md`.
+fn isolated_settings(cwd: &std::path::Path) -> (String, Vec<String>) {
+    let mut warnings = Vec::new();
+    let resolved = match std::fs::canonicalize(cwd) {
+        Ok(path) => path,
+        Err(err) => {
+            warnings.push(format!(
+                "could not resolve the real path of {} ({err}); instruction files are scoped to it as given",
+                cwd.display()
+            ));
+            cwd.to_path_buf()
+        }
+    };
+    let path = utf8_path(&resolved, cwd, &mut warnings);
+    let escaped = glob_escape(&path);
+    let settings = json!({
+        "claudeMdExcludes": [format!("!{}/**", escaped.trim_end_matches('/'))],
+        "pluginConfigs": {
+            "cc-plugin-agents-md@builtin": {
+                "options": { "instructionFiles": "claude-md-and-agents-md" }
+            }
+        }
+    });
+    (settings.to_string(), warnings)
+}
+
+/// `resolved` as a string, lossily (with a warning) when it isn't UTF-8.
+fn utf8_path(
+    resolved: &std::path::Path,
+    cwd: &std::path::Path,
+    warnings: &mut Vec<String>,
+) -> String {
+    match resolved.to_str() {
+        Some(path) => path.to_string(),
+        None => {
+            warnings.push(format!(
+                "the working directory {} is not valid UTF-8; instruction-file scoping may exclude the repo's own CLAUDE.md/AGENTS.md",
+                cwd.display()
+            ));
+            resolved.to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// A warning when an isolated role's `init` line lists plugins and none is
+/// the built-in agents-md plugin: the plugin sits behind a server-side
+/// feature flag, and without it `AGENTS.md` silently stops loading.
+fn agents_md_plugin_warning(init: &Value, isolation: &Isolation) -> Option<AgentEvent> {
+    if matches!(isolation, Isolation::InheritOperatorConfig) {
+        return None;
+    }
+    let plugins = init.get("plugins")?.as_array()?;
+    const NAMES: [&str; 2] = ["cc-plugin-agents-md", "agents-md"];
+    const SOURCES: [&str; 2] = ["cc-plugin-agents-md@builtin", "agents-md@builtin"];
+    let is_agents_md = |entry: &Value| match entry {
+        Value::String(s) => NAMES.contains(&s.as_str()) || SOURCES.contains(&s.as_str()),
+        Value::Object(o) => {
+            o.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| NAMES.contains(&n))
+                || o.get("source")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| SOURCES.contains(&n))
+        }
+        _ => false,
+    };
+    if plugins.iter().any(is_agents_md) {
+        return None;
+    }
+    Some(AgentEvent::Error {
+        message: "Claude Code's built-in agents-md plugin (cc-plugin-agents-md@builtin) is not among this session's plugins, so the repo's AGENTS.md files won't be loaded".to_string(),
+    })
 }
 
 fn user_turn_line(text: &str) -> String {
@@ -1294,10 +1432,18 @@ mod tests {
         isolation: Isolation,
         disallowed_tools: Vec<RoleTool>,
     ) -> HashMap<String, String> {
+        echo_args_in(isolation, disallowed_tools, std::env::temp_dir()).await
+    }
+
+    async fn echo_args_in(
+        isolation: Isolation,
+        disallowed_tools: Vec<RoleTool>,
+        cwd: std::path::PathBuf,
+    ) -> HashMap<String, String> {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
             disallowed_tools,
-            cwd: std::env::temp_dir(),
+            cwd,
             model: None,
             system_prompt: None,
             sandboxed: true,
@@ -1440,6 +1586,294 @@ mod tests {
         );
         assert_eq!(fields["disable_auto_memory"], "<unset>");
         assert_eq!(fields["initialize"], "<unset>");
+        assert_eq!(fields["settings"], "<unset>");
+        assert_eq!(fields["settings_count"], "0");
+    }
+
+    fn expected_settings(cwd: &std::path::Path) -> Value {
+        let canon = std::fs::canonicalize(cwd).unwrap();
+        json!({
+            "claudeMdExcludes": [format!("!{}/**", glob_escape(canon.to_str().unwrap()))],
+            "pluginConfigs": {"cc-plugin-agents-md@builtin": {"options": {"instructionFiles": "claude-md-and-agents-md"}}}
+        })
+    }
+
+    #[tokio::test]
+    async fn an_isolated_spawn_passes_the_scoped_settings_exactly_once() {
+        for isolation in [
+            Isolation::default(),
+            Isolation::Isolated {
+                skills: vec!["run-tests".into()],
+                memory: true,
+            },
+        ] {
+            let fields = echo_args_for(isolation).await;
+            assert_eq!(fields["settings_count"], "1");
+            let settings: Value = serde_json::from_str(&fields["settings"]).unwrap();
+            assert_eq!(settings, expected_settings(&std::env::temp_dir()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chat_spawn_gets_no_settings_flag() {
+        let fields = echo_args_for(Isolation::InheritOperatorConfig).await;
+        assert_eq!(fields["settings"], "<unset>");
+        assert_eq!(fields["settings_count"], "0");
+    }
+
+    #[test]
+    fn glob_escape_leaves_ordinary_paths_alone() {
+        assert_eq!(glob_escape("/Users/me/dev/repo"), "/Users/me/dev/repo");
+        assert_eq!(glob_escape("/Users/me/my repo"), "/Users/me/my repo");
+        assert_eq!(glob_escape("/a.b-c#d/é"), "/a.b-c#d/é");
+    }
+
+    #[test]
+    fn glob_escape_neutralises_each_syntax_character_once() {
+        for c in ['*', '?', '[', ']', '{', '}', '(', ')', '+', '@', '|', '"'] {
+            assert_eq!(glob_escape(&format!("/a{c}b")), format!("/a[{c}]b"));
+        }
+        for c in ['!', '\\'] {
+            assert_eq!(glob_escape(&format!("/a{c}b")), "/a?b");
+        }
+        assert_eq!(
+            glob_escape("/x/[a]+(b)!{c}@d*e?f\\g"),
+            "/x/[[]a[]][+][(]b[)]?[{]c[}][@]d[*]e[?]f?g"
+        );
+    }
+
+    #[test]
+    fn isolated_settings_falls_back_with_a_warning_when_the_path_cannot_be_resolved() {
+        let missing = std::env::temp_dir().join(format!("choco-missing-{}", uuid::Uuid::new_v4()));
+        let (json_str, warnings) = isolated_settings(&missing);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("could not resolve the real path"));
+        let settings: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            settings["claudeMdExcludes"][0],
+            format!("!{}/**", glob_escape(missing.to_str().unwrap()))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_path_that_is_not_utf8_is_used_lossily_with_a_warning() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/bad-\xff"));
+        let mut warnings = Vec::new();
+        let path = utf8_path(bad, bad, &mut warnings);
+        assert_eq!(path, "/tmp/bad-\u{fffd}");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("not valid UTF-8"));
+        let mut none = Vec::new();
+        utf8_path(std::path::Path::new("/tmp/ok"), bad, &mut none);
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_isolated_spawn_whose_init_has_no_plugins_key_produces_no_warning() {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: vec!["done".to_string()],
+            report_sections: Vec::new(),
+            isolation: Isolation::default(),
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        loop {
+            match handle.recv().await.expect("stream ended before a reply") {
+                AgentEvent::AssistantMessage { .. } => break,
+                AgentEvent::Error { message } => panic!("unexpected warning: {message}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// The reader, not just `agents_md_plugin_warning`, must send the warning:
+    /// a fake CLI whose `init` lists plugins without agents-md, spawned
+    /// isolated, yields `SessionMeta` then the `Error`; a chat spawn doesn't.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_reader_sends_the_plugin_warning_after_the_session_meta_for_isolated_roles() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = std::env::temp_dir().join(format!("choco-fake-{}.sh", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nread line\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"plugins\":[{\"name\":\"cc-plugin-telemetry\",\"source\":\"cc-plugin-telemetry@builtin\"}]}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"session_id\":\"s\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (isolation, expect_warning) in [
+            (Isolation::default(), true),
+            (Isolation::InheritOperatorConfig, false),
+        ] {
+            let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
+            let cfg = RoleConfig {
+                disallowed_tools: Vec::new(),
+                cwd: std::env::temp_dir(),
+                model: None,
+                system_prompt: None,
+                sandboxed: true,
+                report_outcomes: Vec::new(),
+                report_sections: Vec::new(),
+                isolation,
+            };
+            let mut handle = adapter.start("go", &cfg).unwrap();
+            let mut seen = Vec::new();
+            while let Some(event) = handle.recv().await {
+                let done = matches!(event, AgentEvent::TurnCompleted { .. });
+                seen.push(event);
+                if done {
+                    break;
+                }
+            }
+            let warned = matches!(seen.get(1), Some(AgentEvent::Error { message }) if message.contains("AGENTS.md"));
+            assert!(matches!(seen[0], AgentEvent::SessionMeta { .. }));
+            assert_eq!(warned, expect_warning, "{seen:?}");
+        }
+        std::fs::remove_file(&script).unwrap();
+    }
+
+    /// Canonicalisation proven on every platform: the cwd is a symlink the
+    /// test makes, with a trailing slash, so the flag must name the real dir.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_isolated_spawn_scopes_to_the_real_path_behind_a_symlink() {
+        let id = uuid::Uuid::new_v4();
+        let real = std::env::temp_dir().join(format!("choco-real-{id}"));
+        let link = std::env::temp_dir().join(format!("choco-link-{id}"));
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let fields = echo_args_in(Isolation::default(), Vec::new(), link.clone()).await;
+        std::fs::remove_file(&link).unwrap();
+        let settings: Value = serde_json::from_str(&fields["settings"]).unwrap();
+        let expected = expected_settings(&real);
+        std::fs::remove_dir(&real).unwrap();
+        assert_eq!(settings, expected);
+        let glob = settings["claudeMdExcludes"][0].as_str().unwrap();
+        assert!(!glob.contains(&format!("choco-link-{id}")), "{glob}");
+    }
+
+    #[test]
+    fn the_scope_glob_has_no_doubled_slash_when_resolution_fails() {
+        let missing = std::env::temp_dir().join(format!("choco-missing-{}/", uuid::Uuid::new_v4()));
+        let (json_str, _) = isolated_settings(&missing);
+        let settings: Value = serde_json::from_str(&json_str).unwrap();
+        let glob = settings["claudeMdExcludes"][0].as_str().unwrap();
+        assert!(glob.ends_with("/**") && !glob.ends_with("//**"), "{glob}");
+    }
+
+    /// The spawn-time warning must reach the event channel, first.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_non_utf8_cwd_sends_its_warning_as_the_first_event() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut name = format!("choco-bad-{}-", uuid::Uuid::new_v4()).into_bytes();
+        name.push(0xff);
+        let dir = std::env::temp_dir().join(std::ffi::OsStr::from_bytes(&name));
+        std::fs::create_dir(&dir).unwrap();
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
+        let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
+            cwd: dir.clone(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
+            isolation: Isolation::default(),
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        let first = handle.recv().await;
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(
+            matches!(&first, Some(AgentEvent::Error { message }) if message.contains("not valid UTF-8")),
+            "{first:?}"
+        );
+    }
+
+    /// A sub-agent's `init` line (it has a `parent_tool_use_id`) carries its
+    /// own plugin set and must not put a warning on the main role's timeline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sub_agent_init_line_does_not_trigger_the_plugin_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = std::env::temp_dir().join(format!("choco-fake-{}.sh", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nread line\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"parent_tool_use_id\":\"toolu_x\",\"plugins\":[{\"name\":\"cc-plugin-telemetry\",\"source\":\"cc-plugin-telemetry@builtin\"}]}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"session_id\":\"s\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
+        let cfg = RoleConfig {
+            disallowed_tools: Vec::new(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
+            isolation: Isolation::default(),
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        let mut seen = Vec::new();
+        while let Some(event) = handle.recv().await {
+            let done = matches!(event, AgentEvent::TurnCompleted { .. });
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+        std::fs::remove_file(&script).unwrap();
+        assert!(
+            !seen.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+            "{seen:?}"
+        );
+        assert!(matches!(
+            seen.last(),
+            Some(AgentEvent::TurnCompleted { .. })
+        ));
+    }
+
+    fn real_plugins() -> Vec<Value> {
+        ["agents-md", "telemetry", "plugin-authoring"]
+            .iter()
+            .map(|n| {
+                json!({"name": format!("cc-plugin-{n}"), "path": "builtin", "source": format!("cc-plugin-{n}@builtin")})
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agents_md_plugin_warning_covers_each_shape() {
+        let iso = Isolation::default();
+        let init =
+            |plugins: Value| json!({"type": "system", "subtype": "init", "plugins": plugins});
+
+        let without = init(json!(real_plugins()[1..]));
+        let Some(AgentEvent::Error { message }) = agents_md_plugin_warning(&without, &iso) else {
+            panic!("expected a warning");
+        };
+        assert!(message.contains("cc-plugin-agents-md") && message.contains("AGENTS.md"));
+        assert!(agents_md_plugin_warning(&init(json!([])), &iso).is_some());
+        assert!(agents_md_plugin_warning(&init(json!(real_plugins())), &iso).is_none());
+        assert!(
+            agents_md_plugin_warning(
+                &init(json!([{"name": "agents-md", "source": "agents-md@builtin"}])),
+                &iso
+            )
+            .is_none()
+        );
+        assert!(agents_md_plugin_warning(&init(json!(["agents-md@builtin"])), &iso).is_none());
+        assert!(
+            agents_md_plugin_warning(&json!({"type": "system", "subtype": "init"}), &iso).is_none()
+        );
+        assert!(agents_md_plugin_warning(&without, &Isolation::InheritOperatorConfig).is_none());
     }
 
     /// #115: workflow role shapes lose every timer tool, and chat loses
@@ -1579,5 +2013,180 @@ mod tests {
             }]
         );
         assert_eq!(normalize(&parse(accepted), &mut tool_names), Vec::new());
+    }
+
+    /// Removes a scratch tree and the transcript folder a probe created, even
+    /// on panic.
+    struct Scratch {
+        root: PathBuf,
+        uuid: String,
+        transcript_dir: Option<PathBuf>,
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+            if let Some(dir) = &self.transcript_dir
+                && dir
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(&self.uuid))
+            {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn write_file(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// One probe against the real CLI: builds a scratch tree named `name`
+    /// under `$HOME`, runs an isolated role in its `repo/`, and checks the
+    /// session transcript for which instruction files were loaded.
+    async fn probe_instruction_files(name: String, uuid: &str, config: &std::path::Path) {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let root = home.join(&name);
+        let mut guard = Scratch {
+            root: root.clone(),
+            uuid: uuid.to_string(),
+            transcript_dir: None,
+        };
+        let repo = root.join("repo");
+        let marker = |tag: &str| format!("MARKER-{tag}-{uuid}");
+        write_file(&root.join("CLAUDE.md"), &marker("parent-claude"));
+        write_file(&root.join("AGENTS.md"), &marker("parent-agents"));
+        write_file(&repo.join("CLAUDE.md"), &marker("repo-claude"));
+        write_file(&repo.join("AGENTS.md"), &marker("repo-agents"));
+        write_file(&repo.join("sub/CLAUDE.md"), &marker("sub-claude"));
+        write_file(&repo.join("sub/AGENTS.md"), &marker("sub-agents"));
+        write_file(&repo.join("sub/notes.txt"), "the notes file");
+        write_file(&repo.join(".claude/CLAUDE.md"), &marker("dot-claude"));
+        let git = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(git.success());
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        let adapter = ClaudeAdapter::new();
+        let cfg = RoleConfig {
+            cwd: repo.clone(),
+            model: Some("haiku".to_string()),
+            isolation: Isolation::default(),
+            sandboxed: true,
+            report_outcomes: vec![],
+            report_sections: vec![],
+            disallowed_tools: vec![],
+            system_prompt: None,
+        };
+        let mut handle = adapter
+            .start(
+                "Use the Read tool to read sub/notes.txt, then reply with its contents.",
+                &cfg,
+            )
+            .unwrap();
+        let mut session_id = None;
+        let mut plugins = Value::Null;
+        let mut warnings = Vec::new();
+        while let Some(event) = handle.recv().await {
+            match event {
+                AgentEvent::SessionMeta {
+                    adapter_session_id,
+                    details,
+                } => {
+                    plugins = details["init"]["plugins"].clone();
+                    session_id = Some(adapter_session_id);
+                }
+                AgentEvent::Error { message } if message.contains("agents-md plugin") => {
+                    warnings.push(message)
+                }
+                AgentEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        println!("[{name}] init plugins: {plugins}");
+        let session_id = session_id.expect("no session id from the init line");
+
+        let transcript = std::fs::read_dir(config.join("projects"))
+            .unwrap()
+            .flatten()
+            .map(|d| d.path())
+            .find(|d| d.join(format!("{session_id}.jsonl")).exists())
+            .expect("transcript not found");
+        guard.transcript_dir = Some(transcript.clone());
+        let text = std::fs::read_to_string(transcript.join(format!("{session_id}.jsonl"))).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let loaded_at = |path: &std::path::Path| {
+            let needle = format!("Contents of {}", path.display());
+            lines.iter().position(|l| l.contains(&needle))
+        };
+        let read_at = lines
+            .iter()
+            .position(|l| l.contains("\"tool_use\"") && l.contains("notes.txt"))
+            .expect(
+                "the transcript shows no Read of sub/notes.txt, so the nested checks mean nothing",
+            );
+
+        assert!(
+            loaded_at(&repo.join("CLAUDE.md")).is_some(),
+            "[{name}] repo CLAUDE.md not loaded"
+        );
+        assert!(
+            loaded_at(&repo.join("AGENTS.md")).is_some(),
+            "[{name}] repo AGENTS.md not loaded"
+        );
+        for file in ["sub/CLAUDE.md", "sub/AGENTS.md"] {
+            let at =
+                loaded_at(&repo.join(file)).unwrap_or_else(|| panic!("[{name}] {file} not loaded"));
+            assert!(at >= read_at, "[{name}] {file} loaded before the read");
+        }
+        let canon_root = std::fs::canonicalize(&root).unwrap();
+        for file in ["CLAUDE.md", "AGENTS.md"] {
+            assert!(
+                loaded_at(&canon_root.join(file)).is_none(),
+                "[{name}] parent {file} leaked"
+            );
+        }
+        let personal = config.join("CLAUDE.md");
+        if personal.exists() {
+            assert!(
+                loaded_at(&personal).is_none(),
+                "[{name}] personal CLAUDE.md leaked"
+            );
+        } else {
+            println!(
+                "[{name}] {} does not exist: the personal-file assertion is vacuous",
+                personal.display()
+            );
+        }
+        println!(
+            "[{name}] repo/.claude/CLAUDE.md loaded: {}",
+            loaded_at(&repo.join(".claude/CLAUDE.md")).is_some()
+        );
+        assert!(warnings.is_empty(), "[{name}] plugin warning: {warnings:?}");
+    }
+
+    /// Opt-in contract test against the real `claude` CLI (needs a login):
+    /// an isolated role loads exactly the repo's own `CLAUDE.md`/`AGENTS.md`.
+    ///
+    /// `cargo build --workspace --all-targets && cargo test -p chocofactoryd --lib -- --ignored isolated_role_loads_exactly_the_repos_instruction_files --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a logged-in real claude CLI"]
+    async fn isolated_role_loads_exactly_the_repos_instruction_files() {
+        let config = std::env::var("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".claude"));
+        let uuid = uuid::Uuid::new_v4().to_string();
+        probe_instruction_files(format!("choco-agents-md-{uuid}"), &uuid, &config).await;
+        probe_instruction_files(format!("choco-agents-md-{uuid} [x]+(1)|"), &uuid, &config).await;
+        probe_instruction_files(
+            format!("choco-agents-md-{uuid} {{a,b}}!@*]"),
+            &uuid,
+            &config,
+        )
+        .await;
     }
 }

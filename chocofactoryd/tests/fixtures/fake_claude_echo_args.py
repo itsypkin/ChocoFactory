@@ -4,7 +4,7 @@
 Like fake_claude_oneshot.py it runs a single turn and exits, so an
 `agent_turn` stage using it completes and auto-advances. Unlike the other
 fixtures, its reply is not an echo of the input but a summary of its own
-argv: `model=<--model>|system_prompt=<--system-prompt>|permission_mode=<--permission-mode>|mcp_config=<--mcp-config>|strict_mcp_config=<present?>|setting_sources=<--setting-sources>|disallowed_tools=<--disallowedTools>|disable_auto_memory=<env>|initialize=<control request>|append_system_prompt=<--append-system-prompt>`.
+argv: `model=<--model>|system_prompt=<--system-prompt>|permission_mode=<--permission-mode>|mcp_config=<--mcp-config>|strict_mcp_config=<present?>|setting_sources=<--setting-sources>|disallowed_tools=<--disallowedTools>|disable_auto_memory=<env>|initialize=<control request>|append_system_prompt=<--append-system-prompt>|settings=<--settings value, or <unset>>|settings_count=<how many times --settings appears in argv>`.
 
 That makes the *resolved role config* observable from the events table.
 `sessions` persists a session's `cli_adapter`/`model` columns, but nothing
@@ -38,7 +38,7 @@ def main():
         initialize = json.dumps(json.loads(line)["request"], separators=(",", ":"))
         sys.stdin.readline()
 
-    reply = "model={}|system_prompt={}|permission_mode={}|mcp_config={}|strict_mcp_config={}|setting_sources={}|disallowed_tools={}|disable_auto_memory={}|initialize={}|append_system_prompt={}".format(
+    reply = "model={}|system_prompt={}|permission_mode={}|mcp_config={}|strict_mcp_config={}|setting_sources={}|disallowed_tools={}|disable_auto_memory={}|initialize={}|append_system_prompt={}|settings={}|settings_count={}".format(
         flag(args, "--model"),
         flag(args, "--system-prompt"),
         flag(args, "--permission-mode"),
@@ -49,6 +49,8 @@ def main():
         os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "<unset>"),
         initialize,
         flag(args, "--append-system-prompt"),
+        flag(args, "--settings"),
+        args.count("--settings"),
     )
 
     auto_report(args, session_id)
