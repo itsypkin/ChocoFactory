@@ -723,6 +723,44 @@ Progress
   → gate (current, no transitions yet)
 ```
 
+**Cost and time.** After the progress list, `choco task status` prints what
+the task has used, recorded from every agent turn's own report:
+
+```
+Cost & time
+  Total        ≈ $0.09 (API-equivalent)
+  Tokens       input 30 · output 15 · cache read 300 · cache write 60
+  Wall time    2h05m
+  Active time  1h10m
+  By stage
+    implement      ≈ $0.05  (in 20 · out 10 · cache read 200 · cache write 40)
+    review         no data
+  By role
+    coder          ≈ $0.05  (…)
+  By lap
+    implement #1   ≈ $0.03  (…)
+    implement #2   ≈ $0.02  (…)
+  By model
+    claude-sonnet  ≈ $0.09  (…)
+```
+
+The cost is the CLI's own list-price figure, so it is always approximate (`≈`).
+It reads `(API-equivalent)` when every turn ran under a subscription login —
+what the same usage would cost on the API — and `(estimated)` otherwise (an API
+key, a mix, or a CLI that does not say). Money has two decimals. A figure the
+CLI did not report prints `?` (tokens), `cost unknown` (cost) or `no data`;
+it is never counted as zero. The total line ends `(N sessions without data)` when
+sessions ended without reporting a turn, such as a killed one. A task from before
+usage was recorded prints the single line `Cost & time  no data`.
+
+*Wall time* runs from creation to now while the task is open or stuck, and to its
+last update after that. *Active time* adds up the stages the task spent working,
+leaving out time at a `human_gate` and in a `terminal` stage; it comes from the
+stage trail, so it reads `no data` once that trail has aged out of retention.
+Cost and tokens are kept for good. A *lap* is the nth time the task entered a
+stage; a retry stays in its lap. `choco task list --json` carries each task's
+total as `usage_total`.
+
 Send a message into the task's live session (or resume a `human_gate`).
 At a gate that has markers, such as `awaiting_human_review`, the text must
 carry exactly one of them on a line of its own.
@@ -954,7 +992,8 @@ scrollable list in four sections:
 **Two modes.** Without `--project` every row has a `project` column (the
 project's name) and the header says `all projects`. With `--project` the column
 is gone and the header names the project. Narrow terminals drop columns: below
-80 columns the laps and PR columns, below 60 the stage and project columns too.
+91 columns the `cost` column (the task's total, `≈$1.23`, or `no data`), below
+80 the laps and PR columns, below 60 the stage and project columns too.
 Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off.
 
 | Key | Action |
@@ -962,7 +1001,7 @@ Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off
 | `↑` `k` / `↓` `j` | move, across section boundaries |
 | `PgUp` `PgDn`, `g` `G` | page; top / bottom |
 | `Tab` / `Shift-Tab` | next / previous non-empty section |
-| `⏎` | open the task's status view: the fields and progress `choco task status` shows, the loop counters, what the task is waiting for, its PR and the last 5 events, following new ones (`Esc` returns) |
+| `⏎` | open the task's status view: the fields and progress `choco task status` shows, the loop counters, what the task is waiting for, its PR, a `Cost` row (`≈ $0.09 (API-equivalent) · wall 2h05m · active 1h10m`, or `no data`) and the last 5 events, following new ones (`Esc` returns) |
 | `e` | in the detail: the full event stream (the last 200 events, following new ones; `PgUp`/`PgDn` scroll back, `End` follows again); `e` or `Esc` returns to the status view |
 | `o` | open the task's pull request |
 | `r` | retry a `stuck` task |

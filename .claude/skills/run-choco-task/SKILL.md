@@ -91,6 +91,13 @@ the pre-merge check in step 4.
   `(built-in updated since task start)`, or `(changed since task start)` for
   a workflow file, when it changed. Check that line and the
   daemon's version before blaming a prompt for a run's behaviour.
+  It ends with a `Cost & time` block: the task's cost (`≈ $…`, marked
+  `(API-equivalent)` when every turn ran under a subscription login and
+  `(estimated)` otherwise), tokens, wall and active time, and the same split
+  by stage, role, lap and model. A figure the CLI did not report reads `no
+  data`, `cost unknown` or `?`, never zero. `choco --json task list` carries
+  each task's total as `usage_total`, and the dashboard shows it in a `cost`
+  column on wide terminals.
 - **A project with no repo** (`REPO -` in `choco project list`) always gets
   the built-in workflows, and every `coding-task` needs `--repo`.
 - **A repo can override a built-in.** If the *project's* repo has

@@ -291,7 +291,7 @@ fn grouped<K: Ord + Clone>(
         }
     }
     let mut out: Vec<(K, Group)> = groups.into_iter().collect();
-    out.sort_by(|a, b| a.1.first_started.cmp(&b.1.first_started));
+    out.sort_by_key(|a| a.1.first_started);
     out.into_iter().map(|(k, g)| (k, g.sums)).collect()
 }
 
