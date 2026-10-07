@@ -43,8 +43,6 @@ checks)
     [ -e "$DIR/fail-checks" ] && { echo "fake gh: pr checks failed" >&2; exit 1; }
     [ -e "$DIR/empty-checks" ] && exit 0
     jq -R -s -c 'split("\n") | map(select(. != "")) | to_entries | map({name: ("job-" + (.key | tostring)), state: .value})' < "$DIR/states" | jq -r "$q"
-    # Like gh: exit 8 while checks are pending, output still printed.
-    [ -e "$DIR/checks-exit-8" ] && exit 8
     exit 0
     ;;
 *) echo "fake gh: unhandled: $*" >&2; exit 1 ;;
@@ -74,7 +72,7 @@ impl Fixture {
         let date = dir.join("date");
         fs::write(
             &date,
-            "#!/bin/sh\nif [ -n \"${FAKE_NOW:-}\" ]; then echo \"$FAKE_NOW\"; else exec /bin/date \"$@\"; fi\n",
+            "#!/bin/sh\n[ -e \"$GH_FAKE_DIR/date-fail\" ] && exit 1\n[ -e \"$GH_FAKE_DIR/date-junk\" ] && { echo soon; exit 0; }\nif [ -n \"${FAKE_NOW:-}\" ]; then echo \"$FAKE_NOW\"; else exec /bin/date \"$@\"; fi\n",
         )
         .unwrap();
         fs::set_permissions(&date, fs::Permissions::from_mode(0o755)).unwrap();
@@ -100,6 +98,14 @@ impl Fixture {
 
     fn switch(&self, name: &str) {
         fs::write(self.dir.join(name), "").unwrap();
+    }
+
+    /// Puts a fake `name` on PATH that exits with `code` and prints nothing.
+    fn broken_tool(&self, name: &str, code: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = self.dir.join(name);
+        fs::write(&p, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn first_seen(&self) -> PathBuf {
@@ -310,13 +316,6 @@ fn an_unparsable_first_seen_file_is_rewritten_with_a_note() {
 }
 
 #[test]
-fn pr_checks_exit_8_with_output_is_a_result_not_a_failure() {
-    let fx = Fixture::new(&["SUCCESS", "FAILURE", "PENDING"]);
-    fx.switch("checks-exit-8");
-    assert_eq!(first_line(&fx.ok()), "RED");
-}
-
-#[test]
 fn a_failing_pr_view_fails_closed() {
     let fx = Fixture::new(&["SUCCESS"]);
     fx.switch("fail-view");
@@ -378,4 +377,56 @@ fn an_unwritable_first_seen_file_fails_closed() {
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("choco ci-checks: "));
+}
+
+#[test]
+fn a_failing_awk_never_turns_a_red_pr_into_green() {
+    let fx = Fixture::new(&["FAILURE", "PENDING"]);
+    fx.broken_tool("awk", 2);
+    assert!(fx.fails().contains("awk failed"));
+}
+
+#[test]
+fn a_failing_sort_fails_closed() {
+    let fx = Fixture::new(&["FAILURE", "PENDING"]);
+    fx.broken_tool("sort", 2);
+    assert!(fx.fails().contains("sort failed"));
+}
+
+#[test]
+fn a_failing_date_fails_closed() {
+    let fx = Fixture::new(&[]);
+    fx.switch("date-fail");
+    assert!(fx.fails().contains("date failed"));
+    assert!(!fx.first_seen().exists());
+}
+
+#[test]
+fn a_date_that_is_not_a_number_fails_closed() {
+    let fx = Fixture::new(&[]);
+    fx.switch("date-junk");
+    assert!(fx.fails().contains("not a number"));
+    assert!(!fx.first_seen().exists());
+}
+
+#[test]
+fn a_failing_move_of_the_first_seen_file_fails_closed() {
+    let fx = Fixture::new(&[]);
+    fx.broken_tool("mv", 1);
+    assert!(fx.fails().contains("cannot move"));
+    assert!(!fx.first_seen().exists());
+}
+
+#[test]
+fn a_missing_pr_number_fails_closed() {
+    let fx = Fixture::new(&["SUCCESS"]);
+    let out = Command::new("sh")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/scripts/ci-checks.sh"))
+        .current_dir(&fx.repo)
+        .env_remove("PR_NUMBER")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("PR_NUMBER is not set"));
 }

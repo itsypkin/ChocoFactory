@@ -1607,7 +1607,17 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             let matched = compiled.matching(&stdout).map(|m| m.then.to_string());
             assert_eq!(matched, case.outcome, "case '{}'", case.name);
             if let Some(outcome) = matched {
-                assert!(stage.on.contains_key(&outcome), "case '{}'", case.name);
+                let expected = match outcome.as_str() {
+                    "green" | "no_checks" => "awaiting_human_review",
+                    "red" => "revising",
+                    _ => "escalate_to_human",
+                };
+                assert_eq!(
+                    stage.on.get(&outcome).map(|t| t.to_string()).as_deref(),
+                    Some(expected),
+                    "case '{}'",
+                    case.name
+                );
             }
         }
         // A token must be the whole first line: a check name cannot select one.

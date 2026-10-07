@@ -38,16 +38,14 @@
 # FAIL CLOSED. Any `gh` or `git` failure, an empty head, a count that is not
 # a number, or a failed write of the first-seen file: a note on stderr
 # (`choco ci-checks: ...`), exit 1 and nothing on stdout. A failure must
-# never print a token, and never look like NO_CHECKS or GREEN. (`gh pr checks`
-# exits 8 while checks are pending; with output that is a result, not a
-# failure.)
+# never print a token, and never look like NO_CHECKS or GREEN.
 set -eu
 LC_ALL=C
 export LC_ALL
 
 NO_CHECKS_GRACE=180
 
-TMP=$(mktemp -d)
+TMP=$(mktemp -d) || { printf 'choco ci-checks: mktemp failed\n' >&2; exit 1; }
 FS_TMP=""
 trap 'rm -rf "$TMP"; [ -z "$FS_TMP" ] || rm -f "$FS_TMP"' EXIT
 
@@ -71,34 +69,31 @@ case "$COUNT" in
 esac
 
 if [ "$COUNT" -gt 0 ]; then
-    RC=0
     gh pr checks "$PR_NUMBER" --json name,state \
-        -q '.[] | "\(.state) \(.name)"' > "$TMP/checks.raw" || RC=$?
-    if [ "$RC" -ne 0 ] && [ "$RC" -ne 8 ]; then
-        fail "gh pr checks failed (exit $RC)"
-    fi
+        -q '.[] | "\(.state) \(.name)"' > "$TMP/checks.raw" ||
+        fail "gh pr checks failed"
     [ -s "$TMP/checks.raw" ] || fail "gh pr checks printed nothing although $COUNT checks exist"
-    sort "$TMP/checks.raw" > "$TMP/checks"
-    awk '{ print $1 }' "$TMP/checks" > "$TMP/states"
-    has() {
-        for s in "$@"; do
-            ! grep -qx "$s" "$TMP/states" || return 0
-        done
-        return 1
-    }
-    if has FAILURE ERROR TIMED_OUT; then
-        TOKEN=RED
-    elif has STARTUP_FAILURE; then
-        TOKEN=STARTUP_FAILURE
-    elif has ACTION_REQUIRED; then
-        TOKEN=ACTION_REQUIRED
-    elif has CANCELLED; then
-        TOKEN=CANCELLED
-    elif ! grep -qvx -e SUCCESS -e SKIPPED -e NEUTRAL "$TMP/states"; then
-        TOKEN=GREEN
-    else
-        TOKEN=PENDING
-    fi
+    sort "$TMP/checks.raw" > "$TMP/checks" || fail "sort failed"
+    # One awk pass classifies; its exit status is checked, so a tool failure
+    # can never be read as "no failing check".
+    awk '
+        { s[$1] = 1 }
+        END {
+            if (("FAILURE" in s) || ("ERROR" in s) || ("TIMED_OUT" in s)) t = "RED"
+            else if (("STARTUP_FAILURE" in s)) t = "STARTUP_FAILURE"
+            else if (("ACTION_REQUIRED" in s)) t = "ACTION_REQUIRED"
+            else if (("CANCELLED" in s)) t = "CANCELLED"
+            else {
+                t = "GREEN"
+                for (k in s) if (k != "SUCCESS" && k != "SKIPPED" && k != "NEUTRAL") t = "PENDING"
+            }
+            print t
+        }' "$TMP/checks" > "$TMP/token" || fail "awk failed"
+    IFS= read -r TOKEN < "$TMP/token" || fail "no classification produced"
+    case "$TOKEN" in
+    RED | STARTUP_FAILURE | ACTION_REQUIRED | CANCELLED | GREEN | PENDING) ;;
+    *) fail "unexpected classification '$TOKEN'" ;;
+    esac
     printf '%s\n\n' "$TOKEN"
     cat "$TMP/checks"
     exit 0
@@ -109,6 +104,9 @@ GIT_DIR_ABS=$(git rev-parse --absolute-git-dir) || fail "git rev-parse --absolut
 [ -n "$GIT_DIR_ABS" ] || fail "no git directory found"
 FIRST_SEEN="$GIT_DIR_ABS/choco-ci-first-seen"
 NOW=$(date +%s) || fail "date failed"
+case "$NOW" in
+'' | *[!0-9]*) fail "date returned a time that is not a number: '$NOW'" ;;
+esac
 
 start_clock() {
     FS_TMP=$(mktemp "$GIT_DIR_ABS/choco-ci-first-seen.XXXXXX") ||

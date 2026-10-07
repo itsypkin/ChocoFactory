@@ -187,5 +187,29 @@
     ],
     "first_line": "ACTION_REQUIRED",
     "outcome": "ci_action_required"
+  },
+  {
+    "name": "neutral alone",
+    "states": [
+      "NEUTRAL"
+    ],
+    "first_line": "GREEN",
+    "outcome": "green"
+  },
+  {
+    "name": "waiting alone",
+    "states": [
+      "WAITING"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "requested alone",
+    "states": [
+      "REQUESTED"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
   }
 ]
