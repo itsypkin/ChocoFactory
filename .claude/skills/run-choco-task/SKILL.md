@@ -270,17 +270,27 @@ an independent reviewer do it, and look for what agents systematically miss:
   passes, and check every new state has a way out.
 - **Your repo's own recurring review findings**, if you know them.
 
-**The verdict is a PR comment**, not a GitHub review: `/approve` or
-`/request-changes` alone on its own line, with your review above it. You can
+**The verdict is a PR comment or a GitHub review**: `/approve` or
+`/request-changes` alone on its own line, with your review above it. A
+collaborator's Approve or Request changes review votes by its state. On the
+PR's own author GitHub only allows a Comment review, so put the marker on a
+line of its body. You can
 also answer with `choco task send <id> --text "..."` carrying exactly one of
 the two markers on a line of its own; a reply with neither or both is
 refused, and nothing is posted to the PR.
 
-- Only comments newer than the head commit count. Editing an earlier comment
-  to add the marker counts too.
+- Only comments and reviews newer than the head commit count (a review by
+  its submission time). Editing an earlier comment to add the marker counts
+  too; editing a review counts only while the review is newer than the head
+  commit, so after a push post a new comment or review.
+- Pending and dismissed reviews never vote. The newest vote across comments
+  and reviews decides, and a tie resolves to `/request-changes`. A comment
+  votes at the later of its creation and last edit, so editing an older marker
+  comment makes it the newest vote. Reviews and
+  their inline comments are handed to the coder after the comments.
 - A marker inside a fenced code block still votes. When you quote the
   convention, indent it or break it up.
-- Only `OWNER`, `MEMBER` and `COLLABORATOR` accounts vote, and `[bot]`
+- Only `OWNER`, `MEMBER` and `COLLABORATOR` accounts vote (comments and reviews), and `[bot]`
   accounts never do. Anything commenting under your account, including an
   agent, votes as you.
 - Prose doesn't retract a verdict, and the first one the poll sees is acted

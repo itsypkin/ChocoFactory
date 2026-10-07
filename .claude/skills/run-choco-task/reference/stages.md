@@ -52,7 +52,7 @@ Read this while watching a task, when its behaviour surprises you.
   with no checks at all goes to `awaiting_human_review` as `no_checks` after
   3 minutes, so on a repo without CI, or on a conflicting PR, you review
   without CI. The timeline lists each check with its state.
-- **awaiting_human_review.** A human gate that watches the PR's comments
+- **awaiting_human_review.** A human gate that watches the PR's comments and reviews
   every minute for 6 hours, then parks at `escalate_to_human`. It also takes
   `choco task send <id> --text "..."` carrying `/approve` or
   `/request-changes` on a line of its own; a reply with neither or both is

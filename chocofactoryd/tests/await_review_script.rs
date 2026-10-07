@@ -18,10 +18,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const FAKE_GH: &str = r#"#!/bin/sh
-# Pages are $DIR/page-1.json, page-2.json ... (a `gh api` comments call
-# prints each page's `-q` output in turn only with --paginate). $DIR/since is the
-# head commit's date. $DIR/fail-<what> makes that call fail, where <what> is
-# pr-view, commits, or comments-<n> for the nth comments call.
+# Issue-comment pages are $DIR/page-1.json, page-2.json ... (a `gh api` call
+# prints each page's `-q` output in turn only with --paginate); reviews are
+# reviews-page-N.json and inline review comments review-comments-page-N.json.
+# $DIR/since is the head commit's date. $DIR/fail-<what> makes that call
+# fail, where <what> is pr-view, commits, or comments-<n>, reviews-<n> or
+# review-comments-<n> for the nth call to that endpoint.
 DIR="$GH_FAKE_DIR"
 echo "$*" >> "$DIR/calls"
 q=""
@@ -42,25 +44,38 @@ pr)
     printf '{"headRefOid":"0123456789abcdef","state":"%s","mergedAt":%s}' "$state" "$merged" | jq -r "$q"
     ;;
 api)
+    # pages <file prefix> <counter file> <fail switch prefix>: the nth call to
+    # this endpoint fails when $DIR/<switch>-<n> exists; pages are
+    # $DIR/<prefix>-N.json, none meaning an empty list.
+    paginate=0
+    for a in "$@"; do [ "$a" = "--paginate" ] && paginate=1; done
+    pages() {
+        n=$(cat "$DIR/$2" 2>/dev/null || echo 0)
+        n=$((n+1))
+        echo "$n" > "$DIR/$2"
+        [ -e "$DIR/$3-$n" ] && { echo "fake gh: $3 failed" >&2; exit 1; }
+        # empty-<switch>-<n>: succeed with nothing (the item went away).
+        [ -e "$DIR/empty-$3-$n" ] && exit 0
+        # Like gh: only the first page unless --paginate is given.
+        found=0
+        for page in "$DIR"/$1-*.json; do
+            [ -e "$page" ] || continue
+            found=1
+            jq -r "$q" < "$page" || exit 1
+            [ "$paginate" = 1 ] || break
+        done
+        [ "$found" = 1 ] || echo '[]' | jq -r "$q"
+    }
     case "$2$3" in
     *commits/*)
         [ -e "$DIR/fail-commits" ] && { echo "fake gh: commits failed" >&2; exit 1; }
         [ -e "$DIR/fail-empty-commits" ] && exit 0
         cat "$DIR/since"
         ;;
-    *)
-        n=$(cat "$DIR/count" 2>/dev/null || echo 0)
-        n=$((n+1))
-        echo "$n" > "$DIR/count"
-        [ -e "$DIR/fail-comments-$n" ] && { echo "fake gh: comments failed" >&2; exit 1; }
-        # Like gh: only the first page unless --paginate is given.
-        paginate=0
-        for a in "$@"; do [ "$a" = "--paginate" ] && paginate=1; done
-        for page in "$DIR"/page-*.json; do
-            jq -r "$q" < "$page" || exit 1
-            [ "$paginate" = 1 ] || break
-        done
-        ;;
+    */issues/*/comments*) pages page count fail-comments ;;
+    */pulls/*/reviews*) pages reviews-page reviews-count fail-reviews ;;
+    */pulls/*/comments*) pages review-comments-page review-comments-count fail-review-comments ;;
+    *) echo "fake gh: unhandled: $*" >&2; exit 1 ;;
     esac
     ;;
 *) echo "fake gh: unhandled: $*" >&2; exit 1 ;;
@@ -94,6 +109,25 @@ impl Fixture {
             fs::write(dir.join(format!("page-{}.json", i + 1)), page).unwrap();
         }
         Fixture { dir }
+    }
+
+    /// Reviews pages, as `reviews-page-N.json`.
+    fn reviews(&self, pages: &[String]) {
+        for (i, page) in pages.iter().enumerate() {
+            fs::write(self.dir.join(format!("reviews-page-{}.json", i + 1)), page).unwrap();
+        }
+    }
+
+    /// Inline review-comment pages, as `review-comments-page-N.json`.
+    fn review_comments(&self, pages: &[String]) {
+        for (i, page) in pages.iter().enumerate() {
+            fs::write(
+                self.dir
+                    .join(format!("review-comments-page-{}.json", i + 1)),
+                page,
+            )
+            .unwrap();
+        }
     }
 
     /// The PR's state as `gh pr view` reports it: OPEN, CLOSED or MERGED.
@@ -838,4 +872,520 @@ fn the_marker_case_table_is_consistent() {
             "missing case '{name}'"
         );
     }
+}
+
+// ---- GitHub reviews and inline review comments (#230) ----
+
+/// One review, JSON-encoded. `id` is a string so a case can pass a
+/// non-numeric one; `submitted_at` is `None` for a pending review.
+fn review(id: &str, state: &str, at: Option<&str>, assoc: &str, login: &str, body: &str) -> String {
+    format!(
+        r#"{{"id": {}, "state": "{state}", "submitted_at": {}, "author_association": "{assoc}", "user": {{"login": {}}}, "html_url": "https://example.test/r/{id}", "body": {}}}"#,
+        id.parse::<u64>()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|_| serde_json::json!(id).to_string()),
+        serde_json::json!(at),
+        serde_json::json!(login),
+        serde_json::json!(body)
+    )
+}
+
+/// A qualifying-by-default review: COLLABORATOR "rev", id 11.
+fn rev(state: &str, at: &str, body: &str) -> String {
+    review("11", state, Some(at), "COLLABORATOR", "rev", body)
+}
+
+struct Inline<'a> {
+    review_id: u64,
+    path: &'a str,
+    line: Option<u64>,
+    original_line: Option<u64>,
+    start_line: Option<u64>,
+    original_start_line: Option<u64>,
+    subject: &'a str,
+    at: &'a str,
+    body: &'a str,
+}
+
+impl<'a> Inline<'a> {
+    fn at_line(review_id: u64, path: &'a str, line: u64, body: &'a str) -> Self {
+        Inline {
+            review_id,
+            path,
+            line: Some(line),
+            original_line: Some(line),
+            start_line: None,
+            original_start_line: None,
+            subject: "line",
+            at: FRESH,
+            body,
+        }
+    }
+
+    fn json(&self) -> String {
+        format!(
+            r#"{{"pull_request_review_id": {}, "path": {}, "line": {}, "original_line": {}, "start_line": {}, "original_start_line": {}, "subject_type": "{}", "created_at": "{at}", "updated_at": "{at}", "html_url": "https://example.test/i/{}", "body": {}}}"#,
+            self.review_id,
+            serde_json::json!(self.path),
+            serde_json::json!(self.line),
+            serde_json::json!(self.original_line),
+            serde_json::json!(self.start_line),
+            serde_json::json!(self.original_start_line),
+            self.subject,
+            self.body.len(),
+            serde_json::json!(self.body),
+            at = self.at
+        )
+    }
+}
+
+fn inline_list(items: &[Inline]) -> String {
+    list(&items.iter().map(Inline::json).collect::<Vec<_>>())
+}
+
+fn review_fixture(comments: &[String], reviews: &[String], inline: &[Inline]) -> Fixture {
+    let fx = Fixture::new(SINCE, &[list(comments)]);
+    fx.reviews(&[list(reviews)]);
+    fx.review_comments(&[inline_list(inline)]);
+    fx
+}
+
+fn review_stdout(comments: &[String], reviews: &[String], inline: &[Inline]) -> String {
+    let fx = review_fixture(comments, reviews, inline);
+    let out = fx.run();
+    assert!(
+        out.status.success(),
+        "script failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or_default()
+}
+
+fn owner_comment(at: &str, body: &str) -> String {
+    comment(at, "OWNER", Some("me"), body)
+}
+
+#[test]
+fn a_changes_requested_review_requests_changes_and_hands_over_its_inline_comments() {
+    let out = review_stdout(
+        &[],
+        &[rev("CHANGES_REQUESTED", FRESH, "")],
+        &[
+            Inline::at_line(11, "src/a.rs", 5, "fix the first"),
+            Inline::at_line(11, "src/b.rs", 9, "fix the second"),
+        ],
+    );
+    assert!(out.starts_with("REQUEST_CHANGES\n\n"), "{out}");
+    for s in [
+        format!("### rev (COLLABORATOR), {FRESH}, review CHANGES_REQUESTED").as_str(),
+        "#### src/a.rs:5",
+        "https://example.test/i/13",
+        "fix the first",
+        "#### src/b.rs:9",
+        "fix the second",
+    ] {
+        assert!(out.contains(s), "{s} missing:\n{out}");
+    }
+}
+
+#[test]
+fn an_approved_review_approves() {
+    let out = review_stdout(
+        &[],
+        &[review("11", "APPROVED", Some(FRESH), "OWNER", "me", "")],
+        &[],
+    );
+    assert!(out.starts_with("APPROVE\n\n"), "{out}");
+}
+
+#[test]
+fn a_markerless_comment_review_gives_no_verdict_and_renders_nothing() {
+    let fx = review_fixture(
+        &[],
+        &[rev("COMMENTED", FRESH, "looks fine")],
+        &[Inline::at_line(11, "a.rs", 1, "hm")],
+    );
+    let out = fx.run();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    let calls = fx.calls();
+    assert_eq!(calls.matches("pulls/7/reviews").count(), 1, "{calls}");
+    assert!(!calls.contains("pulls/7/comments"), "{calls}");
+}
+
+#[test]
+fn a_commented_review_votes_through_a_marker_line_in_its_body() {
+    for (body, want) in [
+        ("note\n/request-changes", "REQUEST_CHANGES"),
+        ("note\n/approve", "APPROVE"),
+    ] {
+        let out = review_stdout(&[], &[rev("COMMENTED", FRESH, body)], &[]);
+        assert_eq!(first_line(&out), want, "{body}");
+    }
+}
+
+/// The review from PR #229: a typo'd marker plus 7 inline comments.
+#[test]
+fn the_229_review_with_a_typo_marker_is_not_a_verdict() {
+    let body =
+        "/request-change\n\ngo through the comments in this review and implement requested changes";
+    let mut inline: Vec<Inline> = Vec::new();
+    for (i, l) in [23, 33, 40, 35, 71, 73].into_iter().enumerate() {
+        inline.push(Inline {
+            line: None,
+            original_line: Some(l),
+            at: STALE,
+            ..Inline::at_line(11, "src/x.rs", i as u64, "old")
+        });
+    }
+    inline.push(Inline {
+        at: STALE,
+        ..Inline::at_line(11, "src/y.rs", 31, "current")
+    });
+    let out = review_stdout(
+        &[],
+        &[review("11", "COMMENTED", Some(FRESH), "OWNER", "me", body)],
+        &inline,
+    );
+    assert_eq!(out, "");
+}
+
+#[test]
+fn a_review_older_than_the_head_commit_never_votes() {
+    for (state, body) in [
+        ("APPROVED", ""),
+        ("CHANGES_REQUESTED", ""),
+        ("COMMENTED", "/approve"),
+    ] {
+        let out = review_stdout(&[], &[rev(state, STALE, body)], &[]);
+        assert_eq!(out, "", "{state}");
+    }
+}
+
+#[test]
+fn a_review_outside_the_author_fence_never_votes() {
+    for (assoc, login) in [("CONTRIBUTOR", "me"), ("NONE", "me"), ("OWNER", "ci[bot]")] {
+        let out = review_stdout(
+            &[],
+            &[review("11", "APPROVED", Some(FRESH), assoc, login, "")],
+            &[],
+        );
+        assert_eq!(out, "", "{assoc} {login}");
+    }
+}
+
+#[test]
+fn pending_and_dismissed_reviews_never_vote() {
+    let pending = review("11", "PENDING", None, "OWNER", "me", "/approve");
+    assert_eq!(review_stdout(&[], &[pending], &[]), "");
+    let dismissed = review("11", "DISMISSED", Some(FRESH), "OWNER", "me", "/approve");
+    assert_eq!(review_stdout(&[], &[dismissed], &[]), "");
+}
+
+#[test]
+fn an_approved_review_with_a_request_changes_line_requests_changes() {
+    let out = review_stdout(&[], &[rev("APPROVED", FRESH, "/request-changes")], &[]);
+    assert_eq!(first_line(&out), "REQUEST_CHANGES");
+}
+
+#[test]
+fn the_newest_item_across_comments_and_reviews_decides() {
+    let cases = [
+        (
+            owner_comment(LATER, "/approve"),
+            "CHANGES_REQUESTED",
+            FRESH,
+            "APPROVE",
+        ),
+        (
+            owner_comment(FRESH, "/request-changes"),
+            "APPROVED",
+            LATER,
+            "APPROVE",
+        ),
+        (
+            owner_comment(FRESH, "/approve"),
+            "CHANGES_REQUESTED",
+            LATER,
+            "REQUEST_CHANGES",
+        ),
+        (
+            owner_comment(FRESH, "/approve"),
+            "CHANGES_REQUESTED",
+            FRESH,
+            "REQUEST_CHANGES",
+        ),
+        (
+            owner_comment(FRESH, "/request-changes"),
+            "APPROVED",
+            FRESH,
+            "REQUEST_CHANGES",
+        ),
+    ];
+    for (c, state, at, want) in cases {
+        let out = review_stdout(std::slice::from_ref(&c), &[rev(state, at, "")], &[]);
+        assert_eq!(first_line(&out), want, "{c} vs {state} at {at}");
+    }
+}
+
+/// A comment created at `created` and edited at `updated`.
+fn edited_comment(created: &str, updated: &str, body: &str) -> String {
+    comment(created, "OWNER", Some("me"), body).replace(
+        &format!(r#""updated_at": "{created}""#),
+        &format!(r#""updated_at": "{updated}""#),
+    )
+}
+
+#[test]
+fn a_comment_votes_at_the_time_it_was_last_edited() {
+    // Created before the review, edited after it: the edit is the newest vote.
+    let c = edited_comment(STALE, LATER, "/approve");
+    let out = review_stdout(&[c], &[rev("CHANGES_REQUESTED", FRESH, "")], &[]);
+    assert_eq!(first_line(&out), "APPROVE");
+    // Two comments: the older one, edited last, wins.
+    let a = edited_comment(FRESH, LATER, "/approve");
+    let b = owner_comment("2026-01-03T12:00:00Z", "/request-changes");
+    let out = review_stdout(&[a, b], &[], &[]);
+    assert_eq!(first_line(&out), "APPROVE");
+}
+
+#[test]
+fn inline_positions_cover_ranges_single_lines_and_bare_paths() {
+    let outdated_range = Inline {
+        line: None,
+        original_line: Some(23),
+        original_start_line: Some(20),
+        ..Inline::at_line(11, "p.rs", 0, "A")
+    };
+    let same = Inline {
+        start_line: Some(5),
+        ..Inline::at_line(11, "q.rs", 5, "B")
+    };
+    let bare = Inline {
+        line: None,
+        original_line: None,
+        ..Inline::at_line(11, "r.rs", 0, "C")
+    };
+    let out = review_stdout(
+        &[],
+        &[rev("CHANGES_REQUESTED", FRESH, "")],
+        &[outdated_range, same, bare],
+    );
+    for s in [
+        "#### p.rs:20-23 (outdated)\n",
+        "#### q.rs:5\n",
+        "#### r.rs\n",
+    ] {
+        assert!(out.contains(s), "{s} missing:\n{out}");
+    }
+}
+
+#[test]
+fn reviews_submitted_together_are_ordered_by_id() {
+    let a = review("30", "COMMENTED", Some(FRESH), "OWNER", "me", "THIRTY");
+    let b = review("4", "CHANGES_REQUESTED", Some(FRESH), "OWNER", "me", "FOUR");
+    let out = review_stdout(&[], &[a, b], &[]);
+    assert!(
+        out.find("FOUR").unwrap() < out.find("THIRTY").unwrap(),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_later_top_level_marker_after_a_typo_review_hands_over_both() {
+    let out = review_stdout(
+        &[owner_comment(LATER, "/request-changes")],
+        &[review(
+            "11",
+            "COMMENTED",
+            Some(FRESH),
+            "OWNER",
+            "me",
+            "/request-change\n\ngo through the comments",
+        )],
+        &[
+            Inline::at_line(11, "a.rs", 1, "INLINE-ONE"),
+            Inline::at_line(11, "a.rs", 2, "INLINE-TWO"),
+            Inline::at_line(11, "a.rs", 3, "INLINE-THREE"),
+        ],
+    );
+    assert!(out.starts_with("REQUEST_CHANGES\n\n"), "{out}");
+    let c = out.find("### me (OWNER), ").unwrap();
+    let r = out.find("review COMMENTED").unwrap();
+    assert!(c < r, "comments come before reviews:\n{out}");
+    for s in ["INLINE-ONE", "INLINE-TWO", "INLINE-THREE"] {
+        assert!(out[r..].contains(s), "{s} missing:\n{out}");
+    }
+}
+
+#[test]
+fn inline_comments_render_their_position_and_follow_their_review() {
+    let outdated = Inline {
+        line: None,
+        original_line: Some(23),
+        ..Inline::at_line(11, "p.rs", 0, "OUTDATED")
+    };
+    let file = Inline {
+        subject: "file",
+        line: None,
+        original_line: None,
+        ..Inline::at_line(11, "f.rs", 0, "FILEWIDE")
+    };
+    let range = Inline {
+        start_line: Some(10),
+        ..Inline::at_line(11, "r.rs", 12, "RANGE")
+    };
+    let stale = Inline {
+        at: STALE,
+        ..Inline::at_line(11, "s.rs", 4, "STALE-BUT-KEPT")
+    };
+    // A fresh inline comment of a review that does not qualify.
+    let other = review("12", "COMMENTED", Some(STALE), "OWNER", "old", "earlier");
+    let foreign = Inline::at_line(12, "z.rs", 1, "NOT-INCLUDED");
+    let out = review_stdout(
+        &[],
+        &[rev("CHANGES_REQUESTED", FRESH, ""), other],
+        &[outdated, file, range, stale, foreign],
+    );
+    for s in [
+        "#### p.rs:23 (outdated)\n",
+        "#### f.rs (file)\n",
+        "#### r.rs:10-12\n",
+        "STALE-BUT-KEPT",
+    ] {
+        assert!(out.contains(s), "{s} missing:\n{out}");
+    }
+    assert!(!out.contains("NOT-INCLUDED"), "{out}");
+    assert!(!out.contains("review COMMENTED"), "{out}");
+}
+
+#[test]
+fn reviews_are_rendered_oldest_first() {
+    let a = review("21", "COMMENTED", Some(LATER), "OWNER", "later", "second");
+    let b = review(
+        "22",
+        "CHANGES_REQUESTED",
+        Some(FRESH),
+        "OWNER",
+        "early",
+        "first",
+    );
+    let out = review_stdout(&[], &[a, b], &[]);
+    assert!(
+        out.find("first").unwrap() < out.find("second").unwrap(),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_gh_failure_in_any_review_call_is_an_error_with_empty_stdout() {
+    for what in ["reviews-1", "reviews-2", "reviews-3", "review-comments-1"] {
+        let fx = review_fixture(
+            &[owner_comment(FRESH, "/request-changes")],
+            &[rev("COMMENTED", FRESH, "")],
+            &[Inline::at_line(11, "a.rs", 1, "x")],
+        );
+        fx.fail(what);
+        let out = fx.run();
+        assert!(!out.status.success(), "{what} must fail the script");
+        assert!(out.stdout.is_empty(), "{what}: no partial verdict");
+        assert!(!out.stderr.is_empty(), "{what}: stderr must say why");
+    }
+}
+
+#[test]
+fn a_non_numeric_review_id_fails_closed() {
+    let fx = review_fixture(
+        &[owner_comment(FRESH, "/request-changes")],
+        &[review("abc", "COMMENTED", Some(FRESH), "OWNER", "me", "")],
+        &[],
+    );
+    let out = fx.run();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}
+
+#[test]
+fn a_merged_pr_never_reads_reviews() {
+    let fx = review_fixture(&[], &[rev("CHANGES_REQUESTED", FRESH, "")], &[]);
+    fx.pr_state("MERGED");
+    let out = fx.run();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .starts_with("MERGED\n")
+    );
+    let calls = fx.calls();
+    for s in ["pulls/7/reviews", "pulls/7/comments", "issues/7/comments"] {
+        assert!(!calls.contains(s), "{s} was read: {calls}");
+    }
+}
+
+#[test]
+fn an_oversized_review_rendering_is_truncated_at_a_whole_item_header() {
+    let big = "x".repeat(60_000);
+    let reviews: Vec<String> = (0..12)
+        .map(|i| {
+            review(
+                &format!("{}", 100 + i),
+                "COMMENTED",
+                Some(FRESH),
+                "OWNER",
+                "me",
+                &big,
+            )
+        })
+        .collect();
+    let inline: Vec<Inline> = (0..12)
+        .map(|i| Inline::at_line(100 + i, "a.rs", 1, "inline body"))
+        .collect();
+    let cs = vec![owner_comment(LATER, "/request-changes")];
+    let out = review_stdout(&cs, &reviews, &inline);
+    assert!(out.starts_with("REQUEST_CHANGES\n\n"));
+    assert!(out.len() < 600_000, "{}", out.len());
+    assert!(out.contains("[truncated"));
+    assert!(out.contains("pulls/7/reviews") && out.contains("pulls/7/comments"));
+    let (_, after) = out.split_once("]\n\n").expect("no truncation note");
+    let head = first_line(after);
+    assert!(head.starts_with("### me (OWNER), "), "{head}");
+    assert!(head.contains(", review COMMENTED"), "{head}");
+}
+
+#[test]
+fn the_script_agrees_with_the_marker_table_for_review_bodies() {
+    for case in marker_cases() {
+        let out = review_stdout(&[], &[rev("COMMENTED", FRESH, &case.body)], &[]);
+        assert_eq!(
+            first_line(&out),
+            case.github,
+            "case '{}': body {:?}",
+            case.name,
+            case.body
+        );
+    }
+}
+
+/// A review dismissed between the id list and its header call prints nothing:
+/// it is skipped with its inline comments, and that is not an error.
+#[test]
+fn a_review_that_stops_qualifying_mid_run_is_skipped_with_its_inline_comments() {
+    let fx = review_fixture(
+        &[owner_comment(FRESH, "/request-changes")],
+        &[rev("COMMENTED", FRESH, "")],
+        &[Inline::at_line(11, "a.rs", 1, "GONE-INLINE")],
+    );
+    fs::write(fx.dir.join("empty-fail-reviews-3"), "").unwrap();
+    let out = fx.run();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.starts_with("REQUEST_CHANGES\n\n"), "{stdout}");
+    assert!(!stdout.contains("review COMMENTED"), "{stdout}");
+    assert!(!stdout.contains("GONE-INLINE"), "{stdout}");
+    assert!(!fx.calls().contains("pulls/7/comments"));
 }

@@ -20,8 +20,9 @@ follow that entry:
 - **`awaiting_human_review` → `changes_requested`**: a human asked for
   changes on the open PR. Their comments are quoted below under "The
   human's review", and that section is current. Address every item in it,
-  not just the first. Formal review bodies and inline review comments are
-  not in that section, so also check them for anything posted after your
+  not just the first. Formal review bodies and their inline review
+  comments are in that section too, but anything posted after it was
+  captured isn't, so also check the PR for anything posted after your
   last commit. Set `N` in the same command as the `gh api` calls, since
   each command starts a fresh shell:
   `N=$(gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --state open --json number -q '.[0].number')`

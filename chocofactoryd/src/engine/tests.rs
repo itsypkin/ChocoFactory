@@ -7195,14 +7195,14 @@ fn owner_comment_page(body: &str) -> String {
 ///
 /// Stateful on purpose, because that is the behaviour #78's fixes turn
 /// on: `pr create` records that it ran so the probe can find nothing
-/// before it and something after, and the comments call reads a
-/// `verdict` file the test owns.
+/// before it and something after, and the review calls read files the
+/// test owns: `verdict` (issue comments), `reviews` and `review-comments`.
 ///
 /// What it deliberately does *not* model: PR state (so the
 /// `--state open` scoping has no regression test here), and the jq
 /// selection rules (the stub applies each call's `-q` filter with `jq`
-/// to the canned comments in the `verdict` file, and does not model
-/// pagination). `tests/await_review_script.rs` covers the selection
+/// to the canned `verdict`, `reviews` and `review-comments` files, and
+/// does not model pagination). `tests/await_review_script.rs` covers the selection
 /// directly against the shipped script.
 fn gh_stub_dir(dir: &Path) -> PathBuf {
     write_script(
@@ -7215,30 +7215,45 @@ created="{dir}/pr-created"
 case "$1" in
     api)
         # `awaiting_human_review` runs `scripts/await-review.sh`, which
-        # makes the head commit's date call and then the comments calls.
-        # The stub answers the comments calls like gh would: it applies the
-        # call's `-q` filter (with `jq`) to a canned page the test owns in
-        # the `verdict` file (a JSON array of PR comments). What a comment
-        # has to look like to vote is covered in
+        # makes the head commit's date call, then the PR's comments, its
+        # reviews and its inline review comments. The stub routes by the
+        # endpoint path and answers like gh would: it applies the call's
+        # `-q` filter (with `jq`) to a canned page the test owns: the
+        # `verdict` file (a JSON array of issue comments), the `reviews`
+        # file and the `review-comments` file (empty lists when absent).
+        # What an item has to look like to vote is covered in
         # `tests/await_review_script.rs`; these workflow tests cover the
         # routing either side of it.
-        if printf '%s\n' "$@" | grep -q '/comments'; then
-            q=""; prev=""
-            for a in "$@"; do
-                if [ "$prev" = "-q" ]; then q=$a; fi
-                prev=$a
-            done
-            # A test can hold the comments call: while `hold` exists the stub
-            # touches `held` and waits for `release` before answering. A
-            # no-op unless `hold` exists.
-            if [ -e "{dir}/hold" ]; then
-                touch "{dir}/held"
-                while [ ! -e "{dir}/release" ]; do sleep 0.05; done
-            fi
-            jq -r "$q" < "{dir}/verdict"
-        else
-            echo "2020-01-01T00:00:00Z"
-        fi
+        url=""
+        for a in "$@"; do
+            case "$a" in repos/*) url=$a ;; esac
+        done
+        q=""; prev=""
+        for a in "$@"; do
+            if [ "$prev" = "-q" ]; then q=$a; fi
+            prev=$a
+        done
+        case "$url" in
+            */issues/*/comments*)
+                # A test can hold the comments call: while `hold` exists the stub
+                # touches `held` and waits for `release` before answering. A
+                # no-op unless `hold` exists.
+                if [ -e "{dir}/hold" ]; then
+                    touch "{dir}/held"
+                    while [ ! -e "{dir}/release" ]; do sleep 0.05; done
+                fi
+                jq -r "$q" < "{dir}/verdict"
+                ;;
+            */pulls/*/reviews*)
+                if [ -e "{dir}/reviews" ]; then jq -r "$q" < "{dir}/reviews"; else echo '[]' | jq -r "$q"; fi
+                ;;
+            */pulls/*/comments*)
+                if [ -e "{dir}/review-comments" ]; then jq -r "$q" < "{dir}/review-comments"; else echo '[]' | jq -r "$q"; fi
+                ;;
+            *)
+                echo "2020-01-01T00:00:00Z"
+                ;;
+        esac
         ;;
     pr)
         case "$2" in
@@ -7438,6 +7453,98 @@ async fn the_real_coding_task_workflow_walks_the_happy_path_to_done() {
     // Worktree cleanup (#58) still fires for the real shipped workflow.
     let worktree_dir = worktree::worktree_path(&repo, "demo", &task_id).unwrap();
     wait_until_path_gone(&worktree_dir).await;
+}
+
+/// One COLLABORATOR review, submitted in 2030 (after the stub's head date).
+fn collaborator_review_page(state: &str) -> String {
+    format!(
+        r#"[{{"id": 5, "state": "{state}", "submitted_at": "2030-01-01T00:00:00Z", "author_association": "COLLABORATOR", "user": {{"login": "rev"}}, "html_url": "https://example.test/r/5", "body": "HUMAN ITEM: from a review"}}]"#
+    )
+}
+
+/// #230: a GitHub review, not a comment, is the verdict. A
+/// `CHANGES_REQUESTED` review routes the real workflow to `revising`.
+#[tokio::test]
+async fn the_real_coding_task_workflow_revises_on_a_changes_requested_review() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(scripts_dir.join("verdict"), "[]").unwrap();
+    fs::write(
+        scripts_dir.join("reviews"),
+        collaborator_review_page("CHANGES_REQUESTED"),
+    )
+    .unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let engine = engine_with_adapter(pool.clone(), &claude_wrapper.to_string_lossy());
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "escalate_to_human").await;
+
+    let trail: Vec<String> = stage_trail(&pool, &task_id)
+        .await
+        .into_iter()
+        .map(|(stage, _)| stage)
+        .collect();
+    assert!(
+        trail.iter().filter(|s| s.as_str() == "revising").count() >= 2,
+        "a CHANGES_REQUESTED review must route to revising: {trail:?}"
+    );
+    let payload = payload_of(&pool, &task_id).await;
+    let review = payload["stages"]["awaiting_human_review"].as_str().unwrap();
+    assert!(review.starts_with("REQUEST_CHANGES\n\n"), "{review:?}");
+    assert!(review.contains("review CHANGES_REQUESTED"), "{review:?}");
+}
+
+/// #230: an `APPROVED` review alone ends the real workflow as approved.
+#[tokio::test]
+async fn the_real_coding_task_workflow_finishes_on_an_approved_review() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(scripts_dir.join("verdict"), "[]").unwrap();
+    fs::write(
+        scripts_dir.join("reviews"),
+        collaborator_review_page("APPROVED"),
+    )
+    .unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let engine = engine_with_adapter(pool.clone(), &claude_wrapper.to_string_lossy());
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "done").await;
+    wait_until_task_status(&pool, &task_id, "closed").await;
+
+    let trail = stage_trail(&pool, &task_id).await;
+    assert_eq!(
+        trail.last(),
+        Some(&("done".to_string(), json!("approved"))),
+        "{trail:?}"
+    );
 }
 
 /// #175: the real `coding-task` at `awaiting_human_review` is answered with

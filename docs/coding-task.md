@@ -49,8 +49,8 @@ alongside `coding-task` so the two can be compared.
 
 When a `coding-task` reaches `awaiting_human_review` it has already pushed
 a branch, opened a PR and waited for CI. What it wants from you is a
-verdict — and it reads that from the PR's **comments**, not from GitHub's
-formal review (the green *Review changes* button).
+verdict — and it reads that from the PR's **comments** or from a GitHub
+**review** (the green *Review changes* button).
 
 That is deliberate rather than a shortcut. `open_pr` pushes under whatever
 identity the daemon inherited, so on a solo repo the PR belongs to the same
@@ -62,9 +62,10 @@ failed to create review: GraphQL: Review Can not request changes on your
 own pull request (addPullRequestReview)
 ```
 
-Commenting on your own PR is allowed, so the verdict lives in a comment.
-Leave an ordinary PR comment containing one of these markers, **alone on
-its own line**:
+Commenting on your own PR is allowed, so on your own PR the verdict lives in
+a comment, or in the body of a *Comment* review. Leave an ordinary PR comment
+or a *Comment* review containing one of these markers, **alone on its own
+line**:
 
 | Marker             | Effect                          |
 | ------------------ | ------------------------------- |
@@ -83,13 +84,38 @@ on the last line and your review above it. A comment that reads "Two
 findings, one worth fixing before merge." followed by your prose, and then
 a final line containing only `/request-changes`, sends the coder back round.
 The workflow hands the coder every qualifying comment (see the points
-below), oldest first, in its prompt; the coder doesn't have to fetch them.
-Formal review bodies and inline review comments are not handed over; the
-coder looks those up itself.
+below), oldest first, in its prompt, and after them every qualifying review
+(oldest first) with that review's inline comments; the coder doesn't have to
+fetch them. Anything posted after the poll read the PR isn't in the prompt,
+so the coder is told to check for it.
+
+Reviews follow these rules:
+
+- **State or marker.** A collaborator's `Approve` review (`APPROVED`) votes
+  `/approve` and `Request changes` (`CHANGES_REQUESTED`) votes
+  `/request-changes`, with no marker needed. A `Comment` review votes only
+  through a marker line in its body. Requesting changes (by
+  state or by marker) is tested first, so an `Approve` review with a
+  `/request-changes` line requests changes, and a `Request changes` review
+  with an `/approve` line does too.
+- **Newer than the head commit.** A review counts by the time it was
+  submitted, the same bound as for comments. Pending (unsubmitted) and
+  dismissed reviews never count.
+- **Same author fence** as comments (below).
+- **The newest vote wins** across comments and reviews together. If a comment
+  and a review carry different verdicts at the same second, the tie resolves
+  to request changes. A comment votes at the later of its creation and its
+  last edit, so editing an older marker comment makes it the newest vote.
+- **Inline comments go with their review.** An inline comment is handed over
+  whenever its review qualifies, whatever its own date, and never when its
+  review does not.
+- **Editing is limited.** A review has no edited time, so editing its body or
+  its inline comments counts only while the review is still newer than the
+  head commit. After a push, post a new comment or review.
 
 Five things worth knowing:
 
-- **Only comments newer than the newest commit count.** Once the coder
+- **Only comments and reviews newer than the newest commit count.** Once the coder
   pushes a fix your previous verdict stops counting on its own, so there is
   nothing to clear between rounds. The flip side: if a `revising` lap ends
   without producing a commit, your old verdict is still the newest thing on
@@ -109,8 +135,8 @@ Five things worth knowing:
   returns raw markdown, so a bare marker line inside triple backticks
   still votes. Indent it, or break it up, when you are quoting the
   convention rather than using it.
-- **Only people with standing in the repo can vote.** A comment counts
-  only if GitHub reports its author as `OWNER`, `MEMBER` or `COLLABORATOR`
+- **Only people with standing in the repo can vote.** A comment or review
+  counts only if GitHub reports its author as `OWNER`, `MEMBER` or `COLLABORATOR`
   — this repo is public, so without that fence any passer-by could
   `/approve` a task to `done`, or burn a coder+reviewer lap at a time with
   `/request-changes`. Comments from `[bot]` accounts are skipped on top of

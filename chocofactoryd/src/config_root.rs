@@ -1056,7 +1056,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 "Their comments are quoted below under \"The human's review\", and that \
                  section is current.",
                 "Address every item in it, not just the first.",
-                "Formal review bodies and inline review comments are not in that section",
+                "Formal review bodies and their inline review comments are in that section too",
                 r#"N=$(gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --state open"#,
                 r#"gh api --paginate "repos/{owner}/{repo}/pulls/$N/reviews""#,
                 r#"gh api --paginate "repos/{owner}/{repo}/pulls/$N/comments""#,
