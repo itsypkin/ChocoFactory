@@ -54,9 +54,12 @@ impl From<CreateTaskError> for ApiError {
             // unknown CLI. A task that already exists and is stuck on one
             // (global config edited since daemon start) is the same fault.
             CreateTaskError::UnknownCli(_)
-            | CreateTaskError::WorkflowDef(WorkflowDefError::UnknownCli(_))
+            | CreateTaskError::RoleRejected(_)
+            | CreateTaskError::WorkflowDef(
+                WorkflowDefError::UnknownCli(_) | WorkflowDefError::RoleRejected(_),
+            )
             | CreateTaskError::Start {
-                source: EngineError::UnknownCli(_),
+                source: EngineError::UnknownCli(_) | EngineError::RoleRejected(_),
                 ..
             } => ApiError::BadRequest(err.to_string()),
             CreateTaskError::NoSuchProject(_) => ApiError::NotFound(err.to_string()),
@@ -144,7 +147,7 @@ impl From<SendMessageOrResumeError> for ApiError {
             )
             // The session was recorded on a CLI this daemon no longer has.
             | SendMessageOrResumeError::SendMessage(SendMessageError::Session(
-                SessionError::UnknownCli(_),
+                SessionError::UnknownCli(_) | SessionError::RoleRejected(_),
             )) => {
                 ApiError::Conflict(err.to_string())
             }
@@ -214,7 +217,7 @@ impl From<RetryTaskError> for ApiError {
             // The role's CLI (from the global config edited since daemon
             // start) is unknown: a conflict with the task's config, not a
             // server fault. Create reports the same fault as 400.
-            | RetryTaskError::Enter(EngineError::UnknownCli(_)) => {
+            | RetryTaskError::Enter(EngineError::UnknownCli(_) | EngineError::RoleRejected(_)) => {
                 ApiError::Conflict(err.to_string())
             }
             _ => ApiError::Internal(err.to_string()),

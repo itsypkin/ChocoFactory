@@ -14514,3 +14514,145 @@ async fn enter_agent_turn_resumes_on_the_recorded_adapter_not_the_resolved_cli()
     let new = run_after(&pool, &task_id, "coding", &old).await;
     assert_eq!(new.cli_adapter, "fake");
 }
+
+// ---- #166: the omp adapter's memory / skill rule ----
+
+const OMP_MEMORY_REJECTION: &str = "role 'coder' runs on cli 'omp', which can't use memory: true; \
+     remove memory: true or run the role on cli: claude";
+
+/// A registry with the fake claude and a real `OmpAdapter` whose binary is a
+/// wrapper that leaves a marker if it is ever run.
+fn claude_and_omp_registry(dir: &Path) -> (Registry, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let marker = dir.join("omp-was-run");
+    let wrapper = dir.join("omp-wrapper");
+    fs::write(
+        &wrapper,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let registry = Registry::new(vec![
+        Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"))),
+        Arc::new(crate::adapter::OmpAdapter::with_binary(
+            wrapper.display().to_string(),
+            dir.join("omp-state"),
+        )),
+    ]);
+    (registry, marker)
+}
+
+#[test]
+fn load_workflow_file_rejects_memory_and_pattern_skills_on_an_omp_role_only() {
+    let dir = tempdir();
+    let (registry, _) = claude_and_omp_registry(&dir);
+    let omp_memory = write_cli_workflow(&dir, "a.yaml", "    cli: omp\n    memory: true\n");
+    let err = load_workflow_file(&omp_memory, &registry).unwrap_err();
+    assert!(matches!(err, WorkflowDefError::RoleRejected(_)), "{err:?}");
+    assert_eq!(err.to_string(), OMP_MEMORY_REJECTION);
+
+    let omp_skill = write_cli_workflow(&dir, "b.yaml", "    cli: omp\n    skills: [\"deploy*\"]\n");
+    let err = load_workflow_file(&omp_skill, &registry).unwrap_err();
+    assert!(err.to_string().contains("skill 'deploy*'"), "{err}");
+
+    // Claude with memory, and omp without it, load.
+    let claude_memory = write_cli_workflow(&dir, "c.yaml", "    cli: claude\n    memory: true\n");
+    assert!(load_workflow_file(&claude_memory, &registry).is_ok());
+    let omp_plain = write_cli_workflow(&dir, "d.yaml", "    cli: omp\n    skills: [plain]\n");
+    assert!(load_workflow_file(&omp_plain, &registry).is_ok());
+    // No `cli:` at all: the check is the turn-start one's job.
+    let no_cli = write_cli_workflow(&dir, "e.yaml", "    memory: true\n");
+    assert!(load_workflow_file(&no_cli, &registry).is_ok());
+}
+
+#[tokio::test]
+async fn create_task_pointing_a_memory_role_at_omp_in_its_config_creates_nothing() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let (registry, marker) = claude_and_omp_registry(&dir);
+    let flow = write_cli_workflow(&dir, "flow.yaml", "    memory: true\n");
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let engine = engine_with_registry(pool.clone(), registry, &dir, None);
+    let err = engine
+        .create_task_from(
+            &project_id,
+            WorkflowRef::File(flow.clone()),
+            "T",
+            "go",
+            json!({"roles": {"coder": {"cli": "omp"}}}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CreateTaskError::RoleRejected(_)), "{err:?}");
+    assert_eq!(err.to_string(), OMP_MEMORY_REJECTION);
+    assert!(
+        tasks::list(&pool, Some(&project_id), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!marker.exists());
+
+    // A role the workflow doesn't define is skipped; claude is accepted.
+    let (def, _) = load_workflow_file(&flow, engine.registry()).unwrap();
+    for config in [
+        json!({"roles": {"nobody": {"cli": "omp"}}}),
+        json!({"roles": {"coder": {"cli": "claude"}}}),
+        json!({"roles": {"coder": {"cli": 1}}}),
+    ] {
+        assert!(
+            crate::adapter::check_task_config_roles(&config, &def, engine.registry()).is_ok(),
+            "{config}"
+        );
+    }
+}
+
+/// The global config isn't visible to any earlier check, so the turn-start
+/// one is what stops a memory role routed to omp: the task goes stuck with
+/// the message, no session row exists, and nothing was spawned.
+#[tokio::test]
+async fn a_memory_role_routed_to_omp_by_the_global_config_fails_the_turn_closed() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let (registry, marker) = claude_and_omp_registry(&dir);
+    let flow = write_cli_workflow(&dir, "flow.yaml", "    memory: true\n");
+    let global = dir.join("config.yaml");
+    fs::write(&global, "roles:\n  coder:\n    cli: omp\n").unwrap();
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let engine = engine_with_registry(pool.clone(), registry, &dir, Some(&global));
+
+    let err = engine
+        .create_task_from(&project_id, WorkflowRef::File(flow), "T", "go", json!({}))
+        .await
+        .unwrap_err();
+    let task_id = match &err {
+        CreateTaskError::Start {
+            task_id,
+            source: EngineError::RoleRejected(_),
+        } => task_id.clone(),
+        other => panic!("expected Start/RoleRejected, got {other:?}"),
+    };
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "stuck");
+    assert!(
+        task.stuck_reason.unwrap().contains(OMP_MEMORY_REJECTION),
+        "the stuck reason carries the message"
+    );
+    assert!(
+        sessions::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!marker.exists(), "omp must not have been started");
+
+    let err = engine
+        .retry_task(&task_id, RetryMode::Auto)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RetryTaskError::Enter(EngineError::RoleRejected(_))),
+        "{err:?}"
+    );
+}

@@ -14,7 +14,7 @@ use super::{ApiError, AppState};
 use crate::adapter;
 use crate::db::usage as usage_db;
 use crate::db::{events, tasks, workflow_state};
-use crate::engine::{WorkflowEngine, WorkflowRef};
+use crate::engine::{ConfigPatchError, WorkflowEngine, WorkflowRef};
 use crate::usage::{self, TaskTimes, TaskUsage};
 
 #[derive(Deserialize)]
@@ -324,10 +324,34 @@ pub async fn update_config(
     }
     adapter::check_task_config_clis(&body.config, state.engine.registry())
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    // A patch that points a role at a CLI is checked against the task's
+    // workflow before anything is merged. Only a body that sets a string
+    // `roles.<name>.cli` can change which adapter a role runs on.
+    if sets_a_role_cli(&body.config) {
+        match state.engine.check_config_patch(&id, &body.config).await {
+            Ok(()) => {}
+            Err(ConfigPatchError::Rejected(message)) => {
+                return Err(ApiError::BadRequest(message));
+            }
+            Err(ConfigPatchError::Db(err)) => return Err(err.into()),
+        }
+    }
     let task = tasks::merge_config(&state.pool, &id, body.config)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;
     Ok(Json(task))
+}
+
+/// Whether `config` sets any string `roles.<name>.cli`.
+fn sets_a_role_cli(config: &serde_json::Value) -> bool {
+    config
+        .get("roles")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|roles| {
+            roles
+                .values()
+                .any(|role| role.get("cli").is_some_and(serde_json::Value::is_string))
+        })
 }
 
 #[derive(Deserialize)]
@@ -2006,6 +2030,83 @@ stages:
             .await;
         assert_eq!(response.status(), 200, "{}", response.json());
         assert_eq!(response.json()["config"]["roles"]["coder"]["cli"], 1);
+    }
+
+    #[tokio::test]
+    async fn patch_task_config_pointing_a_memory_role_at_omp_is_400_and_leaves_the_config_alone() {
+        let server = TestServer::start_with_omp().await;
+        server.write_workflow(
+            "memflow",
+            "name: memflow\nroles:\n  coder:\n    cli: claude\n    model: sonnet\n    memory: true\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    on: {}\n",
+        );
+        let project_id = create_project(&server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "memflow",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": { "cwd": "." },
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{task}"))
+            .to_string();
+        let before = server.get(&format!("/tasks/{task_id}")).await.json()["config"].clone();
+
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "cli": "omp" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        assert_eq!(
+            response.json()["error"],
+            "role 'coder' runs on cli 'omp', which can't use memory: true; remove memory: true \
+             or run the role on cli: claude"
+        );
+        let after = server.get(&format!("/tasks/{task_id}")).await.json()["config"].clone();
+        assert_eq!(before, after);
+
+        // Claude with memory, a role the workflow doesn't define, and a
+        // body that sets no cli at all are all fine.
+        for config in [
+            json!({ "roles": { "coder": { "cli": "claude" } } }),
+            json!({ "roles": { "nobody": { "cli": "omp" } } }),
+            json!({ "roles": { "coder": { "model": "opus" } } }),
+        ] {
+            let response = server
+                .patch(&format!("/tasks/{task_id}"), json!({ "config": config }))
+                .await;
+            assert_eq!(response.status(), 200, "{config}: {}", response.json());
+        }
+
+        // A task that doesn't exist is a 404, not a skipped check.
+        let response = server
+            .patch(
+                "/tasks/no-such-task",
+                json!({ "config": { "roles": { "coder": { "cli": "omp" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 404, "{}", response.json());
+        assert_eq!(response.json()["error"], "no such task 'no-such-task'");
+
+        // A workflow that no longer loads skips the check (the turn-start
+        // one still fails closed), rather than blocking every config change.
+        std::fs::remove_file(server.builtin_workflow_path("memflow")).unwrap();
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "cli": "omp" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{}", response.json());
     }
 
     #[tokio::test]

@@ -263,12 +263,19 @@ impl WorkflowEngine {
             Some(resume) => resume.cli_adapter.as_str(),
             None => resolved.cli.as_str(),
         };
-        let adapter_name = self
+        let adapter = self
             .session_manager
             .registry()
             .lookup(Some(role), cli_name)
-            .map_err(EngineError::UnknownCli)?
-            .name();
+            .map_err(EngineError::UnknownCli)?;
+        // The check nothing can skip: whatever the global config, the task
+        // config or an edited workflow now says, the adapter that will run
+        // this turn (the recorded one on a resume) must accept the role. It
+        // comes before any baseline, session row or process.
+        adapter
+            .validate_role(role, &resolved.role_config.isolation)
+            .map_err(EngineError::RoleRejected)?;
+        let adapter_name = adapter.name();
 
         // #172: a read-only role's baseline is taken (or, for a resumed turn,
         // looked up) before any session row exists, so a failure here leaves

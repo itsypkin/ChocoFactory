@@ -186,7 +186,19 @@ choco task create --project <p> --workflow coding-task \
 ```
 
 - Per-task overrides beat editing shared config:
-  `--role-model <role>=<model>`, `--role-system-prompt-file <role>=<path>`.
+  `--role-model <role>=<model>`, `--role-system-prompt-file <role>=<path>`,
+  `--role-cli <role>=<cli>`.
+- **Running a role on omp.** `--role-cli reviewer=omp` (or `cli: omp` on the
+  role in the workflow) runs that role on the `omp` CLI, for example with
+  `--role-model reviewer=openai-codex/gpt-5.6-terra`. It uses your existing
+  omp login and needs no extra step. An omp role sees the repo's root
+  `CLAUDE.md` and `AGENTS.md` and `.omp/AGENTS.md` and `.omp/RULES.md`, plus
+  the repo's `.claude/CLAUDE.md` (loaded by omp itself), and
+  nothing from nested folders, folders above the repo, or your personal setup,
+  so put what it needs in those files or in the spec. Outside a `worktree:
+  true` workflow it can read but its edits and commands are refused. It can't
+  use `memory: true`. A role on an Anthropic model needs an
+  `ANTHROPIC_API_KEY`, not a Claude subscription login.
   For an existing task, `choco task reconfigure` takes effect on the next
   turn.
 - **Wait for one stage** with `choco task status <id> --until
@@ -322,8 +334,8 @@ cancelling. In short:
 
 ## Cost and safety
 
-- **Every stage runs the real `claude` CLI.** Don't create a task to try
-  something out. For a first run, pick a small, real change.
+- **Every stage runs a real agent CLI** (`claude`, or `omp` for a role with
+  `cli: omp`). Don't create a task to try something out. For a first run, pick a small, real change.
 - **A repo's `.chocofactory/workflows/` and any `--workflow` file can run
   shell commands as you.** Pointing choco at a repo trusts its workflows.
 - **Cancel a task that is going round in circles** rather than letting it

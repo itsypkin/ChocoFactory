@@ -1473,6 +1473,9 @@ pub enum WorkflowDefError {
     /// A role's `cli:` names no adapter the daemon has. Raised by the
     /// engine's `load_workflow_file`, not by `parse` (which has no registry).
     UnknownCli(crate::adapter::UnknownCliError),
+    /// The role's adapter can't run the role as defined (for example omp
+    /// with `memory: true`). Raised by the engine's `load_workflow_file`.
+    RoleRejected(String),
 }
 
 impl fmt::Display for WorkflowDefError {
@@ -1682,6 +1685,7 @@ impl fmt::Display for WorkflowDefError {
                  {missing}; a read-only role must deny edit, write and notebook_edit"
             ),
             WorkflowDefError::UnknownCli(err) => write!(f, "{err}"),
+            WorkflowDefError::RoleRejected(message) => write!(f, "{message}"),
             WorkflowDefError::ReadOnlyRoleWithoutWorktree { role } => write!(
                 f,
                 "role '{role}' is 'read_only: true', which needs 'worktree: true' on the \

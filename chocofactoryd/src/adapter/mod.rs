@@ -1,4 +1,6 @@
 pub mod claude;
+pub mod omp;
+pub mod pi_family;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -8,6 +10,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub use claude::ClaudeAdapter;
+pub use omp::OmpAdapter;
 
 /// Per-role settings an adapter needs to spawn its CLI (§4, §5.5's role
 /// config resolution). `system_prompt` is already-resolved text — reading
@@ -243,7 +246,7 @@ pub struct TurnUsage {
     pub counting: UsageCounting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenCounts {
     pub input: Option<u64>,
     pub output: Option<u64>,
@@ -422,6 +425,13 @@ pub trait AgentAdapter: Send + Sync {
     /// The name a role's `cli:` uses to select this adapter, and the value
     /// stored in `sessions.cli_adapter`.
     fn name(&self) -> &'static str;
+    /// Whether this adapter can run a role with this isolation at all.
+    /// Checked wherever a role's CLI is chosen (workflow load, task create,
+    /// config PATCH) and again at turn start and chat resume, which is the
+    /// check nothing can skip. The default accepts everything.
+    fn validate_role(&self, _role: &str, _isolation: &Isolation) -> Result<(), String> {
+        Ok(())
+    }
     fn start(&self, prompt: &str, cfg: &RoleConfig) -> Result<AgentHandle, AdapterError>;
     fn resume(
         &self,
@@ -519,11 +529,45 @@ pub fn check_task_config_clis(config: &Value, registry: &Registry) -> Result<(),
     Ok(())
 }
 
+/// Asks each role's adapter whether it can run the role, for every string
+/// `roles.<name>.cli` in a task config whose role the workflow defines. A
+/// role the workflow doesn't define is skipped, and so is a `cli` the
+/// registry doesn't know (that is `check_task_config_clis`'s error to give).
+/// Returns the first rejection, in sorted role-name order.
+pub fn check_task_config_roles(
+    config: &Value,
+    definition: &crate::workflow_def::WorkflowDefinition,
+    registry: &Registry,
+) -> Result<(), String> {
+    let Some(roles) = config.get("roles").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut names: Vec<&String> = roles.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(cli) = roles[name].get("cli").and_then(Value::as_str) else {
+            continue;
+        };
+        let (Some(role), Ok(adapter)) = (
+            definition.roles.get(name.as_str()),
+            registry.lookup(Some(name), cli),
+        ) else {
+            continue;
+        };
+        adapter.validate_role(name, &role.isolation)?;
+    }
+    Ok(())
+}
+
 /// A live (or just-exited) agent subprocess. Streams normalized
 /// `AgentEvent`s and accepts further messages over stdin while the
 /// process is alive (§4, §4.1's active-state behavior).
 pub struct AgentHandle {
     child: tokio::process::Child,
+    /// Dropped after `child` (field order), so a file the process may still
+    /// be watching is only removed once the handle, and with it the process,
+    /// is done.
+    _cleanup: Option<Box<dyn std::any::Any + Send>>,
     events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     stdin_tx: mpsc::UnboundedSender<String>,
 }
@@ -536,6 +580,23 @@ impl AgentHandle {
     ) -> Self {
         Self {
             child,
+            _cleanup: None,
+            events_rx,
+            stdin_tx,
+        }
+    }
+
+    /// Like [`Self::new`], with a guard that is dropped after the child when
+    /// the handle drops (an adapter's per-spawn temporary file).
+    pub(crate) fn with_cleanup(
+        child: tokio::process::Child,
+        events_rx: mpsc::UnboundedReceiver<AgentEvent>,
+        stdin_tx: mpsc::UnboundedSender<String>,
+        guard: Box<dyn std::any::Any + Send>,
+    ) -> Self {
+        Self {
+            child,
+            _cleanup: Some(guard),
             events_rx,
             stdin_tx,
         }
@@ -583,6 +644,38 @@ impl AgentHandle {
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
+}
+
+/// The instruction appended to a single-shot turn's system prompt (#90).
+///
+/// Says what completion *is* rather than only asking for a verdict: a turn
+/// that ends without the call is treated as still working (and eventually
+/// nudged), which is what lets an agent wait on its own background work
+/// without the daemon mistaking that pause for "done".
+pub(crate) fn report_instruction(outcomes: &[String]) -> String {
+    format!(
+        "When all of your work for this stage is finished (including anything you started \
+         in the background, which you must wait for), call `report_outcome` to report the \
+         stage's outcome. It must be one of: {}. Calling it is how this stage completes: \
+         ending your turn without calling it means you are still working. If \
+         `report_outcome` is listed as a deferred tool, load it with ToolSearch first.",
+        outcomes.join(", ")
+    )
+}
+
+/// Whether an error message reads like a usage limit rather than a failure
+/// the agent caused. Matched case-insensitively against the phrasings seen
+/// on a real limit (`You've hit your session limit · resets 3:40pm`) and the
+/// API's own wording. Brittle by construction — see `normalize_result`.
+pub(crate) fn usage_limit_text(message: &str) -> bool {
+    const PHRASES: [&str; 4] = [
+        "session limit",
+        "usage limit",
+        "rate limit",
+        "rate_limit_error",
+    ];
+    let message = message.to_lowercase();
+    PHRASES.iter().any(|phrase| message.contains(phrase))
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chocofactory_core::daemon_lock::LockInfo;
 use chocofactory_core::version;
-use chocofactoryd::adapter::{ClaudeAdapter, Registry};
+use chocofactoryd::adapter::{ClaudeAdapter, OmpAdapter, Registry};
 use chocofactoryd::api::{self, AppState, ExeStamp, ServerInfo};
 use chocofactoryd::config_root;
 use chocofactoryd::daemon_lock::DaemonLock;
@@ -58,6 +58,12 @@ fn claude_binary_override() -> Option<String> {
     std::env::var("CHOCOFACTORY_CLAUDE_BINARY").ok()
 }
 
+/// Overrides the adapter's `omp` binary path, mirroring
+/// `CHOCOFACTORY_CLAUDE_BINARY`. Unset in normal use: `omp` from `PATH`.
+fn omp_binary_override() -> Option<String> {
+    std::env::var("CHOCOFACTORY_OMP_BINARY").ok()
+}
+
 /// Overrides the `choco` binary path the adapter embeds in every agent
 /// turn's `--mcp-config` (issue #73). Unset in normal use, where
 /// `ClaudeAdapter`'s sibling-of-`current_exe()` lookup applies unchanged;
@@ -109,7 +115,14 @@ async fn main() {
         claude_adapter = claude_adapter.with_choco_binary(choco_binary);
     }
     let choco_binary = claude_adapter.choco_binary().to_string();
-    let registry = Registry::new(vec![Arc::new(claude_adapter)]);
+    // Always registered: an `omp` that isn't installed shows up as the
+    // ordinary spawn error when a role on it takes a turn.
+    let omp_state_dir = root.join("omp");
+    let omp_adapter = match omp_binary_override() {
+        Some(binary) => OmpAdapter::with_binary(binary, omp_state_dir),
+        None => OmpAdapter::new(omp_state_dir),
+    };
+    let registry = Registry::new(vec![Arc::new(claude_adapter), Arc::new(omp_adapter)]);
 
     // Before the lock: a refused start leaves no lock, port or DB state.
     if let Err(err) = chocofactoryd::global_config::check_known_clis(
