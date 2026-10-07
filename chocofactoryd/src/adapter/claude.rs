@@ -1970,7 +1970,20 @@ mod tests {
                 report_sections: Vec::new(),
                 isolation,
             };
-            let mut handle = adapter.start("go", &cfg).unwrap();
+            // A sibling test forking while the script was open for writing
+            // makes exec fail with ETXTBSY; that is transient, so retry.
+            let mut attempts = 0;
+            let mut handle = loop {
+                match adapter.start("go", &cfg) {
+                    Err(AdapterError::Spawn(e))
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 =>
+                    {
+                        attempts += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    other => break other.unwrap(),
+                }
+            };
             let mut seen = Vec::new();
             while let Some(event) = handle.recv().await {
                 let done = matches!(event, AgentEvent::TurnCompleted { .. });
