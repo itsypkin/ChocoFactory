@@ -36,6 +36,9 @@ fi
 case "${1:-} ${2:-}" in
 "pr list")
     case "$*" in
+    *headRefOid*)
+        if [ -e "$CFG/pr-head" ]; then cat "$CFG/pr-head"; fi
+        ;;
     *number,url*)
         if [ ! -e "$CFG/empty-readback" ] && { [ -e "$CFG/open-number" ] || [ -e "$LOG/created" ]; }; then
             printf '{"number":7,"url":"https://example.test/pull/7"}\n'
@@ -799,5 +802,178 @@ fn text_cut_before_the_filter_is_never_dropped_silently() {
     assert!(
         body.contains(&format!("of {} bytes shown]", big.len() + 1)),
         "wrong or missing total"
+    );
+}
+
+const TASK_REF: &str = "refs/heads/task/branch-name-xyz";
+
+fn origin_tip(fx: &Fixture) -> String {
+    git(&fx.root.join("origin.git"), &["rev-parse", TASK_REF])
+        .trim()
+        .to_string()
+}
+
+fn first_line(out: &Output) -> String {
+    stderr(out).lines().next().unwrap_or("").to_string()
+}
+
+/// Pushes to the task branch from a second clone of origin.
+fn push_from_other_clone(fx: &Fixture) -> String {
+    let other = fx.root.join("other");
+    git(
+        &fx.root,
+        &[
+            "clone",
+            "-q",
+            fx.root.join("origin.git").to_str().unwrap(),
+            "other",
+        ],
+    );
+    git(&other, &["checkout", "-q", "task/branch-name-xyz"]);
+    fs::write(other.join("theirs"), "t\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-q", "-m", "theirs"]);
+    git(&other, &["push", "-q", "origin", "HEAD"]);
+    origin_tip(fx)
+}
+
+fn amend_local(fx: &Fixture) {
+    fs::write(fx.wt.join("f1"), "changed\n").unwrap();
+    git(&fx.wt, &["add", "."]);
+    git(&fx.wt, &["commit", "-q", "--amend", "-m", "amended"]);
+}
+
+fn assert_failed_cleanly(fx: &Fixture, out: &Output) {
+    assert!(!out.status.success());
+    assert!(stdout(out).is_empty(), "{}", stdout(out));
+    assert!(fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty());
+}
+
+fn pr_exists(fx: &Fixture) {
+    fx.cfg("open-number", "7\n");
+    fx.cfg("body", &format!("{BEGIN}\nold\n{END}\n"));
+}
+
+#[test]
+fn first_push_is_plain_and_looks_up_open_pr() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(origin_tip(&fx), git(&fx.wt, &["rev-parse", "HEAD"]).trim());
+    let lists = fx.calls_to("pr list");
+    assert!(lists.iter().any(|c| c.has_arg(b"--state")
+        && c.has_arg(b"open")
+        && c.has_arg(b"--json")
+        && c.has_arg(b"number,headRefOid")));
+}
+
+#[test]
+fn rebased_branch_with_open_pr_is_pushed_with_lease() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    assert!(fx.run("T (#1)", "approved", "r").status.success());
+    fx.cfg("pr-head", &format!("{}\n", origin_tip(&fx)));
+    pr_exists(&fx);
+    amend_local(&fx);
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(origin_tip(&fx), git(&fx.wt, &["rev-parse", "HEAD"]).trim());
+    let err = stderr(&out);
+    assert!(!err.contains("moved since the PR's head") && !err.contains("rejected"));
+}
+
+#[test]
+fn lease_refuses_when_someone_else_moved_the_branch() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    assert!(fx.run("T (#1)", "approved", "r").status.success());
+    let old = origin_tip(&fx);
+    fx.cfg("pr-head", &format!("{old}\n"));
+    pr_exists(&fx);
+    let theirs = push_from_other_clone(&fx);
+    amend_local(&fx);
+    let calls_before = fx.calls_to("pr edit").len();
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(!out.status.success());
+    assert!(stdout(&out).is_empty());
+    assert_eq!(fx.calls_to("pr edit").len(), calls_before);
+    assert_eq!(origin_tip(&fx), theirs);
+    assert_eq!(
+        first_line(&out),
+        format!(
+            "choco open-pr: the branch on GitHub moved since the PR's head {old}: someone else pushed; look before resuming"
+        )
+    );
+    assert!(stderr(&out).contains("(stale info)"));
+}
+
+#[test]
+fn plain_non_fast_forward_without_pr_is_explained() {
+    for fetch in [false, true] {
+        let fx = Fixture::new();
+        fx.write_description(b"d\n");
+        assert!(fx.run("T (#1)", "approved", "r").status.success());
+        let created = fx.calls_to("pr create").len();
+        let theirs = push_from_other_clone(&fx);
+        amend_local(&fx);
+        if fetch {
+            git(&fx.wt, &["fetch", "-q", "origin"]);
+        }
+        let out = fx.run("T (#1)", "approved", "r");
+        assert!(!out.status.success());
+        assert!(stdout(&out).is_empty());
+        assert_eq!(fx.calls_to("pr create").len(), created);
+        assert_eq!(origin_tip(&fx), theirs);
+        assert!(
+            first_line(&out).starts_with("choco open-pr: the push was rejected (non-fast-forward)"),
+            "fetch={fetch}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn lookup_failure_pushes_nothing() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    fx.cfg("fail-pr-list", "");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert_failed_cleanly(&fx, &out);
+    let remote = git(&fx.root.join("origin.git"), &["branch", "--list", "task/*"]);
+    assert!(remote.trim().is_empty(), "{remote}");
+    assert_eq!(
+        first_line(&out),
+        "choco open-pr: could not look up the open PR for task/branch-name-xyz; nothing was pushed"
+    );
+    assert!(stderr(&out).contains("fake gh: configured to fail"));
+}
+
+#[test]
+fn malformed_head_oid_pushes_nothing() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    fx.cfg("pr-head", "7\n");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert_failed_cleanly(&fx, &out);
+    let remote = git(&fx.root.join("origin.git"), &["branch", "--list", "task/*"]);
+    assert!(remote.trim().is_empty(), "{remote}");
+    assert!(first_line(&out).starts_with("choco open-pr: gh returned an unexpected head commit"));
+}
+
+#[test]
+fn other_push_failure_gets_generic_message() {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    let missing = fx.root.join("missing.git");
+    git(
+        &fx.wt,
+        &["remote", "set-url", "origin", missing.to_str().unwrap()],
+    );
+    let out = fx.run("T (#1)", "approved", "r");
+    assert_failed_cleanly(&fx, &out);
+    assert_eq!(
+        first_line(&out),
+        "choco open-pr: the push failed; git's output follows"
     );
 }

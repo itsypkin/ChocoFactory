@@ -43,6 +43,12 @@ moves the task on, into `revising`.
   fresh PR.
 - The note is templated into the coder's prompt verbatim. Make it
   self-contained: list every item in full.
+- `open_pr` force-pushes a rebased branch with a lease on the PR's head
+  commit. If the push is refused because the branch on GitHub moved since
+  the PR's head, someone else pushed: look at the branch on GitHub, keep or
+  bring in their commits, then `choco task send` the note. A plain
+  non-fast-forward rejection (no open PR) means the branch on GitHub has
+  commits the task's branch lacks: inspect it the same way.
 
 ## Getting your review items done when the coder ignores them
 

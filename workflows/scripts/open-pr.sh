@@ -271,8 +271,46 @@ T=$(printf '%s' "${PR_TASK_TITLE:-}" | tr '\n\r\t' '   ' | tr -s ' ' | sed 's/^ 
 
 # Pushed only once the title is known good, so a task that is going to
 # escalate does not publish a branch first.
-git push -u origin HEAD >/dev/null
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# When the branch already has an open PR, push with a lease on that PR's
+# head commit: a rebased branch is never a fast-forward, and the lease still
+# refuses if anyone else moved the branch. `--state open` for the same
+# reason as the later probe (`gh pr view` matches closed and merged PRs).
+# A failed lookup never falls back to a plain or forced push.
+if ! HEAD_OID=$(gh pr list --head "$BRANCH" --state open --json number,headRefOid -q '.[0].headRefOid // empty' 2>"$TMP/lookup-err"); then
+    printf 'choco open-pr: could not look up the open PR for %s; nothing was pushed\n' "$BRANCH" >&2
+    cap 1024 < "$TMP/lookup-err" >&2
+    exit 1
+fi
+if [ -n "$HEAD_OID" ]; then
+    case "$HEAD_OID" in
+    *[!0-9a-f]*) HEAD_OID_BAD=1 ;;
+    *) HEAD_OID_BAD=0 ;;
+    esac
+    if [ "$HEAD_OID_BAD" = 1 ] || { [ "${#HEAD_OID}" -ne 40 ] && [ "${#HEAD_OID}" -ne 64 ]; }; then
+        printf "choco open-pr: gh returned an unexpected head commit for %s's open PR; nothing was pushed\n" "$BRANCH" >&2
+        exit 1
+    fi
+fi
+
+if [ -n "$HEAD_OID" ]; then
+    git push --force-with-lease="$BRANCH:$HEAD_OID" -u origin HEAD >/dev/null 2>"$TMP/push-err" && PUSHED=1 || PUSHED=0
+else
+    git push -u origin HEAD >/dev/null 2>"$TMP/push-err" && PUSHED=1 || PUSHED=0
+fi
+if [ "$PUSHED" != 1 ]; then
+    if grep -qF '(stale info)' "$TMP/push-err"; then
+        msg="the branch on GitHub moved since the PR's head $HEAD_OID: someone else pushed; look before resuming"
+    elif grep -qF -e '(non-fast-forward)' -e '(fetch first)' "$TMP/push-err"; then
+        msg="the push was rejected (non-fast-forward): the branch on GitHub has commits this branch doesn't, and it has no open PR; look at the branch before resuming"
+    else
+        msg="the push failed; git's output follows"
+    fi
+    printf 'choco open-pr: %s\n' "$msg" >&2
+    cap 1024 < "$TMP/push-err" >&2
+    exit 1
+fi
 
 ISSUE=$(printf '%s' "$T" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')
 if [ -n "$ISSUE" ]; then
