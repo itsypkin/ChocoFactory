@@ -1452,6 +1452,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sub_agent_result_records_no_usage_row() {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(fixture_binary(
+            "fake_claude_subagent_result.py",
+        )));
+        let manager = SessionManager::new(
+            pool.clone(),
+            adapter,
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        manager
+            .start(&session_id, "hello", &role_config(), SessionKind::Standing)
+            .await
+            .unwrap();
+
+        // The sub-agent result and the top-level one both become events;
+        // only the top-level one may leave a usage row.
+        crate::test_support::wait_until("both result events", || async {
+            let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+            let n = stored
+                .iter()
+                .filter(|e| e.event_type == chocofactory_core::models::EventType::TurnCompleted)
+                .count();
+            if n >= 2 {
+                Ok(())
+            } else {
+                Err(format!("{n} turn events"))
+            }
+        })
+        .await;
+        let rows = crate::db::usage::list_rows_for_task(&pool, &task_of(&pool, &session_id).await)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cost_usd, Some(0.01));
+    }
+
+    async fn task_of(pool: &SqlitePool, session_id: &str) -> String {
+        sessions::get(pool, session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id
+    }
+
+    #[tokio::test]
     async fn send_message_forwards_to_an_active_in_memory_session() {
         let pool = connect_in_memory().await.unwrap();
         let session_id = seed_session(&pool).await;

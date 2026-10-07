@@ -308,7 +308,12 @@ fn active_time_ms(trail: &[Event], end: DateTime<Utc>) -> Option<i64> {
     }
     let entries: Vec<&Event> = trail
         .iter()
-        .filter(|e| e.payload.get("outcome").and_then(|o| o.as_str()) != Some("retry"))
+        .filter(|e| {
+            !matches!(
+                e.payload.get("outcome").and_then(|o| o.as_str()),
+                Some("retry" | "retry_resume")
+            )
+        })
         .collect();
     let mut total = 0;
     for (i, entry) in entries.iter().enumerate() {
@@ -823,7 +828,8 @@ mod tests {
             entry(0, None, Some("agent_turn")),
             entry(100, Some("go"), Some("human_gate")),
             entry(300, Some("approved"), None),
-            entry(350, Some("retry"), Some("agent_turn")),
+            entry(340, Some("retry"), Some("human_gate")),
+            entry(350, Some("retry_resume"), Some("human_gate")),
             entry(400, Some("again"), Some("agent_turn")),
         ];
         let u = aggregate(times("closed"), &sessions, &rows, &trail, at(900)).unwrap();

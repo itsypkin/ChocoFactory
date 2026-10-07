@@ -123,7 +123,7 @@ async fn create_inner(
                  ELSE MAX(1, (SELECT COUNT(*) FROM events
                      WHERE task_id = ?2 AND event_type = 'stage_entered'
                        AND json_extract(payload, '$.stage') = ?3
-                       AND json_extract(payload, '$.outcome') IS NOT 'retry'))
+                       AND COALESCE(json_extract(payload, '$.outcome'), '') NOT IN ('retry', 'retry_resume')))
              END)
          RETURNING ",
         columns!()

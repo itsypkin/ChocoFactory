@@ -475,6 +475,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resumed_retry_entry_does_not_start_a_new_lap() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        enter(&pool, &task, "implement", None).await;
+        let a = new_session(&pool, &task, "implement").await;
+        enter(&pool, &task, "implement", Some("retry_resume")).await;
+        let b = resumed(&pool, &task, "implement", &a).await;
+        assert_eq!(lap(&pool, &b).await, Some(1));
+        enter(&pool, &task, "review", Some("done")).await;
+        enter(&pool, &task, "implement", Some("changes_requested")).await;
+        let d = new_session(&pool, &task, "implement").await;
+        assert_eq!(lap(&pool, &d).await, Some(2));
+    }
+
+    #[tokio::test]
     async fn a_session_with_no_stage_entries_is_lap_one() {
         let pool = connect_in_memory().await.unwrap();
         let task = new_task(&pool).await;

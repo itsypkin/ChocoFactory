@@ -317,14 +317,7 @@ fn list_cost(t: &TaskSummary) -> String {
         None => "no data".to_string(),
         Some(u) => match u.cost_usd {
             None => "unknown".to_string(),
-            Some(c) => {
-                let text = format!("≈${c:.2}");
-                if text.chars().count() <= COST_W {
-                    text
-                } else {
-                    format!("≈${c:.0}")
-                }
-            }
+            Some(c) => format!("≈${c:.2}"),
         },
     }
 }
