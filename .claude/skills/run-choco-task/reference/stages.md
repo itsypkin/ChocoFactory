@@ -42,7 +42,9 @@ Read this while watching a task, when its behaviour surprises you.
   skill catch both.
 - **checks_polling.** Polls every 30 seconds for up to 30 minutes.
   It goes green when every check passed or was skipped. It goes red on a
-  failed, errored or timed-out check (that starts a paid `revising` lap; the
+  failed, errored or timed-out check that is still red after one automatic
+  re-run of the failed Actions jobs for this head (a failing check that is not
+  an Actions job is red at once). Red starts a paid `revising` lap (the
   4th red in a row parks the task at `escalate_to_human`). It escalates to
   `escalate_to_human` on a cancelled, startup-failure or action-required
   check (the outcome name in `choco task status` says which), and when CI

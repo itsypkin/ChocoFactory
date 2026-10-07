@@ -10,7 +10,7 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 | `internal_review` | A separate, read-only `reviewer` agent reviews the work against the spec. It approves, or sends the task to `revising`. |
 | `revising` | The coder fixes what a review, CI or you asked for, then goes back to `internal_review`. |
 | `open_pr` | A script pushes the branch `task/<id>` and opens the pull request. |
-| `checks_polling` | Polls the PR's CI checks. Green goes on; red goes to `revising`. |
+| `checks_polling` | Polls the PR's CI checks. Green goes on; red goes to `revising`, after the failed GitHub Actions jobs were re-run once for the PR's current head (a failing check that is not an Actions job is red at once). |
 | `awaiting_human_review` | Waits for your verdict on the PR (see below). |
 | `done` | The task is finished. |
 | `escalate_to_human` | A parking stage: the task waits here for a human when a limit is hit (see [Escalation limits](#escalation-limits-and-ci-polling)). |
@@ -143,7 +143,10 @@ If no verdict arrives within six hours the task stops waiting and parks at
 it the same way instead of looping, and resuming from there starts the
 count over. `internal_review` parks the task there on its 4th rejection in a
 row (an approval starts its count over), and `checks_polling` does the same
-on the 4th red CI result in a row (any other outcome starts it over).
+on the 4th red CI result in a row (any other outcome starts it over). A red
+result is one that is still red after the failed Actions jobs were re-run once
+for that head; while the re-run is pending the stage keeps polling and counts
+nothing.
 `checks_polling` polls every 30 seconds for up to 30 minutes: a timeout, and
 a cancelled, startup-failure or action-required check (`ci_cancelled`,
 `ci_startup_failure`, `ci_action_required`), park the task at
