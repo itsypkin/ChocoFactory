@@ -31,7 +31,7 @@ Handing a coding task to an AI agent and walking away goes wrong in familiar way
 - **Tasks survive restarts.** Everything lives in the daemon's database. Waits survive a restart. Interrupted agent turns are parked and can be retried, resuming the agent's session when possible.
 - **Your verdict lives on the PR.** Comment `/approve` or `/request-changes` on the pull request.
 - **One dashboard** (`choco dashboard`) for every task: what needs you, what's running, what's stuck.
-- **Each task gets its own git worktree**, so tasks don't step on each other or on your checkout.
+- **Each coding task gets its own git worktree**, so tasks don't step on each other or on your checkout.
 
 ## How it is used
 
@@ -75,7 +75,7 @@ To update, run `choco update`. `choco update --check` only reports whether an up
 
 ## Quick start
 
-Done once, the first time you use choco:
+Set up once (`project create` is once per repo; start the daemon again after a reboot or logout, since nothing restarts it):
 
 ```
 choco server start                          # background daemon; waits until it answers
