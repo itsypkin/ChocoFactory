@@ -618,7 +618,7 @@ async fn stdout_ending_while_the_statistics_are_awaited_completes_the_turn_then_
 #[tokio::test]
 async fn a_process_that_exits_before_the_session_settles_still_completes_the_finished_turn() {
     let env = Env::new();
-    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled_die")]);
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled,unsettled_die")]);
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
     let events = until_turn_completed(&mut handle).await;
     assert!(matches!(
@@ -629,6 +629,7 @@ async fn a_process_that_exits_before_the_session_settles_still_completes_the_fin
         })
     ));
     assert_eq!(usage_of(&events).tokens, TokenCounts::default());
+    assert_eq!(usage_of(&events).model_turns, Some(2));
 }
 
 #[tokio::test]
