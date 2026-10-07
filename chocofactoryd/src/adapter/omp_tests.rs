@@ -409,7 +409,8 @@ async fn dying_mid_turn_closes_the_stream_without_a_turn_completed() {
 
 #[tokio::test]
 async fn prompt_result_errors_become_error_or_interrupted_then_a_failed_turn() {
-    let cases: [(&str, Option<&str>, fn(&AgentEvent) -> bool); 3] = [
+    type EventCheck = fn(&AgentEvent) -> bool;
+    let cases: [(&str, Option<&str>, EventCheck); 3] = [
         (
             "provider exploded",
             None,
