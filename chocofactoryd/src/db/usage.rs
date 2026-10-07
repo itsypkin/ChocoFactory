@@ -8,7 +8,7 @@ use sqlx::types::Json;
 use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
 use super::events;
-use crate::adapter::{TokenCounts, TurnUsage};
+use crate::adapter::{TokenCounts, TurnUsage, UsageCounting};
 use crate::usage::{self, Baseline, ModelMap, SessionFacts, UsageRow};
 
 /// The sessions to search for a baseline: `session_id`, then its
@@ -85,7 +85,16 @@ pub async fn append_turn_completed(
     let event = events::append_on(&mut tx, session_id, EventType::TurnCompleted, payload).await?;
     let base = baseline(&mut tx, session_id).await?;
     let turn = usage::per_turn(usage, &base);
-    let tokens = usage::turn_tokens(&usage.tokens, turn.models.as_ref());
+    // `usage.tokens` is always this turn's. Summing the per-model figures
+    // only makes sense for cumulative counting, where they span sub-agent
+    // models the CLI's own `usage` leaves out; a per-turn adapter already
+    // reports the figures it means (omp's include side calls).
+    let tokens = match usage.counting {
+        UsageCounting::PerTurn => usage.tokens,
+        UsageCounting::CumulativePerConversation => {
+            usage::turn_tokens(&usage.tokens, turn.models.as_ref())
+        }
+    };
     sqlx::query(
         "INSERT INTO turn_usage (task_id, session_id, recorded_at, billing, counting,
              reported_cost_usd, cost_usd, input_tokens, output_tokens, cache_read_tokens,
@@ -329,6 +338,22 @@ mod tests {
         assert_eq!(
             (t.input, t.output, t.cache_read, t.cache_write),
             (Some(15), Some(15), Some(15), Some(15))
+        );
+    }
+
+    #[tokio::test]
+    async fn per_turn_tokens_are_stored_as_reported_even_with_models_present() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let s = new_session(&pool, &task, "implement").await;
+        let mut u = usage(Some(0.02), 100, one_model(7, 0.02));
+        u.counting = UsageCounting::PerTurn;
+        turn(&pool, &s, &u).await;
+        let rows = list_rows_for_task(&pool, &task).await.unwrap();
+        let t = rows[0].tokens;
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (Some(100), Some(1), Some(1), Some(1))
         );
     }
 

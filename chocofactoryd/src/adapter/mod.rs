@@ -585,6 +585,38 @@ impl AgentHandle {
     }
 }
 
+/// The instruction appended to a single-shot turn's system prompt (#90).
+///
+/// Says what completion *is* rather than only asking for a verdict: a turn
+/// that ends without the call is treated as still working (and eventually
+/// nudged), which is what lets an agent wait on its own background work
+/// without the daemon mistaking that pause for "done".
+pub(crate) fn report_instruction(outcomes: &[String]) -> String {
+    format!(
+        "When all of your work for this stage is finished (including anything you started \
+         in the background, which you must wait for), call `report_outcome` to report the \
+         stage's outcome. It must be one of: {}. Calling it is how this stage completes: \
+         ending your turn without calling it means you are still working. If \
+         `report_outcome` is listed as a deferred tool, load it with ToolSearch first.",
+        outcomes.join(", ")
+    )
+}
+
+/// Whether an error message reads like a usage limit rather than a failure
+/// the agent caused. Matched case-insensitively against the phrasings seen
+/// on a real limit (`You've hit your session limit · resets 3:40pm`) and the
+/// API's own wording. Brittle by construction — see `normalize_result`.
+pub(crate) fn usage_limit_text(message: &str) -> bool {
+    const PHRASES: [&str; 4] = [
+        "session limit",
+        "usage limit",
+        "rate limit",
+        "rate_limit_error",
+    ];
+    let message = message.to_lowercase();
+    PHRASES.iter().any(|phrase| message.contains(phrase))
+}
+
 #[cfg(test)]
 mod registry_tests {
     use std::sync::Arc;
