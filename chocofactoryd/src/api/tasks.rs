@@ -228,6 +228,29 @@ fn workflow_file_status(engine: &WorkflowEngine, task: &Task) -> Option<&'static
 /// A poll one moment later shows the settled pair. Wrapping this in a
 /// transaction would not fix it either — the engine's own two writes aren't
 /// atomic, so the skew is in the data, not in the read.
+async fn read_usage(
+    state: &AppState,
+    id: &str,
+    task: &chocofactory_core::models::Task,
+    stage_trail: &[chocofactory_core::models::Event],
+) -> Result<Option<TaskUsage>, sqlx::Error> {
+    // Rows first: every row's session exists, so the session list read
+    // afterwards can only be a superset of what the rows refer to.
+    let usage_rows = usage_db::list_rows_for_task(&state.pool, id).await?;
+    let usage_sessions = usage_db::list_session_facts(&state.pool, id).await?;
+    Ok(usage::aggregate(
+        TaskTimes {
+            status: &task.status,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+        },
+        &usage_sessions,
+        &usage_rows,
+        stage_trail,
+        chrono::Utc::now(),
+    ))
+}
+
 pub async fn get(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -239,21 +262,16 @@ pub async fn get(
     let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
     let workflow_file_status = workflow_file_status(&state.engine, &task);
     let kept = kept_work(&task);
-    // Rows first: every row's session exists, so the session list read
-    // afterwards can only be a superset of what the rows refer to.
-    let usage_rows = usage_db::list_rows_for_task(&state.pool, &id).await?;
-    let usage_sessions = usage_db::list_session_facts(&state.pool, &id).await?;
-    let usage = usage::aggregate(
-        TaskTimes {
-            status: &task.status,
-            created_at: task.created_at,
-            updated_at: task.updated_at,
-        },
-        &usage_sessions,
-        &usage_rows,
-        &stage_trail,
-        chrono::Utc::now(),
-    );
+    // Usage is an add-on: a read that fails (say, an undecodable row) is
+    // logged and the task is returned with `usage: null`, so the status and
+    // the dashboard detail never depend on it.
+    let usage = match read_usage(&state, &id, &task, &stage_trail).await {
+        Ok(usage) => usage,
+        Err(err) => {
+            tracing::error!(task_id = %id, %err, "failed to read task usage");
+            None
+        }
+    };
     Ok(Json(TaskDetail {
         usage,
         task,
@@ -755,6 +773,22 @@ mod tests {
         assert_eq!(total["tokens"], 405);
         assert_eq!(total["billing_label"], "api_equivalent");
         assert_eq!(row(&without)["usage_total"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_usage_row_still_returns_the_task_with_null_usage() {
+        let server = TestServer::start().await;
+        let id = seed_task_with_usage(&server, true).await;
+        sqlx::query("UPDATE turn_usage SET models = 'not json' WHERE task_id = ?")
+            .bind(&id)
+            .execute(server.pool())
+            .await
+            .unwrap();
+        let resp = server.get(&format!("/tasks/{id}")).await;
+        assert_eq!(resp.status(), 200);
+        let detail: Value = resp.json();
+        assert_eq!(detail["id"], id.as_str());
+        assert_eq!(detail["usage"], Value::Null);
     }
 
     #[tokio::test]
