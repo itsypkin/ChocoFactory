@@ -519,6 +519,26 @@ async fn a_turn_completes_without_figures_when_stdin_was_closed_first() {
 }
 
 #[tokio::test]
+async fn a_report_whose_reply_cannot_be_sent_is_not_recorded_as_accepted() {
+    let env = Env::new();
+    let adapter = env.adapter(&[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    handle.close_stdin();
+    // The fake exits on the closed stdin without a reply: read to the end.
+    let mut events = Vec::new();
+    while let Some(event) = handle.recv().await {
+        events.push(event);
+    }
+    let result = events.iter().find_map(|event| match event {
+        AgentEvent::ToolResult { tool, is_error, .. } if tool.contains("report_outcome") => {
+            Some(*is_error)
+        }
+        _ => None,
+    });
+    assert_eq!(result, Some(true), "{events:?}");
+}
+
+#[tokio::test]
 async fn background_messages_count_toward_the_turn_that_waited_for_them() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);
