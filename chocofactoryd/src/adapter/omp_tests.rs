@@ -1082,6 +1082,18 @@ fn every_otel_variable_in_the_environment_is_removed() {
     };
     assert_eq!(get("OTEL_CHOCO_SCRUB_TEST"), Some(None));
     assert_eq!(get("PATH"), None);
+    // These beat the overlay, so the child must never inherit them.
+    for name in [
+        "PI_AUTO_QA",
+        "PI_AUTO_QA_PUSH",
+        "PI_AUTO_QA_PUSH_URL",
+        "PI_AUTO_QA_PUSH_TOKEN",
+        "PI_CONFIG_FILES",
+        "OMP_PROFILE",
+    ] {
+        assert_eq!(get(name), Some(None), "{name} must be removed");
+    }
+    assert_eq!(get("OTEL_SDK_DISABLED"), Some(Some("true".into())));
 }
 
 // ---------------------------------------------------------------------------
@@ -1708,4 +1720,104 @@ fn a_plain_frame_interrupts_a_sequence_and_is_delivered() {
         asm.feed(chunk("c", 1, 2, 7, b":1}")),
         Reassembled::Rejected(_)
     ));
+}
+
+// -- turns that must never hang --
+
+#[tokio::test]
+async fn a_rejected_prompt_ends_the_turn_with_its_error_exactly_once() {
+    for mode in ["reject_prompt", "reject_prompt_late"] {
+        let env = Env::new();
+        let adapter = env.adapter(&[("FAKE_OMP_MODES", mode)]);
+        let mut handle = adapter.start("/skill:nope", &env.cfg()).unwrap();
+        let mut events = until_turn_completed(&mut handle).await;
+        events.extend(drain(&mut handle).await);
+        let errors: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, vec!["no such skill: nope"], "{mode}");
+        let completions = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+            .count();
+        assert_eq!(completions, 1, "{mode}");
+        let error_at = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Error { .. }))
+            .unwrap();
+        assert!(
+            matches!(
+                events[error_at + 1],
+                AgentEvent::TurnCompleted { is_error: true, .. }
+            ),
+            "{mode}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_statistics_timeout_still_starts_the_next_queued_completion() {
+    let env = Env::new();
+    // Call 0 is the baseline; the first turn's reading never answers.
+    let adapter = env.adapter(&[
+        ("FAKE_OMP_MODES", "noreport"),
+        ("FAKE_OMP_STATS_SEQ", "ok,silent,ok"),
+    ]);
+    let mut handle = adapter.start("one", &env.cfg()).unwrap();
+    handle.send("two").unwrap();
+    let first = until_turn_completed(&mut handle).await;
+    assert!(matches!(
+        first.last(),
+        Some(AgentEvent::TurnCompleted { .. })
+    ));
+    let second = until_turn_completed(&mut handle).await;
+    assert!(matches!(
+        second.last(),
+        Some(AgentEvent::TurnCompleted { .. })
+    ));
+    drain(&mut handle).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_that_never_starts_ends_the_stream_and_kills_the_process() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "no_ready")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = handle.recv().await {
+        events.push(event);
+    }
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { message } if message.contains("ready")
+        )),
+        "{events:?}"
+    );
+    // The fake sleeps for ten minutes: it only exits because it was killed.
+    let status = handle.wait().await.unwrap();
+    assert!(!status.success());
+}
+
+#[tokio::test]
+async fn a_host_tool_call_without_its_fields_is_answered_as_an_error() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,bad_host_call")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    let reply = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::AssistantMessage { text } => text.strip_prefix("bad-call-reply:"),
+            _ => None,
+        })
+        .expect("the fake got a reply");
+    let reply: Value = serde_json::from_str(reply).unwrap();
+    assert_eq!(reply["id"], "htc-bad");
+    assert_eq!(reply["isError"], true);
+    drain(&mut handle).await;
 }

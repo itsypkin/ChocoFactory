@@ -144,6 +144,7 @@ impl OmpAdapter {
         scrub_env(&mut command);
         let mut child: Child = command.spawn().map_err(AdapterError::Spawn)?;
 
+        let pid = child.id();
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -168,6 +169,7 @@ impl OmpAdapter {
             events_tx,
             DriverConfig {
                 binary: self.binary.clone(),
+                pid,
                 stage: StageReport {
                     outcomes: cfg.report_outcomes.clone(),
                     required_sections: cfg.report_sections.clone(),
@@ -255,7 +257,9 @@ fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// The environment every omp process the adapter starts gets: no profile or
-/// config-dir redirect, no OpenTelemetry settings, and the OTel SDK off.
+/// config-dir redirect or env-file, no OpenTelemetry settings, no QA
+/// reporting switches (they beat the overlay's `dev.autoqa: false`), and the
+/// OTel SDK off.
 fn scrub_env(command: &mut Command) {
     scrub_env_from(command, std::env::vars_os().map(|(name, _)| name));
 }
@@ -267,6 +271,11 @@ fn scrub_env_from(command: &mut Command, names: impl Iterator<Item = std::ffi::O
         "PI_PROFILE",
         "PI_CODING_AGENT_DIR",
         "PI_CONFIG_DIR",
+        "PI_CONFIG_FILES",
+        "PI_AUTO_QA",
+        "PI_AUTO_QA_PUSH",
+        "PI_AUTO_QA_PUSH_URL",
+        "PI_AUTO_QA_PUSH_TOKEN",
     ] {
         command.env_remove(var);
     }
@@ -738,6 +747,10 @@ fn spawn_frame_reader(stdout: ChildStdout) -> mpsc::UnboundedReceiver<Value> {
 
 struct DriverConfig {
     binary: String,
+    /// The child's pid (it leads its own process group), for killing it when
+    /// the session can't start. The handle owns the child and reaps it only
+    /// after the event stream ends, so the pid can't be reused before then.
+    pid: Option<u32>,
     stage: StageReport,
     isolation: Value,
 }
@@ -818,6 +831,9 @@ impl Driver {
         if let Err(message) = self.startup(version).await {
             tracing::warn!("omp session didn't start: {message}");
             self.emit(AgentEvent::Error { message });
+            // Nothing will ever drive this process: stop it, so the event
+            // stream ends and the turn fails now rather than at the reaper.
+            self.kill_child();
             return;
         }
         let mut stdin_open = true;
@@ -844,6 +860,7 @@ impl Driver {
                 } => {
                     tracing::warn!("omp: get_session_stats timed out");
                     self.finish_stats(None);
+                    self.start_next_completion().await;
                 }
             }
         }
@@ -851,6 +868,25 @@ impl Driver {
         // no statistics; a turn it hadn't finished ends the way a crashed
         // `claude` does, by closing the channel.
         self.finish_pending_at_exit();
+    }
+
+    /// Kills the omp process group. Used only when the session never started.
+    fn kill_child(&self) {
+        let Some(pid) = self
+            .config
+            .pid
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        else {
+            return;
+        };
+        // SAFETY: `killpg` only sends a signal. `pid` led the group we
+        // started, and the unreaped child keeps it from being reused.
+        if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                tracing::warn!("omp: couldn't kill the process group {pid}: {err}");
+            }
+        }
     }
 
     // -- sending ------------------------------------------------------------
@@ -1085,12 +1121,18 @@ impl Driver {
     }
 
     async fn on_host_tool_call(&mut self, frame: &Value) {
+        let id = frame.get("id").and_then(Value::as_str);
         let (Some(id), Some(tool_call_id), Some(tool_name)) = (
-            frame.get("id").and_then(Value::as_str),
+            id,
             frame.get("toolCallId").and_then(Value::as_str),
             frame.get("toolName").and_then(Value::as_str),
         ) else {
             tracing::warn!("omp: malformed host_tool_call: {frame}");
+            // omp waits for an answer to a call that has an id.
+            if let Some(id) = id {
+                let reply = host_tool_result(id, "malformed host_tool_call", true);
+                self.send_frame(&reply).await;
+            }
             return;
         };
         if tool_name != REPORT_OUTCOME_TOOL_NAME {
@@ -1213,9 +1255,28 @@ impl Driver {
             return;
         }
         if frame.get("success").and_then(Value::as_bool) == Some(false) {
-            // A prompt that failed before reaching the agent also gets a
-            // `prompt_result`, which is what completes the turn.
             tracing::warn!("omp: a command failed: {frame}");
+            // A prompt omp rejects before admitting it (a `/skill:` or
+            // slash command, a throwing extension input handler) gets only
+            // this response: omp drops its result ticket, so no
+            // `prompt_result` follows. The response ends the turn. If a
+            // `prompt_result` does follow, its id is no longer pending and
+            // it is skipped, so the turn completes once.
+            if frame.get("command").and_then(Value::as_str) == Some("prompt")
+                && let Some(sent_at) = id.and_then(|id| self.prompts.remove(id))
+            {
+                let message = frame
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("omp rejected the prompt")
+                    .to_string();
+                self.emit(AgentEvent::Error { message });
+                self.ready_completions.push_back(Completion {
+                    is_error: true,
+                    sent_at,
+                    messages: std::mem::take(&mut self.messages),
+                });
+            }
         }
     }
 

@@ -36,6 +36,12 @@ wrapper script, never through the test process's own environment):
                 statistics are requested (stdout ends while the daemon waits)
   unsettled_die `prompt_result` says the session is unsettled, then the
                 process exits without `session_settled`
+  reject_prompt the `prompt` response is `success: false` and no
+                `prompt_result` follows (omp drops the ticket)
+  reject_prompt_late  as `reject_prompt`, then a `prompt_result` error for
+                the same id arrives anyway
+  bad_host_call a `host_tool_call` with an id but no toolCallId or toolName
+                precedes the turn; the daemon's reply is reported as text
   state_error   `get_state` fails
   tools_error   `set_host_tools` fails
   v1_only       `ready` offers only protocol 1; negotiating kills the process
@@ -279,6 +285,12 @@ def run_reports():
 
 
 def run_prompt(request):
+    if "reject_prompt" in MODES or "reject_prompt_late" in MODES:
+        respond(request, success=False, error="no such skill: nope")
+        if "reject_prompt_late" in MODES:
+            emit({"type": "prompt_result", "id": request.get("id"), "agentInvoked": False,
+                  "status": "error", "error": {"message": "late"}, "sessionSettled": True})
+        return
     if "local_command" in MODES:
         # A builtin slash command: no agent turn and no `prompt_result`.
         respond(request, data={"agentInvoked": False})
@@ -301,6 +313,17 @@ def run_prompt(request):
             if frame.get("type") == "host_tool_result":
                 assistant([{"type": "text",
                             "text": "unknown-tool-reply:" + json.dumps(frame)}])
+                break
+            dispatch(frame)
+    if "bad_host_call" in MODES:
+        emit({"type": "host_tool_call", "id": "htc-bad"})
+        while True:
+            frame = read_frame()
+            if frame is None:
+                sys.exit(0)
+            if frame.get("type") == "host_tool_result":
+                assistant([{"type": "text",
+                            "text": "bad-call-reply:" + json.dumps(frame)}])
                 break
             dispatch(frame)
     if "bad_chunk" in MODES:
@@ -334,7 +357,7 @@ def run_prompt(request):
     if "side_calls" in MODES:
         STATE.totals["input"] += int(os.environ.get("FAKE_OMP_SIDE_TOKENS", "0"))
     assistant([{"type": "text", "text": final_text(request)}], final=True)
-    unsettled = "unsettled" in MODES
+    unsettled = "unsettled" in MODES or "unsettled_die" in MODES
     if "error" in MODES:
         error = {"message": os.environ.get("FAKE_OMP_ERROR_MESSAGE", "boom"), "retryable": False}
         if os.environ.get("FAKE_OMP_ERROR_STATUS"):
