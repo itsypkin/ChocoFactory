@@ -24,8 +24,10 @@ pub(crate) enum ReplyMarkerError {
 
 /// Reads a reply's verdict from its marker lines.
 ///
-/// This is the same line rule as the `VERDICT` filter in
-/// `workflows/scripts/await-review.sh`: a line counts when, with trailing
+/// This is the same line rule as the `VERDICT` and `REVIEW_VERDICT` filters
+/// in `workflows/scripts/await-review.sh`, which apply it to comment bodies
+/// and review bodies. (On GitHub a review's `APPROVED` or
+/// `CHANGES_REQUESTED` state also votes; a reply has no such state.) A line counts when, with trailing
 /// spaces, tabs and `\r` removed, it equals a marker exactly (case-sensitive,
 /// leading whitespace is not ignored). The case table
 /// `chocofactoryd/tests/fixtures/review-markers.json` defines it, and both

@@ -125,17 +125,19 @@ The full key table, columns and behaviour are in [docs/cli.md](docs/cli.md#the-d
 
 ## Reviewing a PR
 
-When a `coding-task` reaches `awaiting_human_review` it has already pushed a branch, opened a PR and waited for CI. It wants a verdict from you, and it reads that from the PR's **comments**, not from GitHub's formal review button.
+When a `coding-task` reaches `awaiting_human_review` it has already pushed a branch, opened a PR and waited for CI. It wants a verdict from you, and it reads that from a PR **comment** or from a GitHub **review**.
 
-Leave a PR comment containing one of these markers, **alone on its own line**, with your review above it:
+Leave a PR comment (or the body of a review) containing one of these markers, **alone on its own line**, with your review above it:
 
 | Marker | Effect |
 |---|---|
 | `/approve` | the task moves to `done` |
 | `/request-changes` | the task goes back to `revising`, and the coder gets your comment |
 
-- Only comments newer than the head commit count, so there is nothing to clear between rounds.
-- Only comments from the repo's owners, members and collaborators vote.
+- Only comments and reviews newer than the head commit count, so there is nothing to clear between rounds.
+- Only comments and reviews from the repo's owners, members and collaborators vote.
+- A collaborator's **Approve** or **Request changes** review votes by itself. On your own PR GitHub only allows a **Comment** review, so put the marker alone on a line of its body.
+- The inline comments on a review go to the coder with it. A pending (unsubmitted) review doesn't count.
 - Merging the PR counts as approval too.
 - `choco task send <id> --text ...` is the other channel: it answers without touching the PR, with the same markers.
 

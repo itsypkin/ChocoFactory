@@ -166,16 +166,21 @@ stages:
   # accepted reply stops the watcher, and its text minus the marker line
   # is what `revising` gets as the human's review. The line rule is
   # pinned by `chocofactoryd/tests/fixtures/review-markers.json`, so
-  # `markers:` here and the script's `VERDICT` filter must change together.
+  # `markers:` here and the script's `VERDICT` and `REVIEW_VERDICT` filters
+  # must change together.
   #
-  # Watches the PR's *comments*, not its `reviewDecision`. GitHub refuses
-  # a formal review from the account that opened the PR, and `open_pr`
-  # pushes under whatever identity the daemon inherited — on a solo repo
-  # that's the same person, so `reviewDecision` stays empty forever
-  # (#78). Commenting on your own PR is allowed, so the verdict is a
-  # marker line in a comment: `/approve` or `/request-changes`.
+  # Watches the PR's *comments and reviews*, not its `reviewDecision`.
+  # GitHub refuses an approving or changes-requesting review from the
+  # account that opened the PR, and `open_pr` pushes under whatever
+  # identity the daemon inherited — on a solo repo that's the same person,
+  # so `reviewDecision` stays empty forever (#78). Commenting on your own
+  # PR is allowed, so the author's verdict is a marker line in a comment or
+  # in the body of a "Comment" review: `/approve` or `/request-changes`.
+  # Another collaborator's APPROVED or CHANGES_REQUESTED review votes by its
+  # state alone. The newest vote across comments and reviews decides.
   #
-  # Only comments newer than the head commit count. That's what keeps a
+  # Only comments and reviews newer than the head commit count (a review by
+  # its `submitted_at`; pending and dismissed reviews never count). That's what keeps a
   # verdict from being re-read on the next lap: `revising` pushes a new
   # commit, which moves `SINCE` past every existing comment, so last
   # round's `/request-changes` stops matching without anything having to
@@ -185,7 +190,7 @@ stages:
   # for first.
   #
   # A merged PR counts as approval (#102): the script prints `MERGED` and
-  # skips the comments, so a PR merged without a marker comment moves on
+  # skips the comments and reviews, so a PR merged without a marker comment moves on
   # at the next lap instead of polling until the timeout. Merged wins over
   # a marker, since there is nothing left to revise once it has landed.
   # A PR closed without merging is nothing new: polling continues.
@@ -195,7 +200,7 @@ stages:
   # no pagination, so on a long PR `.commits | last` is not the head (a
   # stale `SINCE` re-admits verdicts already acted on) and a verdict
   # posted as comment 101 is invisible. Hence `headRefOid` plus the
-  # commits API for the date, and `--paginate` for the comments.
+  # commits API for the date, and `--paginate` for the comments and reviews.
   #
   # Residual, accepted: `committedDate` comes from the daemon's clock
   # while `created_at` comes from GitHub's, so a daemon running more than
@@ -212,7 +217,7 @@ stages:
   # whole of it, `$` meaning end of output.) `/request-changes` is tested
   # first: a comment carrying both markers must never resolve to "merge
   # it". The script's own header documents the selection, the output
-  # format and the two-call trade-off.
+  # format and the separate-calls trade-off.
   #
   # Two author fences, because on a *public* repo the comment box is open
   # to the whole internet and this stage spends money. `authorAssociation`

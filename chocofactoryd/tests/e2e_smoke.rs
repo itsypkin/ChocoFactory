@@ -1104,23 +1104,38 @@ created="{dir}/pr-created"
 case "$1" in
     api)
         # `awaiting_human_review` runs `scripts/await-review.sh`, which
-        # makes the head commit's date call and then the comments calls.
-        # The stub answers the comments calls like gh would: it applies the
-        # call's `-q` filter (with `jq`) to a canned page the test owns in
-        # the `verdict` file (a JSON array of PR comments). What a comment
-        # has to look like to vote is covered in
+        # makes the head commit's date call, then the PR's comments, its
+        # reviews and its inline review comments. The stub routes by the
+        # endpoint path and answers like gh would: it applies the call's
+        # `-q` filter (with `jq`) to a canned page the test owns: the
+        # `verdict` file (a JSON array of issue comments), the `reviews`
+        # file and the `review-comments` file (empty lists when absent).
+        # What an item has to look like to vote is covered in
         # `tests/await_review_script.rs`; these workflow tests cover the
         # routing either side of it.
-        if printf '%s\n' "$@" | grep -q '/comments'; then
-            q=""; prev=""
-            for a in "$@"; do
-                if [ "$prev" = "-q" ]; then q=$a; fi
-                prev=$a
-            done
-            jq -r "$q" < "{dir}/verdict"
-        else
-            echo "2020-01-01T00:00:00Z"
-        fi
+        url=""
+        for a in "$@"; do
+            case "$a" in repos/*) url=$a ;; esac
+        done
+        q=""; prev=""
+        for a in "$@"; do
+            if [ "$prev" = "-q" ]; then q=$a; fi
+            prev=$a
+        done
+        case "$url" in
+            */issues/*/comments*)
+                jq -r "$q" < "{dir}/verdict"
+                ;;
+            */pulls/*/reviews*)
+                if [ -e "{dir}/reviews" ]; then jq -r "$q" < "{dir}/reviews"; else echo '[]' | jq -r "$q"; fi
+                ;;
+            */pulls/*/comments*)
+                if [ -e "{dir}/review-comments" ]; then jq -r "$q" < "{dir}/review-comments"; else echo '[]' | jq -r "$q"; fi
+                ;;
+            *)
+                echo "2020-01-01T00:00:00Z"
+                ;;
+        esac
         ;;
     pr)
         case "$2" in
