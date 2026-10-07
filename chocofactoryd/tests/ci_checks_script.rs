@@ -43,6 +43,9 @@ checks)
     [ -e "$DIR/fail-checks" ] && { echo "fake gh: pr checks failed" >&2; exit 1; }
     [ -e "$DIR/empty-checks" ] && exit 0
     jq -R -s -c 'split("\n") | map(select(. != "")) | to_entries | map({name: ("job-" + (.key | tostring)), state: .value})' < "$DIR/states" | jq -r "$q"
+    # Like gh: exit 8 while checks are pending, output still printed.
+    [ -e "$DIR/checks-exit-8" ] && exit 8
+    exit 0
     ;;
 *) echo "fake gh: unhandled: $*" >&2; exit 1 ;;
 esac
@@ -283,6 +286,13 @@ fn an_unparsable_first_seen_file_is_rewritten_with_a_note() {
         );
         assert!(fx.read_first_seen().starts_with(&format!("{HEAD} ")));
     }
+}
+
+#[test]
+fn pr_checks_exit_8_with_output_is_a_result_not_a_failure() {
+    let fx = Fixture::new(&["SUCCESS", "FAILURE", "PENDING"]);
+    fx.switch("checks-exit-8");
+    assert_eq!(first_line(&fx.ok()), "RED");
 }
 
 #[test]
