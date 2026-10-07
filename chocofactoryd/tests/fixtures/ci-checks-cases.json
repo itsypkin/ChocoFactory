@@ -87,24 +87,24 @@
     "states": [
       "FAILURE"
     ],
-    "first_line": "RED",
-    "outcome": "red"
+    "first_line": "PENDING",
+    "outcome": null
   },
   {
     "name": "error",
     "states": [
       "ERROR"
     ],
-    "first_line": "RED",
-    "outcome": "red"
+    "first_line": "PENDING",
+    "outcome": null
   },
   {
     "name": "timed out",
     "states": [
       "TIMED_OUT"
     ],
-    "first_line": "RED",
-    "outcome": "red"
+    "first_line": "PENDING",
+    "outcome": null
   },
   {
     "name": "startup failure is not red",
@@ -146,8 +146,8 @@
       "FAILURE",
       "CANCELLED"
     ],
-    "first_line": "RED",
-    "outcome": "red"
+    "first_line": "PENDING",
+    "outcome": null
   },
   {
     "name": "failure beats pending",
@@ -156,8 +156,8 @@
       "FAILURE",
       "PENDING"
     ],
-    "first_line": "RED",
-    "outcome": "red"
+    "first_line": "PENDING",
+    "outcome": null
   },
   {
     "name": "skipped and pending",
@@ -208,6 +208,89 @@
     "name": "requested alone",
     "states": [
       "REQUESTED"
+    ],
+    "first_line": "PENDING",
+    "outcome": null
+  },
+  {
+    "name": "failure from a non-Actions check",
+    "states": [
+      "FAILURE"
+    ],
+    "links": [
+      "https://example.com/ci/1"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "error with an empty link",
+    "states": [
+      "ERROR"
+    ],
+    "links": [
+      ""
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "timed out with no link",
+    "states": [
+      "TIMED_OUT"
+    ],
+    "links": [
+      "<none>"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "non-Actions failure beats cancelled",
+    "states": [
+      "FAILURE",
+      "CANCELLED"
+    ],
+    "links": [
+      "https://example.com/ci/1",
+      "https://github.com/o/r/actions/runs/100/job/2"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "non-Actions failure beats pending",
+    "states": [
+      "SUCCESS",
+      "FAILURE",
+      "PENDING"
+    ],
+    "links": [
+      "https://github.com/o/r/actions/runs/100/job/1",
+      "https://example.com/ci/1",
+      "https://github.com/o/r/actions/runs/100/job/3"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "non-Actions failure beats startup failure",
+    "states": [
+      "FAILURE",
+      "STARTUP_FAILURE"
+    ],
+    "links": [
+      "https://example.com/ci/1",
+      "https://github.com/o/r/actions/runs/100/job/1"
+    ],
+    "first_line": "RED",
+    "outcome": "red"
+  },
+  {
+    "name": "Actions failure with startup failure, not re-run yet",
+    "states": [
+      "FAILURE",
+      "STARTUP_FAILURE"
     ],
     "first_line": "PENDING",
     "outcome": null

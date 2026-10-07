@@ -9,7 +9,9 @@
 # Output: a token on line 1, a blank line, then one line per check,
 # `<STATE> <name>`, sorted, so the timeline shows which check is in which
 # state. The workflow's patterns anchor to the token.
-#   RED               a check is FAILURE, ERROR or TIMED_OUT
+#   RED               a check is FAILURE, ERROR or TIMED_OUT, and the failed
+#                     GitHub Actions jobs were already re-run once for this
+#                     head or cannot be re-run (see RE-RUN below)
 #   STARTUP_FAILURE   a check is STARTUP_FAILURE (and none is red)
 #   ACTION_REQUIRED   a check is ACTION_REQUIRED (and none is above)
 #   CANCELLED         a check is CANCELLED (and none is above)
@@ -35,10 +37,42 @@
 # elapsed prints NO_CHECKS. Checks that register late still win: the count is
 # read every attempt, and once it is above 0 NO_CHECKS is never printed.
 #
+# RE-RUN. A red result would send the coder on a paid lap, and a flaky test
+# is not the coder's to fix. So for each head, the first time CI is red the
+# failed Actions jobs are re-run once (`gh run rerun <run id> --failed`) and
+# polling goes on. A failing check is FAILURE, ERROR or TIMED_OUT; it is
+# re-runnable if its link is an Actions job URL
+# (https://github.com/<owner>/<repo>/actions/runs/<run id>/job/<job id>).
+# Applied only when the classification would be RED, in this order:
+#   1. A failing check is not re-runnable (external status, third-party app,
+#      empty or missing link): RED now. No git directory is needed.
+#   2. The record `<git dir>/choco-ci-rerun` is parsable and names this head:
+#      every failing link is in it -> PENDING (GitHub has not replaced the
+#      failed attempt yet; a re-run job has a new job id, so a new link);
+#      any failing link is not in it -> RED (the re-run failed or a new job
+#      failed).
+#   3. Not re-run yet, but a check is still running (a state outside SUCCESS,
+#      SKIPPED, NEUTRAL, FAILURE, ERROR, TIMED_OUT, STARTUP_FAILURE,
+#      ACTION_REQUIRED, CANCELLED): PENDING. GitHub refuses to re-run a run
+#      that is in progress, and one re-run can then cover every failure.
+#   4. Not re-run yet and everything finished: `gh run rerun <id> --failed`
+#      once per distinct run id (sort -u order, stopping at the first
+#      failure), then the record is written, and PENDING. If a re-run call or
+#      the record write fails: RED, with the reason on stderr.
+# The record: line 1 is the head sha, then one failing link per line, sorted
+# and unique, written whole (temp file, then `mv`) only after every re-run
+# call succeeded. An empty record, a line 1 that is empty or has whitespace,
+# no link lines or a link that is not an Actions job URL is unparsable: a
+# note on stderr, then it counts as no record and rule 4 rewrites it. A
+# record for another sha counts as no record. STARTUP_FAILURE and the other
+# tokens never win over a red: a red alongside them prints PENDING or RED.
+#
 # FAIL CLOSED. Any `gh` or `git` failure, an empty head, a count that is not
 # a number, or a failed write of the first-seen file: a note on stderr
 # (`choco ci-checks: ...`), exit 1 and nothing on stdout. A failure must
-# never print a token, and never look like NO_CHECKS or GREEN.
+# never print a token, and never look like NO_CHECKS or GREEN. The one
+# exception is a failed `gh run rerun` or a failed write of the re-run
+# record: those end in RED (today's behaviour) with a note on stderr.
 set -eu
 LC_ALL=C
 export LC_ALL
@@ -47,11 +81,110 @@ NO_CHECKS_GRACE=180
 
 TMP=$(mktemp -d) || { printf 'choco ci-checks: mktemp failed\n' >&2; exit 1; }
 FS_TMP=""
-trap 'rm -rf "$TMP"; [ -z "$FS_TMP" ] || rm -f "$FS_TMP"' EXIT
+REC_TMP=""
+trap 'rm -rf "$TMP"; [ -z "$FS_TMP" ] || rm -f "$FS_TMP"; [ -z "$REC_TMP" ] || rm -f "$REC_TMP"' EXIT
 
 fail() {
     printf 'choco ci-checks: %s\n' "$1" >&2
     exit 1
+}
+
+# Prints the token, a blank line and the check lines; then, if given, a blank
+# line and a message. Exits 0.
+emit() {
+    printf '%s\n\n' "$1"
+    cat "$TMP/checks"
+    if [ -n "$2" ]; then
+        printf '\n%s\n' "$2"
+    fi
+    exit 0
+}
+
+ACTIONS_JOB_URL='^https://github[.]com/[^/]+/[^/]+/actions/runs/[0-9]+/job/[0-9]+$'
+
+# Runs only when the classification is RED: decides between RED and the
+# one-time re-run of the failed Actions jobs (see RE-RUN above).
+rerun_gate() {
+    awk '$1 == "FAILURE" || $1 == "ERROR" || $1 == "TIMED_OUT" { print $2 }' \
+        "$TMP/checks.raw" > "$TMP/fail.unsorted" || fail "awk failed"
+    sort -u "$TMP/fail.unsorted" > "$TMP/fail.links" || fail "sort failed"
+    # Rule 1: a failing check that cannot be re-run is red now.
+    awk -v pat="$ACTIONS_JOB_URL" '$1 !~ pat { n++ } END { print n + 0 }' \
+        "$TMP/fail.links" > "$TMP/nonactions" || fail "awk failed"
+    IFS= read -r NON_ACTIONS < "$TMP/nonactions" || fail "awk printed nothing"
+    [ "$NON_ACTIONS" -eq 0 ] || emit RED ""
+
+    # Rule 2: the record for this head.
+    GIT_DIR_ABS=$(git rev-parse --absolute-git-dir) || fail "git rev-parse --absolute-git-dir failed"
+    [ -n "$GIT_DIR_ABS" ] || fail "no git directory found"
+    RECORD="$GIT_DIR_ABS/choco-ci-rerun"
+    if [ -e "$RECORD" ]; then
+        REC_SHA=""
+        IFS= read -r REC_SHA < "$RECORD" || true
+        awk -v pat="$ACTIONS_JOB_URL" '
+            NR == 1 { if ($0 == "" || $0 ~ /[ \t]/) bad = 1; next }
+            { n++; if ($0 !~ pat) bad = 1 }
+            END { print ((NR == 0 || n == 0 || bad) ? "BAD" : "OK") }' \
+            "$RECORD" > "$TMP/recstate" || fail "awk failed"
+        IFS= read -r REC_STATE < "$TMP/recstate" || fail "awk printed nothing"
+        if [ "$REC_STATE" != OK ]; then
+            printf 'choco ci-checks: ignoring unparsable %s; treating this head as not re-run yet\n' "$RECORD" >&2
+        elif [ "$REC_SHA" = "$HEAD_SHA" ]; then
+            awk 'NR == FNR { if (FNR > 1) r[$0] = 1; next } !($0 in r) { m++ } END { print m + 0 }' \
+                "$RECORD" "$TMP/fail.links" > "$TMP/unrecorded" || fail "awk failed"
+            IFS= read -r UNRECORDED < "$TMP/unrecorded" || fail "awk printed nothing"
+            if [ "$UNRECORDED" -eq 0 ]; then
+                emit PENDING "Waiting for the re-run of the failed jobs for $HEAD_SHA."
+            fi
+            emit RED ""
+        fi
+    fi
+
+    # Rule 3: wait for the other checks, so one re-run covers every failure.
+    awk '$1 != "SUCCESS" && $1 != "SKIPPED" && $1 != "NEUTRAL" && $1 != "FAILURE" &&
+         $1 != "ERROR" && $1 != "TIMED_OUT" && $1 != "STARTUP_FAILURE" &&
+         $1 != "ACTION_REQUIRED" && $1 != "CANCELLED" { n++ } END { print n + 0 }' \
+        "$TMP/checks.raw" > "$TMP/running" || fail "awk failed"
+    IFS= read -r RUNNING < "$TMP/running" || fail "awk printed nothing"
+    if [ "$RUNNING" -gt 0 ]; then
+        emit PENDING "A check failed; waiting for the other checks to finish before re-running the failed jobs."
+    fi
+
+    # Rule 4: re-run the failed jobs of each run once, then record it.
+    sed -n 's|^.*/actions/runs/\([0-9][0-9]*\)/job/.*$|\1|p' "$TMP/fail.links" > "$TMP/runs.unsorted" ||
+        fail "sed failed"
+    sort -u "$TMP/runs.unsorted" > "$TMP/runs" || fail "sort failed"
+    RUN_IDS=""
+    for RUN_ID in $(cat "$TMP/runs"); do
+        RC=0
+        gh run rerun "$RUN_ID" --failed < /dev/null > /dev/null || RC=$?
+        if [ "$RC" -ne 0 ]; then
+            printf 'choco ci-checks: re-running the failed jobs of run %s failed (exit %s); reporting RED\n' "$RUN_ID" "$RC" >&2
+            emit RED ""
+        fi
+        RUN_IDS="$RUN_IDS $RUN_ID"
+    done
+    WHY=""
+    write_record() {
+        REC_TMP=$(mktemp "$GIT_DIR_ABS/choco-ci-rerun.XXXXXX") || {
+            WHY="cannot create a temp file in $GIT_DIR_ABS"
+            return 1
+        }
+        { printf '%s\n' "$HEAD_SHA"; cat "$TMP/fail.links"; } > "$REC_TMP" || {
+            WHY="cannot write $REC_TMP"
+            return 1
+        }
+        mv -f "$REC_TMP" "$RECORD" || {
+            WHY="cannot move $REC_TMP to $RECORD"
+            return 1
+        }
+        REC_TMP=""
+    }
+    if ! write_record; then
+        printf 'choco ci-checks: re-ran the failed jobs but could not record it in %s: %s; reporting RED\n' "$RECORD" "$WHY" >&2
+        emit RED ""
+    fi
+    emit PENDING "Re-ran the failed jobs of run${RUN_IDS} for $HEAD_SHA."
 }
 
 [ -n "${PR_NUMBER:-}" ] || fail "PR_NUMBER is not set"
@@ -69,11 +202,14 @@ case "$COUNT" in
 esac
 
 if [ "$COUNT" -gt 0 ]; then
-    gh pr checks "$PR_NUMBER" --json name,state \
-        -q '.[] | "\(.state) \(.name)"' > "$TMP/checks.raw" ||
+    gh pr checks "$PR_NUMBER" --json name,state,link \
+        -q '.[] | "\(.state) \((.link // "") | if . == "" then "-" else gsub(" "; "%20") end) \(.name)"' \
+        > "$TMP/checks.raw" ||
         fail "gh pr checks failed"
     [ -s "$TMP/checks.raw" ] || fail "gh pr checks printed nothing although $COUNT checks exist"
-    sort "$TMP/checks.raw" > "$TMP/checks" || fail "sort failed"
+    # Lines are `<STATE> <link or -> <name>`; the shown lines drop the link.
+    sed 's/^\([^ ]*\) [^ ]* /\1 /' "$TMP/checks.raw" > "$TMP/checks.unsorted" || fail "sed failed"
+    sort "$TMP/checks.unsorted" > "$TMP/checks" || fail "sort failed"
     # One awk pass classifies; its exit status is checked, so a tool failure
     # can never be read as "no failing check".
     awk '
@@ -88,15 +224,16 @@ if [ "$COUNT" -gt 0 ]; then
                 for (k in s) if (k != "SUCCESS" && k != "SKIPPED" && k != "NEUTRAL") t = "PENDING"
             }
             print t
-        }' "$TMP/checks" > "$TMP/token" || fail "awk failed"
+        }' "$TMP/checks.raw" > "$TMP/token" || fail "awk failed"
     IFS= read -r TOKEN < "$TMP/token" || fail "no classification produced"
     case "$TOKEN" in
     RED | STARTUP_FAILURE | ACTION_REQUIRED | CANCELLED | GREEN | PENDING) ;;
     *) fail "unexpected classification '$TOKEN'" ;;
     esac
-    printf '%s\n\n' "$TOKEN"
-    cat "$TMP/checks"
-    exit 0
+    if [ "$TOKEN" = RED ]; then
+        rerun_gate
+    fi
+    emit "$TOKEN" ""
 fi
 
 # No check reported for this head yet.
