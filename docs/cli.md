@@ -36,7 +36,7 @@ own.
 
 ## The daemon
 
-Use `choco server`. It expects `chocofactoryd` next to the `choco` binary:
+`chocofactoryd` is the daemon: it stores everything in a SQLite database and serves an HTTP/WebSocket API that `choco` talks to. Use `choco server` to run it. It expects `chocofactoryd` next to the `choco` binary:
 
 ```
 choco server start [--port N]      # background, own session; waits until it answers
@@ -148,6 +148,7 @@ ID        bb93ada3-2910-4b94-911d-f6e8aab426dd
 Project   7a0cafdf-8c3a-4e9f-8453-78d11be2a4e4
 Workflow  coding-task
 Status    open
+Repo      /Users/you/code/acme
 Created   2026-08-01 12:33:37 UTC
 ```
 
@@ -225,14 +226,18 @@ Cost and tokens are kept for good. A *lap* is the nth time the task entered a
 stage; a retry stays in its lap. `choco task list --json` carries each task's
 total as `usage_total`.
 
-Send a message into the task's live session (or resume a `human_gate`).
+Send a message to a task. What a task accepts depends on its stage: a
+standing agent stage such as `chat`'s takes a message into the live session,
+and a `human_gate` (or `escalate_to_human`) takes a message that resumes it.
+A `coding-task` accepts a message only at its human gates; at its other agent
+stages (`coding`, `internal_review`, `revising`) the daemon answers `409`.
 At a gate that has markers, such as `awaiting_human_review`, the text must
 carry exactly one of them on a line of its own.
 The daemon accepts it asynchronously — the agent's reply lands as an
 event, not in this response:
 
 ```
-$ choco task send bb93ada3-... --text "go"
+$ choco task send bb93ada3-... --text $'Looks good.\n/approve'
 Message accepted for task bb93ada3-.... The reply is recorded as an event
 — see `choco task events bb93ada3-...`.
 ```
@@ -338,7 +343,7 @@ $ choco task cancel bb93ada3-...
 A stuck task accepts no messages (`choco task send` is a `409`, the same
 shape as sending to a cancelled task) until a retry reopens it.
 
-Read the conversation:
+Read the conversation (this sample is from a `chat` task):
 
 ```
 $ choco task events bb93ada3-...

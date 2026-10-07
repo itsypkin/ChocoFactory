@@ -74,7 +74,7 @@ What you need first:
 - **`gh`**, authenticated as the account that opens the PRs.
 - **`git`**.
 
-To update, run `choco update`. `choco update --check` only reports whether an update is available. A running daemon is restarted on the same port; the built-in workflows update with the binary.
+To update, run `choco update`. `choco update --check` only reports whether an update is available. A running daemon started from the install directory is restarted on the same port (`update` refuses with exit 3 while an agent turn is running, unless you pass `--force`); the built-in workflows update with the binary.
 
 ## Quick start
 
