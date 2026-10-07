@@ -2096,6 +2096,17 @@ stages:
             .await;
         assert_eq!(response.status(), 404, "{}", response.json());
         assert_eq!(response.json()["error"], "no such task 'no-such-task'");
+
+        // A workflow that no longer loads skips the check (the turn-start
+        // one still fails closed), rather than blocking every config change.
+        std::fs::remove_file(server.builtin_workflow_path("memflow")).unwrap();
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "cli": "omp" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{}", response.json());
     }
 
     #[tokio::test]
