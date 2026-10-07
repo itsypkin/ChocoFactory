@@ -196,9 +196,9 @@ choco task create --project <p> --workflow coding-task \
   (
     while :; do
       json=$(choco --json task status "$id") || exit 1
-      state=$(printf '%s\n' "$json" | jq -r '"\(.status) \(.workflow_state.current_stage)"') || exit 1
+      state=$(printf '%s\n' "$json" | jq -r '"\(.status) \(.workflow_state.stage_kind) \(.workflow_state.current_stage)"') || exit 1
       case $state in
-        "open awaiting_human_review" | "open escalate_to_human" | "open spec_questions" | stuck\ * | cancelled\ * | closed\ *)
+        "open human_gate "* | stuck\ * | cancelled\ * | closed\ *)
           echo "$state"; exit 0 ;;
       esac
       sleep 60
@@ -242,7 +242,10 @@ an independent reviewer do it, and look for what agents systematically miss:
 - **Your repo's own recurring review findings**, if you know them.
 
 **The verdict is a PR comment**, not a GitHub review: `/approve` or
-`/request-changes` alone on its own line, with your review above it.
+`/request-changes` alone on its own line, with your review above it. You can
+also answer with `choco task send <id> --text "..."` carrying exactly one of
+the two markers on a line of its own; a reply with neither or both is
+refused, and nothing is posted to the PR.
 
 - Only comments newer than the head commit count. Editing an earlier comment
   to add the marker counts too.

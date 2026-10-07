@@ -126,20 +126,26 @@ stages:
 
   # Same as `coding-task.yaml`'s `awaiting_human_review`.
   awaiting_human_review:
-    kind: poll
-    script_file: scripts/await-review.sh
-    env:
-      PR_NUMBER: "{{ stages.open_pr.number }}"
+    kind: human_gate
     capture: text
-    interval: 60s
-    timeout: 6h
-    outcomes:
-      - match: '\AREQUEST_CHANGES(\n|$)'
+    markers:
+      - line: /request-changes
         then: changes_requested
-      - match: '\AAPPROVE(\n|$)'
+      - line: /approve
         then: approved
-      - match: '\AMERGED(\n|$)'
-        then: approved
+    watch:
+      script_file: scripts/await-review.sh
+      env:
+        PR_NUMBER: "{{ stages.open_pr.number }}"
+      interval: 60s
+      timeout: 6h
+      outcomes:
+        - match: '\AREQUEST_CHANGES(\n|$)'
+          then: changes_requested
+        - match: '\AAPPROVE(\n|$)'
+          then: approved
+        - match: '\AMERGED(\n|$)'
+          then: approved
     on:
       approved: done
       changes_requested: revising

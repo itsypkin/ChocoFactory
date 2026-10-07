@@ -702,7 +702,7 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         }
         if t.task.status == "open"
             && let Some(stage) = t.current_stage.as_deref()
-            && super::app::NEEDS_YOU_STAGES.contains(&stage)
+            && t.waiting_on_human
             && let Some(text) = waiting_text(stage, &t.task.id)
         {
             let mut row = FRow::new("Waiting for", text);
