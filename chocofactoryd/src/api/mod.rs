@@ -185,6 +185,21 @@ stages:
         /// [`Self::start_with_adapter_binary`] that also names the `choco`
         /// binary `GET /server` reports.
         pub async fn start_with_binaries(binary: &str, choco_binary: &str) -> Self {
+            Self::start_inner(binary, choco_binary, None).await
+        }
+
+        /// [`Self::start`] with the engine reading a global config file at
+        /// `global_config_path`, which the test writes after boot — the
+        /// same as editing the file while the daemon runs.
+        pub async fn start_with_global_config(global_config_path: PathBuf) -> Self {
+            Self::start_inner("fake_claude.py", "choco", Some(global_config_path)).await
+        }
+
+        async fn start_inner(
+            binary: &str,
+            choco_binary: &str,
+            global_config_path: Option<PathBuf>,
+        ) -> Self {
             let pool = db::connect_in_memory().await.unwrap();
             let workflows_dir = TempDir::new();
             let events_notify = Arc::new(Notify::new());
@@ -200,7 +215,7 @@ stages:
                 pool.clone(),
                 session_manager,
                 workflows_dir.0.clone(),
-                None,
+                global_config_path,
                 Arc::clone(&events_notify),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

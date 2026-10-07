@@ -210,7 +210,13 @@ impl From<RetryTaskError> for ApiError {
             // Same shape, for a task created from a recorded workflow path
             // (issue #88) whose file has since been deleted.
             | RetryTaskError::MissingWorkflowFile(_)
-            | RetryTaskError::BuiltinWorkflowGone(_) => ApiError::Conflict(err.to_string()),
+            | RetryTaskError::BuiltinWorkflowGone(_)
+            // The role's CLI (from the global config edited since daemon
+            // start) is unknown: a conflict with the task's config, not a
+            // server fault. Create reports the same fault as 400.
+            | RetryTaskError::Enter(EngineError::UnknownCli(_)) => {
+                ApiError::Conflict(err.to_string())
+            }
             _ => ApiError::Internal(err.to_string()),
         }
     }

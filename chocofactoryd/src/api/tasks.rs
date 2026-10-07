@@ -2056,4 +2056,58 @@ stages:
             "role 'chat' uses cli 'ghost', which this daemon doesn't know; known CLIs: claude"
         );
     }
+
+    #[tokio::test]
+    async fn a_cli_that_slips_in_after_startup_is_400_at_create_and_409_at_retry() {
+        let dir = std::env::temp_dir().join(format!("choco-gc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        let server = TestServer::start_with_global_config(config_path.clone()).await;
+        // No `cli:` on the role, so the global config's value is the one used.
+        server.write_workflow(
+            "nocli",
+            "name: nocli\nroles:\n  chat:\n    model: sonnet\nstages:\n  chatting:\n    kind: agent_turn\n    role: chat\n    on: {}\n",
+        );
+        // Written after the engine was built, so no start-time check saw it.
+        std::fs::write(&config_path, "roles:\n  chat:\n    cli: bogus\n").unwrap();
+        let project_id = create_project(&server).await;
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "nocli",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": { "cwd": "." },
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(error.contains("'bogus'"), "{error}");
+        assert!(error.contains("known CLIs: claude"), "{error}");
+        let list = server
+            .get(&format!("/tasks?project_id={project_id}"))
+            .await
+            .json();
+        let tasks = list.as_array().unwrap();
+        assert_eq!(tasks.len(), 1, "{list}");
+        assert_eq!(tasks[0]["status"], "stuck");
+        let task_id = tasks[0]["id"].as_str().unwrap().to_string();
+
+        let response = server
+            .post(&format!("/tasks/{task_id}/retry"), json!({}))
+            .await;
+        assert_eq!(response.status(), 409, "{}", response.json());
+        assert!(
+            response.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("known CLIs: claude"),
+            "{}",
+            response.json()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
