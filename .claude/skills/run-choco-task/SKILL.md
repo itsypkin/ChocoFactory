@@ -203,28 +203,18 @@ choco task create --project <p> --workflow coding-task-planned \
 - Per-task overrides beat editing shared config:
   `--role-model <role>=<model>`, `--role-system-prompt-file <role>=<path>`,
   `--role-cli <role>=<cli>`.
-- **Running a role on omp.** `--role-cli reviewer=omp` (or `cli: omp` on the
-  role in the workflow) runs that role on the `omp` CLI, for example with
-  `--role-model reviewer=openai-codex/gpt-5.6-terra`. It uses your existing
-  omp login and needs no extra step. An omp role sees the repo's root
-  `CLAUDE.md` and `AGENTS.md` and `.omp/AGENTS.md` and `.omp/RULES.md`, plus
-  the repo's `.claude/CLAUDE.md` (loaded by omp itself), and
-  nothing from nested folders, folders above the repo, or your personal setup,
-  so put what it needs in those files or in the spec. Outside a `worktree:
-  true` workflow it can read but its edits and commands are refused. It can't
-  use `memory: true`. A role on an Anthropic model needs an
-  `ANTHROPIC_API_KEY`, not a Claude subscription login.
-  For an existing task, `choco task reconfigure` takes effect on the next
-  turn.
+- **Running a role on omp** (`--role-cli <role>=omp`): see
+  [reference/spec.md](reference/spec.md#running-a-role-on-omp).
 - **Wait for the task to stop.** On `coding-task-planned` it can park at
   `spec_questions` (the planner needs your answer; reply with
   `choco task send <id> --text "<answers>"`), at `awaiting_human_review`
   (vote, step 4) or at `escalate_to_human` (`choco task send`, step 5).
   `--until` takes one target, so
   `choco task status <id> --until stage:awaiting_human_review --timeout 2h`
-  sits out the whole timeout if the task parks elsewhere. Use it only once
-  you know no planner question is pending (or on `coding-task`), and
-  otherwise poll for every stop, as in
+  sits out the whole timeout if the task parks elsewhere, and an answered
+  planner question can come back as another one. Use it only once the task
+  has left `spec_check` for `coding` (or on `coding-task`); an escalation
+  still runs it to the timeout. Until then poll for every stop, as in
   [reference/watch.md](reference/watch.md#polling-every-way-a-task-can-stop).
   The exit codes and typical stage times for choosing `--timeout` are there
   too.
@@ -299,7 +289,7 @@ is in [reference/recover.md](reference/recover.md).
 **`/approve` moves the task to `done`; merging the PR is still your job.**
 Merging the PR also moves the task to `done` within a minute, without a
 vote, so don't post `/approve` after merging; a PR closed without merging
-doesn't move the task. `done` deletes the task's local branch once it was
+doesn't move the task. `done` deletes the task's local branch only if it was
 pushed or merged; the remote `task/<id>` branch stays unless the repo
 deletes merged head branches.
 

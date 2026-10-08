@@ -7,6 +7,7 @@
 - Tasks that read an external API
 - Tasks whose coder runs a real third-party CLI
 - Docs-only tasks
+- Running a role on omp
 
 ## Check that the design holds
 
@@ -84,3 +85,19 @@ done criteria are instead:
 
 Check these yourself before merging a docs PR; a script that walks the
 links and a loop over the `--help` of each command are enough.
+
+## Running a role on omp
+
+`--role-cli reviewer=omp` (or `cli: omp` on the
+role in the workflow) runs that role on the `omp` CLI, for example with
+`--role-model reviewer=openai-codex/gpt-5.6-terra`. It uses your existing
+omp login and needs no extra step. An omp role sees the repo's root
+`CLAUDE.md` and `AGENTS.md` and `.omp/AGENTS.md` and `.omp/RULES.md`, plus
+the repo's `.claude/CLAUDE.md` (loaded by omp itself), and
+nothing from nested folders, folders above the repo, or your personal setup,
+so put what it needs in those files or in the spec. Outside a `worktree:
+true` workflow it can read but its edits and commands are refused. It can't
+use `memory: true`. A role on an Anthropic model needs an
+`ANTHROPIC_API_KEY`, not a Claude subscription login.
+For an existing task, `choco task reconfigure` takes effect on the next
+turn.
