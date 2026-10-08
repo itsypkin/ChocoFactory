@@ -59,8 +59,9 @@
 # state is APPROVED, CHANGES_REQUESTED or COMMENTED (PENDING and DISMISSED
 # never count), and it passes the same author fence. A review has no
 # updated_at, so an edit to its body is seen only while the review is still
-# newer than the head commit. An inline comment is included if and only if
-# its review qualifies; its own timestamps are never compared with SINCE.
+# newer than the head commit. An inline comment is included when its review
+# qualifies and it also passes the same author fence itself (author_association
+# and `[bot]`); its own timestamps are still never compared with SINCE.
 # Comments are written once (SELECT), reviews once (REVIEW_SELECT).
 #
 # VERDICT (comments) and REVIEW_VERDICT (reviews). Per qualifying item,
@@ -134,6 +135,8 @@ REVIEW_RENDER="$REVIEW_SELECT"'
 
 INLINE_RENDER='.[]
   | select((.pull_request_review_id | tostring) == $ENV.RID)
+  | select(.author_association | IN("OWNER", "MEMBER", "COLLABORATOR"))
+  | select((.user.login // "") | endswith("[bot]") | not)
   | (if .subject_type == "file" then "\(.path) (file)"
      elif .line != null then
        "\(.path):" + (if .start_line != null and .start_line != .line

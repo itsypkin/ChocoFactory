@@ -7888,6 +7888,80 @@ async fn the_real_coding_task_planned_workflow_walks_the_happy_path_to_done() {
     );
 }
 
+/// #241: an owner's `/request-changes` review with inline comments, on the
+/// real `coding-task-planned`, routes to `revising` and hands the coder
+/// every inline comment. (The mock coder leaves `revising` at once, so the
+/// test waits for the loop guard to park the task and reads the trail.)
+#[tokio::test]
+async fn the_real_planned_workflow_hands_an_owners_inline_comments_to_the_coder() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(scripts_dir.join("verdict"), "[]").unwrap();
+    fs::write(
+        scripts_dir.join("reviews"),
+        r#"[{"id": 5, "state": "COMMENTED", "submitted_at": "2030-01-01T00:00:00Z", "author_association": "OWNER", "user": {"login": "owner"}, "html_url": "https://example.test/r/5", "body": "note\n/request-changes"}]"#,
+    )
+    .unwrap();
+    let inline = |path: &str, line: u32, body: &str| {
+        json!({
+            "pull_request_review_id": 5, "author_association": "OWNER",
+            "user": {"login": "owner"}, "path": path, "line": line,
+            "original_line": line, "subject_type": "line",
+            "html_url": format!("https://example.test/i/{line}"), "body": body,
+        })
+    };
+    fs::write(
+        scripts_dir.join("review-comments"),
+        json!([
+            inline("src/a.rs", 5, "INLINE-ENGINE-ONE"),
+            inline("src/b.rs", 9, "INLINE-ENGINE-TWO")
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        scripts_dir.join("planner-reply.json"),
+        planner_report("ready"),
+    )
+    .unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_builtin_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+        "coding-task-planned",
+    )
+    .await;
+    let engine = engine_with_adapter(pool.clone(), &claude_wrapper.to_string_lossy());
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "escalate_to_human").await;
+
+    let trail: Vec<String> = stage_trail(&pool, &task_id)
+        .await
+        .into_iter()
+        .map(|(stage, _)| stage)
+        .collect();
+    assert!(
+        trail.iter().filter(|s| s.as_str() == "revising").count() >= 2,
+        "the owner's request must route to revising: {trail:?}"
+    );
+    let payload = payload_of(&pool, &task_id).await;
+    let review = payload["stages"]["awaiting_human_review"].as_str().unwrap();
+    assert!(review.starts_with("REQUEST_CHANGES\n\n"), "{review:?}");
+    assert!(review.contains("review COMMENTED"), "{review:?}");
+    for body in ["INLINE-ENGINE-ONE", "INLINE-ENGINE-TWO"] {
+        assert!(review.contains(body), "{body}: {review:?}");
+    }
+}
+
 /// #120: a planner that reports `needs_input` parks the task, open, at
 /// `spec_questions`; the human's answer goes back to `spec_check`, and
 /// the second report (`ready`) lets the coder start.

@@ -24,6 +24,8 @@ const FAKE_GH: &str = r#"#!/bin/sh
 # $DIR/since is the head commit's date. $DIR/fail-<what> makes that call
 # fail, where <what> is pr-view, commits, or comments-<n>, reviews-<n> or
 # review-comments-<n> for the nth call to that endpoint.
+# $DIR/fail-<pages prefix>-<i>.json (e.g. fail-reviews-page-2.json) makes page
+# i of that endpoint fail under --paginate, after pages 1..i-1 were printed.
 DIR="$GH_FAKE_DIR"
 echo "$*" >> "$DIR/calls"
 q=""
@@ -58,9 +60,12 @@ api)
         [ -e "$DIR/empty-$3-$n" ] && exit 0
         # Like gh: only the first page unless --paginate is given.
         found=0
+        i=0
         for page in "$DIR"/$1-*.json; do
             [ -e "$page" ] || continue
             found=1
+            i=$((i+1))
+            [ -e "$DIR/fail-$1-$i.json" ] && { echo "fake gh: $1 page $i failed" >&2; exit 1; }
             jq -r "$q" < "$page" || exit 1
             [ "$paginate" = 1 ] || break
         done
@@ -905,6 +910,8 @@ struct Inline<'a> {
     subject: &'a str,
     at: &'a str,
     body: &'a str,
+    login: Option<&'a str>,
+    assoc: Option<&'a str>,
 }
 
 impl<'a> Inline<'a> {
@@ -919,12 +926,14 @@ impl<'a> Inline<'a> {
             subject: "line",
             at: FRESH,
             body,
+            login: Some("rev"),
+            assoc: Some("COLLABORATOR"),
         }
     }
 
     fn json(&self) -> String {
         format!(
-            r#"{{"pull_request_review_id": {}, "path": {}, "line": {}, "original_line": {}, "start_line": {}, "original_start_line": {}, "subject_type": "{}", "created_at": "{at}", "updated_at": "{at}", "html_url": "https://example.test/i/{}", "body": {}}}"#,
+            r#"{{"pull_request_review_id": {}, "path": {}, "line": {}, "original_line": {}, "start_line": {}, "original_start_line": {}, "subject_type": "{}", "created_at": "{at}", "updated_at": "{at}", "html_url": "https://example.test/i/{}", "body": {}, "user": {}, "author_association": {}}}"#,
             self.review_id,
             serde_json::json!(self.path),
             serde_json::json!(self.line),
@@ -934,6 +943,8 @@ impl<'a> Inline<'a> {
             self.subject,
             self.body.len(),
             serde_json::json!(self.body),
+            serde_json::json!(self.login.map(|l| serde_json::json!({ "login": l }))),
+            serde_json::json!(self.assoc),
             at = self.at
         )
     }
@@ -1388,4 +1399,222 @@ fn a_review_that_stops_qualifying_mid_run_is_skipped_with_its_inline_comments() 
     assert!(!stdout.contains("review COMMENTED"), "{stdout}");
     assert!(!stdout.contains("GONE-INLINE"), "{stdout}");
     assert!(!fx.calls().contains("pulls/7/comments"));
+}
+
+fn inline_by(
+    id: u64,
+    path: &'static str,
+    line: u64,
+    body: &'static str,
+    login: Option<&'static str>,
+    assoc: Option<&'static str>,
+) -> Inline<'static> {
+    Inline {
+        login,
+        assoc,
+        ..Inline::at_line(id, path, line, body)
+    }
+}
+
+#[test]
+fn an_owners_request_changes_review_hands_over_every_inline_comment() {
+    let out = review_stdout(
+        &[],
+        &[review(
+            "11",
+            "COMMENTED",
+            Some(FRESH),
+            "OWNER",
+            "me",
+            "/request-changes",
+        )],
+        &[
+            inline_by(11, "src/a.rs", 5, "OWNER-ONE", Some("me"), Some("OWNER")),
+            inline_by(11, "src/b.rs", 9, "OWNER-TWO", Some("me"), Some("OWNER")),
+        ],
+    );
+    assert_eq!(first_line(&out), "REQUEST_CHANGES");
+    assert!(out.starts_with("REQUEST_CHANGES\n\n"), "{out}");
+    let header = out
+        .find(&format!("### me (OWNER), {FRESH}, review COMMENTED"))
+        .unwrap_or_else(|| panic!("{out}"));
+    for s in [
+        "#### src/a.rs:5",
+        "OWNER-ONE",
+        "#### src/b.rs:9",
+        "OWNER-TWO",
+    ] {
+        assert!(out.find(s).unwrap_or_else(|| panic!("{s}: {out}")) > header);
+    }
+}
+
+#[test]
+fn inline_comments_from_outsiders_are_dropped() {
+    for assoc in ["CONTRIBUTOR", "NONE", "FIRST_TIMER"] {
+        let body: &'static str = Box::leak(format!("OUTSIDER-{assoc}").into_boxed_str());
+        let out = review_stdout(
+            &[],
+            &[rev("CHANGES_REQUESTED", FRESH, "")],
+            &[
+                Inline::at_line(11, "src/ok.rs", 3, "QUALIFYING"),
+                inline_by(11, "src/out.rs", 4, body, Some("outsider"), Some(assoc)),
+            ],
+        );
+        assert!(out.contains("QUALIFYING"), "{out}");
+        assert!(out.contains("#### src/ok.rs:3"), "{out}");
+        assert!(!out.contains(body), "{assoc}: {out}");
+    }
+}
+
+#[test]
+fn inline_comments_from_bots_are_dropped_whatever_their_association() {
+    for assoc in ["OWNER", "MEMBER", "COLLABORATOR"] {
+        let body: &'static str = Box::leak(format!("BOT-{assoc}").into_boxed_str());
+        let out = review_stdout(
+            &[],
+            &[rev("CHANGES_REQUESTED", FRESH, "")],
+            &[
+                Inline::at_line(11, "src/ok.rs", 3, "QUALIFYING"),
+                inline_by(11, "src/bot.rs", 4, body, Some("ci[bot]"), Some(assoc)),
+            ],
+        );
+        assert!(out.contains("QUALIFYING"), "{out}");
+        assert!(!out.contains(body), "{assoc}: {out}");
+    }
+}
+
+#[test]
+fn inline_comments_with_null_or_missing_association_are_dropped_but_a_null_user_is_not() {
+    let missing = {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&Inline::at_line(11, "src/m.rs", 2, "MISSING-ASSOC").json())
+                .unwrap();
+        v.as_object_mut().unwrap().remove("author_association");
+        v.to_string()
+    };
+    let fx = Fixture::new(SINCE, &[list(&[])]);
+    fx.reviews(&[list(&[rev("CHANGES_REQUESTED", FRESH, "")])]);
+    fx.review_comments(&[list(&[
+        inline_by(11, "src/n.rs", 1, "NULL-ASSOC", Some("rev"), None).json(),
+        missing,
+        inline_by(11, "src/u.rs", 7, "NULL-USER", None, Some("COLLABORATOR")).json(),
+    ])]);
+    let out = fx.run();
+    assert!(out.status.success());
+    let out = String::from_utf8(out.stdout).unwrap();
+    assert!(!out.contains("NULL-ASSOC"), "{out}");
+    assert!(!out.contains("MISSING-ASSOC"), "{out}");
+    assert!(out.contains("NULL-USER"), "{out}");
+    assert!(out.contains("#### src/u.rs:7"), "{out}");
+}
+
+#[test]
+fn dropping_inline_comments_never_changes_the_verdict() {
+    let bad = || {
+        vec![
+            inline_by(11, "a.rs", 1, "X1", Some("o"), Some("CONTRIBUTOR")),
+            inline_by(11, "b.rs", 2, "X2", Some("ci[bot]"), Some("OWNER")),
+            inline_by(11, "c.rs", 3, "X3", Some("rev"), None),
+        ]
+    };
+    for (state, body, want) in [
+        ("CHANGES_REQUESTED", "", "REQUEST_CHANGES"),
+        ("APPROVED", "", "APPROVE"),
+        ("COMMENTED", "/request-changes", "REQUEST_CHANGES"),
+    ] {
+        let with = review_stdout(&[], &[rev(state, FRESH, body)], &bad());
+        let without = review_stdout(&[], &[rev(state, FRESH, body)], &[]);
+        assert_eq!(first_line(&with), want, "{state}: {with}");
+        assert_eq!(first_line(&without), want, "{state}: {without}");
+        for x in ["X1", "X2", "X3"] {
+            assert!(!with.contains(x), "{with}");
+        }
+    }
+    let out = review_stdout(&[], &[rev("COMMENTED", FRESH, "")], &bad());
+    assert!(out.is_empty(), "{out}");
+}
+
+#[test]
+fn a_vote_on_review_page_two_counts_and_its_inline_comments_are_handed_over() {
+    let fx = Fixture::new(SINCE, &[list(&[])]);
+    fx.reviews(&[
+        list(&[rev("COMMENTED", FRESH, "just a note")]),
+        list(&[review(
+            "12",
+            "CHANGES_REQUESTED",
+            Some(FRESH),
+            "OWNER",
+            "me",
+            "PAGE-TWO-REVIEW",
+        )]),
+    ]);
+    fx.review_comments(&[inline_list(&[
+        inline_by(12, "p.rs", 1, "P2-ONE", Some("me"), Some("OWNER")),
+        inline_by(12, "q.rs", 2, "P2-TWO", Some("me"), Some("OWNER")),
+    ])]);
+    let out = fx.run();
+    assert!(out.status.success());
+    let out = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(first_line(&out), "REQUEST_CHANGES", "{out}");
+    for s in ["PAGE-TWO-REVIEW", "P2-ONE", "P2-TWO"] {
+        assert!(out.contains(s), "{s}: {out}");
+    }
+}
+
+#[test]
+fn inline_comments_split_across_pages_render_in_page_order_after_their_review() {
+    let fx = Fixture::new(SINCE, &[list(&[])]);
+    fx.reviews(&[list(&[rev("CHANGES_REQUESTED", FRESH, "")])]);
+    fx.review_comments(&[
+        inline_list(&[Inline::at_line(11, "a.rs", 1, "INLINE-P1")]),
+        inline_list(&[Inline::at_line(11, "b.rs", 2, "INLINE-P2")]),
+    ]);
+    let out = fx.run();
+    assert!(out.status.success());
+    let out = String::from_utf8(out.stdout).unwrap();
+    let h = out.find("### rev (COLLABORATOR)").expect(&out);
+    let p1 = out.find("INLINE-P1").expect(&out);
+    let p2 = out.find("INLINE-P2").expect(&out);
+    assert!(h < p1 && p1 < p2, "{out}");
+}
+
+#[test]
+fn the_newest_vote_wins_across_review_pages() {
+    for (first, second, want) in [
+        ("APPROVED", "CHANGES_REQUESTED", "REQUEST_CHANGES"),
+        ("CHANGES_REQUESTED", "APPROVED", "APPROVE"),
+    ] {
+        let fx = Fixture::new(SINCE, &[list(&[])]);
+        fx.reviews(&[
+            list(&[rev(first, FRESH, "")]),
+            list(&[review("12", second, Some(LATER), "COLLABORATOR", "rev", "")]),
+        ]);
+        fx.review_comments(&[inline_list(&[])]);
+        let out = fx.run();
+        assert!(out.status.success());
+        let out = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(first_line(&out), want, "{first}/{second}: {out}");
+    }
+}
+
+#[test]
+fn a_gh_failure_on_page_two_of_reviews_or_inline_comments_is_an_error_with_empty_stdout() {
+    for what in ["reviews-page-2.json", "review-comments-page-2.json"] {
+        let fx = Fixture::new(SINCE, &[list(&[owner_comment(FRESH, "/request-changes")])]);
+        fx.reviews(&[
+            list(&[rev("COMMENTED", FRESH, "/request-changes")]),
+            list(&[review("12", "COMMENTED", Some(FRESH), "OWNER", "me", "")]),
+        ]);
+        fx.review_comments(&[
+            inline_list(&[Inline::at_line(11, "a.rs", 1, "P1")]),
+            inline_list(&[Inline::at_line(11, "b.rs", 2, "P2")]),
+        ]);
+        fx.fail(what);
+        let out = fx.run();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{what} must fail the script");
+        assert!(out.stdout.is_empty(), "{what}: no partial output");
+        assert!(err.contains("page 2 failed"), "{what}: {err}");
+        assert!(err.contains("choco await-review:"), "{what}: {err}");
+    }
 }
