@@ -114,7 +114,7 @@ choosing `--timeout`:
 |---|---|
 | `spec_check` | 2–9 min |
 | `coding` | 8–42 min |
-| `internal_review` | 1–9 min a lap |
+| `internal_review` | 1–9 min a lap that rejects; an approving lap takes about 5–10 min more, because it runs the gate (longer under load) |
 | `revising` | 1–23 min |
 | `open_pr` | seconds |
 | `checks_polling` | your CI's time plus a minute |

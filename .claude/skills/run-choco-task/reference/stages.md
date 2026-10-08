@@ -26,12 +26,16 @@ Read this while watching a task, when its behaviour surprises you.
 - **internal_review.** The reviewer can't use the file-editing tools, and a
   turn that changes HEAD or `git status` anyway parks the task as `stuck`,
   with the change left in place for you to inspect (same coverage and gaps
-  as `spec_check`: not ignored paths, not anything inside `.git`). It routes the task on
-  its own verdict. Its
-  loop guard counts rejections in a row: the 4th in a row sends the task to
-  `escalate_to_human`. An approval or escalating starts the count over, so
-  your `/request-changes` always gets a fresh internal budget. It re-reads the PR's comments, so it
-  can pick up review items the coder ignored.
+  as `spec_check`: not ignored paths, not anything inside `.git`). Before it
+  approves, it runs the repo's whole gate (the commands the repo's
+  instruction files say a change must pass) in its own scratch copy of HEAD,
+  never in the task's worktree, and gives a failing test the change doesn't
+  touch one re-run on its own before that test blocks. It routes the task on
+  its own verdict. Its loop guard counts rejections in a row: the 4th in a
+  row sends the task to `escalate_to_human`. An approval or escalating
+  starts the count over, so your `/request-changes` always gets a fresh
+  internal budget. It re-reads the PR's comments, so it can pick up review
+  items the coder ignored.
 - **open_pr.** Pushes the branch `task/<task-id>` and opens or refreshes the
   PR. The title comes from the task title; the body is the coder's own
   description plus the internal reviewer's report. A closing keyword followed
