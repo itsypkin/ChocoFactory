@@ -15,9 +15,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Read the pinned toolchain
+        id: pin
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)
+          if [ "$(printf '%s\n' "$channel" | wc -l)" -ne 1 ] || ! printf '%s\n' "$channel" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error file=rust-toolchain.toml::expected exactly one line 'channel = \"X.Y.Z\"' (an exact version); found '${channel}'"
+            exit 1
+          fi
+          echo "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
-          toolchain: stable
+          toolchain: ${{ steps.pin.outputs.channel }}
+      - name: Show the toolchain
+        run: rustc --version && cargo --version
       - name: Tag matches the workspace version and is on main
         if: startsWith(github.ref, 'refs/tags/')
         run: |
@@ -40,10 +52,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read the pinned toolchain
+        id: pin
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)
+          if [ "$(printf '%s\n' "$channel" | wc -l)" -ne 1 ] || ! printf '%s\n' "$channel" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error file=rust-toolchain.toml::expected exactly one line 'channel = \"X.Y.Z\"' (an exact version); found '${channel}'"
+            exit 1
+          fi
+          echo "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
-          toolchain: stable
+          toolchain: ${{ steps.pin.outputs.channel }}
           components: rustfmt, clippy
+      - name: Show the toolchain
+        run: rustc --version && cargo --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
@@ -71,10 +95,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read the pinned toolchain
+        id: pin
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)
+          if [ "$(printf '%s\n' "$channel" | wc -l)" -ne 1 ] || ! printf '%s\n' "$channel" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error file=rust-toolchain.toml::expected exactly one line 'channel = \"X.Y.Z\"' (an exact version); found '${channel}'"
+            exit 1
+          fi
+          echo "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
-          toolchain: stable
+          toolchain: ${{ steps.pin.outputs.channel }}
           targets: ${{ matrix.target }}
+      - name: Show the toolchain
+        run: rustc --version && cargo --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
