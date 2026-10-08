@@ -77,6 +77,8 @@ To run a role on a model from another provider, run it on omp.
 
 omp has been verified with OpenAI models over its OAuth login. An Anthropic model *through omp* needs an Anthropic API key, not a Claude subscription login; the details are in [`cli: omp`](#cli-omp).
 
+**omp as the reviewer.** An omp reviewer is a supported opt-in for code tasks; Claude stays the default. With `openai-codex/gpt-5.6-terra` it checks tests well, breaking the fix in a scratch copy to see a test fail, and matched the Claude reviewer on the one task measured so far. It costs nothing only on a free tier: the cost `choco task status` shows for it is the provider's list price, and an `openai-codex` login counts as a subscription, so the figure is the API-equivalent price, not what you paid. Set it for one task with `--role-cli reviewer=omp --role-model reviewer=openai-codex/gpt-5.6-terra`.
+
 ## `cli: omp`
 
 `omp` is [oh-my-pi](https://github.com/can1357/oh-my-pi), a fork of the Pi
