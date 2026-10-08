@@ -1,3 +1,6 @@
+# CI (.github/workflows/ci.yml) and the release workflow (.github/workflows/release.yml) read the
+# toolchain version from the `channel` line below. Bumping it is a deliberate PR of its own.
+# Keep `channel = "X.Y.Z"` on one line in exactly this shape: the workflows read it with a line match.
 [toolchain]
-channel = "stable"
+channel = "1.99.0"
 components = ["clippy", "rustfmt"]
