@@ -66,6 +66,7 @@ wrapper script, never through the test process's own environment):
 - FAKE_OMP_START_TOKENS: input tokens the session already has at start (a
   resumed session).
 - FAKE_OMP_PROVIDER / FAKE_OMP_MODEL: what `get_state` reports.
+- FAKE_OMP_NO_PROVIDER=1: omit the provider from `get_state` and from messages.
 - FAKE_OMP_VERSION_FAIL: `--version` exits 1.
 """
 import base64
@@ -192,6 +193,8 @@ def assistant(content, usage=True, final=False, provider=None, model=None, count
         "model": model or os.environ.get("FAKE_OMP_MODEL", "gpt-5.6-terra"),
         "stopReason": "stop",
     }
+    if os.environ.get("FAKE_OMP_NO_PROVIDER") == "1":
+        del message["provider"]
     if usage:
         message["usage"] = {
             "input": USAGE["input"],
@@ -446,7 +449,11 @@ def dispatch(request):
             request,
             data={
                 "model": {
-                    "provider": os.environ.get("FAKE_OMP_PROVIDER", "openai-codex"),
+                    **(
+                        {}
+                        if os.environ.get("FAKE_OMP_NO_PROVIDER") == "1"
+                        else {"provider": os.environ.get("FAKE_OMP_PROVIDER", "openai-codex")}
+                    ),
                     "id": os.environ.get("FAKE_OMP_MODEL", "gpt-5.6-terra"),
                 },
                 "thinkingLevel": "medium",

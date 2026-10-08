@@ -1189,6 +1189,25 @@ async fn a_turns_usage_is_the_statistics_delta_with_per_model_figures() {
 }
 
 #[tokio::test]
+async fn an_empty_or_absent_provider_still_gives_one_by_model_entry() {
+    for (env_vars, key) in [
+        (vec![("FAKE_OMP_PROVIDER", "")], "unknown/gpt-5.6-terra"),
+        (vec![("FAKE_OMP_NO_PROVIDER", "1")], "unknown/gpt-5.6-terra"),
+    ] {
+        let env = Env::new();
+        let adapter = env.adapter(&env_vars);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        let usage = usage_of(&until_turn_completed(&mut handle).await);
+        let models = usage.models.unwrap();
+        assert_eq!(models.len(), 1, "{models:?}");
+        assert_eq!(models[0].model, key);
+        assert_eq!(models[0].tokens, usage.tokens);
+        assert_eq!(usage.tokens.input, Some(300));
+        drain(&mut handle).await;
+    }
+}
+
+#[tokio::test]
 async fn side_call_tokens_are_counted_and_a_resumed_first_turn_is_a_delta() {
     let env = Env::new();
     let adapter = env.adapter(&[

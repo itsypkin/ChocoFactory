@@ -161,20 +161,27 @@ fn u64_field(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(Value::as_u64)
 }
 
+/// The by-model key, `<provider>/<id>`. A missing or empty part is
+/// "unknown". Messages and the session's own model (`get_state`) both use
+/// this, so the same model always gets the same key.
+pub fn model_key(provider: Option<&str>, id: Option<&str>) -> String {
+    let part = |value: Option<&str>| match value {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => "unknown".to_string(),
+    };
+    format!("{}/{}", part(provider), part(id))
+}
+
 /// Parses an assistant message's pi-ai `Usage`. `input` already excludes
 /// cache reads. `None` when the message has no usage object.
 pub fn parse_message_usage(message: &Value) -> Option<MessageUsage> {
     let usage = message.get("usage").filter(|usage| usage.is_object())?;
-    let provider = message
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let model = message
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+    let model = model_key(
+        message.get("provider").and_then(Value::as_str),
+        message.get("model").and_then(Value::as_str),
+    );
     Some(MessageUsage {
-        model: format!("{provider}/{model}"),
+        model,
         tokens: TokenCounts {
             input: u64_field(usage, "input"),
             output: u64_field(usage, "output"),

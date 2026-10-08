@@ -1030,12 +1030,10 @@ impl Driver {
             .pointer("/model/id")
             .and_then(Value::as_str)
             .map(|id| {
-                let p = if provider.is_empty() {
-                    "unknown"
-                } else {
-                    provider
-                };
-                format!("{p}/{id}")
+                super::pi_family::model_key(
+                    state.pointer("/model/provider").and_then(Value::as_str),
+                    Some(id),
+                )
             });
         self.billing = billing_for(provider, &|name| std::env::var(name).ok());
         let tools: Vec<Value> = state
