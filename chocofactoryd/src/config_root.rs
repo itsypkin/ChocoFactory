@@ -1922,8 +1922,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "Commit a new test before you break the code it covers.",
             "Then confirm `git status --short` is empty, re-run the test and see it pass.",
             "When the self-check ends, the tree must be exactly what you meant to commit, and the tests must prove it.",
-            "isn't finished: give it its test or that code fact",
-            "Listing it is not finishing it",
+            "A branch no test can reach needs the code fact that shows it;",
+            "one on the change's main path that you would list as untested, or as covered only by a unit test of a helper, isn't finished until it has its test or that code fact, and the reviewer blocks on it.",
+            "Before you build on anything the spec marks **unverified**, run its probe where the claim applies, and give the command and its result in the PR description under `## Look closely at`.",
+            "If the result contradicts the spec, adapt as little as possible and say what changed there.",
+            "If the probe can't run where the claim applies, say there why it couldn't, in place of its result.",
         ];
         assert_says(
             &text,
@@ -1936,6 +1939,10 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             let at = index_of(&text, c);
             assert!(step2 < at && at < step3, "'{c}' must sit in step 2");
         }
+        let step2_text = &text[step2..step3];
+        assert_eq!(step2_text.matches("isn't finished").count(), 1);
+        assert_eq!(step2_text.matches("the code fact that shows it").count(), 1);
+        assert!(!step2_text.contains("Listing it is not finishing it"));
         let step4 = index_of(&text, "4. Write the pull request's description");
         let step5 = index_of(&text, "5. Call `report_outcome`");
         let claims = [
@@ -1964,13 +1971,23 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             ],
             "coder-revise.md must apply the self-check to the lap",
         );
-        assert_says(
-            &squash(done),
-            &[
-                "Re-read the whole description, delete what is no longer true, and keep every section the spec requires.",
-            ],
-            "coder-revise.md must keep the description current",
-        );
+        for name in ["coder-revise.md", "coder-revise-planned.md"] {
+            let raw = embedded_prompt(name);
+            let done = squash(&raw[raw.find("## When you're done").expect("section")..]);
+            assert_says(
+                &done,
+                &[
+                    "Keep every section the spec requires.",
+                    "If the branch has an open PR, first read its published description: set `N` as the `awaiting_human_review` entry does, then `[ -n \"$N\" ] && gh pr view \"$N\" --json body -q .body`.",
+                    "Only the part between the issue line and `## Internal review` is your description; carry into the file every edit a person made there that is still true.",
+                ],
+                name,
+            );
+            assert!(
+                !done.contains("Re-read the whole description, delete what is no longer true"),
+                "{name}: the old re-read sentence is gone"
+            );
+        }
     }
 
     #[test]
@@ -2036,10 +2053,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             &fourth,
             &[
-                "treat it as stop condition 1 and raise it as a question",
-                "cites the command you ran and its output",
-                "**unverified**",
-                "name the probe the coder must run before relying on it",
+                "When a stated decision leaves the protection unsound, the task contradicts itself: treat it as stop condition 1 and raise it as a question instead of keeping the decision silently.",
+                "Every runtime claim the spec relies on (what a program prints, writes, returns or includes), whether a Decision states it, a Decision depends on it without stating it, or it is carried over from the task or the issue, cites the command you ran and its output.",
+                "If the rule above doesn't let you run it, mark the claim **unverified** and name the probe the coder must run before relying on it.",
+                "Run the probe where the claim applies (the same tool, harness and kind of process the claim is about), not in a stand-in:",
+                "a run in a stand-in (a plain shell for a claim about an agent harness) doesn't verify the claim; mark it **unverified**.",
             ],
             "planner-system.md check 4",
         );
@@ -2047,28 +2065,125 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             &sixth,
             &[
-                "restart sweep",
-                "a resumed retry and a fresh one",
-                "Do not build",
-                "at every size from the minimum up",
-                "one test per fail-closed path",
-                "you fix what you find yourself",
-                "grep every place that writes that field",
+                "list every way the protected event can end: each exit path, the daemon's restart sweep, a resumed retry and a fresh one.",
+                "Check that \"Do not build\" doesn't forbid a hook that list needs.",
+                "Require one test that renders every fixture at every size from the minimum up and asserts the invariants.",
+                "The done criteria name one test per fail-closed path they mention.",
+                "Like the other checks, you fix what you find yourself. A soundness gap is a reason to stop only under the stop conditions above.",
+                "When the spec filters or matches on a value (an outcome name, a status, a character set, a check state), grep every place that writes that field",
                 "Say which values the filter handles and why the others don't matter",
-                "the state the world may already be in when the operation starts",
-                "A fix the task decides goes through this check too",
-                "raise it as a question",
+                "Include the state the world may already be in when the operation starts (an existing branch, file, row or remote commit), not only races during it.",
+                "A fix the task decides goes through this check too; if it fails, that is check 4's contradiction: raise it as a question.",
             ],
             "planner-system.md check 6",
         );
         assert!(
-            index_of(&sixth, "the state the world may already be in")
+            index_of(&sixth, "Include the state the world may already be in")
                 < index_of(
                     &sixth,
                     "Like the other checks, you fix what you find yourself"
                 ),
             "the 'Like the other checks' bullet must stay last"
         );
+    }
+
+    #[test]
+    fn planner_system_has_one_run_rule() {
+        let raw = embedded_prompt("planner-system.md");
+        let head = squash(&raw[..raw.find("## Your job, and when to stop").unwrap()]);
+        assert_says(
+            &head,
+            &[
+                "Don't edit any file outside a temporary directory you made.",
+                "You may run read-only commands, such as `git fetch`, and harmless runs that exercise a tool without lasting effect: `--help`, `--version`, a dry run, or the command on a throwaway input in a temporary directory.",
+                "Never install anything, build, run tests, commit, push or post anywhere.",
+            ],
+            "planner-system.md run rule",
+        );
+        let checks = section_of(raw, "## The checks");
+        assert_says(
+            &checks,
+            &[
+                "run it as written where the rule above allows that, and otherwise a run the rule allows that exercises the same tool and flags",
+            ],
+            "planner-system.md check 1",
+        );
+        let one = index_of(&checks, "1. **Reachability.**");
+        let two = index_of(&checks, "2. **Base.**");
+        let at = index_of(&checks, "run it as written where the rule above allows");
+        assert!(one < at && at < two, "the rule reference sits in check 1");
+        for gone in [
+            "Run it as written only if it is read-only",
+            "Never install anything, build, run tests, commit, push or post to prove a command",
+            "can't run it read-only",
+        ] {
+            assert!(!checks.contains(gone), "{gone:?} is gone");
+        }
+    }
+
+    #[test]
+    fn reviewer_system_checks_unverified_claims_in_conformance() {
+        let text = squash(embedded_prompt("reviewer-system.md"));
+        let claims = [
+            "For each claim the task marks **unverified**, check that the PR description gives its probe and result and that the code fits that result; re-run the probe when it is harmless to.",
+            "A probe that could not run where the claim applies is not missing if the PR description says why;",
+            "a missing probe (neither a result nor that reason), or code built on a claim the probe contradicted, is a blocking finding.",
+        ];
+        assert_says(&text, &claims, "reviewer-system.md step 4");
+        let (from, to) = (
+            index_of(&text, "## 4. Conformance"),
+            index_of(&text, "## 5. Decide"),
+        );
+        for c in claims {
+            let at = index_of(&text, c);
+            assert!(from < at && at < to, "'{c}' must sit in step 4");
+        }
+    }
+
+    #[test]
+    fn prompts_read_issues_and_prs_in_a_form_that_prints() {
+        for (name, source) in BUILTIN_WORKFLOW_PROMPTS {
+            assert!(
+                !squash(source).contains("--comments"),
+                "{name} still uses --comments"
+            );
+        }
+        assert_says(
+            &squash(embedded_prompt("planner-system.md")),
+            &["gh issue view 12 --json title,body,comments"],
+            "planner-system.md",
+        );
+        for name in [
+            "reviewer-turn.md",
+            "reviewer-turn-planned.md",
+            "coder-revise.md",
+            "coder-revise-planned.md",
+        ] {
+            assert_says(
+                &squash(embedded_prompt(name)),
+                &["gh pr view --json comments,reviews"],
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_system_runs_the_repos_gate_before_approving() {
+        let text = squash(embedded_prompt("reviewer-system.md"));
+        let clauses = [
+            "Before you report `approved`, run every command the repository's own instruction files (CLAUDE.md, AGENTS.md, CONTRIBUTING) say a change must pass, exactly as they state them (or, if none of them names one, the CI configuration's checks; if nothing names a gate, say so under `Reviewed`), in your scratch copy reset to HEAD with the reset command above.",
+            "A command that fails is a blocking finding; quote its failing output.",
+            "One that can't start here for a reason outside the change (a tool not installed, no network) is named with its error and doesn't block by itself.",
+            "Record each command and its result under `Reviewed`.",
+            "A review that already rejects skips this: the next review runs it.",
+            "Never run the gate, a build, tests or a formatter in the task worktree, whatever verdict you expect: the scratch copy is the only place, and skipping is the only alternative.",
+        ];
+        assert_says(&text, &clauses, "reviewer-system.md gate");
+        let predict = index_of(&text, "## 1. Predict");
+        for c in clauses {
+            assert!(index_of(&text, c) < predict, "'{c}' must sit before step 1");
+        }
+        assert!(!text.contains("Don't re-run formatting, lint, build or the full test suite"));
     }
 
     #[test]
