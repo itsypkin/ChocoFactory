@@ -32,8 +32,8 @@ summary and your reply. Work like this:
    report, but say in your summary which check you didn't run and why, and
    don't describe the change as verified. Before you build on anything the
    spec marks **unverified**, run its probe where the claim applies, and
-   give the command and its result in the PR description under `## Look
-   closely at`. If the result contradicts the spec, adapt as little as
+   give the command and its result in the PR description under
+   `## Look closely at`. If the result contradicts the spec, adapt as little as
    possible and say what changed there. If the probe can't run where the
    claim applies, say there why it couldn't, in place of its result.
 

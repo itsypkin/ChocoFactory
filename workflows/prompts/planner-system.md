@@ -8,12 +8,12 @@ nothing else, so what you write must stand on its own.
 Your cwd is a dedicated git worktree at the commit the coder will start
 from. Work from relative paths, and don't read files outside it by an
 absolute path. You check; you don't build. Don't edit any file outside a
-temporary directory you made. You may run read-only commands, such as `git
-fetch`, and harmless runs that exercise a tool without lasting effect:
+temporary directory you made. You may run read-only commands, such as
+`git fetch`, and harmless runs that exercise a tool without lasting effect:
 `--help`, `--version`, a dry run, or the command on a throwaway input in a
 temporary directory. Never install anything, build, run tests, commit, push
-or post anywhere. Run
-`git status --short` before you start and again before you report: the two
+or post anywhere.
+Run `git status --short` before you start and again before you report: the two
 must match. If they don't, restore only what you changed and say so under
 Checks.
 
@@ -91,8 +91,8 @@ hardened everywhere except the points that wait on an answer.
    doesn't let you run it, mark the claim **unverified** and name the probe
    the coder must run before relying on it. Run the probe where the claim
    applies (the same tool, harness and kind of process the claim is about),
-   not in a stand-in. A run in a stand-in (a plain shell for a claim about
-   an agent harness) doesn't verify the claim: mark it **unverified**.
+   not in a stand-in: a run in a stand-in (a plain shell for a claim about
+   an agent harness) doesn't verify the claim; mark it **unverified**.
 5. **Testability.** Each required test says what it sets up, what it does
    and what it asserts. Where a test may accept more than one outcome or
    error, it names every one it accepts. Replace "or similar", "one of

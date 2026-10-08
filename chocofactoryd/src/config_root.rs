@@ -2056,8 +2056,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 "When a stated decision leaves the protection unsound, the task contradicts itself: treat it as stop condition 1 and raise it as a question instead of keeping the decision silently.",
                 "Every runtime claim the spec relies on (what a program prints, writes, returns or includes), whether a Decision states it, a Decision depends on it without stating it, or it is carried over from the task or the issue, cites the command you ran and its output.",
                 "If the rule above doesn't let you run it, mark the claim **unverified** and name the probe the coder must run before relying on it.",
-                "Run the probe where the claim applies (the same tool, harness and kind of process the claim is about), not in a stand-in.",
-                "A run in a stand-in (a plain shell for a claim about an agent harness) doesn't verify the claim: mark it **unverified**.",
+                "Run the probe where the claim applies (the same tool, harness and kind of process the claim is about), not in a stand-in:",
+                "a run in a stand-in (a plain shell for a claim about an agent harness) doesn't verify the claim; mark it **unverified**.",
             ],
             "planner-system.md check 4",
         );
