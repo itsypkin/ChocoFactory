@@ -30,8 +30,9 @@ Read this while watching a task, when its behaviour surprises you.
   approves, it runs the repo's whole gate (the commands the repo's
   instruction files say a change must pass) in its own scratch copy of HEAD,
   never in the task's worktree, and gives a failing test the change doesn't
-  touch one re-run on its own before that test blocks. It routes the task on
-  its own verdict. Its loop guard counts rejections in a row: the 4th in a
+  touch one re-run on its own, and it blocks only if it fails again. It
+  approves only after a gate that ran to the end. It routes the task on its
+  own verdict. Its loop guard counts rejections in a row: the 4th in a
   row sends the task to `escalate_to_human`. An approval or escalating
   starts the count over, so your `/request-changes` always gets a fresh
   internal budget. It re-reads the PR's comments, so it can pick up review
