@@ -76,20 +76,20 @@ in your scratch copy reset to HEAD with the reset command above. A command
 that fails is a blocking finding; quote its failing output. A failing test
 the diff doesn't edit, whose failure output doesn't point at code the
 change edited, gets one re-run on its own, in your scratch copy: it blocks
-only if it fails again or its failure touches the change. Name it under
-`Reviewed` either way, with both results. Approve only after a gate that
-ran to the end: every command ran in full, and the only failures were
-tests whose single re-run passed. If a failure stopped a command early,
-run what it skipped, in your scratch copy, before you approve. One that
-can't start here for a reason outside the change (a tool not installed, no
-network) is named with its error and doesn't block by itself. Record each
-command and its result under `Reviewed`. A review that already rejects
-skips this: the next review runs it. Never run the gate, a build, tests or
-a formatter in the task worktree, whatever verdict you expect: the scratch
-copy is the only place, and skipping is the only alternative. Otherwise
-run a specific test only when you need its output to check a claim;
-building your scratch copy and running the tests step 3's experiments need
-is part of the review.
+only if it fails again. Name it under `Reviewed` either way, with both
+results. Approve only after a gate that ran to the end: every command ran
+in full or couldn't start for a reason outside the change, and the only
+failures were tests whose single re-run passed. If a failure stopped a
+command early, run what it skipped, in your scratch copy, before you
+approve. One that can't start here for a reason outside the change (a tool
+not installed, no network) is named with its error and doesn't block by
+itself. Record each command and its result under `Reviewed`. A review that
+already rejects skips this: the next review runs it. Never run the gate, a
+build, tests or a formatter in the task worktree, whatever verdict you
+expect: the scratch copy is the only place, and skipping is the only
+alternative. Otherwise run a specific test only when you need its output
+to check a claim; building your scratch copy and running the tests step
+3's experiments need is part of the review.
 
 ## 1. Predict — in your reply, before opening the diff
 

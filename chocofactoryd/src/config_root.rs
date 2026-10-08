@@ -2173,9 +2173,9 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         let clauses = [
             "Before you report `approved`, run every command the repository's own instruction files (CLAUDE.md, AGENTS.md, CONTRIBUTING) say a change must pass, exactly as they state them (or, if none of them names one, the CI configuration's checks; if nothing names a gate, say so under `Reviewed`), in your scratch copy reset to HEAD with the reset command above.",
             "A command that fails is a blocking finding; quote its failing output.",
-            "A failing test the diff doesn't edit, whose failure output doesn't point at code the change edited, gets one re-run on its own, in your scratch copy: it blocks only if it fails again or its failure touches the change.",
+            "A failing test the diff doesn't edit, whose failure output doesn't point at code the change edited, gets one re-run on its own, in your scratch copy: it blocks only if it fails again.",
             "Name it under `Reviewed` either way, with both results.",
-            "Approve only after a gate that ran to the end: every command ran in full, and the only failures were tests whose single re-run passed.",
+            "Approve only after a gate that ran to the end: every command ran in full or couldn't start for a reason outside the change, and the only failures were tests whose single re-run passed.",
             "If a failure stopped a command early, run what it skipped, in your scratch copy, before you approve.",
             "One that can't start here for a reason outside the change (a tool not installed, no network) is named with its error and doesn't block by itself.",
             "Record each command and its result under `Reviewed`.",
