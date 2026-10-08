@@ -159,7 +159,7 @@ More in [docs/workflows.md](docs/workflows.md).
 
 ## Using choco from Claude Code
 
-The `run-choco-task` skill teaches Claude Code to drive a `coding-task`
+The `run-choco-task` skill teaches Claude Code to drive a coding task
 end to end: write the spec, watch the task, review its PR and recover it.
 Copy the whole skill folder, including `scripts/` and `reference/`, into
 your repo's `.claude/skills/` (or `~/.claude/skills/` for every repo). From

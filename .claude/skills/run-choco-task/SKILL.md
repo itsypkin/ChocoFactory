@@ -188,8 +188,8 @@ explicit out-of-scope list.
   couldn't run read-only is marked **unverified**: treat it as open until the
   coder reports the probe's result. Read the report, answer questions and
   see the rest in [reference/spec.md](reference/spec.md#having-choco-check-the-spec-first-coding-task-planned).
-- **Docs-only task:** the done criteria are links, anchors and commands that
-  resolve and match `--help`, and no lost fact; see
+- **Docs-only task:** every link and anchor resolves, every command matches `--help`,
+  and no fact is lost; see
   [reference/spec.md](reference/spec.md#docs-only-tasks).
 
 ## 3. Create and watch
@@ -216,10 +216,18 @@ choco task create --project <p> --workflow coding-task-planned \
   `ANTHROPIC_API_KEY`, not a Claude subscription login.
   For an existing task, `choco task reconfigure` takes effect on the next
   turn.
-- **Wait for one stage** with `choco task status <id> --until
-  stage:awaiting_human_review --timeout 2h`. Exit codes, a background poll
-  that notices every way a task can stop, and typical stage times for
-  choosing `--timeout` are in [reference/watch.md](reference/watch.md).
+- **Wait for the task to stop.** On `coding-task-planned` it can park at
+  `spec_questions` (the planner needs your answer; reply with
+  `choco task send <id> --text "<answers>"`), at `awaiting_human_review`
+  (vote, step 4) or at `escalate_to_human` (`choco task send`, step 5).
+  `--until` takes one target, so
+  `choco task status <id> --until stage:awaiting_human_review --timeout 2h`
+  sits out the whole timeout if the task parks elsewhere. Use it only once
+  you know no planner question is pending (or on `coding-task`), and
+  otherwise poll for every stop, as in
+  [reference/watch.md](reference/watch.md#polling-every-way-a-task-can-stop).
+  The exit codes and typical stage times for choosing `--timeout` are there
+  too.
 - **Read a stage's verdict text** (the latest lap) with
   `choco --json task status <id> | jq -r '.workflow_state.payload.stages.<stage>.summary'`
   for `spec_check` or `internal_review`. Every lap's text, and watching

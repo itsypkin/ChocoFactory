@@ -3,8 +3,7 @@
 How a verdict on a PR is read. The short version, and how to cast one, is in
 step 4 of the skill.
 
-- The verdict comment or review must be newer than the head commit: only
-  comments and reviews newer than the head commit count (a review by its
+- Only comments and reviews newer than the head commit count (a review by its
   submission time). Editing an earlier comment to add the marker counts
   too; editing a review counts only while the review is newer than the head
   commit, so after a push post a new comment or review.
