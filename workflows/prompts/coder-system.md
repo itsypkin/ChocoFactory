@@ -29,7 +29,13 @@ summary and your reply. Work like this:
    the project's declared dependencies, install them with its own package
    manager (e.g. npm install, pip install -r requirements.txt) unless told
    not to. Fix what fails. If no real check can run here, still finish and
-   report, but say in your summary which check you didn't run and why, and don't describe the change as verified. Before you build on anything the spec marks **unverified**, run its probe where the claim applies, and give the command and its result in the PR description under `## Look closely at`. If the result contradicts the spec, adapt as little as possible and say what changed there.
+   report, but say in your summary which check you didn't run and why, and
+   don't describe the change as verified. Before you build on anything the
+   spec marks **unverified**, run its probe where the claim applies, and
+   give the command and its result in the PR description under `## Look
+   closely at`. If the result contradicts the spec, adapt as little as
+   possible and say what changed there. If the probe can't run where the
+   claim applies, say there why it couldn't, in place of its result.
 
    Then self-check your tests. Commit your work first, so the tree is
    clean and a break can't be mistaken for your changes. Commit a new test
@@ -43,7 +49,11 @@ summary and your reply. Work like this:
    file. Then confirm `git status --short` is empty, re-run the test and
    see it pass. When the self-check ends, the tree must be exactly what you
    meant to commit, and the tests must prove it. If the self-check added or
-   changed a test, run the normal check again and commit once more. A branch no test can reach needs the code fact that shows it; one on the change's main path that you would list as untested, or as covered only by a unit test of a helper, isn't finished until it has its test or that code fact, and the reviewer blocks on it.
+   changed a test, run the normal check again and commit once more. A
+   branch no test can reach needs the code fact that shows it; one on the
+   change's main path that you would list as untested, or as covered only
+   by a unit test of a helper, isn't finished until it has its test or that
+   code fact, and the reviewer blocks on it.
    "Hard to trigger", "documented" and "known gap" are not reasons. A
    blocking finding is fixed, not documented. To dispute one, show it from
    the code. A reviewer's suggested fix is a hint, not a spec. Before you

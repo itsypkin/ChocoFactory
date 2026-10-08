@@ -1926,6 +1926,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "one on the change's main path that you would list as untested, or as covered only by a unit test of a helper, isn't finished until it has its test or that code fact, and the reviewer blocks on it.",
             "Before you build on anything the spec marks **unverified**, run its probe where the claim applies, and give the command and its result in the PR description under `## Look closely at`.",
             "If the result contradicts the spec, adapt as little as possible and say what changed there.",
+            "If the probe can't run where the claim applies, say there why it couldn't, in place of its result.",
         ];
         assert_says(
             &text,
@@ -2056,6 +2057,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 "Every runtime claim the spec relies on (what a program prints, writes, returns or includes), whether a Decision states it, a Decision depends on it without stating it, or it is carried over from the task or the issue, cites the command you ran and its output.",
                 "If the rule above doesn't let you run it, mark the claim **unverified** and name the probe the coder must run before relying on it.",
                 "Run the probe where the claim applies (the same tool, harness and kind of process the claim is about), not in a stand-in.",
+                "A run in a stand-in (a plain shell for a claim about an agent harness) doesn't verify the claim: mark it **unverified**.",
             ],
             "planner-system.md check 4",
         );
@@ -2092,7 +2094,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             &head,
             &[
-                "Don't edit any file in this worktree.",
+                "Don't edit any file outside a temporary directory you made.",
                 "You may run read-only commands, such as `git fetch`, and harmless runs that exercise a tool without lasting effect: `--help`, `--version`, a dry run, or the command on a throwaway input in a temporary directory.",
                 "Never install anything, build, run tests, commit, push or post anywhere.",
             ],
@@ -2124,7 +2126,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         let text = squash(embedded_prompt("reviewer-system.md"));
         let claims = [
             "For each claim the task marks **unverified**, check that the PR description gives its probe and result and that the code fits that result; re-run the probe when it is harmless to.",
-            "A missing probe, or code built on a claim the probe contradicted, is a blocking finding.",
+            "A probe that could not run where the claim applies is not missing if the PR description says why;",
+            "a missing probe (neither a result nor that reason), or code built on a claim the probe contradicted, is a blocking finding.",
         ];
         assert_says(&text, &claims, "reviewer-system.md step 4");
         let (from, to) = (
@@ -2168,11 +2171,12 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     fn reviewer_system_runs_the_repos_gate_before_approving() {
         let text = squash(embedded_prompt("reviewer-system.md"));
         let clauses = [
-            "Before you report `approved`, run every command the repository's own instruction files (CLAUDE.md, AGENTS.md, CONTRIBUTING) say a change must pass, exactly as they state them, in your scratch copy reset to HEAD with the reset command above.",
+            "Before you report `approved`, run every command the repository's own instruction files (CLAUDE.md, AGENTS.md, CONTRIBUTING) say a change must pass, exactly as they state them (or, if none of them names one, the CI configuration's checks; if nothing names a gate, say so under `Reviewed`), in your scratch copy reset to HEAD with the reset command above.",
             "A command that fails is a blocking finding; quote its failing output.",
             "One that can't start here for a reason outside the change (a tool not installed, no network) is named with its error and doesn't block by itself.",
             "Record each command and its result under `Reviewed`.",
             "A review that already rejects skips this: the next review runs it.",
+            "Never run the gate, a build, tests or a formatter in the task worktree, whatever verdict you expect: the scratch copy is the only place, and skipping is the only alternative.",
         ];
         assert_says(&text, &clauses, "reviewer-system.md gate");
         let predict = index_of(&text, "## 1. Predict");
