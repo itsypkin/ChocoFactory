@@ -31,11 +31,11 @@ use tokio::time::Instant;
 
 use super::pi_family::{
     MessageNormalizer, SessionStats, TurnMessages, parse_message_usage, parse_session_stats,
-    read_lf_line, read_repo_instructions, render_instruction_files, stats_delta,
+    read_lf_line, read_repo_instructions, render_instruction_files, split_turn_usage, stats_delta,
 };
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentHandle, BillingMode, InterruptionEvidence,
-    Isolation, RoleConfig, RoleTool, TokenCounts, TurnUsage, UsageCounting, report_instruction,
+    Isolation, RoleConfig, RoleTool, TurnUsage, UsageCounting, report_instruction,
     usage_limit_text,
 };
 
@@ -781,6 +781,8 @@ struct Driver {
     messages: TurnMessages,
     /// The usage baseline; `None` is unknown (the next reading becomes it).
     baseline: Option<SessionStats>,
+    /// The session's model as `get_state` named it (`<provider>/<id>`).
+    main_model: Option<String>,
     billing: BillingMode,
     next_request: u64,
     prompts_sent: u32,
@@ -813,6 +815,7 @@ impl Driver {
             normalizer: MessageNormalizer::default(),
             messages: TurnMessages::default(),
             baseline: None,
+            main_model: None,
             billing: BillingMode::Unknown,
             next_request: 0,
             prompts_sent: 0,
@@ -1023,6 +1026,15 @@ impl Driver {
             Some(id) => Value::String(id.to_string()),
             None => Value::Null,
         };
+        self.main_model = state
+            .pointer("/model/id")
+            .and_then(Value::as_str)
+            .map(|id| {
+                super::pi_family::model_key(
+                    state.pointer("/model/provider").and_then(Value::as_str),
+                    Some(id),
+                )
+            });
         self.billing = billing_for(provider, &|name| std::env::var(name).ok());
         let tools: Vec<Value> = state
             .get("dumpTools")
@@ -1031,6 +1043,14 @@ impl Driver {
                 tools
                     .iter()
                     .filter_map(|tool| tool.get("name").cloned())
+                    // Every emitted event names the report tool the same way.
+                    .map(|name| {
+                        if name.as_str() == Some(REPORT_OUTCOME_TOOL_NAME) {
+                            Value::String(qualified_report_outcome_tool_name())
+                        } else {
+                            name
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -1322,22 +1342,20 @@ impl Driver {
     }
 
     fn complete(&mut self, completion: Completion, reading: Option<SessionStats>) {
-        let (tokens, stats_cost) = match (&self.baseline, &reading) {
-            (Some(before), Some(now)) => stats_delta(before, now),
-            _ => (TokenCounts::default(), None),
+        let delta = match (&self.baseline, &reading) {
+            (Some(before), Some(now)) => Some(stats_delta(before, now)),
+            _ => None,
         };
         // A failed reading invalidates the baseline; the next good one
         // becomes the new one.
         self.baseline = reading;
         let messages = &completion.messages;
+        let (tokens, cost_usd, models) =
+            split_turn_usage(self.main_model.as_deref(), messages, delta);
         let usage = TurnUsage {
-            cost_usd: if messages.all_unpriced() {
-                None
-            } else {
-                stats_cost
-            },
+            cost_usd,
             tokens,
-            models: messages.models(),
+            models,
             wall_time_ms: Some(
                 u64::try_from(completion.sent_at.elapsed().as_millis()).unwrap_or(u64::MAX),
             ),

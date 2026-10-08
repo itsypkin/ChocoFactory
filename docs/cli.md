@@ -215,7 +215,10 @@ sessions ended without reporting a turn, such as a killed one, and
 `(N turns without a cost)` when a turn reported tokens but no cost, so the total
 is a lower bound; the dashboard's detail row carries the same notes, and a
 list cell with such turns ends in `+`. A turn's tokens are the sum of its
-per-model figures when the CLI reports them, which includes sub-agent models. A task created by an older version, before
+per-model figures when the CLI reports them, which includes sub-agent models.
+For an omp role the turn's figures are omp's own session statistics, which
+include its sub-agents and side calls but not a response omp discarded, and the
+per-model split adds up to them. A task created by an older version, before
 usage was recorded, prints the single line `Cost & time  no data`.
 
 *Wall time* runs from creation to now while the task is open or stuck, and to its
