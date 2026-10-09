@@ -33,6 +33,8 @@ pub struct Snapshot {
     pub status: String,
     pub stuck_reason: Option<String>,
     pub stage: Option<String>,
+    /// Kind of the current stage (`human_gate`, `agent_turn`, …), if recorded.
+    pub stage_kind: Option<String>,
     pub trail: Vec<TrailEntry>,
 }
 
@@ -53,6 +55,11 @@ impl Snapshot {
         let stage = detail
             .get("workflow_state")
             .and_then(|s| s.get("current_stage"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let stage_kind = detail
+            .get("workflow_state")
+            .and_then(|s| s.get("stage_kind"))
             .and_then(Value::as_str)
             .map(str::to_string);
         let mut trail = Vec::new();
@@ -86,6 +93,7 @@ impl Snapshot {
             status,
             stuck_reason,
             stage,
+            stage_kind,
             trail,
         })
     }
@@ -228,6 +236,7 @@ pub fn start_line(id: &str, snap: &Snapshot, now: DateTime<Utc>) -> String {
 pub fn reached(target: &Until, first: &Snapshot, now: &Snapshot) -> bool {
     match target {
         Until::Status(s) => now.status == *s,
+        Until::Attention => now.status == "open" && now.stage_kind.as_deref() == Some("human_gate"),
         Until::Stage(name) => {
             now.stage.as_deref() == Some(name.as_str())
                 || now
@@ -326,11 +335,16 @@ fn end_message(
     end: WatchEnd,
     id: &str,
     snap: &Snapshot,
+    until: Option<&Until>,
     target: &str,
     timeout: Option<&DurationArg>,
 ) -> Option<String> {
     let stage = snap.stage.as_deref().unwrap_or("-");
+    let attention = matches!(until, Some(Until::Attention));
     let msg = match end {
+        WatchEnd::Reached if attention => {
+            format!("task {id} is waiting for you in stage '{stage}'")
+        }
         WatchEnd::Reached => return None,
         WatchEnd::Stuck => format!(
             "task {id} is stuck in stage '{stage}': {}",
@@ -339,6 +353,9 @@ fn end_message(
                 .unwrap_or("(no reason recorded)")
         ),
         WatchEnd::Cancelled => format!("task {id} was cancelled (last stage '{stage}')"),
+        WatchEnd::ClosedWithoutTarget if attention => {
+            format!("task {id} closed (last stage '{stage}')")
+        }
         WatchEnd::ClosedWithoutTarget => {
             format!("task {id} closed without reaching {target} (last stage '{stage}')")
         }
@@ -427,7 +444,7 @@ pub async fn watch(client: &Client, args: WatchArgs<'_>) -> Result<WatchEnd, Cli
         outcome(args.until, snap)
     };
     let finish = |end: WatchEnd, snap: &Snapshot| {
-        if let Some(msg) = end_message(end, args.id, snap, &target_name, args.timeout) {
+        if let Some(msg) = end_message(end, args.id, snap, args.until, &target_name, args.timeout) {
             eprintln!("{msg}");
         }
         Ok(end)
@@ -509,8 +526,15 @@ mod tests {
             status: status.into(),
             stuck_reason: None,
             stage: stage.map(Into::into),
+            stage_kind: None,
             trail,
         }
+    }
+
+    fn kind(status: &str, kind: Option<&str>) -> Snapshot {
+        let mut s = snap(status, Some("g"), vec![]);
+        s.stage_kind = kind.map(Into::into);
+        s
     }
 
     fn base() -> Snapshot {
@@ -726,6 +750,116 @@ mod tests {
         assert_eq!(WatchEnd::Cancelled.code(), 4);
         assert_eq!(WatchEnd::TimedOut.code(), 5);
         assert_eq!(WatchEnd::ClosedWithoutTarget.code(), 6);
+    }
+
+    #[test]
+    fn attention_parses_and_displays() {
+        assert_eq!("attention".parse::<Until>(), Ok(Until::Attention));
+        assert_eq!(Until::Attention.to_string(), "attention");
+        assert_eq!(
+            Until::Attention.to_string().parse::<Until>(),
+            Ok(Until::Attention)
+        );
+        assert_eq!(
+            "stage:attention".parse::<Until>(),
+            Ok(Until::Stage("attention".into()))
+        );
+        assert_eq!(
+            "foo".parse::<Until>().unwrap_err(),
+            "'foo' is not a valid target — use attention, closed, cancelled, stuck or stage:<name>"
+        );
+    }
+
+    #[test]
+    fn from_detail_reads_stage_kind() {
+        let kind = |v: Value| Snapshot::from_detail(&v).unwrap().stage_kind;
+        assert_eq!(
+            kind(
+                json!({"status":"open","workflow_state":{"current_stage":"g","stage_kind":"human_gate"}})
+            ),
+            Some("human_gate".to_string())
+        );
+        assert_eq!(
+            kind(json!({"status":"open","workflow_state":{"current_stage":"g","stage_kind":null}})),
+            None
+        );
+        assert_eq!(
+            kind(json!({"status":"open","workflow_state":{"current_stage":"g"}})),
+            None
+        );
+        assert_eq!(kind(json!({"status":"open"})), None);
+    }
+
+    #[test]
+    fn attention_reached_only_open_at_a_gate() {
+        let a = Until::Attention;
+        let g = kind("open", Some("human_gate"));
+        assert!(reached(&a, &g, &g));
+        for k in ["agent_turn", "shell", "poll", "terminal"] {
+            let n = kind("open", Some(k));
+            assert!(!reached(&a, &g, &n), "{k}");
+        }
+        assert!(!reached(&a, &g, &kind("open", None)));
+        assert!(!reached(&a, &g, &kind("stuck", Some("human_gate"))));
+        // A gate entered and left since the first poll doesn't count.
+        let first = kind("open", Some("agent_turn"));
+        let mut now = kind("open", Some("agent_turn"));
+        now.trail
+            .push(entry("9", "ask", None, "2026-08-01T14:22:31Z"));
+        assert!(!reached(&a, &first, &now));
+    }
+
+    #[test]
+    fn attention_outcomes() {
+        let a = Until::Attention;
+        let o = |s: &str| outcome(Some(&a), &kind(s, Some("human_gate")));
+        assert_eq!(o("stuck"), Some(WatchEnd::Stuck));
+        assert_eq!(o("cancelled"), Some(WatchEnd::Cancelled));
+        assert_eq!(o("closed"), Some(WatchEnd::ClosedWithoutTarget));
+        assert_eq!(o("open"), None);
+    }
+
+    #[test]
+    fn attention_end_messages() {
+        let a = Until::Attention;
+        let mut s = snap("open", Some("spec_questions"), vec![]);
+        assert_eq!(
+            end_message(WatchEnd::Reached, "X", &s, Some(&a), "attention", None),
+            Some("task X is waiting for you in stage 'spec_questions'".to_string())
+        );
+        let c = Until::Status("closed".into());
+        assert_eq!(
+            end_message(WatchEnd::Reached, "X", &s, Some(&c), "closed", None),
+            None
+        );
+        s.stage = Some("done".into());
+        let m = end_message(
+            WatchEnd::ClosedWithoutTarget,
+            "X",
+            &s,
+            Some(&a),
+            "attention",
+            None,
+        )
+        .unwrap();
+        assert_eq!(m, "task X closed (last stage 'done')");
+        assert!(!m.contains("without reaching"));
+        let n = Until::Stage("nope".into());
+        assert!(
+            end_message(
+                WatchEnd::ClosedWithoutTarget,
+                "X",
+                &s,
+                Some(&n),
+                "stage:nope",
+                None
+            )
+            .unwrap()
+            .contains("closed without reaching stage:nope")
+        );
+        s.stage = Some("a\nb".into());
+        let m = end_message(WatchEnd::Reached, "X", &s, Some(&a), "attention", None).unwrap();
+        assert!(!m.contains('\n'));
     }
 
     #[test]

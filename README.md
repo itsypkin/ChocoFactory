@@ -61,7 +61,7 @@ You don't normally type the `choco task create` commands yourself. You work from
    ```
 
    It prints the task's id. Because the title ends in `(#42)`, the PR body will say `Closes #42`, so merging closes the issue.
-4. The agent monitors the task, for example with `choco task status <id> --until stage:awaiting_human_review --timeout 2h`.
+4. The agent monitors the task, for example with `choco task status <id> --until attention --timeout 2h`, which returns when the task needs a person (a question, the review, an escalation) or has ended.
 5. At the same time you can open `choco dashboard` in another terminal and watch the progress yourself.
 6. When the task reaches human review, the PR is open (the branch is `task/<id>`). The agent, or you, reviews it and comments `/approve` (`gh pr comment <number> --body "/approve"`) or `/request-changes`. `/approve` moves the task to done. Merging (`gh pr merge <number> --squash`, or any merge method) is still yours to do, and merging on its own also counts as approval.
 

@@ -205,19 +205,16 @@ choco task create --project <p> --workflow coding-task-planned \
   `--role-cli <role>=<cli>`.
 - **Running a role on omp** (`--role-cli <role>=omp`): see
   [reference/spec.md](reference/spec.md#running-a-role-on-omp).
-- **Wait for the task to stop.** On `coding-task-planned` it can park at
-  `spec_questions` (the planner needs your answer; reply with
-  `choco task send <id> --text "<answers>"`), at `awaiting_human_review`
-  (vote, step 4) or at `escalate_to_human` (`choco task send`, step 5).
-  `--until` takes one target, so
-  `choco task status <id> --until stage:awaiting_human_review --timeout 2h`
-  sits out the whole timeout if the task parks elsewhere, and an answered
-  planner question can come back as another one. Use it only once the task
-  has left `spec_check` for `coding` (or on `coding-task`); an escalation
-  still runs it to the timeout. Until then poll for every stop, as in
-  [reference/watch.md](reference/watch.md#polling-every-way-a-task-can-stop).
-  The exit codes and typical stage times for choosing `--timeout` are there
-  too.
+- **Wait for the task to stop.** One command covers the whole run:
+  `choco task status <id> --until attention --timeout <dur>`. It returns
+  when the task is open at `spec_questions` (the planner needs your answer;
+  reply with `choco task send <id> --text "<answers>"`), at
+  `awaiting_human_review` (vote, step 4) or at `escalate_to_human`
+  (`choco task send`, step 5), or when it is stuck, cancelled or closed.
+  Its stderr line and exit code say which. The exit codes are in
+  [reference/watch.md](reference/watch.md#waiting-with---until); typical
+  stage times for choosing `--timeout` are in
+  [reference/watch.md](reference/watch.md#stage-times).
 - **Read a stage's verdict text** (the latest lap) with
   `choco --json task status <id> | jq -r '.workflow_state.payload.stages.<stage>.summary'`
   for `spec_check` or `internal_review`. Every lap's text, and watching
