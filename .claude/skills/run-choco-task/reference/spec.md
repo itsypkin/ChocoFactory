@@ -109,26 +109,26 @@ and "the tests are a floor" applies to them. The done criteria are:
 - the acceptance runs below have been run and reported.
 
 **A skill or doc meant to be copied.** Check its links from a copy
-outside the repo. Make the copy from the branch under test: copy its
-changed files from the worktree into a new temp dir with `cp -R`. Never
-run install steps that fetch a release or `rm -rf` a folder (they replace
-the change under test), and never write inside the repo or worktree.
-Take every route of every snippet on a throwaway daemon. A snippet that
-only loads (parses, prints `--help`) has not been taken.
+outside the repo, made from the branch under test: copy the whole skill
+or doc folder(s), in the layout the install instructions produce, from
+the worktree into a new temp dir with `cp -R`. Never run install steps
+that fetch a release or `rm -rf` a folder, and never write inside the
+repo or worktree. Take every route of every snippet on a throwaway
+daemon; a snippet that only loads (parses, prints `--help`) has not been
+taken.
 
-The route below can only reach the daemon it started. Without a lock file
-under the temp `HOME`, `choco` falls back to the default port and the
-operator's daemon, and an exported `CHOCO_BASE_URL` overrides `HOME`. So
-the commands clear `CHOCO_BASE_URL`, and every command after `start`
-first checks that the lock exists and stops with an error if it doesn't.
-Set `t` to the literal temp path again in each separate shell call.
+The route below acts only on the daemon it started: `${t:?}` aborts if
+`t` is empty or lost between shell calls (set it again in each call),
+`env -u` clears an exported `CHOCO_BASE_URL`, and each later command
+needs the lock file, because without it `choco` falls back to the
+operator's daemon.
 
 ```bash
 t=$(mktemp -d)
-env -u CHOCO_BASE_URL HOME=$t choco server start --port 0   # its own lock, database and log under $t
-test -f "$t/.config/chocofactory/chocofactoryd.lock" && env -u CHOCO_BASE_URL HOME=$t choco server status
-test -f "$t/.config/chocofactory/chocofactoryd.lock" && env -u CHOCO_BASE_URL HOME=$t choco server stop
-rm -rf "$t"    # also after a failed step: stop the daemon first if the lock exists
+env -u CHOCO_BASE_URL HOME="${t:?}" choco server start --port 0   # its own lock, database and log under $t
+test -f "${t:?}/.config/chocofactory/chocofactoryd.lock" && env -u CHOCO_BASE_URL HOME="$t" choco server status
+test -f "${t:?}/.config/chocofactory/chocofactoryd.lock" && env -u CHOCO_BASE_URL HOME="$t" choco server stop
+rm -rf "${t:?}"    # also after a failed step: stop the daemon first if the lock exists
 ```
 
 The throwaway daemon's agents get the same `HOME`, so they have no
