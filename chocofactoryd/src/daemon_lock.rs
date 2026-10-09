@@ -128,6 +128,20 @@ mod tests {
         }
     }
 
+    /// A child created while the lock file was open holds the lock until its
+    /// exec closes the inherited descriptor. The bound is the allowance
+    /// `acquire` gives a momentary holder, so this fails when a restart would.
+    fn wait_for_release(root: &Path) -> io::Result<LockState> {
+        let start = Instant::now();
+        loop {
+            let state = read_lock(root)?;
+            if matches!(state, LockState::NotRunning { .. }) || start.elapsed() >= RETRY_FOR {
+                return Ok(state);
+            }
+            std::thread::sleep(RETRY_EVERY);
+        }
+    }
+
     #[test]
     fn acquire_then_publish_is_visible_to_read_lock() {
         let t = Tmp::new();
@@ -162,7 +176,7 @@ mod tests {
         drop(first);
         assert!(lock_path(&t.0).exists());
         assert_eq!(
-            read_lock(&t.0).unwrap(),
+            wait_for_release(&t.0).unwrap(),
             LockState::NotRunning { last: Some(info()) }
         );
         DaemonLock::acquire(&t.0).unwrap();
@@ -198,7 +212,7 @@ mod tests {
             .spawn()
             .unwrap();
         drop(lock);
-        let state = read_lock(&t.0).unwrap();
+        let state = wait_for_release(&t.0).unwrap();
         let alive = child.try_wait().unwrap().is_none();
         let _ = child.kill();
         let _ = child.wait();
