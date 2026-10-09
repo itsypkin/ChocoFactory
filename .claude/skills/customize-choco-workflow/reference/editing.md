@@ -2,7 +2,7 @@
 
 Paths in a workflow are relative to the YAML file. Edit a copy of a
 built-in rather than starting from nothing. The full rules are in
-[docs/workflows.md](../../../../docs/workflows.md).
+[docs/workflows.md](/workflows.md).
 
 ## Contents
 - Stage kinds and their keys
@@ -46,7 +46,7 @@ with `on: {}` is a standing chat-style session and takes no `capture` or
 
 `report_sections` is a list of headings the agent's report must contain;
 names are non-empty and distinct. See
-[routing on an agent's verdict](../../../../docs/workflows.md#routing-on-an-agents-verdict).
+[routing on an agent's verdict](/workflows.md#routing-on-an-agents-verdict).
 
 ## Loop guards
 
@@ -72,12 +72,13 @@ a `then`).
 - Durations use `s`, `m` or `h` only, and are not zero.
 - Every `outcomes[].then` must be a key of `on:`.
 
-See [a human gate that watches for its answer](../../../../docs/workflows.md#a-human-gate-that-watches-for-its-answer).
+See [a human gate that watches for its answer](/workflows.md#a-human-gate-that-watches-for-its-answer).
 
 ## Human gate markers
 
 `markers:` are lines a person writes in a reply, each with a `then`. The
-whole line is matched, case-sensitive. Each `then` must be a key of `on:`.
+whole line is matched, case-sensitive. A reply with no marker line is
+refused and nothing is sent. Each `then` must be a key of `on:`.
 Lines can't be empty, duplicated or padded with whitespace. Same section as
 above.
 
@@ -117,14 +118,14 @@ A role has `cli`, `model` and `system_prompt_file`. Other fields:
 
 - `read_only: true` with `disallowed_tools: [edit, write, notebook_edit]`
   (those three names only; `read_only` needs all three and a workflow-level
-  `worktree: true`). See [read-only roles](../../../../docs/workflows.md#read-only-roles).
+  `worktree: true`). See [read-only roles](/workflows.md#read-only-roles).
 - `inherit_operator_config`, `skills` and `memory` control what the agent
   inherits from your Claude setup. `skills` and `memory` can't go with
   `inherit_operator_config`. See
-  [what an agent inherits](../../../../docs/workflows.md#what-an-agent-inherits-from-your-claude-setup).
+  [what an agent inherits](/workflows.md#what-an-agent-inherits-from-your-claude-setup).
 
-More: [how a role is configured](../../../../docs/models.md#how-a-role-is-configured),
-[running a role on omp](../../../../docs/models.md#cli-omp).
+More: [how a role is configured](/models.md#how-a-role-is-configured),
+[running a role on omp](/models.md#cli-omp).
 
 ## Adding a check: an example
 
@@ -180,8 +181,13 @@ A gate that waits for `/ship`:
     markers:
       - line: /ship
         then: shipped
-    on: { shipped: open_pr, resumed: revising }
+    on: { shipped: open_pr }
 ```
+
+A reply without the `/ship` line is refused and nothing is sent, so the
+gate has no way to send work back. A reviewer who wants changes can't reply
+with text; they cancel the task. To give the gate a second route, add
+another marker with its own `then`.
 
 A second reviewing role and stage:
 
@@ -202,6 +208,12 @@ roles:
     prompt_file: prompts/reviewer-turn.md
     capture: json
     report_sections: [Reviewed, Findings]
-    on: { approved: open_pr, changes_requested: revising }
-    loop_guard: { on: changes_requested, max: 2, then: escalate_to_human }
+    on: { approved: open_pr, changes_requested: escalate_to_human }
 ```
+
+`changes_requested` goes to a human, not to `revising`. The built-in revise
+prompt (`prompts/coder-revise.md`) has no entry for an arrival from `audit`
+and never shows `{{ stages.audit.summary }}`, so a coder sent there would
+revise without the audit's findings. To route to `revising` anyway, eject
+`prompts/`, add an `audit` case to the revise prompt that shows
+`{{ stages.audit.summary }}`, and add a `loop_guard`.

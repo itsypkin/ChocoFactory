@@ -30,6 +30,9 @@ already exists:
 Each role flag is `ROLE=VALUE` and can repeat. `ROLE` is a key of the
 workflow's `roles:`: `coder` and `reviewer` in `coding-task`, plus `planner`
 in `coding-task-planned`. A name that isn't in `roles:` applies to nothing.
+A model is set per role, not per stage: `--role-model coder=…` changes both
+the `coding` and `revising` stages. To give one stage its own model, give it
+a new role in a workflow file.
 
 ```bash
 choco task create --project myproj --workflow coding-task \
@@ -49,13 +52,19 @@ choco task create --project myproj --workflow coding-task \
   workflow's `roles:`. The built-ins set the CLI, model and system prompt
   of every role, so it doesn't change a built-in role.
 
-More: [per-role flags](../../../docs/cli.md#per-role-flags-and-changing-a-tasks-config),
-[how a role is configured](../../../docs/models.md#how-a-role-is-configured).
+More: [per-role flags](/cli.md#per-role-flags-and-changing-a-tasks-config),
+[how a role is configured](/models.md#how-a-role-is-configured).
 
 ### Option 2: a workflow file
 
 `choco task create --workflow <path>.yaml`. A value that contains `/` or ends
 in `.yaml` or `.yml` is a path. Its prompts and scripts resolve next to it.
+
+Start from a whole folder, not a lone YAML: the file fails to load without
+its `prompts/` and `scripts/`. Either run `choco project init-workflows` and
+copy `.chocofactory/workflows/`, or copy the whole
+`~/.config/chocofactory/.builtin-workflows/` folder and run `chmod -R u+w`
+on the copy, because the built-in files are read-only.
 
 **Caveat:** a task started from a `--workflow` file reads that file's
 prompts and scripts from that checkout while it runs. Don't edit those
@@ -125,7 +134,7 @@ when the workflow loads, but a misspelt top-level key is silently ignored.
    any open `human_gate` stage, including ones you added, and when the task
    is stuck, cancelled or closed. Exit codes: 0 at a gate, 3 stuck, 4
    cancelled, 6 closed, 5 timed out. See
-   [watching a task](../../../docs/cli.md#watching-a-task).
+   [watching a task](/cli.md#watching-a-task).
 
 Every agent stage runs the real CLI and costs money. Try it on a small, real
 change.
@@ -136,9 +145,9 @@ A repo's `.chocofactory/workflows/` and any `--workflow` file can run shell
 commands as you: shell stages, poll and watch commands, and scripts. They
 run with the daemon's environment. Treat `.chocofactory/` like a Makefile
 or CI config, and review changes to it like code. See
-[Security](../../../docs/workflows.md#security).
+[Security](/workflows.md#security).
 
 More on where a workflow comes from:
-[project workflows](../../../docs/workflows.md#project-workflows),
-[which workflow file a task ran](../../../docs/workflows.md#which-workflow-file-a-task-ran),
-[customising workflows](../../../docs/workflows.md#customising-workflows).
+[project workflows](/workflows.md#project-workflows),
+[which workflow file a task ran](/workflows.md#which-workflow-file-a-task-ran),
+[customising workflows](/workflows.md#customising-workflows).
