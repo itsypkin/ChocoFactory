@@ -1,6 +1,6 @@
 # Design: parallel stage groups
 
-Status: **draft for the owner's review** (2026-10-09). Inputs: `00-rough-idea.md`, the decisions in `01-idea.md` (Q2–Q9), and `02-research-single-stage-assumptions.md`. Tracking issue #257.
+Status: **approved by the owner on 2026-10-09**. Inputs: `00-rough-idea.md`, the decisions in `01-idea.md` (Q2–Q9), and `02-research-single-stage-assumptions.md`. Tracking issue #257.
 
 ## 1. Overview
 
