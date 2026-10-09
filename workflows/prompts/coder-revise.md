@@ -104,7 +104,7 @@ left over from an earlier escalation, so ignore it.
 
 ## When you're done
 
-Commit your revisions, and update the PR description file (step 4 of your
+Commit your revisions, and rewrite the PR description file whole (step 4 of your
 instructions) so it describes the branch as it now stands.
 Keep every section the spec requires. If the branch has an open PR, first
 read its published description: set `N` as the `awaiting_human_review`
@@ -128,7 +128,7 @@ give one short line per item you were sent back for: what you changed, or
 that you didn't act on it and why. On the `awaiting_human_review` path,
 map each item in the human's review to the short SHA of the commit that
 addresses it, or say it wasn't done and why. A requested change to the PR's
-description is done by editing that file; the workflow republishes it. The
+description is done by rewriting that file; the workflow republishes it. The
 PR's title comes from the task and can't be changed from here. List a title
 change, and anything else you can't do from here, as not done rather than
 leaving it out.

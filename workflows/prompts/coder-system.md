@@ -129,6 +129,17 @@ summary and your reply. Work like this:
    turn's commits, rewriting whatever an earlier turn left there. If your
    file-writing tool refuses the path, write it from the shell with a
    quoted heredoc: `cat > "$path" <<'EOF'`.
+
+   Write the file whole, every turn, from a complete draft, with your
+   file-writing tool or a quoted heredoc. Never change part of it by
+   searching for a heading or any other string (a find-and-replace edit,
+   or a script that splices around a heading): the string can match inside
+   quoted text or code and cut what follows. To keep a person's edits from
+   the published description, copy them into your draft, which you then
+   write whole. After writing it, read the file back and check that every
+   section is there and ends where you meant it to. If the write fails, or
+   the read-back still shows a cut after you rewrite it, say so in the
+   `report_outcome` summary, under what you didn't do.
 5. Call `report_outcome` with outcome `done` and a short summary of what
    you changed: one line, plus anything you didn't do. That call is what
    marks this stage finished; ending your turn without it means you're

@@ -1205,14 +1205,14 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             &squash(&rendered[done..]),
             &[
-                "Commit your revisions, and update the PR description file (step 4 of your \
-                 instructions) so it describes the branch as it now stands.",
+                "Commit your revisions, and rewrite the PR description file whole (step 4 of \
+                 your instructions) so it describes the branch as it now stands.",
                 "An empty commit (`git commit --allow-empty -m \"Update the PR description: \
                  <why>\"`) is allowed only when every requested change is to the PR's \
                  description",
                 "In its summary, give one short line per item you were sent back for: what \
                  you changed, or that you didn't act on it and why.",
-                "A requested change to the PR's description is done by editing that file; the \
+                "A requested change to the PR's description is done by rewriting that file; the \
                  workflow republishes it.",
                 "The PR's title comes from the task and can't be changed from here. List a \
                  title change, and anything else you can't do from here, as not done rather \
@@ -2085,6 +2085,106 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 ),
             "the 'Like the other checks' bullet must stay last"
         );
+    }
+
+    #[test]
+    fn coder_system_step_four_writes_the_description_whole() {
+        let text = squash(embedded_prompt("coder-system.md"));
+        let step = &text[index_of(&text, "4. Write the pull request's description")
+            ..index_of(&text, "5. Call `report_outcome`")];
+        assert_says(
+            step,
+            &[
+                "Write the file whole, every turn, from a complete draft, with your file-writing tool or a quoted heredoc.",
+                "Never change part of it by searching for a heading or any other string (a find-and-replace edit, or a script that splices around a heading): the string can match inside quoted text or code and cut what follows.",
+                "To keep a person's edits from the published description, copy them into your draft, which you then write whole.",
+                "After writing it, read the file back and check that every section is there and ends where you meant it to.",
+                "If the write fails, or the read-back still shows a cut after you rewrite it, say so in the `report_outcome` summary, under what you didn't do.",
+            ],
+            "coder-system.md step 4",
+        );
+    }
+
+    #[test]
+    fn coder_revise_rewrites_the_description_file_whole() {
+        let raw = embedded_prompt("coder-revise.md");
+        let done = squash(&raw[index_of(raw, "## When you're done")..]);
+        assert_says(
+            &done,
+            &[
+                "Commit your revisions, and rewrite the PR description file whole (step 4 of your instructions) so it describes the branch as it now stands.",
+                "done by rewriting that file",
+            ],
+            "coder-revise.md closing section",
+        );
+        assert!(!done.contains("update the PR description file"));
+        assert!(!done.contains("done by editing that file"));
+    }
+
+    #[test]
+    fn reviewer_turn_blocks_on_a_cut_description() {
+        let text = squash(embedded_prompt("reviewer-turn.md"));
+        let blocking = "A description that is cut off or truncated, or is missing `## Problem`, `## Solution`, `## Changes, in reading order` or a section the task requires, is a blocking finding: unlike a description that is missing or empty, which the published PR states outright, it reads as whole when it isn't.";
+        assert_says(
+            &text,
+            &[
+                blocking,
+                "A file longer than 16,384 bytes counts as truncated, because publishing keeps only that much.",
+                "To find a cut, compare the file with the diff and, on a re-review, with the published description (`gh pr view --json body -q .body`, the part between the issue line and `## Internal review`): a numbered list that skips items, a section that stops mid-sentence, or a section the earlier version had that is gone though the change didn't remove its subject, is a cut.",
+                "`## Look closely at`, `## Review history` and `## Not done` are left out when they would be empty, and their absence is not a cut; a section the task requires is never optional.",
+                "If you can't read the published description (no pull request yet, or `gh` fails), check the file alone and name under `Reviewed` what you couldn't compare.",
+            ],
+            "reviewer-turn.md",
+        );
+        let list_at = index_of(&text, "These are non-blocking findings:");
+        assert!(index_of(&text, blocking) < list_at);
+        let list = &text[list_at..];
+        let list = &list[..=list.find('.').unwrap()];
+        for word in ["cut", "truncated", "missing a section", "required"] {
+            assert!(
+                !list.contains(word),
+                "non-blocking list mentions {word}: {list}"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_turn_byte_limit_matches_open_pr_cap() {
+        let (_, script) = BUILTIN_WORKFLOW_SCRIPTS
+            .iter()
+            .find(|(name, _)| *name == "open-pr.sh")
+            .expect("open-pr.sh is embedded");
+        assert!(script.contains("cap 16384 "), "open-pr.sh cap changed");
+        assert!(
+            squash(embedded_prompt("reviewer-turn.md")).contains("16,384 bytes"),
+            "reviewer-turn.md must state the same limit as open-pr.sh"
+        );
+    }
+
+    #[test]
+    fn planner_system_check_six_has_counter_and_key_bullets() {
+        let raw = embedded_prompt("planner-system.md");
+        let rest = &raw[index_of(raw, "## The checks")..];
+        let sixth = squash(&rest[index_of(rest, "6. **Soundness.**")..]);
+        let counter = "When the spec takes a counter or a running total as its source of truth, list everything that can move it down or reset it (a restart, a retry, a compaction, a rollover) and say how the design handles each.";
+        let keys = "When the spec builds a key (an identifier, lookup key or match string) in two places and matches the two across, it says to build it once and share the builder.";
+        assert_says(
+            &sixth,
+            &[
+                counter,
+                "When nothing can, say so and cite what you grepped or ran.",
+                "When the counter belongs to an external tool and the run rule doesn't let you make it drop, mark the claim that it only rises **unverified** and name the probe the coder must run, as in check 4.",
+                keys,
+                "When the two places can't share code (different languages or processes, or keys an older version already stored), the spec still names one canonical form and requires a test that builds the key on both sides from the same inputs, empty and missing parts included, and asserts they are equal.",
+            ],
+            "planner-system.md check 6",
+        );
+        let last = index_of(
+            &sixth,
+            "Like the other checks, you fix what you find yourself",
+        );
+        assert!(index_of(&sixth, counter) < last);
+        assert!(index_of(&sixth, keys) < last);
     }
 
     #[test]
