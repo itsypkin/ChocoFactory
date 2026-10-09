@@ -776,6 +776,51 @@ fn update_judges_the_started_daemon_against_the_installed_version() {
     assert_eq!(marker["version"], "9.9.9");
 }
 
+#[test]
+fn update_warns_when_another_daemon_won_the_start_race_with_the_wrong_version() {
+    let env = Env::new();
+    // The wrapper starts the real daemon in the background and exits, so
+    // start_daemon sees its child exit while another pid holds the lock.
+    let stage = env.home.join("stage");
+    let out_dir = env.home.join("stage-out");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::copy(target_dir().join("choco"), stage.join("choco")).unwrap();
+    let wrapper = stage.join("chocofactoryd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"chocofactoryd 9.9.9 (dev build)\"; exit 0; fi\n'{}' \"$@\" &\nsleep 1\nexit 0\n",
+            target_dir().join("chocofactoryd").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let packed = package(host_target(), &stage, &out_dir);
+    assert!(packed.status.success(), "{}", text(&packed));
+    let archive = std::fs::read(out_dir.join(asset())).unwrap();
+
+    env.install_from_archive();
+    let _old = env.start_daemon();
+    let server = Server::new();
+    server.release(Some("9.9.9"), &archive, sums_for(&archive), "9.9.9");
+    let out = env.choco(&server.url, &["update", "--version", "9.9.9"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("chocofactoryd is already running"),
+        "{}",
+        text(&out)
+    );
+    let err = stderr(&out);
+    assert_eq!(err.matches("is talking to").count(), 1, "{}", text(&out));
+    assert!(
+        err.contains(&format!(
+            "warning: choco 9.9.9 is talking to chocofactoryd {VERSION}"
+        )),
+        "{}",
+        text(&out)
+    );
+}
+
 fn blocking_claude(home: &Path) -> PathBuf {
     let path = home.join("blocking-claude.sh");
     std::fs::write(&path, "#!/bin/sh\nexec sleep 600\n").unwrap();

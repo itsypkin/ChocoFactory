@@ -362,10 +362,7 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
         Ok(())
     };
     // The daemon now on disk reports `new_version`, unless nothing was replaced.
-    let daemon_version: &str = match &replaced {
-        Err(ReplaceFailure::NothingReplaced(_)) => VERSION,
-        _ => &new_version,
-    };
+    let daemon_version = installed_daemon_version(&replaced, &new_version);
     let restart_result = match old_port {
         Some(port) => start_daemon(&root, &new_daemon, Some(port), daemon_version)
             .await
@@ -408,6 +405,17 @@ impl ReplaceFailure {
     }
 }
 
+/// The version the daemon on disk reports after `replace_binaries` ended as `replaced`.
+fn installed_daemon_version<'a>(
+    replaced: &Result<(), ReplaceFailure>,
+    new_version: &'a str,
+) -> &'a str {
+    match replaced {
+        Err(ReplaceFailure::NothingReplaced(_)) => VERSION,
+        _ => new_version,
+    }
+}
+
 fn replace_binaries(src: &Path, dir: &Path, new_version: &str) -> Result<(), ReplaceFailure> {
     let daemon_to = dir.join("chocofactoryd");
     std::fs::rename(src.join("chocofactoryd"), &daemon_to).map_err(|e| {
@@ -423,4 +431,69 @@ fn replace_binaries(src: &Path, dir: &Path, new_version: &str) -> Result<(), Rep
             choco_to.display()
         ))
     })
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use super::*;
+
+    fn stage(root: &Path) -> (PathBuf, PathBuf) {
+        let src = root.join("src");
+        let dir = root.join("bin");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(src.join("chocofactoryd"), "new daemon").unwrap();
+        std::fs::write(src.join("choco"), "new choco").unwrap();
+        (src, dir)
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("choco-replace-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn installed_version_follows_how_replacing_ended() {
+        assert_eq!(installed_daemon_version(&Ok(()), "9.9.9"), "9.9.9");
+        let nothing = Err(ReplaceFailure::NothingReplaced("x".into()));
+        assert_eq!(installed_daemon_version(&nothing, "9.9.9"), VERSION);
+        let split = Err(ReplaceFailure::ChocoNotReplaced("x".into()));
+        assert_eq!(installed_daemon_version(&split, "9.9.9"), "9.9.9");
+    }
+
+    #[test]
+    fn daemon_rename_failure_means_nothing_replaced() {
+        let root = tmp("daemon");
+        let (src, dir) = stage(&root);
+        // A non-empty directory cannot be renamed over by a file.
+        std::fs::create_dir_all(dir.join("chocofactoryd/inner")).unwrap();
+        match replace_binaries(&src, &dir, "9.9.9") {
+            Err(ReplaceFailure::NothingReplaced(m)) => {
+                assert!(m.contains("nothing was replaced"), "{m}")
+            }
+            other => panic!("unexpected: {:?}", other.err().map(|e| e.into_message())),
+        }
+        assert!(src.join("choco").is_file());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn choco_rename_failure_means_daemon_already_replaced() {
+        let root = tmp("choco");
+        let (src, dir) = stage(&root);
+        std::fs::create_dir_all(dir.join("choco/inner")).unwrap();
+        match replace_binaries(&src, &dir, "9.9.9") {
+            Err(ReplaceFailure::ChocoNotReplaced(m)) => {
+                assert!(m.contains("rerun `choco update --force`"), "{m}");
+                assert!(m.contains("chocofactoryd is now 9.9.9"), "{m}");
+            }
+            other => panic!("unexpected: {:?}", other.err().map(|e| e.into_message())),
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("chocofactoryd")).unwrap(),
+            "new daemon"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
