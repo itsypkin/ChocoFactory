@@ -11,7 +11,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{
-    AdapterError, AgentEvent, AgentHandle, Registry, RoleConfig, UnknownCliError,
+    AdapterError, AgentEvent, AgentHandle, BackgroundJob, Registry, RoleConfig, UnknownCliError,
+    describe_jobs,
 };
 use crate::db::{events, sessions, usage};
 
@@ -668,7 +669,10 @@ impl SessionManager {
 ///    open, so a background job's notification can wake it. After
 ///    `nudge_after` with no events at all it is nudged on stdin, up to
 ///    `max_nudges` times; after that, stdin is closed, the grace rule
-///    applies, and the run ends `NoReport`.
+///    applies, and the run ends `NoReport`. While the CLI reports background
+///    jobs still running (claude only), the turn is not nudged: it is closed
+///    the same way if still waiting `job_wait_limit` after it started
+///    waiting, and the idle reaper leaves it alone (#271).
 /// 3. A `result` with `is_error` closes stdin and applies the grace rule; the
 ///    run ends `exited`, as a crash would.
 ///
@@ -794,6 +798,31 @@ async fn drain_session(
                             "single-shot turn ended without reporting; leaving it open"
                         ),
                     }
+                    let now = tokio::time::Instant::now();
+                    if turn.update_job_wait(now, turn_timers.job_wait_limit) {
+                        note_job_wait_entered(
+                            pool,
+                            session_id,
+                            &turn.background_jobs,
+                            turn_timers.job_wait_limit,
+                            events_notify,
+                        )
+                        .await;
+                    }
+                    // Also checked here, not only on the timer branch: the
+                    // biased select could starve that branch under output
+                    // with no gaps.
+                    if turn.job_wait_expired(now) {
+                        close_after_job_wait(
+                            pool,
+                            session_id,
+                            &mut handle,
+                            &mut turn,
+                            turn_timers,
+                            events_notify,
+                        )
+                        .await;
+                    }
                 }
                 // Any drained output counts as activity, not just
                 // inbound `Send`s — broader than §4.1's "no input"
@@ -811,6 +840,15 @@ async fn drain_session(
                             tracing::error!(session_id, %err, "failed to deliver message, process already gone");
                         }
                         *last_activity.lock().await = Utc::now();
+                    }
+                    // The idle reaper's `Close` is ignored while the turn waits
+                    // on its background jobs: nothing nudges it any more, so
+                    // nothing else keeps `last_activity` fresh. The job-wait
+                    // deadline bounds it instead (#271).
+                    Some(Command::Close)
+                        if kind == SessionKind::SingleShot && turn.waiting_on_jobs() =>
+                    {
+                        tracing::debug!(session_id, "ignoring the idle reaper: the turn is waiting on background jobs");
                     }
                     // A `Close` that lands after the turn already completed
                     // is a no-op: stdin is already closed, and `reaped` must
@@ -835,6 +873,21 @@ async fn drain_session(
                     None => {
                         cmd_open = false;
                     }
+                }
+            }
+            _ = tokio::time::sleep_until(turn.job_wait_deadline.unwrap_or(never)),
+                if turn.job_wait_deadline.is_some() =>
+            {
+                if turn.job_wait_expired(tokio::time::Instant::now()) {
+                    close_after_job_wait(
+                        pool,
+                        session_id,
+                        &mut handle,
+                        &mut turn,
+                        turn_timers,
+                        events_notify,
+                    )
+                    .await;
                 }
             }
             _ = tokio::time::sleep_until(nudge_at), if turn.should_nudge() => {
@@ -1035,6 +1088,10 @@ pub struct TurnTimers {
     pub nudge_after: Duration,
     /// How many nudges before a turn that never reports is closed.
     pub max_nudges: u32,
+    /// How long a turn that ended without reporting may wait on its own
+    /// background jobs (as the CLI reports them) before it is closed. While
+    /// it waits, it is not nudged (#271).
+    pub job_wait_limit: Duration,
 }
 
 impl Default for TurnTimers {
@@ -1043,6 +1100,7 @@ impl Default for TurnTimers {
             grace: Duration::from_secs(30),
             nudge_after: Duration::from_secs(5 * 60),
             max_nudges: 3,
+            job_wait_limit: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -1077,6 +1135,12 @@ struct SingleShotTurn {
     /// from outside, so the run is resumable rather than a failure of the
     /// agent's own.
     interrupted: bool,
+    /// The background jobs the CLI last reported as running (#271). Each
+    /// `BackgroundJobs` event replaces it.
+    background_jobs: Vec<BackgroundJob>,
+    /// When the turn's wait on its background jobs runs out. Fixed when the
+    /// turn starts waiting on jobs; see [`SingleShotTurn::update_job_wait`].
+    job_wait_deadline: Option<tokio::time::Instant>,
 }
 
 impl Default for SingleShotTurn {
@@ -1095,6 +1159,8 @@ impl Default for SingleShotTurn {
             lingered: false,
             errored: false,
             interrupted: false,
+            background_jobs: Vec::new(),
+            job_wait_deadline: None,
         }
     }
 }
@@ -1130,6 +1196,12 @@ impl SingleShotTurn {
         // from outside rather than by anything the agent did.
         if let AgentEvent::Interrupted { .. } = event {
             self.interrupted = true;
+        }
+        // Not main-agent activity, so it neither clears `waiting_for_report`
+        // nor needs the guard below.
+        if let AgentEvent::BackgroundJobs { running } = event {
+            self.background_jobs = running.clone();
+            return TurnStep::Continue;
         }
         if self.completed || self.errored || self.gave_up {
             return TurnStep::Continue;
@@ -1204,8 +1276,115 @@ impl SingleShotTurn {
     }
 
     fn should_nudge(&self) -> bool {
-        self.waiting_for_report && !self.gave_up && self.grace_deadline.is_none()
+        self.waiting_for_report
+            && !self.gave_up
+            && self.grace_deadline.is_none()
+            && !self.waiting_on_jobs()
     }
+
+    /// The turn ended without reporting and the CLI says its background jobs
+    /// are still running (#271): it is waiting on them, not silent.
+    fn waiting_on_jobs(&self) -> bool {
+        self.waiting_for_report
+            && !self.gave_up
+            && self.grace_deadline.is_none()
+            && !self.background_jobs.is_empty()
+    }
+
+    /// The one place the job-wait deadline is written. Sets it when the turn
+    /// has just started waiting on jobs (and only then, so later events never
+    /// push it back), clears it when the turn no longer waits on jobs.
+    /// Returns whether the wait was just entered.
+    fn update_job_wait(&mut self, now: tokio::time::Instant, limit: Duration) -> bool {
+        if !self.waiting_on_jobs() {
+            self.job_wait_deadline = None;
+            return false;
+        }
+        if self.job_wait_deadline.is_some() {
+            return false;
+        }
+        // A limit too large for the clock means no bound at all.
+        self.job_wait_deadline = Some(
+            now.checked_add(limit)
+                .unwrap_or_else(|| now + Duration::from_secs(60 * 60 * 24 * 365)),
+        );
+        true
+    }
+
+    /// The job-wait deadline has passed while the turn is still waiting.
+    fn job_wait_expired(&self, now: tokio::time::Instant) -> bool {
+        self.waiting_on_jobs()
+            && self
+                .job_wait_deadline
+                .is_some_and(|deadline| now >= deadline)
+    }
+}
+
+/// The limit as a person would write it: "60 min" for whole minutes.
+fn describe_limit(limit: Duration) -> String {
+    let secs = limit.as_secs();
+    if limit.subsec_nanos() == 0 && secs > 0 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{limit:?}")
+    }
+}
+
+/// Records that a turn has started waiting on its background jobs (#271).
+async fn note_job_wait_entered(
+    pool: &SqlitePool,
+    session_id: &str,
+    jobs: &[BackgroundJob],
+    limit: Duration,
+    events_notify: &Notify,
+) {
+    let deadline = chrono::Duration::from_std(limit)
+        .ok()
+        .and_then(|limit| Utc::now().checked_add_signed(limit))
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "never".to_string());
+    append_session_note(
+        pool,
+        session_id,
+        "job_wait",
+        &format!(
+            "the turn ended without reporting while {} background job(s) run ({}); not nudging \
+             until they finish, closing it at {deadline}",
+            jobs.len(),
+            describe_jobs(jobs)
+        ),
+        events_notify,
+    )
+    .await;
+}
+
+/// Closes a turn whose job-wait limit ran out, the way an exhausted nudge
+/// count closes one: `gave_up`, a `no_report` note, stdin closed, grace armed.
+async fn close_after_job_wait(
+    pool: &SqlitePool,
+    session_id: &str,
+    handle: &mut AgentHandle,
+    turn: &mut SingleShotTurn,
+    turn_timers: &TurnTimers,
+    events_notify: &Notify,
+) {
+    // The note is built before `gave_up` makes the turn stop waiting on jobs.
+    let message = format!(
+        "the turn never called report_outcome and was still waiting on {} background job(s) \
+         ({}) when the {} job-wait limit ran out; closing it",
+        turn.background_jobs.len(),
+        describe_jobs(&turn.background_jobs),
+        describe_limit(turn_timers.job_wait_limit)
+    );
+    turn.gave_up = true;
+    turn.job_wait_deadline = None;
+    tracing::warn!(
+        session_id,
+        "single-shot turn still waiting on background jobs at the limit; closing it"
+    );
+    append_session_note(pool, session_id, "no_report", &message, events_notify).await;
+    handle.close_stdin();
+    turn.arm_grace(turn_timers.grace, GraceCause::NoReport);
 }
 
 /// The run's final `status` and `end_reason` once its process is gone.
@@ -2472,6 +2651,7 @@ mod tests {
             grace: StdDuration::from_millis(400),
             nudge_after: StdDuration::from_millis(150),
             max_nudges,
+            job_wait_limit: StdDuration::from_secs(60),
         }
     }
 
@@ -2614,6 +2794,379 @@ mod tests {
             session_notes(&pool, &session_id).await,
             vec!["nudge", "nudge", "no_report"]
         );
+    }
+
+    // ---- background-job wait (#271) ----
+
+    fn one_job() -> serde_json::Value {
+        json!({"type": "system", "subtype": "background_tasks_changed", "tasks": [
+            {"task_id": "job1", "task_type": "local_bash", "description": "hung gate"}
+        ]})
+    }
+
+    fn no_jobs() -> serde_json::Value {
+        json!({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+    }
+
+    async fn note_events(
+        pool: &SqlitePool,
+        session_id: &str,
+    ) -> Vec<chocofactory_core::models::Event> {
+        events::list_for_session(pool, session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::SessionNote)
+            .collect()
+    }
+
+    async fn wait_for_note(pool: &SqlitePool, session_id: &str, kind: &str) {
+        crate::test_support::wait_until(&format!("a {kind} note"), || async {
+            if session_notes(pool, session_id)
+                .await
+                .iter()
+                .any(|k| k == kind)
+            {
+                Ok(())
+            } else {
+                Err("not yet".to_string())
+            }
+        })
+        .await
+    }
+
+    #[test]
+    fn background_jobs_do_not_end_the_wait_for_a_report_but_stop_nudges() {
+        let jobs = |n: usize| AgentEvent::BackgroundJobs {
+            running: (0..n)
+                .map(|i| BackgroundJob {
+                    id: format!("j{i}"),
+                    kind: "local_bash".into(),
+                    description: "d".into(),
+                })
+                .collect(),
+        };
+        let mut turn = turn_with(|t| t.waiting_for_report = true);
+        assert!(turn.should_nudge());
+        turn.observe(&jobs(1));
+        assert!(turn.waiting_for_report);
+        assert!(turn.waiting_on_jobs());
+        assert!(!turn.should_nudge());
+        turn.observe(&jobs(0));
+        assert!(turn.waiting_for_report);
+        assert!(!turn.waiting_on_jobs());
+        assert!(turn.should_nudge());
+    }
+
+    #[test]
+    fn background_jobs_mid_turn_are_not_a_wait() {
+        let mut turn = SingleShotTurn::default();
+        turn.observe(&AgentEvent::BackgroundJobs {
+            running: vec![BackgroundJob {
+                id: "j".into(),
+                kind: "k".into(),
+                description: "d".into(),
+            }],
+        });
+        assert!(!turn.waiting_for_report);
+        assert!(!turn.should_nudge());
+        assert!(!turn.waiting_on_jobs());
+    }
+
+    #[test]
+    fn update_job_wait_fixes_the_deadline_when_the_wait_starts() {
+        let limit = StdDuration::from_secs(10);
+        let mut turn = turn_with(|t| {
+            t.waiting_for_report = true;
+            t.background_jobs = vec![BackgroundJob {
+                id: "j".into(),
+                kind: "k".into(),
+                description: "d".into(),
+            }];
+        });
+        let now = tokio::time::Instant::now();
+        assert!(turn.update_job_wait(now, limit));
+        assert_eq!(turn.job_wait_deadline, Some(now + limit));
+        let later = now + StdDuration::from_millis(100);
+        assert!(!turn.update_job_wait(later, limit));
+        assert_eq!(turn.job_wait_deadline, Some(now + limit));
+        assert!(!turn.job_wait_expired(later));
+        assert!(turn.job_wait_expired(now + limit));
+
+        turn.background_jobs.clear();
+        assert!(!turn.update_job_wait(later, limit));
+        assert_eq!(turn.job_wait_deadline, None);
+
+        turn.background_jobs.push(BackgroundJob {
+            id: "j".into(),
+            kind: "k".into(),
+            description: "d".into(),
+        });
+        assert!(turn.update_job_wait(later, limit));
+        assert_eq!(turn.job_wait_deadline, Some(later + limit));
+    }
+
+    #[test]
+    fn the_job_wait_limit_reads_as_minutes_when_whole() {
+        assert_eq!(describe_limit(StdDuration::from_secs(3600)), "60 min");
+        assert_eq!(describe_limit(StdDuration::from_millis(300)), "300ms");
+    }
+
+    /// The issue's first case: a report-less turn whose job outlasts every
+    /// nudge is never nudged, and reports once the CLI wakes it.
+    #[tokio::test]
+    async fn a_turn_waiting_on_its_job_is_not_nudged() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "raw", "line": one_job()},
+                {"op": "text", "text": "started the gate"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 1.0},
+                {"op": "raw", "line": no_jobs()},
+                {"op": "init"},
+                {"op": "report", "outcome": "done"},
+                {"op": "text", "text": "done"},
+                {"op": "result"},
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(run.end_reason, None);
+        assert_eq!(
+            session_notes(&pool, &session_id).await,
+            vec!["background_jobs", "job_wait", "background_jobs"]
+        );
+    }
+
+    /// The issue's third case: a job that never ends is bounded by the
+    /// job-wait limit, and the grace kill takes it down with the group.
+    #[tokio::test]
+    async fn a_hung_job_closes_the_turn_as_no_report_at_the_limit() {
+        let dir = TempDir::new();
+        let heartbeat = dir.0.join("heartbeat");
+        let child_pid_path = dir.0.join("child.pid");
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "spawn_child", "heartbeat": heartbeat, "pid_file": child_pid_path},
+                {"op": "raw", "line": one_job()},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let timers = TurnTimers {
+            job_wait_limit: StdDuration::from_millis(300),
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let child_pid = read_pid_when_written(&child_pid_path).await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        assert_eq!(
+            session_notes(&pool, &session_id).await,
+            vec!["background_jobs", "job_wait", "no_report", "lingered"]
+        );
+        let notes = note_events(&pool, &session_id).await;
+        let message = notes[2].payload["message"].as_str().unwrap();
+        assert!(message.contains("hung gate"), "{message}");
+        assert!(message.contains("background job"), "{message}");
+        wait_until_gone(child_pid).await;
+    }
+
+    /// Once the list empties, the nudge clock starts from that moment.
+    #[tokio::test]
+    async fn nudging_resumes_after_the_jobs_are_gone() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "raw", "line": one_job()},
+                {"op": "text", "text": "hmm"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 7.0},
+                {"op": "raw", "line": no_jobs()},
+                {"op": "answer_every_turn", "text": "still thinking"},
+            ]),
+        );
+        let timers = TurnTimers {
+            nudge_after: crate::test_support::RESPONSE_MARGIN,
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(2)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        assert_eq!(
+            session_notes(&pool, &session_id).await,
+            vec![
+                "background_jobs",
+                "job_wait",
+                "background_jobs",
+                "nudge",
+                "nudge",
+                "no_report"
+            ]
+        );
+    }
+
+    /// Output during the wait (a sub-agent's text, a changed list) never
+    /// moves the deadline.
+    #[tokio::test]
+    async fn events_during_the_wait_do_not_push_the_deadline_back() {
+        let dir = TempDir::new();
+        let two_jobs = json!({"type": "system", "subtype": "background_tasks_changed", "tasks": [
+            {"task_id": "job1", "task_type": "local_bash", "description": "A"},
+            {"task_id": "job2", "task_type": "local_bash", "description": "B"},
+        ]});
+        let mut steps = vec![
+            json!({"op": "read_turn"}),
+            json!({"op": "raw", "line": one_job()}),
+            json!({"op": "result"}),
+        ];
+        for i in 0..15 {
+            steps.push(json!({"op": "sleep", "seconds": 0.2}));
+            if i % 2 == 0 {
+                steps.push(json!({"op": "text", "text": "helper", "parent": "toolu_agent"}));
+            } else {
+                steps.push(json!({"op": "raw", "line": two_jobs}));
+            }
+        }
+        steps.push(json!({"op": "sleep", "seconds": 60}));
+        let binary = script_binary(&dir.0, serde_json::Value::Array(steps));
+        let timers = TurnTimers {
+            job_wait_limit: StdDuration::from_secs(1),
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        let notes = note_events(&pool, &session_id).await;
+        let kinds: Vec<_> = notes
+            .iter()
+            .map(|e| e.payload["kind"].as_str().unwrap())
+            .collect();
+        assert!(!kinds.contains(&"nudge"), "{kinds:?}");
+        let started = notes
+            .iter()
+            .find(|e| e.payload["kind"] == "job_wait")
+            .unwrap();
+        let closed = notes
+            .iter()
+            .find(|e| e.payload["kind"] == "no_report")
+            .unwrap();
+        let waited = closed.created_at - started.created_at;
+        assert!(
+            waited >= chrono::Duration::milliseconds(900)
+                && waited < chrono::Duration::milliseconds(2500),
+            "waited {waited}"
+        );
+    }
+
+    async fn start_with_reaper_ready(
+        binary: String,
+        timers: TurnTimers,
+    ) -> (SqlitePool, String, Arc<SessionManager>) {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let manager = SessionManager::with_turn_timers(
+            pool.clone(),
+            Registry::single(adapter),
+            chrono::Duration::zero(),
+            Arc::new(Notify::new()),
+            timers,
+        );
+        manager
+            .start(
+                &session_id,
+                "claude",
+                "go",
+                &single_shot_role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+        (pool, session_id, manager)
+    }
+
+    async fn reap_once(manager: &Arc<SessionManager>) {
+        manager
+            .run_idle_reaper_loop(
+                &IdleReaperConfig {
+                    interval: StdDuration::from_millis(1),
+                },
+                Some(1),
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_idle_reaper_leaves_a_turn_waiting_on_jobs_alone() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "raw", "line": one_job()},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 1},
+                {"op": "raw", "line": no_jobs()},
+                {"op": "init"},
+                {"op": "report", "outcome": "done"},
+                {"op": "text", "text": "done"},
+                {"op": "result"},
+            ]),
+        );
+        let (pool, session_id, manager) = start_with_reaper_ready(binary, fast_timers(3)).await;
+        wait_for_note(&pool, &session_id, "job_wait").await;
+
+        reap_once(&manager).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(run.end_reason, None);
+        let kinds = session_notes(&pool, &session_id).await;
+        for unwanted in ["lingered", "no_report", "nudge"] {
+            assert!(!kinds.iter().any(|k| k == unwanted), "{kinds:?}");
+        }
+    }
+
+    /// Guards today's behaviour: with no job, the reaper still closes a
+    /// stalled turn.
+    #[tokio::test]
+    async fn the_idle_reaper_still_closes_a_stalled_turn_with_no_job() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "text", "text": "hmm"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let timers = TurnTimers {
+            nudge_after: StdDuration::from_secs(3600),
+            ..fast_timers(3)
+        };
+        let (pool, session_id, manager) = start_with_reaper_ready(binary, timers).await;
+        wait_until_events_len(&pool, &session_id, 3).await;
+
+        reap_once(&manager).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::Reaped));
     }
 
     /// A sub-agent calling `report_outcome` does not complete the main

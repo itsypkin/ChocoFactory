@@ -11442,6 +11442,7 @@ fn fast_turn_timers() -> crate::session::TurnTimers {
         grace: StdDuration::from_millis(400),
         nudge_after: StdDuration::from_millis(150),
         max_nudges: 1,
+        job_wait_limit: StdDuration::from_secs(60),
     }
 }
 

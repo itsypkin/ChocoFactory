@@ -38,6 +38,8 @@ Steps, run in order:
 - `{"op": "run", "command": "..."}` — run `command` with `/bin/sh -c` in this
   process's cwd (the task's worktree), failing the process if it fails. Emits
   nothing; lets a test make the "agent" change the worktree.
+- `{"op": "raw", "line": {...}}` — emit `line` verbatim as one JSON line, for
+  output the other ops don't model (a `background_tasks_changed` list, say).
 - `{"op": "exit"}` — exit 0 immediately, without waiting for stdin EOF.
 
 After the last step the process waits for stdin EOF, then exits 0.
@@ -181,6 +183,8 @@ def main():
                 time.sleep(0.02)
         elif op == "run":
             subprocess.run(["/bin/sh", "-c", step["command"]], check=True)
+        elif op == "raw":
+            emit(step["line"])
         elif op == "exit":
             return
         else:
