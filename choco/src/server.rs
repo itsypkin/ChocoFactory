@@ -46,12 +46,18 @@ fn url(info: &LockInfo) -> String {
     format!("http://127.0.0.1:{}", info.port)
 }
 
-fn skew_warning(info: &LockInfo) {
-    if info.version != VERSION {
-        eprintln!(
-            "warning: choco {VERSION} is talking to chocofactoryd {}; run `choco server restart` (or `choco update`)",
-            info.version
-        );
+/// The mismatch warning, or `None` when `reported` is the version `expected`.
+fn skew_message(expected: &str, reported: &str) -> Option<String> {
+    (expected != reported).then(|| {
+        format!(
+            "warning: choco {expected} is talking to chocofactoryd {reported}; run `choco server restart` (or `choco update`)"
+        )
+    })
+}
+
+fn skew_warning(info: &LockInfo, expected: &str) {
+    if let Some(msg) = skew_message(expected, &info.version) {
+        eprintln!("{msg}");
     }
 }
 
@@ -91,24 +97,27 @@ async fn start(port: Option<u16>) -> Result<u8, Failure> {
         .parent()
         .ok_or("cannot locate choco's directory")?
         .join("chocofactoryd");
-    start_daemon(&root, &daemon, port).await
+    start_daemon(&root, &daemon, port, VERSION).await
 }
 
 /// Starts `daemon` in the background and waits until it answers. Shared by
 /// `choco server start` (the sibling of this choco) and `choco update` (the
 /// freshly installed one, passed explicitly because a replaced `current_exe`
-/// no longer names a usable path on Linux). Exit code 0 on success.
+/// no longer names a usable path on Linux). `expected_version` is the version
+/// the started daemon should report; a daemon reporting another one is warned
+/// about. Exit code 0 on success.
 pub(crate) async fn start_daemon(
     root: &Path,
     daemon: &Path,
     port: Option<u16>,
+    expected_version: &str,
 ) -> Result<u8, Failure> {
     if let LockState::Running(info) = lock(root)? {
         println!(
             "chocofactoryd is already running (pid {}, port {}, version {})",
             info.pid, info.port, info.version
         );
-        skew_warning(&info);
+        skew_warning(&info, expected_version);
         return Ok(0);
     }
     if !daemon.is_file() {
@@ -190,7 +199,7 @@ pub(crate) async fn start_daemon(
                     "chocofactoryd is already running (pid {}, port {}, version {})",
                     info.pid, info.port, info.version
                 );
-                skew_warning(&info);
+                skew_warning(&info, expected_version);
                 return Ok(0);
             }
             return Err(format!(
@@ -208,7 +217,7 @@ pub(crate) async fn start_daemon(
         if let Ok(LockState::Running(info)) = lock_state
             && info.pid == pid
         {
-            let client = Client::new(url(&info));
+            let client = Client::new(url(&info)).without_version_check();
             if let Ok(server) = client.server_status(PROBE_TIMEOUT).await
                 && server.pid == pid
             {
@@ -218,6 +227,9 @@ pub(crate) async fn start_daemon(
                     server.port,
                     log.display()
                 );
+                if let Some(msg) = skew_message(expected_version, &server.version) {
+                    eprintln!("{msg}");
+                }
                 return Ok(0);
             }
         }
@@ -404,4 +416,25 @@ async fn status(json: bool) -> Result<u8, Failure> {
         );
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_versions_are_silent() {
+        assert_eq!(skew_message("0.2.5", "0.2.5"), None);
+        assert_eq!(skew_message(VERSION, VERSION), None);
+    }
+
+    #[test]
+    fn different_versions_warn_with_the_expected_in_the_choco_slot() {
+        assert_eq!(
+            skew_message("0.2.5", "0.2.6").as_deref(),
+            Some(
+                "warning: choco 0.2.5 is talking to chocofactoryd 0.2.6; run `choco server restart` (or `choco update`)"
+            )
+        );
+    }
 }
