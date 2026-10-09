@@ -210,7 +210,7 @@ choco task create --project <p> --workflow coding-task-planned \
   when the task is open at `spec_questions` (the planner needs your answer;
   reply with `choco task send <id> --text "<answers>"`), at
   `awaiting_human_review` (vote, step 4) or at `escalate_to_human`
-  (`choco task send`, step 5), or when it is stuck, cancelled or closed.
+  (`choco task retry` or `choco task send`, step 5), or when it is stuck, cancelled or closed.
   Its stderr line and exit code say which. The exit codes are in
   [reference/watch.md](reference/watch.md#waiting-with---until); typical
   stage times for choosing `--timeout` are in
@@ -320,8 +320,11 @@ cancelling. In short:
 
 - `stuck` → find out why in `choco task status <id>`, then
   `choco task retry <id>`.
-- `escalate_to_human` → `choco task send <id> --text "<note>"` is the only
-  way on; `/approve` does nothing there.
+- `escalate_to_human` → after a review timeout, `choco task retry <id>`
+  watches again at no cost; after a CI timeout, re-run CI on GitHub, then
+  `choco task retry <id>`; after any other escalation (a cancelled or
+  failed-to-start check, a loop guard), `choco task send <id> --text "<note>"`
+  moves on through a coder lap. `/approve` alone is refused there.
 - `choco task cancel <id>` is final and deletes the task's worktree and
   local branch; `--keep` keeps both for you to take over.
 

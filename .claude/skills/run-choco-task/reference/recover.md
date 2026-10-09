@@ -48,9 +48,11 @@ the merge and move the task to `done`. `choco task send <id> --text "<note>"` mo
 - After 4 red CI results in a row, name the failing check and what it says
   in the note, or fix CI by hand first.
 - After a CI timeout, or a cancelled, startup-failure or action-required
-  check, fix or re-run CI on GitHub. Once it is green, either merge the PR
+  check, fix or re-run CI on GitHub. Once it is green, after a CI timeout run
+  `choco task retry <id>`: it polls CI again and costs no lap. After a
+  cancelled, startup-failure or action-required check, either merge the PR
   and cancel the task, or send a note saying CI is green and no code change
-  is needed. The note still costs a coder lap and a review lap, because
+  is needed. The note costs a coder lap and a review lap, because
   resuming always goes through `revising`.
 - The note is templated into the coder's prompt verbatim. Make it
   self-contained: list every item in full.

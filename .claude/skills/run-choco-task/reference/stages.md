@@ -66,5 +66,6 @@ Read this while watching a task, when its behaviour surprises you.
   closed without merging does not.
 - **escalate_to_human.** Arriving here starts all three loop counts over (internal rejections, red CI
   results, your votes).
-  It waits for `choco task send <id> --text "<note>"`, which moves the task
-  into `revising`.
+  It waits for you. After a review or CI timeout, `choco task retry <id>`
+  watches again at no cost. Otherwise `choco task send <id> --text "<note>"`
+  moves the task into `revising`.
