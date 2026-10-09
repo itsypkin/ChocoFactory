@@ -93,6 +93,8 @@ and nothing else:
   stage has `.summary` and `.outcome`; a script's JSON fields are available
   by name.
 - `{{ arrival.from }}`, `{{ arrival.outcome }}`
+- `{{ left_at.<stage> }}`: when the task last left that stage
+  (`YYYY-MM-DDTHH:MM:SSZ`, UTC). Empty if it has never left it.
 
 They are filled in in: the contents of a `prompt_file`, an inline `command:`
 of a shell stage, poll stage or watcher, and every `env:` value. They are
