@@ -113,7 +113,8 @@ when the workflow loads, but a misspelt top-level key is silently ignored.
 2. Read `choco task status <id>`. For a file, the `Workflow file` line shows
    the path and `[hash]` the task actually runs, with `(changed since task
    start)` or `(missing)` when it changed or is gone. For a built-in, a
-   second `Workflow` line reads `builtin:<name>@<version>`. The first
+   second `Workflow` line reads `builtin:<name>@<version>`, with `(built-in updated since task
+   start)` when the daemon's built-in changed since the task began. The first
    `Workflow` line is the YAML's `name:`, so check the path line.
 3. `--workflow` takes the workflow from wherever the file is. The task's code
    still forks from `--repo`'s checkout (default: the project's repo) and

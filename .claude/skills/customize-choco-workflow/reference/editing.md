@@ -136,9 +136,13 @@ A shell stage between the review and the PR. In `coding-task`, change
     kind: shell
     command: cargo fmt --check
     timeout: 5m
-    on: { done: open_pr, error: revising }
-    loop_guard: { on: error, max: 2, then: escalate_to_human }
+    on: { done: open_pr, error: escalate_to_human }
 ```
+
+A failed check goes to a human. Routing `error` back to the coder would not
+work unless you also edit the coder's revise prompt (and so eject `prompts/`)
+to handle a lint failure and give the stage `capture: text` so the prompt can
+show `{{ stages.lint }}`; otherwise the coder never sees the failure.
 
 A shell stage passing agent text on:
 
@@ -156,7 +160,7 @@ A poll stage with backoff:
 ```yaml
   wait_deploy:
     kind: poll
-    command: curl -fs https://example.com/health && echo ready
+    command: curl -fso /dev/null https://example.com/health && echo ready
     interval: 30s
     backoff:
       - { after: 10m, interval: 2m }
