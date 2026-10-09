@@ -101,7 +101,11 @@ After that you only create tasks. Create one as in [How it is used](#how-it-is-u
 
 ## The dashboard
 
-`choco dashboard` (alias `choco dash`) is an interactive terminal view of every task. Its four sections:
+`choco dashboard` (alias `choco dash`) is an interactive terminal view of every task.
+
+![The choco dashboard: one task needs you, two are in progress, none are stuck, and ten closed recently](docs/images/dashboard.png)
+
+Its four sections:
 
 | Section | Holds |
 |---|---|
