@@ -316,6 +316,16 @@ stages:
             Self::to_response(resp).await
         }
 
+        /// A POST running in its own task, so a test can abort it to
+        /// simulate a client that disconnects mid-request.
+        pub fn spawn_post(&self, path: &str, body: Value) -> tokio::task::JoinHandle<()> {
+            let client = self.client.clone();
+            let url = format!("{}{path}", self.base_url);
+            tokio::spawn(async move {
+                let _ = client.post(url).json(&body).send().await;
+            })
+        }
+
         pub async fn post(&self, path: &str, body: Value) -> TestResponse {
             let resp = self
                 .client

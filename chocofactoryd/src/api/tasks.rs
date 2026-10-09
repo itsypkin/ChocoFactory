@@ -554,28 +554,44 @@ mod tests {
         std::fs::write(&hook, "#!/bin/sh\nsleep 3\n").unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let dropped = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            post_wt(&server, &project_id, "wt", &repo, None),
-        )
-        .await;
-        assert!(dropped.is_err(), "the create should still be running");
+        let client = server.spawn_post(
+            "/tasks",
+            json!({
+                "project_id": project_id,
+                "workflow_def": "wt",
+                "title": "t",
+                "prompt": "hi",
+                "config": { "cwd": repo.to_string_lossy() },
+            }),
+        );
 
-        let mut staged = false;
-        for _ in 0..100 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The row exists only once the handler is inside create, past the
+        // insert; the hook keeps it there for 3 s, so the client is still
+        // waiting when it is aborted.
+        let mut id = None;
+        for _ in 0..300 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let tasks = server
                 .get(&format!("/tasks?project_id={project_id}"))
                 .await
                 .json();
-            let Some(id) = tasks[0]["id"].as_str() else {
-                continue;
-            };
+            if let Some(found) = tasks[0]["id"].as_str() {
+                id = Some(found.to_string());
+                break;
+            }
+        }
+        let id = id.expect("the handler never inserted the task");
+        assert!(!client.is_finished(), "the create should still be running");
+        client.abort();
+
+        let mut staged = false;
+        for _ in 0..300 {
             let detail = server.get(&format!("/tasks/{id}")).await.json();
             if !detail["workflow_state"].is_null() {
                 staged = true;
                 break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(staged, "the task never reached a stage");
     }
