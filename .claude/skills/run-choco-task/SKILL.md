@@ -154,9 +154,12 @@ explicit out-of-scope list.
   setup that the task needs goes in the spec.
 - **Check that the design holds, not only that it builds.** List every way a
   protected event can end and say whether the protection runs on each. Also
-  grep for statements the change makes false, state what an abandoned or
-  interrupted operation leaves behind (with a test), and probe a new prompt
-  rule on the role's model; see
+  grep for statements the change makes false and probe a new prompt rule on
+  the role's model; see
+  [reference/spec.md](reference/spec.md#check-that-the-design-holds).
+- **Abandoned operations.** For anything that can time out, be cancelled or
+  lose its client, the spec states what it leaves behind (locks, rows,
+  files) and requires a test of it; see
   [reference/spec.md](reference/spec.md#check-that-the-design-holds).
 - **Read the issue with comments:** `gh issue view <n> --json title,body,comments`
   (`gh issue view <n> --comments` can print nothing and exit 0).
@@ -186,7 +189,8 @@ explicit out-of-scope list.
   see the rest in [reference/spec.md](reference/spec.md#having-choco-check-the-spec-first-coding-task-planned).
 - **Docs-only task:** every link and anchor resolves (from a copy outside the
   repo, for a skill or doc meant to be copied), every command matches `--help`,
-  every snippet route is taken on a throwaway daemon, and no fact is lost; see
+  no fact is lost, and for a skill or doc meant to be copied every snippet
+  route is taken on a throwaway daemon; see
   [reference/spec.md](reference/spec.md#docs-only-tasks).
 - **Text an agent or a reader acts on** (a prompt, a skill, docs): the spec
   carries behavioural acceptance criteria and names the runs that prove them;
@@ -254,7 +258,7 @@ an independent reviewer do it, and look for what agents systematically miss:
 - **New messages and states**: read each one with the values its own path
   passes, and check every new state has a way out.
 - **Your repo's own recurring review findings**, if you know them.
-- **A docs PR** has no tests to break; check it against the
+- **A docs PR** has no code tests to break; check it against the
   [docs-only criteria](reference/spec.md#docs-only-tasks) and check that the
   spec's acceptance runs were run and reported.
 

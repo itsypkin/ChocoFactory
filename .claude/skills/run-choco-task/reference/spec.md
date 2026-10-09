@@ -29,9 +29,8 @@ Three more checks belong in the spec:
   prompts for the old behaviour's wording and commands, and fix each hit
   in the same PR.
 - **Abandoned operations.** For anything that can time out, be cancelled,
-  be interrupted part-way (a multi-step delete or cancel included) or lose
-  its client, the spec states what is left behind (locks, rows, files) and
-  requires a test that interrupts it and checks that state.
+  or lose its client, the spec states what is left behind (locks, rows,
+  files) and requires a test that interrupts it and checks that state.
 - **A new rule in a prompt.** The spec requires the coder to run one
   probe of the rule on the role's production model (the model the role
   runs in the workflow) in its lap, and to report the probe and its
@@ -117,7 +116,8 @@ HOME=$t choco server stop
 
 The throwaway daemon's agents get the same `HOME`, so they have no
 `claude` or `gh` login. A route that needs an agent turn or GitHub is
-taken on a small real task on your own daemon instead.
+taken on a small, real task on your own daemon instead, without stopping,
+updating or restarting that daemon.
 
 A script that walks the links and a loop over the `--help` of each
 command check the first three criteria only; they are not enough for
