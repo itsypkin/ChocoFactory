@@ -181,15 +181,24 @@ stages:
   # Another collaborator's APPROVED or CHANGES_REQUESTED review votes by its
   # state alone. The newest vote across comments and reviews decides.
   #
-  # Only comments and reviews newer than the head commit count (a review by
-  # its `submitted_at`; pending and dismissed reviews never count). That's what keeps a
-  # verdict from being re-read on the next lap: `revising` pushes a new
-  # commit, which moves `SINCE` past every existing comment, so last
-  # round's `/request-changes` stops matching without anything having to
-  # clear it. `[created_at, updated_at] | max` rather than `created_at`
-  # alone, so *editing* an earlier comment to add the marker counts —
-  # which is the move a reviewer who already wrote their prose reaches
-  # for first.
+  # Only comments and reviews newer than the last hand-off count (a review
+  # by its `submitted_at`; pending and dismissed reviews never count). The
+  # hand-off is the time the engine last moved the task out of this stage,
+  # passed in as `HANDED_OVER_AT` (`left_at`, whole-second UTC). That's what
+  # keeps a verdict from being re-read on the next lap, whether or not the
+  # coder pushes a commit: everything the gate saw before it let go is
+  # never counted again, and a review submitted while the coder revises is
+  # carried into the next round. Before the first hand-off (the first
+  # round, or a task from before `left_at` existed) `HANDED_OVER_AT` is
+  # empty and the fence is the head commit's committer date. A malformed
+  # value makes the script fail rather than fall back. `[created_at,
+  # updated_at] | max` rather than `created_at` alone, so *editing* an
+  # earlier comment to add the marker counts (an edit after the hand-off
+  # is a new act) — which is the move a reviewer who already wrote their
+  # prose reaches for first. A review has no edit time: editing one after
+  # the hand-off does not count, post a new one. A vote cast while the
+  # coder revises, approval included, is read when the task next reaches
+  # the gate.
   #
   # A merged PR counts as approval (#102): the script prints `MERGED` and
   # skips the comments and reviews, so a PR merged without a marker comment moves on
@@ -197,17 +206,33 @@ stages:
   # a marker, since there is nothing left to revise once it has landed.
   # A PR closed without merging is nothing new: polling continues.
   #
-  # Both halves of that bound are read the long way round on purpose.
-  # `gh pr view --json commits,comments` caps each at the first 100 with
-  # no pagination, so on a long PR `.commits | last` is not the head (a
+  # Both halves of the first-round bound are read the long way round on
+  # purpose. `gh pr view --json commits,comments` caps each at the first 100
+  # with no pagination, so on a long PR `.commits | last` is not the head (a
   # stale `SINCE` re-admits verdicts already acted on) and a verdict
   # posted as comment 101 is invisible. Hence `headRefOid` plus the
   # commits API for the date, and `--paginate` for the comments and reviews.
   #
-  # Residual, accepted: `committedDate` comes from the daemon's clock
-  # while `created_at` comes from GitHub's, so a daemon running more than
-  # a few minutes slow can re-admit one already-consumed verdict. The
-  # loop guard below bounds that at three laps rather than a spin.
+  # Residual, accepted:
+  #  - Clock. The hand-off time is the daemon host's clock, GitHub's
+  #    timestamps are GitHub's. A host clock behind GitHub's by more than
+  #    the age of the deciding vote at hand-off can re-admit that vote; the
+  #    loop guard below bounds that. A clock ahead drops items posted
+  #    within that skew after the hand-off.
+  #  - Read-to-hand-off window. An item posted after the script's reads but
+  #    before the engine commits the transition is neither handed over nor
+  #    counted later. Usually under a second; the same second is excluded
+  #    by truncation.
+  #  - Timeout, resumed. Non-marker comments posted before the 102h timeout
+  #    are not handed over after `choco task send` resumes; the human's
+  #    resume note is the hand-off there.
+  #  - Timeout, rewatched. After `choco task retry` watches again, comments
+  #    and reviews posted before the timeout do not count (rewatch writes no
+  #    hand-off time), including a verdict posted in the last polling
+  #    interval before the timeout, which no final poll read. Post it again.
+  #  - Votes during a revision. A request for changes read by the coder on
+  #    the PR still starts another round; an approval there, if it is the
+  #    newest vote, moves the task to `done` unseen. `done` merges nothing.
   #
   # `scripts/await-review.sh` resolves the verdict itself and prints it
   # as the first line, so the engine's regexes anchor to the start of the
@@ -250,6 +275,8 @@ stages:
       script_file: scripts/await-review.sh
       env:
         PR_NUMBER: "{{ stages.open_pr.number }}"
+        # The time the task last left this stage; empty on the first visit.
+        HANDED_OVER_AT: "{{ left_at.awaiting_human_review }}"
       interval: 60s
       # Every minute for the first 6h, every 5 minutes up to 30h, then every
       # 30 minutes until the 102h timeout.
@@ -271,10 +298,10 @@ stages:
       # happened and `revising` would loop the coder on no feedback, so
       # this parks the task where a human can pick it up deliberately.
       timeout: escalate_to_human
-    # A verdict stays newer than the head commit until the coder pushes,
-    # so a `revising` lap that produces no commit — or a slow daemon
-    # clock — would re-read the same `/request-changes` and spin. Same
-    # bound `internal_review` uses.
+    # The hand-off fence means a verdict already handed over is not read
+    # again, commit or no commit; this bounds human rounds. A slow daemon
+    # clock or a re-edited comment can still repeat a verdict. Same bound
+    # `internal_review` uses.
     loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
 
   done:

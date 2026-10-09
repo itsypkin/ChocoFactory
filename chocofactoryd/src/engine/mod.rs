@@ -3043,6 +3043,14 @@ impl WorkflowEngine {
                 // payload/update, so a later template can tell "never ran"
                 // from "ran but stored no capture".
                 mark_stage_finished(&mut payload, &from_stage);
+                // Records when the task left `from_stage`, truncated to the
+                // whole second (GitHub's timestamp format), in this same
+                // payload/update. The review gate fences on it.
+                set_left_at(
+                    &mut payload,
+                    &from_stage,
+                    &self.now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                );
                 // Stamps (or clears) the poll window for `next_stage`, in
                 // this same payload so the deadline commits in the one
                 // UPDATE that moves `current_stage` (#52).
@@ -3462,6 +3470,29 @@ fn mark_stage_finished(payload: &mut Value, stage: &str) {
     if !list.iter().any(|s| s.as_str() == Some(stage)) {
         list.push(json!(stage));
     }
+}
+
+/// Records in the engine-owned `payload.left_at` object (stage name -> time)
+/// when the task last left `stage` through `advance_from_stage`, whatever the
+/// outcome. Overwrites that stage's earlier value and keeps other stages'.
+/// Retry, rewatch and the restart sweep re-enter a stage without leaving it,
+/// so they never write it. `template::render` exposes it as
+/// `{{ left_at.<stage> }}`.
+fn set_left_at(payload: &mut Value, stage: &str, at: &str) {
+    if !payload.is_object() {
+        *payload = json!({});
+    }
+    let map = payload
+        .as_object_mut()
+        .expect("payload was just ensured to be an object")
+        .entry(template::LEFT_AT)
+        .or_insert_with(|| json!({}));
+    if !map.is_object() {
+        *map = json!({});
+    }
+    map.as_object_mut()
+        .expect("left_at was just ensured to be an object")
+        .insert(stage.to_string(), json!(at));
 }
 
 /// Increments the guarded stage's transition count and rewrites its whole

@@ -69,7 +69,7 @@ changing anything.
 
 Current on the `awaiting_human_review` path. When the review came from the
 PR, it holds the PR comments from accounts with write access, newer than
-your last commit, oldest first, and its first line is the verdict token. A
+the previous hand-off, or than your last commit on the first review, oldest first, and its first line is the verdict token. A
 review sent through choco is the person's reply as written, with no verdict
 line. On the `escalate_to_human` path it is
 context: when the escalation came from the review loop guard, it is the

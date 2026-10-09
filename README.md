@@ -138,7 +138,7 @@ Leave a PR comment (or the body of a review) containing one of these markers, **
 | `/approve` | the task moves to `done` |
 | `/request-changes` | the task goes back to `revising`, and the coder gets your comment |
 
-- Only comments and reviews newer than the head commit count, so there is nothing to clear between rounds.
+- Only comments and reviews newer than the last hand-off to the coder count (before the first hand-off, newer than the head commit), so there is nothing to clear between rounds. A review submitted while the coder revises is carried into the next round; editing a review after the hand-off does not count, so post a new one. A vote cast during a revision, approval included, is read when the task next reaches the gate.
 - Only comments and reviews from the repo's owners, members and collaborators vote.
 - A collaborator's **Approve** or **Request changes** review votes by itself. On your own PR GitHub only allows a **Comment** review, so put the marker alone on a line of its body.
 - The inline comments on a review go to the coder with it. A pending (unsubmitted) review doesn't count.
