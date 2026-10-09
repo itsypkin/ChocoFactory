@@ -15627,9 +15627,20 @@ async fn several_remotes_without_origin_need_an_explicit_base_and_the_longest_re
     )
     .await;
     let other_main = git_out(&other, &["rev-parse", "main"]).await;
+    // Written as plain config: newer git versions refuse `remote add
+    // foo/bar` while a remote `foo` exists, but accept the config.
     git(
         &fx.clone,
-        &["remote", "add", "foo/bar", &other.to_string_lossy()],
+        &["config", "remote.foo/bar.url", &other.to_string_lossy()],
+    )
+    .await;
+    git(
+        &fx.clone,
+        &[
+            "config",
+            "remote.foo/bar.fetch",
+            "+refs/heads/*:refs/remotes/foo/bar/*",
+        ],
     )
     .await;
 
