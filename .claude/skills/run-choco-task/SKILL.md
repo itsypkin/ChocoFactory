@@ -154,8 +154,9 @@ explicit out-of-scope list.
   setup that the task needs goes in the spec.
 - **Check that the design holds, not only that it builds.** List every way a
   protected event can end and say whether the protection runs on each. Also
-  grep for statements the change makes false, state what an abandoned
-  operation leaves behind, and probe a new prompt rule on the role's model; see
+  grep for statements the change makes false, state what an abandoned or
+  interrupted operation leaves behind (with a test), and probe a new prompt
+  rule on the role's model; see
   [reference/spec.md](reference/spec.md#check-that-the-design-holds).
 - **Read the issue with comments:** `gh issue view <n> --json title,body,comments`
   (`gh issue view <n> --comments` can print nothing and exit 0).
@@ -246,8 +247,8 @@ an independent reviewer do it, and look for what agents systematically miss:
 - **Tests for the new branches**, not only the ones the spec listed. Break
   the main fix in a scratch copy and confirm a test fails.
 - **Claims are not evidence.** Code comments ("deliberately untested"),
-  commit messages and "addressed in <sha>" replies are claims to verify. A coder's "not re-run" on a run the spec
-  requires is an unmet requirement.
+  commit messages and "addressed in <sha>" replies are claims to verify. A coder's
+  "not re-run" on a run the spec requires is an unmet requirement.
 - **Numbered artifacts** (migrations above all) against what has landed on
   the default branch since the task started.
 - **New messages and states**: read each one with the values its own path

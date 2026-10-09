@@ -28,9 +28,10 @@ Three more checks belong in the spec:
 - **Every statement the change makes false.** Grep the skills, docs and
   prompts for the old behaviour's wording and commands, and fix each hit
   in the same PR.
-- **Abandoned operations.** For anything that can time out, be cancelled
-  or lose its client, the spec states what is left behind (locks, rows,
-  files) and requires a test of it.
+- **Abandoned operations.** For anything that can time out, be cancelled,
+  be interrupted part-way (a multi-step delete or cancel included) or lose
+  its client, the spec states what is left behind (locks, rows, files) and
+  requires a test that interrupts it and checks that state.
 - **A new rule in a prompt.** The spec requires the coder to run one
   probe of the rule on the role's production model (the model the role
   runs in the workflow) in its lap, and to report the probe and its
