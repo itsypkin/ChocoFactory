@@ -293,12 +293,16 @@ pub enum TaskCmd {
         #[arg(long)]
         keep: bool,
     },
-    /// Re-run a stuck task's current stage (X-4, issue #61).
+    /// Re-run a stuck task's current stage (X-4, issue #61), or watch again.
     ///
-    /// Reopens the task and re-enters whatever stage it stopped in — not a
-    /// replay of the outcome that got it stuck, since the daemon never
-    /// persisted one. Only works on a task whose status is `stuck`; see
-    /// `choco task status` for the reason.
+    /// On a `stuck` task: reopens it and re-enters whatever stage it stopped
+    /// in — not a replay of the outcome that got it stuck, since the daemon
+    /// never persisted one. See `choco task status` for the reason.
+    ///
+    /// On an `open` task waiting at a gate because a watcher (the PR review
+    /// watch, CI polling) timed out: goes back to that watcher with its
+    /// schedule starting over. No agent lap is spent, and `--resume` and
+    /// `--fresh` do not apply. Any other open task cannot be retried.
     ///
     /// When the stage's last agent turn was cut off from outside — a usage
     /// limit, or the daemon closing an idle session — the retry continues

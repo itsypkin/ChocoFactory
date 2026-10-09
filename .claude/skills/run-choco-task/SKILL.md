@@ -30,7 +30,7 @@ post `/request-changes`, or someone resumes the task from `escalate_to_human`.
 A task parks at `escalate_to_human` after a 4th rejection in a row by
 `internal_review`, a 4th red CI result in a row from `checks_polling`, a 4th
 `/request-changes` from you since the last escalation (each counted
-separately), after 6 hours with no verdict from you, when CI has not
+separately), after about 4 days with no verdict from you, when CI has not
 finished in 30 minutes, when a check is cancelled, failed to start or needs
 an action (approval) before it can run, or when `open_pr` fails.
 
@@ -131,7 +131,7 @@ the pre-merge check in step 4.
   The daemon logs to `~/.config/chocofactory/logs/chocofactoryd.log`; kills,
   `stuck` marks and nudges show up there first.
 - **Keep the machine awake for the whole run.** On a sleeping laptop agent
-  turns stall, and the 6-hour review window keeps running and can park the
+  turns stall, and the review window (about 4 days) keeps running and can park the
   task overnight. On macOS, run `caffeinate -dims` in a spare terminal. Don't
   tie it to the daemon with `-w <pid>`: the pid changes on restart.
 

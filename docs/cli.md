@@ -341,6 +341,20 @@ crashes deterministically isn't resumed back into the same crash. Use
 `--resume` to insist (it fails, rather than quietly starting fresh, when
 there is nothing safe to resume) or `--fresh` to start over anyway.
 
+A task that is not stuck but waits at a gate because a watcher timed out (the
+PR review watch, CI polling) can be retried too. It goes back to the watcher
+with its schedule starting over, and no agent lap is spent. `--resume` and
+`--fresh` don't apply and are refused:
+
+```
+$ choco task retry bb93ada3-...
+Watching again: back to stage 'awaiting_human_review' (its schedule starts
+over). See `choco task status bb93ada3-...`.
+```
+
+`choco task status` says when this applies. Any other open task can't be
+retried.
+
 Or give up on it the same way as any other task:
 
 ```

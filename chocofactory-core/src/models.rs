@@ -286,6 +286,10 @@ pub struct RetryOutcome {
     /// "it started over" is the answer an operator is most likely to
     /// question, and the daemon is the only one holding the reason.
     pub fresh_reason: Option<String>,
+    /// Whether the retry sent a task parked at a gate back to the watcher
+    /// stage that timed out, instead of re-running a stuck stage.
+    #[serde(default)]
+    pub rewatched: bool,
 }
 
 /// One row per underlying agent subprocess session a task has had (§3).

@@ -157,7 +157,12 @@ stages:
       env:
         PR_NUMBER: "{{ stages.open_pr.number }}"
       interval: 60s
-      timeout: 6h
+      # Every minute for the first 6h, every 5 minutes up to 30h, then every
+      # 30 minutes until the 102h timeout.
+      backoff:
+        - { after: 6h, interval: 5m }
+        - { after: 30h, interval: 30m }
+      timeout: 102h
       outcomes:
         - match: '\AREQUEST_CHANGES(\n|$)'
           then: changes_requested

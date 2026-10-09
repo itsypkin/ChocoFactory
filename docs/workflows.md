@@ -331,12 +331,20 @@ awaiting_review:
 ```
 
 - `watch:` takes the same fields as a `poll` stage (`command` or
-  `script_file`, `env`, `interval`, `timeout`, `outcomes`), and `interval` is
-  required. When an outcome matches, the gate advances on it, keeping the
+  `script_file`, `env`, `interval`, `backoff`, `timeout`, `outcomes`), and
+  `interval` is required. When an outcome matches, the gate advances on it, keeping the
   command's output if the gate says `capture: text`. When `timeout` runs out it
   advances on the `timeout` edge, which `on:` must have. The watcher is the
   same loop a `poll` runs: it survives a daemon restart with its stored
   deadline.
+- `backoff:` (optional, on a `poll` stage and on `watch:`) slows the polling
+  down the longer the stage waits. Each step is `{ after: 6h, interval: 5m }`:
+  from `after` on, the step's `interval` replaces the base one. `after` is
+  measured from when the stage was entered, so it survives a daemon restart.
+  Durations are `s`, `m` or `h` only (write `72h`, not `3d`). Steps must have
+  strictly increasing `after` values, each before `timeout` when there is one,
+  and the list can't be empty. `backoff` never moves the deadline: `timeout`
+  stays one budget counted from stage entry.
 - `markers:` makes a reply through choco carry a verdict. Each entry is a
   `line` and the outcome (`then`) it chooses. A reply counts a line as a marker
   when the whole line equals it: case-sensitive, trailing spaces, tabs and
@@ -348,5 +356,8 @@ awaiting_review:
 - On an accepted reply the gate advances on the marker's outcome. The captured
   text is the reply without its marker lines. The timeline's `human_message`
   event keeps the reply as typed, and names the outcome.
-- A gate without `markers:` takes any reply and resumes on `resumed`.
+- A gate without `markers:` takes any reply and resumes on `resumed`, except
+  a reply made up only of another gate's marker lines (say `/approve` alone):
+  that is refused, with nothing recorded, because it would be taken as a note
+  rather than a verdict.
 - An accepted reply stops the watcher.

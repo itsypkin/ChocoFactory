@@ -599,7 +599,29 @@ pub struct Watch {
     /// though it doubles as the latter, since each attempt is capped
     /// at whatever is left of it.
     pub timeout: Option<Duration>,
+    /// Slower intervals that replace `interval` once a stage has been
+    /// entered for `after` (#179). Empty means no backoff.
+    pub backoff: Vec<BackoffStep>,
     pub outcomes: Vec<PollOutcome>,
+}
+
+/// From `after` (measured from stage entry) on, poll every `interval`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackoffStep {
+    pub after: Duration,
+    pub interval: Duration,
+}
+
+impl Watch {
+    /// The interval to wait for a watcher that has run for `elapsed`: the
+    /// last backoff step whose `after <= elapsed`, else the base interval.
+    pub fn interval_at(&self, elapsed: Duration) -> Duration {
+        self.backoff
+            .iter()
+            .rev()
+            .find(|step| step.after <= elapsed)
+            .map_or(self.interval, |step| step.interval)
+    }
 }
 
 /// A line a reply to a gate must carry, and the outcome it chooses (#175).
@@ -723,6 +745,7 @@ fn stage_kind_keys(kind: &str) -> Option<&'static [&'static str]> {
             "capture",
             "env",
             "interval",
+            "backoff",
             "timeout",
             "outcomes",
         ],
@@ -821,6 +844,8 @@ enum RawStageKind {
         env: IndexMap<String, String>,
         interval: String,
         #[serde(default)]
+        backoff: Option<Vec<RawBackoffStep>>,
+        #[serde(default)]
         timeout: Option<String>,
         #[serde(default)]
         outcomes: Vec<RawPollOutcome>,
@@ -850,9 +875,18 @@ struct RawWatch {
     env: IndexMap<String, String>,
     interval: String,
     #[serde(default)]
+    backoff: Option<Vec<RawBackoffStep>>,
+    #[serde(default)]
     timeout: Option<String>,
     #[serde(default)]
     outcomes: Vec<RawPollOutcome>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBackoffStep {
+    after: String,
+    interval: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -933,6 +967,7 @@ impl RawStage {
                 script_file,
                 capture,
                 interval,
+                backoff,
                 timeout,
                 outcomes,
                 env,
@@ -946,10 +981,11 @@ impl RawStage {
                         script_file,
                         env,
                         interval,
+                        backoff,
                         timeout,
                         outcomes,
                     },
-                    ("interval", "timeout"),
+                    ("interval", "timeout", "backoff"),
                 )?,
             },
             RawStageKind::HumanGate {
@@ -985,10 +1021,11 @@ impl RawStage {
                                 script_file: w.script_file,
                                 env: w.env,
                                 interval: w.interval,
+                                backoff: w.backoff,
                                 timeout: w.timeout,
                                 outcomes: w.outcomes,
                             },
-                            ("watch.interval", "watch.timeout"),
+                            ("watch.interval", "watch.timeout", "watch.backoff"),
                         )
                     })
                     .transpose()?,
@@ -1009,6 +1046,7 @@ struct WatchFields {
     script_file: Option<String>,
     env: IndexMap<String, String>,
     interval: String,
+    backoff: Option<Vec<RawBackoffStep>>,
     timeout: Option<String>,
     outcomes: Vec<RawPollOutcome>,
 }
@@ -1118,7 +1156,7 @@ fn resolve_watch(
     base_dir: &Path,
     stage_name: &str,
     raw: WatchFields,
-    fields: (&'static str, &'static str),
+    fields: (&'static str, &'static str, &'static str),
 ) -> Result<Watch, WorkflowDefError> {
     let command = resolve_command(base_dir, stage_name, raw.command, raw.script_file)?;
     let interval =
@@ -1129,19 +1167,28 @@ fn resolve_watch(
         })?;
     let timeout = raw
         .timeout
+        .as_deref()
         .map(|value| {
-            parse_duration(&value).map_err(|value| WorkflowDefError::InvalidDuration {
+            parse_duration(value).map_err(|value| WorkflowDefError::InvalidDuration {
                 stage: stage_name.to_string(),
                 field: fields.1,
                 value,
             })
         })
         .transpose()?;
+    let backoff = resolve_backoff(
+        stage_name,
+        raw.backoff,
+        timeout,
+        raw.timeout.as_deref(),
+        fields.2,
+    )?;
     Ok(Watch {
         command,
         env: raw.env,
         interval,
         timeout,
+        backoff,
         outcomes: raw
             .outcomes
             .into_iter()
@@ -1151,6 +1198,62 @@ fn resolve_watch(
             })
             .collect(),
     })
+}
+
+/// Parses and checks a watcher's `backoff:` list (#179). `field` is `backoff`
+/// for a poll and `watch.backoff` for a gate.
+fn resolve_backoff(
+    stage_name: &str,
+    raw: Option<Vec<RawBackoffStep>>,
+    timeout: Option<Duration>,
+    raw_timeout: Option<&str>,
+    field: &'static str,
+) -> Result<Vec<BackoffStep>, WorkflowDefError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.is_empty() {
+        return Err(WorkflowDefError::EmptyBackoff {
+            stage: stage_name.to_string(),
+            field: field.to_string(),
+        });
+    }
+    let parse = |index: usize, key: &str, value: &str| {
+        parse_duration(value).map_err(|value| WorkflowDefError::InvalidBackoffDuration {
+            stage: stage_name.to_string(),
+            field: format!("{field}[{index}].{key}"),
+            value,
+        })
+    };
+    let mut steps: Vec<BackoffStep> = Vec::new();
+    let mut previous_raw = String::new();
+    for (index, step) in raw.iter().enumerate() {
+        let after = parse(index, "after", &step.after)?;
+        let interval = parse(index, "interval", &step.interval)?;
+        if let Some(last) = steps.last()
+            && after <= last.after
+        {
+            return Err(WorkflowDefError::BackoffNotIncreasing {
+                stage: stage_name.to_string(),
+                field: format!("{field}[{index}].after"),
+                after: step.after.clone(),
+                previous: previous_raw,
+            });
+        }
+        if let (Some(limit), Some(raw_limit)) = (timeout, raw_timeout)
+            && after >= limit
+        {
+            return Err(WorkflowDefError::BackoffStepNotBeforeTimeout {
+                stage: stage_name.to_string(),
+                field: format!("{field}[{index}].after"),
+                after: step.after.clone(),
+                timeout: raw_limit.to_string(),
+            });
+        }
+        previous_raw = step.after.clone();
+        steps.push(BackoffStep { after, interval });
+    }
+    Ok(steps)
 }
 
 /// Resolves the `command:`/`script_file:` pair that `shell` and `poll`
@@ -1407,6 +1510,27 @@ pub enum WorkflowDefError {
     EmptyReplyMarkers {
         stage: String,
     },
+    InvalidBackoffDuration {
+        stage: String,
+        field: String,
+        value: String,
+    },
+    EmptyBackoff {
+        stage: String,
+        field: String,
+    },
+    BackoffNotIncreasing {
+        stage: String,
+        field: String,
+        after: String,
+        previous: String,
+    },
+    BackoffStepNotBeforeTimeout {
+        stage: String,
+        field: String,
+        after: String,
+        timeout: String,
+    },
     EmptyReplyMarkerLine {
         stage: String,
     },
@@ -1598,6 +1722,36 @@ impl fmt::Display for WorkflowDefError {
                 f,
                 "human_gate stage '{stage}' declares 'capture: json', but a human's reply is free \
                  text, not structured data — only 'capture: text' is supported"
+            ),
+            WorkflowDefError::InvalidBackoffDuration {
+                stage,
+                field,
+                value,
+            } => write!(
+                f,
+                "stage '{stage}' has an invalid {field} '{value}' (expected e.g. '30s', '5m', '1h')"
+            ),
+            WorkflowDefError::EmptyBackoff { stage, field } => write!(
+                f,
+                "stage '{stage}' declares '{field}:' but the list is empty"
+            ),
+            WorkflowDefError::BackoffNotIncreasing {
+                stage,
+                field,
+                after,
+                previous,
+            } => write!(
+                f,
+                "stage '{stage}' has {field} '{after}', which is not later than the previous step's '{previous}'"
+            ),
+            WorkflowDefError::BackoffStepNotBeforeTimeout {
+                stage,
+                field,
+                after,
+                timeout,
+            } => write!(
+                f,
+                "stage '{stage}' has {field} '{after}', which is not before the timeout '{timeout}'"
             ),
             WorkflowDefError::EmptyReplyMarkers { stage } => write!(
                 f,
@@ -3934,6 +4088,188 @@ stages:
             matches!(&err, WorkflowDefError::InvalidPollPattern { stage, .. } if stage == "gate"),
             "{err}"
         );
+    }
+
+    // ---- backoff (#179) ----
+
+    fn poll_backoff_yaml(backoff: &str, timeout: &str) -> String {
+        format!(
+            "name: p\nstages:\n  w:\n    kind: poll\n    command: x\n    interval: 1m\n{backoff}{timeout}    on: {{ timeout: f }}\n  f:\n    kind: terminal\n"
+        )
+    }
+
+    fn gate_backoff_yaml(backoff: &str, timeout: &str) -> String {
+        format!(
+            "name: g\nstages:\n  w:\n    kind: human_gate\n    watch:\n      command: x\n      interval: 1m\n{backoff}{timeout}    on: {{ resumed: f, timeout: f }}\n  f:\n    kind: terminal\n"
+        )
+    }
+
+    fn poll_err(backoff: &str, timeout: &str) -> WorkflowDefError {
+        let dir = TempDir::new();
+        WorkflowDefinition::parse(&poll_backoff_yaml(backoff, timeout), &dir.path).unwrap_err()
+    }
+
+    fn gate_backoff_err(backoff: &str, timeout: &str) -> WorkflowDefError {
+        let dir = TempDir::new();
+        WorkflowDefinition::parse(&gate_backoff_yaml(backoff, timeout), &dir.path).unwrap_err()
+    }
+
+    const TWO_STEPS: &str = "    backoff:\n      - { after: 6h, interval: 5m }\n      - { after: 30h, interval: 30m }\n    timeout: 102h\n";
+
+    #[test]
+    fn backoff_parses_on_a_poll_and_on_a_gate_watch() {
+        let dir = TempDir::new();
+        let want = vec![
+            BackoffStep {
+                after: Duration::from_secs(6 * 3600),
+                interval: Duration::from_secs(300),
+            },
+            BackoffStep {
+                after: Duration::from_secs(30 * 3600),
+                interval: Duration::from_secs(1800),
+            },
+        ];
+        let poll = WorkflowDefinition::parse(&poll_backoff_yaml(TWO_STEPS, ""), &dir.path).unwrap();
+        assert_eq!(poll.stages["w"].watch().unwrap().backoff, want);
+        let gate_steps = TWO_STEPS
+            .replace("\n    ", "\n      ")
+            .replacen("    ", "      ", 1);
+        let gate =
+            WorkflowDefinition::parse(&gate_backoff_yaml(&gate_steps, ""), &dir.path).unwrap();
+        assert_eq!(gate.stages["w"].watch().unwrap().backoff, want);
+        // No timeout is fine, and no backoff means an empty list.
+        let no_timeout = "    backoff:\n      - { after: 1h, interval: 5m }\n";
+        assert!(WorkflowDefinition::parse(&poll_backoff_yaml(no_timeout, ""), &dir.path).is_ok());
+        let plain = WorkflowDefinition::parse(&poll_backoff_yaml("", ""), &dir.path).unwrap();
+        assert!(plain.stages["w"].watch().unwrap().backoff.is_empty());
+    }
+
+    #[test]
+    fn interval_at_picks_the_last_step_reached() {
+        let dir = TempDir::new();
+        let def = WorkflowDefinition::parse(&poll_backoff_yaml(TWO_STEPS, ""), &dir.path).unwrap();
+        let watch = def.stages["w"].watch().unwrap();
+        let s = Duration::from_secs;
+        let h = |n: u64| s(n * 3600);
+        for (elapsed, want) in [
+            (s(0), s(60)),
+            (h(6) - s(1), s(60)),
+            (h(6), s(300)),
+            (h(30) - s(1), s(300)),
+            (h(30), s(1800)),
+            (h(102) - s(1), s(1800)),
+        ] {
+            assert_eq!(watch.interval_at(elapsed), want, "{elapsed:?}");
+        }
+        let plain = WorkflowDefinition::parse(&poll_backoff_yaml("", ""), &dir.path).unwrap();
+        let plain = plain.stages["w"].watch().unwrap();
+        for elapsed in [s(0), h(6), h(30), h(102)] {
+            assert_eq!(plain.interval_at(elapsed), s(60));
+        }
+    }
+
+    #[test]
+    fn backoff_after_must_strictly_increase() {
+        for second in ["1h", "30m"] {
+            let steps = format!(
+                "    backoff:\n      - {{ after: 1h, interval: 5m }}\n      - {{ after: {second}, interval: 5m }}\n"
+            );
+            let err = poll_err(&steps, "");
+            assert!(
+                matches!(&err, WorkflowDefError::BackoffNotIncreasing { stage, field, after, previous }
+                    if stage == "w" && field == "backoff[1].after" && after == second && previous == "1h"),
+                "{err}"
+            );
+        }
+        let gate_steps = "      backoff:\n        - { after: 1h, interval: 5m }\n        - { after: 1h, interval: 5m }\n";
+        let err = gate_backoff_err(gate_steps, "");
+        assert!(
+            matches!(&err, WorkflowDefError::BackoffNotIncreasing { field, .. } if field == "watch.backoff[1].after"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn backoff_steps_must_come_before_the_timeout() {
+        for after in ["2h", "3h"] {
+            let steps = format!("    backoff:\n      - {{ after: {after}, interval: 5m }}\n");
+            let err = poll_err(&steps, "    timeout: 2h\n");
+            assert!(
+                matches!(&err, WorkflowDefError::BackoffStepNotBeforeTimeout { stage, field, after: a, timeout }
+                    if stage == "w" && field == "backoff[0].after" && a == after && timeout == "2h"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_backoff_is_rejected() {
+        let err = poll_err("    backoff: []\n", "");
+        assert!(
+            matches!(&err, WorkflowDefError::EmptyBackoff { stage, field } if stage == "w" && field == "backoff"),
+            "{err}"
+        );
+        let err = gate_backoff_err("      backoff: []\n", "");
+        assert!(
+            matches!(&err, WorkflowDefError::EmptyBackoff { field, .. } if field == "watch.backoff"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bad_backoff_duration_names_its_field() {
+        let cases = [
+            (
+                "    backoff:\n      - { after: soon, interval: 5m }\n",
+                "backoff[0].after",
+                "soon",
+            ),
+            (
+                "    backoff:\n      - { after: 1h, interval: 5m }\n      - { after: 2h, interval: later }\n",
+                "backoff[1].interval",
+                "later",
+            ),
+            (
+                "    backoff:\n      - { after: 3d, interval: 5m }\n",
+                "backoff[0].after",
+                "3d",
+            ),
+            (
+                "    backoff:\n      - { after: 1h, interval: 0s }\n",
+                "backoff[0].interval",
+                "0s",
+            ),
+        ];
+        for (steps, field, value) in cases {
+            let err = poll_err(steps, "");
+            assert!(
+                matches!(&err, WorkflowDefError::InvalidBackoffDuration { stage, field: f, value: v }
+                    if stage == "w" && f == field && v == value),
+                "{err}"
+            );
+        }
+        let err = gate_backoff_err(
+            "      backoff:\n        - { after: soon, interval: 5m }\n",
+            "",
+        );
+        assert!(
+            matches!(&err, WorkflowDefError::InvalidBackoffDuration { field, .. } if field == "watch.backoff[0].after"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("invalid watch.backoff[0].after 'soon'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_backoff_step_key_fails_the_load() {
+        let err = poll_err(
+            "    backoff:\n      - { after: 1h, interval: 5m, every: 2 }\n",
+            "",
+        );
+        assert!(matches!(err, WorkflowDefError::Yaml(_)), "{err}");
     }
 
     #[test]

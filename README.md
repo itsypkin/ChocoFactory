@@ -41,7 +41,7 @@ Handing a coding task to an AI agent and walking away goes wrong in familiar way
 
   See [Using choco with omp](docs/models.md#using-choco-with-omp).
 - **A separate reviewer.** A different agent, in its own session and read-only, reviews the change against the spec before any PR exists. Read-only is enforced: the daemon checks that the worktree didn't change.
-- **Loop guards and escalation.** Repeated rejections, repeated red CI, or no verdict from you for six hours park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck.
+- **Loop guards and escalation.** Repeated rejections, repeated red CI, or no verdict from you for about four days (checked every minute at first, then less often) park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck.
 - **Tasks survive restarts.** Everything lives in the daemon's database. Waits survive a restart. Interrupted agent turns are parked and can be retried, resuming the agent's session when possible.
 - **Your verdict lives on the PR.** Comment `/approve` or `/request-changes` on the pull request.
 - **One dashboard** (`choco dashboard`) for every task: what needs you, what's running, what's stuck.

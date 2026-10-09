@@ -147,6 +147,10 @@ pub struct TaskDetail {
     /// What the task has cost and how long it ran; `null` when no turn has
     /// recorded usage.
     pub usage: Option<TaskUsage>,
+    /// Set when the task is parked at a gate because a watcher timed out
+    /// (#179): which stage stopped watching, after how long, and where a
+    /// note goes. `null` otherwise.
+    pub watch_timed_out: Option<crate::engine::WatchTimedOutInfo>,
 }
 
 /// The worktree path and branch a `cancel --keep` handed to a person.
@@ -273,8 +277,13 @@ pub async fn get(
             None
         }
     };
+    let watch_timed_out = match &workflow_state {
+        Some(ws) => state.engine.watch_timed_out(&task, ws).await,
+        None => None,
+    };
     Ok(Json(TaskDetail {
         usage,
+        watch_timed_out,
         task,
         kept,
         workflow_state,
