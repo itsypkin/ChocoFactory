@@ -8,9 +8,9 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use super::{
-    AdapterError, AgentAdapter, AgentEvent, AgentHandle, BillingMode, InterruptionEvidence,
-    Isolation, ModelUsage, RoleConfig, RoleTool, TokenCounts, TurnUsage, UsageCounting,
-    report_instruction, usage_limit_text,
+    AdapterError, AgentAdapter, AgentEvent, AgentHandle, BackgroundJob, BillingMode,
+    InterruptionEvidence, Isolation, ModelUsage, RoleConfig, RoleTool, TokenCounts, TurnUsage,
+    UsageCounting, report_instruction, usage_limit_text,
 };
 
 /// Wraps `claude --print --output-format=stream-json --input-format=stream-json
@@ -637,6 +637,22 @@ fn normalize(
                 details: json!({ "init": init_summary(value) }),
             }]
         }
+        Some("system")
+            if value.get("subtype").and_then(Value::as_str) == Some("background_tasks_changed") =>
+        {
+            // The level is per CLI process: a list scoped to a sub-agent
+            // must not replace the main one.
+            if value
+                .get("parent_tool_use_id")
+                .is_some_and(|v| !v.is_null())
+            {
+                tracing::debug!("ignoring a sub-agent-scoped background_tasks_changed line");
+                return Vec::new();
+            }
+            vec![AgentEvent::BackgroundJobs {
+                running: parse_background_jobs(value),
+            }]
+        }
         Some("assistant") => normalize_assistant(value, tool_names),
         Some("user") => normalize_user(value, tool_names),
         Some("result") => normalize_result(value, *billing),
@@ -673,6 +689,45 @@ fn normalize(
             .collect(),
         None => events,
     }
+}
+
+/// The jobs listed by a `background_tasks_changed` line. Unparseable data
+/// never counts as a running job: it must not keep a turn alive.
+fn parse_background_jobs(value: &Value) -> Vec<BackgroundJob> {
+    let Some(tasks) = value.get("tasks").and_then(Value::as_array) else {
+        tracing::warn!("background_tasks_changed line has no `tasks` array; treating it as empty");
+        return Vec::new();
+    };
+    let mut running = Vec::new();
+    for task in tasks {
+        let Some(id) = task.get("task_id").and_then(Value::as_str) else {
+            tracing::warn!(%task, "dropping a background task entry without a string task_id");
+            continue;
+        };
+        let flag = |key: &str| task.get(key).and_then(Value::as_bool) == Some(true);
+        if flag("ambient") || flag("awaited") {
+            tracing::debug!(
+                task_id = id,
+                "dropping an ambient or awaited background task"
+            );
+            continue;
+        }
+        let kind = task
+            .get("task_type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let description = task
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .unwrap_or(id);
+        running.push(BackgroundJob {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            description: description.to_string(),
+        });
+    }
+    running
 }
 
 /// The parts of the CLI's `system/init` line worth keeping on the timeline
@@ -2452,5 +2507,100 @@ mod tests {
             &config,
         )
         .await;
+    }
+
+    fn jobs_of(line: &str) -> Vec<Vec<BackgroundJob>> {
+        normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown)
+            .into_iter()
+            .map(|event| match event {
+                AgentEvent::BackgroundJobs { running } => running,
+                other => panic!("expected BackgroundJobs, got {other:?}"),
+            })
+            .collect()
+    }
+
+    fn job(id: &str, kind: &str, description: &str) -> BackgroundJob {
+        BackgroundJob {
+            id: id.into(),
+            kind: kind.into(),
+            description: description.into(),
+        }
+    }
+
+    #[test]
+    fn a_background_tasks_line_lists_every_job_in_order() {
+        let line = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bvsrzxjlr","task_type":"local_bash","description":"Sleep 15 seconds then exit with code 3"},{"task_id":"a7e3de95f2a6e9192","task_type":"local_agent","subagent_type":"general-purpose","description":"Sleep 10 and reply DONE"}]}"#;
+        assert_eq!(
+            jobs_of(line),
+            vec![vec![
+                job(
+                    "bvsrzxjlr",
+                    "local_bash",
+                    "Sleep 15 seconds then exit with code 3"
+                ),
+                job(
+                    "a7e3de95f2a6e9192",
+                    "local_agent",
+                    "Sleep 10 and reply DONE"
+                ),
+            ]]
+        );
+    }
+
+    #[test]
+    fn an_empty_or_malformed_task_list_is_an_empty_event() {
+        let empty = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
+        assert_eq!(jobs_of(empty), vec![Vec::<BackgroundJob>::new()]);
+        let missing = r#"{"type":"system","subtype":"background_tasks_changed"}"#;
+        assert_eq!(jobs_of(missing), vec![Vec::<BackgroundJob>::new()]);
+        let string = r#"{"type":"system","subtype":"background_tasks_changed","tasks":"x"}"#;
+        assert_eq!(jobs_of(string), vec![Vec::<BackgroundJob>::new()]);
+        let mixed = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_type":"local_bash"},"x",{"task_id":"ok","task_type":"local_bash","description":"d"}]}"#;
+        assert_eq!(jobs_of(mixed), vec![vec![job("ok", "local_bash", "d")]]);
+    }
+
+    #[test]
+    fn ambient_and_awaited_entries_are_dropped_but_ambient_false_is_kept() {
+        let line = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a","task_type":"t","description":"a","ambient":true},{"task_id":"b","task_type":"t","description":"b","awaited":true},{"task_id":"c","task_type":"t","description":"c","ambient":false}]}"#;
+        assert_eq!(jobs_of(line), vec![vec![job("c", "t", "c")]]);
+    }
+
+    #[test]
+    fn a_sub_agent_scoped_task_list_produces_no_event() {
+        let line = r#"{"type":"system","subtype":"background_tasks_changed","parent_tool_use_id":"toolu_x","tasks":[{"task_id":"a","task_type":"t","description":"a"}]}"#;
+        assert!(jobs_of(line).is_empty());
+    }
+
+    #[test]
+    fn an_entry_without_type_or_description_gets_defaults() {
+        let line =
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"abc"}]}"#;
+        assert_eq!(jobs_of(line), vec![vec![job("abc", "unknown", "abc")]]);
+    }
+
+    #[test]
+    fn background_jobs_persist_as_a_session_note() {
+        let event = AgentEvent::BackgroundJobs {
+            running: vec![
+                job("a", "local_bash", "first"),
+                job("b", "local_agent", "second"),
+            ],
+        };
+        assert_eq!(event.event_type(), EventType::SessionNote);
+        let payload = event.payload();
+        assert_eq!(payload["kind"], "background_jobs");
+        assert_eq!(
+            payload["message"],
+            "2 background job(s) running: first; second"
+        );
+        assert_eq!(
+            payload["running"],
+            json!([
+                {"id": "a", "kind": "local_bash", "description": "first"},
+                {"id": "b", "kind": "local_agent", "description": "second"},
+            ])
+        );
+        let none = AgentEvent::BackgroundJobs { running: vec![] }.payload();
+        assert_eq!(none["message"], "no background jobs running");
     }
 }

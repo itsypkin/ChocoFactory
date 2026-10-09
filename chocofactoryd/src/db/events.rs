@@ -203,6 +203,10 @@ pub async fn list_for_session(
 /// far larger than the reply and is only needed here as a boundary marker, so
 /// the query selects its type and discards its payload in SQL.
 ///
+/// `background_jobs` session notes are skipped too (#271): the CLI's job list
+/// can change between the final reply and its `result`, and that must not cut
+/// the reply off. Other session notes, `job_wait` included, still end a message.
+///
 /// Two kinds of row on the session are skipped outright rather than scanned
 /// (#90): a sub-agent's own events (`parent_tool_use_id` set), which are not
 /// the main agent speaking even though the CLI streams them on the same
@@ -240,10 +244,12 @@ pub async fn final_assistant_text_for_session(
          WHERE session_id = ?
            AND json_extract(payload, '$.parent_tool_use_id') IS NULL
            AND json_extract(payload, '$.after_completion') IS NULL
+           AND NOT (event_type = ? AND json_extract(payload, '$.kind') = 'background_jobs')
          ORDER BY created_at, id",
     )
     .bind(&assistant)
     .bind(session_id)
+    .bind(EventType::SessionNote.to_string())
     .fetch_all(pool)
     .await?;
 
@@ -1593,6 +1599,60 @@ mod tests {
                 .await
                 .unwrap(),
             "all done"
+        );
+    }
+
+    /// #271: the CLI's job list can change between the final reply and its
+    /// `result`; that must not erase the reply. A nudge still ends a message.
+    #[tokio::test]
+    async fn a_background_jobs_note_does_not_end_the_final_answer() {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        append_all(
+            &pool,
+            &session_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "final answer" }),
+                ),
+                (
+                    EventType::SessionNote,
+                    json!({ "kind": "background_jobs", "message": "no background jobs running" }),
+                ),
+                (EventType::TurnCompleted, json!({ "is_error": false })),
+            ],
+        )
+        .await;
+        assert_eq!(
+            final_assistant_text_for_session(&pool, &session_id)
+                .await
+                .unwrap(),
+            "final answer"
+        );
+
+        let other = seed_session(&pool).await;
+        append_all(
+            &pool,
+            &other,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "final answer" }),
+                ),
+                (
+                    EventType::SessionNote,
+                    json!({ "kind": "nudge", "message": "asked the agent to report" }),
+                ),
+                (EventType::TurnCompleted, json!({ "is_error": false })),
+            ],
+        )
+        .await;
+        assert_eq!(
+            final_assistant_text_for_session(&pool, &other)
+                .await
+                .unwrap(),
+            ""
         );
     }
 }

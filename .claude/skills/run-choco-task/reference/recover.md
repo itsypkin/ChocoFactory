@@ -23,8 +23,9 @@ and `choco task list --status stuck` finds every stuck task.
   `choco task reconfigure <id> --role-cli <role>=claude` (and `--role-model`),
   then `choco task retry <id> --fresh`, since a session can't resume on a
   different CLI.
-- `no_report`: the turn never called `report_outcome`, was nudged, and was
-  closed. There is no outcome to route on, so read its last events before
+- `no_report`: the turn never called `report_outcome`, was nudged (or, with
+  a background job still running, waited 60 minutes; its `session_note` names
+  the jobs), and was closed. There is no outcome to route on, so read its last events before
   retrying.
 - `lingered`: a process outlived its reported turn and was killed. Something
   it started may still have been writing to the worktree, so check

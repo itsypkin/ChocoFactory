@@ -199,6 +199,14 @@ when it ends *after* the agent called `report_outcome`:
 - A turn that ends without reporting is left open. After 5 minutes with no
   output it's nudged (up to 3 times); after that it's closed, and the task is
   marked `stuck`.
+- The exception is a turn whose own background job is still running. On
+  Claude Code, the CLI reports the session's running background jobs, and
+  while any are running a report-less turn is not nudged. A `job_wait`
+  `session_note` marks the start of the wait. If the turn is still waiting 60
+  minutes after the wait began (a new wait, after the CLI wakes the agent and
+  it ends again without reporting, gets a fresh 60 minutes), it's closed as `no_report` with a `session_note`
+  that names the jobs; once the jobs are gone the nudge rule above applies
+  again. Roles on omp keep the nudge rule.
 - Once a turn has reported and ended, its process has 30 seconds to exit. If
   it's still running, its whole process group is killed and the task is
   marked `stuck`, rather than advancing past work that may still be landing.

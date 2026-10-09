@@ -222,6 +222,29 @@ pub enum AgentEvent {
         parent_tool_use_id: String,
         event: Box<AgentEvent>,
     },
+    /// The full list of background jobs the CLI says are running right now
+    /// (#271). A level signal: each one replaces the previous list. Only the
+    /// claude adapter sends it.
+    BackgroundJobs {
+        running: Vec<BackgroundJob>,
+    },
+}
+
+/// One background job (a background shell command or sub-agent) the CLI
+/// reports as running. `kind` and `description` are display-only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackgroundJob {
+    pub id: String,
+    pub kind: String,
+    pub description: String,
+}
+
+/// The jobs' descriptions joined by "; ", for every message that names them.
+pub fn describe_jobs(jobs: &[BackgroundJob]) -> String {
+    jobs.iter()
+        .map(|job| job.description.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// What one turn used, as its CLI reported it. Part of the adapter
@@ -331,6 +354,7 @@ impl AgentEvent {
             AgentEvent::Error { .. } | AgentEvent::Interrupted { .. } => EventType::Error,
             AgentEvent::TurnCompleted { .. } => EventType::TurnCompleted,
             AgentEvent::Subagent { event, .. } => event.event_type(),
+            AgentEvent::BackgroundJobs { .. } => EventType::SessionNote,
         }
     }
 
@@ -381,6 +405,29 @@ impl AgentEvent {
             }),
             AgentEvent::TurnCompleted { is_error, .. } => {
                 serde_json::json!({ "is_error": is_error })
+            }
+            AgentEvent::BackgroundJobs { running } => {
+                let message = if running.is_empty() {
+                    "no background jobs running".to_string()
+                } else {
+                    format!(
+                        "{} background job(s) running: {}",
+                        running.len(),
+                        describe_jobs(running)
+                    )
+                };
+                serde_json::json!({
+                    "kind": "background_jobs",
+                    "message": message,
+                    "running": running
+                        .iter()
+                        .map(|job| serde_json::json!({
+                            "id": job.id,
+                            "kind": job.kind,
+                            "description": job.description,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
             }
             AgentEvent::Subagent {
                 parent_tool_use_id,
