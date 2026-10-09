@@ -118,7 +118,8 @@ daemon; a snippet that only loads (parses, prints `--help`) has not been
 taken.
 
 The route below acts only on the daemon it started: `${t:?}` aborts if
-`t` is empty or lost between shell calls (set it again in each call),
+`t` is empty or lost between shell calls (set `t` to the same literal path
+in each later call; never run `mktemp` again),
 `env -u` clears an exported `CHOCO_BASE_URL`, and each later command
 needs the lock file, because without it `choco` falls back to the
 operator's daemon.
