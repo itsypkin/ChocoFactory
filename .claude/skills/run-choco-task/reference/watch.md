@@ -2,7 +2,6 @@
 
 ## Contents
 - Waiting with `--until`
-- Polling every way a task can stop
 - Reading a stage's verdict text
 - Watching commits in a revise lap
 - Stage times
@@ -10,47 +9,29 @@
 
 ## Waiting with `--until`
 
-`choco task status <id> --until stage:awaiting_human_review --timeout 2h`
-waits for one stage. The exit code says how it ended:
+`choco task status <id> --until attention --timeout <dur>` waits for every
+stop that needs you: the task is open at a `human_gate` stage
+(`spec_questions`, `awaiting_human_review`, `escalate_to_human`, or any gate
+a custom workflow defines), or it is stuck, cancelled or closed. It looks at
+the current state only, so started while the task already sits at a gate it
+returns at once. The exit code says how it ended:
 
-| Exit | Meaning |
+| Exit | Meaning under `attention` |
 |---|---|
-| 0 | target reached |
+| 0 | waiting for you at a gate; stderr names the stage |
 | 1 | error (unknown task, daemon unreachable) |
-| 3 | became `stuck` |
+| 3 | `stuck` |
 | 4 | cancelled |
 | 5 | `--timeout` elapsed |
-| 6 | closed without reaching the target |
+| 6 | closed |
 
-A task parked at `escalate_to_human` stays `open`, so an `--until` for
-another stage runs to its `--timeout`.
-
-## Polling every way a task can stop
-
-To notice every way it can stop (ready for review, escalated, waiting for
-your answers, ended), poll the JSON in the background instead (needs `jq`).
-It prints the status and stage it stopped on, and exits 1 if `choco` or `jq`
-fails:
-
-```bash
-id=<task-id>
-(
-  while :; do
-    json=$(choco --json task status "$id") || exit 1
-    state=$(printf '%s\n' "$json" | jq -r '"\(.status) \(.workflow_state.stage_kind) \(.workflow_state.current_stage)"') || exit 1
-    case $state in
-      "open human_gate "* | stuck\ * | cancelled\ * | closed\ *)
-        echo "$state"; exit 0 ;;
-    esac
-    sleep 60
-  done
-)
-```
-
-The parentheses keep `exit` from closing your shell. After you vote, the
-task stays at `awaiting_human_review` for up to a minute until the poll
-reads your comment, so wait for the stage to change first, for example
-`choco task status <id> --until stage:revising --timeout 5m`.
+After a PR vote (a `/approve` or `/request-changes` comment) the task stays
+at `awaiting_human_review` until the daemon's poll reads the comment, up to
+a minute. A fresh `--until attention` would return at once, so wait for the
+stage to change first, for example
+`choco task status <id> --until stage:revising --timeout 5m`, then wait on
+`attention` again. A `choco task send` reply moves the task off the gate
+before the command returns, so `--until attention` can follow it directly.
 
 ## Reading a stage's verdict text
 

@@ -37,6 +37,9 @@ pub enum Until {
     Status(String),
     /// The task has entered this stage (`stage:<name>`).
     Stage(String),
+    /// The task needs the user: open at a `human_gate` stage, or stuck,
+    /// cancelled or closed.
+    Attention,
 }
 
 impl FromStr for Until {
@@ -44,11 +47,12 @@ impl FromStr for Until {
 
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
+            "attention" => Ok(Until::Attention),
             "closed" | "cancelled" | "stuck" => Ok(Until::Status(s.to_string())),
             _ => match s.strip_prefix("stage:") {
                 Some(name) if !name.is_empty() => Ok(Until::Stage(name.to_string())),
                 _ => Err(format!(
-                    "'{s}' is not a valid target — use closed, cancelled, stuck or stage:<name>"
+                    "'{s}' is not a valid target — use attention, closed, cancelled, stuck or stage:<name>"
                 )),
             },
         }
@@ -60,6 +64,7 @@ impl fmt::Display for Until {
         match self {
             Until::Status(s) => write!(f, "{s}"),
             Until::Stage(s) => write!(f, "stage:{s}"),
+            Until::Attention => write!(f, "attention"),
         }
     }
 }
@@ -239,6 +244,9 @@ pub enum TaskCmd {
     ///   5  --timeout elapsed first
     ///   6  the task closed without reaching the target
     ///
+    /// With --until attention the codes mean: 0 the task is open at a
+    /// human_gate stage (stderr names it); 3 stuck; 4 cancelled; 6 closed.
+    ///
     /// --live alone does not stop at stuck (a human may retry it).
     #[command(verbatim_doc_comment)]
     #[command(group(ArgGroup::new("watching").args(["live", "until"]).multiple(true)))]
@@ -251,7 +259,9 @@ pub enum TaskCmd {
         #[arg(long)]
         live: bool,
         /// Block until the task reaches TARGET, then exit 0: `closed`,
-        /// `cancelled`, `stuck`, or `stage:<name>`. Implies watching.
+        /// `cancelled`, `stuck`, `stage:<name>`, or `attention` (the task
+        /// needs you: open at a human_gate stage, or stuck, cancelled or
+        /// closed; looks at the current state only). Implies watching.
         #[arg(long, value_name = "TARGET")]
         until: Option<Until>,
         /// Poll cadence, `<integer><s|m|h>`. Needs --live or --until.
