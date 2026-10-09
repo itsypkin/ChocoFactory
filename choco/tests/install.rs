@@ -708,6 +708,7 @@ fn forced_update_replaces_binaries_rewrites_the_marker_and_restarts_the_daemon()
     let marker: Value =
         serde_json::from_str(&std::fs::read_to_string(env.marker()).unwrap()).unwrap();
     assert_eq!(marker["version"], VERSION);
+    assert!(!stderr(&out).contains("is talking to"), "{}", text(&out));
     let new = env.running();
     assert_ne!(new.pid, old.pid);
     assert_eq!(new.port, old.port);
@@ -722,6 +723,57 @@ fn forced_update_replaces_binaries_rewrites_the_marker_and_restarts_the_daemon()
             .to_string_lossy()
             .starts_with(".choco-update")
     }));
+}
+
+#[test]
+fn update_judges_the_started_daemon_against_the_installed_version() {
+    let env = Env::new();
+    // A release whose daemon claims 9.9.9 (then execs the real one, which
+    // reports VERSION), so the installed version differs from this choco's.
+    let stage = env.home.join("stage");
+    let out_dir = env.home.join("stage-out");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::copy(target_dir().join("choco"), stage.join("choco")).unwrap();
+    let wrapper = stage.join("chocofactoryd");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"chocofactoryd 9.9.9 (dev build)\"; exit 0; fi\nexec '{}' \"$@\"\n",
+            target_dir().join("chocofactoryd").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let packed = package(host_target(), &stage, &out_dir);
+    assert!(packed.status.success(), "{}", text(&packed));
+    let archive = std::fs::read(out_dir.join(asset())).unwrap();
+
+    env.install_from_archive();
+    let old = env.start_daemon();
+    let server = Server::new();
+    server.release(Some("9.9.9"), &archive, sums_for(&archive), "9.9.9");
+    let out = env.choco(&server.url, &["update", "--version", "9.9.9"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        stdout(&out).contains(&format!("updated {VERSION} → 9.9.9")),
+        "{}",
+        text(&out)
+    );
+    let err = stderr(&out);
+    assert_eq!(err.matches("is talking to").count(), 1, "{}", text(&out));
+    assert!(
+        err.contains(&format!(
+            "warning: choco 9.9.9 is talking to chocofactoryd {VERSION}"
+        )),
+        "{}",
+        text(&out)
+    );
+    let new = env.running();
+    assert_ne!(new.pid, old.pid);
+    assert_eq!(new.port, old.port);
+    let marker: Value =
+        serde_json::from_str(&std::fs::read_to_string(env.marker()).unwrap()).unwrap();
+    assert_eq!(marker["version"], "9.9.9");
 }
 
 fn blocking_claude(home: &Path) -> PathBuf {

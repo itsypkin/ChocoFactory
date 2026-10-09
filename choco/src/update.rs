@@ -361,8 +361,13 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
     } else {
         Ok(())
     };
+    // The daemon now on disk reports `new_version`, unless nothing was replaced.
+    let daemon_version: &str = match &replaced {
+        Err(ReplaceFailure::NothingReplaced(_)) => VERSION,
+        _ => &new_version,
+    };
     let restart_result = match old_port {
-        Some(port) => start_daemon(&root, &new_daemon, Some(port))
+        Some(port) => start_daemon(&root, &new_daemon, Some(port), daemon_version)
             .await
             .map(|_| ()),
         None => Ok(()),
@@ -370,7 +375,11 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
     let restart_note = restart_result
         .err()
         .map(|e| format!("chocofactoryd did not restart: {e}"));
-    if let Some(e) = replaced.err().or(marker_result.err()) {
+    if let Some(e) = replaced
+        .err()
+        .map(ReplaceFailure::into_message)
+        .or(marker_result.err())
+    {
         return Err(match restart_note {
             Some(n) => format!("{e}; also, {n}"),
             None => e,
@@ -383,19 +392,35 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
     Ok(0)
 }
 
-fn replace_binaries(src: &Path, dir: &Path, new_version: &str) -> Result<(), Failure> {
+/// How `replace_binaries` failed, so the caller knows which daemon is on disk.
+enum ReplaceFailure {
+    /// The daemon rename failed: both binaries are still the old ones.
+    NothingReplaced(Failure),
+    /// The daemon was replaced but choco was not.
+    ChocoNotReplaced(Failure),
+}
+
+impl ReplaceFailure {
+    fn into_message(self) -> Failure {
+        match self {
+            Self::NothingReplaced(m) | Self::ChocoNotReplaced(m) => m,
+        }
+    }
+}
+
+fn replace_binaries(src: &Path, dir: &Path, new_version: &str) -> Result<(), ReplaceFailure> {
     let daemon_to = dir.join("chocofactoryd");
     std::fs::rename(src.join("chocofactoryd"), &daemon_to).map_err(|e| {
-        format!(
+        ReplaceFailure::NothingReplaced(format!(
             "cannot replace {}: {e}; nothing was replaced",
             daemon_to.display()
-        )
+        ))
     })?;
     let choco_to = dir.join("choco");
     std::fs::rename(src.join("choco"), &choco_to).map_err(|e| {
-        format!(
+        ReplaceFailure::ChocoNotReplaced(format!(
             "chocofactoryd is now {new_version}, choco is still {VERSION}; rerun `choco update --force` (cannot replace {}: {e})",
             choco_to.display()
-        )
+        ))
     })
 }
