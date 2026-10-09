@@ -155,7 +155,7 @@ explicit out-of-scope list.
 - **Check that the design holds, not only that it builds.** List every way a
   protected event can end and say whether the protection runs on each. Also
   grep for statements the change makes false and probe a new prompt rule on
-  the role's model; see
+  the production model the role runs in the workflow; see
   [reference/spec.md](reference/spec.md#check-that-the-design-holds).
 - **Abandoned operations.** For anything that can time out, be cancelled or
   lose its client, the spec states what it leaves behind (locks, rows,
@@ -190,7 +190,8 @@ explicit out-of-scope list.
 - **Docs-only task:** every link and anchor resolves (from a copy outside the
   repo, for a skill or doc meant to be copied), every command matches `--help`,
   no fact is lost, and for a skill or doc meant to be copied every snippet
-  route is taken on a throwaway daemon; see
+  route is taken on a throwaway daemon (by the operator, not the coder, when it
+  needs an agent turn or GitHub); see
   [reference/spec.md](reference/spec.md#docs-only-tasks).
 - **Text an agent or a reader acts on** (a prompt, a skill, docs): the spec
   carries behavioural acceptance criteria and names the runs that prove them;
@@ -252,7 +253,9 @@ an independent reviewer do it, and look for what agents systematically miss:
   the main fix in a scratch copy and confirm a test fails.
 - **Claims are not evidence.** Code comments ("deliberately untested"),
   commit messages and "addressed in <sha>" replies are claims to verify. A coder's
-  "not re-run" on a run the spec requires is an unmet requirement.
+  "not re-run" on a run the spec requires is an unmet requirement, unless it
+  reported the run as not made, with the reason, and stopped for you. Every
+  required run has a budget in the spec.
 - **Numbered artifacts** (migrations above all) against what has landed on
   the default branch since the task started.
 - **New messages and states**: read each one with the values its own path
