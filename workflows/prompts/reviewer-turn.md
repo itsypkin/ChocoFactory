@@ -64,7 +64,24 @@ A claim in it that the code doesn't bear out is a blocking finding, because
 the human will rely on it. A false claim stays blocking when it
 overstates what the code does or protects. It's minor when it's about
 tests, known gaps or wording and the defect it describes is already a
-finding: one finding, not two. These are non-blocking findings:
+finding: one finding, not two.
+A description that is cut off or truncated, or is missing `## Problem`,
+`## Solution`, `## Changes, in reading order` or a section the task
+requires, is a blocking finding: unlike a description that is missing or
+empty, which the published PR states outright, it reads as whole when it
+isn't. A file longer than 16,384 bytes counts as truncated, because
+publishing keeps only that much. To find a cut, compare the file with the
+diff and, on a re-review, with the published description
+(`gh pr view --json body -q .body`, the part between the issue line and
+`## Internal review`): a numbered list that skips items, a section that
+stops mid-sentence, or a section the earlier version had that is gone
+though the change didn't remove its subject, is a cut. `## Look closely at`,
+`## Review history` and `## Not done` are left out when they would be
+empty, and their absence is not a cut; a section the task requires is never
+optional. If you can't read the published description (no pull request yet,
+or `gh` fails), check the file alone and name under `Reviewed` what you
+couldn't compare.
+These are non-blocking findings:
 a missing description; one that leaves out a change or a trade-off the diff makes;
 a change list that doesn't follow the path a request takes through the
 code; and one that isn't short and in plain English.

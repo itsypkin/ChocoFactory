@@ -127,6 +127,20 @@ hardened everywhere except the points that wait on an answer.
      through the worst case. Require one test that renders every fixture
      at every size from the minimum up and asserts the invariants.
    - The done criteria name one test per fail-closed path they mention.
+   - When the spec takes a counter or a running total as its source of
+     truth, list everything that can move it down or reset it (a restart, a
+     retry, a compaction, a rollover) and say how the design handles each.
+     When nothing can, say so and cite what you grepped or ran. When the
+     counter belongs to an external tool and the run rule doesn't let you
+     make it drop, mark the claim that it only rises **unverified** and name
+     the probe the coder must run, as in check 4.
+   - When the spec builds a key (an identifier, lookup key or match string)
+     in two places and matches the two across, it says to build it once and
+     share the builder. When the two places can't share code (different
+     languages or processes, or keys an older version already stored), the
+     spec still names one canonical form and requires a test that builds the
+     key on both sides from the same inputs, empty and missing parts
+     included, and asserts they are equal.
    - Like the other checks, you fix what you find yourself. A soundness
      gap is a reason to stop only under the stop conditions above.
 
