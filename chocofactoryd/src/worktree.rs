@@ -725,20 +725,85 @@ async fn run_git_resolve(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let output = match timeout {
-        Some(limit) => match tokio::time::timeout(limit, cmd.output()).await {
+        // Not kill_on_drop: that sends SIGKILL, which leaves a ref
+        // `.lock` file behind if git is mid-fetch. `TermOnDrop` sends
+        // SIGTERM, which git cleans up after.
+        .kill_on_drop(false);
+    let child = cmd.spawn().map_err(WorktreeError::Spawn)?;
+    let mut guard = TermOnDrop(Some(child));
+    let child = guard.0.as_mut().expect("child present");
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let work = async {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let read_out = async {
+            if let Some(s) = stdout.as_mut() {
+                s.read_to_end(&mut out).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let read_err = async {
+            if let Some(s) = stderr.as_mut() {
+                s.read_to_end(&mut err).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let (a, b) = tokio::join!(read_out, read_err);
+        a?;
+        b?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, out, err))
+    };
+    let result = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, work).await {
             Ok(result) => result,
-            Err(_) => return Ok(Ran::TimedOut),
+            Err(_) => {
+                // Dropping `guard` below SIGTERMs git and reaps it.
+                drop(guard);
+                return Ok(Ran::TimedOut);
+            }
         },
-        None => cmd.output().await,
+        None => work.await,
     }
     .map_err(WorktreeError::Spawn)?;
+    guard.0 = None;
+    let (status, out, err) = result;
     Ok(Ran::Done(GitRun {
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        code: status.code(),
+        stdout: String::from_utf8_lossy(&out).trim().to_string(),
+        stderr: String::from_utf8_lossy(&err).trim().to_string(),
     }))
+}
+
+/// Sends SIGTERM to a still-running git when dropped (timeout or a cancelled
+/// request) and reaps it in the background, escalating to SIGKILL after a
+/// grace period. SIGTERM lets git remove the ref lock files it holds.
+struct TermOnDrop(Option<tokio::process::Child>);
+
+impl Drop for TermOnDrop {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if let Some(pid) = child.id() {
+            // SAFETY: plain signal to a child pid we own and have not reaped.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if tokio::time::timeout(Duration::from_secs(10), child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = child.kill().await;
+                }
+            });
+        }
+    }
 }
 
 fn timed_out_text(limit: Duration) -> String {
@@ -915,6 +980,7 @@ async fn fetch_and_resolve(
         repo,
         &[
             "fetch",
+            "--no-tags",
             "--no-write-fetch-head",
             "--end-of-options",
             remote,

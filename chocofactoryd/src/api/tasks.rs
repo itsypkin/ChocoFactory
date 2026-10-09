@@ -52,17 +52,30 @@ pub async fn create(
             ));
         }
     };
-    let task = state
-        .engine
-        .create_task_from(
-            &body.project_id,
-            workflow,
-            &body.title,
-            &body.prompt,
-            body.config.unwrap_or_else(|| json!({})),
-            body.base.as_deref(),
-        )
-        .await?;
+    // Run the create on its own task: a client that disconnects drops this
+    // handler, and a create dropped between the row insert and the first
+    // stage would leave an `open` row with no stage. Spawned, it always ends
+    // with a complete task or nothing.
+    let engine = state.engine.clone();
+    let config = body.config.unwrap_or_else(|| json!({}));
+    let project_id = body.project_id;
+    let title = body.title;
+    let prompt = body.prompt;
+    let base = body.base;
+    let task = tokio::spawn(async move {
+        engine
+            .create_task_from(
+                &project_id,
+                workflow,
+                &title,
+                &prompt,
+                config,
+                base.as_deref(),
+            )
+            .await
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("create task aborted: {e}")))??;
     Ok((StatusCode::CREATED, Json(task)))
 }
 

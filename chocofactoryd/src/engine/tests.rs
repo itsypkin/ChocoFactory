@@ -15785,3 +15785,102 @@ async fn start_task_on_a_row_without_a_base_forks_from_the_repo_head() {
         head
     );
 }
+
+/// Installs a `reference-transaction` hook that stalls every fetch at the
+/// `prepared` step, i.e. while git holds the ref's `.lock` file.
+fn stall_ref_transactions(repo: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = repo.join(".git/hooks/reference-transaction");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nif [ \"$1\" = prepared ]; then sleep 30 >/dev/null 2>&1; fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn lock_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            lock_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "lock") {
+            out.push(path);
+        }
+    }
+}
+
+/// Waits (git needs a moment after SIGTERM) for the repo to hold no lock file.
+async fn assert_no_lock_files_soon(repo: &Path) {
+    let mut found = Vec::new();
+    for _ in 0..50 {
+        found.clear();
+        lock_files(&repo.join(".git"), &mut found);
+        if found.is_empty() {
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+    panic!("lock files left behind: {found:?}");
+}
+
+#[tokio::test]
+async fn a_timed_out_fetch_leaves_no_lock_file_and_the_next_create_works() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    fx.advance("main").await;
+    stall_ref_transactions(&fx.clone);
+    env.engine
+        .set_base_network_timeout(StdDuration::from_secs(2));
+
+    let err = env
+        .create_wt(&fx.clone, Some("origin/main"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CreateTaskError::Base(worktree::BaseError::Remote { .. })
+        ),
+        "{err:?}"
+    );
+    assert_no_lock_files_soon(&fx.clone).await;
+
+    fs::remove_file(fx.clone.join(".git/hooks/reference-transaction")).unwrap();
+    env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cancelled_create_leaves_no_lock_file_and_the_next_create_works() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    fx.advance("main").await;
+    stall_ref_transactions(&fx.clone);
+
+    // Drop the create mid-fetch, as a disconnecting client would.
+    let dropped = tokio::time::timeout(
+        StdDuration::from_secs(2),
+        env.create_wt(&fx.clone, Some("origin/main")),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the stalled create should still be running"
+    );
+    assert_no_lock_files_soon(&fx.clone).await;
+
+    fs::remove_file(fx.clone.join(".git/hooks/reference-transaction")).unwrap();
+    env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_base_fetch_writes_no_tags_into_the_repo() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    fx.advance("main").await;
+    git(&fx.pusher, &["tag", "v-from-remote", "main"]).await;
+    git(&fx.pusher, &["push", "-q", "origin", "v-from-remote"]).await;
+
+    env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
+    assert_eq!(git_out(&fx.clone, &["tag", "--list"]).await, "");
+}
