@@ -15363,13 +15363,13 @@ async fn a_base_that_looks_like_a_refspec_is_not_fetched() {
         .create_wt(&fx.clone, Some("origin/a:refs/heads/main"))
         .await
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            CreateTaskError::Base(worktree::BaseError::UnknownRef { .. })
-        ),
-        "{err:?}"
-    );
+    // Resolved locally (git's own rev-parse wording), never handed to fetch.
+    match &err {
+        CreateTaskError::Base(worktree::BaseError::UnknownRef { stderr, .. }) => {
+            assert!(stderr.contains("single revision"), "{stderr}")
+        }
+        other => panic!("expected UnknownRef, got {other:?}"),
+    }
     assert_eq!(
         git_out(&fx.clone, &["rev-parse", "refs/heads/main"]).await,
         local_main
