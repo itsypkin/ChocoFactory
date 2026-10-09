@@ -116,9 +116,8 @@ command in step 3 and the pre-merge check in step 4.
 - **A repo can override a built-in.** If the *project's* repo has
   `.chocofactory/workflows/<name>.yaml`, that file wins over the built-in of
   that name, and choco updates don't change it (`choco project
-  init-workflows` creates exactly that folder). Customising workflows is out
-  of scope here; see
-  [Customising workflows](https://github.com/itsypkin/ChocoFactory#customising-workflows).
+  init-workflows` creates exactly that folder). To change a workflow, see
+  the [customize-choco-workflow skill](../customize-choco-workflow/SKILL.md).
 - **Don't stop or restart the daemon while an agent turn or shell step
   runs.** `stop` and `restart` refuse (see [Cost and safety](#cost-and-safety)).
   Tasks waiting on a poll or a human survive a restart.

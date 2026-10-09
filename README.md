@@ -159,13 +159,19 @@ A task's workflow comes from the first of these that matches:
 
 **Trust warning:** a repo's workflows, and any `--workflow` file, can run shell commands as you. Only point choco at repos and files you trust.
 
-More in [docs/workflows.md](docs/workflows.md).
+More in [docs/workflows.md](docs/workflows.md). The `customize-choco-workflow` skill (see below) helps pick the lightest way to change a workflow and edit it safely.
 
 ## Using choco from Claude Code
 
-The `run-choco-task` skill teaches Claude Code to drive a coding task
-end to end: write the spec, watch the task, review its PR and recover it.
-Copy the whole skill folder, including `scripts/` and `reference/`, into
+Two skills are available:
+
+- `run-choco-task` teaches Claude Code to drive a coding task end to end:
+  write the spec, watch the task, review its PR and recover it.
+- `customize-choco-workflow` helps you change a workflow: it picks between a
+  per-task override, a workflow file and a repo workflow, and gives the
+  rules for editing safely.
+
+Copy the whole skill folders, including `scripts/` and `reference/`, into
 your repo's `.claude/skills/` (or `~/.claude/skills/` for every repo). From
 the repo's root:
 
@@ -174,19 +180,19 @@ dest=.claude/skills    # or ~/.claude/skills for every repo
 ver=$(choco --version | awk '{print $2}')
 d=$(mktemp -d) &&
   git -c advice.detachedHead=false clone --depth 1 --filter=blob:none --sparse --branch "v$ver" https://github.com/itsypkin/ChocoFactory.git "$d" &&
-  git -C "$d" sparse-checkout set .claude/skills/run-choco-task &&
-  mkdir -p "$dest" && rm -rf "$dest/run-choco-task" &&
-  cp -R "$d/.claude/skills/run-choco-task" "$dest/" &&
+  git -C "$d" sparse-checkout set .claude/skills/run-choco-task .claude/skills/customize-choco-workflow &&
+  mkdir -p "$dest" && rm -rf "$dest/run-choco-task" "$dest/customize-choco-workflow" &&
+  cp -R "$d/.claude/skills/run-choco-task" "$d/.claude/skills/customize-choco-workflow" "$dest/" &&
   rm -rf "$d"
 ```
 
-- `--branch "v$ver"` takes the skill from the release you run. The skill
-  describes that release only, so fetch it again after `choco update`.
+- `--branch "v$ver"` takes the skills from the release you run. They
+  describe that release only, so fetch it again after `choco update`.
   Without `--branch` you get `main`'s copy, which can describe behaviour
   newer than your choco.
 - A clone keeps `scripts/tail-events.sh` executable. If you fetch the files
   another way, such as the GitHub contents API, `chmod +x` it.
-- A new Claude Code session finds the skill. In a running session, if the
+- A new Claude Code session finds the skills. In a running session, if the
   `skills/` folder you copied into didn't exist when it started, run
   `/reload-skills` or start a new session.
 
