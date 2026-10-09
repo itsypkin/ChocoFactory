@@ -584,6 +584,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -659,6 +661,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -705,6 +709,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -785,6 +791,8 @@ mod tests {
             config: json!({}),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         };
         let first = tasks::create(&pool, new_task("A")).await.unwrap().id;
         let second = tasks::create(&pool, new_task("B")).await.unwrap().id;
@@ -825,6 +833,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -875,6 +885,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -946,6 +958,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await

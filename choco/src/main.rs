@@ -352,6 +352,7 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                     title: &args.title,
                     prompt: &args.prompt,
                     config,
+                    base: args.base.as_deref(),
                 })
                 .await?;
             Ok(Output::Task(task))

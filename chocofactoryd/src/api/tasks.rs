@@ -33,6 +33,10 @@ pub struct CreateTaskRequest {
     pub prompt: String,
     #[serde(default)]
     pub config: Option<Value>,
+    /// Commit to fork the task's worktree from (see `choco task create
+    /// --base`). Only valid for a workflow that creates a worktree.
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 pub async fn create(
@@ -56,6 +60,7 @@ pub async fn create(
             &body.title,
             &body.prompt,
             body.config.unwrap_or_else(|| json!({})),
+            body.base.as_deref(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(task)))
@@ -453,6 +458,109 @@ mod tests {
         project["id"].as_str().unwrap().to_string()
     }
 
+    const WT_YAML: &str = "name: wt\nworktree: true\nstages:\n  run:\n    kind: shell\n    command: \"true\"\n    on: { done: hold }\n  hold:\n    kind: human_gate\n    on: { resumed: finished }\n  finished:\n    kind: terminal\n";
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn repo_in(server: &TestServer) -> std::path::PathBuf {
+        let repo = server.temp_dir().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("a"), "a").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        repo
+    }
+
+    async fn post_wt(
+        server: &TestServer,
+        project_id: &str,
+        workflow: &str,
+        repo: &std::path::Path,
+        base: Option<&str>,
+    ) -> crate::api::tests::TestResponse {
+        let mut body = json!({
+            "project_id": project_id,
+            "workflow_def": workflow,
+            "title": "t",
+            "prompt": "hi",
+            "config": { "cwd": repo.to_string_lossy() },
+        });
+        if let Some(base) = base {
+            body["base"] = json!(base);
+        }
+        server.post("/tasks", body).await
+    }
+
+    #[tokio::test]
+    async fn create_task_records_the_base_and_status_carries_it() {
+        let server = TestServer::start().await;
+        server.write_workflow("wt", WT_YAML);
+        let project_id = create_project(&server).await;
+        let repo = repo_in(&server);
+
+        let response = post_wt(&server, &project_id, "wt", &repo, None).await;
+        assert_eq!(response.status(), 201);
+        let task = response.json();
+        assert_eq!(task["base_ref"], "HEAD");
+        let sha = task["base_commit"].as_str().unwrap().to_string();
+        assert_eq!(sha.len(), 40);
+
+        let detail = server
+            .get(&format!("/tasks/{}", task["id"].as_str().unwrap()))
+            .await
+            .json();
+        assert_eq!(detail["base_ref"], "HEAD");
+        assert_eq!(detail["base_commit"], sha.as_str());
+    }
+
+    #[tokio::test]
+    async fn create_task_maps_base_failures_to_400_and_502() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        server.write_workflow("wt", WT_YAML);
+        let project_id = create_project(&server).await;
+        let repo = repo_in(&server);
+
+        let response = post_wt(&server, &project_id, "chat", &repo, Some("HEAD")).await;
+        assert_eq!(response.status(), 400);
+        assert!(
+            response.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("only applies to a workflow that creates a worktree")
+        );
+
+        let response = post_wt(&server, &project_id, "wt", &repo, Some("nope")).await;
+        assert_eq!(response.status(), 400);
+
+        let gone = server.temp_dir().join("does-not-exist");
+        git(&repo, &["remote", "add", "origin", &gone.to_string_lossy()]);
+        let response = post_wt(&server, &project_id, "wt", &repo, Some("origin/main")).await;
+        assert_eq!(response.status(), 502);
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            error.contains("could not fetch from remote 'origin'"),
+            "{error}"
+        );
+        assert!(
+            error.contains("does not appear to be a git repository"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn create_task_resolves_the_named_workflow_and_starts_it() {
         let server = TestServer::start().await;
@@ -728,6 +836,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await

@@ -13,12 +13,15 @@ use crate::engine::{
 };
 use crate::session::SessionError;
 use crate::workflow_def::WorkflowDefError;
+use crate::worktree::{BaseError, WorktreeError};
 
 #[derive(Debug)]
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
     Conflict(String),
+    /// A remote the daemon had to reach (to resolve a task's base) failed.
+    BadGateway(String),
     Internal(String),
 }
 
@@ -28,6 +31,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, Json(json!({ "error": message }))).into_response()
@@ -75,6 +79,16 @@ impl From<CreateTaskError> for ApiError {
                 source: EngineError::TaskCancelled(_),
                 ..
             } => ApiError::Conflict(err.to_string()),
+            CreateTaskError::Base(BaseError::Remote { .. }) => {
+                ApiError::BadGateway(err.to_string())
+            }
+            CreateTaskError::Base(BaseError::Git(
+                WorktreeError::Spawn(_) | WorktreeError::Io(_) | WorktreeError::GitFailed { .. },
+            )) => ApiError::Internal(err.to_string()),
+            // Every other base failure is about what the caller asked for.
+            CreateTaskError::Base(_)
+            | CreateTaskError::BaseWithoutWorktree
+            | CreateTaskError::NoRepo { .. } => ApiError::BadRequest(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }

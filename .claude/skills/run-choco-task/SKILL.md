@@ -1,6 +1,6 @@
 ---
 name: run-choco-task
-description: Drives a coding task through a ChocoFactory (choco) daemon end to end — check choco and its daemon (updating it when it is yours), prepare a base checkout, write the task spec, create and watch the task, review its PR and cast the verdict, and recover a stuck, escalated or interrupted task. Use when asked to have choco implement an issue, or to run, watch, review or rescue a choco task.
+description: Drives a coding task through a ChocoFactory (choco) daemon end to end — check choco and its daemon (updating it when it is yours), write the task spec, create and watch the task, review its PR and cast the verdict, and recover a stuck, escalated or interrupted task. Use when asked to have choco implement an issue, or to run, watch, review or rescue a choco task.
 ---
 
 # Run a choco task
@@ -37,7 +37,7 @@ an action (approval) before it can run, or when `open_pr` fails.
 Copy this checklist and tick it off:
 
 ```
-- [ ] 1. Prepare: choco up to date, or a shared daemon's version noted; daemon running; your own base checkout on the latest default branch
+- [ ] 1. Prepare: choco up to date, or a shared daemon's version noted; daemon running
 - [ ] 2. Write the spec
 - [ ] 3. Create the task and wait for awaiting_human_review (or a parked state)
 - [ ] 4. Review the PR, vote, and run the pre-merge checks
@@ -74,29 +74,23 @@ claude --version              # agents run the claude CLI, logged in as you
 gh auth status                # open_pr and the polls run gh as this account; it is who "you" are when voting
 choco server start && choco server status
 choco project list            # or: choco project create <name> --repo .
-git worktree add --detach ../<name>-base-<you> origin/main      # once per operator
-BASE_CHECKOUT=$(cd ../<name>-base-<you> && pwd)                 # again in each new shell
 ```
 
-Make one base checkout per operator (or per concurrent task). Two operators
-sharing one move it under each other between `checkout` and `task create`,
-and a task forks from the wrong commit.
-
-**Before each task**, check the daemon and move the base checkout to the
-latest default branch:
+**Before each task**, check the daemon:
 
 ```bash
 choco server status
-git -C "$BASE_CHECKOUT" fetch origin && git -C "$BASE_CHECKOUT" checkout --detach origin/main
 ```
 
-Replace `origin/main` with your default branch if it differs, here and in
-the pre-merge check in step 4.
+Replace `origin/main` with your default branch if it differs, in the create
+command in step 3 and the pre-merge check in step 4.
 
-- **The base checkout is what the task forks from.** A task's worktree
-  starts at its `--repo` checkout's HEAD (default: the project's repo). Use
-  a detached checkout that nothing else works in. Never point it at a
-  checkout another session is switching branches in.
+- **A task forks from `--base <ref>`.** Without it, from the remote's default
+  branch, freshly fetched (`origin`, or the only remote), or from the repo's
+  HEAD when the repo has no remote. A `<remote>/<branch>` base is fetched
+  first; any other ref is used as the repo has it. A ref that doesn't
+  resolve, or a failed fetch, creates nothing. `choco task status` shows the
+  `Base` line.
 - **`choco server status`** shows the daemon's version, open tasks and
   in-flight work. It warns when `choco` and the daemon differ in version, or
   the daemon binary changed on disk since it started: run
@@ -196,7 +190,7 @@ explicit out-of-scope list.
 
 ```bash
 choco task create --project <p> --workflow coding-task-planned \
-  --title "<what it does> (#<n>)" --repo "$BASE_CHECKOUT" \
+  --title "<what it does> (#<n>)" --base origin/main \
   --prompt "$(cat spec.md)"
 ```
 

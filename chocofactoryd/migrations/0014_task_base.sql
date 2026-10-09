@@ -1,0 +1,2 @@
+ALTER TABLE tasks ADD COLUMN base_ref TEXT;
+ALTER TABLE tasks ADD COLUMN base_commit TEXT;

@@ -217,6 +217,10 @@ pub struct WorkflowEngine {
     /// sleeps, so a `timeout:` measured on them is not calendar time.
     /// Injectable so tests can jump the clock without waiting.
     wall_clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    /// Milliseconds one network call (`fetch`, `ls-remote`) may take while a
+    /// new task's base is resolved. Defaults to
+    /// `worktree::BASE_NETWORK_TIMEOUT`; a test shortens it.
+    base_network_timeout_ms: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -635,6 +639,16 @@ pub enum CreateTaskError {
         task_id: String,
         source: EngineError,
     },
+    /// The commit to fork the worktree from could not be resolved. Nothing
+    /// was written.
+    Base(worktree::BaseError),
+    /// A base was given for a workflow that creates no worktree.
+    BaseWithoutWorktree,
+    /// The workflow creates a worktree but the task has no repo to fork it
+    /// from. Nothing was written.
+    NoRepo {
+        workflow: String,
+    },
 }
 
 impl fmt::Display for CreateTaskError {
@@ -659,6 +673,17 @@ impl fmt::Display for CreateTaskError {
             CreateTaskError::Start { task_id, source } => {
                 write!(f, "task '{task_id}' failed to start: {source}")
             }
+            CreateTaskError::Base(err) => write!(f, "{err}"),
+            CreateTaskError::BaseWithoutWorktree => {
+                write!(
+                    f,
+                    "--base only applies to a workflow that creates a worktree"
+                )
+            }
+            CreateTaskError::NoRepo { workflow } => write!(
+                f,
+                "workflow '{workflow}' creates a worktree but the task has no repo: pass --repo or give the project a repo"
+            ),
         }
     }
 }
@@ -1220,7 +1245,22 @@ impl WorkflowEngine {
             next_runner_id: AtomicU64::new(0),
             runners_stopping: std::sync::atomic::AtomicBool::new(false),
             wall_clock,
+            base_network_timeout_ms: AtomicU64::new(
+                worktree::BASE_NETWORK_TIMEOUT.as_millis() as u64
+            ),
         })
+    }
+
+    /// Shortens the per-call network timeout used when resolving a new
+    /// task's base, so a test can exercise the timeout without waiting.
+    #[cfg(test)]
+    pub(crate) fn set_base_network_timeout(&self, timeout: std::time::Duration) {
+        self.base_network_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn base_network_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.base_network_timeout_ms.load(Ordering::SeqCst))
     }
 
     /// The current wall-clock time. Every `poll` budget computation goes
@@ -1396,6 +1436,7 @@ impl WorkflowEngine {
             title,
             initial_input,
             config,
+            None,
         )
         .await
     }
@@ -1413,6 +1454,13 @@ impl WorkflowEngine {
     /// from one read of the file) is the canonical file path, or
     /// `builtin:<name>@<VERSION>` for a built-in; every later reload uses
     /// that record (`load_task_workflow`).
+    ///
+    /// For a workflow with `worktree: true` the commit the worktree forks
+    /// from is resolved here, before anything is written
+    /// (`worktree::resolve_base`): `base` if given, else the remote's default
+    /// branch, freshly fetched. Both are recorded on the row by the one
+    /// INSERT. A `base` for a workflow without a worktree is an error; such a
+    /// workflow resolves and fetches nothing.
     pub async fn create_task_from(
         self: &Arc<Self>,
         project_id: &str,
@@ -1420,6 +1468,7 @@ impl WorkflowEngine {
         title: &str,
         initial_input: &str,
         mut config: Value,
+        base: Option<&str>,
     ) -> Result<Task, CreateTaskError> {
         // Before any read or write: an unknown `cli` in the task's own
         // config is rejected without creating anything.
@@ -1501,6 +1550,26 @@ impl WorkflowEngine {
             map.insert("cwd".to_string(), Value::String(repo_path.clone()));
         }
 
+        // Resolved after every cheap check and before the INSERT, so a bad
+        // base creates nothing. The row then carries the base from birth.
+        let resolved_base = if !definition.worktree {
+            if base.is_some() {
+                return Err(CreateTaskError::BaseWithoutWorktree);
+            }
+            None
+        } else {
+            let repo = config.get("cwd").and_then(Value::as_str).ok_or_else(|| {
+                CreateTaskError::NoRepo {
+                    workflow: workflow_def_name.clone(),
+                }
+            })?;
+            Some(
+                worktree::resolve_base(Path::new(repo), base, self.base_network_timeout())
+                    .await
+                    .map_err(CreateTaskError::Base)?,
+            )
+        };
+
         let task = tasks::create(
             &self.pool,
             tasks::NewTask {
@@ -1510,6 +1579,8 @@ impl WorkflowEngine {
                 config,
                 workflow_path: Some(&workflow_path_str),
                 workflow_sha256: Some(&workflow_sha256),
+                base_ref: resolved_base.as_ref().map(|b| b.base_ref.as_str()),
+                base_commit: resolved_base.as_ref().map(|b| b.base_commit.as_str()),
             },
         )
         .await?;
@@ -2589,7 +2660,7 @@ impl WorkflowEngine {
             // `worktree_creation_inputs`'s doc comment).
             if definition.worktree {
                 let (repo, project) = worktree_creation_inputs(&self.pool, &task).await?;
-                worktree::ensure(&repo, &project, &task.id)
+                worktree::ensure(&repo, &project, &task.id, task.base_commit.as_deref())
                     .await
                     .map_err(WorkingDirError::Worktree)?;
                 // `None` means the task row was deleted out from under this

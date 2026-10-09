@@ -133,6 +133,8 @@ pub struct CreateTaskParams<'a> {
     /// Already-assembled task config, or `None` to send no config at all.
     /// Build it with [`build_task_config`].
     pub config: Option<Value>,
+    /// The `--base` value, sent only when given.
+    pub base: Option<&'a str>,
 }
 
 /// Assembles the task-level `config` object (design §5.5) from the CLI's
@@ -558,6 +560,9 @@ impl Client {
             "prompt": params.prompt,
             "config": params.config,
         });
+        if let Some(base) = params.base {
+            body["base"] = json!(base);
+        }
         match params.workflow {
             WorkflowArg::Name(name) => body["workflow_def"] = json!(name),
             WorkflowArg::File(path) => body["workflow_file"] = json!(path),
@@ -734,7 +739,18 @@ mod tests {
             title: "t",
             prompt: "hi",
             config,
+            base: None,
         }
+    }
+
+    #[test]
+    fn create_task_request_sends_base_only_when_given() {
+        let body = body_of(client().create_task_request(&params(None)));
+        assert!(body.get("base").is_none(), "{body}");
+        let mut with = params(None);
+        with.base = Some("origin/main");
+        let body = body_of(client().create_task_request(&with));
+        assert_eq!(body["base"], "origin/main");
     }
 
     fn body_of(req: reqwest::RequestBuilder) -> Value {
