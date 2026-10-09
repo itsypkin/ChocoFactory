@@ -21,7 +21,7 @@ Read this while watching a task, when its behaviour surprises you.
   `report_outcome`, not when it stops printing. A turn that goes quiet
   without reporting is nudged, then closed, unless a background job it started
   is still running (Claude Code only): then it is not nudged, and is closed
-  if still waiting 60 minutes after its turn ended. In `revising`, the coder decides
+  if still waiting 60 minutes after it began waiting (each new wait, after the CLI wakes the agent, gets a fresh 60 minutes). In `revising`, the coder decides
   which PR comments are new by comparing their times with its last commit,
   and it can get that wrong across time zones, so a comment of yours may be
   treated as already handled.

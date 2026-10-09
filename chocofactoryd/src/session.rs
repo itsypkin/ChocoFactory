@@ -3073,6 +3073,44 @@ mod tests {
         );
     }
 
+    /// A flood of output with no gaps can't starve the deadline: the
+    /// `biased` select always has an event ready, so the expiry is also
+    /// checked after each event.
+    #[tokio::test]
+    async fn continuous_output_does_not_starve_the_job_wait_deadline() {
+        let dir = TempDir::new();
+        let mut steps = vec![
+            json!({"op": "read_turn"}),
+            json!({"op": "raw", "line": one_job()}),
+            json!({"op": "result"}),
+        ];
+        for _ in 0..20000 {
+            steps.push(json!({"op": "text", "text": "x", "parent": "toolu_agent"}));
+        }
+        steps.push(json!({"op": "sleep", "seconds": 60}));
+        let binary = script_binary(&dir.0, serde_json::Value::Array(steps));
+        let timers = TurnTimers {
+            job_wait_limit: StdDuration::from_millis(100),
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        // The no_report note must land before the flood is over: events
+        // stored after it prove the close didn't wait for the flood's end.
+        let all = events::list_for_session(&pool, &session_id).await.unwrap();
+        let at = all
+            .iter()
+            .position(|e| e.payload["kind"] == "no_report")
+            .unwrap();
+        let later = all.len() - at - 1;
+        assert!(
+            later > 100,
+            "the close waited for the flood to end ({later})"
+        );
+    }
+
     async fn start_with_reaper_ready(
         binary: String,
         timers: TurnTimers,
