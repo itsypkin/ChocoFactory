@@ -153,7 +153,9 @@ explicit out-of-scope list.
   instruction files in folders above the repo. Anything from your personal
   setup that the task needs goes in the spec.
 - **Check that the design holds, not only that it builds.** List every way a
-  protected event can end and say whether the protection runs on each; see
+  protected event can end and say whether the protection runs on each. Also
+  grep for statements the change makes false, state what an abandoned
+  operation leaves behind, and probe a new prompt rule on the role's model; see
   [reference/spec.md](reference/spec.md#check-that-the-design-holds).
 - **Read the issue with comments:** `gh issue view <n> --json title,body,comments`
   (`gh issue view <n> --comments` can print nothing and exit 0).
@@ -181,9 +183,14 @@ explicit out-of-scope list.
   couldn't run read-only is marked **unverified**: treat it as open until the
   coder reports the probe's result. Read the report, answer questions and
   see the rest in [reference/spec.md](reference/spec.md#having-choco-check-the-spec-first-coding-task-planned).
-- **Docs-only task:** every link and anchor resolves, every command matches `--help`,
-  and no fact is lost; see
+- **Docs-only task:** every link and anchor resolves (from a copy outside the
+  repo, for a skill or doc meant to be copied), every command matches `--help`,
+  every snippet route is taken on a throwaway daemon, and no fact is lost; see
   [reference/spec.md](reference/spec.md#docs-only-tasks).
+- **Text an agent or a reader acts on** (a prompt, a skill, docs): the spec
+  carries behavioural acceptance criteria and names the runs that prove them;
+  see
+  [reference/spec.md](reference/spec.md#text-an-agent-or-a-reader-acts-on).
 
 ## 3. Create and watch
 
@@ -239,14 +246,16 @@ an independent reviewer do it, and look for what agents systematically miss:
 - **Tests for the new branches**, not only the ones the spec listed. Break
   the main fix in a scratch copy and confirm a test fails.
 - **Claims are not evidence.** Code comments ("deliberately untested"),
-  commit messages and "addressed in <sha>" replies are claims to verify.
+  commit messages and "addressed in <sha>" replies are claims to verify. A coder's "not re-run" on a run the spec
+  requires is an unmet requirement.
 - **Numbered artifacts** (migrations above all) against what has landed on
   the default branch since the task started.
 - **New messages and states**: read each one with the values its own path
   passes, and check every new state has a way out.
 - **Your repo's own recurring review findings**, if you know them.
 - **A docs PR** has no tests to break; check it against the
-  [docs-only criteria](reference/spec.md#docs-only-tasks).
+  [docs-only criteria](reference/spec.md#docs-only-tasks) and check that the
+  spec's acceptance runs were run and reported.
 
 **The verdict is a PR comment or a GitHub review**: `/approve` or
 `/request-changes` alone on its own line, with your review above it. A

@@ -7,6 +7,7 @@
 - Tasks that read an external API
 - Tasks whose coder runs a real third-party CLI
 - Docs-only tasks
+- Text an agent or a reader acts on
 - Running a role on omp
 
 ## Check that the design holds
@@ -21,6 +22,19 @@ prescribed message is true under. For a layout, list its invariants and
 require one test that renders every fixture at every size from the
 minimum up. Name one test for each fail-closed path in the done
 criteria.
+
+Three more checks belong in the spec:
+
+- **Every statement the change makes false.** Grep the skills, docs and
+  prompts for the old behaviour's wording and commands, and fix each hit
+  in the same PR.
+- **Abandoned operations.** For anything that can time out, be cancelled
+  or lose its client, the spec states what is left behind (locks, rows,
+  files) and requires a test of it.
+- **A new rule in a prompt.** The spec requires the coder to run one
+  probe of the rule on the role's production model (the model the role
+  runs in the workflow) in its lap, and to report the probe and its
+  result.
 
 ## Having choco check the spec first (`coding-task-planned`)
 
@@ -73,18 +87,55 @@ The spec must:
 
 ## Docs-only tasks
 
-A docs task has no tests, so "the tests are a floor" doesn't apply. The
-done criteria are instead:
+A docs task has no tests of its own, so its tests are the acceptance runs
+of [Text an agent or a reader acts on](#text-an-agent-or-a-reader-acts-on),
+and "the tests are a floor" applies to them. The done criteria are:
 
 - every link and anchor resolves (relative links between files, `#anchors`
   by GitHub's slug rules, and links into other docs);
 - every command and flag shown matches `--help` from a build of the target
   branch (see above);
 - no fact from the old text is lost: the PR lists the facts it moved and
-  where each went.
+  where each went;
+- for a skill or doc meant to be copied, its links resolve from a copy
+  outside the repo, and every route of every snippet has been taken on a
+  throwaway daemon;
+- the acceptance runs below have been run and reported.
 
-Check these yourself before merging a docs PR; a script that walks the
-links and a loop over the `--help` of each command are enough.
+**A skill or doc meant to be copied.** Check its links from a copy
+outside the repo, made the way its install instructions make it. Take
+every route of every snippet on a throwaway daemon. A snippet that only
+loads (parses, prints `--help`) has not been taken.
+
+```bash
+t=$(mktemp -d)
+HOME=$t choco server start --port 0     # its own lock, database and log under $t
+HOME=$t choco server status             # and the same HOME=$t on every choco command
+HOME=$t choco server stop
+```
+
+The throwaway daemon's agents get the same `HOME`, so they have no
+`claude` or `gh` login. A route that needs an agent turn or GitHub is
+taken on a small real task on your own daemon instead.
+
+A script that walks the links and a loop over the `--help` of each
+command check the first three criteria only; they are not enough for
+text meant to be copied or acted on.
+
+## Text an agent or a reader acts on
+
+For a prompt, a skill or docs, the spec carries behavioural acceptance
+criteria:
+
+- Following the text leads no agent or first-time reader into a hang, a
+  poll loop, the wrong tree or a wrong action.
+- Each new rule's way out restates the constraint it relaxes, and has a
+  path for when the agent can't comply.
+- Each command the text names exists for that agent. An agent driven by a
+  daemon runs the `choco` on the `agents' choco` line of
+  `choco server status`.
+- The spec names the runs that prove it, and a coder's "not re-run" on any
+  of them is an unmet requirement.
 
 ## Running a role on omp
 
