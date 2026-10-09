@@ -47,3 +47,13 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+
+# Each task builds in its own git worktree and the reviewer builds a scratch
+# copy of the branch, so the size of a dev target/ matters. Line tables keep
+# file:line in panics and backtraces for our own crates; dependencies get no
+# debug info at all.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
