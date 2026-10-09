@@ -2095,7 +2095,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             step,
             &[
-                "Write the file whole, every turn, from a complete draft, with your file-writing tool or a quoted heredoc.",
+                "Write the file whole, every turn, from a complete draft that starts from the file's current text, with your file-writing tool or a quoted heredoc.",
                 "Never change part of it by searching for a heading or any other string (a find-and-replace edit, or a script that splices around a heading): the string can match inside quoted text or code and cut what follows.",
                 "To keep a person's edits from the published description, copy them into your draft, which you then write whole.",
                 "After writing it, read the file back and check that every section is there and ends where you meant it to.",
@@ -2114,6 +2114,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &[
                 "Commit your revisions, and rewrite the PR description file whole (step 4 of your instructions) so it describes the branch as it now stands.",
                 "done by rewriting that file",
+                "Start your draft from the file's current text, change what this lap changes, and write the whole result in one write; never append to it, find-and-replace in it, or splice around a heading.",
             ],
             "coder-revise.md closing section",
         );

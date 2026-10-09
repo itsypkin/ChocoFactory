@@ -106,6 +106,9 @@ left over from an earlier escalation, so ignore it.
 
 Commit your revisions, and rewrite the PR description file whole (step 4 of your
 instructions) so it describes the branch as it now stands.
+Start your draft from the file's current text, change what this lap changes, and write
+the whole result in one write; never append to it, find-and-replace in it, or splice
+around a heading.
 Keep every section the spec requires. If the branch has an open PR, first
 read its published description: set `N` as the `awaiting_human_review`
 entry does, then `[ -n "$N" ] && gh pr view "$N" --json body -q .body`.
