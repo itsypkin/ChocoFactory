@@ -849,7 +849,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        assert_eq!(env, [("PR_NUMBER", "{{ stages.open_pr.number }}")]);
+        assert_eq!(
+            env,
+            [
+                ("PR_NUMBER", "{{ stages.open_pr.number }}"),
+                ("HANDED_OVER_AT", "{{ left_at.awaiting_human_review }}"),
+            ]
+        );
         assert_eq!(watch.interval, std::time::Duration::from_secs(60));
         let outcomes: Vec<(&str, &str)> = watch
             .outcomes

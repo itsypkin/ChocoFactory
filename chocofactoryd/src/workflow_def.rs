@@ -383,10 +383,13 @@ impl WorkflowDefinition {
                 // in `advance_from_stage`/`start_task`, not a stage's own
                 // capture, and `template::parse_reference` has already
                 // rejected any field but `from`/`outcome` at parse time.
-                let referenced_stage = match reference.root {
+                let (referenced_stage, needs_capture) = match reference.root {
                     crate::template::Root::Task => continue,
                     crate::template::Root::Arrival => continue,
-                    crate::template::Root::Stage(stage) => stage,
+                    crate::template::Root::Stage(stage) => (stage, true),
+                    // `left_at.<stage>`: any defined stage can be left, so
+                    // it needs no `capture:`, only to exist.
+                    crate::template::Root::LeftAt(stage) => (stage, false),
                 };
                 let Some(target) = self.stages.get(&referenced_stage) else {
                     return Err(WorkflowDefError::UnknownTemplateStage {
@@ -396,6 +399,9 @@ impl WorkflowDefinition {
                         referenced: referenced_stage,
                     });
                 };
+                if !needs_capture {
+                    continue;
+                }
                 if !declares_capture(&target.kind) {
                     return Err(WorkflowDefError::TemplateStageCapturesNothing {
                         stage: stage_name.to_string(),
@@ -3661,6 +3667,32 @@ stages:
                 "{bad}: got {err}"
             );
         }
+    }
+
+    /// #260: `left_at.<stage>` needs one segment and a defined stage; the
+    /// stage does not have to declare a `capture:`.
+    #[test]
+    fn validates_left_at_references() {
+        let def = |reference: &str| {
+            format!(
+                "name: templated\nstages:\n  gate:\n    kind: human_gate\n    on: {{ done: report }}\n  report:\n    kind: shell\n    command: \"echo {{{{ {reference} }}}}\"\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
+            )
+        };
+        let dir = TempDir::new();
+        for bad in ["left_at", "left_at.gate.x"] {
+            let err = WorkflowDefinition::parse(&def(bad), &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::InvalidTemplate { stage, .. } if stage == "report"),
+                "{bad}: got {err}"
+            );
+        }
+        let err = WorkflowDefinition::parse(&def("left_at.nope"), &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownTemplateStage { referenced, .. } if referenced == "nope"),
+            "got {err}"
+        );
+        // `gate` declares no `capture:`.
+        WorkflowDefinition::parse(&def("left_at.gate"), &dir.path).unwrap();
     }
 
     /// P2-7a: `task` is always a valid root — it names no stage, so it

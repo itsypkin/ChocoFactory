@@ -98,8 +98,10 @@ Reviews follow these rules:
   state or by marker) is tested first, so an `Approve` review with a
   `/request-changes` line requests changes, and a `Request changes` review
   with an `/approve` line does too.
-- **Newer than the head commit.** A review counts by the time it was
-  submitted, the same bound as for comments. Pending (unsubmitted) and
+- **Newer than the last hand-off.** A review counts by the time it was
+  submitted, the same bound as for comments: later than the last time the task
+  left the review gate (before the first hand-off, later than the head commit).
+  A review submitted while the coder revises is carried into the next round. Pending (unsubmitted) and
   dismissed reviews never count.
 - **Same author fence** as comments (below).
 - **The newest vote wins** across comments and reviews together. If a comment
@@ -112,15 +114,19 @@ Reviews follow these rules:
   and never when its review does not qualify.
 - **Editing is limited.** A review has no edited time, so editing its body or
   its inline comments counts only while the review is still newer than the
-  head commit. After a push, post a new comment or review.
+  last hand-off. Edits after the hand-off do not count; post a new comment or
+  review.
 
 Five things worth knowing:
 
-- **Only comments and reviews newer than the newest commit count.** Once the coder
-  pushes a fix your previous verdict stops counting on its own, so there is
-  nothing to clear between rounds. The flip side: if a `revising` lap ends
-  without producing a commit, your old verdict is still the newest thing on
-  the PR and will be read again.
+- **Only comments and reviews newer than the last hand-off count.** Once a
+  verdict has been handed to the coder it will not be read again, with or
+  without a new commit, so there is nothing to clear between rounds. Before
+  the first hand-off the bound is the head commit. A vote cast while the coder
+  revises, approval included, is read when the task next reaches the gate; if
+  it is the newest vote and an approval, the task goes to `done` without you
+  seeing the revision (`done` merges nothing). The hand-off time is the daemon
+  host's clock, so a clock far behind GitHub's can repeat a verdict.
 - **Prose does not retract a verdict.** Only the markers are read, so a
   follow-up comment saying "wait, hold off" does not undo an `/approve` —
   and `/approve` moves the task to `done` within a minute. To change your
@@ -173,7 +179,9 @@ within 102 hours (about four days) the task stops waiting and parks at
 `revising`. A reply that is only `/approve` or `/request-changes` is refused
 there: the gate doesn't read markers, so it would be a note that starts a coder
 lap. To watch again, run `choco task retry <id>`; the schedule starts over and
-no coder lap is spent. If the PR was merged meanwhile, `retry` is also the
+no coder lap is spent. Comments and reviews posted before the timeout are not
+counted after that (including a verdict posted in the last polling interval
+before it); post them again. If the PR was merged meanwhile, `retry` is also the
 way on: the watcher sees the merge and the task moves to `done`. `retry` after
 a `checks_polling` timeout re-watches CI the same way. A fourth `/request-changes`, after three revise rounds, parks
 it the same way instead of looping, and resuming from there starts the

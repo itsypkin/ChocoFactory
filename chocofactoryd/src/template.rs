@@ -16,8 +16,14 @@
 //! (`engine::set_arrival`) into the same payload, next to `stages` and
 //! `task`, so a `prompt_file` can branch on *why* it's here instead of
 //! guessing from which stale `stages.*` capture happens to be non-empty.
-//! `stages`, `task` and `arrival` are the only three roots a template can
-//! read from.
+//!
+//! A fourth root, `{{ left_at.<stage> }}`, reads the time the task last left
+//! that stage (`YYYY-MM-DDTHH:MM:SSZ`, UTC, whole seconds), written by
+//! `engine::advance_from_stage` (`engine::set_left_at`) under `left_at`. The
+//! review gate uses it as its hand-off fence. A stage the task has never
+//! left has no entry and renders as an empty string.
+//! `stages`, `task`, `arrival` and `left_at` are the only four roots a
+//! template can read from.
 //!
 //! This is deliberately *only* variable substitution. There are no
 //! conditionals, no expressions, and no function calls — branching stays in
@@ -54,7 +60,10 @@ const TASK_NAMESPACE: &str = "task";
 /// `capture:`.
 const ARRIVAL_NAMESPACE: &str = "arrival";
 
-/// Which of the three recognised roots a reference reads from.
+/// The `left_at` root's name; same string as the payload key `LEFT_AT`.
+const LEFT_AT_NAMESPACE: &str = LEFT_AT;
+
+/// Which of the four recognised roots a reference reads from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Root {
     /// `stages.<stage>.<path>` — a stage's capture.
@@ -67,6 +76,8 @@ pub enum Root {
     /// `parse_reference` rejects any other field at parse time rather than
     /// letting it reach `resolve` as a render-time "unresolved" miss.
     Arrival,
+    /// `left_at.<stage>` — when the task last left that stage.
+    LeftAt(String),
 }
 
 /// One `{{ … }}` occurrence, parsed but not yet resolved.
@@ -122,6 +133,13 @@ pub enum TemplateError {
         placeholder: String,
         field: String,
     },
+    /// The `left_at` root has no entry for that stage: the task has never
+    /// left it, or the payload predates `left_at`. Always a normal state, so
+    /// `render` tags it `UnresolvedKind::StageNotRunYet`.
+    UnresolvedLeftAt {
+        placeholder: String,
+        stage: String,
+    },
     /// Resolved to something that can't be substituted into a command or a
     /// prompt as-is. Capture is for short structured signals — a verdict, an
     /// id, a url — not for splicing a blob into a shell command (§5.1).
@@ -147,6 +165,7 @@ impl TemplateError {
                 | TemplateError::UnresolvedField { .. }
                 | TemplateError::UnresolvedTaskField { .. }
                 | TemplateError::UnresolvedArrivalField { .. }
+                | TemplateError::UnresolvedLeftAt { .. }
                 | TemplateError::NotScalar { .. }
         )
     }
@@ -163,8 +182,8 @@ impl fmt::Display for TemplateError {
             }
             TemplateError::UnknownNamespace { placeholder, root } => write!(
                 f,
-                "{placeholder} reads from '{root}', but '{NAMESPACE}', '{TASK_NAMESPACE}' and \
-                 '{ARRIVAL_NAMESPACE}' are the only namespaces a template can read from"
+                "{placeholder} reads from '{root}', but '{NAMESPACE}', '{TASK_NAMESPACE}', \
+                 '{ARRIVAL_NAMESPACE}' and '{LEFT_AT_NAMESPACE}' are the only namespaces a template can read from"
             ),
             TemplateError::UnresolvedStage { placeholder, stage } => write!(
                 f,
@@ -186,6 +205,11 @@ impl fmt::Display for TemplateError {
                 f,
                 "{placeholder} has no value: the task has no arrival '{field}' \
                  (a payload from before #112)"
+            ),
+            TemplateError::UnresolvedLeftAt { placeholder, stage } => write!(
+                f,
+                "{placeholder} has no value: the task has not left stage '{stage}' yet \
+                 (or its payload is from before 'left_at')"
             ),
             TemplateError::NotScalar { placeholder, kind } => write!(
                 f,
@@ -221,6 +245,11 @@ pub fn references(input: &str) -> Result<Vec<TemplateRef>, TemplateError> {
 /// first-finish order. Engine-owned (`advance_from_stage` writes it);
 /// templates cannot reference it.
 pub const FINISHED_STAGES: &str = "finished_stages";
+
+/// Top-level payload key: an object mapping a stage name to the time the task
+/// last left it (`YYYY-MM-DDTHH:MM:SSZ`, UTC, whole seconds). Engine-owned
+/// (`advance_from_stage` writes it); templates read it as `left_at.<stage>`.
+pub const LEFT_AT: &str = "left_at";
 
 /// Why a placeholder fell back to an empty string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +310,7 @@ pub fn render(input: &str, payload: &Value) -> Result<(String, Vec<Unresolved>),
                         {
                             UnresolvedKind::StageNotRunYet
                         }
+                        TemplateError::UnresolvedLeftAt { .. } => UnresolvedKind::StageNotRunYet,
                         _ => UnresolvedKind::Missing,
                     };
                     unresolved.push(Unresolved {
@@ -401,6 +431,23 @@ fn parse_reference(body: &str) -> Result<TemplateRef, TemplateError> {
                 path: remainder.iter().map(|field| (*field).to_string()).collect(),
             })
         }
+        // Exactly one segment: the stage. Anything else is a typo, caught at
+        // load time like a bad `arrival` field.
+        LEFT_AT_NAMESPACE => {
+            let [stage] = remainder.as_slice() else {
+                return Err(TemplateError::Malformed {
+                    placeholder,
+                    reason: format!(
+                        "it must be `{LEFT_AT_NAMESPACE}.<stage>` with exactly one segment"
+                    ),
+                });
+            };
+            Ok(TemplateRef {
+                placeholder,
+                root: Root::LeftAt((*stage).to_string()),
+                path: Vec::new(),
+            })
+        }
         other => Err(TemplateError::UnknownNamespace {
             placeholder,
             root: other.to_string(),
@@ -432,6 +479,13 @@ fn resolve(reference: &TemplateRef, payload: &Value) -> Result<String, TemplateE
             })?,
         Root::Task => payload.get(TASK_NAMESPACE).unwrap_or(&MISSING_TASK),
         Root::Arrival => payload.get(ARRIVAL_NAMESPACE).unwrap_or(&MISSING_ARRIVAL),
+        Root::LeftAt(stage) => payload
+            .get(LEFT_AT)
+            .and_then(|left| left.get(stage))
+            .ok_or_else(|| TemplateError::UnresolvedLeftAt {
+                placeholder: reference.placeholder.clone(),
+                stage: stage.clone(),
+            })?,
     };
 
     for (depth, field) in reference.path.iter().enumerate() {
@@ -450,6 +504,11 @@ fn resolve(reference: &TemplateRef, payload: &Value) -> Result<String, TemplateE
             Root::Arrival => TemplateError::UnresolvedArrivalField {
                 placeholder: reference.placeholder.clone(),
                 field: reference.path[..=depth].join("."),
+            },
+            // The parser gives `left_at` an empty path, so this is not reached.
+            Root::LeftAt(stage) => TemplateError::UnresolvedLeftAt {
+                placeholder: reference.placeholder.clone(),
+                stage: stage.clone(),
             },
         })?;
     }
@@ -497,6 +556,59 @@ mod tests {
 
     fn placeholders(unresolved: &[Unresolved]) -> Vec<&str> {
         unresolved.iter().map(|u| u.placeholder.as_str()).collect()
+    }
+
+    #[test]
+    fn left_at_renders_the_stored_time() {
+        let p = json!({ "left_at": { "gate": "2026-10-09T12:34:56Z" } });
+        let (text, unresolved) = render("at={{ left_at.gate }}", &p).unwrap();
+        assert_eq!(text, "at=2026-10-09T12:34:56Z");
+        assert!(unresolved.is_empty());
+    }
+
+    /// Never left, a `left_at` with no entry for it, a non-object `left_at`
+    /// and a payload from before `left_at`: all "" and only StageNotRunYet.
+    #[test]
+    fn left_at_for_a_stage_never_left_is_empty_and_not_a_mismatch() {
+        for p in [
+            json!({ "left_at": { "other": "2026-10-09T12:34:56Z" } }),
+            json!({ "left_at": "oops" }),
+            json!({}),
+        ] {
+            let (text, unresolved) = render("[{{ left_at.gate }}]", &p).unwrap();
+            assert_eq!(text, "[]", "{p}");
+            assert_eq!(placeholders(&unresolved), ["{{ left_at.gate }}"]);
+            assert_eq!(unresolved[0].kind, UnresolvedKind::StageNotRunYet);
+        }
+    }
+
+    #[test]
+    fn a_non_string_left_at_value_is_missing() {
+        let p = json!({ "left_at": { "gate": { "x": 1 } } });
+        let (text, unresolved) = render("[{{ left_at.gate }}]", &p).unwrap();
+        assert_eq!(text, "[]");
+        assert_eq!(unresolved[0].kind, UnresolvedKind::Missing);
+    }
+
+    #[test]
+    fn left_at_needs_exactly_one_segment() {
+        for bad in ["{{ left_at }}", "{{ left_at.gate.x }}"] {
+            let err = references(bad).unwrap_err();
+            assert!(
+                matches!(err, TemplateError::Malformed { .. }),
+                "{bad}: {err}"
+            );
+        }
+        let refs = references("{{ left_at.gate }}").unwrap();
+        assert_eq!(refs[0].root, Root::LeftAt("gate".to_string()));
+    }
+
+    #[test]
+    fn the_unknown_namespace_message_names_all_four_roots() {
+        let text = references("{{ bogus.x }}").unwrap_err().to_string();
+        for root in ["stages", "task", "arrival", "left_at"] {
+            assert!(text.contains(&format!("'{root}'")), "{text}");
+        }
     }
 
     #[test]

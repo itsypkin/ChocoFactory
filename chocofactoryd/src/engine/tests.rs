@@ -1867,6 +1867,24 @@ async fn payload_of(pool: &SqlitePool, task_id: &str) -> Value {
         .payload
 }
 
+/// `payload` without its engine-owned `left_at`, after checking that
+/// `left_at` holds exactly `stage`, as a whole-second `…Z` time (#260).
+fn without_left_at(mut payload: Value, stage: &str) -> Value {
+    let left = payload
+        .as_object_mut()
+        .unwrap()
+        .remove("left_at")
+        .expect("a transition records left_at");
+    let left = left.as_object().expect("left_at is an object");
+    assert_eq!(left.keys().collect::<Vec<_>>(), [stage]);
+    let at = left[stage].as_str().expect("left_at.<stage> is a string");
+    assert!(
+        at.len() == 20 && chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%SZ").is_ok(),
+        "not YYYY-MM-DDTHH:MM:SSZ: {at}"
+    );
+    payload
+}
+
 /// Waits for the `shell_output` entry a shell stage records, and
 /// returns its payload.
 async fn wait_until_shell_event(pool: &SqlitePool, task_id: &str) -> Value {
@@ -2043,7 +2061,7 @@ async fn a_stage_without_capture_writes_no_payload() {
     // itself writes nothing, since it declares no `capture:` (#112:
     // `arrival` now always accompanies the transition into `finished`).
     assert_eq!(
-        payload_of(&pool, &task_id).await,
+        without_left_at(payload_of(&pool, &task_id).await, "run"),
         json!({
             "task": {"input": null, "title": "T"},
             "arrival": {"from": "run", "outcome": "done"},
@@ -2407,7 +2425,7 @@ async fn an_outcome_for_a_stage_the_task_has_left_is_discarded() {
     let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
     assert_eq!(state.current_stage, "finished");
     assert_eq!(
-        state.payload,
+        without_left_at(state.payload, "run"),
         json!({
             "task": {"input": null, "title": "T"},
             "arrival": {"from": "run", "outcome": "done"},
@@ -5479,7 +5497,7 @@ stages:
     // engine-owned `arrival` (#112) are the only payload keys present
     // (P2-7a).
     assert_eq!(
-        payload_of(&pool, &task_id).await,
+        without_left_at(payload_of(&pool, &task_id).await, "coding"),
         json!({
             "task": {"input": null, "title": "T"},
             "arrival": {"from": "coding", "outcome": "done"},
@@ -7320,6 +7338,11 @@ case "$1" in
                     # `open_pr`'s body read-back (`-t`), not the verdict poll.
                     echo "0000000000000000000000000000000000000000"
                 else
+                    # The review gate's poll (not the CI check poll, which
+                    # reads the PR the same way): record the fence it was given.
+                    if [ "${{CHOCO_STAGE-}}" = awaiting_human_review ]; then
+                        echo "[${{HANDED_OVER_AT-unset}}]" >> "{dir}/handed-over-at"
+                    fi
                     printf '{{"headRefOid":"0000000000000000000000000000000000000000","state":"%s","mergedAt":%s,"statusCheckRollup":[{{"state":"SUCCESS"}}]}}' "$state" "$merged" | jq -r "$q"
                 fi
                 ;;
@@ -7684,6 +7707,109 @@ async fn the_real_coding_task_review_gate_takes_a_choco_reply() {
         .unwrap();
     wait_until_stage(&pool, &task_id, "done").await;
     wait_until_task_status(&pool, &task_id, "closed").await;
+}
+
+/// #260: the real `coding-task` hands the review script an empty
+/// `HANDED_OVER_AT` on the first visit to the gate and the time the task
+/// left it on the next one.
+#[tokio::test]
+async fn the_real_coding_task_gate_gets_the_hand_off_time_on_its_second_visit() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(scripts_dir.join("verdict"), "[]").unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+    let lines = || {
+        fs::read_to_string(scripts_dir.join("handed-over-at"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "awaiting_human_review").await;
+    crate::test_support::wait_until("a first poll of the gate", || async {
+        if lines().is_empty() {
+            Err("nothing recorded".to_string())
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+    // Set and empty, not left out.
+    assert!(lines().iter().all(|l| l == "[]"), "{:?}", lines());
+    for event in events::list_for_task(&pool, &task_id).await.unwrap() {
+        if event.event_type == EventType::TemplateUnresolved {
+            assert!(
+                !event.payload.to_string().contains("left_at"),
+                "{}",
+                event.payload
+            );
+        }
+    }
+
+    engine
+        .send_message_or_resume(&task_id, "FIX X\n/request-changes")
+        .await
+        .unwrap();
+    crate::test_support::wait_until("a second arrival at awaiting_human_review", || async {
+        let trail = stage_trail(&pool, &task_id).await;
+        let n = trail
+            .iter()
+            .filter(|(stage, _)| stage == "awaiting_human_review")
+            .count();
+        if n >= 2 {
+            Ok(())
+        } else {
+            Err(format!("trail {trail:?}"))
+        }
+    })
+    .await;
+    let payload = payload_of(&pool, &task_id).await;
+    let at = payload["left_at"]["awaiting_human_review"]
+        .as_str()
+        .expect("the gate was left")
+        .to_string();
+    assert!(
+        at.len() == 20 && chrono::NaiveDateTime::parse_from_str(&at, "%Y-%m-%dT%H:%M:%SZ").is_ok(),
+        "{at}"
+    );
+    let expected = format!("[{at}]");
+    crate::test_support::wait_until("a poll with the hand-off time", || async {
+        if lines().iter().any(|l| l != "[]") {
+            Ok(())
+        } else {
+            Err(format!("{:?}", lines()))
+        }
+    })
+    .await;
+    // Empty lines first, then only the hand-off time.
+    let all = lines();
+    let first_set = all.iter().position(|l| l != "[]").unwrap();
+    assert!(all[first_set..].iter().all(|l| *l == expected), "{all:?}");
+    engine.abort_detached_runners(&task_id).await;
 }
 
 /// #175, the upgrade: a task the previous daemon left waiting for review
@@ -16435,4 +16561,180 @@ async fn the_base_fetch_writes_no_tags_into_the_repo() {
 
     env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
     assert_eq!(git_out(&fx.clone, &["tag", "--list"]).await, "");
+}
+
+// ---- left_at (#260) ----
+
+fn utc(at: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(at)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+/// Pins the format (truncated, not rounded), the overwrite, and that other
+/// stages' entries survive.
+#[tokio::test]
+async fn advance_from_stage_records_when_the_stage_was_left() {
+    let pool = connect_in_memory().await.unwrap();
+    let def = coder_reviewer_guard_def();
+    let task_id = seed_task(&pool, &def.name).await;
+    let dir = tempdir();
+    let first = engine_with_fixed_clock(pool.clone(), &dir, utc("2026-10-09T12:34:56.789Z"));
+    first.start_task(&task_id, &def, None).await.unwrap();
+    assert!(
+        payload_of(&pool, &task_id).await.get("left_at").is_none(),
+        "starting a task leaves nothing"
+    );
+
+    first.advance(&task_id, &def, "resumed").await.unwrap();
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "internal_review");
+    assert_eq!(
+        state.payload["left_at"],
+        json!({ "coding": "2026-10-09T12:34:56Z" })
+    );
+    first
+        .advance(&task_id, &def, "changes_requested")
+        .await
+        .unwrap();
+
+    let later = engine_with_fixed_clock(pool.clone(), &dir, utc("2026-10-09T13:00:01.5Z"));
+    later.advance(&task_id, &def, "resumed").await.unwrap();
+    assert_eq!(
+        payload_of(&pool, &task_id).await["left_at"],
+        json!({
+            "coding": "2026-10-09T13:00:01Z",
+            "internal_review": "2026-10-09T12:34:56Z",
+        })
+    );
+}
+
+#[test]
+fn a_malformed_left_at_value_is_replaced_by_an_object() {
+    for bad in [json!("oops"), json!(7), json!(["a"])] {
+        let mut payload = json!({ "left_at": bad, "keep": 1 });
+        set_left_at(&mut payload, "gate", "2026-10-09T12:34:56Z");
+        set_left_at(&mut payload, "other", "2026-10-09T12:34:57Z");
+        assert_eq!(
+            payload["left_at"],
+            json!({ "gate": "2026-10-09T12:34:56Z", "other": "2026-10-09T12:34:57Z" })
+        );
+        assert_eq!(payload["keep"], json!(1));
+    }
+    let mut not_object = json!("scalar");
+    set_left_at(&mut not_object, "gate", "2026-10-09T12:34:56Z");
+    assert_eq!(
+        not_object,
+        json!({ "left_at": { "gate": "2026-10-09T12:34:56Z" } })
+    );
+}
+
+/// The redirect still records the stage the task left, not the `then` stage.
+#[tokio::test]
+async fn a_loop_guard_redirect_still_records_the_guarded_stage_as_left() {
+    let pool = connect_in_memory().await.unwrap();
+    let def = coder_reviewer_guard_def();
+    let task_id = seed_task(&pool, &def.name).await;
+    let dir = tempdir();
+    let engine = engine_with_fixed_clock(pool.clone(), &dir, utc("2026-10-09T12:34:56.789Z"));
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    for _ in 0..4 {
+        engine.advance(&task_id, &def, "resumed").await.unwrap();
+        engine
+            .advance(&task_id, &def, "changes_requested")
+            .await
+            .unwrap();
+    }
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "escalate_to_human");
+    assert_eq!(
+        state.payload["left_at"]["internal_review"],
+        json!("2026-10-09T12:34:56Z")
+    );
+    assert!(state.payload["left_at"].get("escalate_to_human").is_none());
+}
+
+#[tokio::test]
+async fn retrying_a_stuck_stage_leaves_left_at_unchanged() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let marker = dir.join("marker"); // never created, so `revising` always fails
+    let yaml = format!(
+        r#"
+name: retry-keeps-left-at
+stages:
+  checks_polling:
+    kind: human_gate
+    on: {{ red: revising }}
+  revising:
+    kind: shell
+    command: "test -f {}"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+        marker.display()
+    );
+    std::fs::write(dir.join("retry-keeps-left-at.yaml"), &yaml).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    engine.advance(&task_id, &def, "red").await.unwrap();
+    wait_until_task_status(&pool, &task_id, "stuck").await;
+    let before = state_of(&pool, &task_id).await.payload["left_at"].clone();
+    assert!(before["checks_polling"].is_string(), "{before}");
+
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "stuck").await;
+    let after = state_of(&pool, &task_id).await.payload["left_at"].clone();
+    assert_eq!(after.to_string(), before.to_string());
+}
+
+#[tokio::test]
+async fn the_restart_sweep_leaves_left_at_unchanged() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_poll_flow(&dir, "sweep-left-at", "echo PENDING", Some("6h"), false);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let now = Utc::now();
+    let left_at = json!({ "other": "2026-10-09T12:34:56Z" });
+    seed_row(
+        &pool,
+        &task_id,
+        "watch",
+        json!({
+            "left_at": left_at,
+            "poll_window": window_json("watch", now - chrono::Duration::minutes(1), Some(now + chrono::Duration::hours(1))),
+        }),
+    )
+    .await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.resume_interrupted_polls().await.unwrap();
+    wait_for_poll_attempt(&pool, &task_id).await;
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "watch");
+    assert_eq!(state.payload["left_at"], left_at);
+    engine.abort_detached_runners(&task_id).await;
+}
+
+/// Rewatch goes back to the gate directly; it records nothing, so the
+/// watcher stage keeps the time of the timeout.
+#[tokio::test]
+async fn rewatching_after_a_timeout_leaves_left_at_unchanged() {
+    let (pool, _dir, task_id, engine, _now) =
+        rewatch_setup("esc", json!({ "from": "review", "outcome": "timeout" })).await;
+    let left_at = json!({ "review": "2026-10-09T12:34:56Z" });
+    sqlx::query("UPDATE workflow_state SET payload = json_set(payload, '$.left_at', json(?)) WHERE task_id = ?")
+        .bind(left_at.to_string())
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    wait_for_poll_attempt(&pool, &task_id).await;
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "review");
+    assert_eq!(state.payload["left_at"], left_at);
+    engine.abort_detached_runners(&task_id).await;
 }

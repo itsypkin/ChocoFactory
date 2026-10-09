@@ -156,6 +156,7 @@ stages:
       script_file: scripts/await-review.sh
       env:
         PR_NUMBER: "{{ stages.open_pr.number }}"
+        HANDED_OVER_AT: "{{ left_at.awaiting_human_review }}"
       interval: 60s
       # Every minute for the first 6h, every 5 minutes up to 30h, then every
       # 30 minutes until the 102h timeout.

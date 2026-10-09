@@ -150,18 +150,27 @@ impl Fixture {
     }
 
     fn run(&self) -> Output {
+        self.run_with_handed_over_at(None)
+    }
+
+    /// Runs with `HANDED_OVER_AT` removed (`None`) or set (`Some("")` is
+    /// set and empty). `run()` never inherits it from the developer's shell.
+    fn run_with_handed_over_at(&self, handed_over_at: Option<&str>) -> Output {
         let path = format!(
             "{}:{}",
             self.dir.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        Command::new("sh")
-            .arg(script_path())
+        let mut cmd = Command::new("sh");
+        cmd.arg(script_path())
             .env("PATH", path)
             .env("GH_FAKE_DIR", &self.dir)
             .env("PR_NUMBER", "7")
-            .output()
-            .expect("failed to run await-review.sh")
+            .env_remove("HANDED_OVER_AT");
+        if let Some(value) = handed_over_at {
+            cmd.env("HANDED_OVER_AT", value);
+        }
+        cmd.output().expect("failed to run await-review.sh")
     }
 }
 
@@ -1617,4 +1626,167 @@ fn a_gh_failure_on_page_two_of_reviews_or_inline_comments_is_an_error_with_empty
         assert!(err.contains("page 2 failed"), "{what}: {err}");
         assert!(err.contains("choco await-review:"), "{what}: {err}");
     }
+}
+
+// ---- the hand-off fence (HANDED_OVER_AT) ----
+
+const HANDED: &str = "2026-01-05T12:00:00Z";
+const HANDED_PLUS_1: &str = "2026-01-05T12:00:01Z";
+const HANDED_MINUS_1: &str = "2026-01-05T11:59:59Z";
+const HANDED_PLUS_30: &str = "2026-01-05T12:00:30Z";
+/// A head commit pushed after the hand-off.
+const HEAD_AFTER: &str = "2026-01-06T00:00:00Z";
+
+fn stdout_ok(out: Output) -> String {
+    assert!(
+        out.status.success(),
+        "script failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Reviewer B's review lands while the coder revises: after the hand-off,
+/// before the push that moves the head commit past it.
+#[test]
+fn a_review_submitted_during_a_revision_is_carried_over() {
+    let fx = review_fixture(
+        &[],
+        &[rev("CHANGES_REQUESTED", HANDED_PLUS_30, "please fix X")],
+        &[
+            Inline::at_line(11, "src/a.rs", 5, "fix the first"),
+            Inline::at_line(11, "src/b.rs", 9, "fix the second"),
+        ],
+    );
+    fs::write(fx.dir.join("since"), HEAD_AFTER).unwrap();
+    let out = stdout_ok(fx.run_with_handed_over_at(Some(HANDED)));
+    assert_eq!(first_line(&out), "REQUEST_CHANGES", "{out}");
+    for s in [
+        format!("### rev (COLLABORATOR), {HANDED_PLUS_30}, review CHANGES_REQUESTED").as_str(),
+        "please fix X",
+        "#### src/a.rs:5",
+        "fix the first",
+        "#### src/b.rs:9",
+        "fix the second",
+    ] {
+        assert!(out.contains(s), "{s} missing:\n{out}");
+    }
+}
+
+/// What the gate saw at the hand-off is not handed over twice, even when
+/// the coder pushed nothing.
+#[test]
+fn a_verdict_already_handed_over_is_not_read_again() {
+    // Case a: a comment at exactly the hand-off second, a review before it.
+    let fx = review_fixture(
+        &[owner_comment(HANDED, "/request-changes")],
+        &[review(
+            "11",
+            "CHANGES_REQUESTED",
+            Some(HANDED_MINUS_1),
+            "OWNER",
+            "me",
+            "old",
+        )],
+        &[],
+    );
+    let out = fx.run_with_handed_over_at(Some(HANDED));
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "");
+
+    // Case b: only the item strictly after the hand-off counts or renders.
+    let fx = review_fixture(
+        &[
+            owner_comment(HANDED, "/request-changes\nEQUAL-TIME-BODY"),
+            owner_comment(HANDED_PLUS_1, "/approve\nNEWER-BODY"),
+        ],
+        &[],
+        &[],
+    );
+    let out = stdout_ok(fx.run_with_handed_over_at(Some(HANDED)));
+    assert_eq!(first_line(&out), "APPROVE", "{out}");
+    assert!(out.contains("NEWER-BODY"), "{out}");
+    assert!(!out.contains("EQUAL-TIME-BODY"), "{out}");
+}
+
+/// First round: unset or empty falls back to the head commit, as before.
+#[test]
+fn without_a_hand_off_the_head_commit_is_the_fence() {
+    for value in [None, Some("")] {
+        let fx = Fixture::new(
+            SINCE,
+            &[list(&[
+                owner_comment(STALE, "/approve"),
+                owner_comment(FRESH, "/request-changes"),
+            ])],
+        );
+        let out = stdout_ok(fx.run_with_handed_over_at(value));
+        assert_eq!(first_line(&out), "REQUEST_CHANGES", "{value:?}: {out}");
+        assert!(out.contains(FRESH), "{out}");
+        assert!(!out.contains(STALE), "{out}");
+        assert!(fx.calls().contains("commits/"), "{value:?}: {}", fx.calls());
+    }
+}
+
+/// With a hand-off the head commit is not consulted, and a push after the
+/// hand-off does not hide a vote cast after it.
+#[test]
+fn a_hand_off_time_replaces_the_head_commit_call() {
+    let fx = Fixture::new(
+        SINCE,
+        &[list(&[owner_comment(HANDED_PLUS_30, "/request-changes")])],
+    );
+    let out = stdout_ok(fx.run_with_handed_over_at(Some(HANDED)));
+    assert_eq!(first_line(&out), "REQUEST_CHANGES", "{out}");
+    assert!(!fx.calls().contains("commits/"), "{}", fx.calls());
+
+    fs::write(fx.dir.join("since"), HEAD_AFTER).unwrap();
+    let out2 = stdout_ok(fx.run_with_handed_over_at(Some(HANDED)));
+    assert_eq!(out2, out);
+}
+
+/// A malformed fence fails closed: exit 1, nothing on stdout, no reads.
+#[test]
+fn a_malformed_hand_off_time_fails_without_reading_anything() {
+    for bad in [
+        "2026-10-09T12:34:56.300Z",
+        "0",
+        "yesterday",
+        "2026-10-09 12:34:56Z",
+    ] {
+        let fx = Fixture::new(SINCE, &[list(&[owner_comment(FRESH, "/request-changes")])]);
+        let out = fx.run_with_handed_over_at(Some(bad));
+        assert_eq!(out.status.code(), Some(1), "{bad}");
+        assert!(out.stdout.is_empty(), "{bad}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("choco await-review:"), "{bad}: {err}");
+        let calls = fx.calls();
+        assert!(!calls.contains("commits/"), "{bad}: {calls}");
+        assert!(!calls.contains("issues/"), "{bad}: {calls}");
+    }
+}
+
+/// The MERGED check runs before the fence is looked at.
+#[test]
+fn merged_wins_over_the_hand_off_fence_even_a_malformed_one() {
+    for value in [HANDED, "not-a-time"] {
+        let fx = merged_fixture(&list(&[owner_comment(HANDED_PLUS_30, "/request-changes")]));
+        let out = stdout_ok(fx.run_with_handed_over_at(Some(value)));
+        assert!(out.starts_with("MERGED\n"), "{value}: {out}");
+    }
+}
+
+/// The truncation note names the real fence, not "your last commit".
+#[test]
+fn the_truncation_note_names_the_hand_off_fence() {
+    let big = "x".repeat(60_000);
+    let mut cs: Vec<String> = (0..12)
+        .map(|_| owner_comment(HANDED_PLUS_30, &big))
+        .collect();
+    cs.push(owner_comment(HANDED_PLUS_30, "/request-changes"));
+    let fx = Fixture::new(SINCE, &[list(&cs)]);
+    let out = stdout_ok(fx.run_with_handed_over_at(Some(HANDED)));
+    assert!(out.contains("[truncated"), "no truncation note");
+    assert!(out.contains(&format!("posted after {HANDED} (UTC)")));
+    assert!(!out.contains("your last commit"));
 }

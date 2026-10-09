@@ -37,7 +37,9 @@ and `choco task list --status stuck` finds every stuck task.
 
 `/approve` does nothing here; a reply that is only `/approve` or
 `/request-changes` is refused. After a review or CI timeout,
-`choco task retry <id>` watches again from the start and costs no lap. If the
+`choco task retry <id>` watches again from the start and costs no lap. After a
+review timeout, comments and reviews posted before the timeout no longer count,
+so post them again. If the
 PR was merged meanwhile, after a review timeout `retry` lets the watcher see
 the merge and move the task to `done`. `choco task send <id> --text "<note>"` moves the task on, into
 `revising`.
