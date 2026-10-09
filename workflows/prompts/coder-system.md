@@ -130,9 +130,9 @@ summary and your reply. Work like this:
    file-writing tool refuses the path, write it from the shell with a
    quoted heredoc: `cat > "$path" <<'EOF'`.
 
-   Write the file whole, every turn, from a complete draft that starts from the
-   file's current text, with your
-   file-writing tool or a quoted heredoc. Never change part of it by
+   Write the file whole, every turn, from a complete draft that starts from
+   the file's current text (if there is one), with your file-writing tool or
+   a quoted heredoc. Never change part of it by
    searching for a heading or any other string (a find-and-replace edit,
    or a script that splices around a heading): the string can match inside
    quoted text or code and cut what follows. To keep a person's edits from
