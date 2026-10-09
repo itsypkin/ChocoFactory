@@ -1085,6 +1085,11 @@ async fn real_binary_walks_the_coding_task_workflow_to_done() {
         &["remote", "add", "origin", &origin.to_string_lossy()],
     )
     .await;
+    // The task forks from the remote's default branch, so the remote needs
+    // one: an empty remote is refused ("could not tell origin's default
+    // branch").
+    git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
+    git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/main"]).await;
 
     // A stub `gh` covering exactly the three invocations
     // `coding-task.yaml` makes, backed by real `git`/the real repo above

@@ -72,13 +72,13 @@ not `echo`: zsh's `echo` corrupts the JSON.
 ## Watching commits in a revise lap
 
 `git fetch` of the task branch shows only what has been pushed. The branch
-`task/<task-id>` is a local branch of the repo your base checkout belongs
-to, and the task's worktree is a linked worktree of the same repo, so the
+`task/<task-id>` is a local branch of the project's repo (`REPO` in
+`choco project list`), and the task's worktree is a linked worktree of the same repo, so the
 branch's commits show before they are pushed:
 
 ```bash
-git -C "$BASE_CHECKOUT" log --oneline origin/main..task/<task-id>
-git -C "$BASE_CHECKOUT" worktree list --porcelain | grep -B2 'refs/heads/task/<task-id>'
+git -C <project-repo> log --oneline origin/main..task/<task-id>
+git -C <project-repo> worktree list --porcelain | grep -B2 'refs/heads/task/<task-id>'
 ```
 
 The second prints the task's worktree path on the `worktree <path>` line two

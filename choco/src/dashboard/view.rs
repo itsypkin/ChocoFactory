@@ -11,8 +11,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::render::{
-    LABEL_CREATED, LABEL_ID, LABEL_PROJECT, LABEL_REPO, LABEL_ROLE, LABEL_STAGE, LABEL_STATUS,
-    LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW, LABEL_WORKFLOW_FILE,
+    LABEL_BASE, LABEL_CREATED, LABEL_ID, LABEL_PROJECT, LABEL_REPO, LABEL_ROLE, LABEL_STAGE,
+    LABEL_STATUS, LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW, LABEL_WORKFLOW_FILE,
 };
 
 use super::app::{App, Detail, Level, PromptKind, Scope, Section, View, fmt_duration, max_laps};
@@ -670,7 +670,7 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
                 }
                 LABEL_ROLE => row.drop = 1,
                 LABEL_CREATED => row.drop = 2,
-                LABEL_REPO => row.drop = 3,
+                LABEL_REPO | LABEL_BASE => row.drop = 3,
                 _ => {}
             }
             rows.push(row);

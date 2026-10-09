@@ -256,6 +256,7 @@ pub const LABEL_ID: &str = "ID";
 pub const LABEL_PROJECT: &str = "Project";
 pub const LABEL_WORKFLOW: &str = "Workflow";
 pub const LABEL_WORKFLOW_FILE: &str = "Workflow file";
+pub const LABEL_BASE: &str = "Base";
 pub const LABEL_STATUS: &str = "Status";
 pub const LABEL_STUCK: &str = "Stuck";
 pub const LABEL_KEPT_WORKTREE: &str = "Kept worktree";
@@ -302,6 +303,15 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
                 LABEL_WORKFLOW_FILE
             },
             line,
+        ));
+    }
+    // The commit the worktree was forked from; absent for a task with no
+    // recorded base (older, or a workflow without a worktree).
+    if let Some(commit) = detail.get("base_commit").and_then(Value::as_str) {
+        let base_ref = get("base_ref");
+        pairs.push((
+            LABEL_BASE,
+            format!("{base_ref} @ {}", &commit[..commit.len().min(7)]),
         ));
     }
     pairs.push((LABEL_STATUS, get("status").to_string()));
@@ -1757,6 +1767,8 @@ mod tests {
             kept_work: false,
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1965,6 +1977,47 @@ mod tests {
         });
         let rendered = task_detail(&detail, test_now());
         assert!(!rendered.contains("Workflow file"), "{rendered}");
+    }
+
+    #[test]
+    fn task_detail_shows_the_base_line_only_when_a_commit_is_recorded() {
+        let sha = "1e209f7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+            "base_ref": "origin/main", "base_commit": sha,
+        });
+        let rendered = task_detail(&detail, test_now());
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("Base"))
+            .unwrap_or_else(|| panic!("no Base line:\n{rendered}"));
+        let value = line.strip_prefix("Base").unwrap();
+        assert!(value.starts_with("  "), "{line:?}");
+        assert_eq!(value.trim(), "origin/main @ 1e209f7");
+
+        detail["base_ref"] = Value::Null;
+        let rendered = task_detail(&detail, test_now());
+        assert!(rendered.contains("- @ 1e209f7"), "{rendered}");
+
+        detail["base_commit"] = Value::Null;
+        let rendered = task_detail(&detail, test_now());
+        assert!(
+            !rendered.lines().any(|l| l.starts_with("Base")),
+            "{rendered}"
+        );
+        // An old daemon sends neither field.
+        let old = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": null,
+        });
+        assert!(
+            !task_detail(&old, test_now())
+                .lines()
+                .any(|l| l.starts_with("Base"))
+        );
     }
 
     /// A task with no config at all must render exactly as before.
@@ -2199,6 +2252,8 @@ mod tests {
             kept_work: false,
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

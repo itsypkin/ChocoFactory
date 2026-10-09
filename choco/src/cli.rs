@@ -381,6 +381,13 @@ pub struct TaskCreateArgs {
     /// when the project has one and this is omitted.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Commit to fork the task's worktree from: a `<remote>/<branch>`
+    /// (fetched first), or any local branch, tag, SHA or `HEAD`. Default: the
+    /// remote's default branch, freshly fetched, or HEAD when the repo has no
+    /// remote. Only for a workflow that creates a worktree. A local branch
+    /// literally named `origin/x` is shadowed by the remote form.
+    #[arg(long)]
+    pub base: Option<String>,
     #[command(flatten)]
     pub roles: RoleOverrideArgs,
 }
@@ -509,6 +516,39 @@ mod tests {
             Command::Update { version, .. } => assert_eq!(version, Some("0.2.0".to_string())),
             _ => panic!("expected Command::Update"),
         }
+    }
+
+    #[test]
+    fn task_create_base_is_its_own_flag_next_to_the_global_base_url() {
+        let argv = [
+            "choco",
+            "--base-url",
+            "http://x:1",
+            "task",
+            "create",
+            "--project",
+            "p",
+            "--workflow",
+            "w",
+            "--title",
+            "t",
+            "--prompt",
+            "x",
+        ];
+        let without = Cli::try_parse_from(argv).unwrap();
+        let Command::Task(TaskCmd::Create(args)) = without.command else {
+            panic!("expected task create");
+        };
+        assert_eq!(args.base, None);
+
+        let mut with = argv.to_vec();
+        with.extend(["--base", "origin/main"]);
+        let cli = Cli::try_parse_from(with).unwrap();
+        assert_eq!(cli.base_url.as_deref(), Some("http://x:1"));
+        let Command::Task(TaskCmd::Create(args)) = cli.command else {
+            panic!("expected task create");
+        };
+        assert_eq!(args.base.as_deref(), Some("origin/main"));
     }
 
     #[test]

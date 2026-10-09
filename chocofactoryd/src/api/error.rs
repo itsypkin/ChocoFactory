@@ -13,12 +13,15 @@ use crate::engine::{
 };
 use crate::session::SessionError;
 use crate::workflow_def::WorkflowDefError;
+use crate::worktree::{BaseError, WorktreeError};
 
 #[derive(Debug)]
 pub enum ApiError {
     NotFound(String),
     BadRequest(String),
     Conflict(String),
+    /// A remote the daemon had to reach (to resolve a task's base) failed.
+    BadGateway(String),
     Internal(String),
 }
 
@@ -28,6 +31,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         (status, Json(json!({ "error": message }))).into_response()
@@ -75,6 +79,16 @@ impl From<CreateTaskError> for ApiError {
                 source: EngineError::TaskCancelled(_),
                 ..
             } => ApiError::Conflict(err.to_string()),
+            CreateTaskError::Base(BaseError::Remote { .. }) => {
+                ApiError::BadGateway(err.to_string())
+            }
+            CreateTaskError::Base(BaseError::Git(
+                WorktreeError::Spawn(_) | WorktreeError::Io(_) | WorktreeError::GitFailed { .. },
+            )) => ApiError::Internal(err.to_string()),
+            // Every other base failure is about what the caller asked for.
+            CreateTaskError::Base(_)
+            | CreateTaskError::BaseWithoutWorktree
+            | CreateTaskError::NoRepo { .. } => ApiError::BadRequest(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }
@@ -262,5 +276,26 @@ mod tests {
             rewatch: false,
         };
         assert!(matches!(ApiError::from(err), ApiError::BadRequest(_)));
+    }
+}
+
+#[cfg(test)]
+mod base_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn base_git_io_failures_are_server_errors_and_a_non_repo_is_a_bad_request() {
+        let io = CreateTaskError::Base(BaseError::Git(WorktreeError::Io(std::io::Error::other(
+            "boom",
+        ))));
+        assert!(matches!(ApiError::from(io), ApiError::Internal(_)));
+        let not_repo = CreateTaskError::Base(BaseError::Git(WorktreeError::NotAGitRepo {
+            path: "/x".into(),
+            source: Box::new(WorktreeError::GitFailed {
+                args: vec![],
+                stderr: String::new(),
+            }),
+        }));
+        assert!(matches!(ApiError::from(not_repo), ApiError::BadRequest(_)));
     }
 }

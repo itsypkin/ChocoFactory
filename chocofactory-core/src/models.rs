@@ -85,6 +85,16 @@ pub struct Task {
     /// after a task starts is allowed, not refused, and reloading never
     /// checks this hash. `None` alongside `workflow_path: None`.
     pub workflow_sha256: Option<String>,
+    /// The ref the task's worktree was forked from, as resolved at create
+    /// (`origin/main`, a `--base` value, or `HEAD`). Set once at create for a
+    /// worktree workflow and never changed; `None` for older tasks and for
+    /// workflows without a worktree.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// The full SHA `base_ref` resolved to at create. Same lifetime as
+    /// `base_ref`.
+    #[serde(default)]
+    pub base_commit: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -9,6 +9,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::Duration;
 
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
@@ -157,7 +158,10 @@ struct KeyLock {
 
 impl KeyLock {
     async fn acquire(path: &Path) -> Self {
-        let key = lock_key(path);
+        Self::acquire_key(lock_key(path)).await
+    }
+
+    async fn acquire_key(key: String) -> Self {
         let lock = acquire_lock(&key);
         // Construct `Self` (with `guard: None`) *before* awaiting the
         // mutex, not after. If this function's caller is cancelled while
@@ -384,16 +388,39 @@ async fn branch_present(repo: &Path, branch: &str) -> Result<bool, WorktreeError
 /// Creates the task's worktree if it doesn't already exist (idempotent, so
 /// re-entering the triggering stage — e.g. after a daemon restart — is
 /// safe). Returns the worktree's path either way.
-pub async fn ensure(repo: &Path, project: &str, task_id: &str) -> Result<PathBuf, WorktreeError> {
+///
+/// `start` is the commit a *new* branch is forked from (`git worktree add -b
+/// <branch> -- <path> <start>`); `None` forks from the checkout's HEAD. When
+/// the branch already exists it is attached as it is and `start` is ignored,
+/// so the branch keeps its commits.
+///
+/// Only called from `start_task`, which runs once at create; retries,
+/// resumes and the restart sweep never call it, so a task's base is resolved
+/// and forked exactly once.
+pub async fn ensure(
+    repo: &Path,
+    project: &str,
+    task_id: &str,
+    start: Option<&str>,
+) -> Result<PathBuf, WorktreeError> {
     // Validate first: cheap, and gives a more specific/actionable error
     // than paying for a `git rev-parse` only to still fail afterwards.
     let path = worktree_path(repo, project, task_id)?;
     ensure_git_repo(repo).await?;
     let _lock = KeyLock::acquire(&path).await;
-    ensure_locked(repo, task_id, &path).await
+    // Also the per-repository lock `resolve_base` takes: a `git fetch` into
+    // the repo while `git worktree add` is half done can fail its
+    // connectivity check on the new worktree's not-yet-valid HEAD.
+    let _repo_lock = repo_lock(repo).await?;
+    ensure_locked(repo, task_id, &path, start).await
 }
 
-async fn ensure_locked(repo: &Path, task_id: &str, path: &Path) -> Result<PathBuf, WorktreeError> {
+async fn ensure_locked(
+    repo: &Path,
+    task_id: &str,
+    path: &Path,
+    start: Option<&str>,
+) -> Result<PathBuf, WorktreeError> {
     if path.exists() {
         // Bare `.git`-file presence isn't enough: git writes that gitlink
         // (and registers the worktree) *before* populating the working
@@ -427,6 +454,12 @@ async fn ensure_locked(repo: &Path, task_id: &str, path: &Path) -> Result<PathBu
     // can't be misparsed by git as a flag.
     if branch_exists(repo, &branch).await {
         run_git(repo, &["worktree", "add", "--", &path_str, &branch]).await?;
+    } else if let Some(start) = start {
+        run_git(
+            repo,
+            &["worktree", "add", "-b", &branch, "--", &path_str, start],
+        )
+        .await?;
     } else {
         run_git(repo, &["worktree", "add", "-b", &branch, "--", &path_str]).await?;
     }
@@ -576,6 +609,451 @@ async fn git_common_dir(repo: &Path) -> Result<PathBuf, WorktreeError> {
         repo.join(path)
     };
     std::fs::canonicalize(&absolute).map_err(WorktreeError::Io)
+}
+
+/// How long one network call (`fetch`, `ls-remote`) made while resolving a
+/// task's base may run before it is killed and reported as a failure.
+pub const BASE_NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The commit a task forks from, and the ref it was named by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBase {
+    pub base_ref: String,
+    pub base_commit: String,
+}
+
+#[derive(Debug)]
+pub enum BaseError {
+    /// `--base ""`.
+    Empty,
+    /// A local ref that does not resolve, or a remote branch that does not exist.
+    UnknownRef {
+        base: String,
+        repo: PathBuf,
+        stderr: String,
+    },
+    /// The remote answered, but named no default branch under `refs/heads/`.
+    NoDefaultBranch {
+        remote: String,
+    },
+    /// No `--base`, two or more remotes, none called `origin`.
+    SeveralRemotes {
+        repo: PathBuf,
+    },
+    /// No `--base`, no remote, and HEAD does not point at a commit.
+    UnbornHead {
+        repo: PathBuf,
+        stderr: String,
+    },
+    /// A network call to the remote failed or timed out.
+    Remote {
+        remote: String,
+        op: &'static str,
+        stderr: String,
+    },
+    Git(WorktreeError),
+}
+
+impl fmt::Display for BaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BaseError::Empty => write!(f, "--base is empty"),
+            BaseError::UnknownRef { base, repo, stderr } => write!(
+                f,
+                "base '{base}' does not resolve to a commit in {}: {}",
+                repo.display(),
+                stderr.trim()
+            ),
+            BaseError::NoDefaultBranch { remote } => {
+                write!(f, "could not tell {remote}'s default branch; pass --base")
+            }
+            BaseError::SeveralRemotes { repo } => write!(
+                f,
+                "{} has several remotes and none is origin; pass --base <remote>/<branch>",
+                repo.display()
+            ),
+            BaseError::UnbornHead { repo, stderr } => write!(
+                f,
+                "{} has no commit at HEAD to fork from: {}",
+                repo.display(),
+                stderr.trim()
+            ),
+            BaseError::Remote { remote, op, stderr } => {
+                write!(
+                    f,
+                    "could not {op} from remote '{remote}': {}",
+                    stderr.trim()
+                )
+            }
+            BaseError::Git(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for BaseError {}
+
+impl From<WorktreeError> for BaseError {
+    fn from(err: WorktreeError) -> Self {
+        BaseError::Git(err)
+    }
+}
+
+/// Finishes of one git invocation made by [`run_git_resolve`].
+struct GitRun {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+enum Ran {
+    Done(GitRun),
+    TimedOut,
+}
+
+/// Runs git for base resolution: no prompts, no stdin, killed when dropped,
+/// and killed after `timeout` when one is given.
+async fn run_git_resolve(
+    repo: &Path,
+    args: &[&str],
+    timeout: Option<Duration>,
+) -> Result<Ran, WorktreeError> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Not kill_on_drop: that sends SIGKILL, which leaves a ref
+        // `.lock` file behind if git is mid-fetch. `TermOnDrop` sends
+        // SIGTERM, which git cleans up after.
+        .kill_on_drop(false);
+    let child = cmd.spawn().map_err(WorktreeError::Spawn)?;
+    let mut guard = TermOnDrop(Some(child));
+    let child = guard.0.as_mut().expect("child present");
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let work = async {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let read_out = async {
+            if let Some(s) = stdout.as_mut() {
+                s.read_to_end(&mut out).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let read_err = async {
+            if let Some(s) = stderr.as_mut() {
+                s.read_to_end(&mut err).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let (a, b) = tokio::join!(read_out, read_err);
+        a?;
+        b?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, out, err))
+    };
+    let result = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, work).await {
+            Ok(result) => result,
+            Err(_) => {
+                // SIGTERM git and wait for it here, while the caller still
+                // holds the per-repo lock, so git has removed its ref lock
+                // file before the next create can start a fetch.
+                if let Some(child) = guard.0.take() {
+                    terminate_and_reap(child).await;
+                }
+                return Ok(Ran::TimedOut);
+            }
+        },
+        None => work.await,
+    }
+    .map_err(WorktreeError::Spawn)?;
+    guard.0 = None;
+    let (status, out, err) = result;
+    Ok(Ran::Done(GitRun {
+        code: status.code(),
+        stdout: String::from_utf8_lossy(&out).trim().to_string(),
+        stderr: String::from_utf8_lossy(&err).trim().to_string(),
+    }))
+}
+
+/// Sends SIGTERM to a still-running git when dropped (timeout or a cancelled
+/// request) and reaps it in the background, escalating to SIGKILL after a
+/// grace period. SIGTERM lets git remove the ref lock files it holds.
+struct TermOnDrop(Option<tokio::process::Child>);
+
+impl Drop for TermOnDrop {
+    fn drop(&mut self) {
+        let Some(child) = self.0.take() else {
+            return;
+        };
+        if let Some(pid) = child.id() {
+            // SAFETY: plain signal to a child pid we own and have not reaped.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(reap_or_kill(child));
+        }
+    }
+}
+
+/// How long a SIGTERMed git gets to exit before it is SIGKILLed.
+const TERM_GRACE: Duration = Duration::from_secs(10);
+
+/// Waits for an already-SIGTERMed git; past the grace period, SIGKILLs it
+/// (which can leave a ref lock file, so it is logged).
+async fn reap_or_kill(mut child: tokio::process::Child) {
+    if tokio::time::timeout(TERM_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            pid = child.id(),
+            "git ignored SIGTERM for {}s; sending SIGKILL (a ref lock file may remain)",
+            TERM_GRACE.as_secs()
+        );
+        let _ = child.kill().await;
+    }
+}
+
+async fn terminate_and_reap(child: tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: plain signal to a child pid we own and have not reaped.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    reap_or_kill(child).await;
+}
+
+fn timed_out_text(limit: Duration) -> String {
+    if limit.subsec_nanos() == 0 {
+        format!("timed out after {}s", limit.as_secs())
+    } else {
+        format!("timed out after {:.1}s", limit.as_secs_f64())
+    }
+}
+
+/// Resolves the commit a new task forks from (see the rules on
+/// `create_task_from`), serialised per repository so concurrent fetches into
+/// one repo cannot collide. Never reads or moves the checkout's HEAD.
+pub async fn resolve_base(
+    repo: &Path,
+    base: Option<&str>,
+    network_timeout: Duration,
+) -> Result<ResolvedBase, BaseError> {
+    if !repo.is_absolute() {
+        return Err(WorktreeError::RepoNotAbsolute(repo.to_path_buf()).into());
+    }
+    ensure_git_repo(repo).await?;
+    if base == Some("") {
+        return Err(BaseError::Empty);
+    }
+    let _lock = repo_lock(repo).await?;
+    resolve_base_locked(repo, base, network_timeout).await
+}
+
+/// The per-repository lock: one key per common git directory (linked
+/// worktrees share it), held by base resolution and by `git worktree add`.
+async fn repo_lock(repo: &Path) -> Result<KeyLock, WorktreeError> {
+    let common = git_common_dir(repo).await?;
+    Ok(KeyLock::acquire_key(format!("base:{}", common.display())).await)
+}
+
+async fn resolve_base_locked(
+    repo: &Path,
+    base: Option<&str>,
+    timeout: Duration,
+) -> Result<ResolvedBase, BaseError> {
+    let remotes_out = run_git_stdout(repo, &["remote"]).await?;
+    let remotes: Vec<&str> = remotes_out.lines().map(str::trim).collect();
+    if let Some(base) = base {
+        if let Some((remote, branch)) = split_remote_form(repo, &remotes, base).await? {
+            return fetch_and_resolve(repo, remote, branch, base, timeout).await;
+        }
+        return resolve_local(repo, base, base).await;
+    }
+    let remote = if remotes.contains(&"origin") {
+        "origin"
+    } else if remotes.len() == 1 {
+        remotes[0]
+    } else if remotes.is_empty() {
+        return resolve_head(repo).await;
+    } else {
+        return Err(BaseError::SeveralRemotes {
+            repo: repo.to_path_buf(),
+        });
+    };
+    let run = run_git_resolve(
+        repo,
+        &["ls-remote", "--symref", "--end-of-options", remote, "HEAD"],
+        Some(timeout),
+    )
+    .await?;
+    let out = match run {
+        Ran::TimedOut => {
+            return Err(BaseError::Remote {
+                remote: remote.to_string(),
+                op: "ls-remote",
+                stderr: timed_out_text(timeout),
+            });
+        }
+        Ran::Done(out) if out.code != Some(0) => {
+            return Err(BaseError::Remote {
+                remote: remote.to_string(),
+                op: "ls-remote",
+                stderr: out.stderr,
+            });
+        }
+        Ran::Done(out) => out,
+    };
+    let branch = out
+        .stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")
+                .and_then(|rest| rest.strip_suffix("\tHEAD"))
+        })
+        .filter(|b| !b.is_empty() && *b != "HEAD")
+        .ok_or_else(|| BaseError::NoDefaultBranch {
+            remote: remote.to_string(),
+        })?;
+    if !valid_branch(repo, branch).await? {
+        return Err(BaseError::NoDefaultBranch {
+            remote: remote.to_string(),
+        });
+    }
+    fetch_and_resolve(repo, remote, branch, &format!("{remote}/{branch}"), timeout).await
+}
+
+async fn valid_branch(repo: &Path, branch: &str) -> Result<bool, WorktreeError> {
+    let name = format!("refs/heads/{branch}");
+    match run_git_resolve(repo, &["check-ref-format", &name], None).await? {
+        Ran::Done(out) => Ok(out.code == Some(0)),
+        Ran::TimedOut => Ok(false),
+    }
+}
+
+/// `Some((remote, branch))` when `base` is `<remote>/<branch>` for one of the
+/// repo's remotes (longest remote name wins) and `<branch>` is a plain branch
+/// name; `None` means "resolve it locally".
+async fn split_remote_form<'a>(
+    repo: &Path,
+    remotes: &[&'a str],
+    base: &'a str,
+) -> Result<Option<(&'a str, &'a str)>, WorktreeError> {
+    let best = remotes
+        .iter()
+        .filter(|r| !r.is_empty() && base.strip_prefix(**r).is_some_and(|x| x.starts_with('/')))
+        .max_by_key(|r| r.len());
+    let Some(remote) = best else {
+        return Ok(None);
+    };
+    let branch = &base[remote.len() + 1..];
+    if branch.is_empty() || branch == "HEAD" || !valid_branch(repo, branch).await? {
+        return Ok(None);
+    }
+    Ok(Some((remote, branch)))
+}
+
+async fn resolve_local(repo: &Path, rev: &str, base_ref: &str) -> Result<ResolvedBase, BaseError> {
+    let spec = format!("{rev}^{{commit}}");
+    match run_git_resolve(
+        repo,
+        &["rev-parse", "--verify", "--end-of-options", &spec],
+        None,
+    )
+    .await?
+    {
+        Ran::Done(out) if out.code == Some(0) => Ok(ResolvedBase {
+            base_ref: base_ref.to_string(),
+            base_commit: out.stdout,
+        }),
+        Ran::Done(out) => Err(BaseError::UnknownRef {
+            base: base_ref.to_string(),
+            repo: repo.to_path_buf(),
+            stderr: out.stderr,
+        }),
+        Ran::TimedOut => unreachable!("no timeout was set"),
+    }
+}
+
+async fn resolve_head(repo: &Path) -> Result<ResolvedBase, BaseError> {
+    match resolve_local(repo, "HEAD", "HEAD").await {
+        Err(BaseError::UnknownRef { repo, stderr, .. }) => {
+            Err(BaseError::UnbornHead { repo, stderr })
+        }
+        other => other,
+    }
+}
+
+async fn fetch_and_resolve(
+    repo: &Path,
+    remote: &str,
+    branch: &str,
+    base_ref: &str,
+    timeout: Duration,
+) -> Result<ResolvedBase, BaseError> {
+    let tracking = format!("refs/remotes/{remote}/{branch}");
+    let refspec = format!("+refs/heads/{branch}:{tracking}");
+    let fetch = run_git_resolve(
+        repo,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--end-of-options",
+            remote,
+            &refspec,
+        ],
+        Some(timeout),
+    )
+    .await?;
+    let fetch_err = match fetch {
+        Ran::Done(out) if out.code == Some(0) => {
+            return resolve_local(repo, &tracking, base_ref).await;
+        }
+        Ran::Done(out) => out.stderr,
+        Ran::TimedOut => timed_out_text(timeout),
+    };
+    // Both "no such branch" and "remote unreachable" exit 128 from fetch, so
+    // ask the remote directly which one it was.
+    let head_ref = format!("refs/heads/{branch}");
+    let probe = run_git_resolve(
+        repo,
+        &[
+            "ls-remote",
+            "--exit-code",
+            "--end-of-options",
+            remote,
+            &head_ref,
+        ],
+        Some(timeout),
+    )
+    .await?;
+    let stderr = match probe {
+        Ran::Done(out) if out.code == Some(2) => {
+            return Err(BaseError::UnknownRef {
+                base: base_ref.to_string(),
+                repo: repo.to_path_buf(),
+                stderr: fetch_err,
+            });
+        }
+        Ran::Done(out) if out.code == Some(0) => fetch_err,
+        Ran::Done(out) => format!("{fetch_err}; ls-remote: {}", out.stderr),
+        Ran::TimedOut => format!("{fetch_err}; ls-remote: {}", timed_out_text(timeout)),
+    };
+    Err(BaseError::Remote {
+        remote: remote.to_string(),
+        op: "fetch",
+        stderr,
+    })
 }
 
 async fn run_git(repo: &Path, args: &[&str]) -> Result<(), WorktreeError> {
@@ -1018,7 +1496,7 @@ mod tests {
         let repo = root.join("myrepo");
         init_repo(&repo).await;
 
-        let path = ensure(&repo, "myrepo", "task-1").await.unwrap();
+        let path = ensure(&repo, "myrepo", "task-1", None).await.unwrap();
         assert_eq!(path, root.join("myrepo-wt-task-1"));
         assert!(path.join("README.md").exists());
 
@@ -1031,8 +1509,8 @@ mod tests {
         let repo = root.join("myrepo");
         init_repo(&repo).await;
 
-        let first = ensure(&repo, "myrepo", "task-1").await.unwrap();
-        let second = ensure(&repo, "myrepo", "task-1").await.unwrap();
+        let first = ensure(&repo, "myrepo", "task-1", None).await.unwrap();
+        let second = ensure(&repo, "myrepo", "task-1", None).await.unwrap();
         assert_eq!(first, second);
 
         std::fs::remove_dir_all(&root).ok();
@@ -1044,12 +1522,12 @@ mod tests {
         let repo = root.join("myrepo");
         init_repo(&repo).await;
 
-        let path = ensure(&repo, "myrepo", "task-1").await.unwrap();
+        let path = ensure(&repo, "myrepo", "task-1", None).await.unwrap();
         // Simulate a crash: the worktree dir is gone but git still thinks
         // it's registered and the branch survives.
         std::fs::remove_dir_all(&path).unwrap();
 
-        let second = ensure(&repo, "myrepo", "task-1").await.unwrap();
+        let second = ensure(&repo, "myrepo", "task-1", None).await.unwrap();
         assert_eq!(second, path);
         assert!(path.join("README.md").exists());
 
@@ -1069,7 +1547,7 @@ mod tests {
         std::fs::create_dir_all(&bogus_path).unwrap();
         std::fs::write(bogus_path.join("stray.txt"), "not a worktree\n").unwrap();
 
-        let err = ensure(&repo, "myrepo", "task-1").await.unwrap_err();
+        let err = ensure(&repo, "myrepo", "task-1", None).await.unwrap_err();
         assert!(matches!(err, WorktreeError::PathOccupied(p) if p == bogus_path));
 
         std::fs::remove_dir_all(&root).ok();
@@ -1081,7 +1559,7 @@ mod tests {
         let repo = root.join("myrepo");
         init_repo(&repo).await;
 
-        let path = ensure(&repo, "myrepo", "task-1").await.unwrap();
+        let path = ensure(&repo, "myrepo", "task-1", None).await.unwrap();
 
         // Simulate a crash landing between `git worktree add` finishing
         // (which writes the `.git` gitlink before populating files) and
@@ -1090,7 +1568,7 @@ mod tests {
         let admin_dir = worktree_admin_dir(&path).unwrap();
         std::fs::remove_file(admin_dir.join(COMPLETE_MARKER)).unwrap();
 
-        let err = ensure(&repo, "myrepo", "task-1").await.unwrap_err();
+        let err = ensure(&repo, "myrepo", "task-1", None).await.unwrap_err();
         assert!(matches!(err, WorktreeError::PathOccupied(p) if p == path));
 
         std::fs::remove_dir_all(&root).ok();
@@ -1108,9 +1586,13 @@ mod tests {
         // identical worktree path for the same (project, task_id) pair.
         // ensure() for repo_a must not accept a worktree that's actually
         // registered under repo_b's admin directory.
-        let path_b = ensure(&repo_b, "shared-name", "task-1").await.unwrap();
+        let path_b = ensure(&repo_b, "shared-name", "task-1", None)
+            .await
+            .unwrap();
 
-        let err = ensure(&repo_a, "shared-name", "task-1").await.unwrap_err();
+        let err = ensure(&repo_a, "shared-name", "task-1", None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, WorktreeError::PathOccupied(p) if p == path_b));
 
         std::fs::remove_dir_all(&root).ok();
@@ -1127,12 +1609,14 @@ mod tests {
         // main repo's real git-dir either way, so using one as `repo` for
         // a nested task must work correctly and idempotently, not just
         // succeed once and then break (the bug this replaced).
-        let nested_repo = ensure(&main_repo, "myrepo", "outer-task").await.unwrap();
-
-        let first = ensure(&nested_repo, "innerproject", "inner-task")
+        let nested_repo = ensure(&main_repo, "myrepo", "outer-task", None)
             .await
             .unwrap();
-        let second = ensure(&nested_repo, "innerproject", "inner-task")
+
+        let first = ensure(&nested_repo, "innerproject", "inner-task", None)
+            .await
+            .unwrap();
+        let second = ensure(&nested_repo, "innerproject", "inner-task", None)
             .await
             .unwrap();
         assert_eq!(first, second);
@@ -1163,8 +1647,12 @@ mod tests {
         )
         .await;
 
-        let first = ensure(&bare_repo, "myproject", "task-1").await.unwrap();
-        let second = ensure(&bare_repo, "myproject", "task-1").await.unwrap();
+        let first = ensure(&bare_repo, "myproject", "task-1", None)
+            .await
+            .unwrap();
+        let second = ensure(&bare_repo, "myproject", "task-1", None)
+            .await
+            .unwrap();
         assert_eq!(first, second);
         assert!(first.join("README.md").exists());
 
@@ -1196,8 +1684,8 @@ mod tests {
         // `repo`'s `.git` is a gitlink pointing at `git_dir` — the same
         // *shape* as a linked worktree or submodule, but a perfectly
         // ordinary standalone repo. It must not be treated as occupied.
-        let first = ensure(&repo, "myproject", "task-1").await.unwrap();
-        let second = ensure(&repo, "myproject", "task-1").await.unwrap();
+        let first = ensure(&repo, "myproject", "task-1", None).await.unwrap();
+        let second = ensure(&repo, "myproject", "task-1", None).await.unwrap();
         assert_eq!(first, second);
         assert!(first.join("README.md").exists());
 
@@ -1230,7 +1718,7 @@ mod tests {
         for _ in 0..8 {
             let repo = Arc::clone(&repo);
             handles.push(tokio::spawn(async move {
-                ensure(&repo, "myrepo", "task-1").await
+                ensure(&repo, "myrepo", "task-1", None).await
             }));
         }
 
@@ -1252,8 +1740,8 @@ mod tests {
         let repo = Arc::new(repo);
 
         let (a, b) = tokio::join!(
-            ensure(&repo, "myrepo", "task-a"),
-            ensure(&repo, "myrepo", "task-b"),
+            ensure(&repo, "myrepo", "task-a", None),
+            ensure(&repo, "myrepo", "task-b", None),
         );
         let (a, b) = (a.unwrap(), b.unwrap());
         assert_ne!(a, b);
@@ -1271,7 +1759,7 @@ mod tests {
 
         // Unique key so this assertion can't be affected by other tests'
         // entries in the process-wide `LOCKS` map running concurrently.
-        let path = ensure(&repo, "lockmap-test-project", "lockmap-test-task")
+        let path = ensure(&repo, "lockmap-test-project", "lockmap-test-task", None)
             .await
             .unwrap();
         remove(&repo, "lockmap-test-project", "lockmap-test-task")
@@ -1317,7 +1805,7 @@ mod tests {
         let root = tempdir();
         let repo = root.join("myrepo");
         init_repo(&repo).await;
-        ensure(&repo, "myrepo", "task-1").await.unwrap();
+        ensure(&repo, "myrepo", "task-1", None).await.unwrap();
         let repo = Arc::new(repo);
 
         let mut handles = Vec::new();
@@ -1325,7 +1813,7 @@ mod tests {
             let repo = Arc::clone(&repo);
             handles.push(tokio::spawn(async move {
                 if i % 2 == 0 {
-                    ensure(&repo, "myrepo", "task-1").await.map(|_| ())
+                    ensure(&repo, "myrepo", "task-1", None).await.map(|_| ())
                 } else {
                     remove(&repo, "myrepo", "task-1").await
                 }
@@ -1344,7 +1832,7 @@ mod tests {
         let repo = root.join("myrepo");
         init_repo(&repo).await;
 
-        let path = ensure(&repo, "myrepo", "task-1").await.unwrap();
+        let path = ensure(&repo, "myrepo", "task-1", None).await.unwrap();
         assert!(path.exists());
 
         remove(&repo, "myrepo", "task-1").await.unwrap();
@@ -1370,7 +1858,7 @@ mod tests {
         let repo = root.join("myrepo");
         init_repo(&repo).await;
 
-        let path = ensure(&repo, "myrepo", "task-1").await.unwrap();
+        let path = ensure(&repo, "myrepo", "task-1", None).await.unwrap();
         std::fs::write(path.join("scratch.txt"), "uncommitted\n").unwrap();
 
         remove(&repo, "myrepo", "task-1").await.unwrap();
@@ -1385,7 +1873,7 @@ mod tests {
         let not_a_repo = root.join("plain-dir");
         std::fs::create_dir_all(&not_a_repo).unwrap();
 
-        let err = ensure(&not_a_repo, "myproject", "task-1")
+        let err = ensure(&not_a_repo, "myproject", "task-1", None)
             .await
             .unwrap_err();
         // The underlying git error should be preserved, not discarded.
@@ -1416,7 +1904,7 @@ mod tests {
         git(&bare, &["init", "-q", "--bare"]).await;
         git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).await;
         git(&repo, &["push", "-q", "-u", "origin", "main"]).await;
-        let wt = ensure(&repo, "myrepo", id).await.unwrap();
+        let wt = ensure(&repo, "myrepo", id, None).await.unwrap();
         std::fs::write(wt.join("work.txt"), "work\n").unwrap();
         git(&wt, &["add", "."]).await;
         git(&wt, &["commit", "-q", "-m", "work"]).await;
@@ -1604,5 +2092,92 @@ mod tests {
         assert!(wt.exists());
         assert!(branch_exists(&repo, "task/task-1").await);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    async fn rev(dir: &Path, what: &str) -> String {
+        run_git_stdout(dir, &["rev-parse", what]).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn ensure_forks_a_new_branch_at_start_and_at_head_without_one() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+        let first = rev(&repo, "HEAD").await;
+        std::fs::write(repo.join("two.txt"), "2").unwrap();
+        git(&repo, &["add", "."]).await;
+        git(&repo, &["commit", "-q", "-m", "two"]).await;
+        let second = rev(&repo, "HEAD").await;
+
+        let at_start = ensure(&repo, "myrepo", "t-start", Some(&first))
+            .await
+            .unwrap();
+        assert_eq!(rev(&at_start, "HEAD").await, first);
+        let at_head = ensure(&repo, "myrepo", "t-head", None).await.unwrap();
+        assert_eq!(rev(&at_head, "HEAD").await, second);
+        // The checkout itself never moved.
+        assert_eq!(rev(&repo, "HEAD").await, second);
+    }
+
+    #[tokio::test]
+    async fn ensure_attaches_an_existing_branch_and_ignores_start() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+        let a = rev(&repo, "HEAD").await;
+        git(&repo, &["branch", "task/t-1", &a]).await;
+        git(&repo, &["checkout", "-q", "task/t-1"]).await;
+        std::fs::write(repo.join("b.txt"), "b").unwrap();
+        git(&repo, &["add", "."]).await;
+        git(&repo, &["commit", "-q", "-m", "b"]).await;
+        let b = rev(&repo, "HEAD").await;
+        git(&repo, &["checkout", "-q", "-"]).await;
+        git(&repo, &["checkout", "-q", "--detach", &a]).await;
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "c"]).await;
+        let c = rev(&repo, "HEAD").await;
+        assert_ne!(b, c);
+
+        let path = ensure(&repo, "myrepo", "t-1", Some(&c)).await.unwrap();
+        assert_eq!(rev(&path, "HEAD").await, b);
+        let log = run_git_stdout(&path, &["rev-list", "HEAD"]).await.unwrap();
+        assert!(log.contains(&a) && log.contains(&b));
+    }
+
+    #[tokio::test]
+    async fn resolve_base_runs_concurrently_on_a_repo_and_its_linked_worktree() {
+        let root = tempdir();
+        let repo = root.join("myrepo");
+        init_repo(&repo).await;
+        let linked = ensure(&repo, "myrepo", "t-linked", None).await.unwrap();
+        let head = rev(&repo, "HEAD").await;
+
+        let (a, b) = tokio::join!(
+            resolve_base(&repo, None, BASE_NETWORK_TIMEOUT),
+            resolve_base(&linked, Some("HEAD"), BASE_NETWORK_TIMEOUT),
+        );
+        assert_eq!(a.unwrap().base_commit, head);
+        assert_eq!(b.unwrap().base_commit, head);
+        // Both took the same per-repository key, and it was released.
+        let key = format!("base:{}", git_common_dir(&repo).await.unwrap().display());
+        assert!(!LOCKS.lock().unwrap().contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn resolve_base_rejects_a_non_repo_and_a_relative_path() {
+        let root = tempdir();
+        let err = resolve_base(&root, None, BASE_NETWORK_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BaseError::Git(WorktreeError::NotAGitRepo { .. })
+        ));
+        let err = resolve_base(Path::new("rel"), None, BASE_NETWORK_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BaseError::Git(WorktreeError::RepoNotAbsolute(_))
+        ));
     }
 }

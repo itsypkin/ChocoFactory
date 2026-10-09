@@ -11,7 +11,7 @@ macro_rules! columns {
     () => {
         "id, project_id, workflow_def, title, status, config, \
      worktree_repo, worktree_project, stuck_reason, kept_work, workflow_path, workflow_sha256, \
-     created_at, updated_at"
+     base_ref, base_commit, created_at, updated_at"
     };
 }
 
@@ -29,6 +29,8 @@ struct TaskRow {
     kept_work: bool,
     workflow_path: Option<String>,
     workflow_sha256: Option<String>,
+    base_ref: Option<String>,
+    base_commit: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -48,6 +50,8 @@ impl From<TaskRow> for Task {
             kept_work: row.kept_work,
             workflow_path: row.workflow_path,
             workflow_sha256: row.workflow_sha256,
+            base_ref: row.base_ref,
+            base_commit: row.base_commit,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -69,6 +73,10 @@ pub struct NewTask<'a> {
     /// time, so `choco task status` can say whether the file has changed
     /// since.
     pub workflow_sha256: Option<&'a str>,
+    /// The ref and full commit the task's worktree forks from; written by
+    /// this one INSERT and never changed.
+    pub base_ref: Option<&'a str>,
+    pub base_commit: Option<&'a str>,
 }
 
 pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::Error> {
@@ -76,8 +84,8 @@ pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::E
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRow>(concat!(
         "INSERT INTO tasks (id, project_id, workflow_def, title, status, config, \
-         workflow_path, workflow_sha256, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
+         workflow_path, workflow_sha256, base_ref, base_commit, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
          RETURNING ",
         columns!()
     ))
@@ -88,6 +96,8 @@ pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::E
     .bind(Json(new.config))
     .bind(new.workflow_path)
     .bind(new.workflow_sha256)
+    .bind(new.base_ref)
+    .bind(new.base_commit)
     .bind(now)
     .bind(now)
     .fetch_one(pool)
@@ -491,6 +501,8 @@ mod tests {
                     config: json!({}),
                     workflow_path: None,
                     workflow_sha256: None,
+                    base_ref: None,
+                    base_commit: None,
                 },
             )
             .await
@@ -532,6 +544,8 @@ mod tests {
                     config: json!({}),
                     workflow_path: path,
                     workflow_sha256: None,
+                    base_ref: None,
+                    base_commit: None,
                 },
             )
             .await
@@ -560,6 +574,8 @@ mod tests {
                 config: json!({"model": "sonnet"}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -600,6 +616,8 @@ mod tests {
                 config,
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -711,10 +729,22 @@ mod tests {
                 workflow_sha256: Some(
                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 ),
+                base_ref: Some("origin/main"),
+                base_commit: Some("1e209f7000000000000000000000000000000000"),
             },
         )
         .await
         .unwrap();
+        assert_eq!(created.base_ref.as_deref(), Some("origin/main"));
+        assert_eq!(
+            get(&pool, &created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .base_commit
+                .as_deref(),
+            Some("1e209f7000000000000000000000000000000000")
+        );
         assert_eq!(
             created.workflow_path.as_deref(),
             Some("/home/user/.config/chocofactory/workflows/chat.yaml")
@@ -745,6 +775,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -864,6 +896,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await
@@ -877,6 +911,8 @@ mod tests {
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await

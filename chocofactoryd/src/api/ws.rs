@@ -367,6 +367,8 @@ stages:
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await

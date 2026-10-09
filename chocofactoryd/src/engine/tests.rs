@@ -37,6 +37,8 @@ async fn seed_task(pool: &SqlitePool, workflow_def: &str) -> String {
             config: json!({}),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -2007,6 +2009,8 @@ stages:
             config: json!({ "cwd": dir.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -2200,6 +2204,8 @@ async fn the_command_runs_in_the_tasks_configured_cwd() {
             config: json!({ "cwd": dir.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -2839,6 +2845,7 @@ async fn create_task_from_a_file_records_the_canonical_path_and_wins_over_the_re
             "t",
             "hi",
             json!({}),
+            None,
         )
         .await
         .unwrap();
@@ -2863,6 +2870,7 @@ async fn create_task_from_a_file_records_the_canonical_path_and_wins_over_the_re
             "t",
             "hi",
             json!({}),
+            None,
         )
         .await
         .unwrap_err();
@@ -2877,6 +2885,7 @@ async fn create_task_from_a_file_records_the_canonical_path_and_wins_over_the_re
             "t",
             "hi",
             json!({}),
+            None,
         )
         .await
         .unwrap_err();
@@ -2909,7 +2918,14 @@ async fn create_task_from_a_file_resolves_prompt_files_next_to_it() {
     );
 
     engine
-        .create_task_from(&project.id, WorkflowRef::File(path), "t", "hi", json!({}))
+        .create_task_from(
+            &project.id,
+            WorkflowRef::File(path),
+            "t",
+            "hi",
+            json!({}),
+            None,
+        )
         .await
         .unwrap();
 }
@@ -4204,6 +4220,8 @@ async fn seed_task_in(pool: &SqlitePool, workflow_def: &str, cwd: &Path) -> Stri
             config: json!({ "cwd": cwd.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -6453,6 +6471,8 @@ stages:
             config: json!({ "cwd": repo.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -6509,6 +6529,8 @@ stages:
             config: json!({ "cwd": repo.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -6897,6 +6919,8 @@ async fn a_task_without_worktree_opt_in_never_creates_one() {
             config: json!({ "cwd": repo.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -6973,6 +6997,8 @@ stages:
             config: json!({ "cwd": repo.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -7375,6 +7401,8 @@ async fn seed_builtin_coding_task(
             config: json!({ "cwd": repo.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -8322,6 +8350,8 @@ stages:
             config: json!({ "cwd": repo.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -9540,6 +9570,8 @@ async fn start_read_only_task_prepped(
             config,
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -11029,7 +11061,8 @@ stages:
 async fn create_task_that_fails_before_reaching_a_stage_cannot_be_retried() {
     // Review, X-4 round 2: `start_task` writes `workflow_state` before
     // it ever calls `enter_stage` — a failure before that point (a
-    // `worktree: true` workflow with no `config.cwd`, here) leaves no
+    // `worktree: true` workflow whose project name `worktree::ensure`
+    // rejects, here) leaves no
     // stage for `retry_task` to re-enter. The reason, and every
     // `TaskStuck` hint, must say so rather than pointing at a retry
     // that can only ever 409.
@@ -11050,11 +11083,24 @@ stages:
 "#,
     )
     .unwrap();
-    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    // A name `validate_identifier` rejects, so the base resolves (the repo is
+    // real, with no remote) and `ensure` then fails after the insert.
+    let project_id = projects::create(&pool, "demo project", None)
+        .await
+        .unwrap()
+        .id;
+    let repo = tempdir();
+    init_git_repo(&repo).await;
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows_dir);
 
     let err = engine
-        .create_task(&project_id, "worktree-entry", "t", "hello", json!({}))
+        .create_task(
+            &project_id,
+            "worktree-entry",
+            "t",
+            "hello",
+            json!({ "cwd": repo.to_string_lossy() }),
+        )
         .await
         .unwrap_err();
 
@@ -11655,6 +11701,8 @@ async fn seed_in_project(pool: &SqlitePool, project_id: &str, name: &str, cwd: &
             config: json!({ "cwd": cwd.to_string_lossy() }),
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
         },
     )
     .await
@@ -14394,7 +14442,14 @@ async fn create_task_from_a_workflow_with_an_unknown_cli_creates_nothing() {
     let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
     let engine = engine_with_registry(pool.clone(), claude_only_registry(), &dir, None);
     let err = engine
-        .create_task_from(&project_id, WorkflowRef::File(bad), "T", "go", json!({}))
+        .create_task_from(
+            &project_id,
+            WorkflowRef::File(bad),
+            "T",
+            "go",
+            json!({}),
+            None,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -14423,6 +14478,7 @@ async fn create_task_with_an_unknown_cli_in_its_config_creates_nothing() {
             "T",
             "go",
             json!({"roles": {"coder": {"cli": "nope"}}}),
+            None,
         )
         .await
         .unwrap_err();
@@ -14480,7 +14536,14 @@ async fn a_cli_that_slips_in_after_startup_fails_the_turn_closed() {
         engine_with_global_config(pool.clone(), &wrapper.display().to_string(), &dir, &global);
 
     let err = engine
-        .create_task_from(&project_id, WorkflowRef::File(flow), "T", "go", json!({}))
+        .create_task_from(
+            &project_id,
+            WorkflowRef::File(flow),
+            "T",
+            "go",
+            json!({}),
+            None,
+        )
         .await
         .unwrap_err();
     let task_id = match &err {
@@ -14843,6 +14906,7 @@ async fn create_task_pointing_a_memory_role_at_omp_in_its_config_creates_nothing
             "T",
             "go",
             json!({"roles": {"coder": {"cli": "omp"}}}),
+            None,
         )
         .await
         .unwrap_err();
@@ -14885,7 +14949,14 @@ async fn a_memory_role_routed_to_omp_by_the_global_config_fails_the_turn_closed(
     let engine = engine_with_registry(pool.clone(), registry, &dir, Some(&global));
 
     let err = engine
-        .create_task_from(&project_id, WorkflowRef::File(flow), "T", "go", json!({}))
+        .create_task_from(
+            &project_id,
+            WorkflowRef::File(flow),
+            "T",
+            "go",
+            json!({}),
+            None,
+        )
         .await
         .unwrap_err();
     let task_id = match &err {
@@ -15563,4 +15634,805 @@ async fn a_workflow_without_marker_gates_takes_a_marker_like_reply_as_a_note() {
         .await
         .unwrap();
     assert_eq!(state_of(&pool, &task_id).await.current_stage, "done");
+}
+
+// ---- task base (#256) ------------------------------------------------
+
+async fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A bare remote with `main`, a clone of it sitting on a `feature` branch
+/// with its own commit, and a second clone (`pusher`) to move the remote on.
+struct BaseFixture {
+    root: TempDir,
+    remote: PathBuf,
+    clone: PathBuf,
+    pusher: PathBuf,
+}
+
+impl BaseFixture {
+    async fn new() -> Self {
+        let root = tempdir();
+        let remote = root.join("remote.git");
+        fs::create_dir_all(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]).await;
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).await;
+        let pusher = root.join("pusher");
+        let remote_s = remote.to_string_lossy().into_owned();
+        git(
+            &root,
+            &["clone", "-q", &remote_s, &pusher.to_string_lossy()],
+        )
+        .await;
+        git(&pusher, &["config", "user.email", "t@example.com"]).await;
+        git(&pusher, &["config", "user.name", "T"]).await;
+        git(&pusher, &["checkout", "-q", "-b", "main"]).await;
+        fs::write(pusher.join("a.txt"), "a\n").unwrap();
+        git(&pusher, &["add", "."]).await;
+        git(&pusher, &["commit", "-q", "-m", "first"]).await;
+        git(&pusher, &["push", "-q", "origin", "main"]).await;
+        let clone = root.join("clone");
+        git(&root, &["clone", "-q", &remote_s, &clone.to_string_lossy()]).await;
+        git(&clone, &["config", "user.email", "t@example.com"]).await;
+        git(&clone, &["config", "user.name", "T"]).await;
+        git(&clone, &["checkout", "-q", "-b", "feature"]).await;
+        fs::write(clone.join("f.txt"), "f\n").unwrap();
+        git(&clone, &["add", "."]).await;
+        git(&clone, &["commit", "-q", "-m", "feature work"]).await;
+        BaseFixture {
+            root,
+            remote,
+            clone,
+            pusher,
+        }
+    }
+
+    /// Commits on `branch` in the pusher, pushes it, and returns the new SHA.
+    async fn advance(&self, branch: &str) -> String {
+        git(&self.pusher, &["checkout", "-q", "-B", branch, "main"]).await;
+        fs::write(
+            self.pusher.join(format!("{branch}.txt")),
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        git(&self.pusher, &["add", "."]).await;
+        git(&self.pusher, &["commit", "-q", "-m", branch]).await;
+        git(&self.pusher, &["push", "-q", "origin", branch]).await;
+        git_out(&self.remote, &["rev-parse", branch]).await
+    }
+
+    /// Nothing a failed create may leave: no row, no worktree directory, no
+    /// `task/*` branch.
+    async fn assert_nothing_created(&self, pool: &SqlitePool, project_id: &str, repo: &Path) {
+        assert!(
+            tasks::list(pool, Some(project_id), None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a task row was written"
+        );
+        let wts: Vec<_> = fs::read_dir(repo.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("-wt-"))
+            .collect();
+        assert!(wts.is_empty(), "a worktree was created: {wts:?}");
+        assert_eq!(
+            git_out(repo, &["for-each-ref", "refs/heads/task/"]).await,
+            "",
+            "a task branch was created"
+        );
+    }
+}
+
+const BASE_WORKFLOW: &str = r#"
+name: base-wt
+worktree: true
+stages:
+  run:
+    kind: shell
+    command: "true"
+    on: { done: hold }
+  hold:
+    kind: human_gate
+    on: { resumed: finished }
+  finished:
+    kind: terminal
+"#;
+
+const BASE_PLAIN_WORKFLOW: &str = r#"
+name: base-plain
+stages:
+  run:
+    kind: shell
+    command: "true"
+    on: { done: hold }
+  hold:
+    kind: human_gate
+    on: { resumed: finished }
+  finished:
+    kind: terminal
+"#;
+
+struct BaseEnv {
+    pool: SqlitePool,
+    engine: Arc<WorkflowEngine>,
+    project_id: String,
+    _workflows: TempDir,
+}
+
+async fn base_env() -> BaseEnv {
+    let pool = connect_in_memory().await.unwrap();
+    let workflows = tempdir();
+    fs::write(workflows.join("base-wt.yaml"), BASE_WORKFLOW).unwrap();
+    fs::write(workflows.join("base-plain.yaml"), BASE_PLAIN_WORKFLOW).unwrap();
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &workflows);
+    BaseEnv {
+        pool,
+        engine,
+        project_id,
+        _workflows: workflows,
+    }
+}
+
+impl BaseEnv {
+    async fn create(
+        &self,
+        workflow: &str,
+        repo: &Path,
+        base: Option<&str>,
+    ) -> Result<Task, CreateTaskError> {
+        self.engine
+            .create_task_from(
+                &self.project_id,
+                WorkflowRef::Name(workflow.to_string()),
+                "t",
+                "hi",
+                json!({ "cwd": repo.to_string_lossy() }),
+                base,
+            )
+            .await
+    }
+
+    async fn create_wt(&self, repo: &Path, base: Option<&str>) -> Result<Task, CreateTaskError> {
+        self.create("base-wt", repo, base).await
+    }
+
+    fn wt_path(&self, repo: &Path, task: &Task) -> PathBuf {
+        worktree::worktree_path(repo, "demo", &task.id).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn base_origin_main_forks_from_the_fresh_remote_commit_not_the_checkout() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let new_main = fx.advance("main").await;
+    let stale = git_out(&fx.clone, &["rev-parse", "refs/remotes/origin/main"]).await;
+    assert_ne!(stale, new_main);
+    let head_before = git_out(&fx.clone, &["rev-parse", "HEAD"]).await;
+
+    let task = env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
+
+    assert_eq!(
+        git_out(&env.wt_path(&fx.clone, &task), &["rev-parse", "HEAD"]).await,
+        new_main
+    );
+    assert_eq!(task.base_ref.as_deref(), Some("origin/main"));
+    assert_eq!(task.base_commit.as_deref(), Some(new_main.as_str()));
+    let stored = tasks::get(&env.pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(stored.base_commit.as_deref(), Some(new_main.as_str()));
+    assert_eq!(
+        git_out(&fx.clone, &["branch", "--show-current"]).await,
+        "feature"
+    );
+    assert_eq!(
+        git_out(&fx.clone, &["rev-parse", "HEAD"]).await,
+        head_before
+    );
+    assert!(!fx.clone.join(".git/FETCH_HEAD").exists());
+}
+
+#[tokio::test]
+async fn concurrent_creates_with_different_bases_each_fork_at_their_own_base() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let main_sha = fx.advance("main").await;
+    let other_sha = fx.advance("other").await;
+    assert_ne!(main_sha, other_sha);
+
+    let (a, b) = tokio::join!(
+        env.create_wt(&fx.clone, Some("origin/main")),
+        env.create_wt(&fx.clone, Some("origin/other")),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(
+        git_out(&env.wt_path(&fx.clone, &a), &["rev-parse", "HEAD"]).await,
+        main_sha
+    );
+    assert_eq!(
+        git_out(&env.wt_path(&fx.clone, &b), &["rev-parse", "HEAD"]).await,
+        other_sha
+    );
+    assert_eq!(a.base_commit.as_deref(), Some(main_sha.as_str()));
+    assert_eq!(b.base_commit.as_deref(), Some(other_sha.as_str()));
+}
+
+#[tokio::test]
+async fn concurrent_creates_with_the_same_base_both_succeed() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let main_sha = fx.advance("main").await;
+    let (a, b) = tokio::join!(
+        env.create_wt(&fx.clone, Some("origin/main")),
+        env.create_wt(&fx.clone, Some("origin/main")),
+    );
+    assert_eq!(a.unwrap().base_commit.as_deref(), Some(main_sha.as_str()));
+    assert_eq!(b.unwrap().base_commit.as_deref(), Some(main_sha.as_str()));
+}
+
+#[tokio::test]
+async fn unknown_bases_fail_without_leaving_anything() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    for base in ["origin/nope", "nope"] {
+        let err = env.create_wt(&fx.clone, Some(base)).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CreateTaskError::Base(worktree::BaseError::UnknownRef { .. })
+            ),
+            "{base}: {err:?}"
+        );
+        fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn a_base_that_looks_like_a_refspec_is_not_fetched() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    git(&fx.clone, &["branch", "-f", "main", "feature"]).await;
+    let local_main = git_out(&fx.clone, &["rev-parse", "refs/heads/main"]).await;
+
+    let err = env
+        .create_wt(&fx.clone, Some("origin/a:refs/heads/main"))
+        .await
+        .unwrap_err();
+    // Resolved locally (git's own rev-parse wording), never handed to fetch.
+    match &err {
+        CreateTaskError::Base(worktree::BaseError::UnknownRef { stderr, .. }) => {
+            assert!(stderr.contains("single revision"), "{stderr}")
+        }
+        other => panic!("expected UnknownRef, got {other:?}"),
+    }
+    assert_eq!(
+        git_out(&fx.clone, &["rev-parse", "refs/heads/main"]).await,
+        local_main
+    );
+    fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+        .await;
+}
+
+#[tokio::test]
+async fn empty_base_fails_without_leaving_anything() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let err = env.create_wt(&fx.clone, Some("")).await.unwrap_err();
+    assert!(
+        matches!(err, CreateTaskError::Base(worktree::BaseError::Empty)),
+        "{err:?}"
+    );
+    fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+        .await;
+}
+
+#[tokio::test]
+async fn unreachable_remote_fails_closed_on_fetch_and_on_default_lookup() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let gone = fx.root.join("does-not-exist");
+    git(
+        &fx.clone,
+        &["remote", "set-url", "origin", &gone.to_string_lossy()],
+    )
+    .await;
+    // The stale tracking ref is still there; it must not be used.
+    assert!(
+        !git_out(&fx.clone, &["rev-parse", "refs/remotes/origin/main"])
+            .await
+            .is_empty()
+    );
+
+    for base in [Some("origin/main"), None] {
+        let err = env.create_wt(&fx.clone, base).await.unwrap_err();
+        match &err {
+            CreateTaskError::Base(worktree::BaseError::Remote { op, stderr, .. }) => {
+                assert_eq!(*op, if base.is_some() { "fetch" } else { "ls-remote" });
+                assert!(
+                    stderr.contains("does not appear to be a git repository"),
+                    "{stderr}"
+                );
+            }
+            other => panic!("{base:?}: expected Remote, got {other:?}"),
+        }
+        fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn a_failed_fetch_of_an_existing_remote_branch_is_a_remote_error_not_an_unknown_ref() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    // Make the tracking ref stale so the fetch has to write it.
+    fx.advance("main").await;
+    // An operator's own concurrent fetch holding the ref lock.
+    let lock = fx.clone.join(".git/refs/remotes/origin/main.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, "").unwrap();
+
+    let err = env
+        .create_wt(&fx.clone, Some("origin/main"))
+        .await
+        .unwrap_err();
+    match &err {
+        CreateTaskError::Base(worktree::BaseError::Remote { op, stderr, .. }) => {
+            assert_eq!(*op, "fetch");
+            assert!(stderr.contains("lock"), "{stderr}");
+            assert!(!stderr.contains("ls-remote:"), "{stderr}");
+        }
+        other => panic!("expected Remote, got {other:?}"),
+    }
+    std::fs::remove_file(&lock).unwrap();
+    fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+        .await;
+}
+
+#[tokio::test]
+async fn a_hanging_remote_times_out_instead_of_hanging_create() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    git(
+        &fx.clone,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            "sleep 30; git-upload-pack",
+        ],
+    )
+    .await;
+    env.engine
+        .set_base_network_timeout(StdDuration::from_secs(1));
+
+    let started = std::time::Instant::now();
+    let err = env.create_wt(&fx.clone, None).await.unwrap_err();
+    assert!(started.elapsed() < StdDuration::from_secs(10));
+    match &err {
+        CreateTaskError::Base(worktree::BaseError::Remote { stderr, .. }) => {
+            assert!(stderr.contains("timed out"), "{stderr}")
+        }
+        other => panic!("expected Remote, got {other:?}"),
+    }
+    fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+        .await;
+}
+
+#[tokio::test]
+async fn a_hanging_remote_times_out_on_fetch_too() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    git(
+        &fx.clone,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            "sleep 30; git-upload-pack",
+        ],
+    )
+    .await;
+    env.engine
+        .set_base_network_timeout(StdDuration::from_secs(1));
+    let err = env
+        .create_wt(&fx.clone, Some("origin/main"))
+        .await
+        .unwrap_err();
+    match &err {
+        CreateTaskError::Base(worktree::BaseError::Remote { op, stderr, .. }) => {
+            assert_eq!(*op, "fetch");
+            assert!(stderr.contains("timed out"), "{stderr}");
+        }
+        other => panic!("expected Remote, got {other:?}"),
+    }
+    fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+        .await;
+}
+
+#[tokio::test]
+async fn no_base_forks_from_the_remote_default_branch_not_stale_local_refs() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let trunk = fx.advance("trunk").await;
+    git(&fx.remote, &["symbolic-ref", "HEAD", "refs/heads/trunk"]).await;
+    // Make the clone's idea of origin/HEAD point at the (stale) main.
+    git(&fx.clone, &["remote", "set-head", "origin", "main"]).await;
+
+    let task = env.create_wt(&fx.clone, None).await.unwrap();
+    assert_eq!(task.base_ref.as_deref(), Some("origin/trunk"));
+    assert_eq!(task.base_commit.as_deref(), Some(trunk.as_str()));
+    assert_eq!(
+        git_out(&env.wt_path(&fx.clone, &task), &["rev-parse", "HEAD"]).await,
+        trunk
+    );
+}
+
+#[tokio::test]
+async fn a_remote_with_a_detached_head_has_no_default_branch() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let sha = git_out(&fx.remote, &["rev-parse", "main"]).await;
+    git(&fx.remote, &["update-ref", "--no-deref", "HEAD", &sha]).await;
+
+    let err = env.create_wt(&fx.clone, None).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CreateTaskError::Base(worktree::BaseError::NoDefaultBranch { .. })
+        ),
+        "{err:?}"
+    );
+    fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+        .await;
+}
+
+#[tokio::test]
+async fn a_single_remote_not_called_origin_is_the_default_remote() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    git(&fx.clone, &["remote", "rename", "origin", "upstream"]).await;
+    let main_sha = fx.advance("main").await;
+    let task = env.create_wt(&fx.clone, None).await.unwrap();
+    assert_eq!(task.base_ref.as_deref(), Some("upstream/main"));
+    assert_eq!(task.base_commit.as_deref(), Some(main_sha.as_str()));
+}
+
+#[tokio::test]
+async fn a_repo_without_a_remote_forks_from_head() {
+    let env = base_env().await;
+    let root = tempdir();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo).await;
+    let head = git_out(&repo, &["rev-parse", "HEAD"]).await;
+
+    let task = env.create_wt(&repo, None).await.unwrap();
+    assert_eq!(task.base_ref.as_deref(), Some("HEAD"));
+    assert_eq!(task.base_commit.as_deref(), Some(head.as_str()));
+}
+
+#[tokio::test]
+async fn an_unborn_head_without_a_remote_fails_without_leaving_anything() {
+    let env = base_env().await;
+    let root = tempdir();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]).await;
+    let err = env.create_wt(&repo, None).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CreateTaskError::Base(worktree::BaseError::UnbornHead { .. })
+        ),
+        "{err:?}"
+    );
+    let fx_check = BaseFixture {
+        root,
+        remote: repo.clone(),
+        clone: repo.clone(),
+        pusher: repo.clone(),
+    };
+    fx_check
+        .assert_nothing_created(&env.pool, &env.project_id, &repo)
+        .await;
+}
+
+#[tokio::test]
+async fn several_remotes_without_origin_need_an_explicit_base_and_the_longest_remote_wins() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let remote_s = fx.remote.to_string_lossy().into_owned();
+    git(&fx.clone, &["remote", "rename", "origin", "foo"]).await;
+    let err = env.create_wt(&fx.clone, None).await;
+    // Only one remote so far: it is the default.
+    assert!(err.is_ok(), "{err:?}");
+
+    // A second remote called `foo/bar`, serving a different `main`.
+    let other = fx.root.join("other.git");
+    git(
+        &fx.root,
+        &["clone", "-q", "--bare", &remote_s, &other.to_string_lossy()],
+    )
+    .await;
+    git(&fx.pusher, &["checkout", "-q", "-B", "main", "origin/main"]).await;
+    fs::write(fx.pusher.join("other.txt"), "o").unwrap();
+    git(&fx.pusher, &["add", "."]).await;
+    git(&fx.pusher, &["commit", "-q", "-m", "other main"]).await;
+    git(
+        &fx.pusher,
+        &["push", "-q", &other.to_string_lossy(), "main"],
+    )
+    .await;
+    let other_main = git_out(&other, &["rev-parse", "main"]).await;
+    // Written as plain config: newer git versions refuse `remote add
+    // foo/bar` while a remote `foo` exists, but accept the config.
+    git(
+        &fx.clone,
+        &["config", "remote.foo/bar.url", &other.to_string_lossy()],
+    )
+    .await;
+    git(
+        &fx.clone,
+        &[
+            "config",
+            "remote.foo/bar.fetch",
+            "+refs/heads/*:refs/remotes/foo/bar/*",
+        ],
+    )
+    .await;
+
+    let err = env.create_wt(&fx.clone, None).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CreateTaskError::Base(worktree::BaseError::SeveralRemotes { .. })
+        ),
+        "{err:?}"
+    );
+    let task = env
+        .create_wt(&fx.clone, Some("foo/bar/main"))
+        .await
+        .unwrap();
+    assert_eq!(task.base_ref.as_deref(), Some("foo/bar/main"));
+    assert_eq!(task.base_commit.as_deref(), Some(other_main.as_str()));
+}
+
+#[tokio::test]
+async fn base_on_a_workflow_without_a_worktree_is_rejected() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let err = env
+        .create("base-plain", &fx.clone, Some("origin/main"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CreateTaskError::BaseWithoutWorktree),
+        "{err:?}"
+    );
+    assert!(
+        tasks::list(&env.pool, Some(&env.project_id), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_without_a_worktree_fetches_nothing_and_records_no_base() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let gone = fx.root.join("does-not-exist");
+    git(
+        &fx.clone,
+        &["remote", "set-url", "origin", &gone.to_string_lossy()],
+    )
+    .await;
+    let task = env.create("base-plain", &fx.clone, None).await.unwrap();
+    assert_eq!(task.base_ref, None);
+    assert_eq!(task.base_commit, None);
+}
+
+#[tokio::test]
+async fn a_worktree_workflow_with_no_repo_fails_before_the_insert() {
+    let env = base_env().await;
+    let err = env
+        .engine
+        .create_task_from(
+            &env.project_id,
+            WorkflowRef::Name("base-wt".to_string()),
+            "t",
+            "hi",
+            json!({}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CreateTaskError::NoRepo { .. }), "{err:?}");
+    assert!(
+        tasks::list(&env.pool, Some(&env.project_id), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_relative_repo_for_a_worktree_workflow_fails_before_the_insert() {
+    let env = base_env().await;
+    let err = env
+        .create_wt(Path::new("relative/repo"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CreateTaskError::Base(worktree::BaseError::Git(WorktreeError::RepoNotAbsolute(_)))
+        ),
+        "{err:?}"
+    );
+    assert!(
+        tasks::list(&env.pool, Some(&env.project_id), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_tasks_recorded_base_does_not_move_when_the_remote_does() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    let first = fx.advance("main").await;
+    let task = env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
+    let wt = env.wt_path(&fx.clone, &task);
+    fx.advance("main").await;
+    // The base of an existing task is never re-resolved.
+    let stored = tasks::get(&env.pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(stored.base_commit.as_deref(), Some(first.as_str()));
+    assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]).await, first);
+}
+
+#[tokio::test]
+async fn start_task_on_a_row_without_a_base_forks_from_the_repo_head() {
+    let env = base_env().await;
+    let root = tempdir();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_git_repo(&repo).await;
+    let head = git_out(&repo, &["rev-parse", "HEAD"]).await;
+    let def = Arc::new(WorkflowDefinition::parse(BASE_WORKFLOW, Path::new(".")).unwrap());
+    let task = tasks::create(
+        &env.pool,
+        tasks::NewTask {
+            project_id: &env.project_id,
+            workflow_def: "base-wt",
+            title: "old",
+            config: json!({ "cwd": repo.to_string_lossy() }),
+            workflow_path: None,
+            workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
+        },
+    )
+    .await
+    .unwrap();
+    env.engine.start_task(&task.id, &def, None).await.unwrap();
+    assert_eq!(
+        git_out(&env.wt_path(&repo, &task), &["rev-parse", "HEAD"]).await,
+        head
+    );
+}
+
+/// Installs a `reference-transaction` hook that stalls every fetch at the
+/// `prepared` step, i.e. while git holds the ref's `.lock` file.
+fn stall_ref_transactions(repo: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = repo.join(".git/hooks/reference-transaction");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nif [ \"$1\" = prepared ]; then sleep 30 >/dev/null 2>&1; fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn lock_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            lock_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "lock") {
+            out.push(path);
+        }
+    }
+}
+
+/// Waits (git needs a moment after SIGTERM) for the repo to hold no lock file.
+async fn assert_no_lock_files_soon(repo: &Path) {
+    let mut found = Vec::new();
+    for _ in 0..50 {
+        found.clear();
+        lock_files(&repo.join(".git"), &mut found);
+        if found.is_empty() {
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+    panic!("lock files left behind: {found:?}");
+}
+
+#[tokio::test]
+async fn a_timed_out_fetch_leaves_no_lock_file_and_the_next_create_works() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    fx.advance("main").await;
+    stall_ref_transactions(&fx.clone);
+    env.engine
+        .set_base_network_timeout(StdDuration::from_secs(2));
+
+    let err = env
+        .create_wt(&fx.clone, Some("origin/main"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CreateTaskError::Base(worktree::BaseError::Remote { .. })
+        ),
+        "{err:?}"
+    );
+    assert_no_lock_files_soon(&fx.clone).await;
+
+    fs::remove_file(fx.clone.join(".git/hooks/reference-transaction")).unwrap();
+    env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cancelled_create_leaves_no_lock_file_and_the_next_create_works() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    fx.advance("main").await;
+    stall_ref_transactions(&fx.clone);
+
+    // Drop the create mid-fetch, as a disconnecting client would.
+    let dropped = tokio::time::timeout(
+        StdDuration::from_secs(2),
+        env.create_wt(&fx.clone, Some("origin/main")),
+    )
+    .await;
+    assert!(
+        dropped.is_err(),
+        "the stalled create should still be running"
+    );
+    assert_no_lock_files_soon(&fx.clone).await;
+
+    fs::remove_file(fx.clone.join(".git/hooks/reference-transaction")).unwrap();
+    env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_base_fetch_writes_no_tags_into_the_repo() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    fx.advance("main").await;
+    git(&fx.pusher, &["tag", "v-from-remote", "main"]).await;
+    git(&fx.pusher, &["push", "-q", "origin", "v-from-remote"]).await;
+
+    env.create_wt(&fx.clone, Some("origin/main")).await.unwrap();
+    assert_eq!(git_out(&fx.clone, &["tag", "--list"]).await, "");
 }

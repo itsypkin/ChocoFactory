@@ -575,9 +575,16 @@ keeps the config it started with.
 
 - `--repo <path>` on `task create` sets the working directory for the
   task's agent subprocess (stored as `config.cwd`). Defaults to the project's
-  repo when the project has one. With neither, a worktree workflow (all the
-  coding built-ins) can't start: the task is marked stuck with a reason saying
-  it has no repo, can't be retried, and must be cancelled. A non-worktree
-  workflow such as `chat` runs in the daemon's own working directory.
+  repo when the project has one. With neither, creating a task on a worktree
+  workflow (all the coding built-ins) fails with an error and nothing is
+  created. A non-worktree workflow such as `chat` runs in the daemon's own
+  working directory.
+- `--base <ref>` on `task create` is the commit the task's worktree forks
+  from: a `<remote>/<branch>` (fetched first), or any local branch, tag, SHA
+  or `HEAD`, used as the repo has it. Without it, the task forks from the
+  remote's default branch, freshly fetched (`origin`, or the only remote), or
+  from the repo's HEAD when it has no remote. A ref that doesn't resolve, or
+  a failed or timed-out fetch, creates nothing. Only valid for a worktree
+  workflow. `choco task status` shows the result on its `Base` line.
 - `--base-url <url>` targets a daemon on a non-default port, e.g. one
   started with `CHOCOFACTORY_PORT=41500`.

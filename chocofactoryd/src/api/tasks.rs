@@ -33,6 +33,10 @@ pub struct CreateTaskRequest {
     pub prompt: String,
     #[serde(default)]
     pub config: Option<Value>,
+    /// Commit to fork the task's worktree from (see `choco task create
+    /// --base`). Only valid for a workflow that creates a worktree.
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 pub async fn create(
@@ -48,16 +52,30 @@ pub async fn create(
             ));
         }
     };
-    let task = state
-        .engine
-        .create_task_from(
-            &body.project_id,
-            workflow,
-            &body.title,
-            &body.prompt,
-            body.config.unwrap_or_else(|| json!({})),
-        )
-        .await?;
+    // Run the create on its own task: a client that disconnects drops this
+    // handler, and a create dropped between the row insert and the first
+    // stage would leave an `open` row with no stage. Spawned, it always ends
+    // with a complete task or nothing.
+    let engine = state.engine.clone();
+    let config = body.config.unwrap_or_else(|| json!({}));
+    let project_id = body.project_id;
+    let title = body.title;
+    let prompt = body.prompt;
+    let base = body.base;
+    let task = tokio::spawn(async move {
+        engine
+            .create_task_from(
+                &project_id,
+                workflow,
+                &title,
+                &prompt,
+                config,
+                base.as_deref(),
+            )
+            .await
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("create task aborted: {e}")))??;
     Ok((StatusCode::CREATED, Json(task)))
 }
 
@@ -524,6 +542,166 @@ stages:
         project["id"].as_str().unwrap().to_string()
     }
 
+    const WT_YAML: &str = "name: wt\nworktree: true\nstages:\n  run:\n    kind: shell\n    command: \"true\"\n    on: { done: hold }\n  hold:\n    kind: human_gate\n    on: { resumed: finished }\n  finished:\n    kind: terminal\n";
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn repo_in(server: &TestServer) -> std::path::PathBuf {
+        let repo = server.temp_dir().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("a"), "a").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        repo
+    }
+
+    async fn post_wt(
+        server: &TestServer,
+        project_id: &str,
+        workflow: &str,
+        repo: &std::path::Path,
+        base: Option<&str>,
+    ) -> crate::api::tests::TestResponse {
+        let mut body = json!({
+            "project_id": project_id,
+            "workflow_def": workflow,
+            "title": "t",
+            "prompt": "hi",
+            "config": { "cwd": repo.to_string_lossy() },
+        });
+        if let Some(base) = base {
+            body["base"] = json!(base);
+        }
+        server.post("/tasks", body).await
+    }
+
+    #[tokio::test]
+    async fn create_task_records_the_base_and_status_carries_it() {
+        let server = TestServer::start().await;
+        server.write_workflow("wt", WT_YAML);
+        let project_id = create_project(&server).await;
+        let repo = repo_in(&server);
+
+        let response = post_wt(&server, &project_id, "wt", &repo, None).await;
+        assert_eq!(response.status(), 201);
+        let task = response.json();
+        assert_eq!(task["base_ref"], "HEAD");
+        let sha = task["base_commit"].as_str().unwrap().to_string();
+        assert_eq!(sha.len(), 40);
+
+        let detail = server
+            .get(&format!("/tasks/{}", task["id"].as_str().unwrap()))
+            .await
+            .json();
+        assert_eq!(detail["base_ref"], "HEAD");
+        assert_eq!(detail["base_commit"], sha.as_str());
+    }
+
+    /// A client that disconnects mid-create must not strand an `open` row
+    /// with no stage: the handler runs the create on its own task. A
+    /// `post-checkout` hook slows `git worktree add`, which runs after the
+    /// row insert.
+    #[tokio::test]
+    async fn a_client_disconnect_mid_create_still_ends_in_a_complete_task() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = TestServer::start().await;
+        server.write_workflow("wt", WT_YAML);
+        let project_id = create_project(&server).await;
+        let repo = repo_in(&server);
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 3\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let client = server.spawn_post(
+            "/tasks",
+            json!({
+                "project_id": project_id,
+                "workflow_def": "wt",
+                "title": "t",
+                "prompt": "hi",
+                "config": { "cwd": repo.to_string_lossy() },
+            }),
+        );
+
+        // The row exists only once the handler is inside create, past the
+        // insert; the hook keeps it there for 3 s, so the client is still
+        // waiting when it is aborted.
+        let mut id = None;
+        for _ in 0..300 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let tasks = server
+                .get(&format!("/tasks?project_id={project_id}"))
+                .await
+                .json();
+            if let Some(found) = tasks[0]["id"].as_str() {
+                id = Some(found.to_string());
+                break;
+            }
+        }
+        let id = id.expect("the handler never inserted the task");
+        assert!(!client.is_finished(), "the create should still be running");
+        client.abort();
+
+        let mut staged = false;
+        for _ in 0..300 {
+            let detail = server.get(&format!("/tasks/{id}")).await.json();
+            if !detail["workflow_state"].is_null() {
+                staged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(staged, "the task never reached a stage");
+    }
+
+    #[tokio::test]
+    async fn create_task_maps_base_failures_to_400_and_502() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        server.write_workflow("wt", WT_YAML);
+        let project_id = create_project(&server).await;
+        let repo = repo_in(&server);
+
+        let response = post_wt(&server, &project_id, "chat", &repo, Some("HEAD")).await;
+        assert_eq!(response.status(), 400);
+        assert!(
+            response.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("only applies to a workflow that creates a worktree")
+        );
+
+        let response = post_wt(&server, &project_id, "wt", &repo, Some("nope")).await;
+        assert_eq!(response.status(), 400);
+
+        let gone = server.temp_dir().join("does-not-exist");
+        git(&repo, &["remote", "add", "origin", &gone.to_string_lossy()]);
+        let response = post_wt(&server, &project_id, "wt", &repo, Some("origin/main")).await;
+        assert_eq!(response.status(), 502);
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            error.contains("could not fetch from remote 'origin'"),
+            "{error}"
+        );
+        assert!(
+            error.contains("does not appear to be a git repository"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn create_task_resolves_the_named_workflow_and_starts_it() {
         let server = TestServer::start().await;
@@ -799,6 +977,8 @@ stages:
                 config: json!({}),
                 workflow_path: None,
                 workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
             },
         )
         .await

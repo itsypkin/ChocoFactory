@@ -57,6 +57,8 @@ fn summary(
             kept_work: false,
             workflow_path: None,
             workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
             created_at: mins_ago(500),
             updated_at: mins_ago(60),
         },
