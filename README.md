@@ -41,7 +41,7 @@ Handing a coding task to an AI agent and walking away goes wrong in familiar way
 
   See [Using choco with omp](docs/models.md#using-choco-with-omp).
 - **A separate reviewer.** A different agent, in its own session and read-only, reviews the change against the spec before any PR exists. Read-only is enforced: the daemon checks that the worktree didn't change.
-- **Loop guards and escalation.** Repeated rejections, repeated red CI, or no verdict from you for six hours park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck.
+- **Loop guards and escalation.** Repeated rejections, repeated red CI, or no verdict from you for about four days (checked every minute at first, then less often) park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck.
 - **Tasks survive restarts.** Everything lives in the daemon's database. Waits survive a restart. Interrupted agent turns are parked and can be retried, resuming the agent's session when possible.
 - **Your verdict lives on the PR.** Comment `/approve` or `/request-changes` on the pull request.
 - **One dashboard** (`choco dashboard`) for every task: what needs you, what's running, what's stuck.
@@ -61,7 +61,7 @@ You don't normally type the `choco task create` commands yourself. You work from
    ```
 
    It prints the task's id. Because the title ends in `(#42)`, the PR body will say `Closes #42`, so merging closes the issue.
-4. The agent monitors the task, for example with `choco task status <id> --until stage:awaiting_human_review --timeout 2h`.
+4. The agent monitors the task, for example with `choco task status <id> --until attention --timeout 2h`, which returns when the task needs a person (a question, the review, an escalation) or has ended.
 5. At the same time you can open `choco dashboard` in another terminal and watch the progress yourself.
 6. When the task reaches human review, the PR is open (the branch is `task/<id>`). The agent, or you, reviews it and comments `/approve` (`gh pr comment <number> --body "/approve"`) or `/request-changes`. `/approve` moves the task to done. Merging (`gh pr merge <number> --squash`, or any merge method) is still yours to do, and merging on its own also counts as approval.
 

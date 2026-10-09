@@ -86,7 +86,7 @@ use sweep::agent_reason;
 #[cfg(test)]
 use turn::unverified_note;
 use turn::{MAX_CONSECUTIVE_RESUMES, ResumeSession};
-use watch::set_poll_window;
+use watch::{TimedOutWatch, set_poll_window, timed_out_watch};
 #[cfg(test)]
 use watch::{poll_window_for, remaining_budget};
 
@@ -873,6 +873,18 @@ pub enum SendMessageOrResumeError {
         stage: String,
         found: Vec<String>,
     },
+    /// The gate doesn't read markers and the reply is nothing but marker
+    /// lines of other gates (#179): it would be taken as a note, not a
+    /// verdict. Nothing was recorded or changed. `found` lists the distinct
+    /// marker lines in the reply; `resumes_to` is where a note would send
+    /// the task; `rewatch` says whether `retry` would watch again.
+    ReplyIsOnlyMarkers {
+        task_id: String,
+        stage: String,
+        found: Vec<String>,
+        resumes_to: Option<String>,
+        rewatch: bool,
+    },
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     /// This task's recorded `workflow_path` (issue #88) names a file that no
@@ -932,6 +944,31 @@ impl fmt::Display for SendMessageOrResumeError {
                     [] => String::new(),
                 };
                 write!(f, "your reply has {listed}; keep one. Nothing was sent.")
+            }
+            SendMessageOrResumeError::ReplyIsOnlyMarkers {
+                task_id,
+                stage,
+                found,
+                resumes_to,
+                rewatch,
+            } => {
+                write!(
+                    f,
+                    "stage '{stage}' doesn't read {}: a reply here is a note",
+                    found.join(" or ")
+                )?;
+                if let Some(next) = resumes_to {
+                    write!(f, ", and sends the task on to stage '{next}'")?;
+                }
+                write!(
+                    f,
+                    " \u{2014} not a verdict. Nothing was sent. Write the note in words, or cancel \
+                     the task with 'choco task cancel {task_id}'."
+                )?;
+                if *rewatch {
+                    write!(f, " To watch again, run 'choco task retry {task_id}'.")?;
+                }
+                Ok(())
             }
             SendMessageOrResumeError::Resolve(err) => write!(f, "{err}"),
             SendMessageOrResumeError::WorkflowDef(err) => write!(f, "{err}"),
@@ -1011,6 +1048,15 @@ impl From<sqlx::Error> for CancelTaskError {
     }
 }
 
+/// An `open` task parked at a gate because a watcher's timeout elapsed
+/// (#179), as `choco task status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WatchTimedOutInfo {
+    pub stage: String,
+    pub timeout_secs: Option<u64>,
+    pub resumes_to: Option<String>,
+}
+
 /// Errors from [`WorkflowEngine::retry_task`] (X-4, issue #61).
 #[derive(Debug)]
 pub enum RetryTaskError {
@@ -1047,6 +1093,12 @@ pub enum RetryTaskError {
     /// happened, and silently doing the other thing would hide that the
     /// claim was wrong.
     NotResumable(String),
+    /// `--resume` or `--fresh` at a gate a watcher's timeout parked the task
+    /// at (#179): the retry re-watches, and there is no session to resume.
+    RewatchTakesNoMode {
+        task_id: String,
+        stage: String,
+    },
 }
 
 impl fmt::Display for RetryTaskError {
@@ -1083,6 +1135,11 @@ impl fmt::Display for RetryTaskError {
             RetryTaskError::NotResumable(why) => {
                 write!(f, "this stage's last session cannot be resumed: {why}")
             }
+            RetryTaskError::RewatchTakesNoMode { task_id, stage } => write!(
+                f,
+                "stage '{stage}' stopped watching; run 'choco task retry {task_id}' without \
+                 --resume or --fresh to watch again (there is no session to resume)"
+            ),
         }
     }
 }
@@ -1892,7 +1949,7 @@ impl WorkflowEngine {
         let state = workflow_state::get(&self.pool, task_id)
             .await?
             .ok_or(SendMessageOrResumeError::NoWorkflowState)?;
-        let current_stage = state.current_stage;
+        let current_stage = state.current_stage.clone();
 
         let stage_def = definition
             .stages
@@ -1901,7 +1958,7 @@ impl WorkflowEngine {
 
         match &stage_def.kind {
             StageKind::HumanGate { .. } => {
-                self.reply_to_gate(task_id, &definition, &current_stage, text)
+                self.reply_to_gate(task_id, &definition, &current_stage, text, &state.payload)
                     .await
             }
             StageKind::AgentTurn { .. } if stage_def.on.is_empty() => self
@@ -2247,7 +2304,7 @@ impl WorkflowEngine {
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(RetryTaskError::NoSuchTask)?;
-        if task.status != TASK_STATUS_STUCK {
+        if task.status != TASK_STATUS_STUCK && task.status != TASK_STATUS_OPEN {
             return Err(RetryTaskError::NotStuck(task.status));
         }
 
@@ -2257,6 +2314,24 @@ impl WorkflowEngine {
             .await?
             .ok_or(RetryTaskError::NoWorkflowState)?;
         let current_stage = state.current_stage.clone();
+
+        // An open task is retryable only when a watcher's timeout parked it
+        // at a gate (#179): then retry watches again.
+        if task.status == TASK_STATUS_OPEN {
+            let Some(timed_out) = timed_out_watch(&definition, &current_stage, &state.payload)
+            else {
+                return Err(RetryTaskError::NotStuck(task.status));
+            };
+            if mode != RetryMode::Auto {
+                return Err(RetryTaskError::RewatchTakesNoMode {
+                    task_id: task_id.to_string(),
+                    stage: timed_out.from,
+                });
+            }
+            return self
+                .rewatch_locked(task_id, &definition, &current_stage, &state, timed_out)
+                .await;
+        }
 
         let stage_def = definition
             .stages
@@ -2410,6 +2485,99 @@ impl WorkflowEngine {
             resumed: resume.is_some(),
             adapter_session_id: resume.map(|resume| resume.adapter_session_id),
             fresh_reason,
+            rewatched: false,
+        })
+    }
+
+    /// Watches again after a watcher's timeout (#179): moves the task back
+    /// to the watcher stage `timed_out.from` with a fresh window, in one
+    /// state write, and re-enters it. Runs under the per-task lock
+    /// `retry_task` holds, on the state it read under that lock. The task
+    /// stays `open`.
+    async fn rewatch_locked(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        gate: &str,
+        state: &chocofactory_core::models::WorkflowState,
+        timed_out: TimedOutWatch,
+    ) -> Result<RetryOutcome, RetryTaskError> {
+        let from = timed_out.from;
+        let from_def = definition
+            .stages
+            .get(&from)
+            .ok_or_else(|| RetryTaskError::UnknownStage(from.clone()))?;
+        let mut payload = state.payload.clone();
+        // The record must stay true: the task is no longer at the gate it
+        // arrived at by timing out.
+        set_arrival(&mut payload, gate, "retry");
+        set_poll_window(&mut payload, definition, &from, self.now())
+            .map_err(RetryTaskError::Enter)?;
+        let updated = workflow_state::update(
+            &self.pool,
+            task_id,
+            workflow_state::WorkflowStateUpdate {
+                current_stage: from.clone(),
+                stage_kind: from_def.kind.name().to_string(),
+                loop_counters: state.loop_counters.clone(),
+                payload,
+                enters_stage: true,
+            },
+        )
+        .await?
+        .ok_or(RetryTaskError::NoWorkflowState)?;
+        if let Err(err) = self
+            .enter_stage(
+                task_id,
+                definition,
+                &from,
+                None,
+                Some("retry"),
+                &updated.payload,
+                None,
+            )
+            .await
+        {
+            self.mark_stuck(
+                task_id,
+                &format!("stage '{from}': retry failed: {err}"),
+                matches!(err, EngineError::Template { .. }),
+            )
+            .await;
+            return Err(RetryTaskError::Enter(err));
+        }
+        Ok(RetryOutcome {
+            stage: from,
+            resumed: false,
+            adapter_session_id: None,
+            fresh_reason: None,
+            rewatched: true,
+        })
+    }
+
+    /// For an `open` task parked at a gate because a watcher timed out:
+    /// which stage stopped watching, after how long, and where a note goes.
+    /// Informational: a workflow that won't load gives `None`.
+    pub async fn watch_timed_out(
+        &self,
+        task: &Task,
+        state: &chocofactory_core::models::WorkflowState,
+    ) -> Option<WatchTimedOutInfo> {
+        if task.status != TASK_STATUS_OPEN {
+            return None;
+        }
+        let definition = match self.load_task_workflow(task).await {
+            Ok(definition) => definition,
+            Err(err) => {
+                tracing::warn!(task_id = %task.id, %err, "could not load the workflow to describe a timed-out watcher");
+                return None;
+            }
+        };
+        let timed_out = timed_out_watch(&definition, &state.current_stage, &state.payload)?;
+        Some(WatchTimedOutInfo {
+            stage: timed_out.from,
+            timeout_secs: timed_out.timeout.map(|t| t.as_secs()),
+            resumes_to: timed_out.resumes_to,
         })
     }
 

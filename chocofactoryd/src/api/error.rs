@@ -113,7 +113,8 @@ impl From<SendMessageOrResumeError> for ApiError {
             // gate reads its verdict from, or carries markers for different
             // outcomes. Nothing was recorded, so the caller can just resend.
             SendMessageOrResumeError::ReplyNeedsMarker { .. }
-            | SendMessageOrResumeError::ReplyHasConflictingMarkers { .. } => {
+            | SendMessageOrResumeError::ReplyHasConflictingMarkers { .. }
+            | SendMessageOrResumeError::ReplyIsOnlyMarkers { .. } => {
                 ApiError::BadRequest(err.to_string())
             }
             // A `human_gate`'s `resumed` relay lost a race with another
@@ -218,7 +219,8 @@ impl From<RetryTaskError> for ApiError {
             // is not one that can be resumed (#92). The caller could retry
             // without it, so it is the task's state that conflicts, not the
             // request that is malformed.
-            | RetryTaskError::NotResumable(_) => ApiError::Conflict(err.to_string()),
+            | RetryTaskError::NotResumable(_)
+            | RetryTaskError::RewatchTakesNoMode { .. } => ApiError::Conflict(err.to_string()),
             // The workflow file backing this task's `workflow_def` is gone,
             // so the retry cannot happen — a conflict with the task's own
             // state, not a request the caller could reasonably have made
@@ -252,6 +254,28 @@ impl From<InitWorkflowsError> for ApiError {
             }
             _ => ApiError::Internal(err.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewatch_and_marker_only_errors_map_to_409_and_400() {
+        let err = RetryTaskError::RewatchTakesNoMode {
+            task_id: "t".into(),
+            stage: "s".into(),
+        };
+        assert!(matches!(ApiError::from(err), ApiError::Conflict(_)));
+        let err = SendMessageOrResumeError::ReplyIsOnlyMarkers {
+            task_id: "t".into(),
+            stage: "s".into(),
+            found: vec!["/approve".into()],
+            resumes_to: None,
+            rewatch: false,
+        };
+        assert!(matches!(ApiError::from(err), ApiError::BadRequest(_)));
     }
 }
 

@@ -341,6 +341,20 @@ crashes deterministically isn't resumed back into the same crash. Use
 `--resume` to insist (it fails, rather than quietly starting fresh, when
 there is nothing safe to resume) or `--fresh` to start over anyway.
 
+A task that is not stuck but waits at a gate because a watcher timed out (the
+PR review watch, CI polling) can be retried too. It goes back to the watcher
+with its schedule starting over, and no agent lap is spent. `--resume` and
+`--fresh` don't apply and are refused:
+
+```
+$ choco task retry bb93ada3-...
+Watching again: back to stage 'awaiting_human_review' (its schedule starts
+over). See `choco task status bb93ada3-...`.
+```
+
+`choco task status` says when this applies. Any other open task can't be
+retried.
+
 Or give up on it the same way as any other task:
 
 ```
@@ -407,9 +421,12 @@ hand-written polling loop. It polls the daemon (`GET /tasks/<id>`).
 | `--timeout <dur>` | Give up after this long and exit 5. Default: none. Needs `--live` or `--until`. |
 
 `<dur>` is `<integer><s|m|h>`, non-zero, the same spelling as workflow YAML
-(`5s`, `30s`, `5m`, `1h`). `<target>` is `closed`, `cancelled`, `stuck`, or
-`stage:<name>` (the task has entered that stage, even if it already left it
-between two polls). The `stage:` prefix keeps stage names apart from
+(`5s`, `30s`, `5m`, `1h`). `<target>` is `attention`, `closed`, `cancelled`,
+`stuck`, or `stage:<name>` (the task has entered that stage, even if it
+already left it between two polls). `attention` means the task needs you: it
+is open at any `human_gate` stage (whatever the stage is called), or it is
+stuck, cancelled or closed. It looks at the current state only, so a watch
+started while the task already sits at a gate returns at once. The `stage:` prefix keeps stage names apart from
 statuses. A `--live` watch alone does not stop at `stuck`, since a human may
 `choco task retry` it.
 
@@ -423,6 +440,9 @@ statuses. A `--live` watch alone does not stop at `stuck`, since a human may
 | 5 | `--timeout` elapsed first. |
 | 6 | The task closed without reaching the target. |
 
+Under `--until attention` the codes mean: 0 the task is open at a
+`human_gate` stage (stderr says which stage); 3 stuck; 4 cancelled; 6 closed.
+
 Every non-zero exit from a watch explains itself on stderr.
 
 ```
@@ -433,6 +453,20 @@ $ case $? in
     4) echo "cancelled" ;;
     5) echo "still running after 2h" ;;
     *) echo "something else went wrong" ;;
+  esac
+```
+
+To wait for whatever stops the task next, use `attention`. The line on
+stderr names the stage:
+
+```
+$ choco task status "$id" --until attention --timeout 2h
+$ case $? in
+    0) echo "waiting for you at a gate" ;;
+    3) echo "stuck" ;;
+    4) echo "cancelled" ;;
+    5) echo "still running after 2h" ;;
+    6) echo "closed" ;;
   esac
 ```
 

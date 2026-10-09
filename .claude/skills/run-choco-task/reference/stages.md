@@ -58,12 +58,14 @@ Read this while watching a task, when its behaviour surprises you.
   3 minutes, so on a repo without CI, or on a conflicting PR, you review
   without CI. The timeline lists each check with its state.
 - **awaiting_human_review.** A human gate that watches the PR's comments and reviews
-  every minute for 6 hours, then parks at `escalate_to_human`. It also takes
+  every minute for 6 hours, every 5 minutes for the next 24 hours and every
+  30 minutes for the next 3 days, then parks at `escalate_to_human`. It also takes
   `choco task send <id> --text "..."` carrying `/approve` or
   `/request-changes` on a line of its own; a reply with neither or both is
   refused. A merged PR counts as approval and moves the task to `done`; a PR
   closed without merging does not.
 - **escalate_to_human.** Arriving here starts all three loop counts over (internal rejections, red CI
   results, your votes).
-  It waits for `choco task send <id> --text "<note>"`, which moves the task
-  into `revising`.
+  It waits for you. After a review or CI timeout, `choco task retry <id>`
+  watches again at no cost. Otherwise `choco task send <id> --text "<note>"`
+  moves the task into `revising`.

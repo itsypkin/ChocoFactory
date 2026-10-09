@@ -212,6 +212,12 @@ pub fn tasks(list: &[Task]) -> String {
 /// operator who asked for one and got the other should not have to go
 /// looking for that.
 pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
+    if outcome.rewatched {
+        return format!(
+            "Watching again: back to stage '{}' (its schedule starts over). See `choco task status {task_id}`.",
+            outcome.stage
+        );
+    }
     let what = match &outcome.adapter_session_id {
         Some(adapter_session_id) if outcome.resumed => format!(
             "Retrying stage '{}' by resuming its interrupted session ({adapter_session_id}) — it \
@@ -403,10 +409,41 @@ pub fn loop_counters_line(detail: &Value) -> Option<String> {
     Some(format!("Loop counters  {}", rendered.join(" ")))
 }
 
+/// The paragraph telling a person that a watcher stopped watching and what
+/// to do about it, from the daemon's `watch_timed_out` field (#179).
+fn watch_timed_out_hint(detail: &Value) -> Option<String> {
+    let info = detail.get("watch_timed_out").filter(|v| v.is_object())?;
+    let stage = info.get("stage").and_then(Value::as_str)?;
+    let id = detail.get("id").and_then(Value::as_str).unwrap_or("<id>");
+    let after = info
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .map(|secs| {
+            format!(
+                " after {}",
+                chocofactory_core::duration::format_duration(std::time::Duration::from_secs(secs))
+            )
+        })
+        .unwrap_or_default();
+    let on_to = info
+        .get("resumes_to")
+        .and_then(Value::as_str)
+        .map(|next| format!(" on to stage '{next}'"))
+        .unwrap_or_default();
+    Some(format!(
+        "{stage} stopped watching{after} with no outcome. 'choco task retry {id}' watches again \
+         from the start; 'choco task send {id} --text \"<note>\"' sends a note{on_to}."
+    ))
+}
+
 /// Renders the daemon's `TaskDetail` (a `Task` flattened alongside
 /// `workflow_state`) from raw JSON — it has no exported Rust type.
 pub fn task_detail(detail: &Value, now: DateTime<Utc>) -> String {
     let mut out = fields(&task_fields(detail));
+    if let Some(hint) = watch_timed_out_hint(detail) {
+        out.push_str("\n\n");
+        out.push_str(&hint);
+    }
     match detail_progress(detail, now, None) {
         Some(table) => {
             out.push_str("\n\nProgress\n");
@@ -1256,6 +1293,57 @@ mod tests {
     }
 
     #[test]
+    fn retried_says_watching_again_when_rewatched() {
+        let out = super::retried(
+            "task-1",
+            &RetryOutcome {
+                stage: "awaiting_human_review".to_string(),
+                resumed: false,
+                adapter_session_id: None,
+                fresh_reason: None,
+                rewatched: true,
+            },
+        );
+        assert_eq!(
+            out,
+            "Watching again: back to stage 'awaiting_human_review' (its schedule starts over). See `choco task status task-1`."
+        );
+    }
+
+    #[test]
+    fn task_detail_hints_at_a_timed_out_watcher() {
+        let mut detail = usage_detail("api_equivalent", 0);
+        detail["id"] = json!("t-9");
+        detail["watch_timed_out"] = json!({
+            "stage": "awaiting_human_review",
+            "timeout_secs": 102 * 3600,
+            "resumes_to": "revising",
+        });
+        let out = task_detail(&detail, test_now());
+        assert!(
+            out.contains(
+                "awaiting_human_review stopped watching after 102h with no outcome. 'choco task retry t-9' watches again from the start; 'choco task send t-9 --text \"<note>\"' sends a note on to stage 'revising'."
+            ),
+            "{out}"
+        );
+
+        detail["watch_timed_out"] = json!({
+            "stage": "checks_polling", "timeout_secs": null, "resumes_to": null,
+        });
+        let out = task_detail(&detail, test_now());
+        assert!(
+            out.contains("checks_polling stopped watching with no outcome.")
+                && out.contains("sends a note."),
+            "{out}"
+        );
+
+        detail["watch_timed_out"] = Value::Null;
+        assert!(!task_detail(&detail, test_now()).contains("stopped watching"));
+        detail.as_object_mut().unwrap().remove("watch_timed_out");
+        assert!(!task_detail(&detail, test_now()).contains("stopped watching"));
+    }
+
+    #[test]
     fn retried_says_whether_the_session_was_resumed() {
         let resumed = super::retried(
             "task-1",
@@ -1264,6 +1352,7 @@ mod tests {
                 resumed: true,
                 adapter_session_id: Some("sess-123".to_string()),
                 fresh_reason: None,
+                rewatched: false,
             },
         );
         assert!(
@@ -1282,6 +1371,7 @@ mod tests {
                 resumed: false,
                 adapter_session_id: None,
                 fresh_reason: Some("its turn ended 'no_report'".to_string()),
+                rewatched: false,
             },
         );
         assert!(

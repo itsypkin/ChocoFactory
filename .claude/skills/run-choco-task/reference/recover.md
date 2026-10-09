@@ -2,7 +2,7 @@
 
 ## Contents
 - `stuck`: retry
-- `escalate_to_human`: send a note
+- `escalate_to_human`: watch again or send a note
 - Getting your review items done when the coder ignores them
 - Cancelling a task
 - Stray processes
@@ -33,10 +33,14 @@ and `choco task list --status stuck` finds every stuck task.
   that point, so reset it first. The check also runs when a read-only turn
   crashes or ends without reporting; the stuck reason then carries both.
 
-## `escalate_to_human`: send a note
+## `escalate_to_human`: watch again or send a note
 
-`/approve` does nothing here; only `choco task send <id> --text "<note>"`
-moves the task on, into `revising`.
+`/approve` does nothing here; a reply that is only `/approve` or
+`/request-changes` is refused. After a review or CI timeout,
+`choco task retry <id>` watches again from the start and costs no lap. If the
+PR was merged meanwhile, after a review timeout `retry` lets the watcher see
+the merge and move the task to `done`. `choco task send <id> --text "<note>"` moves the task on, into
+`revising`.
 
 - If the PR is already good, merge it and then `choco task cancel <id>`.
   Don't send a note after merging by hand: the next `open_pr` would open a
@@ -44,9 +48,11 @@ moves the task on, into `revising`.
 - After 4 red CI results in a row, name the failing check and what it says
   in the note, or fix CI by hand first.
 - After a CI timeout, or a cancelled, startup-failure or action-required
-  check, fix or re-run CI on GitHub. Once it is green, either merge the PR
+  check, fix or re-run CI on GitHub. Once it is green, after a CI timeout run
+  `choco task retry <id>`: it polls CI again and costs no lap. After a
+  cancelled, startup-failure or action-required check, either merge the PR
   and cancel the task, or send a note saying CI is green and no code change
-  is needed. The note still costs a coder lap and a review lap, because
+  is needed. The note costs a coder lap and a review lap, because
   resuming always goes through `revising`.
 - The note is templated into the coder's prompt verbatim. Make it
   self-contained: list every item in full.
@@ -89,8 +95,8 @@ The other options cost more:
 - Cancel and create a new task with your items in the spec. It redoes the
   work from scratch unless `--repo` points at a checkout of the old task's
   branch, and you close the old PR either way.
-- Leave the PR without a verdict until the 6-hour window parks it, then send
-  the note. No command moves a task from `awaiting_human_review` to
+- Leave the PR without a verdict until the review window (about 4 days) parks it,
+  then send the note. No command moves a task from `awaiting_human_review` to
   `escalate_to_human`, so this is the last resort.
 
 ## Cancelling a task

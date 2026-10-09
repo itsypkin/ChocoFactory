@@ -30,7 +30,7 @@ post `/request-changes`, or someone resumes the task from `escalate_to_human`.
 A task parks at `escalate_to_human` after a 4th rejection in a row by
 `internal_review`, a 4th red CI result in a row from `checks_polling`, a 4th
 `/request-changes` from you since the last escalation (each counted
-separately), after 6 hours with no verdict from you, when CI has not
+separately), after about 4 days with no verdict from you, when CI has not
 finished in 30 minutes, when a check is cancelled, failed to start or needs
 an action (approval) before it can run, or when `open_pr` fails.
 
@@ -125,7 +125,7 @@ command in step 3 and the pre-merge check in step 4.
   The daemon logs to `~/.config/chocofactory/logs/chocofactoryd.log`; kills,
   `stuck` marks and nudges show up there first.
 - **Keep the machine awake for the whole run.** On a sleeping laptop agent
-  turns stall, and the 6-hour review window keeps running and can park the
+  turns stall, and the review window (about 4 days) keeps running and can park the
   task overnight. On macOS, run `caffeinate -dims` in a spare terminal. Don't
   tie it to the daemon with `-w <pid>`: the pid changes on restart.
 
@@ -199,19 +199,16 @@ choco task create --project <p> --workflow coding-task-planned \
   `--role-cli <role>=<cli>`.
 - **Running a role on omp** (`--role-cli <role>=omp`): see
   [reference/spec.md](reference/spec.md#running-a-role-on-omp).
-- **Wait for the task to stop.** On `coding-task-planned` it can park at
-  `spec_questions` (the planner needs your answer; reply with
-  `choco task send <id> --text "<answers>"`), at `awaiting_human_review`
-  (vote, step 4) or at `escalate_to_human` (`choco task send`, step 5).
-  `--until` takes one target, so
-  `choco task status <id> --until stage:awaiting_human_review --timeout 2h`
-  sits out the whole timeout if the task parks elsewhere, and an answered
-  planner question can come back as another one. Use it only once the task
-  has left `spec_check` for `coding` (or on `coding-task`); an escalation
-  still runs it to the timeout. Until then poll for every stop, as in
-  [reference/watch.md](reference/watch.md#polling-every-way-a-task-can-stop).
-  The exit codes and typical stage times for choosing `--timeout` are there
-  too.
+- **Wait for the task to stop.** One command covers the whole run:
+  `choco task status <id> --until attention --timeout <dur>`. It returns
+  when the task is open at `spec_questions` (the planner needs your answer;
+  reply with `choco task send <id> --text "<answers>"`), at
+  `awaiting_human_review` (vote, step 4) or at `escalate_to_human`
+  (`choco task retry` or `choco task send`, step 5), or when it is stuck, cancelled or closed.
+  Its stderr line and exit code say which. The exit codes are in
+  [reference/watch.md](reference/watch.md#waiting-with---until); typical
+  stage times for choosing `--timeout` are in
+  [reference/watch.md](reference/watch.md#stage-times).
 - **Read a stage's verdict text** (the latest lap) with
   `choco --json task status <id> | jq -r '.workflow_state.payload.stages.<stage>.summary'`
   for `spec_check` or `internal_review`. Every lap's text, and watching
@@ -317,8 +314,11 @@ cancelling. In short:
 
 - `stuck` → find out why in `choco task status <id>`, then
   `choco task retry <id>`.
-- `escalate_to_human` → `choco task send <id> --text "<note>"` is the only
-  way on; `/approve` does nothing there.
+- `escalate_to_human` → after a review timeout, `choco task retry <id>`
+  watches again at no cost; after a CI timeout, re-run CI on GitHub, then
+  `choco task retry <id>`; after any other escalation (a cancelled or
+  failed-to-start check, a loop guard), `choco task send <id> --text "<note>"`
+  moves on through a coder lap. `/approve` alone is refused there.
 - `choco task cancel <id>` is final and deletes the task's worktree and
   local branch; `--keep` keeps both for you to take over.
 

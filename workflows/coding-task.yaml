@@ -92,8 +92,9 @@ stages:
   # below), because CI has not finished within 30 minutes (the `timeout` of
   # `checks_polling`) or has a cancelled, startup-failure or action-required
   # check (`ci_cancelled`, `ci_startup_failure`, `ci_action_required`), or
-  # because no human review arrives within 6h
-  # (the `timeout` of `awaiting_human_review`'s watcher). Arriving here restarts all three
+  # because no human review arrives within 102h (about four days: polled every
+  # minute for 6h, every 5 minutes for the next 24h, every 30 minutes for the
+  # next 3 days; the `timeout` of `awaiting_human_review`'s watcher). Arriving here restarts all three
   # loop guards' counts (§5.3), whichever of those brought the task here,
   # so a human resuming from this stage always hands the loop a fresh
   # budget. `capture: text` keeps the human's reply so `revising` can see
@@ -250,7 +251,12 @@ stages:
       env:
         PR_NUMBER: "{{ stages.open_pr.number }}"
       interval: 60s
-      timeout: 6h
+      # Every minute for the first 6h, every 5 minutes up to 30h, then every
+      # 30 minutes until the 102h timeout.
+      backoff:
+        - { after: 6h, interval: 5m }
+        - { after: 30h, interval: 30m }
+      timeout: 102h
       outcomes:
         - match: '\AREQUEST_CHANGES(\n|$)'
           then: changes_requested
@@ -261,7 +267,7 @@ stages:
     on:
       approved: done
       changes_requested: revising
-      # Nobody reviewed in 6h. `done` would claim an approval that never
+      # Nobody reviewed in 102h (see `watch` above). `done` would claim an approval that never
       # happened and `revising` would loop the coder on no feedback, so
       # this parks the task where a human can pick it up deliberately.
       timeout: escalate_to_human

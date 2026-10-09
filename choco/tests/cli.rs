@@ -2035,6 +2035,154 @@ async fn watch_on_an_already_closed_task_prints_only_the_first_line() {
     assert!(out.contains("watching task"));
 }
 
+/// A workflow whose `run` stage waits (at most ~60 s) for `sentinel` to
+/// exist, then moves to a `human_gate` stage named `gate`. The test decides
+/// when the gate is reached by creating the file, so a watcher's first poll
+/// provably comes first without any sleep-based ordering.
+fn sentinel_gate_wf(gate: &str, sentinel: &std::path::Path) -> String {
+    format!(
+        r#"
+name: sentinelwf
+stages:
+  run:
+    kind: shell
+    command: "n=0; until [ -e '{}' ] || [ $n -ge 600 ]; do sleep 0.1; n=$((n+1)); done"
+    on: {{ done: {gate} }}
+  {gate}:
+    kind: human_gate
+    on: {{ resumed: finished }}
+  finished:
+    kind: terminal
+"#,
+        sentinel.display()
+    )
+}
+
+/// Reads one stdout line from a spawned watcher.
+async fn first_stdout_line(child: &mut Child) -> String {
+    let stdout = child.stdout.as_mut().expect("piped stdout");
+    let mut line = String::new();
+    BufReader::new(stdout).read_line(&mut line).await.unwrap();
+    line
+}
+
+/// Runs `--until attention` against a task that reaches `gate` only after
+/// the first line is read. Returns exit code, stdout rest, stderr, first line.
+async fn attention_at_gate(
+    gate: &str,
+    extra: &[&str],
+) -> (Option<i32>, String, String, String, String) {
+    let sentinel_dir = TempHome::new();
+    let sentinel = sentinel_dir.0.join("go");
+    let (d, id) = watch_setup("sentinelwf", &sentinel_gate_wf(gate, &sentinel)).await;
+    let timeout = timeout_arg();
+    let mut args = vec![
+        "--until",
+        "attention",
+        "--interval",
+        "1s",
+        "--timeout",
+        &timeout,
+    ];
+    args.extend_from_slice(extra);
+    let mut child = spawn_watcher(&d.base_url, &id, &args);
+    let first = first_stdout_line(&mut child).await;
+    assert!(first.contains("run"), "first line: {first:?}");
+    std::fs::write(&sentinel, "").unwrap();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (code, stderr) = finish_watcher(child).await;
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).await.unwrap();
+    (code, rest, stderr, first, id)
+}
+
+#[tokio::test]
+async fn watch_until_attention_returns_at_every_kind_of_gate() {
+    for gate in [
+        "spec_questions",
+        "awaiting_human_review",
+        "escalate_to_human",
+        "ask_the_boss",
+    ] {
+        let (code, _rest, stderr, first, id) = attention_at_gate(gate, &[]).await;
+        assert!(first.contains("watching task"), "{gate}: {first:?}");
+        assert!(first.contains("stage run"), "{gate}: {first:?}");
+        assert_eq!(code, Some(0), "{gate} stderr: {stderr}");
+        assert!(
+            stderr.contains(&format!("task {id} is waiting for you in stage '{gate}'")),
+            "{gate}: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn watch_until_attention_keeps_waiting_while_running() {
+    let sentinel_dir = TempHome::new();
+    let sentinel = sentinel_dir.0.join("never");
+    let (d, id) = watch_setup("sentinelwf", &sentinel_gate_wf("g", &sentinel)).await;
+    let started = std::time::Instant::now();
+    let out = watch_choco(
+        &d,
+        &id,
+        &[
+            "--until",
+            "attention",
+            "--interval",
+            "1s",
+            "--timeout",
+            "2s",
+        ],
+    )
+    .await;
+    assert_eq!(out.code, Some(5), "stderr: {}", out.stderr);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(out.stderr.contains("timed out after 2s"), "{}", out.stderr);
+    assert!(out.stderr.contains("run"), "{}", out.stderr);
+}
+
+#[tokio::test]
+async fn watch_until_attention_on_a_stuck_task_exits_3() {
+    let (d, id) = watch_setup("stuckwf", STUCK_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "attention", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(3), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("stuck"), "{}", out.stderr);
+    assert!(out.stderr.contains(&id), "{}", out.stderr);
+}
+
+#[tokio::test]
+async fn watch_until_attention_on_a_closing_task_exits_6() {
+    let (d, id) = watch_setup("closing", CLOSING_WF).await;
+    let out = watch_choco(&d, &id, &["--until", "attention", "--interval", "1s"]).await;
+    assert_eq!(out.code, Some(6), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr
+            .contains(&format!("task {id} closed (last stage 'finished')")),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("without reaching"), "{}", out.stderr);
+}
+
+#[tokio::test]
+async fn watch_until_attention_json_keeps_stdout_ndjson() {
+    let gate = "ask_the_boss";
+    let (code, rest, stderr, first, id) = attention_at_gate(gate, &["--json"]).await;
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let lines: Vec<&str> = std::iter::once(first.trim_end())
+        .chain(rest.lines())
+        .collect();
+    for line in &lines {
+        serde_json::from_str::<Value>(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+    }
+    let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["workflow_state"]["current_stage"], gate);
+    assert!(!rest.contains("waiting for you"), "{rest}");
+    assert!(
+        stderr.contains(&format!("task {id} is waiting for you in stage '{gate}'")),
+        "{stderr}"
+    );
+}
+
 #[tokio::test]
 async fn watch_json_is_ndjson() {
     let (d, id) = watch_setup("closing", CLOSING_WF).await;

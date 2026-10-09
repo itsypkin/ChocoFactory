@@ -10489,6 +10489,7 @@ async fn retry_resumes_the_session_a_usage_limit_interrupted() {
             resumed: true,
             adapter_session_id: interrupted_run.adapter_session_id.clone(),
             fresh_reason: None,
+            rewatched: false,
         }
     );
     wait_until_task_status(&pool, &task_id, "closed").await;
@@ -11163,9 +11164,16 @@ stages:
 #[tokio::test]
 async fn retry_task_on_an_open_task_is_not_stuck() {
     let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
     let def = human_gate_chain_def();
+    // An open task's workflow is loaded to see whether a watcher timed out.
+    std::fs::write(
+        dir.join("gated.yaml"),
+        "name: gated\nstages:\n  gate:\n    kind: human_gate\n    on: { resumed: done }\n  done:\n    kind: terminal\n",
+    )
+    .unwrap();
     let task_id = seed_task(&pool, &def.name).await;
-    let engine = engine_with_adapter(pool.clone(), "unused");
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
     engine.start_task(&task_id, &def, None).await.unwrap();
 
     let err = engine
@@ -15082,6 +15090,550 @@ fn a_malformed_finished_stages_value_is_replaced_by_a_list() {
     let mut not_object = json!("scalar");
     mark_stage_finished(&mut not_object, "gate");
     assert_eq!(not_object["finished_stages"], json!(["gate"]));
+}
+
+// ---- backoff, re-watch and marker-only refusal (#179) ----
+
+/// An engine whose clock is the real one plus a movable offset in seconds.
+fn engine_with_offset_clock(
+    pool: SqlitePool,
+    dir: &Path,
+) -> (Arc<WorkflowEngine>, Arc<std::sync::atomic::AtomicI64>) {
+    let offset = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let clock_offset = Arc::clone(&offset);
+    let events_notify = Arc::new(Notify::new());
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary("unused"));
+    let session_manager = SessionManager::new(
+        pool.clone(),
+        Registry::single(adapter),
+        chrono::Duration::hours(1),
+        Arc::clone(&events_notify),
+    );
+    let engine = WorkflowEngine::new_with_clock(
+        pool,
+        session_manager,
+        dir.to_path_buf(),
+        None,
+        events_notify,
+        Arc::new(move || {
+            Utc::now()
+                + chrono::Duration::seconds(clock_offset.load(std::sync::atomic::Ordering::SeqCst))
+        }),
+    );
+    (engine, offset)
+}
+
+/// An engine whose clock always reads `at`.
+fn engine_with_fixed_clock(pool: SqlitePool, dir: &Path, at: DateTime<Utc>) -> Arc<WorkflowEngine> {
+    let events_notify = Arc::new(Notify::new());
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary("unused"));
+    let session_manager = SessionManager::new(
+        pool.clone(),
+        Registry::single(adapter),
+        chrono::Duration::hours(1),
+        Arc::clone(&events_notify),
+    );
+    WorkflowEngine::new_with_clock(
+        pool,
+        session_manager,
+        dir.to_path_buf(),
+        None,
+        events_notify,
+        Arc::new(move || at),
+    )
+}
+
+/// A poll whose command counts its runs in `counter`, waits for `go` to
+/// exist, and prints the count. It matches once the count reaches `target`.
+fn write_backoff_poll_flow(
+    dir: &Path,
+    name: &str,
+    target: u32,
+    timeout: Option<&str>,
+) -> Arc<WorkflowDefinition> {
+    let counter = dir.join("count");
+    let go = dir.join("go");
+    let timeout = timeout
+        .map(|t| format!("    timeout: {t}\n"))
+        .unwrap_or_default();
+    let on_timeout = if timeout.is_empty() {
+        ""
+    } else {
+        ", timeout: stalled"
+    };
+    let yaml = format!(
+        r#"
+name: {name}
+stages:
+  watch:
+    kind: poll
+    command: 'echo x >> {c}; while [ ! -f {g} ]; do sleep 0.05; done; wc -l < {c}'
+    interval: 1h
+    backoff:
+      - {{ after: 1h, interval: 1s }}
+{timeout}    outcomes:
+      - match: '\A\s*{target}'
+        then: done
+    on: {{ done: finished{on_timeout} }}
+  finished:
+    kind: terminal
+  stalled:
+    kind: terminal
+"#,
+        c = counter.display(),
+        g = go.display()
+    );
+    std::fs::write(dir.join(format!("{name}.yaml")), &yaml).unwrap();
+    Arc::new(WorkflowDefinition::parse(&yaml, dir).unwrap())
+}
+
+#[tokio::test]
+async fn a_backoff_step_shortens_the_wait_once_the_clock_reaches_it() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_backoff_poll_flow(&dir, "backoff-live", 2, None);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let (engine, offset) = engine_with_offset_clock(pool.clone(), &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&dir.join("count"), 1).await;
+    // The first attempt is still waiting for `go`; by the time it ends, the
+    // stage has been running for two hours.
+    offset.store(2 * 3600, std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(dir.join("go"), "").unwrap();
+    // With the base interval of 1h this would wait an hour.
+    wait_until_stage(&pool, &task_id, "finished").await;
+}
+
+#[tokio::test]
+async fn a_restart_picks_its_backoff_step_from_the_stored_entry_time() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    // Never matches, so the stage stays put and its window can be read.
+    let def = write_backoff_poll_flow(&dir, "backoff-restart", 99, Some("200h"));
+    std::fs::write(dir.join("go"), "").unwrap();
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let now = Utc::now();
+    let deadline = now + chrono::Duration::hours(100);
+    seed_row(
+        &pool,
+        &task_id,
+        "watch",
+        json!({ "poll_window": window_json("watch", now - chrono::Duration::hours(2), Some(deadline)) }),
+    )
+    .await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.resume_interrupted_polls().await.unwrap();
+    // The second attempt arrives after 1s, not 1h.
+    wait_until_count(&dir.join("count"), 2).await;
+    let window = poll_window_for(&state_of(&pool, &task_id).await.payload, "watch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(window.deadline, Some(deadline));
+    engine.abort_detached_runners(&task_id).await;
+}
+
+#[tokio::test]
+async fn the_timeout_note_says_how_long_the_stage_watched() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_backoff_poll_flow(&dir, "backoff-note", 99, Some("90m"));
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let (engine, offset) = engine_with_offset_clock(pool.clone(), &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&dir.join("count"), 1).await;
+    offset.store(100 * 60 + 30, std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(dir.join("go"), "").unwrap();
+    wait_until_stage(&pool, &task_id, "stalled").await;
+    let event = wait_until_decisive_poll_event(&pool, &task_id).await;
+    assert_eq!(
+        event["note"],
+        json!("no outcome matched in 1 attempts over 1h40m; timeout elapsed")
+    );
+}
+
+const REWATCH_FLOW: &str = r#"
+name: rw
+stages:
+  review:
+    kind: human_gate
+    markers:
+      - line: /request-changes
+        then: changes_requested
+      - line: /approve
+        then: approved
+    watch:
+      command: "echo PENDING"
+      interval: 1s
+      timeout: 1h
+      outcomes:
+        - match: 'NEVER_XYZ'
+          then: approved
+    on: { approved: done, changes_requested: revising, timeout: esc }
+  ci:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    timeout: 30m
+    outcomes:
+      - match: 'NEVER_XYZ'
+        then: green
+    on: { green: done, timeout: esc, other: ci2, more: esc2 }
+  ci3:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    timeout: 30m
+    outcomes:
+      - match: 'NEVER_XYZ'
+        then: green
+    on: { green: done, timeout: fixer }
+  fixer:
+    kind: shell
+    command: "echo hi"
+    on: { done: done }
+  ci2:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    timeout: 30m
+    outcomes:
+      - match: 'NEVER_XYZ'
+        then: green
+    on: { green: done, timeout: esc_w }
+  esc:
+    kind: human_gate
+    on: { resumed: revising }
+  esc2:
+    kind: human_gate
+    on: { resumed: revising }
+  esc_w:
+    kind: human_gate
+    watch:
+      command: "echo PENDING"
+      interval: 1s
+      outcomes:
+        - match: 'NEVER_XYZ'
+          then: ok
+    on: { resumed: revising, ok: done }
+  revising:
+    kind: terminal
+  done:
+    kind: terminal
+"#;
+
+async fn rewatch_setup(
+    stage: &str,
+    arrival: Value,
+) -> (
+    SqlitePool,
+    TempDir,
+    String,
+    Arc<WorkflowEngine>,
+    DateTime<Utc>,
+) {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    std::fs::write(dir.join("rw.yaml"), REWATCH_FLOW).unwrap();
+    let task_id = seed_task_in(&pool, "rw", &dir).await;
+    seed_row(
+        &pool,
+        &task_id,
+        stage,
+        json!({ "task": { "title": "T" }, "arrival": arrival }),
+    )
+    .await;
+    sqlx::query("UPDATE workflow_state SET loop_counters = ? WHERE task_id = ?")
+        .bind(sqlx::types::Json(json!({ "review": { "count": 2 } })))
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let engine = engine_with_fixed_clock(pool.clone(), &dir, now);
+    (pool, dir, task_id, engine, now)
+}
+
+#[tokio::test]
+async fn retry_at_a_gate_after_a_watcher_timeout_watches_again() {
+    for (from, timeout) in [("review", 3600), ("ci", 1800)] {
+        let (pool, _dir, task_id, engine, now) =
+            rewatch_setup("esc", json!({ "from": from, "outcome": "timeout" })).await;
+        let before = state_of(&pool, &task_id).await;
+        let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+        assert_eq!(
+            outcome,
+            RetryOutcome {
+                stage: from.to_string(),
+                resumed: false,
+                adapter_session_id: None,
+                fresh_reason: None,
+                rewatched: true,
+            }
+        );
+        wait_for_poll_attempt(&pool, &task_id).await;
+        let state = state_of(&pool, &task_id).await;
+        assert_eq!(state.current_stage, from);
+        assert_eq!(state.loop_counters, before.loop_counters);
+        assert_eq!(
+            state.payload["arrival"],
+            json!({ "from": "esc", "outcome": "retry" })
+        );
+        let window = poll_window_for(&state.payload, from).unwrap().unwrap();
+        assert_eq!(window.entered_at, now);
+        assert_eq!(
+            window.deadline,
+            Some(now + chrono::Duration::seconds(timeout))
+        );
+        assert_ne!(state.stage_entered_at, before.stage_entered_at);
+        assert_eq!(
+            tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+            "open"
+        );
+        assert!(
+            stage_trail(&pool, &task_id)
+                .await
+                .iter()
+                .any(|(s, o)| s == from && o == &json!("retry"))
+        );
+        engine.abort_detached_runners(&task_id).await;
+    }
+}
+
+#[tokio::test]
+async fn retry_refuses_an_open_task_that_did_not_time_out_at_a_gate() {
+    let cases = [
+        (
+            "a loop guard",
+            "esc",
+            json!({ "from": "review", "outcome": "changes_requested" }),
+        ),
+        (
+            "an error edge",
+            "esc",
+            json!({ "from": "ci", "outcome": "error" }),
+        ),
+        (
+            "a stage with no watcher",
+            "esc",
+            json!({ "from": "esc2", "outcome": "timeout" }),
+        ),
+        (
+            "a watcher timing out elsewhere",
+            "esc2",
+            json!({ "from": "review", "outcome": "timeout" }),
+        ),
+        (
+            "a gate that watches itself",
+            "esc_w",
+            json!({ "from": "ci2", "outcome": "timeout" }),
+        ),
+        (
+            "a non-gate stage",
+            "ci",
+            json!({ "from": "review", "outcome": "timeout" }),
+        ),
+        (
+            "a watcherless non-gate target of a timeout edge",
+            "fixer",
+            json!({ "from": "ci3", "outcome": "timeout" }),
+        ),
+    ];
+    for (label, stage, arrival) in cases {
+        let (pool, _dir, task_id, engine, _now) = rewatch_setup(stage, arrival).await;
+        let before = state_of(&pool, &task_id).await;
+        let err = engine
+            .retry_task(&task_id, RetryMode::Auto)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, RetryTaskError::NotStuck(status) if status == "open"),
+            "{label}: {err:?}"
+        );
+        assert_eq!(state_of(&pool, &task_id).await, before, "{label}");
+        assert!(!engine.has_detached_runner(&task_id), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn a_rewatch_that_cannot_start_the_watcher_leaves_the_task_stuck_there() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("rw.yaml"),
+        REWATCH_FLOW.replacen("stages:", "worktree: true\nstages:", 1),
+    )
+    .unwrap();
+    let task_id = seed_task_in(&pool, "rw", &dir).await;
+    seed_row(
+        &pool,
+        &task_id,
+        "esc",
+        json!({ "task": { "title": "T" }, "arrival": { "from": "review", "outcome": "timeout" } }),
+    )
+    .await;
+    let engine = engine_with_fixed_clock(pool.clone(), &dir, Utc::now());
+    let err = engine
+        .retry_task(&task_id, RetryMode::Auto)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RetryTaskError::Enter(_)), "{err:?}");
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "stuck");
+    assert!(
+        task.stuck_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("stage 'review': retry failed"),
+        "{:?}",
+        task.stuck_reason
+    );
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "review");
+}
+
+#[tokio::test]
+async fn retry_with_a_mode_at_a_timed_out_gate_is_refused() {
+    for mode in [RetryMode::Resume, RetryMode::Fresh] {
+        let (pool, _dir, task_id, engine, _now) =
+            rewatch_setup("esc", json!({ "from": "review", "outcome": "timeout" })).await;
+        let before = state_of(&pool, &task_id).await;
+        let err = engine.retry_task(&task_id, mode).await.unwrap_err();
+        assert!(
+            matches!(&err, RetryTaskError::RewatchTakesNoMode { stage, .. } if stage == "review"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("without --resume or --fresh"));
+        assert_eq!(state_of(&pool, &task_id).await, before);
+    }
+}
+
+#[tokio::test]
+async fn a_closed_task_is_not_retried_even_at_a_timed_out_gate() {
+    let (pool, _dir, task_id, engine, _now) =
+        rewatch_setup("esc", json!({ "from": "review", "outcome": "timeout" })).await;
+    tasks::update_status(&pool, &task_id, "closed")
+        .await
+        .unwrap();
+    let err = engine
+        .retry_task(&task_id, RetryMode::Auto)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::NotStuck(s) if s == "closed"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn status_reports_a_timed_out_watcher_only_for_an_open_parked_task() {
+    let (pool, _dir, task_id, engine, _now) =
+        rewatch_setup("esc", json!({ "from": "review", "outcome": "timeout" })).await;
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(
+        engine.watch_timed_out(&task, &state).await,
+        Some(WatchTimedOutInfo {
+            stage: "review".into(),
+            timeout_secs: Some(3600),
+            resumes_to: Some("revising".into()),
+        })
+    );
+    let mut closed = task.clone();
+    closed.status = "closed".into();
+    assert_eq!(engine.watch_timed_out(&closed, &state).await, None);
+}
+
+#[tokio::test]
+async fn a_marker_only_reply_at_a_gate_without_markers_is_refused() {
+    for text in [
+        "/approve",
+        "/request-changes",
+        "/approve\n\n",
+        "/approve  \r\n/approve",
+    ] {
+        let (pool, _dir, task_id, engine, _now) =
+            rewatch_setup("esc", json!({ "from": "review", "outcome": "timeout" })).await;
+        let before = state_of(&pool, &task_id).await;
+        let err = engine
+            .send_message_or_resume(&task_id, text)
+            .await
+            .unwrap_err();
+        match &err {
+            SendMessageOrResumeError::ReplyIsOnlyMarkers {
+                stage,
+                found,
+                resumes_to,
+                rewatch,
+                ..
+            } => {
+                assert_eq!(stage, "esc");
+                assert_eq!(found.len(), 1, "{text:?}");
+                assert_eq!(resumes_to.as_deref(), Some("revising"));
+                assert!(*rewatch);
+            }
+            other => panic!("{text:?}: {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("doesn't read /")
+                && message.contains("sends the task on to stage 'revising'")
+                && message.contains(&format!("choco task retry {task_id}")),
+            "{message}"
+        );
+        assert!(human_messages(&pool, &task_id).await.is_empty());
+        assert_eq!(state_of(&pool, &task_id).await, before);
+    }
+}
+
+#[tokio::test]
+async fn the_retry_hint_is_left_out_when_the_gate_was_not_reached_by_a_timeout() {
+    let (_pool, _dir, task_id, engine, _now) = rewatch_setup(
+        "esc",
+        json!({ "from": "review", "outcome": "changes_requested" }),
+    )
+    .await;
+    let err = engine
+        .send_message_or_resume(&task_id, "/approve")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            SendMessageOrResumeError::ReplyIsOnlyMarkers { rewatch: false, .. }
+        ),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains("choco task retry"));
+    assert!(
+        err.to_string()
+            .contains(&format!("choco task cancel {task_id}"))
+    );
+}
+
+#[tokio::test]
+async fn a_marker_with_words_or_leading_space_is_a_note() {
+    for text in ["/approve\nalso fix X", "  /approve"] {
+        let (pool, _dir, task_id, engine, _now) =
+            rewatch_setup("esc", json!({ "from": "review", "outcome": "timeout" })).await;
+        engine.send_message_or_resume(&task_id, text).await.unwrap();
+        assert_eq!(state_of(&pool, &task_id).await.current_stage, "revising");
+        assert_eq!(human_messages(&pool, &task_id).await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_workflow_without_marker_gates_takes_a_marker_like_reply_as_a_note() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let yaml = "name: nomark\nstages:\n  gate:\n    kind: human_gate\n    on: { resumed: done }\n  done:\n    kind: terminal\n";
+    std::fs::write(dir.join("nomark.yaml"), yaml).unwrap();
+    let task_id = seed_task_in(&pool, "nomark", &dir).await;
+    seed_row(&pool, &task_id, "gate", json!({ "task": { "title": "T" } })).await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine
+        .send_message_or_resume(&task_id, "/approve")
+        .await
+        .unwrap();
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "done");
 }
 
 // ---- task base (#256) ------------------------------------------------

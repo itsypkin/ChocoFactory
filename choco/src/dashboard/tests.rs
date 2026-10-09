@@ -450,6 +450,7 @@ fn retry_only_applies_to_a_stuck_task() {
                 resumed: true,
                 adapter_session_id: None,
                 fresh_reason: None,
+                rewatched: false,
             })),
         },
     );
