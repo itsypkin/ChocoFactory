@@ -15426,6 +15426,34 @@ async fn unreachable_remote_fails_closed_on_fetch_and_on_default_lookup() {
 }
 
 #[tokio::test]
+async fn a_failed_fetch_of_an_existing_remote_branch_is_a_remote_error_not_an_unknown_ref() {
+    let fx = BaseFixture::new().await;
+    let env = base_env().await;
+    // Make the tracking ref stale so the fetch has to write it.
+    fx.advance("main").await;
+    // An operator's own concurrent fetch holding the ref lock.
+    let lock = fx.clone.join(".git/refs/remotes/origin/main.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, "").unwrap();
+
+    let err = env
+        .create_wt(&fx.clone, Some("origin/main"))
+        .await
+        .unwrap_err();
+    match &err {
+        CreateTaskError::Base(worktree::BaseError::Remote { op, stderr, .. }) => {
+            assert_eq!(*op, "fetch");
+            assert!(stderr.contains("lock"), "{stderr}");
+            assert!(!stderr.contains("ls-remote:"), "{stderr}");
+        }
+        other => panic!("expected Remote, got {other:?}"),
+    }
+    std::fs::remove_file(&lock).unwrap();
+    fx.assert_nothing_created(&env.pool, &env.project_id, &fx.clone)
+        .await;
+}
+
+#[tokio::test]
 async fn a_hanging_remote_times_out_instead_of_hanging_create() {
     let fx = BaseFixture::new().await;
     let env = base_env().await;

@@ -254,3 +254,24 @@ impl From<InitWorkflowsError> for ApiError {
         }
     }
 }
+
+#[cfg(test)]
+mod base_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn base_git_io_failures_are_server_errors_and_a_non_repo_is_a_bad_request() {
+        let io = CreateTaskError::Base(BaseError::Git(WorktreeError::Io(std::io::Error::other(
+            "boom",
+        ))));
+        assert!(matches!(ApiError::from(io), ApiError::Internal(_)));
+        let not_repo = CreateTaskError::Base(BaseError::Git(WorktreeError::NotAGitRepo {
+            path: "/x".into(),
+            source: Box::new(WorktreeError::GitFailed {
+                args: vec![],
+                stderr: String::new(),
+            }),
+        }));
+        assert!(matches!(ApiError::from(not_repo), ApiError::BadRequest(_)));
+    }
+}
