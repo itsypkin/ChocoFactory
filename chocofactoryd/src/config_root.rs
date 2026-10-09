@@ -2162,6 +2162,22 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     }
 
     #[test]
+    fn planner_system_check_six_bullets_stay_inside_the_list_item() {
+        let raw = embedded_prompt("planner-system.md");
+        let rest = &raw[index_of(raw, "## The checks")..];
+        let sixth = &rest[index_of(rest, "6. **Soundness.**")..];
+        let end = sixth.find("\n## ").expect("a heading follows check 6");
+        let bullets: Vec<&str> = sixth[..end]
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .collect();
+        assert!(bullets.len() >= 4, "check 6 has its bullets");
+        for b in bullets {
+            assert!(b.starts_with("   - "), "bullet not at 3 spaces: {b:?}");
+        }
+    }
+
+    #[test]
     fn planner_system_check_six_has_counter_and_key_bullets() {
         let raw = embedded_prompt("planner-system.md");
         let rest = &raw[index_of(raw, "## The checks")..];
