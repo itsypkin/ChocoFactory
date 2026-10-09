@@ -539,6 +539,47 @@ mod tests {
         assert_eq!(detail["base_commit"], sha.as_str());
     }
 
+    /// A client that disconnects mid-create must not strand an `open` row
+    /// with no stage: the handler runs the create on its own task. A
+    /// `post-checkout` hook slows `git worktree add`, which runs after the
+    /// row insert.
+    #[tokio::test]
+    async fn a_client_disconnect_mid_create_still_ends_in_a_complete_task() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = TestServer::start().await;
+        server.write_workflow("wt", WT_YAML);
+        let project_id = create_project(&server).await;
+        let repo = repo_in(&server);
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 3\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            post_wt(&server, &project_id, "wt", &repo, None),
+        )
+        .await;
+        assert!(dropped.is_err(), "the create should still be running");
+
+        let mut staged = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let tasks = server
+                .get(&format!("/tasks?project_id={project_id}"))
+                .await
+                .json();
+            let Some(id) = tasks[0]["id"].as_str() else {
+                continue;
+            };
+            let detail = server.get(&format!("/tasks/{id}")).await.json();
+            if !detail["workflow_state"].is_null() {
+                staged = true;
+                break;
+            }
+        }
+        assert!(staged, "the task never reached a stage");
+    }
+
     #[tokio::test]
     async fn create_task_maps_base_failures_to_400_and_502() {
         let server = TestServer::start().await;

@@ -760,8 +760,12 @@ async fn run_git_resolve(
         Some(limit) => match tokio::time::timeout(limit, work).await {
             Ok(result) => result,
             Err(_) => {
-                // Dropping `guard` below SIGTERMs git and reaps it.
-                drop(guard);
+                // SIGTERM git and wait for it here, while the caller still
+                // holds the per-repo lock, so git has removed its ref lock
+                // file before the next create can start a fetch.
+                if let Some(child) = guard.0.take() {
+                    terminate_and_reap(child).await;
+                }
                 return Ok(Ran::TimedOut);
             }
         },
@@ -784,7 +788,7 @@ struct TermOnDrop(Option<tokio::process::Child>);
 
 impl Drop for TermOnDrop {
     fn drop(&mut self) {
-        let Some(mut child) = self.0.take() else {
+        let Some(child) = self.0.take() else {
             return;
         };
         if let Some(pid) = child.id() {
@@ -794,16 +798,38 @@ impl Drop for TermOnDrop {
             }
         }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if tokio::time::timeout(Duration::from_secs(10), child.wait())
-                    .await
-                    .is_err()
-                {
-                    let _ = child.kill().await;
-                }
-            });
+            handle.spawn(reap_or_kill(child));
         }
     }
+}
+
+/// How long a SIGTERMed git gets to exit before it is SIGKILLed.
+const TERM_GRACE: Duration = Duration::from_secs(10);
+
+/// Waits for an already-SIGTERMed git; past the grace period, SIGKILLs it
+/// (which can leave a ref lock file, so it is logged).
+async fn reap_or_kill(mut child: tokio::process::Child) {
+    if tokio::time::timeout(TERM_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            pid = child.id(),
+            "git ignored SIGTERM for {}s; sending SIGKILL (a ref lock file may remain)",
+            TERM_GRACE.as_secs()
+        );
+        let _ = child.kill().await;
+    }
+}
+
+async fn terminate_and_reap(child: tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: plain signal to a child pid we own and have not reaped.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    reap_or_kill(child).await;
 }
 
 fn timed_out_text(limit: Duration) -> String {
