@@ -15207,6 +15207,19 @@ stages:
       - match: 'NEVER_XYZ'
         then: green
     on: { green: done, timeout: esc, other: ci2, more: esc2 }
+  ci3:
+    kind: poll
+    command: "echo PENDING"
+    interval: 1s
+    timeout: 30m
+    outcomes:
+      - match: 'NEVER_XYZ'
+        then: green
+    on: { green: done, timeout: fixer }
+  fixer:
+    kind: shell
+    command: "echo hi"
+    on: { done: done }
   ci2:
     kind: poll
     command: "echo PENDING"
@@ -15348,6 +15361,11 @@ async fn retry_refuses_an_open_task_that_did_not_time_out_at_a_gate() {
             "ci",
             json!({ "from": "review", "outcome": "timeout" }),
         ),
+        (
+            "a watcherless non-gate target of a timeout edge",
+            "fixer",
+            json!({ "from": "ci3", "outcome": "timeout" }),
+        ),
     ];
     for (label, stage, arrival) in cases {
         let (pool, _dir, task_id, engine, _now) = rewatch_setup(stage, arrival).await;
@@ -15363,6 +15381,42 @@ async fn retry_refuses_an_open_task_that_did_not_time_out_at_a_gate() {
         assert_eq!(state_of(&pool, &task_id).await, before, "{label}");
         assert!(!engine.has_detached_runner(&task_id), "{label}");
     }
+}
+
+#[tokio::test]
+async fn a_rewatch_that_cannot_start_the_watcher_leaves_the_task_stuck_there() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    std::fs::write(
+        dir.join("rw.yaml"),
+        REWATCH_FLOW.replacen("stages:", "worktree: true\nstages:", 1),
+    )
+    .unwrap();
+    let task_id = seed_task_in(&pool, "rw", &dir).await;
+    seed_row(
+        &pool,
+        &task_id,
+        "esc",
+        json!({ "task": { "title": "T" }, "arrival": { "from": "review", "outcome": "timeout" } }),
+    )
+    .await;
+    let engine = engine_with_fixed_clock(pool.clone(), &dir, Utc::now());
+    let err = engine
+        .retry_task(&task_id, RetryMode::Auto)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RetryTaskError::Enter(_)), "{err:?}");
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "stuck");
+    assert!(
+        task.stuck_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("stage 'review': retry failed"),
+        "{:?}",
+        task.stuck_reason
+    );
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "review");
 }
 
 #[tokio::test]

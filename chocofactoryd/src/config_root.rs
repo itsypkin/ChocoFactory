@@ -754,10 +754,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         }
     }
 
-    /// The embedded `coding-task.yaml` and its prompt files aren't just
-    /// present after seeding — they have to actually resolve and validate
-    /// together (#18), since `system_prompt_file`/`prompt_file` are
-    /// relative to wherever the seeded copy ends up on disk, not the repo.
+    /// Both built-ins carry the same review-gate backoff schedule.
     #[test]
     fn both_built_ins_back_the_review_gate_off_over_102_hours() {
         use crate::workflow_def::BackoffStep;
@@ -792,6 +789,10 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         }
     }
 
+    /// The embedded `coding-task.yaml` and its prompt files aren't just
+    /// present after seeding — they have to actually resolve and validate
+    /// together (#18), since `system_prompt_file`/`prompt_file` are
+    /// relative to wherever the seeded copy ends up on disk, not the repo.
     #[test]
     fn the_seeded_coding_task_workflow_loads_and_validates() {
         let dir = TempDir::new();

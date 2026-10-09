@@ -454,6 +454,68 @@ mod tests {
 
     use super::super::tests::TestServer;
 
+    const PARKED_FLOW: &str = r#"
+name: parked
+stages:
+  review:
+    kind: human_gate
+    watch:
+      command: "echo PENDING"
+      interval: 1s
+      timeout: 1h
+      outcomes:
+        - match: 'NEVER_XYZ'
+          then: approved
+    on: { approved: done, timeout: esc }
+  esc:
+    kind: human_gate
+    on: { resumed: done }
+  done:
+    kind: terminal
+"#;
+
+    #[tokio::test]
+    async fn status_reports_a_timed_out_watcher_only_for_a_parked_task() {
+        let server = TestServer::start().await;
+        server.write_workflow("parked", PARKED_FLOW);
+        let project = create_project(&server).await;
+        let mut bodies = Vec::new();
+        for arrival in [
+            json!({ "from": "review", "outcome": "timeout" }),
+            json!({ "from": "review", "outcome": "approved" }),
+        ] {
+            let task: Value = server
+                .post(
+                    "/tasks",
+                    json!({ "project_id": project, "workflow_def": "parked", "title": "t", "prompt": "p", "config": { "cwd": "." } }),
+                )
+                .await
+                .json();
+            let id = task["id"].as_str().unwrap().to_string();
+            // Whatever the engine started, park the task by hand.
+            sqlx::query("DELETE FROM workflow_state WHERE task_id = ?")
+                .bind(&id)
+                .execute(server.pool())
+                .await
+                .unwrap();
+            crate::db::workflow_state::create(
+                server.pool(),
+                &id,
+                "esc",
+                "human_gate",
+                json!({ "task": { "title": "t" }, "arrival": arrival }),
+            )
+            .await
+            .unwrap();
+            bodies.push(server.get(&format!("/tasks/{id}")).await.json());
+        }
+        assert_eq!(
+            bodies[0]["watch_timed_out"],
+            json!({ "stage": "review", "timeout_secs": 3600, "resumes_to": "done" })
+        );
+        assert!(bodies[1]["watch_timed_out"].is_null(), "{}", bodies[1]);
+    }
+
     async fn create_project(server: &TestServer) -> String {
         let project: Value = server
             .post("/projects", json!({ "name": "demo" }))

@@ -4200,6 +4200,14 @@ stages:
                 "{err}"
             );
         }
+        let err = gate_backoff_err(
+            "      backoff:\n        - { after: 2h, interval: 5m }\n",
+            "      timeout: 2h\n",
+        );
+        assert!(
+            matches!(&err, WorkflowDefError::BackoffStepNotBeforeTimeout { field, .. } if field == "watch.backoff[0].after"),
+            "{err}"
+        );
     }
 
     #[test]
