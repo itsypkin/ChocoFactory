@@ -12,7 +12,11 @@ use super::*;
 struct WatchRun {
     command: ShellCommand,
     capture: Option<Capture>,
-    interval: Duration,
+    /// The watcher as defined: `interval` and `backoff` pick each sleep (#179).
+    watch: Watch,
+    /// When the stage was entered, from `payload.poll_window`; backoff steps
+    /// are measured from here.
+    entered_at: DateTime<Utc>,
     /// Wall-clock deadline (#52), read from `payload.poll_window`; `None`
     /// when the stage has no `timeout:`.
     deadline: Option<DateTime<Utc>>,
@@ -103,6 +107,48 @@ pub(super) fn poll_window_for(
     Ok(Some(window))
 }
 
+/// A gate that a watcher's timeout parked the task at (#179).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TimedOutWatch {
+    /// The watcher stage that timed out.
+    pub from: String,
+    pub timeout: Option<Duration>,
+    /// Where a plain reply at the gate sends the task (its `on.resumed`).
+    pub resumes_to: Option<String>,
+}
+
+/// Whether a task at `current_stage` is waiting there because a watcher
+/// timed out, so that `retry` can watch again. Callers check the task is
+/// `open`. All of these must hold: the stage is a `human_gate` with no
+/// watcher of its own (a gate that already watches never gets a second
+/// one); the task arrived with outcome `timeout`; it came from a stage that
+/// has a watcher; and that stage's `timeout` edge leads to this gate.
+pub(crate) fn timed_out_watch(
+    definition: &WorkflowDefinition,
+    current_stage: &str,
+    payload: &Value,
+) -> Option<TimedOutWatch> {
+    let gate = definition.stages.get(current_stage)?;
+    if !matches!(gate.kind, StageKind::HumanGate { .. }) || gate.watch().is_some() {
+        return None;
+    }
+    let arrival = payload.get("arrival")?;
+    if arrival.get("outcome")?.as_str()? != "timeout" {
+        return None;
+    }
+    let from = arrival.get("from")?.as_str()?;
+    let watcher = definition.stages.get(from)?;
+    let watch = watcher.watch()?;
+    if watcher.on.get("timeout").map(String::as_str) != Some(current_stage) {
+        return None;
+    }
+    Some(TimedOutWatch {
+        from: from.to_string(),
+        timeout: watch.timeout,
+        resumes_to: gate.on.get("resumed").cloned(),
+    })
+}
+
 /// What is left of a wall-clock budget; `ZERO` once the deadline passed.
 pub(super) fn remaining_budget(deadline: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
     (deadline - now).to_std().unwrap_or(Duration::ZERO)
@@ -141,15 +187,14 @@ impl WorkflowEngine {
             payload,
             ..
         } = *entry;
-        let interval = watch.interval;
         let (command, env) = self
             .render_stage_command(entry, &watch.command, &watch.env)
             .await?;
         // The deadline was computed once, on entry, and stored in the same
         // write that moved the task here (#52). A missing or malformed
         // window is an invariant violation, not a cue to invent a budget.
-        let deadline = match poll_window_for(payload, stage_name) {
-            Ok(Some(window)) => window.deadline,
+        let (entered_at, deadline) = match poll_window_for(payload, stage_name) {
+            Ok(Some(window)) => (window.entered_at, window.deadline),
             Ok(None) => {
                 return Err(EngineError::PollWindow {
                     stage: stage_name.to_string(),
@@ -181,7 +226,8 @@ impl WorkflowEngine {
             WatchRun {
                 command,
                 capture,
-                interval,
+                watch: watch.clone(),
+                entered_at,
                 deadline,
                 outcomes: compiled,
                 cwd,
@@ -252,6 +298,7 @@ impl WorkflowEngine {
         let described = describe_command(&run.command);
         // Fixed on stage entry, not here: this runner may be a resumed one.
         let deadline = run.deadline;
+        let entered_at = run.entered_at;
         let mut attempt: u64 = 0;
         // What the previous attempt produced, for the "only record what
         // changed" rule below. `None` until the first attempt reports.
@@ -305,6 +352,7 @@ impl WorkflowEngine {
                     &described,
                     attempt,
                     last_outcome.as_ref(),
+                    entered_at,
                 )
                 .await;
                 return;
@@ -396,7 +444,7 @@ impl WorkflowEngine {
                     // yielded: nothing.
                     last_outcome = None;
                     if self
-                        .sleep_before_next_attempt(run.interval, deadline)
+                        .sleep_before_next_attempt(self.interval_now(&run, entered_at), deadline)
                         .await
                         .is_break()
                     {
@@ -407,6 +455,7 @@ impl WorkflowEngine {
                             &described,
                             attempt,
                             last_outcome.as_ref(),
+                            entered_at,
                         )
                         .await;
                         return;
@@ -529,13 +578,14 @@ impl WorkflowEngine {
                     &described,
                     attempt,
                     last_outcome.as_ref(),
+                    entered_at,
                 )
                 .await;
                 return;
             }
 
             if self
-                .sleep_before_next_attempt(run.interval, deadline)
+                .sleep_before_next_attempt(self.interval_now(&run, entered_at), deadline)
                 .await
                 .is_break()
             {
@@ -546,11 +596,19 @@ impl WorkflowEngine {
                     &described,
                     attempt,
                     last_outcome.as_ref(),
+                    entered_at,
                 )
                 .await;
                 return;
             }
         }
+    }
+
+    /// The interval to sleep now: the backoff step for how long the stage
+    /// has been running. A clock set backwards gives the base interval.
+    fn interval_now(&self, run: &WatchRun, entered_at: DateTime<Utc>) -> Duration {
+        let elapsed = (self.now() - entered_at).to_std().unwrap_or(Duration::ZERO);
+        run.watch.interval_at(elapsed)
     }
 
     /// Whether the task is still sitting in the stage this runner belongs
@@ -641,6 +699,7 @@ impl WorkflowEngine {
     /// `on_timeout`). The loader guarantees a `timeout` edge exists
     /// whenever the stage sets a `timeout:`, so this reaches
     /// `finish_detached`'s park path only for a hand-built definition.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_poll_timed_out(
         self: &Arc<Self>,
         task_id: &str,
@@ -649,6 +708,7 @@ impl WorkflowEngine {
         described: &str,
         attempts: u64,
         last: Option<&shell::ShellOutcome>,
+        entered_at: DateTime<Utc>,
     ) {
         tracing::info!(
             task_id,
@@ -661,7 +721,14 @@ impl WorkflowEngine {
             "timeout elapsed before the first attempt: the deadline passed while the daemon was down"
                 .to_string()
         } else {
-            format!("no outcome matched in {attempts} attempts; timeout elapsed")
+            let mut elapsed = (self.now() - entered_at).to_std().unwrap_or(Duration::ZERO);
+            if elapsed >= Duration::from_secs(60) {
+                elapsed = Duration::from_secs(elapsed.as_secs() / 60 * 60);
+            }
+            format!(
+                "no outcome matched in {attempts} attempts over {}; timeout elapsed",
+                chocofactory_core::duration::format_duration(elapsed)
+            )
         };
         // Outranks the plain timeout wording: the workflow is about to
         // follow its `timeout` edge while the last command may still be

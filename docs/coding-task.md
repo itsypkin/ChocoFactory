@@ -164,9 +164,18 @@ before the task has read it, wins.
 
 ## Escalation limits and CI polling
 
-If no verdict arrives within six hours the task stops waiting and parks at
+`awaiting_human_review` backs off while it waits for a verdict: it checks the
+PR every minute for the first 6 hours, every 5 minutes for the next 24 hours,
+and every 30 minutes for the next 3 days. A verdict anywhere in that window
+works as an early one, at most one polling interval late. If none arrives
+within 102 hours (about four days) the task stops waiting and parks at
 `escalate_to_human`, where `choco task send <id> --text "<note>"` resumes it into
-`revising`. A fourth `/request-changes`, after three revise rounds, parks
+`revising`. A reply that is only `/approve` or `/request-changes` is refused
+there: the gate doesn't read markers, so it would be a note that starts a coder
+lap. To watch again, run `choco task retry <id>`; the schedule starts over and
+no coder lap is spent. If the PR was merged meanwhile, `retry` is also the
+way on: the watcher sees the merge and the task moves to `done`. `retry` after
+a `checks_polling` timeout re-watches CI the same way. A fourth `/request-changes`, after three revise rounds, parks
 it the same way instead of looping, and resuming from there starts the
 count over. `internal_review` parks the task there on its 4th rejection in a
 row (an approval starts its count over), and `checks_polling` does the same

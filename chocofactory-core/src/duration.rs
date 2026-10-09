@@ -29,9 +29,42 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
+/// Formats a duration as its non-zero hour, minute and second parts, in that
+/// order and unpadded: `102h`, `1h30m`, `1m30s`, `45s`; zero is `0s`. Sub-second
+/// parts are dropped. For a whole-unit value it inverts `parse_duration`.
+pub fn format_duration(d: Duration) -> String {
+    let total = d.as_secs();
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if s > 0 || out.is_empty() {
+        out.push_str(&format!("{s}s"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_non_zero_parts() {
+        for (secs, want) in [
+            (102 * 3600, "102h"),
+            (5400, "1h30m"),
+            (1800, "30m"),
+            (90, "1m30s"),
+            (45, "45s"),
+            (0, "0s"),
+        ] {
+            assert_eq!(format_duration(Duration::from_secs(secs)), want);
+        }
+    }
 
     #[test]
     fn accepts_s_m_h() {

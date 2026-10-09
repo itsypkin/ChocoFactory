@@ -754,6 +754,41 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         }
     }
 
+    /// Both built-ins carry the same review-gate backoff schedule.
+    #[test]
+    fn both_built_ins_back_the_review_gate_off_over_102_hours() {
+        use crate::workflow_def::BackoffStep;
+        use std::time::Duration;
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        for file in ["coding-task.yaml", "coding-task-planned.yaml"] {
+            let def = crate::workflow_def::WorkflowDefinition::load(&dir.path.join(file)).unwrap();
+            let watch = def.stages["awaiting_human_review"]
+                .watch()
+                .expect("awaiting_human_review has a watcher");
+            assert_eq!(watch.interval, Duration::from_secs(60), "{file}");
+            assert_eq!(
+                watch.backoff,
+                [
+                    BackoffStep {
+                        after: Duration::from_secs(6 * 3600),
+                        interval: Duration::from_secs(300)
+                    },
+                    BackoffStep {
+                        after: Duration::from_secs(30 * 3600),
+                        interval: Duration::from_secs(1800)
+                    },
+                ],
+                "{file}"
+            );
+            assert_eq!(
+                watch.timeout,
+                Some(Duration::from_secs(102 * 3600)),
+                "{file}"
+            );
+        }
+    }
+
     /// The embedded `coding-task.yaml` and its prompt files aren't just
     /// present after seeding — they have to actually resolve and validate
     /// together (#18), since `system_prompt_file`/`prompt_file` are
@@ -816,10 +851,6 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             .collect();
         assert_eq!(env, [("PR_NUMBER", "{{ stages.open_pr.number }}")]);
         assert_eq!(watch.interval, std::time::Duration::from_secs(60));
-        assert_eq!(
-            watch.timeout,
-            Some(std::time::Duration::from_secs(6 * 3600))
-        );
         let outcomes: Vec<(&str, &str)> = watch
             .outcomes
             .iter()

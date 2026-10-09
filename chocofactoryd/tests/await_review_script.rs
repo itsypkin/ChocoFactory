@@ -292,7 +292,7 @@ fn a_bot_marker_is_not_a_verdict() {
 
 /// A deleted account leaves `user: null`. Before the `// ""` guard this
 /// threw inside jq, which the poll would have seen as empty output —
-/// indistinguishable from "nobody has reviewed yet", for six hours.
+/// indistinguishable from "nobody has reviewed yet", until the review gate's timeout.
 #[test]
 fn a_null_author_does_not_error_the_filter() {
     assert_eq!(

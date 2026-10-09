@@ -22,6 +22,32 @@ pub(crate) enum ReplyMarkerError {
     Conflict { found: Vec<String> },
 }
 
+/// A reply line as markers are compared: trailing spaces, tabs and `\r`
+/// removed, leading whitespace kept.
+fn strip_reply_line(line: &str) -> String {
+    line.trim_end_matches([' ', '\t', '\r']).to_string()
+}
+
+/// The distinct lines of `text` that are non-blank, in first-seen order, when
+/// every non-blank line is one of `marker_lines`; `None` otherwise (including
+/// for a blank text).
+fn only_marker_lines(text: &str, marker_lines: &[String]) -> Option<Vec<String>> {
+    let mut found: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let stripped = strip_reply_line(line);
+        if stripped.is_empty() {
+            continue;
+        }
+        if !marker_lines.contains(&stripped) {
+            return None;
+        }
+        if !found.contains(&stripped) {
+            found.push(stripped);
+        }
+    }
+    if found.is_empty() { None } else { Some(found) }
+}
+
 /// Reads a reply's verdict from its marker lines.
 ///
 /// This is the same line rule as the `VERDICT` and `REVIEW_VERDICT` filters
@@ -43,11 +69,10 @@ pub(crate) fn reply_verdict<'a>(
     text: &str,
     markers: &'a [ReplyMarker],
 ) -> Result<ReplyVerdict<'a>, ReplyMarkerError> {
-    let strip = |line: &str| line.trim_end_matches([' ', '\t', '\r']).to_string();
     let mut found: Vec<&'a ReplyMarker> = Vec::new();
     let mut kept: Vec<&str> = Vec::new();
     for line in text.split('\n') {
-        let stripped = strip(line);
+        let stripped = strip_reply_line(line);
         match markers.iter().find(|m| m.line == stripped) {
             Some(marker) => {
                 if !found.iter().any(|f| f.line == marker.line) {
@@ -77,7 +102,7 @@ pub(crate) fn reply_verdict<'a>(
         }
     };
 
-    let is_blank = |line: &&str| strip(line).is_empty();
+    let is_blank = |line: &&str| strip_reply_line(line).is_empty();
     let start = kept.iter().position(|l| !is_blank(l)).unwrap_or(kept.len());
     let end = kept
         .iter()
@@ -118,6 +143,7 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         gate: &str,
         text: &str,
+        payload: &Value,
     ) -> Result<(), SendMessageOrResumeError> {
         let StageKind::HumanGate {
             capture, markers, ..
@@ -129,6 +155,30 @@ impl WorkflowEngine {
         };
 
         let (outcome, captured, note) = if markers.is_empty() {
+            // A reply that is only other gates' verdict markers would be
+            // taken as a note and start a paid lap (#179): refuse it before
+            // anything is recorded.
+            let mut marker_lines: Vec<String> = Vec::new();
+            for stage in definition.stages.values() {
+                if let StageKind::HumanGate { markers, .. } = &stage.kind {
+                    for marker in markers {
+                        if !marker_lines.contains(&marker.line) {
+                            marker_lines.push(marker.line.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(found) = only_marker_lines(text, &marker_lines) {
+                let resumes_to = definition.stages[gate].on.get("resumed").cloned();
+                let rewatch = timed_out_watch(definition, gate, payload).is_some();
+                return Err(SendMessageOrResumeError::ReplyIsOnlyMarkers {
+                    task_id: task_id.to_string(),
+                    stage: gate.to_string(),
+                    found,
+                    resumes_to,
+                    rewatch,
+                });
+            }
             let (captured, note) =
                 derive_capture(*capture, text, task_id, gate, "the human's message");
             ("resumed", captured, note)
