@@ -18,7 +18,11 @@ and `choco task list --status stuck` finds every stuck task.
   turn that failed on its own (`no_report`, a crash) starts fresh. Use
   `--resume` or `--fresh` to force either.
 - After a usage limit, wait for the reset time shown in the error event, then
-  retry.
+  retry. omp's limit message gives no reset time, and on a free tier the limit
+  covers every model on the account. To finish on another CLI instead, run
+  `choco task reconfigure <id> --role-cli <role>=claude` (and `--role-model`),
+  then `choco task retry <id> --fresh`, since a session can't resume on a
+  different CLI.
 - `no_report`: the turn never called `report_outcome`, was nudged, and was
   closed. There is no outcome to route on, so read its last events before
   retrying.
