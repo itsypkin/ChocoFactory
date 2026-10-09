@@ -2,7 +2,7 @@
 
 Paths in a workflow are relative to the YAML file. Edit a copy of a
 built-in rather than starting from nothing. The full rules are in
-[docs/workflows.md](/workflows.md).
+[docs/workflows.md](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md).
 
 ## Contents
 - Stage kinds and their keys
@@ -46,7 +46,7 @@ with `on: {}` is a standing chat-style session and takes no `capture` or
 
 `report_sections` is a list of headings the agent's report must contain;
 names are non-empty and distinct. See
-[routing on an agent's verdict](/workflows.md#routing-on-an-agents-verdict).
+[routing on an agent's verdict](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#routing-on-an-agents-verdict).
 
 ## Loop guards
 
@@ -72,7 +72,7 @@ a `then`).
 - Durations use `s`, `m` or `h` only, and are not zero.
 - Every `outcomes[].then` must be a key of `on:`.
 
-See [a human gate that watches for its answer](/workflows.md#a-human-gate-that-watches-for-its-answer).
+See [a human gate that watches for its answer](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#a-human-gate-that-watches-for-its-answer).
 
 ## Human gate markers
 
@@ -118,14 +118,14 @@ A role has `cli`, `model` and `system_prompt_file`. Other fields:
 
 - `read_only: true` with `disallowed_tools: [edit, write, notebook_edit]`
   (those three names only; `read_only` needs all three and a workflow-level
-  `worktree: true`). See [read-only roles](/workflows.md#read-only-roles).
+  `worktree: true`). See [read-only roles](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#read-only-roles).
 - `inherit_operator_config`, `skills` and `memory` control what the agent
   inherits from your Claude setup. `skills` and `memory` can't go with
   `inherit_operator_config`. See
-  [what an agent inherits](/workflows.md#what-an-agent-inherits-from-your-claude-setup).
+  [what an agent inherits](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#what-an-agent-inherits-from-your-claude-setup).
 
-More: [how a role is configured](/models.md#how-a-role-is-configured),
-[running a role on omp](/models.md#cli-omp).
+More: [how a role is configured](https://github.com/itsypkin/ChocoFactory/blob/main/docs/models.md#how-a-role-is-configured),
+[running a role on omp](https://github.com/itsypkin/ChocoFactory/blob/main/docs/models.md#cli-omp).
 
 ## Adding a check: an example
 
