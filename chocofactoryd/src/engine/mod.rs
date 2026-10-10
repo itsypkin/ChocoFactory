@@ -1243,6 +1243,17 @@ impl From<sqlx::Error> for InitWorkflowsError {
     }
 }
 
+/// What [`WorkflowEngine::mark_stuck`] did to the task's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StuckMark {
+    /// The task was `open` and is now `stuck`.
+    Marked,
+    /// The task was no longer `open`; nothing changed.
+    NotMarked,
+    /// The write failed (logged); the task is as it was.
+    WriteFailed,
+}
+
 impl WorkflowEngine {
     pub fn new(
         pool: SqlitePool,
@@ -2180,12 +2191,19 @@ impl WorkflowEngine {
     /// `stuck: true` would double the same failure up on the timeline. The
     /// status write below still happens either way — only the event is
     /// skipped.
-    async fn mark_stuck(&self, task_id: &str, reason: &str, event_already_recorded: bool) {
+    ///
+    /// Returns what happened to the status: see [`StuckMark`].
+    async fn mark_stuck(
+        &self,
+        task_id: &str,
+        reason: &str,
+        event_already_recorded: bool,
+    ) -> StuckMark {
         match tasks::mark_stuck(&self.pool, task_id, reason).await {
             Ok(true) => {
                 tracing::error!(task_id, reason, "task stuck: {reason}");
                 if event_already_recorded {
-                    return;
+                    return StuckMark::Marked;
                 }
                 let stage = match workflow_state::get(&self.pool, task_id).await {
                     Ok(Some(state)) => json!(state.current_stage),
@@ -2212,19 +2230,26 @@ impl WorkflowEngine {
                         "failed to record a stuck-task event"
                     ),
                 }
+                StuckMark::Marked
             }
             // The task was no longer `open` — already cancelled, closed, or
             // already stuck — so there is nothing to mark. Not an error:
             // this is the compare-and-set doing exactly its job.
-            Ok(false) => tracing::info!(
-                task_id,
-                reason,
-                "task not marked stuck: it was no longer open"
-            ),
-            Err(err) => tracing::error!(
-                task_id, reason, %err,
-                "failed to mark task stuck"
-            ),
+            Ok(false) => {
+                tracing::info!(
+                    task_id,
+                    reason,
+                    "task not marked stuck: it was no longer open"
+                );
+                StuckMark::NotMarked
+            }
+            Err(err) => {
+                tracing::error!(
+                    task_id, reason, %err,
+                    "failed to mark task stuck"
+                );
+                StuckMark::WriteFailed
+            }
         }
     }
 
