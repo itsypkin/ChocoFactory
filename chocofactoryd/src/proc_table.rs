@@ -333,7 +333,7 @@ mod platform {
             let count = unsafe {
                 libc::proc_listallpids(
                     buf.as_mut_ptr().cast(),
-                    (buf.len() * std::mem::size_of::<i32>()) as libc::c_int,
+                    std::mem::size_of_val(buf) as libc::c_int,
                 )
             };
             if count <= 0 {
@@ -735,7 +735,7 @@ mod tests {
             daemon_sid: -5,
             uid: entry.uid,
         };
-        assert!(owned_pids(&[entry.clone()], &input).contains(&pid));
+        assert!(owned_pids(std::slice::from_ref(&entry), &input).contains(&pid));
     }
 
     #[test]
