@@ -14,6 +14,9 @@ pub enum RestartEffect {
     StrandsAgentTurn,
     /// A shell command: its process dies with the daemon.
     StrandsShell,
+    /// A parallel group: what a restart strands is decided per running
+    /// branch from the payload.
+    PerBranch,
 }
 
 /// Exhaustive on purpose: a new stage kind must be classified here to
@@ -27,8 +30,7 @@ pub fn restart_effect(def: &StageDef) -> RestartEffect {
         StageKind::Poll { .. } | StageKind::HumanGate { .. } | StageKind::Terminal => {
             RestartEffect::Survives
         }
-        // Groups can't be entered yet, so no task rests at one running.
-        StageKind::Parallel { .. } => RestartEffect::Survives,
+        StageKind::Parallel { .. } => RestartEffect::PerBranch,
     }
 }
 
@@ -67,6 +69,12 @@ pub struct ParkReport {
     /// already no longer open, or whose stuck write failed (logged by
     /// `mark_stuck`), is not counted.
     pub stuck_other: usize,
+    /// Tasks at a parallel group parked as stuck.
+    ///
+    /// Counts only tasks whose status actually changed to `stuck`; a task
+    /// already no longer open, or whose stuck write failed (logged by
+    /// `mark_stuck`), is not counted.
+    pub groups: usize,
 }
 
 /// What [`WorkflowEngine::resume_interrupted_polls`] did, per task.
@@ -193,6 +201,17 @@ impl WorkflowEngine {
         };
         match restart_effect(stage_def) {
             RestartEffect::Survives => {}
+            RestartEffect::PerBranch => {
+                let StageKind::Parallel { branches } = &stage_def.kind else {
+                    return;
+                };
+                if self
+                    .park_group_locked(&task, &definition, &stage, branches, &state)
+                    .await
+                {
+                    report.groups += 1;
+                }
+            }
             RestartEffect::StrandsShell => {
                 if self.mark_stuck(task_id, &shell_reason(&stage), false).await == StuckMark::Marked
                 {
@@ -258,9 +277,19 @@ impl WorkflowEngine {
             let kind = match self.load_task_workflow(&task).await {
                 Ok(definition) => match definition.stages.get(&stage).map(restart_effect) {
                     Some(RestartEffect::Survives) => continue,
-                    Some(RestartEffect::StrandsAgentTurn) => "agent_turn",
-                    Some(RestartEffect::StrandsShell) => "shell",
-                    None => "unknown",
+                    Some(RestartEffect::PerBranch) => {
+                        match super::parallel::running_branch_kinds(
+                            &state.payload,
+                            &definition,
+                            &stage,
+                        ) {
+                            Some(kind) => kind,
+                            None => continue,
+                        }
+                    }
+                    Some(RestartEffect::StrandsAgentTurn) => "agent_turn".to_string(),
+                    Some(RestartEffect::StrandsShell) => "shell".to_string(),
+                    None => "unknown".to_string(),
                 },
                 Err(err) => {
                     tracing::warn!(
@@ -268,14 +297,14 @@ impl WorkflowEngine {
                         error = %err,
                         "could not load the task's workflow; listing it as unknown in-flight"
                     );
-                    "unknown"
+                    "unknown".to_string()
                 }
             };
             out.push(InFlight {
                 task_id: task.id,
                 title: task.title,
                 stage,
-                kind: kind.to_string(),
+                kind,
             });
         }
         Ok(out)

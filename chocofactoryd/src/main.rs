@@ -254,6 +254,7 @@ async fn main() {
         agent_turns = park.agent_turns,
         shells = park.shells,
         stuck_other = park.stuck_other,
+        groups = park.groups,
         "parked interrupted agent and shell stages"
     );
 

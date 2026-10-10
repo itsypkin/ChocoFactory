@@ -235,7 +235,8 @@ pub struct InFlight {
     pub task_id: String,
     pub title: String,
     pub stage: String,
-    /// `"agent_turn"`, `"shell"`, or `"unknown"` when the task's workflow
+    /// `"agent_turn"`, `"shell"`, the comma-separated kinds of a parallel
+    /// group's running branches, or `"unknown"` when the task's workflow
     /// could not be loaded or no longer has the stage.
     pub kind: String,
 }
