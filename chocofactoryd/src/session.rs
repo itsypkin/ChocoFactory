@@ -1061,7 +1061,7 @@ async fn drain_session(
                         ),
                         Some(GroupKill::Unknown { .. }) => format!(
                             "{grace_s:.1}s after {after}, could not check whether the agent \
-                             process was still running; killed its process group"
+                             process was still running; sent the kill to its process group"
                         ),
                         _ => format!(
                             "the agent process had exited {grace_s:.1}s after {after}, but \
@@ -1791,6 +1791,8 @@ impl LeftoverTracker {
                 match proc_table::kill_pid(pid) {
                     proc_table::PidKill::Killed => {
                         let mut state = self.state();
+                        // Killed now: no longer a survivor of an earlier site.
+                        state.survivors.retain(|(p, _)| *p != pid);
                         if !state.killed.iter().any(|(p, _)| *p == pid) {
                             state.killed.push((pid, comm(pid)));
                             killed_here += 1;
@@ -5495,6 +5497,7 @@ mod tests {
         // SAFETY: only reads ids and probes pids with signal 0.
         let uid = unsafe { libc::geteuid() };
         if uid == 0 {
+            eprintln!("skipped: running as root, every pid is signalable");
             return;
         }
         // A pid we may not signal: some other user's process.
@@ -5503,7 +5506,10 @@ mod tests {
             let rc = unsafe { libc::kill(pid, 0) };
             rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
         });
-        let Some(foreign) = foreign else { return };
+        let Some(foreign) = foreign else {
+            eprintln!("skipped: no foreign pid found");
+            return;
+        };
         let dir = TempDir::new();
         let binary = script_binary(
             &dir.0,
@@ -5540,6 +5546,58 @@ mod tests {
             .expect("a leftovers_killed note");
         assert!(message.starts_with("1 could not be killed"), "{message}");
         assert_eq!(message.matches("(foreign)").count(), 1, "{message}");
+    }
+
+    /// A live agent group the daemon may not signal (EPERM) is listed as a
+    /// survivor by `kill_and_sweep`'s group-failure path.
+    #[tokio::test]
+    async fn a_group_that_cannot_be_killed_is_listed_as_a_survivor() {
+        // SAFETY: only reads the uid and probes pids with signal 0.
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            eprintln!("skipped: running as root, every pid is signalable");
+            return;
+        }
+        let foreign = (2..5000).find(|&pid| {
+            // SAFETY: signal 0 only checks permission.
+            let rc = unsafe { libc::kill(pid, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        });
+        let Some(foreign) = foreign else {
+            eprintln!("skipped: no foreign pid found");
+            return;
+        };
+        let reader: crate::proc_table::ProcReader = Arc::new(move |_| {
+            Ok(vec![crate::proc_table::ProcEntry {
+                pid: foreign,
+                ppid: 1,
+                pgid: foreign,
+                sid: foreign,
+                uid,
+                start: 1,
+                zombie: false,
+                comm: "foreign".into(),
+                marker: crate::proc_table::MarkerStatus::Absent,
+            }])
+        });
+        let tracker = LeftoverTracker::new(
+            "CHOCOFACTORY_TURN_x".into(),
+            SessionKind::SingleShot,
+            reader,
+        );
+        let report = kill_and_sweep(&tracker, foreign as u32, "test").await;
+        assert!(
+            matches!(report.group, GroupKill::Failed(_)),
+            "{:?}",
+            describe_group_kill(&report.group)
+        );
+        let state = tracker.state();
+        let listed = state
+            .survivors
+            .iter()
+            .filter(|(p, _)| *p == foreign)
+            .count();
+        assert_eq!(listed, 1, "{:?}", state.survivors);
     }
 
     /// Short waits that each end well inside the limit still add up to it.
