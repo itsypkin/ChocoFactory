@@ -33,6 +33,7 @@ impl From<WorkflowStateRow> for WorkflowState {
             payload: row.payload.0,
             updated_at: row.updated_at,
             stage_entered_at: row.stage_entered_at,
+            branches: Vec::new(),
         }
     }
 }

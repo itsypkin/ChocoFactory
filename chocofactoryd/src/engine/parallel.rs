@@ -12,6 +12,7 @@
 use super::*;
 use crate::db::events::BranchEnd;
 use crate::workflow_def::Branch;
+use chocofactory_core::models::BranchStatus;
 
 /// What `enter_agent_turn` needs to know when the stage it starts is a
 /// parallel group's branch rather than a top-level stage.
@@ -109,6 +110,88 @@ pub(super) fn set_parallel_block(
         "parallel".to_string(),
         json!({ "stage": stage, "entry": entry, "branches": branch_states }),
     );
+}
+
+/// The current-group rule, shared by the API's detail and (in SQL) its list:
+/// the stage is a `parallel` kind, `payload.parallel` names `current_stage`,
+/// and its `branches` is a JSON object. Returns that object.
+pub(crate) fn current_group_branches<'a>(
+    payload: &'a Value,
+    current_stage: &str,
+    stage_kind: Option<&str>,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    if stage_kind != Some("parallel") {
+        return None;
+    }
+    let block = payload.get("parallel")?.as_object()?;
+    if block.get("stage")?.as_str()? != current_stage {
+        return None;
+    }
+    block.get("branches")?.as_object()
+}
+
+/// The branches of the current group, for `GET /tasks/{id}`. Read-only.
+///
+/// Definition branches come first in declaration order (only those present
+/// in the payload), then names the definition doesn't know, sorted by name.
+/// With no definition every name is sorted and `kind` is `None`. Empty when
+/// no group is current or the group has no branches.
+pub(crate) fn branch_statuses_from(
+    payload: &Value,
+    current_stage: &str,
+    stage_kind: Option<&str>,
+    definition: Option<&WorkflowDefinition>,
+) -> Vec<BranchStatus> {
+    let Some(slots) = current_group_branches(payload, current_stage, stage_kind) else {
+        return Vec::new();
+    };
+    let entry = payload
+        .get("parallel")
+        .and_then(|block| block.get("entry"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let declared = match definition
+        .and_then(|d| d.stages.get(current_stage))
+        .map(|d| &d.kind)
+    {
+        Some(StageKind::Parallel { branches }) => Some(branches),
+        _ => None,
+    };
+    let mut names: Vec<&String> = Vec::with_capacity(slots.len());
+    if let Some(declared) = declared {
+        names.extend(declared.keys().filter(|name| slots.contains_key(*name)));
+    }
+    let mut unknown: Vec<&String> = slots
+        .keys()
+        .filter(|name| declared.is_none_or(|d| !d.contains_key(*name)))
+        .collect();
+    unknown.sort();
+    names.extend(unknown);
+    let text = |slot: &Value, key: &str| slot.get(key).and_then(Value::as_str).map(str::to_string);
+    let time = |slot: &Value, key: &str| {
+        slot.get(key)
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+    };
+    names
+        .into_iter()
+        .map(|name| {
+            let slot = &slots[name];
+            BranchStatus {
+                name: name.clone(),
+                kind: declared
+                    .and_then(|d| d.get(name))
+                    .map(|b| b.def.kind.name().to_string()),
+                state: text(slot, "state").unwrap_or_else(|| "unknown".to_string()),
+                result: text(slot, "result"),
+                reason: text(slot, "reason"),
+                entry,
+                started_at: time(slot, "started_at"),
+                ended_at: time(slot, "ended_at"),
+            }
+        })
+        .collect()
 }
 
 /// The `parallel` block when it belongs to `group`.
@@ -694,5 +777,98 @@ impl WorkflowEngine {
             .get(&next_stage)
             .is_some_and(|d| matches!(d.kind, StageKind::Terminal));
         Ok((BranchApplied::Recorded { done }, terminal))
+    }
+}
+
+#[cfg(test)]
+mod branch_statuses_tests {
+    use super::*;
+
+    const YAML: &str = "name: g\nworktree: true\nroles:\n  r:\n    cli: claude\n    model: opus\n    \
+        read_only: true\n    disallowed_tools: [edit, write, notebook_edit]\nstages:\n  panel:\n    \
+        kind: parallel\n    branches:\n      two: { kind: agent_turn, role: r }\n      \
+        one: { kind: agent_turn, role: r }\n      absent: { kind: agent_turn, role: r }\n    \
+        on: { done: finished }\n  finished:\n    kind: terminal\n";
+
+    fn definition() -> WorkflowDefinition {
+        WorkflowDefinition::parse(YAML, &std::env::temp_dir()).unwrap()
+    }
+
+    fn payload(stage: &str, branches: Value) -> Value {
+        json!({"parallel": {"stage": stage, "entry": 3, "branches": branches}})
+    }
+
+    fn slots() -> Value {
+        json!({
+            "zzz": {"state": "running"},
+            "one": {"state": "done", "result": "clean", "started_at": "2026-10-09T12:00:00Z",
+                    "ended_at": "2026-10-09T12:01:00Z"},
+            "two": {"state": "failed", "reason": "boom"},
+            "aaa": {"state": "running"},
+        })
+    }
+
+    fn names(statuses: &[BranchStatus]) -> Vec<&str> {
+        statuses.iter().map(|b| b.name.as_str()).collect()
+    }
+
+    #[test]
+    fn declared_branches_come_first_then_unknown_names_sorted() {
+        let def = definition();
+        let got = branch_statuses_from(
+            &payload("panel", slots()),
+            "panel",
+            Some("parallel"),
+            Some(&def),
+        );
+        // `absent` is declared but not in the payload: not invented.
+        assert_eq!(names(&got), ["two", "one", "aaa", "zzz"]);
+        assert_eq!(got[0].kind.as_deref(), Some("agent_turn"));
+        assert_eq!(got[0].reason.as_deref(), Some("boom"));
+        assert_eq!(got[1].result.as_deref(), Some("clean"));
+        assert!(got[1].started_at.is_some() && got[1].ended_at.is_some());
+        assert_eq!(got[2].kind, None);
+        assert!(got.iter().all(|b| b.entry == 3));
+    }
+
+    #[test]
+    fn without_a_definition_every_name_is_sorted_and_has_no_kind() {
+        let got = branch_statuses_from(&payload("panel", slots()), "panel", Some("parallel"), None);
+        assert_eq!(names(&got), ["aaa", "one", "two", "zzz"]);
+        assert!(got.iter().all(|b| b.kind.is_none()));
+    }
+
+    #[test]
+    fn a_missing_entry_reads_as_zero_and_odd_slots_as_unknown() {
+        let mut p = payload("panel", json!({"a": 7, "b": {"state": 5}}));
+        p["parallel"].as_object_mut().unwrap().remove("entry");
+        let got = branch_statuses_from(&p, "panel", Some("parallel"), None);
+        assert!(got.iter().all(|b| b.state == "unknown" && b.entry == 0));
+    }
+
+    #[test]
+    fn only_the_current_group_has_branches() {
+        let def = definition();
+        let ok = payload("panel", slots());
+        let empty = |p: &Value, stage: &str, kind: Option<&str>| {
+            branch_statuses_from(p, stage, kind, Some(&def)).is_empty()
+        };
+        assert!(!empty(&ok, "panel", Some("parallel")));
+        assert!(empty(&ok, "panel", None));
+        assert!(empty(&ok, "panel", Some("agent_turn")));
+        assert!(empty(&ok, "finished", Some("parallel")));
+        assert!(empty(&payload("other", slots()), "panel", Some("parallel")));
+        assert!(empty(
+            &payload("panel", json!([1])),
+            "panel",
+            Some("parallel")
+        ));
+        assert!(empty(
+            &payload("panel", json!({})),
+            "panel",
+            Some("parallel")
+        ));
+        assert!(empty(&json!({}), "panel", Some("parallel")));
+        assert!(empty(&json!({"parallel": "x"}), "panel", Some("parallel")));
     }
 }

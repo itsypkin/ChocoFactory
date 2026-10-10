@@ -281,7 +281,10 @@ pub async fn get(
     let task = tasks::get(&state.pool, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no such task '{id}'")))?;
-    let workflow_state = workflow_state::get(&state.pool, &id).await?;
+    let mut workflow_state = workflow_state::get(&state.pool, &id).await?;
+    if let Some(ws) = workflow_state.as_mut() {
+        ws.branches = state.engine.branch_statuses(&task, ws).await;
+    }
     let stage_trail = events::list_stage_trail(&state.pool, &id).await?;
     let workflow_file_status = workflow_file_status(&state.engine, &task);
     let kept = kept_work(&task);
@@ -2057,6 +2060,294 @@ stages:
 
         let detail: Value = server.get(&format!("/tasks/{task_id}")).await.json();
         assert!(detail["workflow_file_status"].is_null());
+    }
+
+    // ---- parallel groups (#257, PG1-7) ----
+
+    const PANEL_YAML: &str = "name: panel-flow\nworktree: true\nroles:\n  reviewer:\n    cli: claude\n    model: opus\n    \
+        read_only: true\n    disallowed_tools: [edit, write, notebook_edit]\nstages:\n  hold:\n    kind: human_gate\n    on: { resumed: panel }\n  panel:\n    \
+        kind: parallel\n    branches:\n      two: { kind: agent_turn, role: reviewer }\n      \
+        one: { kind: agent_turn, role: reviewer }\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
+
+    async fn panel_task(server: &TestServer, project_id: &str) -> String {
+        let repo = server.temp_dir().join("repo");
+        if !repo.exists() {
+            repo_in(server);
+        }
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "panel-flow",
+                    "title": "panel",
+                    "prompt": "hello",
+                    "config": { "cwd": repo.to_string_lossy() },
+                }),
+            )
+            .await
+            .json();
+        task["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{task}"))
+            .to_string()
+    }
+
+    async fn set_state(
+        server: &TestServer,
+        task_id: &str,
+        stage: &str,
+        kind: Option<&str>,
+        payload: Value,
+    ) {
+        sqlx::query(
+            "UPDATE workflow_state SET current_stage = ?, stage_kind = ?, payload = ? WHERE task_id = ?",
+        )
+        .bind(stage)
+        .bind(kind)
+        .bind(payload.to_string())
+        .bind(task_id)
+        .execute(server.pool())
+        .await
+        .unwrap();
+    }
+
+    fn group_payload(stage: &str, branches: Value) -> Value {
+        json!({"parallel": {"stage": stage, "entry": 2, "branches": branches}})
+    }
+
+    fn mixed_branches() -> Value {
+        json!({
+            "zzz_extra": {"state": "failed", "reason": "boom", "resumable": true,
+                          "started_at": "garbage", "ended_at": "2026-10-09T12:03:00Z"},
+            "one": {"state": "done", "result": "clean",
+                    "started_at": "2026-10-09T12:00:00Z", "ended_at": "2026-10-09T12:02:00Z"},
+            "two": {"state": "running", "started_at": "2026-10-09T12:00:00Z"},
+            "bare": "just a string",
+        })
+    }
+
+    async fn detail_branches(server: &TestServer, id: &str) -> Value {
+        let response = server.get(&format!("/tasks/{id}")).await;
+        assert_eq!(response.status(), 200);
+        let detail: Value = response.json();
+        detail["workflow_state"]["branches"].clone()
+    }
+
+    #[tokio::test]
+    async fn get_task_lists_a_groups_branches_in_declaration_order() {
+        let server = TestServer::start().await;
+        server.write_workflow("panel-flow", PANEL_YAML);
+        let project_id = create_project(&server).await;
+        let id = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &id,
+            "panel",
+            Some("parallel"),
+            group_payload("panel", mixed_branches()),
+        )
+        .await;
+
+        let branches = detail_branches(&server, &id).await;
+        let names: Vec<&str> = branches
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["two", "one", "bare", "zzz_extra"]);
+        assert_eq!(
+            branches[0],
+            json!({"name": "two", "kind": "agent_turn", "state": "running", "result": null,
+                   "reason": null, "entry": 2, "started_at": "2026-10-09T12:00:00Z",
+                   "ended_at": null})
+        );
+        assert_eq!(
+            branches[1],
+            json!({"name": "one", "kind": "agent_turn", "state": "done", "result": "clean",
+                   "reason": null, "entry": 2, "started_at": "2026-10-09T12:00:00Z",
+                   "ended_at": "2026-10-09T12:02:00Z"})
+        );
+        // A non-object slot reads as unknown.
+        assert_eq!(branches[2]["state"], "unknown");
+        assert_eq!(branches[2]["kind"], Value::Null);
+        // An undeclared name has no kind; an unparsable stamp is null.
+        assert_eq!(
+            branches[3],
+            json!({"name": "zzz_extra", "kind": null, "state": "failed", "result": null,
+                   "reason": "boom", "entry": 2, "started_at": null,
+                   "ended_at": "2026-10-09T12:03:00Z"})
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_has_no_branches_outside_a_current_group() {
+        let server = TestServer::start().await;
+        server.write_workflow("panel-flow", PANEL_YAML);
+        let project_id = create_project(&server).await;
+        let one = json!({"two": {"state": "running"}});
+
+        let no_block = panel_task(&server, &project_id).await;
+        assert_eq!(detail_branches(&server, &no_block).await, json!([]));
+
+        let stale = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &stale,
+            "panel",
+            Some("parallel"),
+            group_payload("other", one.clone()),
+        )
+        .await;
+        assert_eq!(detail_branches(&server, &stale).await, json!([]));
+
+        let not_parallel = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &not_parallel,
+            "panel",
+            Some("agent_turn"),
+            group_payload("panel", one.clone()),
+        )
+        .await;
+        assert_eq!(detail_branches(&server, &not_parallel).await, json!([]));
+
+        let null_kind = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &null_kind,
+            "panel",
+            None,
+            group_payload("panel", one.clone()),
+        )
+        .await;
+        assert_eq!(detail_branches(&server, &null_kind).await, json!([]));
+
+        let not_object = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &not_object,
+            "panel",
+            Some("parallel"),
+            group_payload("panel", json!([1])),
+        )
+        .await;
+        assert_eq!(detail_branches(&server, &not_object).await, json!([]));
+
+        let empty = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &empty,
+            "panel",
+            Some("parallel"),
+            group_payload("panel", json!({})),
+        )
+        .await;
+        assert_eq!(detail_branches(&server, &empty).await, json!([]));
+    }
+
+    #[tokio::test]
+    async fn get_task_still_answers_when_the_workflow_cannot_be_loaded() {
+        let server = TestServer::start().await;
+        server.write_workflow("panel-flow", PANEL_YAML);
+        let project_id = create_project(&server).await;
+        let id = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &id,
+            "panel",
+            Some("parallel"),
+            group_payload("panel", mixed_branches()),
+        )
+        .await;
+        std::fs::remove_file(server.builtin_workflow_path("panel-flow")).unwrap();
+
+        let branches = detail_branches(&server, &id).await;
+        let names: Vec<&str> = branches
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["bare", "one", "two", "zzz_extra"]);
+        assert!(
+            branches
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b["kind"].is_null())
+        );
+    }
+
+    #[tokio::test]
+    async fn list_reports_branch_progress_in_agreement_with_the_detail() {
+        let server = TestServer::start().await;
+        server.write_workflow("panel-flow", PANEL_YAML);
+        let project_id = create_project(&server).await;
+        let in_group = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &in_group,
+            "panel",
+            Some("parallel"),
+            group_payload("panel", mixed_branches()),
+        )
+        .await;
+        let no_block = panel_task(&server, &project_id).await;
+        let stale = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &stale,
+            "panel",
+            Some("parallel"),
+            group_payload("other", mixed_branches()),
+        )
+        .await;
+        let empty = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &empty,
+            "panel",
+            Some("parallel"),
+            group_payload("panel", json!({})),
+        )
+        .await;
+        let not_parallel = panel_task(&server, &project_id).await;
+        set_state(
+            &server,
+            &not_parallel,
+            "panel",
+            Some("agent_turn"),
+            group_payload("panel", mixed_branches()),
+        )
+        .await;
+
+        let listed: Value = server.get("/tasks").await.json();
+        let progress = |id: &str| {
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()["branch_progress"]
+                .clone()
+        };
+        // Four slots: running, done, failed and a non-object that counts as
+        // settled, like the detail's `unknown`.
+        assert_eq!(progress(&in_group), json!({"settled": 3, "total": 4}));
+        let detail_branches = detail_branches(&server, &in_group).await;
+        let settled = detail_branches
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b["state"] != "running")
+            .count();
+        assert_eq!(detail_branches.as_array().unwrap().len(), 4);
+        assert_eq!(settled, 3);
+        for id in [&no_block, &stale, &empty, &not_parallel] {
+            assert_eq!(progress(id), Value::Null, "{id}");
+        }
     }
 
     // ---- #175: waiting_on_human and verdict markers ----

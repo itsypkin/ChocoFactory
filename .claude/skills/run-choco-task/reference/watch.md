@@ -5,6 +5,7 @@
 - Reading a stage's verdict text
 - Watching commits in a revise lap
 - Stage times
+- Reading a parallel group
 - The workflow-file line
 
 ## Waiting with `--until`
@@ -100,6 +101,38 @@ choosing `--timeout`:
 | `open_pr` | seconds |
 | `checks_polling` | your CI's time plus a minute |
 | create → `awaiting_human_review` | 20–100 min |
+
+## Reading a parallel group
+
+While a task is in a parallel group, `choco task status <id>` prints a
+`Branches` table between the fields and `Progress`. The `Progress` table
+still has one row for the whole group.
+
+```
+Branches
+  branch               kind        state    result or reason                                              time  cost
+  security_review      agent_turn  running                                                                5m    ≈ $0.42
+  architecture_review  agent_turn  done     blocking                                                      2m    cost unknown
+  tests                ?           failed   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbb…  3m    no data
+```
+
+- `state` is `running`, `done` or `failed`, as stored.
+- `result or reason` is the result of a `done` branch and the reason of a
+  `failed` one, cut to 60 characters; the full text is in the JSON.
+- `time` is `ended − started` for a finished branch. For a `running` branch
+  it is the time since it started while the task is `open`; for a task that
+  is cancelled or stuck it is `-`, as it is when a time is missing.
+- `cost` is `≈ $…` for the branch's turn in the group's current entry,
+  `cost unknown` when the turn recorded usage without a cost, and `no data`
+  when no turn recorded usage for it.
+- A `?` in `kind` means the workflow file no longer declares the branch (or
+  could not be loaded).
+
+`choco --json task status <id> | jq '.workflow_state.branches'` lists the same
+rows with `name`, `kind`, `state`, `result`, `reason`, `entry`, `started_at`
+and `ended_at`; it is `[]` when no group is current. In the dashboard the
+stage cell reads `<group> settled/total` (a branch is settled once it is not
+`running`), and `choco task events` has one line per branch start and finish.
 
 ## The workflow-file line
 

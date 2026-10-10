@@ -577,6 +577,42 @@ pub struct WorkflowState {
     /// When `current_stage` was last entered. `None` only for a row that
     /// predates the column and has no matching `stage_entered` event.
     pub stage_entered_at: Option<DateTime<Utc>>,
+    /// The branches of the current parallel group, derived by the API.
+    /// Always empty on a row read from the database; an empty array also
+    /// means no group is current.
+    #[serde(default)]
+    pub branches: Vec<BranchStatus>,
+}
+
+/// One branch of the current parallel group, as `GET /tasks/{id}` reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchStatus {
+    pub name: String,
+    /// The branch's kind as workflow YAML spells it; `None` when the
+    /// workflow does not declare the branch (or could not be loaded).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// `running`, `done`, `failed`, or `unknown`; kept a string so a state a
+    /// later version adds still decodes.
+    pub state: String,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The group's current entry number (0 when unrecorded).
+    #[serde(default)]
+    pub entry: i64,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ended_at: Option<DateTime<Utc>>,
+}
+
+/// How far the current parallel group has got, for the task list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BranchProgress {
+    pub settled: u32,
+    pub total: u32,
 }
 
 /// One row of `GET /tasks`: the task plus the few workflow facts a
@@ -597,6 +633,10 @@ pub struct TaskSummary {
     /// usage (every task from before usage was recorded).
     #[serde(default)]
     pub usage_total: Option<UsageTotal>,
+    /// Settled and total branches of the current parallel group; `None`
+    /// when no group is current.
+    #[serde(default)]
+    pub branch_progress: Option<BranchProgress>,
 }
 
 /// A task's cost and token total as `GET /tasks` reports it.

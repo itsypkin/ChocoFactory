@@ -184,6 +184,25 @@ Progress
   → coding (current, no transitions yet)
 ```
 
+**Parallel groups.** A task whose current stage is a parallel group shows a
+`Branches` table between the fields and `Progress`, one row per branch:
+`branch`, `kind`, `state`, `result or reason` (the result of a `done` branch,
+the reason of a `failed` one, cut to 60 characters), `time` and `cost`. `time`
+is how long a branch ran, or has run so far while the task is open; `-` means
+the branch is not running (the task is not open) or a time is missing. `cost`
+is the branch's turn cost for the group's current entry; `no data` means no
+turn recorded usage for it. `choco --json task status <id>` carries the full
+text under `workflow_state.branches`. The table is gone once the task leaves
+the group.
+
+```
+Branches
+  branch               kind        state    result or reason                                              time  cost
+  security_review      agent_turn  running                                                                5m    ≈ $0.42
+  architecture_review  agent_turn  done     blocking                                                      2m    cost unknown
+  tests                ?           failed   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbb…  3m    no data
+```
+
 **Cost and time.** After the progress list, `choco task status` prints what
 the task has used, recorded from every agent turn's own report:
 
@@ -503,7 +522,8 @@ scrollable list in four sections:
 
 **Two modes.** Without `--project` every row has a `project` column (the
 project's name) and the header says `all projects`. With `--project` the column
-is gone and the header names the project. Narrow terminals drop columns: below
+is gone and the header names the project. In a parallel group the stage column reads `<group> settled/total`, for
+example `review_panel 2/3`. Narrow terminals drop columns: below
 91 columns the `cost` column (the task's total, `≈$1.23`, or `no data`), below
 80 the laps and PR columns, below 60 the stage and project columns too.
 Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off.
@@ -513,7 +533,7 @@ Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off
 | `↑` `k` / `↓` `j` | move, across section boundaries |
 | `PgUp` `PgDn`, `g` `G` | page; top / bottom |
 | `Tab` / `Shift-Tab` | next / previous non-empty section |
-| `⏎` | open the task's status view: the fields and progress `choco task status` shows, the loop counters, what the task is waiting for, its PR, a `Cost` row (`≈ $0.09 (API-equivalent) · wall 2h05m · active 1h10m`, or `no data`) and the last 5 events, following new ones (`Esc` returns) |
+| `⏎` | open the task's status view: the fields and progress `choco task status` shows (for a parallel group, its branch table too), the loop counters, what the task is waiting for, its PR, a `Cost` row (`≈ $0.09 (API-equivalent) · wall 2h05m · active 1h10m`, or `no data`) and the last 5 events, following new ones (`Esc` returns) |
 | `e` | in the detail: the full event stream (the last 200 events, following new ones; `PgUp`/`PgDn` scroll back, `End` follows again); `e` or `Esc` returns to the status view |
 | `o` | open the task's pull request |
 | `r` | retry a `stuck` task |

@@ -68,6 +68,7 @@ fn summary(
         pr: None,
         waiting_on_human: false,
         usage_total: None,
+        branch_progress: None,
     }
 }
 
@@ -3090,6 +3091,11 @@ fn the_expanded_view_says_esc_goes_back_to_the_status_view() {
 /// What every size must show: the progress separator, the current row, and
 /// nothing wider than the terminal; times in full from 60 columns up.
 fn assert_detail_invariants(app: &App, w: u16, h: u16, stale: bool) {
+    assert_detail_invariants_for(app, w, h, stale, 34);
+}
+
+/// [`assert_detail_invariants`] for a trail of `last` steps.
+fn assert_detail_invariants_for(app: &App, w: u16, h: u16, stale: bool, last_step: usize) {
     let s = render(app, w, h);
     let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
     let at = format!("{w}x{h}\n{s}");
@@ -3097,7 +3103,8 @@ fn assert_detail_invariants(app: &App, w: u16, h: u16, stale: bool) {
     let rows = step_rows(&s);
     let last = rows.last().unwrap_or_else(|| panic!("no step rows {at}"));
     let first = last.split_whitespace().next().unwrap();
-    assert_eq!(first, if stale { "→" } else { "34" }, "{at}");
+    let want = last_step.to_string();
+    assert_eq!(first, if stale { "→" } else { &want }, "{at}");
     if w >= 60 {
         // Narrower than that a dated row can outgrow the screen, and the
         // right edge (the marker) is cut.
@@ -3269,4 +3276,157 @@ fn a_stuck_row_with_an_empty_reason_still_renders() {
     open_detail(&mut app, id);
     let s = render(&app, 80, 24);
     assert!(s.lines().any(|l| l.starts_with("Stuck")), "{s}");
+}
+
+// ---- parallel groups (#257, PG1-7) ---------------------------------------
+
+fn progress_of(settled: u32, total: u32) -> Option<chocofactory_core::models::BranchProgress> {
+    Some(chocofactory_core::models::BranchProgress { settled, total })
+}
+
+#[test]
+fn the_stage_cell_reads_settled_over_total_in_a_group() {
+    let mut app = board();
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == BUSY)
+        .unwrap()
+        .branch_progress = progress_of(2, 3);
+    for w in [80u16, 100, 140] {
+        let s = render(&app, w, 24);
+        assert!(s.contains("internal_review 2/3"), "{w}\n{s}");
+    }
+}
+
+#[test]
+fn the_stage_cell_is_the_plain_stage_without_branch_progress() {
+    let app = board();
+    let s = render(&app, 100, 24);
+    assert!(s.contains("internal_review"), "{s}");
+    assert!(!s.contains("internal_review 0/"), "{s}");
+    assert!(!s.contains("internal_review 2/"), "{s}");
+}
+
+#[test]
+fn a_summary_from_an_older_daemon_has_no_branch_progress() {
+    let mut v =
+        serde_json::to_value(summary("t1", "T", "open", Some("coding"), Some(5), "p")).unwrap();
+    v.as_object_mut().unwrap().remove("branch_progress");
+    let t: TaskSummary = serde_json::from_value(v).unwrap();
+    assert_eq!(t.branch_progress, None);
+    let mut app = new_app(Scope::AllProjects);
+    load(&mut app, vec![t], vec![]);
+    let s = render(&app, 100, 24);
+    assert!(s.contains("coding"), "{s}");
+}
+
+/// `long_detail` made a parallel group's detail: three branches.
+fn group_detail(n: usize) -> Value {
+    let mut d = long_detail(n, false);
+    d["workflow_state"]["branches"] = json!([
+        {"name": "security_review", "kind": "agent_turn", "state": "running",
+         "result": null, "reason": null, "entry": 2,
+         "started_at": "2026-01-01T11:50:00Z", "ended_at": null},
+        {"name": "architecture_review", "kind": "agent_turn", "state": "done",
+         "result": "blocking", "reason": null, "entry": 2,
+         "started_at": "2026-01-01T11:50:00Z", "ended_at": "2026-01-01T11:55:00Z"},
+        {"name": "tests", "kind": "agent_turn", "state": "failed",
+         "result": null, "reason": "the suite did not compile", "entry": 2,
+         "started_at": "2026-01-01T11:50:00Z", "ended_at": "2026-01-01T11:52:00Z"},
+    ]);
+    d
+}
+
+fn group_view(n: usize, events: usize) -> App {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    answer(&mut app, BUSY, Ok(group_detail(n)));
+    push_events(&mut app, BUSY, events);
+    app
+}
+
+/// The branch block of a screen: `None` when absent, else the index of its
+/// separator, after checking its header and rows follow it in order.
+fn branch_block_at(s: &str) -> Option<usize> {
+    let lines: Vec<&str> = s.lines().map(str::trim_end).collect();
+    let progress = lines.iter().position(|l| l.starts_with("─ progress"))?;
+    let Some(at) = lines.iter().position(|l| l.starts_with("─ branches")) else {
+        assert!(
+            !lines.iter().any(|l| l.contains("security_review")
+                || l.contains("architecture_review")
+                || l.trim_start().starts_with("branch ")),
+            "part of the branch block is on screen:\n{s}"
+        );
+        return None;
+    };
+    assert!(at + 4 < progress, "block must sit above progress:\n{s}");
+    assert!(lines[at + 1].trim_start().starts_with("branch "), "{s}");
+    assert!(lines[at + 2].contains("security_review"), "{s}");
+    assert!(lines[at + 3].contains("architecture_review"), "{s}");
+    assert!(lines[at + 4].trim_start().starts_with("tests "), "{s}");
+    Some(at)
+}
+
+#[test]
+fn the_detail_view_shows_the_branch_table_above_progress() {
+    let app = group_view(6, 3);
+    let s = render(&app, 120, 40);
+    assert!(branch_block_at(&s).is_some(), "{s}");
+    assert!(s.contains("the suite did not compile"), "{s}");
+    assert!(s.contains("5m"), "{s}");
+}
+
+#[test]
+fn the_detail_view_keeps_its_invariants_with_a_parallel_group() {
+    let app = group_view(16, 60);
+    let mut seen_present = false;
+    for w in 40..=140u16 {
+        for h in 10..=40u16 {
+            assert_detail_invariants_for(&app, w, h, false, 16);
+            seen_present |= branch_block_at(&render(&app, w, h)).is_some();
+        }
+    }
+    assert!(seen_present);
+    assert!(
+        branch_block_at(&render(&app, 120, 40)).is_some(),
+        "the block is present at 120x40"
+    );
+}
+
+#[test]
+fn the_branch_table_goes_before_any_older_progress_step() {
+    let app = group_view(16, 0);
+    let mut dropped_with_all_steps = false;
+    for h in 10..=40u16 {
+        let s = render(&app, 120, h);
+        let steps = step_rows(&s).len();
+        if branch_block_at(&s).is_some() {
+            assert_eq!(
+                steps, 16,
+                "the block stayed while steps were cut at h={h}\n{s}"
+            );
+        } else if steps == 16 {
+            dropped_with_all_steps = true;
+        }
+    }
+    assert!(dropped_with_all_steps, "no height drops only the block");
+}
+
+#[test]
+fn a_stuck_groups_stage_cell_does_not_shrink_the_title_column() {
+    let plain = render(&board(), 80, 24);
+    let mut app = board();
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == "7d22e1a8-dddd")
+        .unwrap()
+        .branch_progress = progress_of(2, 3);
+    let grouped = render(&app, 80, 24);
+    let busy = |s: &str| {
+        s.lines()
+            .find(|l| l.contains("9c03aa17"))
+            .unwrap_or_else(|| panic!("{s}"))
+            .to_string()
+    };
+    assert_eq!(busy(&plain), busy(&grouped));
 }
