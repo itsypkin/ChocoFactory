@@ -5502,8 +5502,9 @@ mod tests {
         }
         // A pid we may not signal: some other user's process.
         let foreign = (2..5000).find(|&pid| {
-            // SAFETY: signal 0 only checks permission.
-            let rc = unsafe { libc::kill(pid, 0) };
+            // SAFETY: signal 0 only checks permission. The pid must name a
+            // process *group* we may not signal, since the kill is a killpg.
+            let rc = unsafe { libc::killpg(pid, 0) };
             rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
         });
         let Some(foreign) = foreign else {
@@ -5559,8 +5560,9 @@ mod tests {
             return;
         }
         let foreign = (2..5000).find(|&pid| {
-            // SAFETY: signal 0 only checks permission.
-            let rc = unsafe { libc::kill(pid, 0) };
+            // SAFETY: signal 0 only checks permission. The pid must name a
+            // process *group* we may not signal, since the kill is a killpg.
+            let rc = unsafe { libc::killpg(pid, 0) };
             rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
         });
         let Some(foreign) = foreign else {
