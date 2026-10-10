@@ -97,6 +97,17 @@ pub async fn update(
     task_id: &str,
     update: WorkflowStateUpdate,
 ) -> Result<Option<WorkflowState>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    update_in(&mut conn, task_id, update).await
+}
+
+/// [`update`] on a caller-supplied connection, so it can run inside a
+/// caller's transaction (pass `&mut *tx`).
+pub async fn update_in(
+    conn: &mut sqlx::SqliteConnection,
+    task_id: &str,
+    update: WorkflowStateUpdate,
+) -> Result<Option<WorkflowState>, sqlx::Error> {
     let now = Utc::now();
     let row = sqlx::query_as::<_, WorkflowStateRow>(concat!(
         "UPDATE workflow_state
@@ -114,9 +125,44 @@ pub async fn update(
     .bind(update.enters_stage)
     .bind(now)
     .bind(task_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.map(Into::into))
+}
+
+/// Result of [`settle_with_failures`].
+#[derive(Debug)]
+pub struct SettledWithFailures {
+    pub state: WorkflowState,
+    /// true: the task was `open` and is now `stuck` with `reason`.
+    /// false: "not marked" — the task was no longer `open`; its status and
+    /// stuck_reason are untouched.
+    pub marked_stuck: bool,
+}
+
+/// Writes the `workflow_state` update and marks the task `stuck` in one
+/// transaction, so neither lands without the other. `Ok(None)` means no
+/// `workflow_state` row (nothing written). A task no longer `open` still gets
+/// the payload committed and comes back with `marked_stuck: false`. Any
+/// failure drops the transaction, which rolls both writes back. The `Error`
+/// timeline event is the caller's to append after this returns.
+pub async fn settle_with_failures(
+    pool: &SqlitePool,
+    task_id: &str,
+    update: WorkflowStateUpdate,
+    reason: &str,
+) -> Result<Option<SettledWithFailures>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let Some(state) = update_in(&mut tx, task_id, update).await? else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let marked_stuck = crate::db::tasks::mark_stuck_in(&mut tx, task_id, reason).await?;
+    tx.commit().await?;
+    Ok(Some(SettledWithFailures {
+        state,
+        marked_stuck,
+    }))
 }
 
 /// Records the kind of the task's current stage without touching anything
@@ -301,5 +347,108 @@ mod tests {
 
         let fetched = get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(fetched.payload, created.payload);
+    }
+
+    const FORCE_STUCK_FAILURE: &str = "CREATE TRIGGER forced BEFORE UPDATE OF status ON tasks \
+         BEGIN SELECT RAISE(ABORT, 'forced'); END";
+
+    fn settle_update() -> WorkflowStateUpdate {
+        WorkflowStateUpdate {
+            current_stage: "review".to_string(),
+            stage_kind: "agent_turn".to_string(),
+            loop_counters: json!({"x": 1}),
+            payload: json!({"a": 2}),
+            enters_stage: true,
+        }
+    }
+
+    async fn seeded_with_row(pool: &SqlitePool) -> String {
+        let task_id = seed_task(pool).await;
+        create(pool, &task_id, "coding", "agent_turn", json!({"a": 1}))
+            .await
+            .unwrap();
+        task_id
+    }
+
+    #[tokio::test]
+    async fn settle_with_failures_lands_both_writes() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seeded_with_row(&pool).await;
+
+        let s = settle_with_failures(&pool, &task_id, settle_update(), "r")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(s.marked_stuck);
+        assert_eq!(s.state.current_stage, "review");
+        let row = get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(row.current_stage, "review");
+        assert_eq!(row.payload, json!({"a": 2}));
+        assert_eq!(row.loop_counters, json!({"x": 1}));
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "stuck");
+        assert_eq!(task.stuck_reason.as_deref(), Some("r"));
+    }
+
+    #[tokio::test]
+    async fn settle_with_failures_rolls_back_when_the_stuck_write_fails() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seeded_with_row(&pool).await;
+        let before = get(&pool, &task_id).await.unwrap().unwrap();
+        sqlx::query(FORCE_STUCK_FAILURE)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = settle_with_failures(&pool, &task_id, settle_update(), "r").await;
+        assert!(result.is_err());
+        assert_eq!(get(&pool, &task_id).await.unwrap().unwrap(), before);
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.stuck_reason, None);
+    }
+
+    #[tokio::test]
+    async fn settle_with_failures_on_a_task_that_is_not_open_commits_the_payload_only() {
+        let pool = connect_in_memory().await.unwrap();
+        let cancelled = seeded_with_row(&pool).await;
+        tasks::update_status(&pool, &cancelled, "cancelled")
+            .await
+            .unwrap();
+        let stuck = seeded_with_row(&pool).await;
+        assert!(tasks::mark_stuck(&pool, &stuck, "first").await.unwrap());
+
+        for (id, status, reason) in [
+            (&cancelled, "cancelled", None),
+            (&stuck, "stuck", Some("first")),
+        ] {
+            let s = settle_with_failures(&pool, id, settle_update(), "second")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!s.marked_stuck);
+            assert_eq!(
+                get(&pool, id).await.unwrap().unwrap().payload,
+                json!({"a": 2})
+            );
+            let task = tasks::get(&pool, id).await.unwrap().unwrap();
+            assert_eq!(task.status, status);
+            assert_eq!(task.stuck_reason.as_deref(), reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_with_failures_without_a_row_writes_nothing() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+
+        let result = settle_with_failures(&pool, &task_id, settle_update(), "r")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.stuck_reason, None);
+        assert!(get(&pool, &task_id).await.unwrap().is_none());
     }
 }

@@ -346,14 +346,27 @@ pub async fn mark_cancelled(
     Ok(row.map(Into::into))
 }
 
+/// Marks `id` `stuck` with `reason`, but only if it is currently `open`.
+/// See [`mark_stuck_in`] for the compare-and-set semantics; this is the
+/// pool wrapper.
+pub async fn mark_stuck(pool: &SqlitePool, id: &str, reason: &str) -> Result<bool, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    mark_stuck_in(&mut conn, id, reason).await
+}
+
 /// Marks `id` `stuck` with `reason`, but only if it is currently `open`
 /// (X-4, issue #61) — a single conditional `UPDATE`, not a read-then-write,
 /// so a late failure can never clobber a task a human already `cancelled`
 /// or that reached `closed`/`stuck` through some other path in the
 /// meantime. Returns whether a row actually changed: `false` means the task
 /// was no longer `open` when this ran, which callers treat as "nothing to
-/// do" rather than an error.
-pub async fn mark_stuck(pool: &SqlitePool, id: &str, reason: &str) -> Result<bool, sqlx::Error> {
+/// do" rather than an error. Runs on the given connection, so it can join a
+/// caller's transaction (pass `&mut *tx`).
+pub async fn mark_stuck_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    reason: &str,
+) -> Result<bool, sqlx::Error> {
     let now = Utc::now();
     let result = sqlx::query(
         "UPDATE tasks SET status = 'stuck', stuck_reason = ?, updated_at = ? \
@@ -362,7 +375,7 @@ pub async fn mark_stuck(pool: &SqlitePool, id: &str, reason: &str) -> Result<boo
     .bind(reason)
     .bind(now)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(result.rows_affected() > 0)
 }

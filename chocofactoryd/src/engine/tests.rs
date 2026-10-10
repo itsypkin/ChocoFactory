@@ -12261,6 +12261,145 @@ async fn a_malformed_window_marks_the_task_stuck() {
     );
 }
 
+const FORCE_STUCK_FAILURE: &str = "CREATE TRIGGER forced BEFORE UPDATE OF status ON tasks \
+     BEGIN SELECT RAISE(ABORT, 'forced'); END";
+
+async fn stuck_error_events(pool: &SqlitePool, task_id: &str) -> usize {
+    events::list_for_task(pool, task_id)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e.event_type == EventType::Error && e.payload["stuck"] == json!(true))
+        .count()
+}
+
+#[tokio::test]
+async fn a_failed_stuck_write_is_not_counted_by_the_poll_sweep() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_poll_flow(&dir, "bad-window", "echo PENDING", Some("1h"), false);
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    seed_row(
+        &pool,
+        &task_id,
+        "watch",
+        json!({ "poll_window": { "stage": "watch" } }),
+    )
+    .await;
+    sqlx::query(FORCE_STUCK_FAILURE)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.stuck, 0);
+    assert_eq!(report.resumed, 0);
+    assert_eq!(
+        tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+        "open"
+    );
+    assert_eq!(stuck_error_events(&pool, &task_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_failed_stuck_write_is_not_counted_by_the_park_sweep() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let coding = coding_workflow(&dir);
+    let marker = dir.join("marker");
+    let shell = write_marker_shell_workflow(&dir, &marker);
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let agent = open_task_at(&pool, &project_id, &coding.name, &dir, "coding").await;
+    let sh = open_task_at(&pool, &project_id, &shell.name, &dir, "run").await;
+    let ghost = open_task_at(&pool, &project_id, &coding.name, &dir, "ghost").await;
+    sqlx::query(FORCE_STUCK_FAILURE)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+    let report = engine.park_interrupted_turns().await.unwrap();
+    assert_eq!(report, ParkReport::default());
+    for id in [&agent, &sh, &ghost] {
+        assert_eq!(tasks::get(&pool, id).await.unwrap().unwrap().status, "open");
+        assert_eq!(stuck_error_events(&pool, id).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn mark_stuck_reports_what_happened_to_the_status() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = coding_workflow(&dir);
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+    let open = seed_task(&pool, &def.name).await;
+    assert_eq!(
+        engine.mark_stuck(&open, "reason", false).await,
+        StuckMark::Marked
+    );
+    let task = tasks::get(&pool, &open).await.unwrap().unwrap();
+    assert_eq!(task.status, "stuck");
+    assert_eq!(task.stuck_reason.as_deref(), Some("reason"));
+    assert_eq!(stuck_error_events(&pool, &open).await, 1);
+
+    let recorded = seed_task(&pool, &def.name).await;
+    assert_eq!(
+        engine.mark_stuck(&recorded, "reason", true).await,
+        StuckMark::Marked
+    );
+    assert_eq!(
+        tasks::get(&pool, &recorded).await.unwrap().unwrap().status,
+        "stuck"
+    );
+    assert!(
+        events::list_for_task(&pool, &recorded)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let cancelled = seed_task(&pool, &def.name).await;
+    tasks::update_status(&pool, &cancelled, "cancelled")
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.mark_stuck(&cancelled, "reason", false).await,
+        StuckMark::NotMarked
+    );
+    assert_eq!(
+        tasks::get(&pool, &cancelled).await.unwrap().unwrap().status,
+        "cancelled"
+    );
+    assert!(
+        events::list_for_task(&pool, &cancelled)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let failing = seed_task(&pool, &def.name).await;
+    sqlx::query(FORCE_STUCK_FAILURE)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.mark_stuck(&failing, "reason", false).await,
+        StuckMark::WriteFailed
+    );
+    assert_eq!(
+        tasks::get(&pool, &failing).await.unwrap().unwrap().status,
+        "open"
+    );
+    assert!(
+        events::list_for_task(&pool, &failing)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn the_sweep_leaves_non_open_and_non_poll_tasks_alone() {
     let pool = connect_in_memory().await.unwrap();

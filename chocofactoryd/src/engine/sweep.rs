@@ -47,11 +47,17 @@ fn shell_reason(stage: &str) -> String {
 /// What [`WorkflowEngine::park_interrupted_turns`] did, per task.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ParkReport {
-    /// Single-shot agent turns parked as stuck.
+    /// Single-shot agent turns parked as stuck. Counts only tasks whose status actually changed to `stuck`; a task already
+    /// no longer open, or whose stuck write failed (logged by `mark_stuck`), is
+    /// not counted.
     pub agent_turns: usize,
-    /// Shell stages parked as stuck.
+    /// Shell stages parked as stuck. Counts only tasks whose status actually changed to `stuck`; a task already
+    /// no longer open, or whose stuck write failed (logged by `mark_stuck`), is
+    /// not counted.
     pub shells: usize,
-    /// Tasks parked because the sweep could not classify them.
+    /// Tasks parked because the sweep could not classify them. Counts only tasks whose status actually changed to `stuck`; a task already
+    /// no longer open, or whose stuck write failed (logged by `mark_stuck`), is
+    /// not counted.
     pub stuck_other: usize,
 }
 
@@ -62,7 +68,9 @@ pub struct PollSweepReport {
     pub resumed: usize,
     /// Skipped: a live runner already owns the task.
     pub already_running: usize,
-    /// Could not be resumed, and were marked stuck.
+    /// Could not be resumed, and were marked stuck. Counts only tasks whose status actually changed to `stuck`; a task already
+    /// no longer open, or whose stuck write failed (logged by `mark_stuck`), is
+    /// not counted.
     pub stuck: usize,
     /// Tasks whose stored `stage_kind` was missing or stale and could not be
     /// corrected. Each was logged; the sweep carried on with the resume.
@@ -125,8 +133,9 @@ impl WorkflowEngine {
     }
 
     async fn park_mark_stuck(&self, task_id: &str, reason: &str, report: &mut ParkReport) {
-        self.mark_stuck(task_id, reason, false).await;
-        report.stuck_other += 1;
+        if self.mark_stuck(task_id, reason, false).await == StuckMark::Marked {
+            report.stuck_other += 1;
+        }
     }
 
     /// The body of [`Self::park_interrupted_turns`] for one task; the caller
@@ -175,8 +184,10 @@ impl WorkflowEngine {
         match restart_effect(stage_def) {
             RestartEffect::Survives => {}
             RestartEffect::StrandsShell => {
-                self.mark_stuck(task_id, &shell_reason(&stage), false).await;
-                report.shells += 1;
+                if self.mark_stuck(task_id, &shell_reason(&stage), false).await == StuckMark::Marked
+                {
+                    report.shells += 1;
+                }
             }
             RestartEffect::StrandsAgentTurn => {
                 let mut reason = agent_reason(&stage);
@@ -217,8 +228,9 @@ impl WorkflowEngine {
                         }
                     }
                 }
-                self.mark_stuck(task_id, &reason, false).await;
-                report.agent_turns += 1;
+                if self.mark_stuck(task_id, &reason, false).await == StuckMark::Marked {
+                    report.agent_turns += 1;
+                }
             }
         }
     }
@@ -260,8 +272,9 @@ impl WorkflowEngine {
     }
 
     async fn sweep_mark_stuck(&self, task_id: &str, reason: &str, report: &mut PollSweepReport) {
-        self.mark_stuck(task_id, reason, false).await;
-        report.stuck += 1;
+        if self.mark_stuck(task_id, reason, false).await == StuckMark::Marked {
+            report.stuck += 1;
+        }
     }
 
     /// The body of [`Self::resume_interrupted_polls`] for one task; the
@@ -412,13 +425,16 @@ impl WorkflowEngine {
                 let reason = format!(
                     "stage '{stage}': poll could not be resumed after a daemon restart: {err}"
                 );
-                self.mark_stuck(
-                    task_id,
-                    &reason,
-                    matches!(err, EngineError::Template { .. }),
-                )
-                .await;
-                report.stuck += 1;
+                let mark = self
+                    .mark_stuck(
+                        task_id,
+                        &reason,
+                        matches!(err, EngineError::Template { .. }),
+                    )
+                    .await;
+                if mark == StuckMark::Marked {
+                    report.stuck += 1;
+                }
             }
         }
     }
