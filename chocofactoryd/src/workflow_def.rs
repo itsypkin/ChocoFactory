@@ -34,7 +34,41 @@ pub struct WorkflowDefinition {
     pub worktree: bool,
 }
 
+/// One branch of a `kind: parallel` group, resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Branch {
+    /// The branch as a stage definition: `on` is empty, `loop_guard` is `None`.
+    pub def: StageDef,
+    /// Outcome names the branch may report, none of which route. The
+    /// default (`[done]`) is already applied.
+    pub results: Vec<String>,
+}
+
+/// A branch found by [`WorkflowDefinition::branch`], with its group.
+#[derive(Debug, Clone, Copy)]
+pub struct BranchRef<'a> {
+    pub group: &'a str,
+    pub def: &'a StageDef,
+    pub results: &'a [String],
+}
+
 impl WorkflowDefinition {
+    /// Finds a branch by name across every group. Computed from `stages`
+    /// rather than stored, so it can never disagree with them; names are
+    /// unique across stages and branches, so there is at most one match.
+    pub fn branch(&self, name: &str) -> Option<BranchRef<'_>> {
+        self.stages.iter().find_map(|(group, stage)| {
+            let StageKind::Parallel { branches } = &stage.kind else {
+                return None;
+            };
+            branches.get(name).map(|branch| BranchRef {
+                group: group.as_str(),
+                def: &branch.def,
+                results: &branch.results,
+            })
+        })
+    }
+
     /// The workflow's entry stage: the first one declared in `stages:`.
     /// Safe to unwrap the `Option` after a successful `load`/`parse`, since
     /// validation rejects definitions with zero stages.
@@ -135,7 +169,44 @@ impl WorkflowDefinition {
     }
 
     fn validate(&self) -> Result<(), WorkflowDefError> {
+        // Top-level names are already unique (the map rejects duplicate
+        // keys), so only a branch can collide: with a stage, its own group,
+        // or an earlier branch.
+        let mut seen: std::collections::HashSet<&str> =
+            self.stages.keys().map(String::as_str).collect();
+        for (group, stage) in &self.stages {
+            if let StageKind::Parallel { branches } = &stage.kind {
+                for name in branches.keys() {
+                    if !seen.insert(name.as_str()) {
+                        return Err(WorkflowDefError::DuplicateStageName {
+                            name: name.clone(),
+                            group: group.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
         for (stage_name, stage) in &self.stages {
+            if let StageKind::Parallel { branches } = &stage.kind {
+                if branches.len() < 2 {
+                    return Err(WorkflowDefError::GroupTooFewBranches {
+                        stage: stage_name.clone(),
+                        count: branches.len(),
+                    });
+                }
+                if stage.on.len() != 1 || !stage.on.contains_key("done") {
+                    return Err(WorkflowDefError::GroupOnNotDone {
+                        stage: stage_name.clone(),
+                    });
+                }
+                if stage.loop_guard.is_some() {
+                    return Err(WorkflowDefError::GroupHasLoopGuard {
+                        stage: stage_name.clone(),
+                    });
+                }
+            }
+
             if let StageKind::AgentTurn { role, .. } = &stage.kind
                 && !self.roles.contains_key(role)
             {
@@ -152,6 +223,13 @@ impl WorkflowDefinition {
             }
 
             for target in stage.on.values() {
+                if let Some(branch) = self.branch(target) {
+                    return Err(WorkflowDefError::OnTargetIsBranch {
+                        stage: stage_name.clone(),
+                        target: target.clone(),
+                        group: branch.group.to_string(),
+                    });
+                }
                 if !self.stages.contains_key(target) {
                     return Err(WorkflowDefError::UnknownStageTarget {
                         stage: stage_name.clone(),
@@ -165,6 +243,13 @@ impl WorkflowDefinition {
                     return Err(WorkflowDefError::UnknownLoopGuardOutcome {
                         stage: stage_name.clone(),
                         outcome: guard.on.clone(),
+                    });
+                }
+                if let Some(branch) = self.branch(&guard.then) {
+                    return Err(WorkflowDefError::LoopGuardThenIsBranch {
+                        stage: stage_name.clone(),
+                        target: guard.then.clone(),
+                        group: branch.group.to_string(),
                     });
                 }
                 if !self.stages.contains_key(&guard.then) {
@@ -228,33 +313,7 @@ impl WorkflowDefinition {
                         stage: stage_name.clone(),
                     });
                 }
-                let mut seen: Vec<String> = Vec::new();
-                for section in report_sections {
-                    // Normalized, not merely trimmed (review of #95): a
-                    // name like "##" or "1." is all decoration to the
-                    // tool, leaving a section whose heading no report can
-                    // ever carry.
-                    let key = chocofactory_core::mcp::normalize_report_heading(section);
-                    if key.is_empty() {
-                        return Err(WorkflowDefError::EmptyReportSection {
-                            stage: stage_name.clone(),
-                        });
-                    }
-                    // Compared with the tool's own normalization, not a
-                    // lookalike of it (review of #95): `Branches → tests`
-                    // and `Branches -> tests` differ here but are one name
-                    // there, and a stage declaring both would require a
-                    // section whose heading can only ever be credited to
-                    // one of them — rejecting every review it ever runs,
-                    // for a section the reviewer did write.
-                    if seen.contains(&key) {
-                        return Err(WorkflowDefError::DuplicateReportSection {
-                            stage: stage_name.clone(),
-                            section: section.clone(),
-                        });
-                    }
-                    seen.push(key);
-                }
+                validate_report_sections(stage_name, report_sections)?;
             }
 
             // A human's reply is free text they typed, not a command's
@@ -282,7 +341,41 @@ impl WorkflowDefinition {
                 validate_env_names(stage_name, env)?;
             }
 
-            self.validate_templates(stage_name, stage)?;
+            self.validate_templates(stage_name, stage, None)?;
+        }
+
+        // Branches, after every top-level stage. The open-ended-turn rules
+        // (`CaptureOnOpenEndedTurn`, `ReportSectionsOnOpenEndedTurn`) are
+        // deliberately not applied: a branch always has an empty `on:` but
+        // is not chat's open-ended shape.
+        for (group, stage) in &self.stages {
+            let StageKind::Parallel { branches } = &stage.kind else {
+                continue;
+            };
+            for (branch_name, branch) in branches {
+                if let StageKind::AgentTurn {
+                    role,
+                    report_sections,
+                    ..
+                } = &branch.def.kind
+                {
+                    let Some(role_def) = self.roles.get(role) else {
+                        return Err(WorkflowDefError::UnknownRole {
+                            stage: branch_name.clone(),
+                            role: role.clone(),
+                        });
+                    };
+                    if !role_def.read_only {
+                        return Err(WorkflowDefError::BranchRoleNotReadOnly {
+                            group: group.clone(),
+                            branch: branch_name.clone(),
+                            role: role.clone(),
+                        });
+                    }
+                    validate_report_sections(branch_name, report_sections)?;
+                }
+                self.validate_templates(branch_name, &branch.def, Some(group))?;
+            }
         }
 
         // A second pass, run only once every stage's own checks above have
@@ -365,6 +458,7 @@ impl WorkflowDefinition {
         &self,
         stage_name: &str,
         stage: &StageDef,
+        owning_group: Option<&str>,
     ) -> Result<(), WorkflowDefError> {
         for (field, source) in templatable_sources(stage_name, stage)? {
             let references = crate::template::references(&source).map_err(|err| {
@@ -391,7 +485,15 @@ impl WorkflowDefinition {
                     // it needs no `capture:`, only to exist.
                     crate::template::Root::LeftAt(stage) => (stage, false),
                 };
-                let Some(target) = self.stages.get(&referenced_stage) else {
+                // `stages.<name>` also resolves among branches; `left_at`
+                // does not, since nothing stamps it for a branch.
+                let target = self.stages.get(&referenced_stage).or_else(|| {
+                    needs_capture
+                        .then(|| self.branch(&referenced_stage))
+                        .flatten()
+                        .map(|b| b.def)
+                });
+                let Some(target) = target else {
                     return Err(WorkflowDefError::UnknownTemplateStage {
                         stage: stage_name.to_string(),
                         field: field.clone(),
@@ -401,6 +503,20 @@ impl WorkflowDefinition {
                 };
                 if !needs_capture {
                     continue;
+                }
+                if let Some(group) = owning_group
+                    && referenced_stage != stage_name
+                    && self
+                        .branch(&referenced_stage)
+                        .is_some_and(|b| b.group == group)
+                {
+                    return Err(WorkflowDefError::BranchReferencesSibling {
+                        group: group.to_string(),
+                        branch: stage_name.to_string(),
+                        sibling: referenced_stage,
+                        field: field.clone(),
+                        placeholder: reference.placeholder,
+                    });
                 }
                 if !declares_capture(&target.kind) {
                     return Err(WorkflowDefError::TemplateStageCapturesNothing {
@@ -509,6 +625,7 @@ impl StageKind {
             StageKind::Poll { .. } => "poll",
             StageKind::HumanGate { .. } => "human_gate",
             StageKind::Terminal => "terminal",
+            StageKind::Parallel { .. } => "parallel",
         }
     }
 }
@@ -572,6 +689,11 @@ pub enum StageKind {
         watch: Option<Watch>,
     },
     Terminal,
+    /// A group of stages started together (#257). It captures nothing and
+    /// its only outgoing edge is `on: { done: … }`.
+    Parallel {
+        branches: IndexMap<String, Branch>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -757,6 +879,7 @@ fn stage_kind_keys(kind: &str) -> Option<&'static [&'static str]> {
         ],
         "human_gate" => &["capture", "markers", "watch"],
         "terminal" => &[],
+        "parallel" => &["branches"],
         _ => return None,
     })
 }
@@ -792,6 +915,37 @@ fn reject_unknown_stage_keys(source: &str) -> Result<(), WorkflowDefError> {
                 });
             }
         }
+        // One level only: a nested group's own branches are not walked,
+        // since that branch is rejected as a never-allowed kind anyway.
+        if stage.get("kind").and_then(|k| k.as_str()) == Some("parallel")
+            && let Some(branches) = stage.get("branches").and_then(|b| b.as_mapping())
+        {
+            for (branch_name, branch) in branches {
+                let (Some(branch_name), Some(branch)) = (branch_name.as_str(), branch.as_mapping())
+                else {
+                    continue;
+                };
+                let Some(allowed) = branch
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .and_then(stage_kind_keys)
+                else {
+                    continue;
+                };
+                for key in branch.keys() {
+                    let Some(key) = key.as_str() else { continue };
+                    if !COMMON_STAGE_KEYS.contains(&key)
+                        && !allowed.contains(&key)
+                        && key != "results"
+                    {
+                        return Err(WorkflowDefError::UnknownStageKey {
+                            stage: branch_name.to_string(),
+                            key: key.to_string(),
+                        });
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -807,6 +961,11 @@ struct RawStage {
     on: IndexMap<String, String>,
     #[serde(default)]
     loop_guard: Option<LoopGuard>,
+    /// A branch's reportable outcomes. `Option` so `results: []` can be told
+    /// from an absent list. Only read for a branch; on a top-level stage the
+    /// key is rejected by `reject_unknown_stage_keys`.
+    #[serde(default)]
+    results: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -865,6 +1024,13 @@ enum RawStageKind {
         watch: Option<RawWatch>,
     },
     Terminal,
+    Parallel {
+        #[serde(
+            default,
+            deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
+        )]
+        branches: IndexMap<String, RawStage>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1037,6 +1203,14 @@ impl RawStage {
                     .transpose()?,
             },
             RawStageKind::Terminal => StageKind::Terminal,
+            RawStageKind::Parallel { branches } => {
+                let mut resolved = IndexMap::new();
+                for (branch_name, raw) in branches {
+                    let branch = raw.resolve_branch(base_dir, stage_name, &branch_name)?;
+                    resolved.insert(branch_name, branch);
+                }
+                StageKind::Parallel { branches: resolved }
+            }
         };
 
         Ok(StageDef {
@@ -1044,6 +1218,89 @@ impl RawStage {
             on: self.on,
             loop_guard: self.loop_guard,
         })
+    }
+}
+
+impl RawStage {
+    /// Resolves one branch of the group `group`, checking in a fixed order:
+    /// kind, `on:`, `loop_guard`, `results`, then the stage itself.
+    fn resolve_branch(
+        mut self,
+        base_dir: &Path,
+        group: &str,
+        branch: &str,
+    ) -> Result<Branch, WorkflowDefError> {
+        let capture = match &self.kind {
+            RawStageKind::AgentTurn { capture, .. } => *capture,
+            RawStageKind::Shell { .. } | RawStageKind::Poll { .. } => {
+                return Err(WorkflowDefError::BranchKindNotYetSupported {
+                    group: group.to_string(),
+                    branch: branch.to_string(),
+                    kind: self.kind.name(),
+                });
+            }
+            RawStageKind::Parallel { .. }
+            | RawStageKind::HumanGate { .. }
+            | RawStageKind::Terminal => {
+                return Err(WorkflowDefError::BranchKindNeverAllowed {
+                    group: group.to_string(),
+                    branch: branch.to_string(),
+                    kind: self.kind.name(),
+                });
+            }
+        };
+        if !self.on.is_empty() {
+            return Err(WorkflowDefError::BranchHasOn {
+                group: group.to_string(),
+                branch: branch.to_string(),
+            });
+        }
+        if self.loop_guard.is_some() {
+            return Err(WorkflowDefError::BranchHasLoopGuard {
+                group: group.to_string(),
+                branch: branch.to_string(),
+            });
+        }
+        let results = match self.results.take() {
+            None => vec!["done".to_string()],
+            Some(list) if list.is_empty() => {
+                return Err(WorkflowDefError::EmptyBranchResults {
+                    group: group.to_string(),
+                    branch: branch.to_string(),
+                });
+            }
+            Some(list) => list,
+        };
+        for (i, result) in results.iter().enumerate() {
+            if results[..i].contains(result) {
+                return Err(WorkflowDefError::DuplicateBranchResult {
+                    group: group.to_string(),
+                    branch: branch.to_string(),
+                    result: result.clone(),
+                });
+            }
+        }
+        if capture != Some(Capture::Json) && results != ["done"] {
+            return Err(WorkflowDefError::BranchResultsNeedJsonCapture {
+                group: group.to_string(),
+                branch: branch.to_string(),
+            });
+        }
+        let def = self.resolve(base_dir, branch)?;
+        Ok(Branch { def, results })
+    }
+}
+
+impl RawStageKind {
+    fn name(&self) -> &'static str {
+        match self {
+            RawStageKind::AgentTurn { .. } => "agent_turn",
+            RawStageKind::Shell { .. } => "shell",
+            RawStageKind::Poll { .. } => "poll",
+            RawStageKind::HumanGate { .. } => "human_gate",
+            RawStageKind::Terminal => "terminal",
+            RawStageKind::Parallel { .. } => "parallel",
+        }
     }
 }
 
@@ -1108,6 +1365,38 @@ fn validate_env_names(
                 name: name.clone(),
             });
         }
+    }
+    Ok(())
+}
+
+/// #95. Each name is matched against the report's headings, so a blank one
+/// would match every line and a duplicate would ask twice for the same walk.
+/// Shared by stages and branches.
+fn validate_report_sections(
+    stage_name: &str,
+    report_sections: &[String],
+) -> Result<(), WorkflowDefError> {
+    let mut seen: Vec<String> = Vec::new();
+    for section in report_sections {
+        // Normalized, not merely trimmed (review of #95): a name like "##"
+        // or "1." is all decoration to the tool, leaving a section whose
+        // heading no report can ever carry.
+        let key = chocofactory_core::mcp::normalize_report_heading(section);
+        if key.is_empty() {
+            return Err(WorkflowDefError::EmptyReportSection {
+                stage: stage_name.to_string(),
+            });
+        }
+        // Compared with the tool's own normalization, not a lookalike of it
+        // (review of #95): `Branches → tests` and `Branches -> tests` are
+        // one name there.
+        if seen.contains(&key) {
+            return Err(WorkflowDefError::DuplicateReportSection {
+                stage: stage_name.to_string(),
+                section: section.clone(),
+            });
+        }
+        seen.push(key);
     }
     Ok(())
 }
@@ -1295,7 +1584,9 @@ fn resolve_command(
 }
 
 /// Whether a stage keeps anything in `workflow_state.payload` — i.e. whether
-/// `{{ stages.<this stage>.… }}` could ever resolve against it.
+/// `{{ stages.<this stage>.… }}` could ever resolve against it. A
+/// `parallel` group captures nothing (its branches do), so it falls through
+/// to `false`.
 fn declares_capture(kind: &StageKind) -> bool {
     matches!(
         kind,
@@ -1560,6 +1851,73 @@ pub enum WorkflowDefError {
         stage: String,
         key: String,
     },
+    GroupTooFewBranches {
+        stage: String,
+        count: usize,
+    },
+    GroupOnNotDone {
+        stage: String,
+    },
+    GroupHasLoopGuard {
+        stage: String,
+    },
+    BranchHasOn {
+        group: String,
+        branch: String,
+    },
+    BranchHasLoopGuard {
+        group: String,
+        branch: String,
+    },
+    BranchKindNotYetSupported {
+        group: String,
+        branch: String,
+        kind: &'static str,
+    },
+    BranchKindNeverAllowed {
+        group: String,
+        branch: String,
+        kind: &'static str,
+    },
+    BranchResultsNeedJsonCapture {
+        group: String,
+        branch: String,
+    },
+    EmptyBranchResults {
+        group: String,
+        branch: String,
+    },
+    DuplicateBranchResult {
+        group: String,
+        branch: String,
+        result: String,
+    },
+    DuplicateStageName {
+        name: String,
+        group: String,
+    },
+    OnTargetIsBranch {
+        stage: String,
+        target: String,
+        group: String,
+    },
+    LoopGuardThenIsBranch {
+        stage: String,
+        target: String,
+        group: String,
+    },
+    BranchRoleNotReadOnly {
+        group: String,
+        branch: String,
+        role: String,
+    },
+    BranchReferencesSibling {
+        group: String,
+        branch: String,
+        sibling: String,
+        field: String,
+        placeholder: String,
+    },
     InvalidTemplate {
         stage: String,
         field: String,
@@ -1784,6 +2142,108 @@ impl fmt::Display for WorkflowDefError {
             WorkflowDefError::UnknownStageKey { stage, key } => write!(
                 f,
                 "stage '{stage}' has the key '{key}', which its kind does not define"
+            ),
+            WorkflowDefError::GroupTooFewBranches { stage, count } => write!(
+                f,
+                "parallel stage '{stage}' has {count} branch(es), but a group needs at least two"
+            ),
+            WorkflowDefError::GroupOnNotDone { stage } => write!(
+                f,
+                "parallel stage '{stage}' must have exactly one 'on:' key, 'done'"
+            ),
+            WorkflowDefError::GroupHasLoopGuard { stage } => write!(
+                f,
+                "parallel stage '{stage}' has a 'loop_guard', which a group does not support"
+            ),
+            WorkflowDefError::BranchHasOn { group, branch } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' has an 'on:' map; a branch \
+                 declares 'results:' instead, and the group's 'on: {{ done }}' does the routing"
+            ),
+            WorkflowDefError::BranchHasLoopGuard { group, branch } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' has a 'loop_guard', which a \
+                 branch does not support"
+            ),
+            WorkflowDefError::BranchKindNotYetSupported {
+                group,
+                branch,
+                kind,
+            } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' is a {kind} stage; {kind} \
+                 branches are supported in a later version, only agent_turn branches are for now"
+            ),
+            WorkflowDefError::BranchKindNeverAllowed {
+                group,
+                branch,
+                kind,
+            } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' is a {kind} stage; a branch must \
+                 be an agent_turn"
+            ),
+            WorkflowDefError::BranchResultsNeedJsonCapture { group, branch } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' lists 'results:' other than \
+                 [done] without 'capture: json', so nothing could choose between them"
+            ),
+            WorkflowDefError::EmptyBranchResults { group, branch } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' has an empty 'results:' list"
+            ),
+            WorkflowDefError::DuplicateBranchResult {
+                group,
+                branch,
+                result,
+            } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' lists the result '{result}' more \
+                 than once"
+            ),
+            WorkflowDefError::DuplicateStageName { name, group } => write!(
+                f,
+                "branch '{name}' of parallel stage '{group}' reuses a name that is already a \
+                 stage or another branch; stage and branch names must be unique"
+            ),
+            WorkflowDefError::OnTargetIsBranch {
+                stage,
+                target,
+                group,
+            } => write!(
+                f,
+                "stage '{stage}' routes to '{target}', which is a branch of parallel stage \
+                 '{group}'; route to the group instead"
+            ),
+            WorkflowDefError::LoopGuardThenIsBranch {
+                stage,
+                target,
+                group,
+            } => write!(
+                f,
+                "stage '{stage}' has a loop_guard whose 'then' is '{target}', which is a branch \
+                 of parallel stage '{group}'; name the group instead"
+            ),
+            WorkflowDefError::BranchRoleNotReadOnly {
+                group,
+                branch,
+                role,
+            } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' uses role '{role}', which is not \
+                 'read_only: true'; branches run side by side so they must not edit the worktree"
+            ),
+            WorkflowDefError::BranchReferencesSibling {
+                group,
+                branch,
+                sibling,
+                field,
+                placeholder,
+            } => write!(
+                f,
+                "branch '{branch}' of parallel stage '{group}' has {placeholder} in its {field}, \
+                 but '{sibling}' is a sibling branch that runs at the same time, so its result \
+                 does not exist yet"
             ),
             WorkflowDefError::UnknownReplyMarkerOutcome { stage, outcome } => write!(
                 f,
@@ -4517,5 +4977,616 @@ stages:
         ));
         let yaml = "name: g\nstages:\n  gate:\n    kind: human_gate\n    markers:\n      - line: /a\n        then: ok\n    on: { ok: f }\n  f:\n    kind: terminal\n";
         WorkflowDefinition::parse(yaml, &dir.path).unwrap();
+    }
+
+    // ---- kind: parallel (#257 PG1-1) ----
+
+    const PANEL_YAML: &str = r#"
+name: example
+worktree: true
+roles:
+  coder: { cli: claude, model: sonnet }
+  security: { cli: claude, model: sonnet, read_only: true, disallowed_tools: [edit, write, notebook_edit] }
+  architect: { cli: claude, model: sonnet, read_only: true, disallowed_tools: [edit, write, notebook_edit] }
+  lead: { cli: claude, model: opus }
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompts/coding.md
+    on: { done: review_panel }
+  review_panel:
+    kind: parallel
+    branches:
+      security_review:
+        kind: agent_turn
+        role: security
+        prompt_file: prompts/security.md
+        capture: json
+        results: [clean, blocking]
+      architecture_review:
+        kind: agent_turn
+        role: architect
+        prompt_file: prompts/architecture.md
+        capture: json
+        results: [clean, blocking]
+    on: { done: lead_review }
+  lead_review:
+    kind: agent_turn
+    role: lead
+    prompt_file: prompts/lead.md
+    capture: json
+    on: { approved: done, changes_requested: coding }
+    loop_guard: { on: changes_requested, max: 3, then: escalate }
+  escalate: { kind: human_gate, on: { resumed: coding } }
+  done: { kind: terminal }
+"#;
+
+    fn panel_dir() -> TempDir {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path.join("prompts")).unwrap();
+        dir.write("prompts/coding.md", "code");
+        dir.write("prompts/security.md", "sec");
+        dir.write("prompts/architecture.md", "arch");
+        dir.write(
+            "prompts/lead.md",
+            "{{ stages.security_review.summary }} {{ stages.architecture_review.summary }}",
+        );
+        dir
+    }
+
+    /// The valid panel with one textual change; panics if `old` is absent so
+    /// a stale edit can't make a test pass vacuously.
+    fn panel_with(old: &str, new: &str) -> String {
+        assert!(PANEL_YAML.contains(old), "{old}");
+        PANEL_YAML.replacen(old, new, 1)
+    }
+
+    fn panel_err(yaml: &str) -> WorkflowDefError {
+        WorkflowDefinition::parse(yaml, &panel_dir().path).unwrap_err()
+    }
+
+    const SEC_BRANCH_HEAD: &str = "      security_review:\n        kind: agent_turn\n";
+
+    #[test]
+    fn a_valid_two_branch_group_loads_and_branches_are_looked_up() {
+        let dir = panel_dir();
+        let def = WorkflowDefinition::parse(PANEL_YAML, &dir.path).unwrap();
+        let keys: Vec<_> = def.stages.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["coding", "review_panel", "lead_review", "escalate", "done"]
+        );
+        let sec = def.branch("security_review").unwrap();
+        assert_eq!(sec.group, "review_panel");
+        assert_eq!(sec.results, ["clean", "blocking"]);
+        assert!(sec.def.on.is_empty() && sec.def.loop_guard.is_none());
+        assert!(
+            matches!(&sec.def.kind, StageKind::AgentTurn { role, capture: Some(Capture::Json), .. } if role == "security")
+        );
+        let arch = def.branch("architecture_review").unwrap();
+        assert_eq!(arch.group, "review_panel");
+        assert_eq!(arch.results, ["clean", "blocking"]);
+        assert!(def.branch("review_panel").is_none());
+        assert!(def.branch("coding").is_none());
+        assert_eq!(def.stages["review_panel"].kind.name(), "parallel");
+    }
+
+    #[test]
+    fn group_with_one_branch_or_none_is_rejected() {
+        let one = "      architecture_review:\n        kind: agent_turn\n        role: architect\n        prompt_file: prompts/architecture.md\n        capture: json\n        results: [clean, blocking]\n";
+        let err = panel_err(&panel_with(one, ""));
+        assert!(
+            matches!(&err, WorkflowDefError::GroupTooFewBranches { stage, count: 1 } if stage == "review_panel"),
+            "{err:?}"
+        );
+        let start = PANEL_YAML.find("    branches:").unwrap();
+        let end = PANEL_YAML.find("    on: { done: lead_review }").unwrap();
+        let mut none = PANEL_YAML.to_string();
+        none.replace_range(start..end, "");
+        let err = panel_err(&none);
+        assert!(
+            matches!(&err, WorkflowDefError::GroupTooFewBranches { stage, count: 0 } if stage == "review_panel"),
+            "{err:?}"
+        );
+        let empty = panel_with("    branches:\n", "    branches: {}\n");
+        let start = empty.find("      security_review:").unwrap();
+        let end = empty.find("    on: { done: lead_review }").unwrap();
+        let mut empty = empty;
+        empty.replace_range(start..end, "");
+        assert!(matches!(
+            panel_err(&empty),
+            WorkflowDefError::GroupTooFewBranches { count: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn group_on_must_be_exactly_done() {
+        let on = "    on: { done: lead_review }\n  lead_review";
+        for replacement in [
+            "  lead_review",
+            "    on: {}\n  lead_review",
+            "    on: { finished: lead_review }\n  lead_review",
+            "    on: { done: lead_review, error: coding }\n  lead_review",
+        ] {
+            let err = panel_err(&panel_with(on, replacement));
+            assert!(
+                matches!(&err, WorkflowDefError::GroupOnNotDone { stage } if stage == "review_panel"),
+                "{replacement}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_with_a_loop_guard_is_rejected() {
+        let yaml = panel_with(
+            "    on: { done: lead_review }\n",
+            "    on: { done: lead_review }\n    loop_guard: { on: done, max: 2, then: coding }\n",
+        );
+        let err = panel_err(&yaml);
+        assert!(
+            matches!(&err, WorkflowDefError::GroupHasLoopGuard { stage } if stage == "review_panel"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_with_on_or_loop_guard_is_rejected() {
+        let err = panel_err(&panel_with(
+            "        results: [clean, blocking]\n",
+            "        results: [clean, blocking]\n        on: { done: coding }\n",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::BranchHasOn { group, branch }
+                if group == "review_panel" && branch == "security_review"),
+            "{err:?}"
+        );
+        let err = panel_err(&panel_with(
+            "        results: [clean, blocking]\n",
+            "        results: [clean, blocking]\n        loop_guard: { on: done, max: 2, then: coding }\n",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::BranchHasLoopGuard { group, branch }
+                if group == "review_panel" && branch == "security_review"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn shell_and_poll_branches_are_not_yet_supported() {
+        let dir = panel_dir();
+        for (kind, body) in [
+            ("shell", "kind: shell\n        command: \"true\"\n"),
+            (
+                "poll",
+                "kind: poll\n        command: \"true\"\n        interval: 1s\n",
+            ),
+        ] {
+            let yaml = panel_with(
+                &format!(
+                    "{SEC_BRANCH_HEAD}        role: security\n        prompt_file: prompts/security.md\n        capture: json\n        results: [clean, blocking]\n"
+                ),
+                &format!("      security_review:\n        {body}"),
+            );
+            let err = WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::BranchKindNotYetSupported { group, branch, kind: k }
+                    if group == "review_panel" && branch == "security_review" && *k == kind),
+                "{kind}: {err:?}"
+            );
+            assert!(err.to_string().contains("later version"), "{err}");
+        }
+    }
+
+    #[test]
+    fn nested_group_gate_and_terminal_branches_are_never_allowed() {
+        let dir = panel_dir();
+        for (kind, body) in [
+            (
+                "parallel",
+                "kind: parallel\n        branches:\n          x: { kind: agent_turn, role: security }\n          y: { kind: agent_turn, role: security }\n",
+            ),
+            ("human_gate", "kind: human_gate\n"),
+            ("terminal", "kind: terminal\n"),
+        ] {
+            let yaml = panel_with(
+                &format!(
+                    "{SEC_BRANCH_HEAD}        role: security\n        prompt_file: prompts/security.md\n        capture: json\n        results: [clean, blocking]\n"
+                ),
+                &format!("      security_review:\n        {body}"),
+            );
+            let err = WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err();
+            assert!(
+                matches!(&err, WorkflowDefError::BranchKindNeverAllowed { group, branch, kind: k }
+                    if group == "review_panel" && branch == "security_review" && *k == kind),
+                "{kind}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_results_rules() {
+        let json_results = "        capture: json\n        results: [clean, blocking]\n";
+        // The first occurrence is the security branch.
+        for capture in ["", "        capture: text\n"] {
+            let err = panel_err(&panel_with(
+                json_results,
+                &format!("{capture}        results: [clean]\n"),
+            ));
+            assert!(
+                matches!(&err, WorkflowDefError::BranchResultsNeedJsonCapture { group, branch }
+                    if group == "review_panel" && branch == "security_review"),
+                "{capture:?}: {err:?}"
+            );
+        }
+        let err = panel_err(&panel_with(
+            json_results,
+            "        capture: json\n        results: []\n",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::EmptyBranchResults { branch, .. } if branch == "security_review"),
+            "{err:?}"
+        );
+        let err = panel_err(&panel_with(
+            json_results,
+            "        capture: json\n        results: [clean, clean]\n",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::DuplicateBranchResult { branch, result, .. }
+                if branch == "security_review" && result == "clean"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_results_default_to_done() {
+        let dir = panel_dir();
+        // The lead's prompt reads captures these variants drop.
+        dir.write("prompts/lead.md", "plain");
+        let json_results = "        capture: json\n        results: [clean, blocking]\n";
+        for tail in [
+            "",
+            "        capture: text\n",
+            "        capture: text\n        results: [done]\n",
+        ] {
+            let def = WorkflowDefinition::parse(&panel_with(json_results, tail), &dir.path)
+                .unwrap_or_else(|e| panic!("{tail:?}: {e}"));
+            assert_eq!(def.branch("security_review").unwrap().results, ["done"]);
+        }
+    }
+
+    #[test]
+    fn duplicate_names_across_stages_and_branches_are_rejected() {
+        // Like a top-level stage.
+        let err = panel_err(&panel_with("      architecture_review:", "      coding:"));
+        assert!(
+            matches!(&err, WorkflowDefError::DuplicateStageName { name, group }
+                if name == "coding" && group == "review_panel"),
+            "{err:?}"
+        );
+        // Like its own group.
+        let err = panel_err(&panel_with(
+            "      architecture_review:",
+            "      review_panel:",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::DuplicateStageName { name, group }
+                if name == "review_panel" && group == "review_panel"),
+            "{err:?}"
+        );
+        // Like a branch of another group.
+        let second = "  second:\n    kind: parallel\n    branches:\n      security_review: { kind: agent_turn, role: security }\n      other: { kind: agent_turn, role: security }\n    on: { done: lead_review }\n";
+        let err = panel_err(&panel_with(
+            "  lead_review:\n",
+            &format!("{second}  lead_review:\n"),
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::DuplicateStageName { name, group }
+                if name == "security_review" && group == "second"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_branch_key_fails_the_yaml_parse() {
+        let yaml = panel_with(
+            "      architecture_review:",
+            "      security_review:\n        kind: agent_turn\n        role: security\n      architecture_review:",
+        );
+        assert!(matches!(panel_err(&yaml), WorkflowDefError::Yaml(_)));
+    }
+
+    #[test]
+    fn routing_to_a_branch_is_rejected() {
+        let err = panel_err(&panel_with(
+            "    on: { done: review_panel }",
+            "    on: { done: security_review }",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::OnTargetIsBranch { stage, target, group }
+                if stage == "coding" && target == "security_review" && group == "review_panel"),
+            "{err:?}"
+        );
+        let err = panel_err(&panel_with("then: escalate", "then: security_review"));
+        assert!(
+            matches!(&err, WorkflowDefError::LoopGuardThenIsBranch { stage, target, group }
+                if stage == "lead_review" && target == "security_review" && group == "review_panel"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_group_may_be_an_on_target() {
+        let yaml = PANEL_YAML.replace(
+            "on: { approved: done, changes_requested: coding }",
+            "on: { approved: done, changes_requested: review_panel }",
+        );
+        WorkflowDefinition::parse(&yaml, &panel_dir().path).unwrap();
+    }
+
+    #[test]
+    fn a_group_may_be_a_loop_guard_then_target() {
+        // `then` is a group that is not on the guarded lap.
+        let alt = "  alt:\n    kind: parallel\n    branches:\n      p: { kind: agent_turn, role: security }\n      q: { kind: agent_turn, role: architect }\n    on: { done: lead_review }\n  escalate:";
+        let yaml = PANEL_YAML
+            .replace("  escalate:", alt)
+            .replace("then: escalate", "then: alt");
+        WorkflowDefinition::parse(&yaml, &panel_dir().path).unwrap();
+    }
+
+    #[test]
+    fn a_branch_may_read_a_branch_of_another_group() {
+        let second = r#"  review_panel:
+    kind: parallel
+    branches:
+      security_review:
+        kind: agent_turn
+        role: security
+        prompt_file: prompts/security.md
+        capture: json
+        results: [clean, blocking]
+      architecture_review:
+        kind: agent_turn
+        role: architect
+        prompt_file: prompts/architecture.md
+        capture: json
+        results: [clean, blocking]
+    on: { done: second }
+  second:
+    kind: parallel
+    branches:
+      x:
+        kind: agent_turn
+        role: security
+        prompt_file: prompts/x.md
+        capture: json
+      y:
+        kind: agent_turn
+        role: architect
+        prompt_file: prompts/y.md
+    on: { done: lead_review }
+"#;
+        let start = PANEL_YAML.find("  review_panel:").unwrap();
+        let end = PANEL_YAML.find("  lead_review:").unwrap();
+        let yaml = format!("{}{}{}", &PANEL_YAML[..start], second, &PANEL_YAML[end..]);
+        let dir = panel_dir();
+        dir.write("prompts/x.md", "{{ stages.security_review.summary }}");
+        dir.write("prompts/y.md", "{{ stages.security_review.summary }}");
+        let def = WorkflowDefinition::parse(&yaml, &dir.path).unwrap();
+        assert_eq!(def.branch("x").unwrap().group, "second");
+        // Same group is still refused.
+        dir.write("prompts/y.md", "{{ stages.x.summary }}");
+        let err = WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::BranchReferencesSibling { sibling, .. } if sibling == "x"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_roles_must_exist_and_be_read_only() {
+        let err = panel_err(&panel_with("role: security", "role: ghost"));
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownRole { stage, role }
+                if stage == "security_review" && role == "ghost"),
+            "{err:?}"
+        );
+        let err = panel_err(&panel_with("role: security", "role: coder"));
+        assert!(
+            matches!(&err, WorkflowDefError::BranchRoleNotReadOnly { group, branch, role }
+                if group == "review_panel" && branch == "security_review" && role == "coder"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn template_references_to_branches_and_groups() {
+        let dir = panel_dir();
+        // A branch may read its own capture.
+        dir.write(
+            "prompts/security.md",
+            "{{ stages.security_review.summary }}",
+        );
+        WorkflowDefinition::parse(PANEL_YAML, &dir.path).unwrap();
+        // Not a sibling's.
+        dir.write(
+            "prompts/security.md",
+            "{{ stages.architecture_review.summary }}",
+        );
+        let err = WorkflowDefinition::parse(PANEL_YAML, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::BranchReferencesSibling { group, branch, sibling, field, .. }
+                if group == "review_panel" && branch == "security_review"
+                    && sibling == "architecture_review" && field == "prompt_file"),
+            "{err:?}"
+        );
+        // A later stage may not read the group.
+        let dir = panel_dir();
+        dir.write("prompts/lead.md", "{{ stages.review_panel.summary }}");
+        let err = WorkflowDefinition::parse(PANEL_YAML, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::TemplateStageCapturesNothing { referenced, .. }
+                if referenced == "review_panel"),
+            "{err:?}"
+        );
+        // left_at works for a group, not for a branch.
+        let dir = panel_dir();
+        dir.write("prompts/lead.md", "{{ left_at.review_panel }}");
+        WorkflowDefinition::parse(PANEL_YAML, &dir.path).unwrap();
+        dir.write("prompts/lead.md", "{{ left_at.security_review }}");
+        let err = WorkflowDefinition::parse(PANEL_YAML, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownTemplateStage { referenced, .. }
+                if referenced == "security_review"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_on_groups_and_branches_are_rejected() {
+        let err = panel_err(&panel_with(
+            "        capture: json\n",
+            "        captrue: json\n",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownStageKey { stage, key }
+                if stage == "security_review" && key == "captrue"),
+            "{err:?}"
+        );
+        let err = panel_err(&panel_with(
+            "    kind: agent_turn\n    role: coder\n",
+            "    kind: agent_turn\n    role: coder\n    results: [done]\n",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownStageKey { stage, key }
+                if stage == "coding" && key == "results"),
+            "{err:?}"
+        );
+        let err = panel_err(&panel_with(
+            "    on: { done: lead_review }\n",
+            "    capture: json\n    on: { done: lead_review }\n",
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::UnknownStageKey { stage, key }
+                if stage == "review_panel" && key == "capture"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn open_ended_turn_rules_do_not_apply_to_branches() {
+        let dir = panel_dir();
+        let yaml = panel_with(
+            "        results: [clean, blocking]\n",
+            "        results: [clean, blocking]\n        report_sections: [A, B]\n",
+        );
+        WorkflowDefinition::parse(&yaml, &dir.path).unwrap();
+        // They still apply to a top-level stage.
+        let yaml = "name: n\nroles:\n  r: { cli: claude }\nstages:\n  a:\n    kind: agent_turn\n    role: r\n    capture: json\n    on: {}\n";
+        assert!(matches!(
+            WorkflowDefinition::parse(yaml, &dir.path).unwrap_err(),
+            WorkflowDefError::CaptureOnOpenEndedTurn { .. }
+        ));
+        let yaml = "name: n\nroles:\n  r: { cli: claude }\nstages:\n  a:\n    kind: agent_turn\n    role: r\n    report_sections: [A]\n    on: {}\n";
+        assert!(matches!(
+            WorkflowDefinition::parse(yaml, &dir.path).unwrap_err(),
+            WorkflowDefError::ReportSectionsOnOpenEndedTurn { .. }
+        ));
+    }
+
+    #[test]
+    fn branch_report_section_checks_apply() {
+        let tail = "        results: [clean, blocking]\n";
+        let err = panel_err(&panel_with(
+            tail,
+            &format!("{tail}        report_sections: [\"##\"]\n"),
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::EmptyReportSection { stage } if stage == "security_review"),
+            "{err:?}"
+        );
+        let err = panel_err(&panel_with(
+            tail,
+            &format!("{tail}        report_sections: [A, A]\n"),
+        ));
+        assert!(
+            matches!(&err, WorkflowDefError::DuplicateReportSection { stage, .. } if stage == "security_review"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn branch_prompt_files_resolve_through_the_same_guard() {
+        let dir = panel_dir();
+        let def = WorkflowDefinition::parse(PANEL_YAML, &dir.path).unwrap();
+        let StageKind::AgentTurn { prompt_file, .. } =
+            &def.branch("security_review").unwrap().def.kind
+        else {
+            panic!("agent_turn expected");
+        };
+        assert_eq!(
+            prompt_file.as_deref(),
+            Some(dir.path.join("prompts/security.md").as_path())
+        );
+
+        let err = panel_err(&panel_with("prompts/security.md", "../x.md"));
+        assert!(
+            matches!(&err, WorkflowDefError::InvalidFileReference { owner, field, .. }
+                if owner == "stage 'security_review'" && *field == "prompt_file"),
+            "{err:?}"
+        );
+        let err = panel_err(&panel_with("prompts/security.md", "prompts/nope.md"));
+        assert!(
+            matches!(&err, WorkflowDefError::MissingReferencedFile { owner, .. }
+                if owner == "stage 'security_review'"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn graph_checks_treat_a_group_as_one_node() {
+        let dir = panel_dir();
+        let roles = "roles:\n  r: { cli: claude, read_only: true, disallowed_tools: [edit, write, notebook_edit] }\nworktree: true\n";
+        let group = "  g:\n    kind: parallel\n    branches:\n      b1: { kind: agent_turn, role: r }\n      b2: { kind: agent_turn, role: r }\n";
+        // Only path to the sink runs through the group.
+        let yaml = format!(
+            "name: n\n{roles}stages:\n  a: {{ kind: shell, command: \"true\", on: {{ done: g }} }}\n{group}    on: {{ done: t }}\n  t: {{ kind: terminal }}\n"
+        );
+        WorkflowDefinition::parse(&yaml, &dir.path).unwrap();
+        // The group leads back to a shell stage: nothing can rest.
+        let yaml = format!(
+            "name: n\n{roles}stages:\n  a: {{ kind: shell, command: \"true\", on: {{ done: g }} }}\n{group}    on: {{ done: a }}\n"
+        );
+        assert!(matches!(
+            WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err(),
+            WorkflowDefError::NoReachableSink
+        ));
+        // A guard whose `then` is the group and sits on every lap.
+        let yaml = panel_with("then: escalate", "then: review_panel");
+        let err = panel_err(&yaml);
+        assert!(
+            matches!(&err, WorkflowDefError::LoopGuardEscapeOnEveryLap { then, .. } if then == "review_panel"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_is_a_stage_kind_name() {
+        let yaml = r#"
+name: names
+worktree: true
+roles:
+  r: { cli: claude, read_only: true, disallowed_tools: [edit, write, notebook_edit] }
+stages:
+  g:
+    kind: parallel
+    branches:
+      b1: { kind: agent_turn, role: r }
+      b2: { kind: agent_turn, role: r }
+    on: { done: t }
+  t: { kind: terminal }
+"#;
+        let def = WorkflowDefinition::parse(yaml, Path::new(".")).unwrap();
+        assert_eq!(def.stages["g"].kind.name(), "parallel");
     }
 }

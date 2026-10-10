@@ -27,6 +27,8 @@ pub fn restart_effect(def: &StageDef) -> RestartEffect {
         StageKind::Poll { .. } | StageKind::HumanGate { .. } | StageKind::Terminal => {
             RestartEffect::Survives
         }
+        // Groups can't be entered yet, so no task rests at one running.
+        StageKind::Parallel { .. } => RestartEffect::Survives,
     }
 }
 
