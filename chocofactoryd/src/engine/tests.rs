@@ -10619,6 +10619,7 @@ async fn retry_resumes_the_session_a_usage_limit_interrupted() {
             adapter_session_id: interrupted_run.adapter_session_id.clone(),
             fresh_reason: None,
             rewatched: false,
+            branches: Vec::new(),
         }
     );
     wait_until_task_status(&pool, &task_id, "closed").await;
@@ -15700,6 +15701,7 @@ async fn retry_at_a_gate_after_a_watcher_timeout_watches_again() {
                 adapter_session_id: None,
                 fresh_reason: None,
                 rewatched: true,
+                branches: Vec::new(),
             }
         );
         wait_for_poll_attempt(&pool, &task_id).await;

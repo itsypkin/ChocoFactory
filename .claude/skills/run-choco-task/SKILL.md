@@ -332,7 +332,10 @@ parked at `escalate_to_human`, ignoring your review items, or needs
 cancelling. In short:
 
 - `stuck` → find out why in `choco task status <id>`, then
-  `choco task retry <id>`.
+  `choco task retry <id>`. On a task stuck in a parallel group, retry
+  re-runs only the failed branches and keeps the finished ones; it is
+  refused while a branch session is still live (wait for it to end, then
+  retry, or cancel).
 - `escalate_to_human` → after a review timeout, `choco task retry <id>`
   watches again at no cost; after a CI timeout, re-run CI on GitHub, then
   `choco task retry <id>`; after any other escalation (a cancelled or

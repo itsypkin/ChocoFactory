@@ -251,6 +251,61 @@ impl Group {
     }
 }
 
+fn set_script(g: &Group, script: Value) {
+    fs::write(
+        g._dirs[0].join("fake-claude-group.json"),
+        script.to_string(),
+    )
+    .unwrap();
+}
+
+async fn retry(g: &Group, mode: RetryMode) -> Result<RetryOutcome, RetryTaskError> {
+    g.engine.retry_task(&g.task_id, mode).await
+}
+
+/// Everything a refused retry must leave alone.
+async fn snapshot(g: &Group) -> (String, Option<String>, Value, usize, usize) {
+    let task = tasks::get(&g.pool, &g.task_id).await.unwrap().unwrap();
+    (
+        task.status,
+        task.stuck_reason,
+        g.state().await.payload,
+        sessions::list_for_task(&g.pool, &g.task_id)
+            .await
+            .unwrap()
+            .len(),
+        events::list_for_task(&g.pool, &g.task_id)
+            .await
+            .unwrap()
+            .len(),
+    )
+}
+
+async fn started_events(g: &Group, branch: &str) -> Vec<chocofactory_core::models::Event> {
+    g.events_of(EventType::BranchStarted)
+        .await
+        .into_iter()
+        .filter(|e| e.payload["branch"] == branch)
+        .collect()
+}
+
+async fn wait_settle_errors(g: &Group, n: usize) {
+    crate::test_support::wait_until("settle errors", || async {
+        let found = g
+            .events_of(EventType::Error)
+            .await
+            .iter()
+            .filter(|e| e.payload["stuck"] == true)
+            .count();
+        if found >= n {
+            Ok(())
+        } else {
+            Err(format!("{found} settle error(s)"))
+        }
+    })
+    .await;
+}
+
 /// How many transition and branch entries the timeline holds.
 async fn timeline_len(g: &Group) -> usize {
     let mut n = 0;
@@ -645,7 +700,7 @@ async fn a_start_failure_does_not_stop_the_sibling_and_the_starts_are_recorded_f
 
 // 12 and 16
 #[tokio::test]
-async fn every_branch_failing_to_start_parks_the_group_and_retry_is_refused() {
+async fn every_branch_failing_to_start_parks_the_group_and_retry_re_enters_both() {
     let shape = Shape {
         one_prompt: false,
         two_prompt: false,
@@ -667,16 +722,34 @@ async fn every_branch_failing_to_start_parks_the_group_and_retry_is_refused() {
         "{all:?}"
     );
 
-    let err = g
+    let outcome = g
         .engine
         .retry_task(&g.task_id, RetryMode::Auto)
         .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, RetryTaskError::ParallelGroupRetryNotYet { stage } if stage == "panel"),
-        "{err}"
-    );
-    assert_eq!(stuck_reason(&g.pool, &g.task_id).await, reason);
+        .unwrap();
+    assert_eq!(outcome.stage, "panel");
+    assert!(!outcome.resumed);
+    assert_eq!(outcome.branches.len(), 2);
+    for b in &outcome.branches {
+        assert!(!b.resumed);
+        assert_eq!(
+            b.fresh_reason.as_deref(),
+            Some("the stage has no previous session")
+        );
+    }
+    for branch in ["one", "two"] {
+        let retried = g
+            .events_of(EventType::BranchStarted)
+            .await
+            .into_iter()
+            .filter(|e| e.payload["branch"] == branch && e.payload["via"] == "retry")
+            .count();
+        assert_eq!(retried, 1, "{branch}");
+    }
+    // They fail to start again (no input), and the task is stuck again.
+    let again = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(again.contains("2 of 2 branch(es) failed"), "{again}");
+    assert!(again.contains("no input"), "{again}");
     assert!(
         sessions::list_for_task(&g.pool, &g.task_id)
             .await
@@ -1205,4 +1278,435 @@ async fn an_unreadable_reply_fails_the_branch() {
     );
     let payload = g.state().await.payload;
     assert_eq!(branch_slot(&payload, "one")["state"], "failed");
+}
+
+// ---- retrying a group (PG1-5) ----
+
+fn one_fails_two_clean() -> Value {
+    by_prompt(&[
+        ("BRANCH-ONE", report_steps("bogus", "x")),
+        ("BRANCH-TWO", report_steps("clean", "sum-two")),
+        ("SUMMARIZE", summarize_steps()),
+    ])
+}
+
+#[tokio::test]
+async fn retry_re_runs_only_the_failed_branch() {
+    let script = by_prompt(&[
+        ("BRANCH-ONE", report_steps("clean", "sum-one")),
+        ("BRANCH-TWO", report_steps("bogus", "x")),
+        ("SUMMARIZE", summarize_steps()),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let before = g.state().await.payload;
+    set_script(
+        &g,
+        by_prompt(&[
+            ("BRANCH-ONE", report_steps("clean", "sum-one")),
+            ("BRANCH-TWO", report_steps("clean", "sum-two")),
+            ("SUMMARIZE", summarize_steps()),
+        ]),
+    );
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    assert_eq!(outcome.stage, "panel");
+    assert!(!outcome.resumed);
+    assert_eq!(outcome.adapter_session_id, None);
+    assert!(!outcome.rewatched);
+    assert_eq!(outcome.branches.len(), 1);
+    assert_eq!(outcome.branches[0].branch, "two");
+    assert!(!outcome.branches[0].resumed);
+    assert!(outcome.branches[0].fresh_reason.is_some());
+    let top = outcome.fresh_reason.unwrap();
+    assert!(
+        top.starts_with("1 of 1 re-run branch(es) start fresh: 'two' ("),
+        "{top}"
+    );
+
+    let target = g.wait_sessions("summarize", 1).await.remove(0);
+    crate::test_support::wait_until("both summaries", || async {
+        let events = events::list_for_session(&g.pool, &target.id).await.unwrap();
+        let text: String = events
+            .iter()
+            .filter_map(|e| e.payload.get("text").and_then(Value::as_str))
+            .collect();
+        if text.contains("sum-one") && text.contains("sum-two") {
+            Ok(())
+        } else {
+            Err(text)
+        }
+    })
+    .await;
+    assert_eq!(g.sessions("two").await.len(), 2);
+    assert_eq!(g.sessions("one").await.len(), 1);
+    let state = g.state().await;
+    assert_eq!(state.payload["stages"]["one"], before["stages"]["one"]);
+    assert_eq!(state.current_stage, "summarize");
+}
+
+#[tokio::test]
+async fn retry_resumes_a_usage_limited_branch() {
+    let script = by_prompt(&[
+        (
+            "BRANCH-ONE",
+            json!([{"op": "read_turn"}, {"op": "usage_limit"}]),
+        ),
+        ("BRANCH-TWO", report_steps("clean", "sum-two")),
+        ("SUMMARIZE", summarize_steps()),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let old = g.sessions("one").await.remove(0);
+    set_script(
+        &g,
+        by_prompt(&[
+            (
+                "Your previous turn on this stage was interrupted",
+                report_steps("clean", "sum-one"),
+            ),
+            ("BRANCH-TWO", report_steps("clean", "sum-two")),
+            ("SUMMARIZE", summarize_steps()),
+        ]),
+    );
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    assert!(outcome.resumed);
+    assert_eq!(outcome.fresh_reason, None);
+    assert_eq!(outcome.adapter_session_id, None);
+    assert_eq!(
+        outcome.branches,
+        vec![chocofactory_core::models::RetriedBranch {
+            branch: "one".to_string(),
+            resumed: true,
+            adapter_session_id: Some(old.adapter_session_id.clone().unwrap()),
+            fresh_reason: None,
+        }]
+    );
+    let starts = started_events(&g, "one").await;
+    assert!(starts.iter().any(|e| e.payload["via"] == "retry_resume"));
+    let sessions = g.wait_sessions("one", 2).await;
+    let new = sessions.iter().find(|s| s.id != old.id).unwrap();
+    assert_eq!(new.resumed_from.as_deref(), Some(old.id.as_str()));
+    g.wait_sessions("summarize", 1).await;
+}
+
+#[tokio::test]
+async fn resume_with_a_non_resumable_branch_changes_nothing() {
+    let script = by_prompt(&[
+        ("BRANCH-ONE", report_steps("bogus", "x")),
+        (
+            "BRANCH-TWO",
+            json!([{"op": "read_turn"}, {"op": "usage_limit"}]),
+        ),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let before = snapshot(&g).await;
+    let err = retry(&g, RetryMode::Resume).await.unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::NotResumable(s) if s.contains("branch 'one'") && s.contains("parallel stage 'panel'")),
+        "{err}"
+    );
+    assert_eq!(snapshot(&g).await, before);
+}
+
+#[tokio::test]
+async fn a_fast_second_failure_still_parks() {
+    let g = group(Shape::new(), one_fails_two_clean()).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    wait_settle_errors(&g, 1).await;
+    retry(&g, RetryMode::Auto).await.unwrap();
+    wait_settle_errors(&g, 2).await;
+    g.wait_status("stuck").await;
+    let reason = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(reason.contains("'one'"), "{reason}");
+    assert_eq!(g.sessions("one").await.len(), 2);
+}
+
+async fn install_no_state_update(g: &Group) {
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_state_update BEFORE UPDATE ON workflow_state
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn retry_is_refused_while_a_branch_is_live_then_re_enters_dead_running_slots() {
+    // The branches hold for a few seconds, then exit without a report.
+    let hold_then_exit = json!([
+        {"op": "read_turn"}, {"op": "sleep", "seconds": 4}, {"op": "exit"}
+    ]);
+    let g = group(
+        Shape::new(),
+        by_prompt(&[
+            ("BRANCH-ONE", hold_then_exit.clone()),
+            ("BRANCH-TWO", hold_then_exit),
+        ]),
+    )
+    .await;
+    g.start(None).await.unwrap();
+    let one = g.wait_sessions("one", 1).await.remove(0);
+    g.wait_sessions("two", 1).await;
+    install_no_state_update(&g).await;
+    let applied = g.finish(1, "one", &one.id, reported("clean", "x")).await;
+    assert!(matches!(applied, BranchApplied::Parked(_)), "{applied:?}");
+    let before = snapshot(&g).await;
+    let err = retry(&g, RetryMode::Auto).await.unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::BranchStillActive { stage, branch } if stage == "panel" && branch == "one"),
+        "{err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "branch 'one' of parallel stage 'panel' still has a live session; wait for it to end, then retry (or cancel the task)"
+    );
+    assert_eq!(snapshot(&g).await, before);
+
+    crate::test_support::wait_until("sessions end", || async {
+        let all = sessions::list_for_task(&g.pool, &g.task_id).await.unwrap();
+        if all.iter().all(|s| s.status != SessionStatus::Active) {
+            Ok(())
+        } else {
+            Err(format!("{all:?}"))
+        }
+    })
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe("DROP TRIGGER no_state_update"))
+        .execute(&g.pool)
+        .await
+        .unwrap();
+    set_script(&g, both_report("clean"));
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    assert_eq!(outcome.branches.len(), 2);
+    for branch in ["one", "two"] {
+        g.wait_sessions(branch, 2).await;
+        assert!(
+            started_events(&g, branch)
+                .await
+                .iter()
+                .any(|e| e.payload["via"] == "retry"),
+            "{branch}"
+        );
+    }
+}
+
+async fn entry_two_start_failed(extra: bool) -> Group {
+    let shape = Shape {
+        target: Target::Back,
+        ..Shape::new()
+    };
+    let g = group(shape, both_report("clean")).await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_entry_two BEFORE INSERT ON events
+         WHEN NEW.event_type = 'branch_started' AND json_extract(NEW.payload, '$.entry') = 2
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    sqlx::query(sqlx::AssertSqlSafe("DROP TRIGGER no_entry_two"))
+        .execute(&g.pool)
+        .await
+        .unwrap();
+    if extra {
+        sqlx::query(
+            "UPDATE sessions SET end_reason = 'interrupted' WHERE task_id = ? AND stage = 'one'",
+        )
+        .bind(&g.task_id)
+        .execute(&g.pool)
+        .await
+        .unwrap();
+    }
+    g
+}
+
+#[tokio::test]
+async fn retry_after_failed_entry_starts_gives_entry_laps() {
+    let g = entry_two_start_failed(false).await;
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    for b in &outcome.branches {
+        assert_eq!(
+            b.fresh_reason.as_deref(),
+            Some("its last session belongs to an earlier entry of parallel stage 'panel'")
+        );
+    }
+    for branch in ["one", "two"] {
+        g.wait_sessions(branch, 2).await;
+        let mut laps: Vec<_> = g.facts(branch).await.into_iter().map(|f| f.lap).collect();
+        laps.sort();
+        assert_eq!(laps, [Some(1), Some(2)], "{branch}");
+        let two: Vec<_> = started_events(&g, branch)
+            .await
+            .into_iter()
+            .filter(|e| e.payload["entry"] == 2)
+            .collect();
+        assert_eq!(two.len(), 2, "{two:?}");
+        assert!(two[0].payload["via"].is_null());
+        assert_eq!(two[1].payload["via"], "retry");
+    }
+}
+
+#[tokio::test]
+async fn an_earlier_entry_session_is_never_resumed() {
+    let g = entry_two_start_failed(true).await;
+    let before = snapshot(&g).await;
+    let err = retry(&g, RetryMode::Resume).await.unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::NotResumable(s) if s.contains("branch 'one'") && s.contains("earlier entry")),
+        "{err}"
+    );
+    assert_eq!(snapshot(&g).await, before);
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    let one = outcome.branches.iter().find(|b| b.branch == "one").unwrap();
+    assert!(!one.resumed);
+    assert!(one.fresh_reason.as_ref().unwrap().contains("earlier entry"));
+}
+
+#[tokio::test]
+async fn a_late_end_from_an_earlier_entry_writes_nothing() {
+    let shape = Shape {
+        target: Target::Back,
+        ..Shape::new()
+    };
+    let g = group(shape, holding()).await;
+    g.start(None).await.unwrap();
+    let one = g.wait_sessions("one", 1).await.remove(0);
+    let two = g.wait_sessions("two", 1).await.remove(0);
+    assert_eq!(
+        g.finish(1, "one", &one.id, reported("clean", "a")).await,
+        BranchApplied::Recorded { done: true }
+    );
+    assert_eq!(
+        g.finish(1, "two", &two.id, reported("clean", "b")).await,
+        BranchApplied::Recorded { done: true }
+    );
+    let sessions = g.wait_sessions("one", 2).await;
+    g.wait_sessions("two", 2).await;
+    let new_one = sessions.iter().find(|s| s.id != one.id).unwrap();
+    assert_eq!(g.state().await.payload["parallel"]["entry"], 2);
+    let before = (
+        g.state().await.payload,
+        g.status().await,
+        timeline_len(&g).await,
+    );
+    let applied = g
+        .finish(1, "one", &new_one.id, reported("clean", "x"))
+        .await;
+    assert!(matches!(applied, BranchApplied::Dropped(_)), "{applied:?}");
+    assert_eq!(
+        (
+            g.state().await.payload,
+            g.status().await,
+            timeline_len(&g).await
+        ),
+        before
+    );
+}
+
+#[tokio::test]
+async fn fresh_starts_a_resumable_branch_over() {
+    let script = by_prompt(&[
+        (
+            "BRANCH-ONE",
+            json!([{"op": "read_turn"}, {"op": "usage_limit"}]),
+        ),
+        ("BRANCH-TWO", report_steps("clean", "sum-two")),
+        ("SUMMARIZE", summarize_steps()),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let old = g.sessions("one").await.remove(0);
+    set_script(&g, both_report("clean"));
+    let outcome = retry(&g, RetryMode::Fresh).await.unwrap();
+    assert!(!outcome.resumed);
+    assert_eq!(
+        outcome.branches[0].fresh_reason.as_deref(),
+        Some("a fresh start was asked for")
+    );
+    assert!(
+        started_events(&g, "one")
+            .await
+            .iter()
+            .any(|e| e.payload["via"] == "retry")
+    );
+    let sessions = g.wait_sessions("one", 2).await;
+    let new = sessions.iter().find(|s| s.id != old.id).unwrap();
+    assert_eq!(new.resumed_from, None);
+}
+
+#[tokio::test]
+async fn a_failed_starts_transaction_during_retry_parks_the_group() {
+    let g = group(Shape::new(), one_fails_two_clean()).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_retry_start BEFORE INSERT ON events
+         WHEN NEW.event_type = 'branch_started' AND json_extract(NEW.payload, '$.via') = 'retry'
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    let sessions_before = g.sessions("one").await.len();
+    retry(&g, RetryMode::Auto).await.unwrap();
+    let reason = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(
+        reason.contains("could not record the branch start"),
+        "{reason}"
+    );
+    assert_eq!(g.sessions("one").await.len(), sessions_before);
+}
+
+#[tokio::test]
+async fn retry_refuses_a_missing_block_and_a_group_with_nothing_failed() {
+    let g = group(Shape::new(), one_fails_two_clean()).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let state = g.state().await;
+    let write = |payload: Value| {
+        workflow_state::update(
+            &g.pool,
+            &g.task_id,
+            workflow_state::WorkflowStateUpdate {
+                current_stage: state.current_stage.clone(),
+                stage_kind: "parallel".to_string(),
+                loop_counters: state.loop_counters.clone(),
+                payload,
+                enters_stage: false,
+            },
+        )
+    };
+
+    let mut all_done = state.payload.clone();
+    for branch in ["one", "two"] {
+        all_done["parallel"]["branches"][branch] = json!({"state": "done"});
+    }
+    write(all_done).await.unwrap();
+    let before = snapshot(&g).await;
+    let err = retry(&g, RetryMode::Auto).await.unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::NothingToRetry { stage } if stage == "panel"),
+        "{err}"
+    );
+    assert_eq!(snapshot(&g).await, before);
+
+    let mut missing = state.payload.clone();
+    missing.as_object_mut().unwrap().remove("parallel");
+    write(missing).await.unwrap();
+    let before = snapshot(&g).await;
+    let err = retry(&g, RetryMode::Auto).await.unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::GroupStateMissing { stage } if stage == "panel"),
+        "{err}"
+    );
+    assert_eq!(snapshot(&g).await, before);
 }

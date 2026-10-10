@@ -186,6 +186,31 @@ pub async fn append_branch_started_on(
     .await
 }
 
+/// Whether `branch` has a `branch_started` event for group entry `entry`
+/// that is not a retry's (`via` null or anything but `retry`/`retry_resume`).
+/// Read-only.
+pub async fn branch_start_exists(
+    pool: &SqlitePool,
+    task_id: &str,
+    branch: &str,
+    entry: i64,
+) -> Result<bool, sqlx::Error> {
+    let found: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM events
+         WHERE task_id = ? AND event_type = 'branch_started'
+           AND json_extract(payload, '$.branch') = ?
+           AND json_extract(payload, '$.entry') = ?
+           AND COALESCE(json_extract(payload, '$.via'), '') NOT IN ('retry', 'retry_resume')
+         LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(branch)
+    .bind(entry)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
+}
+
 /// How a branch ended: exactly one of a reported `result` or a failure
 /// `reason`, so a payload can never carry both.
 #[derive(Debug, Clone, Copy)]
@@ -692,6 +717,51 @@ mod tests {
         .await
         .unwrap()
         .id
+    }
+
+    #[tokio::test]
+    async fn branch_start_exists_ignores_retries_and_other_entries_and_branches() {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let task_id = sessions::get(&pool, &session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id;
+        let exists = |branch: &'static str, entry: i64| {
+            let pool = pool.clone();
+            let task_id = task_id.clone();
+            async move {
+                branch_start_exists(&pool, &task_id, branch, entry)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!exists("one", 1).await);
+        for via in [Some("retry"), Some("retry_resume")] {
+            append_branch_started(&pool, &task_id, "g", "one", "agent_turn", 1, via)
+                .await
+                .unwrap();
+        }
+        assert!(!exists("one", 1).await, "retries do not count");
+        append_branch_started(&pool, &task_id, "g", "one", "agent_turn", 2, None)
+            .await
+            .unwrap();
+        assert!(!exists("one", 1).await, "another entry does not count");
+        assert!(!exists("two", 2).await, "another branch does not count");
+        assert!(exists("one", 2).await);
+        append_branch_started(&pool, &task_id, "g", "two", "agent_turn", 1, None)
+            .await
+            .unwrap();
+        assert!(exists("two", 1).await);
+        // A different task's start does not count.
+        let other = seed_session(&pool).await;
+        let other_task = sessions::get(&pool, &other).await.unwrap().unwrap().task_id;
+        assert!(
+            !branch_start_exists(&pool, &other_task, "one", 2)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

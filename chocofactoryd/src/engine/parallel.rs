@@ -368,6 +368,268 @@ impl WorkflowEngine {
             .await
     }
 
+    /// Retries a task stuck in the parallel group `group`, under the task
+    /// lock the caller holds. Step 1 only reads; a refusal changes nothing.
+    /// Step 2 writes, in order: the re-entered slots back to `running`, the
+    /// reopen, the missing/retry `branch_started` events, then the starts.
+    pub(super) async fn retry_group_locked(
+        self: &Arc<Self>,
+        task: &Task,
+        definition: &Arc<WorkflowDefinition>,
+        group: &str,
+        stage_def: &StageDef,
+        state: &chocofactory_core::models::WorkflowState,
+        mode: RetryMode,
+    ) -> Result<RetryOutcome, RetryTaskError> {
+        let task_id = task.id.as_str();
+        let StageKind::Parallel { branches } = &stage_def.kind else {
+            unreachable!("retry_group_locked is only called for Parallel stages")
+        };
+        let missing = || RetryTaskError::GroupStateMissing {
+            stage: group.to_string(),
+        };
+        let entry_no = block_for(&state.payload, group)
+            .and_then(|block| block.get("entry"))
+            .and_then(Value::as_i64)
+            .ok_or_else(missing)?;
+
+        // Step 1: reads only.
+        struct Rerun<'a> {
+            name: &'a str,
+            branch: &'a Branch,
+            resume: Option<ResumeSession>,
+            fresh_reason: Option<String>,
+            needs_base_start: bool,
+        }
+        let mut rerun: Vec<Rerun<'_>> = Vec::new();
+        for (name, branch) in branches {
+            let last = sessions::get_current_for_stage(&self.pool, task_id, name).await?;
+            if let Some(session) = &last
+                && session.status == SessionStatus::Active
+            {
+                return Err(RetryTaskError::BranchStillActive {
+                    stage: group.to_string(),
+                    branch: name.clone(),
+                });
+            }
+            if branch_state(&state.payload, name) == Some("done") {
+                continue;
+            }
+            let resumable = if mode == RetryMode::Fresh {
+                Err("a fresh start was asked for".to_string())
+            } else {
+                let earlier_entry = match &last {
+                    Some(session) => {
+                        sessions::lap(&self.pool, &session.id).await? != Some(entry_no)
+                    }
+                    None => false,
+                };
+                if earlier_entry {
+                    Err(format!(
+                        "its last session belongs to an earlier entry of parallel stage '{group}'"
+                    ))
+                } else {
+                    self.resumable_session(task, definition, &branch.def, last.as_ref(), true)
+                        .await?
+                }
+            };
+            let (resume, fresh_reason) = match resumable {
+                Ok(resume) => (Some(resume), None),
+                Err(why) => {
+                    if mode == RetryMode::Resume {
+                        return Err(RetryTaskError::NotResumable(format!(
+                            "branch '{name}' of parallel stage '{group}': {why}"
+                        )));
+                    }
+                    (None, Some(why))
+                }
+            };
+            let needs_base_start =
+                !events::branch_start_exists(&self.pool, task_id, name, entry_no).await?;
+            rerun.push(Rerun {
+                name,
+                branch,
+                resume,
+                fresh_reason,
+                needs_base_start,
+            });
+        }
+        if rerun.is_empty() {
+            return Err(RetryTaskError::NothingToRetry {
+                stage: group.to_string(),
+            });
+        }
+        let input = state
+            .payload
+            .get("task")
+            .and_then(|task| task.get("input"))
+            .and_then(Value::as_str);
+
+        // Step 2, write 1: the re-entered slots become `running` in one UPDATE.
+        let mut new_payload = state.payload.clone();
+        let started_at = stamp(self.now());
+        let slots = new_payload
+            .get_mut("parallel")
+            .and_then(|block| block.get_mut("branches"))
+            .and_then(Value::as_object_mut)
+            .ok_or_else(missing)?;
+        for r in &rerun {
+            slots.insert(
+                r.name.to_string(),
+                json!({ "state": "running", "started_at": started_at }),
+            );
+        }
+        let payload = workflow_state::update(
+            &self.pool,
+            task_id,
+            workflow_state::WorkflowStateUpdate {
+                current_stage: group.to_string(),
+                stage_kind: "parallel".to_string(),
+                loop_counters: state.loop_counters.clone(),
+                payload: new_payload,
+                enters_stage: false,
+            },
+        )
+        .await?
+        .ok_or(RetryTaskError::NoWorkflowState)?
+        .payload;
+
+        // Write 2: reopen before any start, so a fast second failure's
+        // settle finds the task open.
+        if tasks::reopen_stuck(&self.pool, task_id).await?.is_none() {
+            return Err(match tasks::get(&self.pool, task_id).await? {
+                Some(t) => RetryTaskError::NotStuck(t.status),
+                None => RetryTaskError::NoSuchTask,
+            });
+        }
+
+        // Write 3: the start events, INSERTs only, all or none.
+        let recorded = async {
+            let mut tx = self.pool.begin().await?;
+            for r in rerun.iter().filter(|r| r.needs_base_start) {
+                events::append_branch_started_on(
+                    &mut tx,
+                    task_id,
+                    group,
+                    r.name,
+                    r.branch.def.kind.name(),
+                    entry_no,
+                    None,
+                )
+                .await?;
+            }
+            for r in &rerun {
+                let via = if r.resume.is_some() {
+                    "retry_resume"
+                } else {
+                    "retry"
+                };
+                events::append_branch_started_on(
+                    &mut tx,
+                    task_id,
+                    group,
+                    r.name,
+                    r.branch.def.kind.name(),
+                    entry_no,
+                    Some(via),
+                )
+                .await?;
+            }
+            tx.commit().await
+        }
+        .await;
+
+        let mut failures: Vec<(String, String)> = Vec::new();
+        if let Err(err) = recorded {
+            tracing::error!(task_id, group, %err, "could not record the retried branch starts");
+            for r in &rerun {
+                failures.push((
+                    r.name.to_string(),
+                    format!("could not record the branch start: {err}"),
+                ));
+            }
+        } else {
+            // Step 4: start each re-entered branch.
+            for r in &rerun {
+                if !matches!(r.branch.def.kind, StageKind::AgentTurn { .. }) {
+                    failures.push((
+                        r.name.to_string(),
+                        format!(
+                            "branch '{}' is not an agent_turn, which is all a branch can be",
+                            r.name
+                        ),
+                    ));
+                    continue;
+                }
+                let branch_entry = StageEntry {
+                    task_id,
+                    definition,
+                    stage_name: r.name,
+                    stage_def: &r.branch.def,
+                    payload: &payload,
+                    input,
+                    resume: r.resume.as_ref(),
+                    branch: Some(BranchEntry {
+                        group,
+                        entry: entry_no,
+                        results: &r.branch.results,
+                    }),
+                };
+                if let Err(err) = self.enter_agent_turn(&branch_entry).await {
+                    tracing::error!(task_id, group, branch = %r.name, %err, "branch failed to start");
+                    failures.push((r.name.to_string(), err.to_string()));
+                }
+            }
+        }
+        if !failures.is_empty()
+            && let Err(err) = self
+                .record_start_failures(task_id, group, branches, entry_no, &failures)
+                .await
+        {
+            self.mark_stuck(
+                task_id,
+                &format!("stage '{group}': retry failed: {err}"),
+                false,
+            )
+            .await;
+            return Err(RetryTaskError::Enter(err));
+        }
+
+        let retried: Vec<chocofactory_core::models::RetriedBranch> = rerun
+            .iter()
+            .map(|r| chocofactory_core::models::RetriedBranch {
+                branch: r.name.to_string(),
+                resumed: r.resume.is_some(),
+                adapter_session_id: r.resume.as_ref().map(|x| x.adapter_session_id.clone()),
+                fresh_reason: r.fresh_reason.clone(),
+            })
+            .collect();
+        let fresh: Vec<String> = rerun
+            .iter()
+            .filter_map(|r| {
+                r.fresh_reason
+                    .as_ref()
+                    .map(|why| format!("'{}' ({why})", r.name))
+            })
+            .collect();
+        let fresh_reason = (!fresh.is_empty()).then(|| {
+            format!(
+                "{} of {} re-run branch(es) start fresh: {}",
+                fresh.len(),
+                rerun.len(),
+                fresh.join("; ")
+            )
+        });
+        Ok(RetryOutcome {
+            stage: group.to_string(),
+            resumed: fresh.is_empty(),
+            adapter_session_id: None,
+            fresh_reason,
+            rewatched: false,
+            branches: retried,
+        })
+    }
+
     async fn record_branch_starts(
         &self,
         task_id: &str,

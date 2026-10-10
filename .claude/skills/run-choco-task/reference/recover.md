@@ -17,6 +17,13 @@ and `choco task list --status stuck` finds every stuck task.
   session) **resumes its session**, with the work already in the worktree. A
   turn that failed on its own (`no_report`, a crash) starts fresh. Use
   `--resume` or `--fresh` to force either.
+- On a task stuck in a parallel group, `choco task retry <id>` re-runs only
+  the failed branches. Each one resumes or starts fresh by the same rules as
+  a stage, and finished branches are kept with their results. Retry is
+  refused while any branch session is still live: wait for it to end, then
+  retry, or cancel the task. `--resume` is refused, changing nothing, if any
+  failed branch can't resume, and `--fresh` starts every failed branch
+  fresh. The output lists each re-run branch and whether it resumed.
 - After a usage limit, wait for the reset time shown in the error event, then
   retry. omp's limit message gives no reset time, and on a free tier the limit
   covers every model on the account. To finish on another CLI instead, run
