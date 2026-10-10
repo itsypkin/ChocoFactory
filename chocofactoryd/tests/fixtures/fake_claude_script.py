@@ -163,7 +163,7 @@ def spawn_escaped(step, session_id):
             )
             if step.get("child_pid_file"):
                 start_job(step["child_pid_file"], True, False)
-            if step.get("double_fork"):
+            if step.get("double_fork") or step.get("wait_orphaned"):
                 # Released when the fixture closes its end of the pipe.
                 os.read(read_fd, 1)
                 os._exit(0)

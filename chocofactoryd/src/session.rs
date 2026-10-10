@@ -1049,18 +1049,23 @@ async fn drain_session(
                         cause = after,
                         "process still running after stdin was closed; killed its process group"
                     );
-                    append_session_note(
-                        pool,
-                        session_id,
-                        "lingered",
-                        &format!(
-                            "the agent process was still running {:.1}s after {after}; killed its \
-                             process group",
-                            turn_timers.grace.as_secs_f32()
+                    let grace_s = turn_timers.grace.as_secs_f32();
+                    let message = match report.as_ref().map(|r| &r.group) {
+                        Some(GroupKill::Killed(_)) | Some(GroupKill::Failed(_)) => format!(
+                            "the agent process was still running {grace_s:.1}s after {after}; \
+                             killed its process group"
                         ),
-                        events_notify,
-                    )
-                    .await;
+                        Some(GroupKill::Unknown { .. }) => format!(
+                            "{grace_s:.1}s after {after}, could not check whether the agent \
+                             process was still running; killed its process group"
+                        ),
+                        _ => format!(
+                            "the agent process had exited {grace_s:.1}s after {after}, but \
+                             processes it started were still running; killed them"
+                        ),
+                    };
+                    append_session_note(pool, session_id, "lingered", &message, events_notify)
+                        .await;
                 } else if report.is_none() {
                     tracing::error!(
                         session_id,
@@ -1662,6 +1667,15 @@ fn lingered_after(report: &KillReport) -> bool {
     lingered_decision(&report.group, report.sweep_killed)
 }
 
+impl TrackerState {
+    /// Records a process that could not be killed, once per pid.
+    fn add_survivor(&mut self, pid: i32, comm: String) {
+        if !self.survivors.iter().any(|(p, _)| *p == pid) {
+            self.survivors.push((pid, comm));
+        }
+    }
+}
+
 impl LeftoverTracker {
     fn new(marker: String, kind: SessionKind, reader: ProcReader) -> Self {
         Self {
@@ -1761,9 +1775,7 @@ impl LeftoverTracker {
                 );
                 let mut state = self.state();
                 for pid in owned {
-                    if !state.survivors.iter().any(|(p, _)| *p == pid) {
-                        state.survivors.push((pid, comm(pid)));
-                    }
+                    state.add_survivor(pid, comm(pid));
                 }
                 break;
             }
@@ -1783,7 +1795,7 @@ impl LeftoverTracker {
                     proc_table::PidKill::Failed(err) => {
                         tracing::error!(site, pid, %err, "could not kill a leftover process");
                         failed.insert(pid);
-                        self.state().survivors.push((pid, comm(pid)));
+                        self.state().add_survivor(pid, comm(pid));
                     }
                 }
             }
@@ -1830,8 +1842,7 @@ async fn kill_and_sweep(tracker: &LeftoverTracker, pgid: u32, site: &str) -> Kil
     if let GroupKill::Failed(err) = &group {
         tracker
             .state()
-            .survivors
-            .push((agent, format!("process group ({err})")));
+            .add_survivor(agent, format!("process group ({err})"));
     }
     let sweep_killed = tracker.sweep(agent, site).await;
     tracing::debug!(site, group = %describe_group_kill(&group), sweep_killed, "killed the agent's group and swept");
@@ -5363,6 +5374,109 @@ mod tests {
             "{notes:?}"
         );
         assert!(!good_notes.contains(&"leftovers_unchecked".to_string()));
+    }
+
+    /// Entering a wait with the per-turn budget already spent closes the turn
+    /// at once: no deadline, no `job_wait` note, a message that says why.
+    #[tokio::test]
+    async fn a_wait_entered_with_no_budget_left_closes_the_turn() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "raw", "line": one_job()},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let timers = TurnTimers {
+            nudge_after: StdDuration::from_secs(3600),
+            job_wait_limit: StdDuration::ZERO,
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        let notes = session_notes(&pool, &session_id).await;
+        assert!(!notes.contains(&"job_wait".to_string()), "{notes:?}");
+        let message = note_message(&pool, &session_id, "no_report").await.unwrap();
+        assert!(message.contains("already been used up"), "{message}");
+    }
+
+    /// A grace-site kill that finds nothing alive and sweeps nothing does not
+    /// count as the agent lingering: no `lingered` note, not `Lingered`.
+    #[tokio::test]
+    async fn a_grace_kill_that_finds_nothing_alive_is_not_lingering() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let empty: crate::proc_table::ProcReader = Arc::new(|_| Ok(Vec::new()));
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(empty),
+        )
+        .await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_ne!(run.end_reason, Some(SessionEndReason::Lingered));
+        let notes = session_notes(&pool, &session_id).await;
+        assert!(!notes.contains(&"lingered".to_string()), "{notes:?}");
+    }
+
+    /// A process the sweep cannot get rid of is listed as a survivor in the
+    /// `leftovers_killed` note rather than dropped.
+    #[tokio::test]
+    async fn a_process_that_survives_the_sweep_is_listed_in_the_note() {
+        const GHOST: i32 = 99_999_999;
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        // SAFETY: only reads the process's own uid.
+        let uid = unsafe { libc::geteuid() };
+        let reader: crate::proc_table::ProcReader = Arc::new(move |_| {
+            Ok(vec![crate::proc_table::ProcEntry {
+                pid: GHOST,
+                ppid: 1,
+                pgid: GHOST,
+                sid: GHOST,
+                uid,
+                start: 1,
+                zombie: false,
+                comm: "ghost".into(),
+                marker: crate::proc_table::MarkerStatus::Present,
+            }])
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        wait_until_final(&pool, &session_id).await;
+        let message = note_message(&pool, &session_id, "leftovers_killed")
+            .await
+            .expect("a leftovers_killed note");
+        assert!(message.contains("could not be killed"), "{message}");
+        assert!(message.contains(&format!("{GHOST} (ghost)")), "{message}");
+        // Listed once, though several sites swept.
+        assert_eq!(message.matches("(ghost)").count(), 1, "{message}");
     }
 
     /// Short waits that each end well inside the limit still add up to it.
