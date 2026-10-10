@@ -106,7 +106,10 @@ pub async fn create_resumed(
 // `lap` (set by the same INSERT, so there is one write per fact): the nth
 // time the task entered this stage. A retry is not an entry, and a resumed
 // session belongs to the lap it resumed. Stored on the row so it survives
-// the pruning of the `stage_entered` events it was counted from.
+// the pruning of the `stage_entered` events it was counted from. A parallel
+// branch's session has the branch's name as its stage, so its lap counts the
+// `branch_started` events for that branch (retries excluded): a branch's lap
+// equals its group's entry.
 async fn create_inner(
     pool: &SqlitePool,
     new: NewSession<'_>,
@@ -121,9 +124,13 @@ async fn create_inner(
              CASE WHEN ?9 IS NOT NULL
                  THEN (SELECT lap FROM sessions WHERE id = ?9)
                  ELSE MAX(1, (SELECT COUNT(*) FROM events
-                     WHERE task_id = ?2 AND event_type = 'stage_entered'
-                       AND json_extract(payload, '$.stage') = ?3
-                       AND COALESCE(json_extract(payload, '$.outcome'), '') NOT IN ('retry', 'retry_resume')))
+                     WHERE task_id = ?2 AND (
+                         (event_type = 'stage_entered'
+                           AND json_extract(payload, '$.stage') = ?3
+                           AND COALESCE(json_extract(payload, '$.outcome'), '') NOT IN ('retry', 'retry_resume'))
+                      OR (event_type = 'branch_started'
+                           AND json_extract(payload, '$.branch') = ?3
+                           AND COALESCE(json_extract(payload, '$.via'), '') NOT IN ('retry', 'retry_resume')))))
              END)
          RETURNING ",
         columns!()

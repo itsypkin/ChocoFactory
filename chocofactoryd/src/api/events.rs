@@ -382,4 +382,83 @@ mod tests {
             .await;
         assert_eq!(response.status(), 200);
     }
+
+    #[tokio::test]
+    async fn branch_events_are_served_with_their_exact_payloads() {
+        use crate::db::events::{BranchEnd, append_branch_finished, append_branch_started};
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project: Value = server
+            .post("/projects", json!({ "name": "demo" }))
+            .await
+            .json();
+        let project_id = project["id"].as_str().unwrap();
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"].as_str().unwrap().to_string();
+        let pool = server.pool();
+        append_branch_started(pool, &task_id, "panel", "sec", "agent_turn", 1, None)
+            .await
+            .unwrap();
+        append_branch_finished(
+            pool,
+            &task_id,
+            "panel",
+            "sec",
+            1,
+            BranchEnd::Done { result: "clean" },
+        )
+        .await
+        .unwrap();
+        append_branch_finished(
+            pool,
+            &task_id,
+            "panel",
+            "perf",
+            1,
+            BranchEnd::Failed { reason: "boom" },
+        )
+        .await
+        .unwrap();
+
+        let body: Value = server.get(&format!("/tasks/{task_id}/events")).await.json();
+        let of = |kind: &str| -> Vec<Value> {
+            body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["event_type"] == kind)
+                .cloned()
+                .collect()
+        };
+        let started = of("branch_started");
+        let finished = of("branch_finished");
+        assert_eq!(started.len(), 1);
+        assert_eq!(finished.len(), 2);
+        for e in started.iter().chain(&finished) {
+            assert!(e["session_id"].is_null());
+        }
+        assert_eq!(
+            started[0]["payload"],
+            json!({"group":"panel","branch":"sec","kind":"agent_turn","entry":1,"via":null})
+        );
+        assert_eq!(
+            finished[0]["payload"],
+            json!({"group":"panel","branch":"sec","entry":1,"state":"done","result":"clean"})
+        );
+        assert_eq!(
+            finished[1]["payload"],
+            json!({"group":"panel","branch":"perf","entry":1,"state":"failed","reason":"boom"})
+        );
+    }
 }

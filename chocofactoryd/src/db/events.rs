@@ -138,6 +138,60 @@ pub async fn append_stage_transition(
     .await
 }
 
+/// Appends a `branch_started` entry: a parallel group started `branch`
+/// under its `entry`-th entry. `via` is `None` for a start on entering the
+/// group, or `"retry"` / `"retry_resume"`; the key is always written (null
+/// for `None`). Task-scoped. Errors go back to the caller.
+pub async fn append_branch_started(
+    pool: &SqlitePool,
+    task_id: &str,
+    group: &str,
+    branch: &str,
+    kind: &str,
+    entry: i64,
+    via: Option<&str>,
+) -> Result<Event, sqlx::Error> {
+    append_for_task(
+        pool,
+        task_id,
+        EventType::BranchStarted,
+        json!({ "group": group, "branch": branch, "kind": kind, "entry": entry, "via": via }),
+    )
+    .await
+}
+
+/// How a branch ended: exactly one of a reported `result` or a failure
+/// `reason`, so a payload can never carry both.
+#[derive(Debug, Clone, Copy)]
+pub enum BranchEnd<'a> {
+    Done { result: &'a str },
+    Failed { reason: &'a str },
+}
+
+/// Appends a `branch_finished` entry. `Done` writes `state: "done"` and
+/// `result`; `Failed` writes `state: "failed"` and `reason`. Task-scoped.
+/// Errors go back to the caller.
+pub async fn append_branch_finished(
+    pool: &SqlitePool,
+    task_id: &str,
+    group: &str,
+    branch: &str,
+    entry: i64,
+    end: BranchEnd<'_>,
+) -> Result<Event, sqlx::Error> {
+    let payload = match end {
+        BranchEnd::Done { result } => json!({
+            "group": group, "branch": branch, "entry": entry,
+            "state": "done", "result": result,
+        }),
+        BranchEnd::Failed { reason } => json!({
+            "group": group, "branch": branch, "entry": entry,
+            "state": "failed", "reason": reason,
+        }),
+    };
+    append_for_task(pool, task_id, EventType::BranchFinished, payload).await
+}
+
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Event>, sqlx::Error> {
     let row =
         sqlx::query_as::<_, EventRow>(concat!("SELECT ", columns!(), " FROM events WHERE id = ?"))
@@ -421,7 +475,9 @@ fn ends_a_message(event_type: &str) -> bool {
         | EventType::ShellOutput
         | EventType::TemplateUnresolved
         | EventType::EnvTruncated
-        | EventType::BranchCleanup => false,
+        | EventType::BranchCleanup
+        | EventType::BranchStarted
+        | EventType::BranchFinished => false,
     }
 }
 
@@ -1654,5 +1710,73 @@ mod tests {
                 .unwrap(),
             ""
         );
+    }
+
+    #[tokio::test]
+    async fn branch_helpers_write_exact_task_scoped_payloads() {
+        let pool = connect_in_memory().await.unwrap();
+        let session = seed_session(&pool).await;
+        let task_id = sessions::get(&pool, &session)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id;
+        append_branch_started(&pool, &task_id, "panel", "sec", "agent_turn", 1, None)
+            .await
+            .unwrap();
+        append_branch_finished(
+            &pool,
+            &task_id,
+            "panel",
+            "sec",
+            1,
+            BranchEnd::Done { result: "clean" },
+        )
+        .await
+        .unwrap();
+        append_branch_finished(
+            &pool,
+            &task_id,
+            "panel",
+            "perf",
+            1,
+            BranchEnd::Failed { reason: "boom" },
+        )
+        .await
+        .unwrap();
+        append_branch_started(
+            &pool,
+            &task_id,
+            "panel",
+            "sec",
+            "agent_turn",
+            1,
+            Some("retry"),
+        )
+        .await
+        .unwrap();
+        let got: Vec<_> = list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.session_id.is_none() && e.event_type != EventType::StageEntered)
+            .collect();
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|e| e.session_id.is_none()));
+        assert_eq!(got[0].event_type, EventType::BranchStarted);
+        assert_eq!(
+            got[0].payload,
+            json!({"group":"panel","branch":"sec","kind":"agent_turn","entry":1,"via":null})
+        );
+        assert_eq!(got[1].event_type, EventType::BranchFinished);
+        assert_eq!(
+            got[1].payload,
+            json!({"group":"panel","branch":"sec","entry":1,"state":"done","result":"clean"})
+        );
+        assert_eq!(
+            got[2].payload,
+            json!({"group":"panel","branch":"perf","entry":1,"state":"failed","reason":"boom"})
+        );
+        assert_eq!(got[3].payload["via"], "retry");
     }
 }
