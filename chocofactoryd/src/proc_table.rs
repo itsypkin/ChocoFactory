@@ -208,6 +208,28 @@ pub fn read(marker: Option<&str>) -> io::Result<Vec<ProcEntry>> {
     platform::read(marker)
 }
 
+/// Fills a pid buffer through `list`, which writes pids into the slice and
+/// returns how many it wrote. A result that fills the buffer may have been
+/// cut short, so the buffer doubles and the call repeats until it does not.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn fill_pids(
+    initial: usize,
+    mut list: impl FnMut(&mut [i32]) -> io::Result<usize>,
+) -> io::Result<Vec<i32>> {
+    let mut capacity = initial.max(1);
+    loop {
+        let mut pids = vec![0i32; capacity];
+        let count = list(&mut pids)?;
+        if count < capacity {
+            pids.truncate(count);
+            return Ok(pids);
+        }
+        capacity = capacity.checked_mul(2).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "the pid list never fit a buffer")
+        })?;
+    }
+}
+
 /// Whether an environment entry list holds `<marker>=`.
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn env_has_marker<'a>(mut entries: impl Iterator<Item = &'a [u8]>, marker: &str) -> bool {
@@ -300,26 +322,23 @@ mod platform {
 mod platform {
     use super::*;
 
-    fn list_pids() -> io::Result<Vec<i32>> {
-        // SAFETY: a null buffer asks for the size in bytes.
-        let bytes = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        if bytes <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Room for processes started between the two calls.
-        let mut pids = vec![0i32; bytes as usize / std::mem::size_of::<i32>() + 64];
-        // SAFETY: the buffer is `pids.len() * 4` bytes long.
-        let count = unsafe {
-            libc::proc_listallpids(
-                pids.as_mut_ptr().cast(),
-                (pids.len() * std::mem::size_of::<i32>()) as libc::c_int,
-            )
-        };
-        if count <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-        pids.truncate(count as usize);
-        Ok(pids)
+    /// Pids of every process, growing the buffer until the kernel's answer
+    /// fits with room to spare (a full buffer may be a truncated list).
+    fn list_pids(initial: usize) -> io::Result<Vec<i32>> {
+        fill_pids(initial, |buf| {
+            // SAFETY: the buffer is `buf.len() * 4` bytes long.
+            let count = unsafe {
+                libc::proc_listallpids(
+                    buf.as_mut_ptr().cast(),
+                    (buf.len() * std::mem::size_of::<i32>()) as libc::c_int,
+                )
+            };
+            if count <= 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        })
     }
 
     fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
@@ -394,10 +413,19 @@ mod platform {
     }
 
     pub fn read(marker: Option<&str>) -> io::Result<Vec<ProcEntry>> {
+        read_with_capacity(marker, 1024)
+    }
+
+    /// `read` with a chosen starting size for the pid buffer, so a test can
+    /// start below the live count.
+    pub fn read_with_capacity(
+        marker: Option<&str>,
+        initial_pids: usize,
+    ) -> io::Result<Vec<ProcEntry>> {
         // SAFETY: `geteuid` has no preconditions.
         let me = unsafe { libc::geteuid() };
         let mut table = Vec::new();
-        for pid in list_pids()? {
+        for pid in list_pids(initial_pids)? {
             if pid <= 0 {
                 continue;
             }
@@ -645,6 +673,91 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(status, MarkerStatus::Present);
+    }
+
+    #[test]
+    fn a_pid_list_that_fills_the_buffer_is_retried_larger() {
+        let all: Vec<i32> = (1..=100).collect();
+        let mut calls = 0;
+        let got = fill_pids(4, |buf| {
+            calls += 1;
+            let n = buf.len().min(all.len());
+            buf[..n].copy_from_slice(&all[..n]);
+            Ok(n)
+        })
+        .unwrap();
+        assert_eq!(got, all);
+        assert!(calls > 1);
+        // An error from the lister is passed on, never turned into a list.
+        assert!(fill_pids(4, |_| Err(io::Error::other("no"))).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_small_starting_buffer_still_reads_every_process() {
+        let name = "CHOCOFACTORY_TURN_0000000000000000000000000small";
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(exe)
+            .args(["--exact", "proc_table::tests::never_matches", "--nocapture"])
+            .env(name, "1")
+            .env("PROC_TABLE_HOLD", "1")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let me = std::process::id() as i32;
+        let mut found = None;
+        for _ in 0..100 {
+            // Capacity 4 is far below the live count, and this child is
+            // older than whatever else the machine starts meanwhile.
+            let table = platform::read_with_capacity(Some(name), 4).unwrap();
+            assert!(table.iter().any(|e| e.pid == me), "this process is listed");
+            found = table.into_iter().find(|e| e.pid == pid);
+            if found
+                .as_ref()
+                .is_some_and(|e| e.marker == MarkerStatus::Present)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let entry = found.expect("the child is listed");
+        assert_eq!(entry.marker, MarkerStatus::Present);
+        let none = HashSet::new();
+        let input = OwnershipInput {
+            agent: None,
+            recorded: &none,
+            daemon_pid: me,
+            daemon_sid: -5,
+            uid: entry.uid,
+        };
+        assert!(owned_pids(&[entry.clone()], &input).contains(&pid));
+    }
+
+    #[test]
+    fn a_seed_in_the_daemons_session_owns_nothing_else_there_without_the_agent() {
+        // The agent is absent from the table (an exited, unreaped agent).
+        let mut table = vec![p(D, 1, DS, 10)];
+        let mut seed = p(300, 1, DS, 30);
+        seed.marker = MarkerStatus::Present;
+        table.push(seed);
+        table.push(p(301, 1, DS, 31));
+        let none = HashSet::new();
+        assert_eq!(owned_pids(&table, &input(&none)), vec![300]);
+    }
+
+    #[test]
+    fn an_unreadable_or_unchecked_environment_is_not_a_marker() {
+        for status in [MarkerStatus::Unreadable, MarkerStatus::NotChecked] {
+            let mut table = base();
+            let mut orphan = p(300, 1, 300, 30);
+            orphan.marker = status;
+            table.push(orphan);
+            table.push(p(301, 1, 300, 31));
+            let none = HashSet::new();
+            assert!(owned_pids(&table, &input(&none)).is_empty(), "{status:?}");
+        }
     }
 
     #[test]

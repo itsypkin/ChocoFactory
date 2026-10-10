@@ -5229,6 +5229,43 @@ mod tests {
         assert!(note.contains(&format!("{job} (")), "{note}");
     }
 
+    /// A job nobody announced, with no readable marker, still the agent's
+    /// descendant when the turn reports. The CLI then lets it be orphaned and
+    /// exits on its own: only the pids recorded at `TurnCompleted` link the
+    /// job to the turn.
+    #[tokio::test]
+    async fn an_unannounced_unmarked_job_is_found_through_the_pids_recorded_at_turn_completed() {
+        let dir = TempDir::new();
+        let job_pid_file = dir.0.join("job.pid");
+        let release = dir.0.join("release");
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "spawn_escaped", "setsid": true, "double_fork": true, "scrub_env": true,
+                 "defer_release": true, "pid_file": job_pid_file},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "release_escaped", "release_file": release},
+                {"op": "exit"},
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let job = read_pid_when_written(&job_pid_file).await;
+        // The descendants are recorded before the event is stored.
+        wait_for_turn_completed(&pool, &session_id).await;
+        std::fs::write(&release, "").unwrap();
+        wait_until_final(&pool, &session_id).await;
+        wait_until_gone(job).await;
+        let note = note_message(&pool, &session_id, "leftovers_killed")
+            .await
+            .unwrap();
+        assert!(note.contains(&format!("{job} (")), "{note}");
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(run.end_reason, None);
+    }
+
     /// An orphaned session nobody announced: one process carries the marker,
     /// one does not. The first is a seed; the second is owned through the
     /// session.

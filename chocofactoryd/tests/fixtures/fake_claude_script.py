@@ -51,8 +51,12 @@ Steps, run in order:
   pid), `announce` (emit a `background_tasks_changed` line listing the job
   while the intermediate is still alive), `release_file` (after announcing,
   wait for this file to exist), `wait_orphaned` (don't continue until the
-  intermediate has exited). The intermediate stays alive until the announce
-  and release are done.
+  intermediate has exited), `defer_release` (return at once and keep the
+  intermediate alive until a later `release_escaped` step). The intermediate
+  stays alive until the announce and release are done.
+- `{"op": "release_escaped", "release_file": path?}` — wait for `release_file`
+  (when given), then let every deferred intermediate go and reap it, so its job
+  is orphaned.
 
 After the last step the process waits for stdin EOF, then exits 0.
 """
@@ -146,6 +150,9 @@ def wait_for_file(path, seconds=30):
         time.sleep(0.01)
 
 
+DEFERRED = []
+
+
 def spawn_escaped(step, session_id):
     read_fd, write_fd = os.pipe()
     intermediate = os.fork()
@@ -184,11 +191,23 @@ def spawn_escaped(step, session_id):
                 ],
             }
         )
+    if step.get("defer_release"):
+        DEFERRED.append((write_fd, intermediate))
+        return
     if step.get("release_file"):
         wait_for_file(step["release_file"])
     os.close(write_fd)
     if step.get("double_fork") or step.get("wait_orphaned"):
         os.waitpid(intermediate, 0)
+
+
+def release_escaped(step):
+    if step.get("release_file"):
+        wait_for_file(step["release_file"])
+    for write_fd, intermediate in DEFERRED:
+        os.close(write_fd)
+        os.waitpid(intermediate, 0)
+    DEFERRED.clear()
 
 
 def result(session_id, is_error=False):
@@ -278,6 +297,8 @@ def main():
             emit(step["line"])
         elif op == "spawn_escaped":
             spawn_escaped(step, session_id)
+        elif op == "release_escaped":
+            release_escaped(step)
         elif op == "exit":
             sys.exit(step.get("code", 0))
         else:
