@@ -1404,6 +1404,54 @@ async fn retry_resumes_a_usage_limited_branch() {
 }
 
 #[tokio::test]
+async fn a_mixed_retry_reports_resumed_false_and_names_only_the_fresh_branch() {
+    let script = by_prompt(&[
+        (
+            "BRANCH-ONE",
+            json!([{"op": "read_turn"}, {"op": "usage_limit"}]),
+        ),
+        ("BRANCH-TWO", report_steps("bogus", "x")),
+        ("SUMMARIZE", summarize_steps()),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let old = g.sessions("one").await.remove(0);
+    set_script(
+        &g,
+        by_prompt(&[
+            (
+                "Your previous turn on this stage was interrupted",
+                report_steps("clean", "sum-one"),
+            ),
+            ("BRANCH-TWO", report_steps("clean", "sum-two")),
+            ("SUMMARIZE", summarize_steps()),
+        ]),
+    );
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    assert!(!outcome.resumed);
+    let top = outcome.fresh_reason.clone().unwrap();
+    assert!(
+        top.starts_with("1 of 2 re-run branch(es) start fresh: 'two' ("),
+        "{top}"
+    );
+    assert!(!top.contains("'one'"), "{top}");
+    assert_eq!(outcome.branches.len(), 2);
+    assert_eq!(
+        outcome.branches[0],
+        chocofactory_core::models::RetriedBranch {
+            branch: "one".to_string(),
+            resumed: true,
+            adapter_session_id: Some(old.adapter_session_id.clone().unwrap()),
+            fresh_reason: None,
+        }
+    );
+    assert_eq!(outcome.branches[1].branch, "two");
+    assert!(!outcome.branches[1].resumed);
+    assert!(outcome.branches[1].fresh_reason.is_some());
+}
+
+#[tokio::test]
 async fn resume_with_a_non_resumable_branch_changes_nothing() {
     let script = by_prompt(&[
         ("BRANCH-ONE", report_steps("bogus", "x")),
