@@ -459,6 +459,19 @@ pub enum EventType {
     /// `{"field": "head"|"branch"|"status", "before", "after"}` and `message`
     /// is the reason the task was parked as stuck.
     WorktreeChanged,
+    /// A parallel group started one of its branches. Task-scoped
+    /// (`session_id` is `None`). Payload is `{"group", "branch", "kind",
+    /// "entry", "via"}`: `group` is the group stage's name, `branch` the
+    /// branch's name, `kind` its stage kind as YAML spells it, `entry` the
+    /// group's entry number (an integer), and `via` is null for a start on
+    /// entering the group, `"retry"` for a fresh start by a retry, or
+    /// `"retry_resume"` for a retry that resumed the interrupted session.
+    BranchStarted,
+    /// A parallel group's branch finished. Task-scoped (`session_id` is
+    /// `None`). Payload is `{"group", "branch", "entry", "state"}` plus
+    /// `"result"` when `state` is `"done"` (the outcome the branch reported)
+    /// or `"reason"` when it is `"failed"` (the failure text); never both.
+    BranchFinished,
 }
 
 impl fmt::Display for EventType {
@@ -481,6 +494,8 @@ impl fmt::Display for EventType {
             EventType::SessionNote => "session_note",
             EventType::WorktreeBaseline => "worktree_baseline",
             EventType::WorktreeChanged => "worktree_changed",
+            EventType::BranchStarted => "branch_started",
+            EventType::BranchFinished => "branch_finished",
         })
     }
 }
@@ -518,6 +533,8 @@ impl FromStr for EventType {
             "session_note" => Ok(EventType::SessionNote),
             "worktree_baseline" => Ok(EventType::WorktreeBaseline),
             "worktree_changed" => Ok(EventType::WorktreeChanged),
+            "branch_started" => Ok(EventType::BranchStarted),
+            "branch_finished" => Ok(EventType::BranchFinished),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -675,6 +692,8 @@ mod tests {
             EventType::SessionNote,
             EventType::WorktreeBaseline,
             EventType::WorktreeChanged,
+            EventType::BranchStarted,
+            EventType::BranchFinished,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),
@@ -704,5 +723,30 @@ mod tests {
             serde_json::to_string(&EventType::ToolResult).unwrap(),
             "\"tool_result\""
         );
+    }
+
+    #[test]
+    fn branch_events_serialize_and_round_trip() {
+        assert_eq!(
+            serde_json::to_string(&EventType::BranchStarted).unwrap(),
+            "\"branch_started\""
+        );
+        for (event_type, name) in [
+            (EventType::BranchStarted, "branch_started"),
+            (EventType::BranchFinished, "branch_finished"),
+        ] {
+            let event = Event {
+                id: "e".into(),
+                task_id: "t".into(),
+                session_id: None,
+                event_type,
+                payload: serde_json::json!({"group": "g"}),
+                created_at: Utc::now(),
+            };
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["event_type"], name);
+            let back: Event = serde_json::from_str(&json.to_string()).unwrap();
+            assert_eq!(back, event);
+        }
     }
 }

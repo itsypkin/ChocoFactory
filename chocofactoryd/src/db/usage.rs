@@ -210,6 +210,7 @@ mod tests {
     use super::*;
     use crate::adapter::{BillingMode, ModelUsage, UsageCounting};
     use crate::db::{connect_in_memory, projects, sessions, tasks};
+    use chocofactory_core::models::EventType;
 
     fn usage(cost: Option<f64>, input: u64, models: Option<Vec<ModelUsage>>) -> TurnUsage {
         TurnUsage {
@@ -550,6 +551,212 @@ mod tests {
         let task = new_task(&pool).await;
         let a = new_session(&pool, &task, "implement").await;
         assert_eq!(lap(&pool, &a).await, Some(1));
+    }
+
+    async fn start_branch(
+        pool: &SqlitePool,
+        task: &str,
+        group: &str,
+        branch: &str,
+        entry: i64,
+        via: Option<&str>,
+    ) {
+        events::append_branch_started(pool, task, group, branch, "agent_turn", entry, via)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn branch_lap_advances_per_entry() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        let mut laps = Vec::new();
+        for entry in 1..=3 {
+            enter(
+                &pool,
+                &task,
+                "panel",
+                if entry == 1 { None } else { Some("done") },
+            )
+            .await;
+            start_branch(&pool, &task, "panel", "sec", entry, None).await;
+            let s = new_session(&pool, &task, "sec").await;
+            laps.push(lap(&pool, &s).await);
+        }
+        assert_eq!(laps, vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[tokio::test]
+    async fn a_retry_does_not_advance_a_branch_lap() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        start_branch(&pool, &task, "panel", "sec", 1, None).await;
+        let a = new_session(&pool, &task, "sec").await;
+        assert_eq!(lap(&pool, &a).await, Some(1));
+
+        start_branch(&pool, &task, "panel", "sec", 1, Some("retry")).await;
+        let b = new_session(&pool, &task, "sec").await;
+        assert_eq!(lap(&pool, &b).await, Some(1));
+
+        start_branch(&pool, &task, "panel", "sec", 1, Some("retry_resume")).await;
+        let c = resumed(&pool, &task, "sec", &a).await;
+        assert_eq!(lap(&pool, &c).await, Some(1));
+        let d = new_session(&pool, &task, "sec").await;
+        assert_eq!(lap(&pool, &d).await, Some(1));
+
+        start_branch(&pool, &task, "panel", "sec", 2, None).await;
+        let e = new_session(&pool, &task, "sec").await;
+        assert_eq!(lap(&pool, &e).await, Some(2));
+    }
+
+    async fn review_laps(pool: &SqlitePool, task: &str, with_branches: bool) -> Vec<Option<i64>> {
+        let mut laps = Vec::new();
+        enter(pool, task, "review", None).await;
+        if with_branches {
+            start_branch(pool, task, "review", "sec", 1, None).await;
+            start_branch(pool, task, "review", "other", 1, None).await;
+        }
+        let s = new_session(pool, task, "review").await;
+        laps.push(lap(pool, &s).await);
+        enter(pool, task, "implement", Some("changes_requested")).await;
+        if with_branches {
+            start_branch(pool, task, "g", "other", 2, Some("retry")).await;
+            start_branch(pool, task, "g", "other", 2, Some("retry_resume")).await;
+        }
+        enter(pool, task, "review", Some("done")).await;
+        if with_branches {
+            start_branch(pool, task, "review", "sec", 2, None).await;
+        }
+        let s = new_session(pool, task, "review").await;
+        laps.push(lap(pool, &s).await);
+        laps
+    }
+
+    #[tokio::test]
+    async fn ordinary_stages_are_unaffected_by_branch_events() {
+        let pool = connect_in_memory().await.unwrap();
+        let with = new_task(&pool).await;
+        let without = new_task(&pool).await;
+        let a = review_laps(&pool, &with, true).await;
+        let b = review_laps(&pool, &without, false).await;
+        assert_eq!(a, vec![Some(1), Some(2)]);
+        assert_eq!(a, b);
+    }
+
+    /// The pre-change lap expression, verbatim, evaluated as a plain SELECT.
+    async fn old_lap(pool: &SqlitePool, task: &str, stage: &str, from: Option<&str>) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT CASE WHEN ?9 IS NOT NULL
+                THEN (SELECT lap FROM sessions WHERE id = ?9)
+                ELSE MAX(1, (SELECT COUNT(*) FROM events
+                    WHERE task_id = ?2 AND event_type = 'stage_entered'
+                      AND json_extract(payload, '$.stage') = ?3
+                      AND COALESCE(json_extract(payload, '$.outcome'), '') NOT IN ('retry', 'retry_resume')))
+            END",
+        )
+        .bind(None::<String>)
+        .bind(task)
+        .bind(stage)
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind(from)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn checked(pool: &SqlitePool, task: &str, stage: &str, from: Option<&str>) -> String {
+        let reference = old_lap(pool, task, stage, from).await;
+        let id = match from {
+            Some(f) => resumed(pool, task, stage, f).await,
+            None => new_session(pool, task, stage).await,
+        };
+        assert_eq!(
+            lap(pool, &id).await,
+            Some(reference),
+            "{stage} from {from:?}"
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn laps_equal_the_old_computation_on_data_without_branch_events() {
+        let pool = connect_in_memory().await.unwrap();
+        let t1 = new_task(&pool).await;
+        let t2 = new_task(&pool).await;
+        let mut made: Vec<(String, String)> = Vec::new();
+        for task in [&t1, &t2] {
+            enter(&pool, task, "coding", None).await;
+            events::append_for_task(
+                &pool,
+                task,
+                EventType::ShellOutput,
+                json!({"stage": "coding", "output": "x"}),
+            )
+            .await
+            .unwrap();
+            let s = checked(&pool, task, "coding", None).await;
+            made.push((task.clone(), s.clone()));
+            enter(&pool, task, "internal_review", Some("done")).await;
+            checked(&pool, task, "internal_review", None).await;
+            enter(&pool, task, "revising", Some("changes_requested")).await;
+            events::append_for_task(
+                &pool,
+                task,
+                EventType::TemplateUnresolved,
+                json!({"stage": "revising", "placeholders": []}),
+            )
+            .await
+            .unwrap();
+            checked(&pool, task, "revising", None).await;
+            enter(&pool, task, "coding", Some("done")).await;
+            events::append_for_task(
+                &pool,
+                task,
+                EventType::BranchCleanup,
+                json!({"branch": "coding", "sha": "x", "action": "kept", "message": "m"}),
+            )
+            .await
+            .unwrap();
+            checked(&pool, task, "coding", None).await;
+            enter(&pool, task, "coding", Some("retry")).await;
+            checked(&pool, task, "coding", None).await;
+            enter(&pool, task, "coding", Some("retry_resume")).await;
+            checked(&pool, task, "coding", Some(&s)).await;
+            checked(&pool, task, "open_pr", None).await;
+        }
+        for (task, via) in [
+            (&t1, None),
+            (&t1, Some("retry")),
+            (&t2, Some("retry_resume")),
+        ] {
+            start_branch(&pool, task, "coding", "sec", 1, via).await;
+            start_branch(&pool, task, "g", "perf", 2, via).await;
+        }
+        for (task, s) in &made {
+            checked(&pool, task, "coding", None).await;
+            checked(&pool, task, "coding", Some(s)).await;
+            checked(&pool, task, "internal_review", None).await;
+            checked(&pool, task, "open_pr", None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_laps_are_not_recomputed() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        enter(&pool, &task, "x", None).await;
+        let s = new_session(&pool, &task, "x").await;
+        assert_eq!(lap(&pool, &s).await, Some(1));
+        for entry in 1..=3 {
+            start_branch(&pool, &task, "g", "x", entry, None).await;
+        }
+        assert_eq!(lap(&pool, &s).await, Some(1));
+        let n = new_session(&pool, &task, "x").await;
+        assert_eq!(lap(&pool, &n).await, Some(4));
     }
 
     #[tokio::test]
