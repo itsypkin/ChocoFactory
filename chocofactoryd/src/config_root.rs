@@ -1482,6 +1482,44 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     }
 
     #[test]
+    fn coder_system_step_four_asks_for_a_sketch_of_the_new_order() {
+        let text = squash(embedded_prompt("coder-system.md"));
+        let step = &text[index_of(&text, "4. Write the pull request's description")
+            ..index_of(&text, "5. Call `report_outcome`")];
+        let rule = "When the change alters what happens in what order (which function calls \
+                    which, a state's transitions, or where files live), end this section with \
+                    one small sketch of the new order in a fenced plain-text block, not a \
+                    diagram language: a call tree, or a call tree with `+` lines for what was \
+                    added and `-` lines for what was removed, keeping only the calls that \
+                    matter, in about 15 lines at most. Leave it out for a change of a few \
+                    lines or one that changes only text.";
+        assert_says(
+            step,
+            &[rule],
+            "coder-system.md step 4 must ask for a sketch",
+        );
+        let rule_at = index_of(step, "When the change alters what happens in what order");
+        assert!(
+            index_of(step, "- `## Solution`:") < rule_at
+                && rule_at < index_of(step, "- `## Changes, in reading order`:"),
+            "the sketch rule must sit inside the Solution bullet"
+        );
+        let example = &step[index_of(step, "For example:")..];
+        let sol = index_of(example, "## Solution");
+        let chg = index_of(example, "## Changes, in reading order");
+        let plus = index_of(example, "+ resume_interrupted_polls");
+        let minus = index_of(example, "- wait on a timer that pauses during sleep");
+        assert!(
+            sol < plus && plus < chg && sol < minus && minus < chg,
+            "the example sketch must sit inside its Solution"
+        );
+        assert!(
+            example[sol..plus].contains("```") && example[minus..chg].contains("```"),
+            "the example sketch must be fenced"
+        );
+    }
+
+    #[test]
     fn reviewer_turn_reads_the_pr_description() {
         let text = squash(embedded_prompt("reviewer-turn.md"));
         assert_says(
