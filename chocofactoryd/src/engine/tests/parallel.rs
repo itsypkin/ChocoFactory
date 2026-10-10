@@ -7,6 +7,8 @@ use chocofactory_core::models::{SessionEndReason, WorkflowState};
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
     Summarize,
+    /// An agent_turn target with no `prompt_file`, so entering it fails.
+    Bare,
     Back,
 }
 
@@ -49,6 +51,10 @@ fn yaml(shape: Shape) -> String {
         Target::Summarize => (
             "summarize",
             "  summarize:\n    kind: agent_turn\n    role: reviewer\n    prompt_file: summarize.md\n    on: { done: finished }\n",
+        ),
+        Target::Bare => (
+            "summarize",
+            "  summarize:\n    kind: agent_turn\n    role: reviewer\n    on: { done: finished }\n",
         ),
         Target::Back => (
             "back",
@@ -403,6 +409,16 @@ async fn a_failed_branch_settles_with_its_sibling_kept() {
             .iter()
             .any(|e| e.payload["stage"] == "panel" && e.payload["stuck"] == true),
         "{errors:?}"
+    );
+    // The branch's own failure is on the timeline before the settle's error.
+    let all = events::list_for_task(&g.pool, &g.task_id).await.unwrap();
+    let at = |kind: EventType, stage_key: &str, name: &str| {
+        all.iter()
+            .position(|e| e.event_type == kind && e.payload[stage_key] == name)
+            .unwrap_or_else(|| panic!("no {kind:?} for {name}"))
+    };
+    assert!(
+        at(EventType::BranchFinished, "branch", "one") < at(EventType::Error, "stage", "panel")
     );
 }
 
@@ -1044,4 +1060,149 @@ async fn a_failed_settle_writes_neither_the_payload_nor_the_stuck_status() {
     // payload, and the task is still open.
     assert_eq!(g.state().await.payload, before);
     assert_eq!(g.status().await, "open");
+}
+
+// A done target that cannot be entered parks the task there.
+#[tokio::test]
+async fn a_done_target_that_cannot_be_entered_parks_the_task() {
+    let mut shape = Shape::new();
+    shape.target = Target::Bare;
+    let g = group(shape, both_report("clean")).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let reason = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(
+        reason.contains("stage 'summarize': could not be entered after 'panel' completed"),
+        "{reason}"
+    );
+    let state = g.state().await;
+    assert_eq!(state.current_stage, "summarize");
+    assert!(state.payload.get("parallel").is_none());
+}
+
+// A database failure while recording a branch's end parks the task.
+#[tokio::test]
+async fn a_failed_branch_write_parks_the_task_with_the_error() {
+    let g = group(Shape::new(), holding()).await;
+    g.start(None).await.unwrap();
+    let one = g.wait_sessions("one", 1).await.remove(0);
+    g.wait_sessions("two", 1).await;
+    let before = g.state().await.payload;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_state_update BEFORE UPDATE ON workflow_state
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    let applied = g.finish(1, "one", &one.id, reported("clean", "x")).await;
+    assert!(matches!(applied, BranchApplied::Parked(_)), "{applied:?}");
+    assert_eq!(g.status().await, "stuck");
+    let reason = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(
+        reason.contains("could not record the branch's end"),
+        "{reason}"
+    );
+    assert_eq!(g.state().await.payload, before);
+}
+
+// The timeline's `turn_outcome` says what became of each branch's turn.
+#[tokio::test]
+async fn turn_outcome_events_say_whether_a_branch_was_applied() {
+    let script = by_prompt(&[
+        ("BRANCH-ONE", report_steps("bogus", "x")),
+        ("BRANCH-TWO", report_steps("clean", "sum-two")),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    let events = g.events_of(EventType::TurnOutcome).await;
+    let of = |stage: &str| {
+        events
+            .iter()
+            .find(|e| e.payload["stage"] == stage)
+            .unwrap_or_else(|| panic!("no turn_outcome for {stage}: {events:?}"))
+            .payload
+            .clone()
+    };
+    let one = of("one");
+    assert_eq!(one["applied"], false, "{one}");
+    assert_eq!(one["note"], "branch recorded as failed", "{one}");
+    let two = of("two");
+    assert_eq!(two["applied"], true, "{two}");
+}
+
+#[tokio::test]
+async fn a_turn_outcome_for_a_dropped_branch_end_is_not_applied() {
+    let script = by_prompt(&[
+        (
+            "BRANCH-ONE",
+            json!([
+                {"op": "read_turn"},
+                {"op": "sleep", "seconds": 2},
+                {"op": "report", "outcome": "clean", "summary": "x"},
+                {"op": "result"},
+            ]),
+        ),
+        ("BRANCH-TWO", hold_steps()),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_sessions("one", 1).await;
+    g.wait_sessions("two", 1).await;
+    assert!(
+        tasks::mark_stuck(&g.pool, &g.task_id, "manual")
+            .await
+            .unwrap()
+    );
+    let event = crate::test_support::wait_until("one's turn_outcome", || async {
+        g.events_of(EventType::TurnOutcome)
+            .await
+            .into_iter()
+            .find(|e| e.payload["stage"] == "one")
+            .ok_or_else(|| "none yet".to_string())
+    })
+    .await;
+    assert_eq!(event.payload["applied"], false, "{event:?}");
+    let note = event.payload["note"].as_str().unwrap_or_default();
+    assert!(note.starts_with("not applied:"), "{event:?}");
+    assert_eq!(
+        branch_slot(&g.state().await.payload, "one")["state"],
+        "running"
+    );
+}
+
+// A reply that cannot be read back fails the branch.
+#[tokio::test]
+async fn an_unreadable_reply_fails_the_branch() {
+    let script = by_prompt(&[
+        ("BRANCH-ONE", hold_steps()),
+        ("BRANCH-TWO", report_steps("clean", "sum-two")),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    let one = g.wait_sessions("one", 1).await.remove(0);
+    // A malformed event on one's session makes the query that reads its
+    // reply back fail.
+    sqlx::query(
+        "INSERT INTO events (id, task_id, session_id, event_type, payload, created_at)
+         VALUES ('bad-event', ?, ?, 'assistant_message', 'not json', datetime('now'))",
+    )
+    .bind(&g.task_id)
+    .bind(&one.id)
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    // The turn ends idle with no report, so the watcher goes to read it back.
+    sessions::update_status(&g.pool, &one.id, SessionStatus::Idle, None, None)
+        .await
+        .unwrap();
+    g.wait_status("stuck").await;
+    let reason = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(
+        reason.contains("the turn's reply could not be read back"),
+        "{reason}"
+    );
+    let payload = g.state().await.payload;
+    assert_eq!(branch_slot(&payload, "one")["state"], "failed");
 }

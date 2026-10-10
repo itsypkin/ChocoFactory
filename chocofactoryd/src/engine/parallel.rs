@@ -241,15 +241,16 @@ impl WorkflowEngine {
     }
 
     /// Commits a group's failure settle (payload + `stuck` in one
-    /// transaction) and appends the `Error` event after it, as `mark_stuck`
-    /// does.
+    /// transaction). Returns the stuck reason when the task was marked stuck;
+    /// the caller appends the `Error` event (see
+    /// [`Self::append_settle_error`]) after the branches' `branch_finished`.
     async fn settle_group_with_failures(
         &self,
         task_id: &str,
         group: &str,
         branches: &IndexMap<String, Branch>,
         update: workflow_state::WorkflowStateUpdate,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<String>, EngineError> {
         let reason = settle_reason(group, branches, &update.payload);
         let settled = workflow_state::settle_with_failures(&self.pool, task_id, update, &reason)
             .await?
@@ -261,8 +262,13 @@ impl WorkflowEngine {
                 reason,
                 "parallel group settled with failures but the task was no longer open"
             );
-            return Ok(());
+            return Ok(None);
         }
+        Ok(Some(reason))
+    }
+
+    /// Appends the settle's `Error` event, best-effort, as `mark_stuck` does.
+    async fn append_settle_error(&self, task_id: &str, group: &str, reason: String) {
         tracing::error!(task_id, reason, "task stuck: {reason}");
         match events::append_for_task(
             &self.pool,
@@ -275,7 +281,6 @@ impl WorkflowEngine {
             Ok(_) => self.events_notify.notify_waiters(),
             Err(err) => tracing::error!(task_id, %err, "failed to record a stuck-task event"),
         }
-        Ok(())
     }
 
     /// Enters a parallel group under the task lock the caller holds: records
@@ -415,16 +420,17 @@ impl WorkflowEngine {
             payload,
             enters_stage: false,
         };
-        if any_running {
+        let stuck_reason = if any_running {
             workflow_state::update(&self.pool, task_id, update)
                 .await?
                 .ok_or(EngineError::NoWorkflowState)?;
+            None
         } else {
             self.settle_group_with_failures(task_id, group, branches, update)
-                .await?;
-        }
-        // Appended after the commit, once per failed start; the settle's
-        // `Error` event (if any) is already on the timeline before them.
+                .await?
+        };
+        // Appended after the commit, once per failed start, then the
+        // settle's `Error` event (if it marked the task stuck).
         for (name, reason) in failures {
             self.record_branch_finished(
                 task_id,
@@ -434,6 +440,9 @@ impl WorkflowEngine {
                 BranchEnd::Failed { reason },
             )
             .await;
+        }
+        if let Some(reason) = stuck_reason {
+            self.append_settle_error(task_id, group, reason).await;
         }
         Ok(())
     }
@@ -627,10 +636,14 @@ impl WorkflowEngine {
                     .await;
                 return Ok((BranchApplied::Recorded { done }, false));
             }
-            self.settle_group_with_failures(task_id, group, branches, update)
+            let stuck_reason = self
+                .settle_group_with_failures(task_id, group, branches, update)
                 .await?;
             self.record_branch_end(task_id, group, branch, watch.entry, &ended)
                 .await;
+            if let Some(reason) = stuck_reason {
+                self.append_settle_error(task_id, group, reason).await;
+            }
             return Ok((BranchApplied::Recorded { done }, true));
         }
 
