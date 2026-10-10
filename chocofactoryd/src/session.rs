@@ -811,6 +811,18 @@ async fn drain_session(
                 {
                     tracing::error!(session_id, %err, "failed to persist adapter_session_id");
                 }
+                // Recorded while the agent is alive and its children are still
+                // its children: a background job's shell is the CLI's child
+                // only until the CLI exits.
+                if kind == SessionKind::SingleShot
+                    && matches!(
+                        event,
+                        AgentEvent::BackgroundJobs { .. } | AgentEvent::TurnCompleted { .. }
+                    )
+                    && let Some(agent) = *pgid.lock().await
+                {
+                    tracker.record_descendants(agent, "turn event").await;
+                }
                 let event_type = event.event_type();
                 let mut payload = event.payload();
                 if turn.completed
@@ -834,18 +846,6 @@ async fn drain_session(
                         events_notify.notify_waiters();
                     }
                     Err(err) => tracing::error!(session_id, %err, "failed to append event"),
-                }
-                // Recorded while the agent is alive and its children are still
-                // its children: a background job's shell is the CLI's child
-                // only until the CLI exits.
-                if kind == SessionKind::SingleShot
-                    && matches!(
-                        event,
-                        AgentEvent::BackgroundJobs { .. } | AgentEvent::TurnCompleted { .. }
-                    )
-                    && let Some(agent) = *pgid.lock().await
-                {
-                    tracker.record_descendants(agent, "turn event").await;
                 }
                 if kind == SessionKind::SingleShot {
                     match turn.observe(&event) {
@@ -3394,17 +3394,18 @@ mod tests {
     }
 
     /// The issue's third case: a job that never ends is bounded by the
-    /// job-wait limit, and the grace kill takes it down with the group.
+    /// job-wait limit. The job runs in a session of its own, as Claude Code's
+    /// Bash tool runs it, so the group kill does not reach it: the sweep that
+    /// follows the kill does.
     #[tokio::test]
     async fn a_hung_job_closes_the_turn_as_no_report_at_the_limit() {
         let dir = TempDir::new();
-        let heartbeat = dir.0.join("heartbeat");
         let child_pid_path = dir.0.join("child.pid");
         let binary = script_binary(
             &dir.0,
             json!([
                 {"op": "read_turn"},
-                {"op": "spawn_child", "heartbeat": heartbeat, "pid_file": child_pid_path},
+                {"op": "spawn_escaped", "setsid": true, "pid_file": child_pid_path},
                 {"op": "raw", "line": one_job()},
                 {"op": "result"},
                 {"op": "sleep", "seconds": 60},
@@ -3422,7 +3423,13 @@ mod tests {
         assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
         assert_eq!(
             session_notes(&pool, &session_id).await,
-            vec!["background_jobs", "job_wait", "no_report", "lingered"]
+            vec![
+                "background_jobs",
+                "job_wait",
+                "no_report",
+                "lingered",
+                "leftovers_killed"
+            ]
         );
         let notes = note_events(&pool, &session_id).await;
         let message = notes[2].payload["message"].as_str().unwrap();
@@ -4897,5 +4904,485 @@ mod tests {
         )
         .await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- leftovers: what a turn started is killed when it ends ------------
+
+    /// An escaped job: its own session, started through an intermediate that
+    /// exits, so it is neither in the agent's group nor its descendant.
+    fn escaped_job(pid_file: &std::path::Path) -> serde_json::Value {
+        json!({
+            "op": "spawn_escaped", "setsid": true, "double_fork": true, "pid_file": pid_file,
+        })
+    }
+
+    async fn start_leftovers(
+        binary: String,
+        timers: TurnTimers,
+        idle: chrono::Duration,
+        reader: Option<crate::proc_table::ProcReader>,
+    ) -> (SqlitePool, String, Arc<SessionManager>) {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let registry = Registry::single(adapter);
+        let notify = Arc::new(Notify::new());
+        let manager = match reader {
+            Some(reader) => SessionManager::with_proc_reader(
+                pool.clone(),
+                registry,
+                idle,
+                notify,
+                timers,
+                reader,
+            ),
+            None => SessionManager::with_turn_timers(pool.clone(), registry, idle, notify, timers),
+        };
+        manager
+            .start(
+                &session_id,
+                "claude",
+                "go",
+                &single_shot_role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+        (pool, session_id, manager)
+    }
+
+    async fn note_message(pool: &SqlitePool, session_id: &str, kind: &str) -> Option<String> {
+        note_events(pool, session_id)
+            .await
+            .into_iter()
+            .find(|e| e.payload["kind"] == kind)
+            .map(|e| e.payload["message"].as_str().unwrap_or_default().to_string())
+    }
+
+    async fn wait_for_turn_completed(pool: &SqlitePool, session_id: &str) {
+        crate::test_support::wait_until("a turn_completed event", || async {
+            let events = events::list_for_session(pool, session_id).await.unwrap();
+            if events.iter().any(|e| e.event_type == EventType::TurnCompleted) {
+                Ok(())
+            } else {
+                Err("not yet".to_string())
+            }
+        })
+        .await
+    }
+
+    enum EndAction {
+        Nothing,
+        Reap,
+        Cancel,
+        Shutdown,
+    }
+
+    /// Runs a fixture with one escaped job to the end of its turn and checks
+    /// the job is gone and named in the `leftovers_killed` note.
+    async fn assert_escaped_job_is_killed(
+        extra_steps: Vec<serde_json::Value>,
+        timers: TurnTimers,
+        action: EndAction,
+    ) -> (SqlitePool, String) {
+        let dir = TempDir::new();
+        let job_pid_file = dir.0.join("job.pid");
+        let mut steps = vec![json!({"op": "read_turn"}), escaped_job(&job_pid_file)];
+        steps.extend(extra_steps);
+        let idle = match action {
+            EndAction::Reap => chrono::Duration::zero(),
+            _ => chrono::Duration::hours(1),
+        };
+        let binary = script_binary(&dir.0, json!(steps));
+        let (pool, session_id, manager) = start_leftovers(binary, timers, idle, None).await;
+        let job = read_pid_when_written(&job_pid_file).await;
+        match action {
+            EndAction::Nothing => {}
+            EndAction::Reap => {
+                wait_for_turn_completed(&pool, &session_id).await;
+                reap_once(&manager).await;
+            }
+            EndAction::Cancel => manager.cancel(&session_id).await.unwrap(),
+            EndAction::Shutdown => manager.shutdown(StdDuration::from_secs(20)).await,
+        }
+        wait_until_final(&pool, &session_id).await;
+        wait_until_gone(job).await;
+        let note = note_message(&pool, &session_id, "leftovers_killed")
+            .await
+            .expect("a leftovers_killed note");
+        assert!(note.contains(&format!("{job} (")), "{note}");
+        (pool, session_id)
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_when_the_cli_exits_on_its_own_after_reporting() {
+        let (pool, id) = assert_escaped_job_is_killed(
+            vec![
+                json!({"op": "report", "outcome": "done"}),
+                json!({"op": "result"}),
+                json!({"op": "exit"}),
+            ],
+            fast_timers(3),
+            EndAction::Nothing,
+        )
+        .await;
+        let run = sessions::get(&pool, &id).await.unwrap().unwrap();
+        // The sweep does not change how the turn ended.
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(run.end_reason, None);
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_when_the_cli_lingers_after_reporting() {
+        let (pool, id) = assert_escaped_job_is_killed(
+            vec![
+                json!({"op": "report", "outcome": "done"}),
+                json!({"op": "result"}),
+                json!({"op": "sleep", "seconds": 60}),
+            ],
+            fast_timers(3),
+            EndAction::Nothing,
+        )
+        .await;
+        let run = sessions::get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::Lingered));
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_when_the_turn_closes_as_no_report_after_nudges() {
+        let (pool, id) = assert_escaped_job_is_killed(
+            vec![
+                json!({"op": "result"}),
+                json!({"op": "sleep", "seconds": 60}),
+            ],
+            fast_timers(1),
+            EndAction::Nothing,
+        )
+        .await;
+        let run = sessions::get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_when_the_job_wait_limit_closes_the_turn() {
+        let timers = TurnTimers {
+            job_wait_limit: StdDuration::from_millis(300),
+            ..fast_timers(3)
+        };
+        let (pool, id) = assert_escaped_job_is_killed(
+            vec![
+                json!({"op": "raw", "line": one_job()}),
+                json!({"op": "result"}),
+                json!({"op": "sleep", "seconds": 60}),
+            ],
+            timers,
+            EndAction::Nothing,
+        )
+        .await;
+        let run = sessions::get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_when_the_turn_ends_with_an_error_result() {
+        assert_escaped_job_is_killed(
+            vec![
+                json!({"op": "result", "is_error": true}),
+                json!({"op": "sleep", "seconds": 60}),
+            ],
+            fast_timers(3),
+            EndAction::Nothing,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_when_the_idle_reaper_closes_the_turn() {
+        let timers = TurnTimers {
+            nudge_after: StdDuration::from_secs(3600),
+            ..fast_timers(3)
+        };
+        let (pool, id) = assert_escaped_job_is_killed(
+            vec![
+                json!({"op": "result"}),
+                json!({"op": "sleep", "seconds": 60}),
+            ],
+            timers,
+            EndAction::Reap,
+        )
+        .await;
+        let run = sessions::get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::Reaped));
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_on_cancel() {
+        let (pool, id) = assert_escaped_job_is_killed(
+            vec![json!({"op": "sleep", "seconds": 60})],
+            fast_timers(3),
+            EndAction::Cancel,
+        )
+        .await;
+        let run = sessions::get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_on_shutdown() {
+        let (pool, id) = assert_escaped_job_is_killed(
+            vec![json!({"op": "sleep", "seconds": 60})],
+            fast_timers(3),
+            EndAction::Shutdown,
+        )
+        .await;
+        let run = sessions::get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(run.end_reason, Some(SessionEndReason::DaemonStopped));
+    }
+
+    #[tokio::test]
+    async fn an_escaped_job_is_killed_when_the_cli_crashes_mid_turn() {
+        let (pool, id) = assert_escaped_job_is_killed(
+            vec![json!({"op": "exit", "code": 3})],
+            fast_timers(3),
+            EndAction::Nothing,
+        )
+        .await;
+        let run = sessions::get(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, None);
+    }
+
+    /// A job whose environment is scrubbed is found only through the pids
+    /// recorded while it was still the agent's descendant (`BackgroundJobs`).
+    #[tokio::test]
+    async fn a_job_without_the_marker_is_found_through_the_pids_recorded_at_its_announcement() {
+        let dir = TempDir::new();
+        let job_pid_file = dir.0.join("job.pid");
+        let release = dir.0.join("release");
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "spawn_escaped", "setsid": true, "double_fork": true, "scrub_env": true,
+                 "announce": true, "release_file": release, "pid_file": job_pid_file},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let job = read_pid_when_written(&job_pid_file).await;
+        // Recorded before the event is stored, so seeing the note means the
+        // job (still a descendant) is on the list. Only then let its
+        // intermediate parent go.
+        wait_for_note(&pool, &session_id, "background_jobs").await;
+        std::fs::write(&release, "").unwrap();
+        wait_until_final(&pool, &session_id).await;
+        wait_until_gone(job).await;
+        let note = note_message(&pool, &session_id, "leftovers_killed")
+            .await
+            .unwrap();
+        assert!(note.contains(&format!("{job} (")), "{note}");
+    }
+
+    /// An orphaned session nobody announced: one process carries the marker,
+    /// one does not. The first is a seed; the second is owned through the
+    /// session.
+    #[tokio::test]
+    async fn the_markerless_member_of_an_orphaned_session_is_killed_with_its_marked_one() {
+        let dir = TempDir::new();
+        let marked = dir.0.join("marked.pid");
+        let unmarked = dir.0.join("unmarked.pid");
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "spawn_escaped", "setsid": true, "double_fork": true,
+                 "pid_file": marked, "child_pid_file": unmarked},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let marked = read_pid_when_written(&marked).await;
+        let unmarked = read_pid_when_written(&unmarked).await;
+        wait_until_final(&pool, &session_id).await;
+        wait_until_gone(marked).await;
+        wait_until_gone(unmarked).await;
+    }
+
+    #[tokio::test]
+    async fn a_job_that_ignores_sigterm_is_killed() {
+        let dir = TempDir::new();
+        let job_pid_file = dir.0.join("job.pid");
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "spawn_escaped", "setsid": true, "double_fork": true,
+                 "ignore_sigterm": true, "pid_file": job_pid_file},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, fast_timers(3)).await;
+        let job = read_pid_when_written(&job_pid_file).await;
+        wait_until_final(&pool, &session_id).await;
+        wait_until_gone(job).await;
+    }
+
+    /// Three processes the turn did not start survive a sweep.
+    struct Bystanders(Vec<std::process::Child>);
+
+    impl Bystanders {
+        fn start() -> Self {
+            use std::os::unix::process::CommandExt;
+            let in_own_session = |mut command: std::process::Command| {
+                // SAFETY: `setsid` is async-signal-safe.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                command.spawn().unwrap()
+            };
+            let own_session = in_own_session({
+                let mut c = std::process::Command::new("sleep");
+                c.arg("600");
+                c
+            });
+            let other_marker = in_own_session({
+                let mut c = std::process::Command::new("python3");
+                c.args(["-c", "import time; time.sleep(600)"])
+                    .env("CHOCOFACTORY_TURN_00000000000000000000000000000001", "1");
+                c
+            });
+            let plain_child = std::process::Command::new("sleep").arg("600").spawn().unwrap();
+            Bystanders(vec![own_session, other_marker, plain_child])
+        }
+
+        fn all_alive(&self) -> bool {
+            self.0.iter().all(|c| process_alive(c.id()))
+        }
+    }
+
+    impl Drop for Bystanders {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sweep_never_kills_what_the_turn_did_not_start() {
+        for action in [EndAction::Cancel, EndAction::Nothing] {
+            let bystanders = Bystanders::start();
+            let extra = match action {
+                EndAction::Cancel => vec![json!({"op": "sleep", "seconds": 60})],
+                _ => vec![
+                    json!({"op": "report", "outcome": "done"}),
+                    json!({"op": "result"}),
+                    json!({"op": "sleep", "seconds": 60}),
+                ],
+            };
+            assert_escaped_job_is_killed(extra, fast_timers(3), action).await;
+            assert!(bystanders.all_alive(), "a sweep killed a bystander");
+        }
+    }
+
+    /// With the table unreadable, the group kill is still sent, the turn ends
+    /// the way it does with a working reader, and the operator is told.
+    #[tokio::test]
+    async fn an_unreadable_process_table_is_reported_and_changes_nothing_else() {
+        async fn run(
+            reader: Option<crate::proc_table::ProcReader>,
+        ) -> (SessionStatus, Option<SessionEndReason>, Vec<String>) {
+            let dir = TempDir::new();
+            let agent_pid_file = dir.0.join("agent.pid");
+            let binary = script_binary(
+                &dir.0,
+                json!([
+                    {"op": "read_turn"},
+                    {"op": "run", "command": format!("echo $PPID > {}", agent_pid_file.display())},
+                    {"op": "report", "outcome": "done"},
+                    {"op": "result"},
+                    {"op": "sleep", "seconds": 60},
+                ]),
+            );
+            let (pool, session_id, _manager) = start_leftovers(
+                binary,
+                fast_timers(3),
+                chrono::Duration::hours(1),
+                reader,
+            )
+            .await;
+            let agent = read_pid_when_written(&agent_pid_file).await;
+            let run = wait_until_final(&pool, &session_id).await;
+            wait_until_gone(agent).await;
+            (
+                run.status,
+                run.end_reason,
+                session_notes(&pool, &session_id).await,
+            )
+        }
+        let broken: crate::proc_table::ProcReader =
+            Arc::new(|_| Err(std::io::Error::other("injected failure")));
+        let (status, reason, notes) = run(Some(broken)).await;
+        let (good_status, good_reason, good_notes) = run(None).await;
+        assert_eq!((status, reason), (good_status, good_reason));
+        assert_eq!(reason, Some(SessionEndReason::Lingered));
+        assert!(notes.contains(&"leftovers_unchecked".to_string()), "{notes:?}");
+        assert!(!good_notes.contains(&"leftovers_unchecked".to_string()));
+    }
+
+    /// Short waits that each end well inside the limit still add up to it.
+    #[tokio::test]
+    async fn waits_on_short_jobs_add_up_to_one_per_turn_limit() {
+        let dir = TempDir::new();
+        let block = json!([
+            {"op": "raw", "line": one_job()},
+            {"op": "result"},
+            {"op": "sleep", "seconds": 0.8},
+            {"op": "raw", "line": no_jobs()},
+            {"op": "init"},
+        ]);
+        let mut steps = vec![json!({"op": "read_turn"})];
+        for _ in 0..4 {
+            steps.extend(block.as_array().unwrap().clone());
+        }
+        let binary = script_binary(&dir.0, json!(steps));
+        let timers = TurnTimers {
+            nudge_after: StdDuration::from_secs(3600),
+            job_wait_limit: StdDuration::from_secs(2),
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        let message = note_message(&pool, &session_id, "no_report").await.unwrap();
+        assert!(message.contains("a total per turn"), "{message}");
+    }
+
+    #[test]
+    fn lingered_is_decided_from_the_kill_outcomes() {
+        let err = || std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(!lingered_decision(&GroupKill::NothingAlive, 0));
+        assert!(lingered_decision(&GroupKill::Killed(1), 0));
+        assert!(lingered_decision(&GroupKill::NothingAlive, 1));
+        assert!(lingered_decision(&GroupKill::Failed(err()), 0));
+        assert!(lingered_decision(
+            &GroupKill::Unknown {
+                scan_error: err(),
+                signal_result: Ok(())
+            },
+            0
+        ));
     }
 }

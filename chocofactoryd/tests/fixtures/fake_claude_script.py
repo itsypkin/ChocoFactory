@@ -40,7 +40,19 @@ Steps, run in order:
   nothing; lets a test make the "agent" change the worktree.
 - `{"op": "raw", "line": {...}}` — emit `line` verbatim as one JSON line, for
   output the other ops don't model (a `background_tasks_changed` list, say).
-- `{"op": "exit"}` — exit 0 immediately, without waiting for stdin EOF.
+- `{"op": "exit", "code": 0?}` — exit immediately, without waiting for stdin EOF.
+- `{"op": "spawn_escaped", ...}` — start a background job that has left this
+  process's group, the way Claude Code's Bash tool runs a command. Options:
+  `pid_file` (written by the job once it runs), `setsid` (own session and
+  group), `double_fork` (an intermediate process starts the job and exits, so
+  the job is reparented), `scrub_env` (the job's environment drops every
+  `CHOCOFACTORY_TURN_*` variable), `ignore_sigterm`, `child_pid_file` (a second
+  job in the same session, always with a scrubbed environment, writing its own
+  pid), `announce` (emit a `background_tasks_changed` line listing the job
+  while the intermediate is still alive), `release_file` (after announcing,
+  wait for this file to exist), `wait_orphaned` (don't continue until the
+  intermediate has exited). The intermediate stays alive until the announce
+  and release are done.
 
 After the last step the process waits for stdin EOF, then exits 0.
 """
@@ -98,6 +110,85 @@ def usage_limit(session_id, structured=True):
             "session_id": session_id,
         }
     )
+
+
+JOB_CODE = (
+    "import os, signal, sys, time\n"
+    "{ignore}"
+    "tmp = sys.argv[1] + '.tmp'\n"
+    "open(tmp, 'w').write(str(os.getpid()))\n"
+    "os.rename(tmp, sys.argv[1])\n"
+    "time.sleep(600)\n"
+)
+
+
+def start_job(pid_file, scrub, ignore_sigterm):
+    env = dict(os.environ)
+    if scrub:
+        env = {k: v for k, v in env.items() if not k.startswith("CHOCOFACTORY_TURN_")}
+    code = JOB_CODE.format(
+        ignore="signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_sigterm else ""
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", code, pid_file],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_for_file(path, seconds=30):
+    deadline = time.time() + seconds
+    while not os.path.exists(path):
+        if time.time() > deadline:
+            raise SystemExit("timed out waiting for " + path)
+        time.sleep(0.01)
+
+
+def spawn_escaped(step, session_id):
+    read_fd, write_fd = os.pipe()
+    intermediate = os.fork()
+    if intermediate == 0:
+        os.close(write_fd)
+        try:
+            # Don't hold the daemon's output pipes open.
+            null = os.open(os.devnull, os.O_RDWR)
+            os.dup2(null, 1)
+            os.dup2(null, 2)
+            if step.get("setsid"):
+                os.setsid()
+            start_job(
+                step["pid_file"], step.get("scrub_env", False), step.get("ignore_sigterm", False)
+            )
+            if step.get("child_pid_file"):
+                start_job(step["child_pid_file"], True, False)
+            if step.get("double_fork"):
+                # Released when the fixture closes its end of the pipe.
+                os.read(read_fd, 1)
+                os._exit(0)
+            time.sleep(600)
+        finally:
+            os._exit(1)
+    os.close(read_fd)
+    wait_for_file(step["pid_file"])
+    if step.get("child_pid_file"):
+        wait_for_file(step["child_pid_file"])
+    if step.get("announce"):
+        emit(
+            {
+                "type": "system",
+                "subtype": "background_tasks_changed",
+                "tasks": [
+                    {"task_id": "escaped", "task_type": "local_bash", "description": "escaped job"}
+                ],
+            }
+        )
+    if step.get("release_file"):
+        wait_for_file(step["release_file"])
+    os.close(write_fd)
+    if step.get("double_fork") or step.get("wait_orphaned"):
+        os.waitpid(intermediate, 0)
 
 
 def result(session_id, is_error=False):
@@ -185,8 +276,10 @@ def main():
             subprocess.run(["/bin/sh", "-c", step["command"]], check=True)
         elif op == "raw":
             emit(step["line"])
+        elif op == "spawn_escaped":
+            spawn_escaped(step, session_id)
         elif op == "exit":
-            return
+            sys.exit(step.get("code", 0))
         else:
             raise SystemExit("unknown op: {}".format(op))
 

@@ -215,6 +215,16 @@ pub(crate) fn kill_group_with(pid: u32, live: std::io::Result<usize>) -> GroupKi
     } else {
         Err(std::io::Error::last_os_error())
     };
+    classify_group_kill(pgid, live, signal_result)
+}
+
+/// Decides a group kill's outcome from the pre-kill scan and `killpg`'s
+/// result. Pure apart from logging, so every branch can be tested.
+pub(crate) fn classify_group_kill(
+    pgid: i32,
+    live: std::io::Result<usize>,
+    signal_result: Result<(), std::io::Error>,
+) -> GroupKill {
     match live {
         Err(scan_error) => {
             tracing::warn!(pgid, %scan_error, ?signal_result, "could not scan the process table before killing a process group");
@@ -385,6 +395,99 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    // --- group-kill outcomes ---------------------------------------------
+
+    fn wait_for_table(what: &str, mut ok: impl FnMut(&[crate::proc_table::ProcEntry]) -> bool) {
+        for _ in 0..500 {
+            if let Ok(table) = crate::proc_table::read(None)
+                && ok(&table)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn in_own_group(command: &mut std::process::Command) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0).spawn().unwrap()
+    }
+
+    #[test]
+    fn a_group_of_only_zombies_has_nothing_alive() {
+        let mut child = in_own_group(std::process::Command::new("sh").args(["-c", "exit 0"]));
+        let pgid = child.id();
+        // Exited but not reaped.
+        wait_for_table("the child to exit", |t| live_members(t, pgid as i32) == 0);
+        assert!(matches!(kill_group(pgid), GroupKill::NothingAlive));
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_live_group_is_killed() {
+        let mut child = in_own_group(std::process::Command::new("sleep").arg("600"));
+        let pgid = child.id();
+        wait_for_table("the child to run", |t| live_members(t, pgid as i32) == 1);
+        assert!(matches!(kill_group(pgid), GroupKill::Killed(1)));
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_zombie_leader_with_a_live_member_kills_the_member() {
+        let mut child = in_own_group(
+            std::process::Command::new("sh").args(["-c", "sleep 600 & exit 0"]),
+        );
+        let pgid = child.id();
+        // The leader has exited (zombie) and the sleep still lives.
+        wait_for_table("the member to outlive its leader", |t| {
+            live_members(t, pgid as i32) == 1
+                && !t.iter().any(|e| e.pid == pgid as i32 && !e.zombie)
+        });
+        assert!(matches!(kill_group(pgid), GroupKill::Killed(1)));
+        wait_for_table("the member to die", |t| live_members(t, pgid as i32) == 0);
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn classification_of_every_scan_and_signal_combination() {
+        let eperm = || std::io::Error::from_raw_os_error(libc::EPERM);
+        let esrch = || std::io::Error::from_raw_os_error(libc::ESRCH);
+        // The zombie-only EPERM (macOS) and a plain 0 (Linux) both read as
+        // nothing alive, and `EPERM` is never a kill.
+        assert!(matches!(
+            classify_group_kill(7, Ok(0), Err(eperm())),
+            GroupKill::NothingAlive
+        ));
+        assert!(matches!(
+            classify_group_kill(7, Ok(0), Ok(())),
+            GroupKill::NothingAlive
+        ));
+        assert!(matches!(
+            classify_group_kill(7, Ok(0), Err(esrch())),
+            GroupKill::NothingAlive
+        ));
+        assert!(matches!(
+            classify_group_kill(7, Ok(2), Ok(())),
+            GroupKill::Killed(2)
+        ));
+        // Exited between the scan and the signal.
+        assert!(matches!(
+            classify_group_kill(7, Ok(2), Err(esrch())),
+            GroupKill::NothingAlive
+        ));
+        // A live member and a refused signal is a failure.
+        assert!(matches!(
+            classify_group_kill(7, Ok(2), Err(eperm())),
+            GroupKill::Failed(_)
+        ));
+        // The scan itself failed: the signal result is kept.
+        match classify_group_kill(7, Err(std::io::Error::other("scan")), Ok(())) {
+            GroupKill::Unknown { signal_result, .. } => assert!(signal_result.is_ok()),
+            other => panic!("{other:?}"),
+        }
+    }
+
     use std::path::PathBuf;
 
     use super::*;
