@@ -1047,13 +1047,17 @@ async fn drain_session(
                         session_id,
                         grace_ms = turn_timers.grace.as_millis() as u64,
                         cause = after,
-                        "process still running after stdin was closed; killed its process group"
+                        "process still running after stdin was closed; tried to kill its process group"
                     );
                     let grace_s = turn_timers.grace.as_secs_f32();
                     let message = match report.as_ref().map(|r| &r.group) {
-                        Some(GroupKill::Killed(_)) | Some(GroupKill::Failed(_)) => format!(
+                        Some(GroupKill::Killed(_)) => format!(
                             "the agent process was still running {grace_s:.1}s after {after}; \
                              killed its process group"
+                        ),
+                        Some(GroupKill::Failed(err)) => format!(
+                            "the agent process was still running {grace_s:.1}s after {after}; \
+                             could not kill its process group: {err}"
                         ),
                         Some(GroupKill::Unknown { .. }) => format!(
                             "{grace_s:.1}s after {after}, could not check whether the agent \
@@ -1670,7 +1674,8 @@ fn lingered_after(report: &KillReport) -> bool {
 impl TrackerState {
     /// Records a process that could not be killed, once per pid.
     fn add_survivor(&mut self, pid: i32, comm: String) {
-        if !self.survivors.iter().any(|(p, _)| *p == pid) {
+        let listed = |list: &[(i32, String)]| list.iter().any(|(p, _)| *p == pid);
+        if !listed(&self.survivors) && !listed(&self.killed) {
             self.survivors.push((pid, comm));
         }
     }
@@ -1876,18 +1881,22 @@ async fn write_leftover_notes(
             .join(", ")
     };
     if !killed.is_empty() || !survivors.is_empty() {
-        let mut message = format!(
-            "killed {} process(es) the turn left running: {}",
-            killed.len(),
-            list(&killed)
-        );
+        let mut parts = Vec::new();
+        if !killed.is_empty() {
+            parts.push(format!(
+                "killed {} process(es) the turn left running: {}",
+                killed.len(),
+                list(&killed)
+            ));
+        }
         if !survivors.is_empty() {
-            message.push_str(&format!(
-                "; {} could not be killed and may still be running: {}",
+            parts.push(format!(
+                "{} could not be killed and may still be running: {}",
                 survivors.len(),
                 list(&survivors)
             ));
         }
+        let message = parts.join("; ");
         append_session_note(
             pool,
             session_id,
@@ -5477,6 +5486,60 @@ mod tests {
         assert!(message.contains(&format!("{GHOST} (ghost)")), "{message}");
         // Listed once, though several sites swept.
         assert_eq!(message.matches("(ghost)").count(), 1, "{message}");
+    }
+
+    /// A leftover the daemon is not permitted to kill (EPERM) is listed as a
+    /// survivor, once, by the per-pid failure path.
+    #[tokio::test]
+    async fn a_leftover_that_cannot_be_killed_is_listed_as_a_survivor() {
+        // SAFETY: only reads ids and probes pids with signal 0.
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            return;
+        }
+        // A pid we may not signal: some other user's process.
+        let foreign = (2..5000).find(|&pid| {
+            // SAFETY: signal 0 only checks permission.
+            let rc = unsafe { libc::kill(pid, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        });
+        let Some(foreign) = foreign else { return };
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let reader: crate::proc_table::ProcReader = Arc::new(move |_| {
+            Ok(vec![crate::proc_table::ProcEntry {
+                pid: foreign,
+                ppid: 1,
+                pgid: foreign,
+                sid: foreign,
+                uid,
+                start: 1,
+                zombie: false,
+                comm: "foreign".into(),
+                marker: crate::proc_table::MarkerStatus::Present,
+            }])
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        wait_until_final(&pool, &session_id).await;
+        let message = note_message(&pool, &session_id, "leftovers_killed")
+            .await
+            .expect("a leftovers_killed note");
+        assert!(message.starts_with("1 could not be killed"), "{message}");
+        assert_eq!(message.matches("(foreign)").count(), 1, "{message}");
     }
 
     /// Short waits that each end well inside the limit still add up to it.
