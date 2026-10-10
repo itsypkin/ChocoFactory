@@ -1188,8 +1188,18 @@ async fn turn_outcome_events_say_whether_a_branch_was_applied() {
     ]);
     let g = group(Shape::new(), script).await;
     g.start(None).await.unwrap();
-    g.wait_status("stuck").await;
-    let events = g.events_of(EventType::TurnOutcome).await;
+    // The last branch's `turn_outcome` is appended after the settle commits
+    // `stuck`, so wait for both events rather than for the status.
+    let events = crate::test_support::wait_until("both turn_outcome events", || async {
+        let events = g.events_of(EventType::TurnOutcome).await;
+        let has = |stage: &str| events.iter().any(|e| e.payload["stage"] == stage);
+        if has("one") && has("two") {
+            Ok(events)
+        } else {
+            Err(format!("{events:?}"))
+        }
+    })
+    .await;
     let of = |stage: &str| {
         events
             .iter()
@@ -1883,4 +1893,644 @@ async fn resume_reports_a_live_later_branch_before_a_non_resumable_earlier_one()
         matches!(&err, RetryTaskError::BranchStillActive { branch, .. } if branch == "two"),
         "{err}"
     );
+}
+
+// ---- The restart sweep for a task at a group (PG1-6) ----
+
+fn running_slot() -> Value {
+    json!({"state": "running", "started_at": "2026-10-09T12:00:00Z"})
+}
+
+fn done_slot() -> Value {
+    json!({"state": "done", "result": "clean", "started_at": "2026-10-09T12:00:00Z",
+           "ended_at": "2026-10-09T12:01:00Z"})
+}
+
+/// A task as a restarted daemon finds it: open at `panel`, entry 1, with
+/// `slots` in the payload, and nothing else yet (no sessions, no events).
+async fn restarted(slots: Value) -> Group {
+    let g = group(Shape::new(), both_report("clean")).await;
+    // What `start_task` leaves behind, so a retry can start branches.
+    let repo = g._dirs[1].0.clone();
+    crate::worktree::ensure(&repo, "demo", &g.task_id, None)
+        .await
+        .unwrap();
+    tasks::set_worktree(&g.pool, &g.task_id, &repo.to_string_lossy(), "demo")
+        .await
+        .unwrap();
+    let payload = json!({
+        "parallel": {"stage": "panel", "entry": 1, "branches": slots},
+        "parallel_entries": {"panel": 1},
+        "stages": {"one": {"summary": "kept"}},
+    });
+    workflow_state::create(&g.pool, &g.task_id, "panel", "parallel", payload)
+        .await
+        .unwrap();
+    g
+}
+
+async fn both_running() -> Group {
+    restarted(json!({"one": running_slot(), "two": running_slot()})).await
+}
+
+/// A branch session as a dead daemon left it, with its own resume id.
+async fn branch_session(
+    g: &Group,
+    branch: &str,
+    status: SessionStatus,
+    reason: Option<SessionEndReason>,
+) -> Session {
+    let s = crashed_session(&g.pool, &g.task_id, branch).await;
+    sessions::set_adapter_session_id(&g.pool, &s.id, &format!("adapter-{branch}"))
+        .await
+        .unwrap();
+    // The read-only baseline a real turn records at its start; a resume
+    // inherits it.
+    let cwd = crate::worktree::worktree_path(&g._dirs[1].0, "demo", &g.task_id).unwrap();
+    let snap = crate::worktree::snapshot(&cwd).await.unwrap();
+    events::append(
+        &g.pool,
+        &s.id,
+        EventType::WorktreeBaseline,
+        json!({
+            "stage": branch, "role": "reviewer", "cwd": cwd, "head": snap.head,
+            "branch": snap.branch, "status_sha256": snap.status_sha256,
+            "status_entries": snap.status_entries, "status": snap.status_preview,
+            "inherited_from": null, "message": "seeded baseline",
+        }),
+    )
+    .await
+    .unwrap();
+    if status == SessionStatus::Idle && reason.is_none() {
+        return sessions::get(&g.pool, &s.id).await.unwrap().unwrap();
+    }
+    let ended = (status != SessionStatus::Active).then(Utc::now);
+    sessions::update_status(&g.pool, &s.id, status, ended, reason)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn idle_pair(g: &Group) -> (Session, Session) {
+    (
+        branch_session(g, "one", SessionStatus::Idle, None).await,
+        branch_session(g, "two", SessionStatus::Idle, None).await,
+    )
+}
+
+async fn sweep(g: &Group) -> super::super::sweep::ParkReport {
+    g.engine.park_interrupted_turns().await.unwrap()
+}
+
+fn groups(n: usize) -> super::super::sweep::ParkReport {
+    super::super::sweep::ParkReport {
+        groups: n,
+        ..Default::default()
+    }
+}
+
+async fn task_reason(g: &Group) -> String {
+    tasks::get(&g.pool, &g.task_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap_or_default()
+}
+
+async fn session_now(g: &Group, s: &Session) -> Session {
+    sessions::get(&g.pool, &s.id).await.unwrap().unwrap()
+}
+
+// 1
+#[tokio::test]
+async fn a_restart_mid_group_parks_the_task_with_every_branch_failed_and_resumable() {
+    let g = both_running().await;
+    let (one, two) = idle_pair(&g).await;
+    assert_eq!(sweep(&g).await, groups(1));
+
+    assert_eq!(g.status().await, "stuck");
+    let payload = g.state().await.payload;
+    for name in ["one", "two"] {
+        let slot = branch_slot(&payload, name);
+        assert_eq!(slot["state"], "failed", "{slot}");
+        assert_eq!(slot["resumable"], true, "{slot}");
+        assert!(
+            slot["reason"].as_str().unwrap().contains(&format!(
+                "branch '{name}' of parallel stage 'panel' was running"
+            )),
+            "{slot}"
+        );
+    }
+    for s in [&one, &two] {
+        let now = session_now(&g, s).await;
+        assert_eq!(now.status, SessionStatus::Exited);
+        assert_eq!(now.end_reason, Some(SessionEndReason::DaemonStopped));
+    }
+    let reason = task_reason(&g).await;
+    assert!(
+        reason.contains("'one'") && reason.contains("'two'"),
+        "{reason}"
+    );
+
+    let all = events::list_for_task(&g.pool, &g.task_id).await.unwrap();
+    let finished: Vec<_> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.event_type == EventType::BranchFinished)
+        .collect();
+    assert_eq!(finished.len(), 2);
+    let mut names: Vec<_> = finished
+        .iter()
+        .map(|(_, e)| e.payload["branch"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["one", "two"]);
+    for (_, e) in &finished {
+        assert_eq!(e.payload["state"], "failed");
+        assert_eq!(e.payload["entry"], 1);
+    }
+    let errors: Vec<_> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.event_type == EventType::Error && e.payload["stuck"] == true)
+        .collect();
+    assert_eq!(errors.len(), 1);
+    assert!(finished.iter().all(|(i, _)| *i < errors[0].0));
+}
+
+#[tokio::test]
+async fn a_done_branch_keeps_its_result_and_capture_when_its_sibling_is_parked() {
+    let g = restarted(json!({"one": done_slot(), "two": running_slot()})).await;
+    branch_session(&g, "two", SessionStatus::Idle, None).await;
+    let before = g.state().await.payload;
+    assert_eq!(sweep(&g).await, groups(1));
+    let payload = g.state().await.payload;
+    assert_eq!(branch_slot(&payload, "one"), branch_slot(&before, "one"));
+    assert_eq!(payload["stages"], before["stages"]);
+    assert_eq!(branch_slot(&payload, "two")["state"], "failed");
+    assert_eq!(g.events_of(EventType::BranchFinished).await.len(), 1);
+}
+
+// 2
+#[tokio::test]
+async fn a_retry_after_the_sweep_resumes_exactly_the_interrupted_branches() {
+    let g = restarted(json!({"one": done_slot(), "two": running_slot()})).await;
+    let two = branch_session(&g, "two", SessionStatus::Idle, None).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    assert_eq!(outcome.branches.len(), 1);
+    assert_eq!(outcome.branches[0].branch, "two");
+    assert!(outcome.branches[0].resumed);
+    assert_eq!(
+        outcome.branches[0].adapter_session_id.as_deref(),
+        Some("adapter-two")
+    );
+    let runs = g.wait_sessions("two", 2).await;
+    let new = runs.iter().find(|s| s.id != two.id).unwrap();
+    assert_eq!(new.resumed_from.as_deref(), Some(two.id.as_str()));
+    assert!(g.sessions("one").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_retry_resumes_each_branch_from_its_own_session_and_the_group_completes() {
+    let g = both_running().await;
+    let (one, two) = idle_pair(&g).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    set_script(
+        &g,
+        by_prompt(&[
+            (
+                "Your previous turn on this stage was interrupted",
+                report_steps("clean", "sum"),
+            ),
+            ("SUMMARIZE", summarize_steps()),
+        ]),
+    );
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    assert!(outcome.resumed, "{outcome:?}");
+    for (name, old) in [("one", &one), ("two", &two)] {
+        let runs = g.wait_sessions(name, 2).await;
+        let new = runs.iter().find(|s| s.id != old.id).unwrap();
+        assert_eq!(new.resumed_from.as_deref(), Some(old.id.as_str()));
+        let b = outcome.branches.iter().find(|b| b.branch == name).unwrap();
+        assert_eq!(
+            b.adapter_session_id.as_deref(),
+            Some(format!("adapter-{name}").as_str())
+        );
+    }
+    wait_until_stage(&g.pool, &g.task_id, "summarize").await;
+}
+
+// 3
+#[tokio::test]
+async fn a_crash_before_any_session_parks_every_branch_fresh_and_retry_starts_them_fresh() {
+    for with_events in [true, false] {
+        let g = both_running().await;
+        if with_events {
+            let mut tx = g.pool.begin().await.unwrap();
+            for name in ["one", "two"] {
+                events::append_branch_started_on(
+                    &mut tx,
+                    &g.task_id,
+                    "panel",
+                    name,
+                    "agent_turn",
+                    1,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(sweep(&g).await, groups(1));
+        let payload = g.state().await.payload;
+        for name in ["one", "two"] {
+            let slot = branch_slot(&payload, name);
+            assert_eq!(slot["state"], "failed");
+            assert_eq!(slot["resumable"], false);
+            assert!(
+                slot["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("the daemon stopped before the branch's session started"),
+                "{slot}"
+            );
+        }
+        let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+        assert!(outcome.branches.iter().all(|b| !b.resumed));
+        for name in ["one", "two"] {
+            let runs = g.wait_sessions(name, 1).await;
+            assert!(runs.iter().all(|s| s.resumed_from.is_none()));
+            let starts = started_events(&g, name).await;
+            assert!(starts.iter().any(|e| e.payload["via"] == "retry"));
+            if !with_events {
+                assert!(
+                    starts
+                        .iter()
+                        .any(|e| e.payload.get("via").is_none_or(Value::is_null))
+                );
+            }
+        }
+    }
+}
+
+// 4
+#[tokio::test]
+async fn a_group_with_a_failed_branch_and_no_live_session_is_settled_by_the_sweep() {
+    let failed = json!({"state": "failed", "reason": "it broke", "resumable": true,
+                        "started_at": "2026-10-09T12:00:00Z", "ended_at": "2026-10-09T12:01:00Z"});
+    let g = restarted(json!({"one": failed, "two": done_slot()})).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    assert_eq!(g.status().await, "stuck");
+    let reason = task_reason(&g).await;
+    assert!(reason.contains("'one': it broke"), "{reason}");
+    assert!(g.events_of(EventType::BranchFinished).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_running_slot_whose_session_ended_is_failed_and_the_session_row_is_left_alone() {
+    let g = restarted(json!({"one": running_slot(), "two": done_slot()})).await;
+    let one = branch_session(
+        &g,
+        "one",
+        SessionStatus::Exited,
+        Some(SessionEndReason::NoReport),
+    )
+    .await;
+    assert_eq!(sweep(&g).await, groups(1));
+    let slot = branch_slot(&g.state().await.payload, "one").clone();
+    assert_eq!(slot["state"], "failed");
+    assert_eq!(slot["resumable"], false);
+    let why = slot["reason"].as_str().unwrap();
+    assert!(
+        why.contains("before the branch's end was recorded")
+            && why.contains("exited, end reason no_report"),
+        "{why}"
+    );
+    assert_eq!(session_now(&g, &one).await, one);
+}
+
+#[tokio::test]
+async fn a_completed_turn_whose_end_was_never_recorded_is_marked_and_resumable() {
+    let g = restarted(json!({"one": running_slot(), "two": done_slot()})).await;
+    let one = branch_session(&g, "one", SessionStatus::Idle, None).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    let slot = branch_slot(&g.state().await.payload, "one").clone();
+    assert_eq!(slot["state"], "failed");
+    assert_eq!(slot["resumable"], true);
+    assert_eq!(
+        session_now(&g, &one).await.end_reason,
+        Some(SessionEndReason::DaemonStopped)
+    );
+}
+
+// 5
+#[tokio::test]
+async fn a_branch_with_a_live_session_is_left_alone() {
+    let g = both_running().await;
+    let live = branch_session(&g, "one", SessionStatus::Active, None).await;
+    branch_session(&g, "two", SessionStatus::Idle, None).await;
+    assert_eq!(sweep(&g).await, groups(0));
+    assert_eq!(g.status().await, "open");
+    let payload = g.state().await.payload;
+    assert_eq!(branch_slot(&payload, "one")["state"], "running");
+    assert_eq!(branch_slot(&payload, "two")["state"], "failed");
+    assert_eq!(session_now(&g, &live).await, live);
+    let finished = g.events_of(EventType::BranchFinished).await;
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].payload["branch"], "two");
+    assert!(g.events_of(EventType::Error).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_group_whose_branches_are_all_live_is_not_written() {
+    let g = both_running().await;
+    branch_session(&g, "one", SessionStatus::Active, None).await;
+    branch_session(&g, "two", SessionStatus::Active, None).await;
+    let before = g.state().await;
+    assert_eq!(sweep(&g).await, groups(0));
+    assert_eq!(g.state().await, before);
+    assert!(g.events_of(EventType::BranchFinished).await.is_empty());
+}
+
+// 6
+#[tokio::test]
+async fn the_sweep_finishes_the_job_after_a_crash_between_session_and_payload_writes() {
+    let g = both_running().await;
+    for name in ["one", "two"] {
+        branch_session(
+            &g,
+            name,
+            SessionStatus::Exited,
+            Some(SessionEndReason::DaemonStopped),
+        )
+        .await;
+    }
+    assert_eq!(sweep(&g).await, groups(1));
+    assert_eq!(g.status().await, "stuck");
+    let payload = g.state().await.payload;
+    for name in ["one", "two"] {
+        let slot = branch_slot(&payload, name);
+        assert_eq!(slot["state"], "failed");
+        assert_eq!(slot["resumable"], true, "{slot}");
+    }
+}
+
+#[tokio::test]
+async fn a_second_sweep_changes_nothing() {
+    let g = both_running().await;
+    idle_pair(&g).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    let before = snapshot(&g).await;
+    assert_eq!(sweep(&g).await, groups(0));
+    assert_eq!(snapshot(&g).await, before);
+}
+
+// 7
+#[tokio::test]
+async fn a_failed_sweep_write_parks_the_task_with_the_slots_unchanged() {
+    // (a) the settle path
+    let g = both_running().await;
+    idle_pair(&g).await;
+    install_no_state_update(&g).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    assert_eq!(g.status().await, "stuck");
+    let reason = task_reason(&g).await;
+    assert!(
+        reason.contains("parallel stage 'panel'") && reason.contains("boom"),
+        "{reason}"
+    );
+    let payload = g.state().await.payload;
+    assert_eq!(branch_slot(&payload, "one")["state"], "running");
+    assert_eq!(branch_slot(&payload, "two")["state"], "running");
+
+    // (b) the plain update path, one branch live
+    let g = both_running().await;
+    branch_session(&g, "one", SessionStatus::Active, None).await;
+    branch_session(&g, "two", SessionStatus::Idle, None).await;
+    install_no_state_update(&g).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    assert_eq!(g.status().await, "stuck");
+    let reason = task_reason(&g).await;
+    assert!(
+        reason.contains("parallel stage 'panel'") && reason.contains("boom"),
+        "{reason}"
+    );
+    assert_eq!(
+        branch_slot(&g.state().await.payload, "two")["state"],
+        "running"
+    );
+    assert!(g.events_of(EventType::BranchFinished).await.is_empty());
+}
+
+// 8
+#[tokio::test]
+async fn a_failed_session_write_fails_the_branch_as_not_resumable() {
+    let g = both_running().await;
+    idle_pair(&g).await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_session_update BEFORE UPDATE ON sessions
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    assert_eq!(sweep(&g).await, groups(1));
+    assert_eq!(g.status().await, "stuck");
+    let slot = branch_slot(&g.state().await.payload, "one").clone();
+    assert_eq!(slot["state"], "failed");
+    assert_eq!(slot["resumable"], false);
+    assert!(
+        slot["reason"]
+            .as_str()
+            .unwrap()
+            .contains("the interrupted session could not be recorded"),
+        "{slot}"
+    );
+}
+
+// 9
+#[tokio::test]
+async fn a_missing_or_foreign_block_parks_the_task() {
+    for foreign in [false, true] {
+        let g = both_running().await;
+        let mut state = g.state().await;
+        if foreign {
+            state.payload["parallel"]["stage"] = json!("elsewhere");
+        } else {
+            state.payload.as_object_mut().unwrap().remove("parallel");
+        }
+        workflow_state::update(
+            &g.pool,
+            &g.task_id,
+            workflow_state::WorkflowStateUpdate {
+                current_stage: "panel".to_string(),
+                stage_kind: "parallel".to_string(),
+                loop_counters: state.loop_counters,
+                payload: state.payload,
+                enters_stage: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(sweep(&g).await, groups(1));
+        let reason = task_reason(&g).await;
+        assert!(
+            reason.contains("parallel stage 'panel' has no branch state in the workflow payload"),
+            "{reason}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_branch_done_at_the_group_parks_the_task_without_moving_it_on() {
+    let g = restarted(json!({"one": done_slot(), "two": done_slot()})).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    assert_eq!(g.status().await, "stuck");
+    assert!(
+        task_reason(&g).await.contains("every branch is done"),
+        "{}",
+        task_reason(&g).await
+    );
+    assert_eq!(g.state().await.current_stage, "panel");
+}
+
+#[tokio::test]
+async fn a_declared_branch_with_no_slot_is_failed_fresh() {
+    let g = restarted(json!({"one": running_slot()})).await;
+    branch_session(&g, "one", SessionStatus::Active, None).await;
+    assert_eq!(sweep(&g).await, groups(0));
+    assert_eq!(g.status().await, "open");
+    let slot = branch_slot(&g.state().await.payload, "two").clone();
+    assert_eq!(slot["state"], "failed");
+    assert_eq!(slot["resumable"], false);
+    assert!(slot["started_at"].is_null(), "{slot}");
+    assert!(
+        slot["reason"]
+            .as_str()
+            .unwrap()
+            .contains("had no readable state when the daemon restarted"),
+        "{slot}"
+    );
+    assert!(g.sessions("two").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_session_from_an_earlier_entry_is_not_resumed_by_the_sweep() {
+    let g = restarted(json!({"one": running_slot(), "two": done_slot()})).await;
+    sqlx::query(
+        "UPDATE workflow_state SET payload = json_set(payload, '$.parallel.entry', 2) \
+         WHERE task_id = ?",
+    )
+    .bind(&g.task_id)
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    let old = branch_session(&g, "one", SessionStatus::Idle, None).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    let slot = branch_slot(&g.state().await.payload, "one").clone();
+    assert_eq!(slot["state"], "failed");
+    assert_eq!(slot["resumable"], false, "{slot}");
+    assert!(
+        slot["reason"]
+            .as_str()
+            .unwrap()
+            .contains("before the branch's session started"),
+        "{slot}"
+    );
+    let now = session_now(&g, &old).await;
+    assert_eq!(now.status, SessionStatus::Idle);
+    assert_eq!(now.end_reason, None);
+}
+
+#[tokio::test]
+async fn a_read_only_branch_that_changed_the_worktree_is_flagged_by_the_sweep() {
+    let g = restarted(json!({"one": running_slot(), "two": done_slot()})).await;
+    branch_session(&g, "one", SessionStatus::Idle, None).await;
+    let cwd = crate::worktree::worktree_path(&g._dirs[1].0, "demo", &g.task_id).unwrap();
+    std::fs::write(cwd.join("violation.txt"), "x").unwrap();
+    assert_eq!(sweep(&g).await, groups(1));
+    let slot = branch_slot(&g.state().await.payload, "one").clone();
+    let reason = slot["reason"].as_str().unwrap();
+    assert!(reason.contains("changed the worktree"), "{reason}");
+    assert!(task_reason(&g).await.contains("changed the worktree"));
+}
+
+// 10
+#[tokio::test]
+async fn in_flight_lists_a_group_only_while_a_branch_is_running() {
+    let g = both_running().await;
+    let listed = g.engine.in_flight().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].stage, "panel");
+    assert_eq!(listed[0].kind, "agent_turn");
+
+    let settled = restarted(json!({"one": done_slot(), "two": done_slot()})).await;
+    assert!(settled.engine.in_flight().await.unwrap().is_empty());
+
+    let broken = both_running().await;
+    sqlx::query("UPDATE workflow_state SET payload = '{}' WHERE task_id = ?")
+        .bind(&broken.task_id)
+        .execute(&broken.pool)
+        .await
+        .unwrap();
+    let listed = broken.engine.in_flight().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].kind, "unknown");
+
+    let undeclared = restarted(json!({"ghost": running_slot(), "one": running_slot()})).await;
+    let listed = undeclared.engine.in_flight().await.unwrap();
+    assert_eq!(listed[0].kind, "agent_turn, unknown");
+}
+
+// 11
+#[tokio::test]
+async fn messages_to_a_group_are_refused_and_record_nothing() {
+    let g = both_running().await;
+    let counts = |g: &Group| {
+        let g_pool = g.pool.clone();
+        let id = g.task_id.clone();
+        async move {
+            (
+                events::list_for_task(&g_pool, &id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.event_type == EventType::HumanMessage)
+                    .count(),
+                sessions::list_for_task(&g_pool, &id).await.unwrap().len(),
+            )
+        }
+    };
+    let before = counts(&g).await;
+    let err = g.engine.send_message(&g.task_id, "hi").await.unwrap_err();
+    assert!(
+        matches!(&err, SendMessageError::StageNotOpenEnded(s) if s == "panel"),
+        "{err:?}"
+    );
+    let err = g
+        .engine
+        .send_message_or_resume(&g.task_id, "hi")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, SendMessageOrResumeError::UnsupportedStageKind(s) if s == "panel"),
+        "{err:?}"
+    );
+    assert_eq!(counts(&g).await, before);
+}
+
+// 12
+#[tokio::test]
+async fn the_poll_sweep_ignores_a_group() {
+    let g = both_running().await;
+    let before = snapshot(&g).await;
+    let report = g.engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(
+        (report.resumed, report.stuck, report.already_running),
+        (0, 0, 0)
+    );
+    assert_eq!(snapshot(&g).await, before);
 }

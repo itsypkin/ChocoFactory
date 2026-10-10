@@ -13117,7 +13117,7 @@ async fn restart_effect_classifies_every_stage_kind() {
     let group = WorkflowDefinition::parse(&parallel_group_yaml(true), &dir).unwrap();
     assert_eq!(
         restart_effect(&group.stages["panel"]),
-        RestartEffect::Survives
+        RestartEffect::PerBranch
     );
 }
 
@@ -13176,7 +13176,8 @@ async fn parking_an_interrupted_agent_turn_records_the_session_and_retry_resumes
         ParkReport {
             agent_turns: 1,
             shells: 0,
-            stuck_other: 0
+            stuck_other: 0,
+            groups: 0
         }
     );
 
@@ -13390,7 +13391,8 @@ async fn parking_a_shell_stage_lets_retry_rerun_it() {
         ParkReport {
             agent_turns: 0,
             shells: 1,
-            stuck_other: 0
+            stuck_other: 0,
+            groups: 0
         }
     );
     let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
@@ -13471,7 +13473,8 @@ async fn the_park_sweep_names_what_it_could_not_check() {
         ParkReport {
             agent_turns: 1,
             shells: 0,
-            stuck_other: 2
+            stuck_other: 2,
+            groups: 0
         }
     );
 

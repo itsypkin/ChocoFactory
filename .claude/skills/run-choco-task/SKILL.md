@@ -127,9 +127,12 @@ command in step 3 and the pre-merge check in step 4.
   that name, and choco updates don't change it (`choco project
   init-workflows` creates exactly that folder). To change a workflow, see
   the [customize-choco-workflow skill](../customize-choco-workflow/SKILL.md).
-- **Don't stop or restart the daemon while an agent turn or shell step
-  runs.** `stop` and `restart` refuse (see [Cost and safety](#cost-and-safety)).
+- **Don't stop or restart the daemon while an agent turn (including a
+  parallel group's running branches) or shell step runs.** `stop` and
+  `restart` refuse (see [Cost and safety](#cost-and-safety)).
   Tasks waiting on a poll or a human survive a restart.
+  A forced restart while a parallel group's branches run parks the task
+  `stuck` with those branches failed; `choco task retry` resumes them.
   The daemon logs to `~/.config/chocofactory/logs/chocofactoryd.log`; kills,
   `stuck` marks and nudges show up there first.
 - **Keep the machine awake for the whole run.** On a sleeping laptop agent
@@ -364,6 +367,7 @@ cancelling. In short:
 - **Cancel a task that is going round in circles** rather than letting it
   spend a coder lap per round.
 - **`choco update`, `choco server stop` and `choco server restart` refuse
-  with exit 3 while an agent turn or shell step is running.** `--force` goes
+  with exit 3 while an agent turn (including a parallel group's running
+  branches) or shell step is running.** `--force` goes
   ahead and marks that work `stuck`; use it only if you are prepared to
   `choco task retry` those tasks.

@@ -167,6 +167,66 @@ stages:
         );
     }
 
+    const GROUP_WORKFLOW: &str = r#"
+name: grp
+worktree: true
+roles:
+  reviewer:
+    cli: claude
+    model: opus
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+stages:
+  panel:
+    kind: parallel
+    branches:
+      one: { kind: agent_turn, role: reviewer }
+      two: { kind: agent_turn, role: reviewer }
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+
+    #[tokio::test]
+    async fn get_server_lists_a_task_whose_group_has_running_branches() {
+        use crate::db::{projects, tasks, workflow_state};
+        let server = TestServer::start().await;
+        server.write_workflow("grp", GROUP_WORKFLOW);
+        let project = projects::create(server.pool(), "p", None).await.unwrap();
+        // Rest the task at the group with a branch running, as a group
+        // entry leaves it.
+        let id = tasks::create(
+            server.pool(),
+            tasks::NewTask {
+                project_id: &project.id,
+                workflow_def: "grp",
+                title: "T",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        workflow_state::create(
+            server.pool(),
+            &id,
+            "panel",
+            "parallel",
+            json!({"parallel": {"stage": "panel", "entry": 1, "branches": {
+                "one": {"state": "running"}, "two": {"state": "done", "result": "clean"}}}}),
+        )
+        .await
+        .unwrap();
+        let body = server.get("/server").await.json();
+        assert_eq!(body["in_flight"][0]["task_id"], id);
+        assert_eq!(body["in_flight"][0]["stage"], "panel");
+        assert_eq!(body["in_flight"][0]["kind"], "agent_turn");
+    }
+
     #[tokio::test]
     async fn every_response_carries_the_version_header() {
         let server = TestServer::start().await;

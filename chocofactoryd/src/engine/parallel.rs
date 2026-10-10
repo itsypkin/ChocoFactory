@@ -9,6 +9,7 @@
 //! statement is its UPDATE) and the `branch_started` batch (INSERTs only), so
 //! deferred transactions are safe.
 
+use super::turn::ReadOnlyVerdict;
 use super::*;
 use crate::db::events::BranchEnd;
 use crate::workflow_def::Branch;
@@ -199,6 +200,37 @@ fn block_for<'a>(payload: &'a Value, group: &str) -> Option<&'a Value> {
     payload
         .get("parallel")
         .filter(|block| block.get("stage").and_then(Value::as_str) == Some(group))
+}
+
+/// For `GET /server`: the kinds (sorted, comma-joined) of the running
+/// branches of the group `group`, `None` when no branch is running, and
+/// `"unknown"` when the group's payload block is missing or malformed.
+pub(super) fn running_branch_kinds(
+    payload: &Value,
+    definition: &WorkflowDefinition,
+    group: &str,
+) -> Option<String> {
+    let Some(slots) = block_for(payload, group)
+        .and_then(|block| block.get("branches"))
+        .and_then(Value::as_object)
+    else {
+        return Some("unknown".to_string());
+    };
+    let mut kinds: Vec<&str> = slots
+        .iter()
+        .filter(|(_, slot)| slot.get("state").and_then(Value::as_str) == Some("running"))
+        .map(|(name, _)| {
+            definition
+                .branch(name)
+                .map_or("unknown", |b| b.def.kind.name())
+        })
+        .collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    kinds.sort_unstable();
+    kinds.dedup();
+    Some(kinds.join(", "))
 }
 
 fn branch_state<'a>(payload: &'a Value, branch: &str) -> Option<&'a str> {
@@ -449,6 +481,220 @@ impl WorkflowEngine {
         }
         self.record_start_failures(task_id, group, branches, entry_no, &failures)
             .await
+    }
+
+    /// The restart sweep for one open task at the group `group`, under the
+    /// task lock the caller holds (see `sweep.rs`). Decides each running
+    /// branch from its slot and its session for this entry, then writes the
+    /// result with one write: nothing, a plain update (a live branch
+    /// remains), or the settle (payload and `stuck` in one transaction).
+    /// Returns whether the task was marked stuck by this call.
+    pub(super) async fn park_group_locked(
+        &self,
+        task: &Task,
+        definition: &WorkflowDefinition,
+        group: &str,
+        branches: &IndexMap<String, Branch>,
+        state: &chocofactory_core::models::WorkflowState,
+    ) -> bool {
+        let task_id = task.id.as_str();
+        let block = block_for(&state.payload, group);
+        let entry_no = block
+            .and_then(|block| block.get("entry"))
+            .and_then(Value::as_i64);
+        let slots_ok = block
+            .and_then(|block| block.get("branches"))
+            .is_some_and(Value::is_object);
+        let marked = |mark: StuckMark| mark == StuckMark::Marked;
+        let Some(entry_no) = entry_no.filter(|_| slots_ok) else {
+            let reason = format!(
+                "parallel stage '{group}' has no branch state in the workflow payload, so the \
+                 restart sweep could not tell which branches were interrupted"
+            );
+            return marked(self.mark_stuck(task_id, &reason, false).await);
+        };
+        match self
+            .park_group_branches(task, definition, group, branches, state, entry_no)
+            .await
+        {
+            Ok(stuck) => stuck,
+            Err(err) => {
+                let reason = format!(
+                    "parallel stage '{group}': the restart sweep could not record its \
+                     interrupted branches: {err}"
+                );
+                marked(self.mark_stuck(task_id, &reason, false).await)
+            }
+        }
+    }
+
+    async fn park_group_branches(
+        &self,
+        task: &Task,
+        definition: &WorkflowDefinition,
+        group: &str,
+        branches: &IndexMap<String, Branch>,
+        state: &chocofactory_core::models::WorkflowState,
+        entry_no: i64,
+    ) -> Result<bool, EngineError> {
+        let task_id = task.id.as_str();
+        let mut payload = state.payload.clone();
+        let now = stamp(self.now());
+        let mut failed_now: Vec<(String, String)> = Vec::new();
+        for (name, branch) in branches {
+            match branch_state(&payload, name) {
+                Some("done" | "failed") => continue,
+                Some("running") => {}
+                _ => {
+                    let reason = format!(
+                        "branch '{name}' of parallel stage '{group}' had no readable state when \
+                         the daemon restarted; 'choco task retry' starts it fresh"
+                    );
+                    if let Some(slots) = payload
+                        .get_mut("parallel")
+                        .and_then(|block| block.get_mut("branches"))
+                        .and_then(Value::as_object_mut)
+                    {
+                        slots
+                            .entry(name.clone())
+                            .or_insert_with(|| json!({ "state": "running" }));
+                    }
+                    fail_branch(&mut payload, name, &reason, false, &now);
+                    failed_now.push((name.clone(), reason));
+                    continue;
+                }
+            }
+            let mut session = None;
+            if let Some(current) =
+                sessions::get_current_for_stage(&self.pool, task_id, name).await?
+                && sessions::lap(&self.pool, &current.id).await? == Some(entry_no)
+            {
+                session = Some(current);
+            }
+            let Some(session) = session else {
+                let reason = format!(
+                    "branch '{name}' of parallel stage '{group}': the daemon stopped before the \
+                     branch's session started; 'choco task retry' starts it fresh"
+                );
+                fail_branch(&mut payload, name, &reason, false, &now);
+                failed_now.push((name.clone(), reason));
+                continue;
+            };
+            let mut recorded = true;
+            let mut error_note = String::new();
+            let (mut reason, session) = match (session.status, session.end_reason) {
+                // A live turn owns it: leave the slot and the session alone.
+                (SessionStatus::Active, _) => continue,
+                (SessionStatus::Idle, None) => {
+                    let reason = format!(
+                        "branch '{name}' of parallel stage '{group}' was running an agent turn \
+                         when the daemon stopped; 'choco task retry' continues it, resuming the \
+                         agent's session when it can"
+                    );
+                    match sessions::mark_daemon_stopped(&self.pool, &session.id).await {
+                        Ok(_) => {
+                            let reread = sessions::get(&self.pool, &session.id).await?;
+                            (reason, reread.unwrap_or(session))
+                        }
+                        Err(err) => {
+                            recorded = false;
+                            error_note = format!(
+                                "; the interrupted session could not be recorded ({err}), so \
+                                 retry will start the branch fresh"
+                            );
+                            (reason, session)
+                        }
+                    }
+                }
+                (status, end_reason) => {
+                    let why = end_reason
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    let reason = format!(
+                        "branch '{name}' of parallel stage '{group}': the daemon stopped before \
+                         the branch's end was recorded (its session had ended: {status}, end \
+                         reason {why}); 'choco task retry' re-runs it, resuming the agent's \
+                         session when it can"
+                    );
+                    (reason, session)
+                }
+            };
+            reason.push_str(&error_note);
+            let mut resumable = false;
+            if recorded {
+                match self
+                    .resumable_session(task, definition, &branch.def, Some(&session), true)
+                    .await
+                {
+                    Ok(verdict) => resumable = verdict.is_ok(),
+                    Err(err) => {
+                        tracing::error!(task_id, branch = %name, %err, "could not tell whether a branch's session can be resumed");
+                        reason.push_str(&format!(
+                            " (could not tell whether its session can be resumed: {err})"
+                        ));
+                    }
+                }
+            }
+            match self
+                .read_only_verdict(task_id, definition, name, &session.id, false)
+                .await
+            {
+                ReadOnlyVerdict::Clean => {}
+                ReadOnlyVerdict::Violation(found) | ReadOnlyVerdict::Unverified(found) => {
+                    reason.push_str(&format!("; {found}"));
+                }
+            }
+            fail_branch(&mut payload, name, &reason, resumable, &now);
+            failed_now.push((name.clone(), reason));
+        }
+
+        let running = branches
+            .keys()
+            .any(|name| branch_state(&payload, name) == Some("running"));
+        let failed = branches
+            .keys()
+            .any(|name| branch_state(&payload, name) == Some("failed"));
+        if running && failed_now.is_empty() {
+            return Ok(false);
+        }
+        if !running && !failed {
+            let reason = format!(
+                "parallel stage '{group}': every branch is done but the task is still at the \
+                 group; the restart sweep does not move it on"
+            );
+            return Ok(self.mark_stuck(task_id, &reason, false).await == StuckMark::Marked);
+        }
+        let update = workflow_state::WorkflowStateUpdate {
+            current_stage: state.current_stage.clone(),
+            stage_kind: "parallel".to_string(),
+            loop_counters: state.loop_counters.clone(),
+            payload,
+            enters_stage: false,
+        };
+        let stuck_reason = if running {
+            workflow_state::update(&self.pool, task_id, update)
+                .await?
+                .ok_or(EngineError::NoWorkflowState)?;
+            None
+        } else {
+            self.settle_group_with_failures(task_id, group, branches, update)
+                .await?
+        };
+        for (name, reason) in &failed_now {
+            self.record_branch_finished(
+                task_id,
+                group,
+                name,
+                entry_no,
+                BranchEnd::Failed { reason },
+            )
+            .await;
+        }
+        let stuck = stuck_reason.is_some();
+        if let Some(reason) = stuck_reason {
+            self.append_settle_error(task_id, group, reason).await;
+        }
+        Ok(stuck)
     }
 
     /// Retries a task stuck in the parallel group `group`, under the task
