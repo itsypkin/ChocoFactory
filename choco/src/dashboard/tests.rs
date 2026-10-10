@@ -3421,7 +3421,7 @@ fn a_stuck_groups_stage_cell_does_not_shrink_the_title_column() {
     let grouped = render(&app, 80, 24);
     let busy = |s: &str| {
         s.lines()
-            .find(|l| l.contains("Per-kind stage execution"))
+            .find(|l| l.contains("9c03aa17"))
             .unwrap_or_else(|| panic!("{s}"))
             .to_string()
     };
