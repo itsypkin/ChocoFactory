@@ -30,7 +30,9 @@ Three more checks belong in the spec:
   in the same PR.
 - **Abandoned operations.** For anything that can time out, be cancelled,
   or lose its client, the spec states what is left behind (locks, rows,
-  files) and requires a test that interrupts it and checks that state.
+  files) and requires a test that interrupts it and checks that state;
+  or, if the operation can't be interrupted in a test, names the
+  interrupt as an accepted cost, with the reason.
 - **A new rule in a prompt.** The spec requires the coder to run one
   probe of the rule on the production model the role runs in the workflow,
   in its lap, and to report the probe and its result.
@@ -38,8 +40,14 @@ Three more checks belong in the spec:
 **Every run the spec requires has a budget and a way out.** The spec
 states how many runs, and what the coder does when it can't make one (no
 access to the model or provider, no login, budget spent): it reports the
-run as not made, with the reason, and stops for the operator. It never
-skips the run silently and never retries in a loop.
+run as not made, with the reason, and still finishes: a coder's stages end
+only with done, so it can't stop and wait. Its summary and the PR
+description mark the item "not made: <reason>". The spec also tells the
+internal reviewer, which runs inside the task, not to request changes for
+that item but to name it in its report so it reaches the human gate; the
+reviewer still blocks on everything else, and on a not-made item with no
+reason or outside the spec's way out. The coder never skips a run
+silently and never retries in a loop.
 
 ## Having choco check the spec first (`coding-task-planned`)
 
@@ -111,7 +119,8 @@ and "the tests are a floor" applies to them. The done criteria are:
 **A skill or doc meant to be copied.** Check its links from a copy
 outside the repo, made from the branch under test: copy the whole skill
 or doc folder(s), in the layout the install instructions produce, from
-the worktree into a new temp dir with `cp -R`. Never run install steps
+the worktree into a new temp dir with `cp -R`. Copy every folder the
+install copies, so a skill that links to another skill keeps working. Never run install steps
 that fetch a release or `rm -rf` a folder, and never write inside the
 repo or worktree. Take every route of every snippet on a throwaway
 daemon; a snippet that only loads (parses, prints `--help`) has not been
@@ -135,10 +144,11 @@ rm -rf "${t:?}"    # also after a failed step: stop the daemon first if the lock
 The throwaway daemon's agents get the same `HOME`, so they have no
 `claude` or `gh` login. The coder creates no task and opens no PR to
 satisfy a criterion. A route that needs an agent turn or GitHub is taken
-by the operator (or a named reviewer who isn't the coder), on a small
+by the operator (or a named person who isn't the coder), on a small
 real task on their own daemon without stopping, updating or restarting
 it. The spec names that owner and a budget of runs; the coder reports the
-route as not taken, with the reason, and stops for them.
+route as "not made: <reason>" in its summary and the PR description and
+finishes, so the item reaches that person at the human gate.
 
 A script that walks the links and a loop over the `--help` of each
 command check the first three criteria only; they are not enough for

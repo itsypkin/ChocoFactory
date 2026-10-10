@@ -341,7 +341,7 @@ cancelling. In short:
 ## Cost and safety
 
 - **Every stage runs a real agent CLI** (`claude`, or `omp` for a role with
-  `cli: omp`). Don't create a task to try something out. For a first run, pick a small, real change.
+  `cli: omp`). Don't create a task to try something out, except the budgeted acceptance tasks that the spec's `reference/spec.md` assigns to the operator. For a first run, pick a small, real change.
 - **A repo's `.chocofactory/workflows/` and any `--workflow` file can run
   shell commands as you.** Pointing choco at a repo trusts its workflows.
 - **Cancel a task that is going round in circles** rather than letting it
