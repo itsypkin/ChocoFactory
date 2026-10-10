@@ -5,6 +5,8 @@ use serde_json::json;
 
 use super::*;
 
+mod parallel;
+
 #[test]
 fn set_arrival_replaces_a_non_object_payload() {
     let mut payload = json!(null);
@@ -1769,6 +1771,7 @@ async fn a_turn_reaped_by_the_idle_timeout_does_not_auto_advance() {
         "chatting".to_string(),
         None,
         session.id.clone(),
+        None,
     );
 
     // Also marks the task stuck (X-4, issue #61; review round 2): the
@@ -4874,7 +4877,7 @@ async fn finish_review_turn_from_reply(
         .unwrap();
 
     engine
-        .finish_turn(task_id, def, "review", Some(Capture::Json), &run_id)
+        .finish_turn(task_id, def, "review", Some(Capture::Json), &run_id, None)
         .await;
 }
 
@@ -10380,7 +10383,7 @@ async fn recheck_without_baseline(stage: &str) -> String {
         .await
         .unwrap();
     run._engine
-        .finish_turn(&run.task_id, &run.def, stage, None, &session.id)
+        .finish_turn(&run.task_id, &run.def, stage, None, &session.id, None)
         .await;
     stuck_reason(&run.pool, &run.task_id).await
 }
@@ -10836,7 +10839,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     let interrupted = ended(Some("session-a"), Some(SessionEndReason::Interrupted)).await;
     assert_eq!(
         engine
-            .resumable_session(&task, &def, coding, Some(&interrupted))
+            .resumable_session(&task, &def, coding, Some(&interrupted), false)
             .await
             .unwrap(),
         Ok(ResumeSession {
@@ -10851,7 +10854,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     let reaped = ended(Some("session-b"), Some(SessionEndReason::Reaped)).await;
     assert!(
         engine
-            .resumable_session(&task, &def, coding, Some(&reaped))
+            .resumable_session(&task, &def, coding, Some(&reaped), false)
             .await
             .unwrap()
             .is_ok(),
@@ -10869,7 +10872,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
         let run = ended(Some("session-c"), reason).await;
         assert!(
             engine
-                .resumable_session(&task, &def, coding, Some(&run))
+                .resumable_session(&task, &def, coding, Some(&run), false)
                 .await
                 .unwrap()
                 .is_err(),
@@ -10881,7 +10884,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     let sessionless = ended(None, Some(SessionEndReason::Interrupted)).await;
     assert!(
         engine
-            .resumable_session(&task, &def, coding, Some(&sessionless))
+            .resumable_session(&task, &def, coding, Some(&sessionless), false)
             .await
             .unwrap()
             .is_err()
@@ -10890,7 +10893,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     // A stage with no session at all, and a stage with no run yet.
     assert!(
         engine
-            .resumable_session(&task, &def, finished, Some(&interrupted))
+            .resumable_session(&task, &def, finished, Some(&interrupted), false)
             .await
             .unwrap()
             .is_err(),
@@ -10898,7 +10901,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
     );
     assert!(
         engine
-            .resumable_session(&task, &def, coding, None)
+            .resumable_session(&task, &def, coding, None, false)
             .await
             .unwrap()
             .is_err()
@@ -10946,7 +10949,7 @@ async fn a_session_resumed_too_many_times_in_a_row_has_to_start_over() {
     // Three resumes are allowed; the fourth is where the cap bites.
     for resume in 1..=MAX_CONSECUTIVE_RESUMES + 1 {
         let decision = engine
-            .resumable_session(&task, &def, coding, Some(&previous))
+            .resumable_session(&task, &def, coding, Some(&previous), false)
             .await
             .unwrap();
         if resume <= MAX_CONSECUTIVE_RESUMES {
@@ -10980,7 +10983,7 @@ async fn a_session_resumed_too_many_times_in_a_row_has_to_start_over() {
     let fresh = interrupt(&fresh).await;
     assert!(
         engine
-            .resumable_session(&task, &def, coding, Some(&fresh))
+            .resumable_session(&task, &def, coding, Some(&fresh), false)
             .await
             .unwrap()
             .is_ok(),
@@ -13147,106 +13150,6 @@ stages:
     )
 }
 
-/// Creates a task on `parallel_group_yaml` in a real repo and starts it.
-async fn start_group_task(
-    with_prep: bool,
-) -> (
-    SqlitePool,
-    Arc<WorkflowEngine>,
-    String,
-    Result<(), EngineError>,
-    Vec<TempDir>,
-) {
-    let pool = connect_in_memory().await.unwrap();
-    let dir = tempdir();
-    let repo = tempdir();
-    init_git_repo(&repo).await;
-    let yaml = parallel_group_yaml(with_prep);
-    fs::write(dir.join("group-flow.yaml"), &yaml).unwrap();
-    let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
-    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
-    let task_id = tasks::create(
-        &pool,
-        tasks::NewTask {
-            project_id: &project_id,
-            workflow_def: &def.name,
-            title: "T",
-            config: json!({ "cwd": repo.to_string_lossy() }),
-            workflow_path: None,
-            workflow_sha256: None,
-            base_ref: None,
-            base_commit: None,
-        },
-    )
-    .await
-    .unwrap()
-    .id;
-    let binary = named_script_binary(&dir, "fake-claude-group", json!([]));
-    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
-    let started = engine.start_task(&task_id, &def, None).await;
-    (pool, engine, task_id, started, vec![dir, repo])
-}
-
-#[tokio::test]
-async fn entering_a_parallel_group_parks_the_task() {
-    let (pool, _engine, task_id, started, _dirs) = start_group_task(true).await;
-    started.unwrap();
-    let reason = stuck_reason(&pool, &task_id).await;
-    assert!(reason.contains("'panel'"), "{reason}");
-    assert!(reason.contains("parallel groups don't run yet"), "{reason}");
-    let state = crate::db::workflow_state::get(&pool, &task_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(state.current_stage, "panel");
-    assert!(
-        sessions::list_for_task(&pool, &task_id)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn retry_at_a_parallel_group_parks_again() {
-    let (pool, engine, task_id, started, _dirs) = start_group_task(true).await;
-    started.unwrap();
-    stuck_reason(&pool, &task_id).await;
-    let err = engine
-        .retry_task(&task_id, RetryMode::Auto)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, RetryTaskError::Enter(EngineError::ParallelGroupNotRunYet { stage })
-            if stage == "panel"),
-        "{err}"
-    );
-    let reason = stuck_reason(&pool, &task_id).await;
-    assert!(reason.contains("retry failed"), "{reason}");
-    assert!(reason.contains("parallel groups don't run yet"), "{reason}");
-    assert!(
-        sessions::list_for_task(&pool, &task_id)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn a_parallel_group_as_the_entry_stage_fails_the_start() {
-    let (pool, _engine, task_id, started, _dirs) = start_group_task(false).await;
-    assert!(
-        matches!(&started, Err(EngineError::ParallelGroupNotRunYet { stage }) if stage == "panel"),
-        "{started:?}"
-    );
-    assert!(
-        sessions::list_for_task(&pool, &task_id)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-}
-
 #[tokio::test]
 async fn parking_an_interrupted_agent_turn_records_the_session_and_retry_resumes_it() {
     let pool = connect_in_memory().await.unwrap();
@@ -15215,7 +15118,7 @@ async fn a_role_cli_that_cannot_be_resolved_makes_the_session_not_resumable() {
         .await
         .unwrap();
     let why = engine
-        .resumable_session(&task, &def, &def.stages["coding"], last.as_ref())
+        .resumable_session(&task, &def, &def.stages["coding"], last.as_ref(), false)
         .await
         .unwrap()
         .unwrap_err();

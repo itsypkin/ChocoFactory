@@ -15,7 +15,7 @@ Steps, run in order:
   control requests). At EOF the process exits 0, as the real CLI does.
 - `{"op": "text", "text": "...", "parent": "toolu_x"?}` — an assistant
   message, from a sub-agent when `parent` is set.
-- `{"op": "report", "outcome": "done", "parent": "toolu_x"?, "is_error": false?}`
+- `{"op": "report", "outcome": "done", "summary": ""?, "parent": "toolu_x"?, "is_error": false?}`
   — a `report_outcome` tool_use/tool_result pair.
 - `{"op": "result", "is_error": false?}` — the CLI's end-of-turn line.
 - `{"op": "echo_turn"}` — wait for the next user turn and repeat it back as
@@ -41,6 +41,12 @@ Steps, run in order:
 - `{"op": "raw", "line": {...}}` — emit `line` verbatim as one JSON line, for
   output the other ops don't model (a `background_tasks_changed` list, say).
 - `{"op": "exit"}` — exit 0 immediately, without waiting for stdin EOF.
+
+The file may instead hold `{"by_prompt": {"marker": [steps...], ...}}`: the
+first user turn is read, and the steps of the first marker its text contains
+run; that turn counts as the first `read_turn` or `echo_turn` among them. This lets sessions
+that share one binary, such as a parallel group's branches, behave
+differently.
 
 After the last step the process waits for stdin EOF, then exits 0.
 """
@@ -124,18 +130,31 @@ def main():
 
     emit({"type": "system", "subtype": "init", "session_id": session_id})
 
+    first_turn = None
+    if isinstance(steps, dict):
+        turn = read_turn(sys.stdin)
+        if turn is None:
+            return
+        steps = next(
+            (chosen for marker, chosen in steps["by_prompt"].items() if marker in turn),
+            [],
+        )
+        first_turn = turn
+
     reports = 0
     for step in steps:
         op = step["op"]
         if op == "read_turn":
-            if read_turn(sys.stdin) is None:
+            if first_turn is not None:
+                first_turn = None
+            elif read_turn(sys.stdin) is None:
                 return
         elif op == "text":
             assistant_text(session_id, step["text"], step.get("parent"))
         elif op == "report":
             reports += 1
             tool_use_id = "toolu_report_{}".format(reports)
-            report_input = {"outcome": step["outcome"], "summary": ""}
+            report_input = {"outcome": step["outcome"], "summary": step.get("summary", "")}
             emit_report(
                 session_id,
                 report_input,
@@ -146,7 +165,8 @@ def main():
         elif op == "result":
             result(session_id, step.get("is_error", False))
         elif op == "echo_turn":
-            turn = read_turn(sys.stdin)
+            turn = first_turn if first_turn is not None else read_turn(sys.stdin)
+            first_turn = None
             if turn is None:
                 return
             assistant_text(session_id, "turn text: {}".format(turn))

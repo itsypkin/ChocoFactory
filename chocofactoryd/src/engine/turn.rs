@@ -1,3 +1,4 @@
+use super::parallel::{BranchApplied, BranchOutcome, BranchWatch, agent_role_of, ran_beside};
 use super::stage_capture::{
     MAX_CAPTURE_BYTES, capture_label, derive_agent_reply_capture, outcome_from_report,
     turn_outcome, unwrap_code_fence,
@@ -146,6 +147,7 @@ impl WorkflowEngine {
             payload,
             input,
             resume,
+            branch,
         } = *entry;
         let StageKind::AgentTurn {
             role,
@@ -229,7 +231,16 @@ impl WorkflowEngine {
         // stage ever advances on, so it's also the only one the tool should
         // accept. A standing stage (empty `on:`, chat) never concludes, so it
         // gets nothing and no instruction to report.
-        let report_outcomes: Vec<String> = if capture == Some(Capture::Json) {
+        //
+        // A parallel branch never routes: its `on:` is always empty, and what
+        // it may report is its group's `results:` list instead.
+        let report_outcomes: Vec<String> = if let Some(branch) = branch {
+            if capture == Some(Capture::Json) {
+                branch.results.to_vec()
+            } else {
+                vec![TURN_DEFAULT_OUTCOME.to_string()]
+            }
+        } else if capture == Some(Capture::Json) {
             stage_def.on.keys().cloned().collect()
         } else if stage_def.on.is_empty() {
             Vec::new()
@@ -410,7 +421,10 @@ impl WorkflowEngine {
         // agent reports and its turn ends (#90), which is what the watcher
         // below waits for — computed once here rather than at each site
         // separately, so the two decisions can't diverge.
-        let session_kind = if stage_def.on.is_empty() {
+        //
+        // A branch is always single-shot, though its `on:` is empty: the
+        // group waits on its watcher.
+        let session_kind = if branch.is_none() && stage_def.on.is_empty() {
             SessionKind::Standing
         } else {
             SessionKind::SingleShot
@@ -486,6 +500,10 @@ impl WorkflowEngine {
                 stage_name.to_string(),
                 capture,
                 session.id,
+                branch.map(|b| BranchWatch {
+                    group: b.group.to_string(),
+                    entry: b.entry,
+                }),
             );
         }
         Ok(())
@@ -589,11 +607,12 @@ impl WorkflowEngine {
     /// parked as stuck. A check that can't run parks the task too: it never
     /// passes silently.
     async fn read_only_check_passes(
-        &self,
+        self: &Arc<Self>,
         task_id: &str,
-        definition: &WorkflowDefinition,
+        definition: &Arc<WorkflowDefinition>,
         stage_name: &str,
         session_id: &str,
+        branch: Option<&BranchWatch>,
     ) -> bool {
         match self
             .read_only_verdict(task_id, definition, stage_name, session_id, true)
@@ -601,7 +620,21 @@ impl WorkflowEngine {
         {
             ReadOnlyVerdict::Clean => true,
             ReadOnlyVerdict::Violation(reason) | ReadOnlyVerdict::Unverified(reason) => {
-                self.mark_stuck(task_id, &reason, false).await;
+                match branch {
+                    None => {
+                        self.mark_stuck(task_id, &reason, false).await;
+                    }
+                    Some(watch) => {
+                        let reason = format!(
+                            "{reason}{}",
+                            ran_beside(definition, &watch.group, stage_name)
+                        );
+                        self.fail_branch_turn(
+                            task_id, definition, watch, stage_name, session_id, reason,
+                        )
+                        .await;
+                    }
+                }
                 false
             }
         }
@@ -615,23 +648,58 @@ impl WorkflowEngine {
     /// its new baseline. A violation, or a check that can't run, is added to
     /// the stuck reason.
     async fn park_incomplete_turn(
-        &self,
+        self: &Arc<Self>,
         task_id: &str,
-        definition: &WorkflowDefinition,
+        definition: &Arc<WorkflowDefinition>,
         stage_name: &str,
         session_id: &str,
         reason: &str,
+        branch: Option<&BranchWatch>,
     ) {
+        let beside = branch
+            .map(|watch| ran_beside(definition, &watch.group, stage_name))
+            .unwrap_or_default();
         let reason = match self
             .read_only_verdict(task_id, definition, stage_name, session_id, false)
             .await
         {
             ReadOnlyVerdict::Clean => reason.to_string(),
             ReadOnlyVerdict::Violation(found) | ReadOnlyVerdict::Unverified(found) => {
-                format!("{reason}; {found}")
+                format!("{reason}; {found}{beside}")
             }
         };
-        self.mark_stuck(task_id, &reason, false).await;
+        match branch {
+            None => {
+                self.mark_stuck(task_id, &reason, false).await;
+            }
+            Some(watch) => {
+                self.fail_branch_turn(task_id, definition, watch, stage_name, session_id, reason)
+                    .await;
+            }
+        }
+    }
+
+    /// A branch's turn did not complete (or was refused): records the branch
+    /// as failed with `reason`. The group settles if it was the last one
+    /// running; the task is parked there, not here.
+    async fn fail_branch_turn(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        watch: &BranchWatch,
+        branch: &str,
+        session_id: &str,
+        reason: String,
+    ) -> BranchApplied {
+        self.finish_branch(
+            task_id,
+            definition,
+            watch,
+            branch,
+            session_id,
+            BranchOutcome::Failed { reason },
+        )
+        .await
     }
 
     /// Compares a read-only role's worktree with the baseline of `session_id`.
@@ -644,9 +712,9 @@ impl WorkflowEngine {
         session_id: &str,
         outcome_pending: bool,
     ) -> ReadOnlyVerdict {
-        let subject = match definition.stages.get(stage_name).map(|s| &s.kind) {
-            Some(StageKind::AgentTurn { role, .. }) => format!("read-only role '{role}'"),
-            _ => format!("stage '{stage_name}'"),
+        let subject = match agent_role_of(definition, stage_name) {
+            Some(role) => format!("read-only role '{role}'"),
+            None => format!("stage '{stage_name}'"),
         };
         // A turn that ended abnormally never produced an outcome, so only a
         // turn that did can say its outcome was not applied.
@@ -661,13 +729,8 @@ impl WorkflowEngine {
                  stage '{stage_name}': {error}. {tail}"
             )
         };
-        let Some(role_def) = definition
-            .stages
-            .get(stage_name)
-            .and_then(|s| match &s.kind {
-                StageKind::AgentTurn { role, .. } => definition.roles.get(role),
-                _ => None,
-            })
+        let Some(role_def) =
+            agent_role_of(definition, stage_name).and_then(|role| definition.roles.get(role))
         else {
             return ReadOnlyVerdict::Unverified(unverified(format!(
                 "stage '{stage_name}' has no agent_turn role in the workflow definition"
@@ -676,9 +739,8 @@ impl WorkflowEngine {
         if !role_def.read_only {
             return ReadOnlyVerdict::Clean;
         }
-        let role = match definition.stages.get(stage_name).map(|s| &s.kind) {
-            Some(StageKind::AgentTurn { role, .. }) => role.as_str(),
-            _ => return ReadOnlyVerdict::Unverified(unverified("stage lost its role".into())),
+        let Some(role) = agent_role_of(definition, stage_name) else {
+            return ReadOnlyVerdict::Unverified(unverified("stage lost its role".into()));
         };
 
         let outcome: Result<Option<String>, String> = async {
@@ -825,6 +887,7 @@ impl WorkflowEngine {
         stage_name: String,
         capture: Option<Capture>,
         session_id: String,
+        branch: Option<BranchWatch>,
     ) {
         let engine = Arc::clone(self);
         tokio::spawn(async move {
@@ -874,6 +937,7 @@ impl WorkflowEngine {
                                      the idle reaper before completing; 'choco task retry' will \
                                      resume it"
                                 ),
+                                branch.as_ref(),
                             )
                             .await;
                         return;
@@ -901,6 +965,7 @@ impl WorkflowEngine {
                                      usage limit before it could report; 'choco task retry' will \
                                      resume it"
                                 ),
+                                branch.as_ref(),
                             )
                             .await;
                         return;
@@ -921,6 +986,7 @@ impl WorkflowEngine {
                                 &stage_name,
                                 &session_id,
                                 &agent_reason(&stage_name),
+                                branch.as_ref(),
                             )
                             .await;
                         return;
@@ -949,6 +1015,7 @@ impl WorkflowEngine {
                                     "stage '{stage_name}': the agent's turn ended without \
                                      calling report_outcome"
                                 ),
+                                branch.as_ref(),
                             )
                             .await;
                         return;
@@ -973,6 +1040,7 @@ impl WorkflowEngine {
                                      its turn ended and was killed; work it started may be \
                                      incomplete"
                                 ),
+                                branch.as_ref(),
                             )
                             .await;
                         return;
@@ -993,6 +1061,7 @@ impl WorkflowEngine {
                                     "stage '{stage_name}': the agent process exited without \
                                      completing its turn"
                                 ),
+                                branch.as_ref(),
                             )
                             .await;
                         return;
@@ -1022,6 +1091,7 @@ impl WorkflowEngine {
                                 &format!(
                                     "stage '{stage_name}': lost track of the agent turn: {err}"
                                 ),
+                                branch.as_ref(),
                             )
                             .await;
                         return;
@@ -1030,7 +1100,14 @@ impl WorkflowEngine {
                 tokio::time::sleep(TURN_WATCH_INTERVAL).await;
             }
             engine
-                .finish_turn(&task_id, &definition, &stage_name, capture, &session_id)
+                .finish_turn(
+                    &task_id,
+                    &definition,
+                    &stage_name,
+                    capture,
+                    &session_id,
+                    branch.as_ref(),
+                )
                 .await;
         });
     }
@@ -1045,11 +1122,12 @@ impl WorkflowEngine {
         stage_name: &str,
         capture: Option<Capture>,
         session_id: &str,
+        branch: Option<&BranchWatch>,
     ) {
         // #172: before anything is fetched, resolved or routed, a read-only
         // role's worktree is compared with its baseline.
         if !self
-            .read_only_check_passes(task_id, definition, stage_name, session_id)
+            .read_only_check_passes(task_id, definition, stage_name, session_id, branch)
             .await
         {
             return;
@@ -1233,15 +1311,22 @@ impl WorkflowEngine {
                                     }),
                                 )
                                 .await;
-                                self.mark_stuck(
-                                    task_id,
-                                    &format!(
-                                        "stage '{stage_name}': the turn's reply could not be \
-                                         read back: {err}"
-                                    ),
-                                    false,
-                                )
-                                .await;
+                                let reason = format!(
+                                    "stage '{stage_name}': the turn's reply could not be \
+                                     read back: {err}"
+                                );
+                                match branch {
+                                    None => {
+                                        self.mark_stuck(task_id, &reason, false).await;
+                                    }
+                                    Some(watch) => {
+                                        self.fail_branch_turn(
+                                            task_id, definition, watch, stage_name, session_id,
+                                            reason,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 return;
                             }
                         }
@@ -1250,130 +1335,165 @@ impl WorkflowEngine {
             }
         };
 
-        // `expected_stage` below catches a task that has *left* this stage,
-        // but not one that left and came back: re-entering opens a new
-        // `session`, and a late watcher for the superseded one would pass
-        // that check and overwrite the fresh capture with a stale verdict.
-        // Advisory only, like poll's `still_in_stage` — it runs outside the
-        // lock, and nothing can produce that interleaving today (nothing
-        // moves a task out of an `agent_turn` while its run is live), so this
-        // is the invariant announcing itself rather than a known case.
-        if !self
-            .is_current_run_for_stage(task_id, stage_name, session_id)
-            .await
-        {
-            tracing::warn!(
-                task_id,
-                session_id,
-                stage = stage_name,
-                "discarded a turn's outcome: its stage has since started a newer run"
-            );
-            return;
-        }
-
-        // `expected_stage` matters even though a turn holds its stage open:
-        // a human can close or resume the task between the run going idle
-        // and this write, and the capture is keyed by the stage the check
-        // confirms is still current.
-        let applied = self
-            .advance_from_stage(
-                task_id,
-                definition,
-                &outcome,
-                Some(stage_name),
-                captured,
-                false,
-            )
-            .await;
-
-        let applied_note = match &applied {
-            Ok(()) => {
-                tracing::debug!(
+        let (applied_ok, applied_note) = if let Some(watch) = branch {
+            // A parallel branch does not advance the task: it records its own
+            // end in the group's payload, under the task lock, which also
+            // checks that the entry, the branch's state and its current run
+            // still match.
+            let applied = self
+                .finish_branch(
+                    task_id,
+                    definition,
+                    watch,
+                    stage_name,
+                    session_id,
+                    BranchOutcome::Done {
+                        result: outcome.clone(),
+                        capture: captured,
+                        note: note.clone(),
+                    },
+                )
+                .await;
+            match applied {
+                BranchApplied::Recorded { done } => (
+                    done,
+                    (!done).then(|| "branch recorded as failed".to_string()),
+                ),
+                BranchApplied::Dropped(why) | BranchApplied::Parked(why) => {
+                    (false, Some(format!("not applied: {why}")))
+                }
+            }
+        } else {
+            // `expected_stage` below catches a task that has *left* this stage,
+            // but not one that left and came back: re-entering opens a new
+            // `session`, and a late watcher for the superseded one would pass
+            // that check and overwrite the fresh capture with a stale verdict.
+            // Advisory only, like poll's `still_in_stage` — it runs outside the
+            // lock, and nothing can produce that interleaving today (nothing
+            // moves a task out of an `agent_turn` while its run is live), so this
+            // is the invariant announcing itself rather than a known case.
+            if !self
+                .is_current_run_for_stage(task_id, stage_name, session_id)
+                .await
+            {
+                tracing::warn!(
                     task_id,
                     session_id,
                     stage = stage_name,
-                    outcome,
-                    "turn completed; advanced"
+                    "discarded a turn's outcome: its stage has since started a newer run"
                 );
-                None
+                return;
             }
-            // Deliberately parked, not broken — the same classification
-            // `finish_detached` uses. A reviewer stage that declares only
-            // `approved`/`changes_requested` and whose reply carried neither
-            // lands here, which is the intended place for a human to pick it
-            // up rather than the engine inventing a transition.
-            Err(EngineError::UnknownOutcome { stage, outcome }) => {
-                tracing::info!(
+
+            // `expected_stage` matters even though a turn holds its stage open:
+            // a human can close or resume the task between the run going idle
+            // and this write, and the capture is keyed by the stage the check
+            // confirms is still current.
+            let applied = self
+                .advance_from_stage(
                     task_id,
-                    stage,
-                    outcome,
-                    "turn parked: its outcome has no 'on:' edge"
-                );
-                // `note` (from the outer match) already says when `outcome`
-                // itself was a fallback — e.g. the reply carried no
-                // 'outcome' key and this advanced with 'done' anyway — so
-                // it's folded into the reason a human sees on the task
-                // rather than just on this turn's own event.
-                let reason = match &note {
-                    Some(note) => format!(
-                        "stage '{stage}': turn outcome '{outcome}' has no 'on:' edge ({note})"
-                    ),
-                    None => format!("stage '{stage}': turn outcome '{outcome}' has no 'on:' edge"),
-                };
-                self.mark_stuck(task_id, &reason, false).await;
-                Some(format!(
-                    "parked: stage '{stage}' has no 'on:' edge for '{outcome}'"
-                ))
-            }
-            Err(EngineError::StageMovedOn { expected, actual }) => {
-                tracing::info!(
-                    task_id,
-                    expected,
-                    actual,
-                    outcome,
-                    "discarded a turn's outcome: the task had already left that stage"
-                );
-                Some(format!(
-                    "not applied: the task had already left '{expected}' for '{actual}'"
-                ))
-            }
-            // A turn that completed in the same instant it was cancelled.
-            // The note goes on the `turn_outcome` event, so the timeline
-            // says why the verdict wasn't applied rather than leaving a
-            // reader to infer it from the task's status.
-            Err(EngineError::TaskCancelled(_)) => {
-                tracing::info!(
-                    task_id,
-                    stage = stage_name,
-                    outcome,
-                    "discarded a turn's outcome: the task was cancelled"
-                );
-                Some("not applied: the task was cancelled".to_string())
-            }
-            Err(err) => {
-                tracing::error!(
-                    task_id, stage = stage_name, outcome, %err,
-                    "task wedged: its turn completed but the transition failed"
-                );
-                // See `finish_detached`'s identical catch-all for why
-                // this blames whichever stage actually failed rather than
-                // always `stage_name`.
-                let blamed = self.stage_to_blame(task_id, stage_name).await;
-                let reason = if blamed == stage_name {
-                    format!("stage '{stage_name}': turn completed but the transition failed: {err}")
-                } else {
-                    format!(
-                        "stage '{blamed}': could not be entered after '{stage_name}' completed: {err}"
-                    )
-                };
-                self.mark_stuck(
-                    task_id,
-                    &reason,
-                    matches!(err, EngineError::Template { .. }),
+                    definition,
+                    &outcome,
+                    Some(stage_name),
+                    captured,
+                    false,
                 )
                 .await;
-                Some(format!("not applied: {err}"))
-            }
+
+            let applied_note = match &applied {
+                Ok(()) => {
+                    tracing::debug!(
+                        task_id,
+                        session_id,
+                        stage = stage_name,
+                        outcome,
+                        "turn completed; advanced"
+                    );
+                    None
+                }
+                // Deliberately parked, not broken — the same classification
+                // `finish_detached` uses. A reviewer stage that declares only
+                // `approved`/`changes_requested` and whose reply carried neither
+                // lands here, which is the intended place for a human to pick it
+                // up rather than the engine inventing a transition.
+                Err(EngineError::UnknownOutcome { stage, outcome }) => {
+                    tracing::info!(
+                        task_id,
+                        stage,
+                        outcome,
+                        "turn parked: its outcome has no 'on:' edge"
+                    );
+                    // `note` (from the outer match) already says when `outcome`
+                    // itself was a fallback — e.g. the reply carried no
+                    // 'outcome' key and this advanced with 'done' anyway — so
+                    // it's folded into the reason a human sees on the task
+                    // rather than just on this turn's own event.
+                    let reason = match &note {
+                        Some(note) => format!(
+                            "stage '{stage}': turn outcome '{outcome}' has no 'on:' edge ({note})"
+                        ),
+                        None => {
+                            format!("stage '{stage}': turn outcome '{outcome}' has no 'on:' edge")
+                        }
+                    };
+                    self.mark_stuck(task_id, &reason, false).await;
+                    Some(format!(
+                        "parked: stage '{stage}' has no 'on:' edge for '{outcome}'"
+                    ))
+                }
+                Err(EngineError::StageMovedOn { expected, actual }) => {
+                    tracing::info!(
+                        task_id,
+                        expected,
+                        actual,
+                        outcome,
+                        "discarded a turn's outcome: the task had already left that stage"
+                    );
+                    Some(format!(
+                        "not applied: the task had already left '{expected}' for '{actual}'"
+                    ))
+                }
+                // A turn that completed in the same instant it was cancelled.
+                // The note goes on the `turn_outcome` event, so the timeline
+                // says why the verdict wasn't applied rather than leaving a
+                // reader to infer it from the task's status.
+                Err(EngineError::TaskCancelled(_)) => {
+                    tracing::info!(
+                        task_id,
+                        stage = stage_name,
+                        outcome,
+                        "discarded a turn's outcome: the task was cancelled"
+                    );
+                    Some("not applied: the task was cancelled".to_string())
+                }
+                Err(err) => {
+                    tracing::error!(
+                        task_id, stage = stage_name, outcome, %err,
+                        "task wedged: its turn completed but the transition failed"
+                    );
+                    // See `finish_detached`'s identical catch-all for why
+                    // this blames whichever stage actually failed rather than
+                    // always `stage_name`.
+                    let blamed = self.stage_to_blame(task_id, stage_name).await;
+                    let reason = if blamed == stage_name {
+                        format!(
+                            "stage '{stage_name}': turn completed but the transition failed: {err}"
+                        )
+                    } else {
+                        format!(
+                            "stage '{blamed}': could not be entered after '{stage_name}' completed: {err}"
+                        )
+                    };
+                    self.mark_stuck(
+                        task_id,
+                        &reason,
+                        matches!(err, EngineError::Template { .. }),
+                    )
+                    .await;
+                    Some(format!("not applied: {err}"))
+                }
+            };
+            (applied.is_ok(), applied_note)
         };
 
         // Written *after* the advance, and carrying whether it was applied,
@@ -1408,7 +1528,7 @@ impl WorkflowEngine {
             // rather than suppressed later, so it can't swallow a note that
             // was explaining something else — an oversized reply that wasn't
             // stored at all is the one that must always survive.
-            let text_hint = (capture == Some(Capture::Text) && applied.is_err()).then(|| {
+            let text_hint = (capture == Some(Capture::Text) && !applied_ok).then(|| {
                 "'capture: text' keeps the reply but carries no verdict; use 'capture: json' \
                  to route on an 'outcome' key"
                     .to_string()
@@ -1425,7 +1545,7 @@ impl WorkflowEngine {
                     "stage": stage_name,
                     "capture": capture_label(capture),
                     "outcome": outcome,
-                    "applied": applied.is_ok(),
+                    "applied": applied_ok,
                     "note": note,
                     "source": source,
                 }),

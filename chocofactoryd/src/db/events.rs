@@ -99,6 +99,18 @@ pub async fn append_for_task(
     event_type: EventType,
     payload: Value,
 ) -> Result<Event, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    append_for_task_on(&mut conn, task_id, event_type, payload).await
+}
+
+/// [`append_for_task`] on a caller-supplied connection, so several entries
+/// can commit together in the caller's transaction (pass `&mut *tx`).
+pub async fn append_for_task_on(
+    conn: &mut sqlx::SqliteConnection,
+    task_id: &str,
+    event_type: EventType,
+    payload: Value,
+) -> Result<Event, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let row = sqlx::query_as::<_, EventRow>(concat!(
@@ -112,7 +124,7 @@ pub async fn append_for_task(
     .bind(event_type.to_string())
     .bind(Json(payload))
     .bind(now)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     Ok(row.into())
 }
@@ -151,8 +163,22 @@ pub async fn append_branch_started(
     entry: i64,
     via: Option<&str>,
 ) -> Result<Event, sqlx::Error> {
-    append_for_task(
-        pool,
+    let mut conn = pool.acquire().await?;
+    append_branch_started_on(&mut conn, task_id, group, branch, kind, entry, via).await
+}
+
+/// [`append_branch_started`] on a caller-supplied connection or transaction.
+pub async fn append_branch_started_on(
+    conn: &mut sqlx::SqliteConnection,
+    task_id: &str,
+    group: &str,
+    branch: &str,
+    kind: &str,
+    entry: i64,
+    via: Option<&str>,
+) -> Result<Event, sqlx::Error> {
+    append_for_task_on(
+        conn,
         task_id,
         EventType::BranchStarted,
         json!({ "group": group, "branch": branch, "kind": kind, "entry": entry, "via": via }),
