@@ -402,7 +402,10 @@ impl WorkflowEngine {
             needs_base_start: bool,
         }
         let mut rerun: Vec<Rerun<'_>> = Vec::new();
-        for (name, branch) in branches {
+        // First pass: a live session on any branch refuses before any
+        // resume decision is made.
+        let mut current = Vec::with_capacity(branches.len());
+        for name in branches.keys() {
             let last = sessions::get_current_for_stage(&self.pool, task_id, name).await?;
             if let Some(session) = &last
                 && session.status == SessionStatus::Active
@@ -412,6 +415,9 @@ impl WorkflowEngine {
                     branch: name.clone(),
                 });
             }
+            current.push(last);
+        }
+        for ((name, branch), last) in branches.iter().zip(current) {
             if branch_state(&state.payload, name) == Some("done") {
                 continue;
             }

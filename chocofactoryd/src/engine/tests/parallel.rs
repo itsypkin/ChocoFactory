@@ -1340,6 +1340,18 @@ async fn retry_re_runs_only_the_failed_branch() {
     .await;
     assert_eq!(g.sessions("two").await.len(), 2);
     assert_eq!(g.sessions("one").await.len(), 1);
+    // The ordinary retry writes no extra plain start: the retried session
+    // keeps the group's entry as its lap.
+    for branch in ["one", "two"] {
+        let plain = started_events(&g, branch)
+            .await
+            .iter()
+            .filter(|e| e.payload["via"].is_null())
+            .count();
+        assert_eq!(plain, 1, "{branch}");
+    }
+    let laps: Vec<_> = g.facts("two").await.into_iter().map(|f| f.lap).collect();
+    assert_eq!(laps, [Some(1), Some(1)]);
     let state = g.state().await;
     assert_eq!(state.payload["stages"]["one"], before["stages"]["one"]);
     assert_eq!(state.current_stage, "summarize");
@@ -1438,18 +1450,7 @@ async fn install_no_state_update(g: &Group) {
 
 #[tokio::test]
 async fn retry_is_refused_while_a_branch_is_live_then_re_enters_dead_running_slots() {
-    // The branches hold for a few seconds, then exit without a report.
-    let hold_then_exit = json!([
-        {"op": "read_turn"}, {"op": "sleep", "seconds": 4}, {"op": "exit"}
-    ]);
-    let g = group(
-        Shape::new(),
-        by_prompt(&[
-            ("BRANCH-ONE", hold_then_exit.clone()),
-            ("BRANCH-TWO", hold_then_exit),
-        ]),
-    )
-    .await;
+    let g = group(Shape::new(), holding()).await;
     g.start(None).await.unwrap();
     let one = g.wait_sessions("one", 1).await.remove(0);
     g.wait_sessions("two", 1).await;
@@ -1468,15 +1469,12 @@ async fn retry_is_refused_while_a_branch_is_live_then_re_enters_dead_running_slo
     );
     assert_eq!(snapshot(&g).await, before);
 
-    crate::test_support::wait_until("sessions end", || async {
-        let all = sessions::list_for_task(&g.pool, &g.task_id).await.unwrap();
-        if all.iter().all(|s| s.status != SessionStatus::Active) {
-            Ok(())
-        } else {
-            Err(format!("{all:?}"))
-        }
-    })
-    .await;
+    // End the live sessions deliberately instead of racing a timer.
+    sqlx::query("UPDATE sessions SET status = 'exited' WHERE task_id = ?")
+        .bind(&g.task_id)
+        .execute(&g.pool)
+        .await
+        .unwrap();
     sqlx::query(sqlx::AssertSqlSafe("DROP TRIGGER no_state_update"))
         .execute(&g.pool)
         .await
@@ -1709,4 +1707,132 @@ async fn retry_refuses_a_missing_block_and_a_group_with_nothing_failed() {
         "{err}"
     );
     assert_eq!(snapshot(&g).await, before);
+}
+
+/// The no-input group: every start fails, so the task parks with `running`
+/// slots turned back to `failed` by `record_start_failures`.
+async fn parked_without_input() -> Group {
+    let shape = Shape {
+        one_prompt: false,
+        two_prompt: false,
+        ..Shape::new()
+    };
+    let g = group(shape, holding()).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+    g
+}
+
+#[tokio::test]
+async fn a_failed_record_of_start_failures_marks_stuck_and_the_next_retry_recovers() {
+    let g = parked_without_input().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_failed_back BEFORE UPDATE ON workflow_state
+         WHEN json_extract(NEW.payload, '$.parallel.branches.one.state') = 'failed'
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    let err = retry(&g, RetryMode::Auto).await.unwrap_err();
+    assert!(matches!(err, RetryTaskError::Enter(_)), "{err}");
+    assert_eq!(g.status().await, "stuck");
+    let reason = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(reason.contains("retry failed"), "{reason}");
+    wait_settle_errors(&g, 2).await;
+
+    sqlx::query(sqlx::AssertSqlSafe("DROP TRIGGER no_failed_back"))
+        .execute(&g.pool)
+        .await
+        .unwrap();
+    let outcome = retry(&g, RetryMode::Auto).await.unwrap();
+    assert_eq!(outcome.branches.len(), 2);
+}
+
+#[tokio::test]
+async fn a_retry_whose_write_is_ignored_reports_no_workflow_state() {
+    let g = parked_without_input().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER ignore_state BEFORE UPDATE ON workflow_state
+         BEGIN SELECT RAISE(IGNORE); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    let before = snapshot(&g).await;
+    let err = retry(&g, RetryMode::Auto).await.unwrap_err();
+    assert!(matches!(err, RetryTaskError::NoWorkflowState), "{err}");
+    assert_eq!(snapshot(&g).await, before);
+}
+
+#[tokio::test]
+async fn a_retry_whose_reopen_is_ignored_reports_not_stuck_and_keeps_running_slots() {
+    let g = parked_without_input().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER ignore_reopen BEFORE UPDATE ON tasks
+         BEGIN SELECT RAISE(IGNORE); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    let err = retry(&g, RetryMode::Auto).await.unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::NotStuck(s) if s == "stuck"),
+        "{err}"
+    );
+    assert_eq!(g.status().await, "stuck");
+    let payload = g.state().await.payload;
+    assert_eq!(branch_slot(&payload, "one")["state"], "running");
+    assert_eq!(branch_slot(&payload, "two")["state"], "running");
+    assert!(g.sessions("one").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_block_with_an_entry_but_no_branches_is_group_state_missing() {
+    let g = parked_without_input().await;
+    let state = g.state().await;
+    let mut payload = state.payload.clone();
+    payload["parallel"]["branches"] = Value::Null;
+    workflow_state::update(
+        &g.pool,
+        &g.task_id,
+        workflow_state::WorkflowStateUpdate {
+            current_stage: state.current_stage.clone(),
+            stage_kind: "parallel".to_string(),
+            loop_counters: state.loop_counters.clone(),
+            payload,
+            enters_stage: false,
+        },
+    )
+    .await
+    .unwrap();
+    let before = snapshot(&g).await;
+    let err = retry(&g, RetryMode::Auto).await.unwrap_err();
+    assert!(
+        matches!(err, RetryTaskError::GroupStateMissing { .. }),
+        "{err}"
+    );
+    assert_eq!(snapshot(&g).await, before);
+}
+
+#[tokio::test]
+async fn resume_reports_a_live_later_branch_before_a_non_resumable_earlier_one() {
+    let g = group(Shape::new(), holding()).await;
+    g.start(None).await.unwrap();
+    g.wait_sessions("one", 1).await;
+    g.wait_sessions("two", 1).await;
+    install_no_state_update(&g).await;
+    let one = g.sessions("one").await.remove(0);
+    g.finish(1, "one", &one.id, reported("bogus", "x")).await;
+    // `one` is exited, so only `two` is live; `one` is not resumable.
+    sqlx::query("UPDATE sessions SET status = 'exited' WHERE id = ?")
+        .bind(&one.id)
+        .execute(&g.pool)
+        .await
+        .unwrap();
+    let err = retry(&g, RetryMode::Resume).await.unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::BranchStillActive { branch, .. } if branch == "two"),
+        "{err}"
+    );
 }
