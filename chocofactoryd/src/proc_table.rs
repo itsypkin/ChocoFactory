@@ -88,7 +88,8 @@ pub struct ProcEntry {
 pub type Identity = (i32, u64);
 
 /// A table reader; swapped in tests.
-pub type ProcReader = std::sync::Arc<dyn Fn(Option<&str>) -> io::Result<Vec<ProcEntry>> + Send + Sync>;
+pub type ProcReader =
+    std::sync::Arc<dyn Fn(Option<&str>) -> io::Result<Vec<ProcEntry>> + Send + Sync>;
 
 /// The facts the ownership rule needs besides the table.
 pub struct OwnershipInput<'a> {
@@ -151,16 +152,11 @@ pub fn owned_pids(table: &[ProcEntry], input: &OwnershipInput<'_>) -> Vec<i32> {
     }
     seeds.retain(|pid| by_pid.get(pid).is_some_and(|e| !never_owned(e, input)));
 
-    let agent_sid = input
-        .agent
-        .and_then(|a| by_pid.get(&a))
-        .map(|a| a.sid);
+    let agent_sid = input.agent.and_then(|a| by_pid.get(&a)).map(|a| a.sid);
     let sessions: HashSet<i32> = seeds
         .iter()
         .map(|pid| by_pid[pid].sid)
-        .filter(|sid| {
-            ![0, 1, input.daemon_sid].contains(sid) && Some(*sid) != agent_sid
-        })
+        .filter(|sid| ![0, 1, input.daemon_sid].contains(sid) && Some(*sid) != agent_sid)
         .collect();
 
     let mut owned: Vec<i32> = table
@@ -249,7 +245,11 @@ mod platform {
         let mut table = Vec::new();
         for dirent in std::fs::read_dir("/proc")? {
             let Ok(dirent) = dirent else { continue };
-            let Some(pid) = dirent.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            let Some(pid) = dirent
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i32>().ok())
+            else {
                 continue;
             };
             let dir = format!("/proc/{pid}");
@@ -390,11 +390,7 @@ mod platform {
         for _ in 0..argc.max(0) {
             rest.next()?;
         }
-        Some(
-            rest.filter(|p| !p.is_empty())
-                .map(<[u8]>::to_vec)
-                .collect(),
-        )
+        Some(rest.filter(|p| !p.is_empty()).map(<[u8]>::to_vec).collect())
     }
 
     pub fn read(marker: Option<&str>) -> io::Result<Vec<ProcEntry>> {
@@ -517,7 +513,13 @@ mod tests {
         let mut table = base();
         let mut orphan = p(300, 1, 300, 30);
         let none = HashSet::new();
-        assert!(owned_pids(&[table.clone(), vec![orphan.clone()]].concat(), &input(&none)).is_empty());
+        assert!(
+            owned_pids(
+                &[table.clone(), vec![orphan.clone()]].concat(),
+                &input(&none)
+            )
+            .is_empty()
+        );
         orphan.marker = MarkerStatus::Present;
         table.push(orphan);
         assert_eq!(owned_pids(&table, &input(&none)), vec![300]);

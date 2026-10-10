@@ -600,13 +600,11 @@ impl SessionManager {
             sessions
                 .iter()
                 .filter_map(|(session_id, slot)| match slot {
-                    SessionSlot::Live(session) => {
-                        Some((
-                            session_id.clone(),
-                            Arc::clone(&session.signals.pgid),
-                            Arc::clone(&session.signals.tracker),
-                        ))
-                    }
+                    SessionSlot::Live(session) => Some((
+                        session_id.clone(),
+                        Arc::clone(&session.signals.pgid),
+                        Arc::clone(&session.signals.tracker),
+                    )),
                     SessionSlot::Establishing => None,
                 })
                 .collect()
@@ -1265,7 +1263,9 @@ impl Default for SingleShotTurn {
 #[derive(Debug, PartialEq, Eq)]
 enum JobWaitChange {
     /// A wait began; `remaining` of the turn's budget is left for it.
-    Entered { remaining: Duration },
+    Entered {
+        remaining: Duration,
+    },
     /// A wait began with none of the turn's budget left.
     ExhaustedOnEntry,
     NoChange,
@@ -1704,7 +1704,9 @@ impl LeftoverTracker {
 
     /// Scans (no environments) and records the agent's current descendants.
     async fn record_descendants(&self, agent: u32, site: &str) {
-        let Ok(agent) = i32::try_from(agent) else { return };
+        let Ok(agent) = i32::try_from(agent) else {
+            return;
+        };
         match self.scan(false).await {
             Ok(table) => self.record_table(&table, agent),
             Err(err) => self.note_scan_failure(site, &err),
@@ -1752,7 +1754,11 @@ impl LeftoverTracker {
                 break;
             }
             if round == SWEEP_ROUNDS {
-                tracing::warn!(site, count = owned.len(), "processes the turn started survived the sweep");
+                tracing::warn!(
+                    site,
+                    count = owned.len(),
+                    "processes the turn started survived the sweep"
+                );
                 let mut state = self.state();
                 for pid in owned {
                     if !state.survivors.iter().any(|(p, _)| *p == pid) {
@@ -1784,7 +1790,11 @@ impl LeftoverTracker {
             tokio::time::sleep(SWEEP_INTERVAL).await;
         }
         if killed_here > 0 {
-            tracing::warn!(site, killed = killed_here, "killed processes left behind by the turn");
+            tracing::warn!(
+                site,
+                killed = killed_here,
+                "killed processes left behind by the turn"
+            );
         }
         killed_here
     }
@@ -1867,7 +1877,14 @@ async fn write_leftover_notes(
                 list(&survivors)
             ));
         }
-        append_session_note(pool, session_id, "leftovers_killed", &message, events_notify).await;
+        append_session_note(
+            pool,
+            session_id,
+            "leftovers_killed",
+            &message,
+            events_notify,
+        )
+        .await;
     }
     if !failures.is_empty() {
         append_session_note(
@@ -3336,10 +3353,7 @@ mod tests {
                 remaining: StdDuration::from_secs(6)
             }
         );
-        assert_eq!(
-            turn.job_wait_deadline,
-            Some(t5 + StdDuration::from_secs(6))
-        );
+        assert_eq!(turn.job_wait_deadline, Some(t5 + StdDuration::from_secs(6)));
         // It lasts 6 s: the budget is gone.
         turn.background_jobs.clear();
         let t11 = t5 + StdDuration::from_secs(6);
@@ -4956,13 +4970,21 @@ mod tests {
             .await
             .into_iter()
             .find(|e| e.payload["kind"] == kind)
-            .map(|e| e.payload["message"].as_str().unwrap_or_default().to_string())
+            .map(|e| {
+                e.payload["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
     }
 
     async fn wait_for_turn_completed(pool: &SqlitePool, session_id: &str) {
         crate::test_support::wait_until("a turn_completed event", || async {
             let events = events::list_for_session(pool, session_id).await.unwrap();
-            if events.iter().any(|e| e.event_type == EventType::TurnCompleted) {
+            if events
+                .iter()
+                .any(|e| e.event_type == EventType::TurnCompleted)
+            {
                 Ok(())
             } else {
                 Err("not yet".to_string())
@@ -5262,7 +5284,10 @@ mod tests {
                     .env("CHOCOFACTORY_TURN_00000000000000000000000000000001", "1");
                 c
             });
-            let plain_child = std::process::Command::new("sleep").arg("600").spawn().unwrap();
+            let plain_child = std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .unwrap();
             Bystanders(vec![own_session, other_marker, plain_child])
         }
 
@@ -5316,13 +5341,8 @@ mod tests {
                     {"op": "sleep", "seconds": 60},
                 ]),
             );
-            let (pool, session_id, _manager) = start_leftovers(
-                binary,
-                fast_timers(3),
-                chrono::Duration::hours(1),
-                reader,
-            )
-            .await;
+            let (pool, session_id, _manager) =
+                start_leftovers(binary, fast_timers(3), chrono::Duration::hours(1), reader).await;
             let agent = read_pid_when_written(&agent_pid_file).await;
             let run = wait_until_final(&pool, &session_id).await;
             wait_until_gone(agent).await;
@@ -5338,7 +5358,10 @@ mod tests {
         let (good_status, good_reason, good_notes) = run(None).await;
         assert_eq!((status, reason), (good_status, good_reason));
         assert_eq!(reason, Some(SessionEndReason::Lingered));
-        assert!(notes.contains(&"leftovers_unchecked".to_string()), "{notes:?}");
+        assert!(
+            notes.contains(&"leftovers_unchecked".to_string()),
+            "{notes:?}"
+        );
         assert!(!good_notes.contains(&"leftovers_unchecked".to_string()));
     }
 
@@ -5384,5 +5407,98 @@ mod tests {
             },
             0
         ));
+    }
+
+    /// Pids of this user's processes whose program name ends with `program`
+    /// and whose command line contains `needle`: the process itself, not a
+    /// shell whose command line merely mentions it.
+    fn pids_running(program: &str, needle: &str) -> Vec<u32> {
+        let out = std::process::Command::new("ps")
+            .args(["-axo", "pid=,command="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let pid = words.next()?.parse().ok()?;
+                let name = words.next()?;
+                let name_matches = name.rsplit('/').next()?.to_lowercase().starts_with(program);
+                (name_matches && line.contains(needle)).then_some(pid)
+            })
+            .collect()
+    }
+
+    /// Opt-in probe against the real `claude` (a few cents on haiku): a
+    /// turn that starts a background `sleep` and a foreground `nohup`ed
+    /// python, ends without reporting, and is closed at the job-wait limit.
+    /// Both must be gone afterwards.
+    ///
+    /// `CHOCOFACTORY_REAL_CLAUDE_TESTS=1 cargo test -p chocofactoryd
+    /// the_real_claude_turns_leftovers_are_killed -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "drives the real claude; set CHOCOFACTORY_REAL_CLAUDE_TESTS=1"]
+    async fn the_real_claude_turns_leftovers_are_killed() {
+        assert_eq!(
+            std::env::var("CHOCOFACTORY_REAL_CLAUDE_TESTS").as_deref(),
+            Ok("1"),
+            "set CHOCOFACTORY_REAL_CLAUDE_TESTS=1 to run this test against the real claude"
+        );
+        assert!(
+            std::env::var_os("CHOCOFACTORY_CLAUDE_BINARY").is_none(),
+            "CHOCOFACTORY_CLAUDE_BINARY is set; this probe must drive the real claude"
+        );
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::new());
+        let manager = SessionManager::with_turn_timers(
+            pool.clone(),
+            Registry::single(adapter),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+            TurnTimers {
+                job_wait_limit: StdDuration::from_secs(20),
+                ..fast_timers(3)
+            },
+        );
+        let dir = TempDir::new();
+        let cfg = RoleConfig {
+            model: Some("haiku".to_string()),
+            cwd: dir.0.clone(),
+            // A disposable directory, and Bash calls need no approval there.
+            sandboxed: true,
+            ..single_shot_role_config()
+        };
+        let prompt = "Do exactly this, then stop. First, one Bash call with run_in_background \
+             true running: /bin/sleep 600 . Second, a separate foreground Bash call running: \
+             nohup python3 -c \"import time; time.sleep(601)\" >/dev/null 2>&1 & \
+             After both calls, end your turn with the single word ok. Do not wait for the \
+             commands and do not call report_outcome.";
+        manager
+            .start(&session_id, "claude", prompt, &cfg, SessionKind::SingleShot)
+            .await
+            .unwrap();
+
+        // Recorded while the turn is still open.
+        let (sleep_pid, python_pid) =
+            crate::test_support::wait_until("both leftovers to be running", || async {
+                let sleeps = pids_running("sleep", "sleep 600");
+                let pythons = pids_running("python", "time.sleep(601)");
+                match (sleeps.first(), pythons.first()) {
+                    (Some(a), Some(b)) => Ok((*a, *b)),
+                    _ => Err(format!("sleep {sleeps:?}, python {pythons:?}")),
+                }
+            })
+            .await;
+        println!("leftovers before the close: sleep {sleep_pid}, python {python_pid}");
+
+        let run = wait_until_final(&pool, &session_id).await;
+        println!("end_reason {:?}", run.end_reason);
+        for note in note_events(&pool, &session_id).await {
+            println!("note {}: {}", note.payload["kind"], note.payload["message"]);
+        }
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        wait_until_gone(sleep_pid).await;
+        wait_until_gone(python_pid).await;
     }
 }

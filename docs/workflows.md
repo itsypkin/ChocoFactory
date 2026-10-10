@@ -202,16 +202,38 @@ when it ends *after* the agent called `report_outcome`:
 - The exception is a turn whose own background job is still running. On
   Claude Code, the CLI reports the session's running background jobs, and
   while any are running a report-less turn is not nudged. A `job_wait`
-  `session_note` marks the start of the wait. If the turn is still waiting 60
-  minutes after the wait began (a new wait, after the CLI wakes the agent and
-  it ends again without reporting, gets a fresh 60 minutes), it's closed as `no_report` with a `session_note`
-  that names the jobs; once the jobs are gone the nudge rule above applies
-  again. Roles on omp keep the nudge rule.
+  `session_note` marks the start of each wait. The 60 minutes are a total for
+  the whole turn, summed over all its waits: a wait that begins after the CLI
+  woke the agent and it ended again without reporting gets only what is left,
+  never a fresh 60 minutes. When the total is used up the turn is closed as
+  `no_report` with a `session_note` that names the jobs; once the jobs are
+  gone the nudge rule above applies again. Roles on omp keep the nudge rule.
 - Once a turn has reported and ended, its process has 30 seconds to exit. If
-  it's still running, its whole process group is killed and the task is
-  marked `stuck`, rather than advancing past work that may still be landing.
+  it's still running, the process and what the turn started are killed and the
+  task is marked `stuck`, rather than advancing past work that may still be
+  landing. A process that exited on its own, with nothing of the turn's left
+  alive, does not park the task.
 - Output that arrives after a turn completed stays on the timeline, flagged
   `after_completion`. Nudges and kills appear as `session_note` events.
+- However a turn ends (reported, closed, cancelled, daemon stopped, or the
+  agent crashed), choco then kills the processes it can prove the turn
+  started. That includes background jobs the agent's tool ran in sessions
+  and process groups of their own (Claude Code runs every Bash call in a
+  new session), such as a hung `cargo test` or a dev server. They are
+  listed in a `leftovers_killed` `session_note`, which also lists any that
+  could not be killed. A `leftovers_unchecked` note means choco could not
+  read the process table, so the check could not run (the agent's own
+  process group was still killed). A process counts as the turn's if it
+  descends from the agent, was seen descending from it earlier, carries
+  the turn's marker in its environment, or shares a session with one that
+  does. choco never signals anything else. One blind spot: on macOS the OS
+  hides the environment of Apple's own binaries (`/bin/zsh`, `/bin/sleep`,
+  `/usr/bin/perl`), so a foreground `nohup /bin/sleep 999 &` that left the
+  agent's process tree before the turn ended, and shares no session with
+  anything else of the turn's, survives. Anything you built or installed
+  (cargo, test binaries, node, Homebrew Python) is found. A process started
+  through a service manager (`launchctl`, `systemd-run`, `docker run`) or
+  as another user is out of reach.
 
 A sub-agent calling `report_outcome` doesn't count, and neither does a call
 the tool rejected.

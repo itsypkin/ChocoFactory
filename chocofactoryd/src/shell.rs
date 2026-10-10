@@ -435,9 +435,8 @@ mod tests {
 
     #[test]
     fn a_zombie_leader_with_a_live_member_kills_the_member() {
-        let mut child = in_own_group(
-            std::process::Command::new("sh").args(["-c", "sleep 600 & exit 0"]),
-        );
+        let mut child =
+            in_own_group(std::process::Command::new("sh").args(["-c", "sleep 600 & exit 0"]));
         let pgid = child.id();
         // The leader has exited (zombie) and the sleep still lives.
         wait_for_table("the member to outlive its leader", |t| {
