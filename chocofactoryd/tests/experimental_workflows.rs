@@ -172,6 +172,9 @@ fn copied_files_are_byte_identical() {
 fn list(dir: &Path, prefix: &str, out: &mut BTreeSet<String>) {
     for e in fs::read_dir(dir).unwrap() {
         let e = e.unwrap();
+        if e.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let name = format!("{prefix}{}", e.file_name().to_string_lossy());
         if e.path().is_dir() {
             list(&e.path(), &format!("{name}/"), out);

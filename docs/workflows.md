@@ -155,7 +155,7 @@ of `approved`/`changes_requested` to keep in sync — change the `on:` map and
 every agent-facing part of the contract changes with it.
 
 The tool is present on *every* agent turn, and every stage that can finish
-on its own (anything but a standing `on: {}` session like chat) has to call
+on its own (anything but a standing `on: {}` session like chat; a branch of a parallel group also has an empty `on:` but must still report) has to call
 it to finish. A stage without `capture: json` may only report `done`, the
 one outcome it advances on. A branch of a [parallel group](#parallel-stages)
 reports one of its `results:` instead of an `on:` key.
@@ -535,7 +535,8 @@ a branch whose last session belongs to an earlier entry of the group starts
 fresh.
 
 - `--resume` is refused, changing nothing, if any failed branch can't resume:
-  `branch '<b>' of parallel stage '<g>': <why>`.
+  `this stage's last session cannot be resumed: branch '<b>' of parallel
+  stage '<g>': <why>`.
 - `--fresh` starts every failed branch fresh.
 - A retry is refused while any branch's session is still live: `branch '<b>'
   of parallel stage '<g>' still has a live session; wait for it to end, then
