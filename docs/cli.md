@@ -188,11 +188,13 @@ Progress
 `Branches` table between the fields and `Progress`, one row per branch:
 `branch`, `kind`, `state`, `result or reason` (the result of a `done` branch,
 the reason of a `failed` one, cut to 60 characters), `time` and `cost`. `time`
-is how long a branch ran, or has run so far while the task is open; `-` means
-the branch is not running (the task is not open) or a time is missing. `cost`
-is the branch's turn cost for the group's current entry; `no data` means no
-turn recorded usage for it. `choco --json task status <id>` carries the full
-text under `workflow_state.branches`. The table is gone once the task leaves
+is `ended − started` for a finished (`done` or `failed`) branch, and the time
+since it started for a `running` branch while the task is `open`; `-` appears
+for a `running` branch of a task that is stuck or cancelled, or when a time is
+missing. `cost` is the branch's turn cost for the group's current entry; `no
+data` means no turn recorded usage for it at that entry, and `cost unknown`
+means a turn recorded usage but no cost. `choco --json task status <id>` carries the
+full text under `workflow_state.branches`. The table is gone once the task leaves
 the group.
 
 ```
@@ -200,7 +202,7 @@ Branches
   branch               kind        state    result or reason                                              time  cost
   security_review      agent_turn  running                                                                5m    ≈ $0.42
   architecture_review  agent_turn  done     blocking                                                      2m    cost unknown
-  tests                ?           failed   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbb…  3m    no data
+  tests                agent_turn  failed   stage 'tests': the agent's turn ended without calling repor…  3m    no data
 ```
 
 **Cost and time.** After the progress list, `choco task status` prints what

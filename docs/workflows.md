@@ -1,6 +1,6 @@
 # Writing and customising workflows
 
-A workflow is a YAML file that defines a task's stages, roles and routing. This page covers where a workflow comes from, how to keep your own in a repo, and how to write one: routing on an agent's verdict, what an agent can see, read-only roles and human gates. Back to the [README](../README.md).
+A workflow is a YAML file that defines a task's stages, roles and routing. This page covers where a workflow comes from, how to keep your own in a repo, and how to write one: routing on an agent's verdict, what an agent can see, read-only roles, human gates and parallel stages. Back to the [README](../README.md).
 
 ## Project workflows
 
@@ -157,7 +157,8 @@ every agent-facing part of the contract changes with it.
 The tool is present on *every* agent turn, and every stage that can finish
 on its own (anything but a standing `on: {}` session like chat) has to call
 it to finish. A stage without `capture: json` may only report `done`, the
-one outcome it advances on.
+one outcome it advances on. A branch of a [parallel group](#parallel-stages)
+reports one of its `results:` instead of an `on:` key.
 
 A stage can also require the report itself to carry named sections:
 
@@ -198,7 +199,9 @@ when it ends *after* the agent called `report_outcome`:
 
 - A turn that ends without reporting is left open. After 5 minutes with no
   output it's nudged (up to 3 times); after that it's closed, and the task is
-  marked `stuck`.
+  marked `stuck`. (In a [parallel group](#parallel-stages), where this section
+  says the task is marked `stuck`, the branch fails instead, and the task
+  parks once no branch is running.)
 - The exception is a turn whose own background job is still running. On
   Claude Code, the CLI reports the session's running background jobs, and
   while any are running a report-less turn is not nudged. A `job_wait`
@@ -313,7 +316,8 @@ roles:
   branch, `git status` and file contents, ignored files excluded) before the role's turn, and
   compare it afterwards. Bash can still write files, so the denylist alone
   isn't enough. The comparison happens only on stages that conclude (a
-  single-shot `agent_turn` with an `on:` map). A `read_only` role on a standing
+  single-shot `agent_turn` with an `on:` map), and on every branch of a
+  [parallel group](#parallel-stages) (whose `on:` is always empty). A `read_only` role on a standing
   stage (`on: {}`, as in a chat) gets a baseline but its turns are not checked.
 
 Two rules are checked at load time: a `read_only` role must list all three
@@ -324,8 +328,9 @@ Neither field can be set from task config (`--config`, `--role-*`) or the
 global config file; such keys are ignored. Only the workflow definition can
 set them.
 
-If the turn changed the worktree anyway, the task is marked `stuck` with a
-reason such as `read-only role 'reviewer' changed the worktree in stage
+If the turn changed the worktree anyway, the task is marked `stuck` (in a
+[parallel group](#parallel-stages) the branch fails instead, and the task parks
+when the group settles) with a reason such as `read-only role 'reviewer' changed the worktree in stage
 'internal_review': HEAD 1a2b3c4 → 9f8e7d6; git status changed (3 entries)`,
 and a `worktree_changed` event lands on the timeline. Nothing is reverted:
 inspect the worktree, reset it yourself, then run `choco task retry`. A
@@ -397,3 +402,221 @@ awaiting_review:
   that is refused, with nothing recorded, because it would be taken as a note
   rather than a verdict.
 - An accepted reply stops the watcher.
+
+## Parallel stages
+
+A `kind: parallel` stage starts several agent turns (its *branches*) at the
+same time, waits for all of them, and then moves on. Use it when independent
+reviewers can read the same commit side by side. This example is
+self-contained; its prompt files live next to the YAML, under `prompts/`:
+
+```yaml
+name: panel-example
+worktree: true
+roles:
+  coder:
+    cli: claude
+    model: claude-sonnet-5-5
+  security:
+    cli: claude
+    model: claude-sonnet-5-5
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+  architect:
+    cli: claude
+    model: claude-sonnet-5-5
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+  lead:
+    cli: claude
+    model: claude-opus-5-5
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompts/coder.md
+    on: { done: review_panel }
+
+  review_panel:
+    kind: parallel
+    branches:
+      security_review:
+        kind: agent_turn
+        role: security
+        prompt_file: prompts/security.md
+        capture: json
+        results: [clean, blocking]
+      architecture_review:
+        kind: agent_turn
+        role: architect
+        prompt_file: prompts/architecture.md
+        capture: json
+        results: [clean, blocking]
+    on: { done: lead_review }
+
+  lead_review:
+    kind: agent_turn
+    role: lead
+    prompt_file: prompts/lead.md
+    capture: json
+    on: { approved: done, changes_requested: coding }
+
+  done:
+    kind: terminal
+```
+
+`prompts/lead.md` would contain `{{ stages.security_review.summary }}` and
+`{{ stages.architecture_review.summary }}` (and the `.outcome` of each) so
+the lead sees both reports.
+
+The loader enforces these rules, and each failure names the stage:
+
+- `branches:` is a map of at least two: `parallel stage '{stage}' has {count}
+  branch(es), but a group needs at least two`.
+- The group has exactly `on: { done: <stage> }`: `parallel stage '{stage}'
+  must have exactly one 'on:' key, 'done'`. It has no `loop_guard`: `…has a
+  'loop_guard', which a group does not support`.
+- A branch is an `agent_turn`. Shell and poll branches are not supported yet:
+  `branch '{branch}' of parallel stage '{group}' is a {kind} stage; {kind}
+  branches are supported in a later version, only agent_turn branches are for
+  now`. A `parallel`, `human_gate` or `terminal` branch is never allowed:
+  `…is a {kind} stage; a branch must be an agent_turn`. So groups don't nest.
+- A branch has no `on:` and no `loop_guard`. A group's own `done` edge is the
+  only way out.
+- Stage and branch names are unique across the whole workflow.
+- No `on:` target and no `loop_guard.then` may name a branch: `…routes to
+  '{target}', which is a branch of parallel stage '{group}'; route to the
+  group instead`.
+- Every branch role is `read_only` (see below).
+- `prompt_file`, `capture` and `report_sections` work on a branch as they do
+  on a stage.
+
+### `results:`
+
+`results:` lists the outcomes a branch may report. None of them route. The
+default is `[done]`. Anything other than `[done]` needs `capture: json`, the
+list can't be empty and can't repeat a value. The `report_outcome` tool's
+allowed values come from it, as they come from `on:` on a stage; a branch
+without `capture: json` may only report `done`.
+
+### The join
+
+Every branch starts at once. The group waits for every branch, then always
+leaves through `done`, whatever results the branches reported. Any decision
+belongs to a later stage that reads the branches' captures. Entering the group
+again (after a revise lap, say) runs every branch again.
+
+### When a branch fails
+
+A branch fails when its turn can't complete: it ends without reporting (reason
+such as `stage 'security_review': the agent's turn ended without calling
+report_outcome`), crashes, leaves a process running, changes the worktree, or
+hits a usage limit. It also fails if it reports a result outside its
+`results:`, and its capture is then dropped (the tool normally refuses such a
+value, so this is a guard). The other branches keep running. When none is left
+running, the task is marked `stuck` with a reason naming each failed branch,
+joined with `; `:
+
+```
+parallel stage 'review_panel': 1 of 3 branch(es) failed: 'security_review': stage 'security_review': result 'maybe' is not one of its results [clean, blocking]
+```
+
+`choco task cancel` kills every branch's session.
+
+### Retrying a group
+
+`choco task retry <id>` re-runs only the failed branches. Done branches keep
+their results and captures and are not paid for again. Each failed branch
+resumes its interrupted session or starts fresh, by the same rules as a stage;
+a branch whose last session belongs to an earlier entry of the group starts
+fresh.
+
+- `--resume` is refused, changing nothing, if any failed branch can't resume:
+  `branch '<b>' of parallel stage '<g>': <why>`.
+- `--fresh` starts every failed branch fresh.
+- A retry is refused while any branch's session is still live: `branch '<b>'
+  of parallel stage '<g>' still has a live session; wait for it to end, then
+  retry (or cancel the task)`.
+- If no branch failed it is refused: `every branch of parallel stage '<g>' is
+  done; there is no failed branch to retry`.
+
+```
+Retrying parallel stage 'review_panel': re-running 2 failed branch(es); finished branches are kept.
+  security_review: resuming its interrupted session (sess-1).
+  architecture_review: from scratch, in a fresh session: <why>.
+See `choco task status <id>`.
+```
+
+A branch line may also end `resuming its interrupted session.` or `from
+scratch, in a fresh session.`, without the parenthesis or the reason.
+
+### Watching a group
+
+`choco task status` shows a `Branches` table while the task is in the group;
+see the **Parallel groups** paragraph in
+[cli.md](cli.md#a-full-walkthrough) for its columns. The dashboard's stage
+cell reads `<group> settled/total`. `choco task events` has one line per
+branch start and finish:
+
+```
+review_panel › security_review  started (agent_turn, entry 1)
+review_panel › security_review  done: clean (entry 1)
+review_panel › architecture_review  failed: <reason> (entry 1)
+```
+
+A start after a retry ends `, via retry` or `, via retry_resume`.
+
+### When the daemon restarts
+
+If the daemon restarts while a group runs, each running agent branch's session
+is marked `daemon_stopped` and the branch becomes `failed` and resumable. With
+nothing left running the group settles, so the task parks `stuck`, and `choco
+task retry` then resumes exactly those branches. (This describes the approved
+design; it is being implemented separately and may not be in your build yet.)
+
+### Branches must be read-only
+
+Branches share one worktree and run concurrently, so each branch's role must
+be `read_only: true`, or loading fails: `branch '{branch}' of parallel stage
+'{group}' uses role '{role}', which is not 'read_only: true'; branches run
+side by side so they must not edit the worktree`. Each branch's turn is
+checked against its own baseline, as any [read-only](#read-only-roles) turn
+is. A violation fails that branch rather than parking the task at once; its
+reason is the usual `read-only role '…' changed the worktree in stage
+'<branch>': …` and ends `; ran beside: <other branches>`. Build output in
+ignored folders, and anything inside `.git`, is outside the check.
+
+### Templates
+
+A later stage reads a branch with `{{ stages.<branch>.<field> }}`. A branch
+may read its own previous capture (as a re-reviewer does) and anything
+captured before the group was entered. It may not reference a sibling:
+`branch '{branch}' of parallel stage '{group}' has {placeholder} in its
+{field}, but '{sibling}' is a sibling branch that runs at the same time, so
+its result does not exist yet` (the only value it could see would be last
+lap's). `{{ stages.<group>… }}` is an error because a group captures nothing:
+`stage '{stage}' has {placeholder} in its {field}, but stage '{referenced}'
+declares no 'capture:' so it stores nothing to reference`. `{{
+left_at.<branch> }}` is not supported (`…but '{referenced}' is not a stage in
+this workflow`); `left_at.<group>` works.
+
+### What it costs
+
+There is no cap on branches. N branches are N agent processes at once on one
+vendor account, so its rate limit is reached N times as fast (a usage-limit
+cut-off parks the branch as resumable). Whatever a branch's prompt does
+happens N times concurrently: if the prompts build the project, that is N
+builds. Bound how many branches build; the example below lets exactly one.
+Concurrent branches can't share one scratch build directory, because they
+would race to create it. Re-entering the group re-runs every branch, so each
+lap of a review loop costs every branch again.
+
+### An example
+
+`workflows/experimental/review-panel.yaml` is a full coding workflow with a
+three-branch review panel and a lead who decides. It is experimental and not
+built in. Run it with `choco task create --workflow
+<checkout>/workflows/experimental/review-panel.yaml …`.
