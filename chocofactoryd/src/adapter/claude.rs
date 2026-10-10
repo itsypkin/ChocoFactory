@@ -162,6 +162,7 @@ fn spawn(
     resume_session_id: Option<&str>,
     initial_prompt: &str,
 ) -> Result<AgentHandle, AdapterError> {
+    let marker = super::new_turn_marker()?;
     let mut command = Command::new(binary);
     command
         .current_dir(&cfg.cwd)
@@ -285,6 +286,7 @@ fn spawn(
     //   `apply_auto_memory_env` below, not read from the daemon's own
     //   environment (#105).
     apply_auto_memory_env(&mut command, &cfg.isolation);
+    command.env(&marker, "1");
     //
     // #115: workflow (isolated) roles lose all of `TIMER_TOOLS`; chat loses
     // only `CHAT_BLOCKED_TOOLS` (see their comments for why). "Inherit the
@@ -374,7 +376,7 @@ fn spawn(
         cfg.isolation.clone(),
     ));
 
-    Ok(AgentHandle::new(child, events_rx, stdin_tx))
+    Ok(AgentHandle::new(child, events_rx, stdin_tx, marker))
 }
 
 /// The single place `CLAUDE_CODE_DISABLE_AUTO_MEMORY` is decided (#105).

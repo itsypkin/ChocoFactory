@@ -130,6 +130,7 @@ impl OmpAdapter {
         let guard = OverlayGuard(overlay_path.clone());
 
         let args = build_args(cfg, &overlay_path, &session_dir, append.as_deref(), resume);
+        let marker = super::new_turn_marker()?;
         let mut command = Command::new(&self.binary);
         command
             .current_dir(&cfg.cwd)
@@ -142,6 +143,8 @@ impl OmpAdapter {
             .process_group(0)
             .kill_on_drop(true);
         scrub_env(&mut command);
+        // After the scrub, so nothing can remove it.
+        command.env(&marker, "1");
         let mut child: Child = command.spawn().map_err(AdapterError::Spawn)?;
 
         let pid = child.id();
@@ -184,6 +187,7 @@ impl OmpAdapter {
             events_rx,
             stdin_tx,
             Box::new(guard),
+            marker,
         ))
     }
 }

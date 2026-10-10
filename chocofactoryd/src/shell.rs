@@ -114,7 +114,9 @@ impl ProcessGroup {
     /// second time.
     fn kill(&mut self) {
         if let Some(pid) = self.0.take() {
-            kill_group(pid);
+            // Classified and logged inside; a shell stage has no note to
+            // leave the outcome in.
+            let _ = kill_group(pid);
         }
     }
 
@@ -145,46 +147,95 @@ impl Drop for ProcessGroup {
 /// Callers must only pass the pid of a child spawned with
 /// `Command::process_group(0)` (so pgid == pid), and must not have reaped
 /// it yet — after `wait`, the pid may belong to something else entirely.
-pub(crate) fn kill_group(pid: u32) {
+pub(crate) fn kill_group(pid: u32) -> GroupKill {
     let Ok(pgid) = i32::try_from(pid) else {
-        return;
+        return GroupKill::NothingAlive;
+    };
+    // The environment-free scan is a few pid-info reads. `ProcessGroup::kill`
+    // runs this from `Drop`, which cannot await, and `block_in_place` panics
+    // on a current-thread runtime, so it runs inline.
+    let live = crate::proc_table::read(None).map(|table| live_members(&table, pgid));
+    kill_group_with(pid, live)
+}
+
+/// How many live (non-zombie) members the table shows in group `pgid`.
+pub(crate) fn live_members(table: &[crate::proc_table::ProcEntry], pgid: i32) -> usize {
+    table
+        .iter()
+        .filter(|entry| entry.pgid == pgid && !entry.zombie)
+        .count()
+}
+
+/// What a group kill did. Neither `killpg`'s return value nor its errno says
+/// whether anything alive was killed: on macOS a group whose only members are
+/// zombies fails with `EPERM`, on Linux the same call returns 0. So the
+/// outcome is decided by a scan taken just before the signal.
+#[derive(Debug)]
+pub(crate) enum GroupKill {
+    /// `n` live members were seen before the kill, and it was delivered.
+    Killed(usize),
+    /// The scan saw no live member, whatever `killpg` returned.
+    NothingAlive,
+    /// A live member was seen and the signal failed (never `ESRCH`).
+    Failed(std::io::Error),
+    /// The scan itself failed. The signal was still sent; its result is kept.
+    Unknown {
+        scan_error: std::io::Error,
+        signal_result: Result<(), std::io::Error>,
+    },
+}
+
+/// Sends SIGKILL to group `pid` and classifies the result from `live`, the
+/// count of live members a scan just before saw (or the scan's error).
+pub(crate) fn kill_group_with(pid: u32, live: std::io::Result<usize>) -> GroupKill {
+    let Ok(pgid) = i32::try_from(pid) else {
+        return GroupKill::NothingAlive;
     };
     // `killpg(0, …)` means "my own process group" — the daemon would
     // SIGKILL itself and everything sharing its group. `child.id()` can't
     // return 0, so this is unreachable; it's here because the cost of the
     // check is two lines and the cost of being wrong is the whole daemon.
     if pgid <= 0 {
-        return;
+        return GroupKill::NothingAlive;
     }
-    // SAFETY: `killpg` is async-signal-safe and merely sends a signal; the
-    // only failure modes are "no such group" and "not permitted", both of
-    // which are reported through the return value rather than by any
-    // memory effect.
+    // SAFETY: `killpg` only sends a signal; both failure modes ("no such
+    // group", "not permitted") come back through the return value.
     //
-    // The pgid is the child's own pid. On the timeout path tokio has not
-    // yet waited on it, so it cannot have been reused. On the `Io` paths
-    // this runs from `Drop` after `wait_with_output` already returned an
-    // error, and `try_join3` may have reaped the child before the pipe read
-    // failed — leaving a window in which the pid could in principle have
-    // been reused by a new group leader. That needs a rare pipe error plus
-    // immediate pid reuse in the same instant; killing on `Io` is still the
-    // right call, since the alternative is orphaning a command that may
-    // well still be running.
-    //
-    // On the cancel path (#69) the caller is responsible for the same
-    // property, and `SessionManager` enforces it with a lock rather than by
-    // construction: `drain_session` clears the shared pgid while holding
-    // that lock immediately before it reaps the child, so a `cancel` either
-    // signals a pid that is still the agent's or sees `None` and signals
-    // nothing at all.
+    // The pgid is the child's own pid. Callers must not have reaped the
+    // child: after `wait` the number may belong to something else. On the
+    // session paths `SessionManager` enforces that with the `pgid` lock:
+    // `drain_session` clears the pgid under it immediately before reaping,
+    // so a kill either signals a pid still the agent's or sees `None`.
+    // On the `ProcessGroup` `Io` paths a reap by `try_join3` before the pipe
+    // read failed leaves a theoretical window; killing is still the right
+    // call there.
     let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        // ESRCH just means the group is already gone, which is the common
-        // and entirely fine case.
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            tracing::warn!(pgid, %err, "failed to kill a process group");
+    let signal_result = if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    };
+    match live {
+        Err(scan_error) => {
+            tracing::warn!(pgid, %scan_error, ?signal_result, "could not scan the process table before killing a process group");
+            GroupKill::Unknown {
+                scan_error,
+                signal_result,
+            }
         }
+        Ok(0) => {
+            tracing::debug!(pgid, "process group had no live member to kill");
+            GroupKill::NothingAlive
+        }
+        Ok(n) => match signal_result {
+            Ok(()) => GroupKill::Killed(n),
+            // It exited between the scan and the signal.
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => GroupKill::NothingAlive,
+            Err(err) => {
+                tracing::error!(pgid, %err, "failed to kill a process group with live members");
+                GroupKill::Failed(err)
+            }
+        },
     }
 }
 

@@ -617,6 +617,32 @@ pub struct AgentHandle {
     _cleanup: Option<Box<dyn std::any::Any + Send>>,
     events_rx: mpsc::UnboundedReceiver<AgentEvent>,
     stdin_tx: mpsc::UnboundedSender<String>,
+    /// Name of the environment variable that marks this spawn's process
+    /// tree (see [`new_turn_marker`]).
+    marker: String,
+}
+
+/// Prefix of the per-spawn marker variable's name.
+pub(crate) const TURN_MARKER_PREFIX: &str = "CHOCOFACTORY_TURN_";
+
+/// Builds the name of a fresh per-spawn environment variable,
+/// `CHOCOFACTORY_TURN_<32 lowercase hex>`, from 128 random bits.
+///
+/// Read from `/dev/urandom` rather than a uuid (v4 has only 122 random bits)
+/// or `getentropy` (not bound by libc for the musl release targets). The
+/// token is in the *name*, so a nested daemon's own markers never overwrite
+/// this one. There is no fallback: a failed read fails the spawn.
+pub(crate) fn new_turn_marker() -> Result<String, AdapterError> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(AdapterError::Spawn)?;
+    let mut name = String::from(TURN_MARKER_PREFIX);
+    for byte in bytes {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    Ok(name)
 }
 
 impl AgentHandle {
@@ -624,13 +650,21 @@ impl AgentHandle {
         child: tokio::process::Child,
         events_rx: mpsc::UnboundedReceiver<AgentEvent>,
         stdin_tx: mpsc::UnboundedSender<String>,
+        marker: String,
     ) -> Self {
         Self {
             child,
             _cleanup: None,
             events_rx,
             stdin_tx,
+            marker,
         }
+    }
+
+    /// The name of the environment variable every process this spawn starts
+    /// inherits (value `1`).
+    pub fn marker(&self) -> &str {
+        &self.marker
     }
 
     /// Like [`Self::new`], with a guard that is dropped after the child when
@@ -640,12 +674,14 @@ impl AgentHandle {
         events_rx: mpsc::UnboundedReceiver<AgentEvent>,
         stdin_tx: mpsc::UnboundedSender<String>,
         guard: Box<dyn std::any::Any + Send>,
+        marker: String,
     ) -> Self {
         Self {
             child,
             _cleanup: Some(guard),
             events_rx,
             stdin_tx,
+            marker,
         }
     }
 
