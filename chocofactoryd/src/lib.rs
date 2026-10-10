@@ -7,6 +7,7 @@ pub mod engine;
 pub mod fileref;
 pub mod global_config;
 pub mod poll;
+pub mod proc_table;
 #[cfg(test)]
 pub(crate) mod recording_adapter;
 pub mod retention;

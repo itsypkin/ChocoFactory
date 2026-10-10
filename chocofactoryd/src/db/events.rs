@@ -324,7 +324,8 @@ pub async fn final_assistant_text_for_session(
          WHERE session_id = ?
            AND json_extract(payload, '$.parent_tool_use_id') IS NULL
            AND json_extract(payload, '$.after_completion') IS NULL
-           AND NOT (event_type = ? AND json_extract(payload, '$.kind') = 'background_jobs')
+           AND NOT (event_type = ? AND json_extract(payload, '$.kind')
+                IN ('background_jobs', 'leftovers_killed', 'leftovers_unchecked'))
          ORDER BY created_at, id",
     )
     .bind(&assistant)
@@ -1736,6 +1737,38 @@ mod tests {
                 .unwrap(),
             ""
         );
+    }
+
+    /// The notes written when a turn ends leave its captured answer intact.
+    #[tokio::test]
+    async fn the_leftover_notes_do_not_end_the_final_answer() {
+        for kind in ["leftovers_killed", "leftovers_unchecked"] {
+            let pool = connect_in_memory().await.unwrap();
+            let session_id = seed_session(&pool).await;
+            append_all(
+                &pool,
+                &session_id,
+                &[
+                    (
+                        EventType::AssistantMessage,
+                        json!({ "text": "final answer" }),
+                    ),
+                    (EventType::TurnCompleted, json!({ "is_error": false })),
+                    (
+                        EventType::SessionNote,
+                        json!({ "kind": kind, "message": "note" }),
+                    ),
+                ],
+            )
+            .await;
+            assert_eq!(
+                final_assistant_text_for_session(&pool, &session_id)
+                    .await
+                    .unwrap(),
+                "final answer",
+                "{kind}"
+            );
+        }
     }
 
     #[tokio::test]

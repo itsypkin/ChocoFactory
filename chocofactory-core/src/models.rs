@@ -438,13 +438,27 @@ pub enum EventType {
     /// or `"delete_failed"`. A `deleting` event is
     /// written before the branch is removed, so the tip is recoverable.
     BranchCleanup,
-    /// The daemon itself acted on an agent session (#90): it nudged a turn
-    /// that ended without calling `report_outcome`, gave up on one that
-    /// never did, or killed a process that kept running after its turn had
-    /// completed. Session-scoped (`session_id` set). Payload is
-    /// `{"kind", "message"}`, where `kind` is `"nudge"`, `"no_report"` or
-    /// `"lingered"`. Without it those interventions would only be visible
-    /// in the daemon's logs and in the run's `end_reason`.
+    /// The daemon itself acted on an agent session (#90). Session-scoped
+    /// (`session_id` set). Payload is `{"kind", "message"}`, where `kind` is:
+    /// - `"nudge"`: asked a turn that ended without calling `report_outcome`
+    ///   to report;
+    /// - `"no_report"`: closed a turn that never reported (nudges used up, or
+    ///   its total job-wait limit ran out);
+    /// - `"lingered"`: the agent process was still alive after its turn ended
+    ///   and was killed;
+    /// - `"job_wait"`: the turn ended without reporting while background jobs
+    ///   run, so it is not nudged until they finish or its total job-wait
+    ///   limit runs out;
+    /// - `"background_jobs"`: the CLI's list of running background jobs
+    ///   changed;
+    /// - `"resume"`: a retry resumed the interrupted turn's conversation;
+    /// - `"leftovers_killed"`: processes the turn started were still running
+    ///   when it ended and were killed (survivors are listed separately);
+    /// - `"leftovers_unchecked"`: the process table could not be read, so
+    ///   what the turn left running could not be checked.
+    ///
+    /// Without it those interventions would only be visible in the daemon's
+    /// logs and in the run's `end_reason`.
     SessionNote,
     /// The worktree state recorded when a `read_only` role's turn starts
     /// (#172). Session-scoped. Payload is `{"stage", "role", "cwd", "head",

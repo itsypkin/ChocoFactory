@@ -24,12 +24,23 @@ and `choco task list --status stuck` finds every stuck task.
   then `choco task retry <id> --fresh`, since a session can't resume on a
   different CLI.
 - `no_report`: the turn never called `report_outcome`, was nudged (or, with
-  a background job still running, waited 60 minutes; its `session_note` names
-  the jobs), and was closed. There is no outcome to route on, so read its last events before
-  retrying.
-- `lingered`: a process outlived its reported turn and was killed. Something
-  it started may still have been writing to the worktree, so check
-  `git status` there before retrying.
+  a background job still running, waited 60 minutes in total across all its
+  waits; its `session_note` names the jobs), and was closed. The processes the
+  turn started, such as that job, were killed when it closed; the
+  `leftovers_killed` `session_note` lists them by pid, and a
+  `leftovers_unchecked` note means the process table could not be read, so
+  look for strays yourself. There is no outcome to route on, so read its last
+  events before retrying. Blind spots, where a stray can survive: on macOS, a process the OS
+  hides the environment of (`/bin/sleep`, `/bin/zsh`) that left the agent's
+  tree early and shares no session with anything else of the turn's; on any
+  OS, a process that dropped its environment (`env -i`) and left both the
+  tree and its session before choco saw it; on Linux, a process whose
+  environment is unreadable (setuid, or non-dumpable). `docs/workflows.md`
+  has the details.
+- `lingered`: the agent process outlived its reported turn, or something the
+  turn started was still alive, and it was killed. The `leftovers_killed`
+  `session_note` says what. The turn may have been writing to the worktree
+  until then, so check `git status` there before retrying.
 - A read-only role changed its worktree (the reason starts `read-only role
   '...' changed the worktree`): the change is still there, nothing was
   reverted. Inspect it, reset or clean it yourself, then retry. A retry that
