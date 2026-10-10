@@ -3392,3 +3392,38 @@ fn the_detail_view_keeps_its_invariants_with_a_parallel_group() {
         "the block is present at 120x40"
     );
 }
+
+#[test]
+fn the_branch_table_goes_before_any_older_progress_step() {
+    let app = group_view(16, 0);
+    let mut dropped_with_all_steps = false;
+    for h in 10..=40u16 {
+        let s = render(&app, 120, h);
+        let steps = step_rows(&s).len();
+        if branch_block_at(&s).is_some() {
+            assert_eq!(steps, 16, "the block stayed while steps were cut at h={h}\n{s}");
+        } else if steps == 16 {
+            dropped_with_all_steps = true;
+        }
+    }
+    assert!(dropped_with_all_steps, "no height drops only the block");
+}
+
+#[test]
+fn a_stuck_groups_stage_cell_does_not_shrink_the_title_column() {
+    let plain = render(&board(), 80, 24);
+    let mut app = board();
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == "7d22e1a8-dddd")
+        .unwrap()
+        .branch_progress = progress_of(2, 3);
+    let grouped = render(&app, 80, 24);
+    let busy = |s: &str| {
+        s.lines()
+            .find(|l| l.contains("Per-kind stage execution"))
+            .unwrap_or_else(|| panic!("{s}"))
+            .to_string()
+    };
+    assert_eq!(busy(&plain), busy(&grouped));
+}

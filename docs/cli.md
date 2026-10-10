@@ -522,7 +522,8 @@ scrollable list in four sections:
 
 **Two modes.** Without `--project` every row has a `project` column (the
 project's name) and the header says `all projects`. With `--project` the column
-is gone and the header names the project. Narrow terminals drop columns: below
+is gone and the header names the project. In a parallel group the stage column reads `<group> settled/total`, for
+example `review_panel 2/3`. Narrow terminals drop columns: below
 91 columns the `cost` column (the task's total, `≈$1.23`, or `no data`), below
 80 the laps and PR columns, below 60 the stage and project columns too.
 Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off.

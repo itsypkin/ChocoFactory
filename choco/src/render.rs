@@ -449,6 +449,8 @@ pub fn detail_branches(
         .iter()
         .map(|b| {
             let name = text(b, "name").unwrap_or_else(|| "?".to_string());
+            // The usage line is keyed by the stored name, not the display one.
+            let raw_name = b.get("name").and_then(Value::as_str).unwrap_or("?");
             let state = text(b, "state").unwrap_or_else(|| "?".to_string());
             let outcome = match state.as_str() {
                 "done" => text(b, "result"),
@@ -469,7 +471,7 @@ pub fn detail_branches(
                 state,
                 outcome,
                 elapsed.map_or_else(|| "-".to_string(), crate::dashboard::app::fmt_duration),
-                branch_cost(detail, &name, entry),
+                branch_cost(detail, raw_name, entry),
             ]
         })
         .collect();
@@ -1114,8 +1116,9 @@ fn event_summary_body(event: &Event) -> String {
             let line = if event.event_type == EventType::BranchStarted {
                 match payload.get("via").and_then(Value::as_str) {
                     Some(via) => format!(
-                        "{head}  started ({}, entry {entry}, via {via})",
-                        field("kind")
+                        "{head}  started ({}, entry {entry}, via {})",
+                        field("kind"),
+                        single_line(via)
                     ),
                     None => format!("{head}  started ({}, entry {entry})", field("kind")),
                 }
@@ -2694,6 +2697,21 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_name_with_spaced_runs_still_finds_its_cost() {
+        let mut d = group_detail("open");
+        let cost = d["usage"]["by_lap"][0].clone();
+        let mut line = cost.clone();
+        line["stage"] = json!("a  b");
+        d["usage"]["by_lap"] = json!([line]);
+        let mut b = d["workflow_state"]["branches"][0].clone();
+        b["name"] = json!("a  b");
+        b["entry"] = cost["lap"].clone();
+        d["workflow_state"]["branches"] = json!([b]);
+        let rows = branch_cells(&d, None);
+        assert_ne!(rows[0].last().unwrap(), "no data", "{rows:?}");
+    }
+
+    #[test]
     fn branch_cost_never_invents_a_figure() {
         let mut d = group_detail("open");
         d["usage"]["by_lap"][0]["lap"] = json!(null);
@@ -2816,6 +2834,10 @@ mod tests {
             "g › b  paused (entry 1)"
         );
         assert_eq!(finished(json!({})), "? › ?  ? (entry ?)");
+        let long = finished(json!({"group": "g", "branch": "b", "entry": 1,
+                                   "state": "failed", "reason": "x".repeat(120)}));
+        assert_eq!(long.chars().count(), 101, "{long}");
+        assert!(long.ends_with('…'), "{long}");
         assert_eq!(
             started(Value::Null).matches('{').count() + finished(json!({})).matches('{').count(),
             0

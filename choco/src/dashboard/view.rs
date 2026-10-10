@@ -231,7 +231,9 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid 
         // column keeps room for it even if the title gets less.
         let floor = sections
             .iter()
-            .flat_map(|ts| ts.iter())
+            .zip(Section::ALL)
+            .filter(|(_, s)| matches!(s, Section::NeedsYou | Section::InProgress))
+            .flat_map(|(ts, _)| ts.iter())
             .filter(|t| t.branch_progress.is_some())
             .map(|t| stage_cell(t).chars().count().clamp(6, 22))
             .max()

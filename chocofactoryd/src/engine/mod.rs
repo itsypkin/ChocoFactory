@@ -2655,7 +2655,7 @@ impl WorkflowEngine {
         let definition = match self.load_task_workflow(task).await {
             Ok(definition) => Some(definition),
             Err(err) => {
-                tracing::warn!(task_id = %task.id, %err, "could not load the workflow to describe a parallel group's branches");
+                tracing::debug!(task_id = %task.id, %err, "could not load the workflow to describe a parallel group's branches");
                 None
             }
         };
