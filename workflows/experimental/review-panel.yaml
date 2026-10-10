@@ -1,0 +1,215 @@
+# Experimental, not built in: `coding-task-planned` with its single
+# `internal_review` stage replaced by a parallel group of three reviewers and
+# a lead who decides. Run it with
+#   choco task create --workflow <checkout>/workflows/experimental/review-panel.yaml ...
+# Stages not described here are as in `coding-task-planned.yaml`.
+name: review-panel
+worktree: true
+roles:
+  planner:
+    cli: claude
+    model: claude-opus-5-5
+    system_prompt_file: prompts/planner-system.md
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+  coder:
+    cli: claude
+    model: claude-sonnet-5-5
+    system_prompt_file: prompts/coder-system.md
+  reviewer:
+    cli: claude
+    model: claude-opus-5-5
+    system_prompt_file: prompts/reviewer-system.md
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+  # Branches share one worktree and run at the same time, so every branch
+  # role must be read-only. The lead is not a branch, but it only decides.
+  security:
+    cli: claude
+    model: claude-sonnet-5-5
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+  architect:
+    cli: claude
+    model: claude-sonnet-5-5
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+  lead:
+    cli: claude
+    model: claude-opus-5-5
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+
+stages:
+  # As in `coding-task-planned.yaml`.
+  spec_check:
+    kind: agent_turn
+    role: planner
+    prompt_file: prompts/planner-turn.md
+    capture: json
+    report_sections: [Checks, Decisions, Questions, Spec]
+    on: { ready: coding, needs_input: spec_questions }
+
+  # As in `coding-task-planned.yaml`.
+  spec_questions:
+    kind: human_gate
+    capture: text
+    on: { resumed: spec_check }
+
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompts/coder-turn-planned.md
+    on: { done: review_panel }
+
+  revising:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompts/coder-revise-planned.md
+    on: { done: review_panel }
+
+  # All three branches start together and the group always leaves through
+  # `done`; `lead_review` decides. Only `internal_review` builds and runs the
+  # tests: N building branches are N concurrent builds, and concurrent
+  # branches can't share one scratch build. The other two only read.
+  # The branch is named `internal_review` so the shipped
+  # `reviewer-turn-planned.md`, which reads `stages.internal_review.summary`
+  # as its own previous report, works unchanged.
+  review_panel:
+    kind: parallel
+    branches:
+      security_review:
+        kind: agent_turn
+        role: security
+        prompt_file: prompts/security-review.md
+        capture: json
+        results: [clean, blocking]
+        report_sections: [Reviewed, Findings]
+      architecture_review:
+        kind: agent_turn
+        role: architect
+        prompt_file: prompts/architecture-review.md
+        capture: json
+        results: [clean, blocking]
+        report_sections: [Reviewed, Findings]
+      internal_review:
+        kind: agent_turn
+        role: reviewer
+        prompt_file: prompts/reviewer-turn-planned.md
+        capture: json
+        results: [approved, changes_requested]
+        report_sections:
+          - Reviewed
+          - Predictions
+          - Branches → tests
+          - States
+          - Messages
+          - Side effects
+          - Resources and work
+          - Old behaviour
+          - Findings
+          - Dismissed
+    on: { done: lead_review }
+
+  # The lead owns the loop guard: a group can't have one.
+  lead_review:
+    kind: agent_turn
+    role: lead
+    prompt_file: prompts/lead-review.md
+    capture: json
+    report_sections: [Prior findings, Reviewers, Findings, Dismissed]
+    on:
+      approved: open_pr
+      changes_requested: revising
+    loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Same as `coding-task-planned.yaml`'s `escalate_to_human`.
+  escalate_to_human:
+    kind: human_gate
+    capture: text
+    on: { resumed: revising }
+
+  # Same as `coding-task-planned.yaml`'s `open_pr`.
+  open_pr:
+    kind: shell
+    script_file: scripts/open-pr.sh
+    env:
+      PR_TASK_TITLE: "{{ task.title }}"
+      PR_REVIEW_VERDICT: "{{ stages.lead_review.outcome }}"
+      PR_REVIEW_REPORT: "{{ stages.lead_review.summary }}"
+    capture: json
+    timeout: 5m
+    on: { done: checks_polling, error: escalate_to_human }
+
+  # Same as `coding-task-planned.yaml`'s `checks_polling`.
+  checks_polling:
+    kind: poll
+    script_file: scripts/ci-checks.sh
+    env:
+      PR_NUMBER: "{{ stages.open_pr.number }}"
+    interval: 30s
+    timeout: 30m
+    outcomes:
+      - match: '\ARED(\n|$)'
+        then: red
+      - match: '\ASTARTUP_FAILURE(\n|$)'
+        then: ci_startup_failure
+      - match: '\AACTION_REQUIRED(\n|$)'
+        then: ci_action_required
+      - match: '\ACANCELLED(\n|$)'
+        then: ci_cancelled
+      - match: '\AGREEN(\n|$)'
+        then: green
+      - match: '\ANO_CHECKS(\n|$)'
+        then: no_checks
+    on:
+      green: awaiting_human_review
+      no_checks: awaiting_human_review
+      red: revising
+      ci_startup_failure: escalate_to_human
+      ci_action_required: escalate_to_human
+      ci_cancelled: escalate_to_human
+      timeout: escalate_to_human
+    # CI that keeps failing while `lead_review` keeps approving would
+    # otherwise loop forever, one paid coder lap and one paid reviewer lap
+    # per round. The guard parks the task at `escalate_to_human` on the 4th
+    # red in a row. Any other outcome resets the count.
+    loop_guard: { on: red, max: 3, then: escalate_to_human }
+
+  # Same as `coding-task-planned.yaml`'s `awaiting_human_review`.
+  awaiting_human_review:
+    kind: human_gate
+    capture: text
+    markers:
+      - line: /request-changes
+        then: changes_requested
+      - line: /approve
+        then: approved
+    watch:
+      script_file: scripts/await-review.sh
+      env:
+        PR_NUMBER: "{{ stages.open_pr.number }}"
+        HANDED_OVER_AT: "{{ left_at.awaiting_human_review }}"
+      interval: 60s
+      # Every minute for the first 6h, every 5 minutes up to 30h, then every
+      # 30 minutes until the 102h timeout.
+      backoff:
+        - { after: 6h, interval: 5m }
+        - { after: 30h, interval: 30m }
+      timeout: 102h
+      outcomes:
+        - match: '\AREQUEST_CHANGES(\n|$)'
+          then: changes_requested
+        - match: '\AAPPROVE(\n|$)'
+          then: approved
+        - match: '\AMERGED(\n|$)'
+          then: approved
+    on:
+      approved: done
+      changes_requested: revising
+      timeout: escalate_to_human
+    loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Same as `coding-task-planned.yaml`'s `done`.
+  done:
+    kind: terminal

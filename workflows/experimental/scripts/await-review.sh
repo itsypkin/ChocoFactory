@@ -1,0 +1,1 @@
+../../scripts/await-review.sh
