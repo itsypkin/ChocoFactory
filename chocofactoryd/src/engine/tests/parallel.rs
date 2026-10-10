@@ -2040,6 +2040,12 @@ async fn a_restart_mid_group_parks_the_task_with_every_branch_failed_and_resumab
         .filter(|(_, e)| e.event_type == EventType::BranchFinished)
         .collect();
     assert_eq!(finished.len(), 2);
+    let mut names: Vec<_> = finished
+        .iter()
+        .map(|(_, e)| e.payload["branch"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["one", "two"]);
     for (_, e) in &finished {
         assert_eq!(e.payload["state"], "failed");
         assert_eq!(e.payload["entry"], 1);
@@ -2411,6 +2417,47 @@ async fn a_declared_branch_with_no_slot_is_failed_fresh() {
     assert!(g.sessions("two").await.is_empty());
 }
 
+#[tokio::test]
+async fn a_session_from_an_earlier_entry_is_not_resumed_by_the_sweep() {
+    let g = restarted(json!({"one": running_slot(), "two": done_slot()})).await;
+    sqlx::query(
+        "UPDATE workflow_state SET payload = json_set(payload, '$.parallel.entry', 2) \
+         WHERE task_id = ?",
+    )
+    .bind(&g.task_id)
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    let old = branch_session(&g, "one", SessionStatus::Idle, None).await;
+    assert_eq!(sweep(&g).await, groups(1));
+    let slot = branch_slot(&g.state().await.payload, "one").clone();
+    assert_eq!(slot["state"], "failed");
+    assert_eq!(slot["resumable"], false, "{slot}");
+    assert!(
+        slot["reason"]
+            .as_str()
+            .unwrap()
+            .contains("before the branch's session started"),
+        "{slot}"
+    );
+    let now = session_now(&g, &old).await;
+    assert_eq!(now.status, SessionStatus::Idle);
+    assert_eq!(now.end_reason, None);
+}
+
+#[tokio::test]
+async fn a_read_only_branch_that_changed_the_worktree_is_flagged_by_the_sweep() {
+    let g = restarted(json!({"one": running_slot(), "two": done_slot()})).await;
+    branch_session(&g, "one", SessionStatus::Idle, None).await;
+    let cwd = crate::worktree::worktree_path(&g._dirs[1].0, "demo", &g.task_id).unwrap();
+    std::fs::write(cwd.join("violation.txt"), "x").unwrap();
+    assert_eq!(sweep(&g).await, groups(1));
+    let slot = branch_slot(&g.state().await.payload, "one").clone();
+    let reason = slot["reason"].as_str().unwrap();
+    assert!(reason.contains("changed the worktree"), "{reason}");
+    assert!(task_reason(&g).await.contains("changed the worktree"));
+}
+
 // 10
 #[tokio::test]
 async fn in_flight_lists_a_group_only_while_a_branch_is_running() {
@@ -2432,6 +2479,10 @@ async fn in_flight_lists_a_group_only_while_a_branch_is_running() {
     let listed = broken.engine.in_flight().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].kind, "unknown");
+
+    let undeclared = restarted(json!({"ghost": running_slot(), "one": running_slot()})).await;
+    let listed = undeclared.engine.in_flight().await.unwrap();
+    assert_eq!(listed[0].kind, "agent_turn, unknown");
 }
 
 // 11
