@@ -149,16 +149,19 @@ fn review_panel_has_the_decided_shape() {
 }
 
 #[test]
-fn copied_files_are_byte_identical() {
+fn shared_files_are_links_to_the_shipped_ones() {
     for rel in COPIES {
-        let copy = fs::read(exp().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
-        let orig = fs::read(root().join("workflows").join(rel)).unwrap();
-        assert!(copy == orig, "{rel} differs from the shipped original");
+        let path = exp().join(rel);
+        let meta = fs::symlink_metadata(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        assert!(meta.file_type().is_symlink(), "{rel} is not a symlink");
+        let target = fs::canonicalize(&path).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        let shipped = fs::canonicalize(root().join("workflows").join(rel)).unwrap();
+        assert_eq!(target, shipped, "{rel} does not link to the shipped file");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let om = fs::metadata(root().join("workflows").join(rel)).unwrap();
-            let cm = fs::metadata(exp().join(rel)).unwrap();
+            let om = fs::metadata(&shipped).unwrap();
+            let cm = fs::metadata(&path).unwrap();
             if om.permissions().mode() & 0o111 != 0 {
                 assert!(
                     cm.permissions().mode() & 0o111 != 0,

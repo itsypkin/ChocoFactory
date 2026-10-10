@@ -39,8 +39,10 @@ repository's default branch) to `HEAD`. If a pull request exists, read its
 comments and reviews too: `gh pr view --json comments,reviews`. You do not
 build or run tests; you rely on the all-round review's report for the gate.
 Report `approved` only if the all-round review approved, or its Reviewed
-section records a gate that ran to the end. If it rejected and no gate ran,
-report `changes_requested`: a missing gate is blocking.
+section records a gate in which every command ran in full and passed (a test
+that failed once and passed its single re-run counts as passing). A gate that
+is missing, cut short or failing blocks: report `changes_requested`, even when
+the security and architecture reviews are `clean`.
 
 Decide which findings are blocking. Reject a finding that is wrong, already
 handled or out of scope, and say why.

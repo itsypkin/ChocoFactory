@@ -463,6 +463,7 @@ stages:
     prompt_file: prompts/lead.md
     capture: json
     on: { approved: done, changes_requested: coding }
+    loop_guard: { on: changes_requested, max: 3, then: done }
 
   done:
     kind: terminal
@@ -506,7 +507,10 @@ without `capture: json` may only report `done`.
 
 Every branch starts at once. The group waits for every branch, then always
 leaves through `done`, whatever results the branches reported. Any decision
-belongs to a later stage that reads the branches' captures. Entering the group
+belongs to a later stage that reads the branches' captures, and that stage
+owns the review loop's `loop_guard` too (a group can't have one). `choco task
+send` to a task sitting at a group is refused: `stage '<g>' cannot accept a
+message or resume signal here`. Entering the group
 again (after a revise lap, say) runs every branch again.
 
 ### When a branch fails
@@ -572,11 +576,23 @@ A start after a retry ends `, via retry` or `, via retry_resume`.
 
 ### When the daemon restarts
 
-If the daemon restarts while a group runs, each running agent branch's session
-is marked `daemon_stopped` and the branch becomes `failed` and resumable. With
-nothing left running the group settles, so the task parks `stuck`, and `choco
-task retry` then resumes exactly those branches. (This describes the approved
-design; it is being implemented separately and may not be in your build yet.)
+When the daemon restarts while a group runs, the startup sweep looks at each
+branch that was running:
+
+- A branch whose session is idle with no end reason (its turn was cut off) has
+  that session marked `daemon_stopped`, and the branch becomes `failed`.
+- The branch is resumable only if `choco task retry`'s normal resume check
+  allows it. A branch with no session for the group's current entry, a session
+  with no adapter id, or a turn that ended through the agent's own failure is
+  not resumable; retry starts it fresh.
+- A branch whose session is still active is left running. The task parks
+  `stuck` only when no branch is left running.
+- `choco task retry` then re-runs every failed branch, resuming it where it
+  can and starting it fresh otherwise.
+- While any branch runs, `choco server status` lists the task as in flight:
+  its stage is the group and its kind is the running branches' kinds.
+  `choco update`, `choco server stop` and `choco server restart` warn or
+  refuse as they do for a single running stage, and `--force` goes ahead.
 
 ### Branches must be read-only
 
@@ -602,7 +618,8 @@ lap's). `{{ stages.<group>… }}` is an error because a group captures nothing:
 `stage '{stage}' has {placeholder} in its {field}, but stage '{referenced}'
 declares no 'capture:' so it stores nothing to reference`. `{{
 left_at.<branch> }}` is not supported (`…but '{referenced}' is not a stage in
-this workflow`); `left_at.<group>` works.
+this workflow`); `left_at.<group>` works. A later stage can read a branch
+only if the branch has `capture:`.
 
 ### What it costs
 
@@ -620,4 +637,7 @@ lap of a review loop costs every branch again.
 `workflows/experimental/review-panel.yaml` is a full coding workflow with a
 three-branch review panel and a lead who decides. It is experimental and not
 built in. Run it with `choco task create --workflow
-<checkout>/workflows/experimental/review-panel.yaml …`.
+<checkout>/workflows/experimental/review-panel.yaml …`. Where it doesn't
+change a shipped prompt or script, it links to the shipped file (relative
+symlinks); to use the workflow elsewhere, copy it with the links dereferenced
+(`cp -RL`).
