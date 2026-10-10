@@ -30,9 +30,13 @@ and `choco task list --status stuck` finds every stuck task.
   `leftovers_killed` `session_note` lists them by pid, and a
   `leftovers_unchecked` note means the process table could not be read, so
   look for strays yourself. There is no outcome to route on, so read its last
-  events before retrying. The one blind spot is on macOS: a process the OS
+  events before retrying. Blind spots, where a stray can survive: on macOS, a process the OS
   hides the environment of (`/bin/sleep`, `/bin/zsh`) that left the agent's
-  tree early and shares no session with anything else of the turn's.
+  tree early and shares no session with anything else of the turn's; on any
+  OS, a process that dropped its environment (`env -i`) and left both the
+  tree and its session before choco saw it; on Linux, a process whose
+  environment is unreadable (setuid, or non-dumpable). `docs/workflows.md`
+  has the details.
 - `lingered`: the agent process outlived its reported turn, or something the
   turn started was still alive, and it was killed. The `leftovers_killed`
   `session_note` says what. The turn may have been writing to the worktree

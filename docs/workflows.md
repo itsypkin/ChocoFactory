@@ -233,7 +233,13 @@ when it ends *after* the agent called `report_outcome`:
   anything else of the turn's, survives. Anything you built or installed
   (cargo, test binaries, node, Homebrew Python) is found. A process started
   through a service manager (`launchctl`, `systemd-run`, `docker run`) or
-  as another user is out of reach.
+  as another user is out of reach. Two more blind spots: a process that
+  drops its environment (`env -i`) and leaves both the agent's process tree
+  and its session before choco has seen it descend from the agent is not
+  found; and on Linux, a process whose `/proc/<pid>/environ` cannot be read
+  (setuid/setgid programs, or one that made itself non-dumpable) carries no
+  readable marker, so it is found only through the tree, an earlier sighting
+  or a shared session.
 
 A sub-agent calling `report_outcome` doesn't count, and neither does a call
 the tool rejected.

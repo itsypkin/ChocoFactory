@@ -225,7 +225,10 @@ fn fill_pids(
             return Ok(pids);
         }
         capacity = capacity.checked_mul(2).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::OutOfMemory, "the pid list never fit a buffer")
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "the pid list never fit a buffer",
+            )
         })?;
     }
 }
