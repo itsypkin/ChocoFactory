@@ -3401,7 +3401,10 @@ fn the_branch_table_goes_before_any_older_progress_step() {
         let s = render(&app, 120, h);
         let steps = step_rows(&s).len();
         if branch_block_at(&s).is_some() {
-            assert_eq!(steps, 16, "the block stayed while steps were cut at h={h}\n{s}");
+            assert_eq!(
+                steps, 16,
+                "the block stayed while steps were cut at h={h}\n{s}"
+            );
         } else if steps == 16 {
             dropped_with_all_steps = true;
         }
