@@ -12303,6 +12303,34 @@ async fn a_failed_stuck_write_is_not_counted_by_the_poll_sweep() {
 }
 
 #[tokio::test]
+async fn a_failed_stuck_write_after_a_failed_enter_is_not_counted_by_the_poll_sweep() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let now = Utc::now();
+    let payload =
+        json!({ "poll_window": window_json("watch", now, Some(now + chrono::Duration::hours(1))) });
+    // enter_stage fails: worktree workflow, task has no snapshot.
+    write_poll_flow(&dir, "tree-flow", "echo PENDING", Some("1h"), true);
+    let task_id = seed_in_project(&pool, &project_id, "tree-flow", &dir).await;
+    seed_row(&pool, &task_id, "watch", payload).await;
+    sqlx::query(FORCE_STUCK_FAILURE)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+
+    let report = engine.resume_interrupted_polls().await.unwrap();
+    assert_eq!(report.stuck, 0);
+    assert_eq!(report.resumed, 0);
+    assert_eq!(
+        tasks::get(&pool, &task_id).await.unwrap().unwrap().status,
+        "open"
+    );
+    assert_eq!(stuck_error_events(&pool, &task_id).await, 0);
+}
+
+#[tokio::test]
 async fn a_failed_stuck_write_is_not_counted_by_the_park_sweep() {
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();

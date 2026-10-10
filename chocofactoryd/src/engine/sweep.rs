@@ -47,17 +47,23 @@ fn shell_reason(stage: &str) -> String {
 /// What [`WorkflowEngine::park_interrupted_turns`] did, per task.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ParkReport {
-    /// Single-shot agent turns parked as stuck. Counts only tasks whose status actually changed to `stuck`; a task already
-    /// no longer open, or whose stuck write failed (logged by `mark_stuck`), is
-    /// not counted.
+    /// Single-shot agent turns parked as stuck.
+    ///
+    /// Counts only tasks whose status actually changed to `stuck`; a task
+    /// already no longer open, or whose stuck write failed (logged by
+    /// `mark_stuck`), is not counted.
     pub agent_turns: usize,
-    /// Shell stages parked as stuck. Counts only tasks whose status actually changed to `stuck`; a task already
-    /// no longer open, or whose stuck write failed (logged by `mark_stuck`), is
-    /// not counted.
+    /// Shell stages parked as stuck.
+    ///
+    /// Counts only tasks whose status actually changed to `stuck`; a task
+    /// already no longer open, or whose stuck write failed (logged by
+    /// `mark_stuck`), is not counted.
     pub shells: usize,
-    /// Tasks parked because the sweep could not classify them. Counts only tasks whose status actually changed to `stuck`; a task already
-    /// no longer open, or whose stuck write failed (logged by `mark_stuck`), is
-    /// not counted.
+    /// Tasks parked because the sweep could not classify them.
+    ///
+    /// Counts only tasks whose status actually changed to `stuck`; a task
+    /// already no longer open, or whose stuck write failed (logged by
+    /// `mark_stuck`), is not counted.
     pub stuck_other: usize,
 }
 
@@ -68,9 +74,11 @@ pub struct PollSweepReport {
     pub resumed: usize,
     /// Skipped: a live runner already owns the task.
     pub already_running: usize,
-    /// Could not be resumed, and were marked stuck. Counts only tasks whose status actually changed to `stuck`; a task already
-    /// no longer open, or whose stuck write failed (logged by `mark_stuck`), is
-    /// not counted.
+    /// Could not be resumed, and were marked stuck.
+    ///
+    /// Counts only tasks whose status actually changed to `stuck`; a task
+    /// already no longer open, or whose stuck write failed (logged by
+    /// `mark_stuck`), is not counted.
     pub stuck: usize,
     /// Tasks whose stored `stage_kind` was missing or stale and could not be
     /// corrected. Each was logged; the sweep carried on with the resume.
