@@ -12943,6 +12943,141 @@ async fn restart_effect_classifies_every_stage_kind() {
         restart_effect(&polls.stages["gate"]),
         RestartEffect::Survives
     );
+    let group = WorkflowDefinition::parse(&parallel_group_yaml(true), &dir).unwrap();
+    assert_eq!(
+        restart_effect(&group.stages["panel"]),
+        RestartEffect::Survives
+    );
+}
+
+/// A read-only two-branch group `panel`, reached from a shell stage when
+/// `with_prep`, else the workflow's entry stage.
+fn parallel_group_yaml(with_prep: bool) -> String {
+    let prep = if with_prep {
+        "  prep:\n    kind: shell\n    command: \"true\"\n    on: { done: panel }\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"name: group-flow
+worktree: true
+roles:
+  reviewer:
+    cli: claude
+    model: opus
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+stages:
+{prep}  panel:
+    kind: parallel
+    branches:
+      one: {{ kind: agent_turn, role: reviewer }}
+      two: {{ kind: agent_turn, role: reviewer }}
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#
+    )
+}
+
+/// Creates a task on `parallel_group_yaml` in a real repo and starts it.
+async fn start_group_task(
+    with_prep: bool,
+) -> (
+    SqlitePool,
+    Arc<WorkflowEngine>,
+    String,
+    Result<(), EngineError>,
+    Vec<TempDir>,
+) {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let yaml = parallel_group_yaml(with_prep);
+    fs::write(dir.join("group-flow.yaml"), &yaml).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let task_id = tasks::create(
+        &pool,
+        tasks::NewTask {
+            project_id: &project_id,
+            workflow_def: &def.name,
+            title: "T",
+            config: json!({ "cwd": repo.to_string_lossy() }),
+            workflow_path: None,
+            workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    let binary = named_script_binary(&dir, "fake-claude-group", json!([]));
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+    let started = engine.start_task(&task_id, &def, None).await;
+    (pool, engine, task_id, started, vec![dir, repo])
+}
+
+#[tokio::test]
+async fn entering_a_parallel_group_parks_the_task() {
+    let (pool, _engine, task_id, started, _dirs) = start_group_task(true).await;
+    started.unwrap();
+    let reason = stuck_reason(&pool, &task_id).await;
+    assert!(reason.contains("'panel'"), "{reason}");
+    assert!(reason.contains("parallel groups don't run yet"), "{reason}");
+    let state = crate::db::workflow_state::get(&pool, &task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.current_stage, "panel");
+    assert!(
+        sessions::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn retry_at_a_parallel_group_parks_again() {
+    let (pool, engine, task_id, started, _dirs) = start_group_task(true).await;
+    started.unwrap();
+    stuck_reason(&pool, &task_id).await;
+    let err = engine
+        .retry_task(&task_id, RetryMode::Auto)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::Enter(EngineError::ParallelGroupNotRunYet { stage })
+            if stage == "panel"),
+        "{err}"
+    );
+    let reason = stuck_reason(&pool, &task_id).await;
+    assert!(reason.contains("retry failed"), "{reason}");
+    assert!(reason.contains("parallel groups don't run yet"), "{reason}");
+    assert!(
+        sessions::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_parallel_group_as_the_entry_stage_fails_the_start() {
+    let (pool, _engine, task_id, started, _dirs) = start_group_task(false).await;
+    assert!(
+        matches!(&started, Err(EngineError::ParallelGroupNotRunYet { stage }) if stage == "panel"),
+        "{started:?}"
+    );
+    assert!(
+        sessions::list_for_task(&pool, &task_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

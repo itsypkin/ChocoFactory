@@ -225,6 +225,10 @@ pub struct WorkflowEngine {
 
 #[derive(Debug)]
 pub enum EngineError {
+    /// The stage is a `kind: parallel` group, which the engine can't run yet.
+    ParallelGroupNotRunYet {
+        stage: String,
+    },
     NoWorkflowState,
     NoSuchTask,
     UnknownStage(String),
@@ -314,6 +318,11 @@ impl fmt::Display for EngineError {
         match self {
             EngineError::NoWorkflowState => write!(f, "task has no workflow_state row"),
             EngineError::NoSuchTask => write!(f, "no such task"),
+            EngineError::ParallelGroupNotRunYet { stage } => write!(
+                f,
+                "stage '{stage}' is a parallel group, and parallel groups don't run yet in this \
+                 version"
+            ),
             EngineError::UnknownStage(stage) => {
                 write!(f, "workflow_state references unknown stage '{stage}'")
             }
@@ -3287,6 +3296,11 @@ impl WorkflowEngine {
             // and a gate with a `watch:` also starts that watcher (#175).
             StageKind::HumanGate { .. } => self.enter_gate(entry).await,
             StageKind::Terminal => self.enter_terminal(entry).await,
+            // Fails closed until groups run: no session is started, and
+            // every caller of `enter_stage` parks the task on the error.
+            StageKind::Parallel { .. } => Err(EngineError::ParallelGroupNotRunYet {
+                stage: entry.stage_name.to_string(),
+            }),
         }
     }
 }
