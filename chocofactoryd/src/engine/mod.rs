@@ -2637,6 +2637,36 @@ impl WorkflowEngine {
         })
     }
 
+    /// The branches of the task's current parallel group, for
+    /// `GET /tasks/{id}`. Read-only, and unlike `watch_timed_out` it does not
+    /// filter on task status: a stuck or cancelled task shows its branches.
+    /// A workflow that won't load degrades to name order with no kinds.
+    pub(crate) async fn branch_statuses(
+        &self,
+        task: &Task,
+        state: &chocofactory_core::models::WorkflowState,
+    ) -> Vec<chocofactory_core::models::BranchStatus> {
+        let stage_kind = state.stage_kind.as_deref();
+        if parallel::current_group_branches(&state.payload, &state.current_stage, stage_kind)
+            .is_none()
+        {
+            return Vec::new();
+        }
+        let definition = match self.load_task_workflow(task).await {
+            Ok(definition) => Some(definition),
+            Err(err) => {
+                tracing::warn!(task_id = %task.id, %err, "could not load the workflow to describe a parallel group's branches");
+                None
+            }
+        };
+        parallel::branch_statuses_from(
+            &state.payload,
+            &state.current_stage,
+            stage_kind,
+            definition.as_ref(),
+        )
+    }
+
     /// Whether the stuck stage's last run can be picked up where it left
     /// off (#92), or a sentence saying why not.
     ///

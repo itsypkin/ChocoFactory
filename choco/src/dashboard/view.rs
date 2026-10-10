@@ -200,9 +200,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid 
             .zip(Section::ALL)
             .flat_map(|(ts, s)| ts.iter().map(move |t| (s, t)))
             .filter_map(|(s, t)| match s {
-                Section::NeedsYou | Section::InProgress => {
-                    Some(t.current_stage.as_deref().unwrap_or("-").chars().count())
-                }
+                Section::NeedsYou | Section::InProgress => Some(stage_cell(t).chars().count()),
                 Section::Closed => Some(t.task.status.chars().count()),
                 Section::Stuck => None,
             })
@@ -229,7 +227,17 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid 
         title_w = rest(project_w, stage_w);
     }
     if title_w < TITLE_MIN && cols.stage {
-        let give = (TITLE_MIN - title_w).min(stage_w.saturating_sub(8));
+        // A group's `settled/total` suffix is the point of the cell, so the
+        // column keeps room for it even if the title gets less.
+        let floor = sections
+            .iter()
+            .flat_map(|ts| ts.iter())
+            .filter(|t| t.branch_progress.is_some())
+            .map(|t| stage_cell(t).chars().count().clamp(6, 22))
+            .max()
+            .unwrap_or(0)
+            .max(8);
+        let give = (TITLE_MIN - title_w).min(stage_w.saturating_sub(floor));
         stage_w -= give;
         title_w = rest(project_w, stage_w);
     }
@@ -292,12 +300,22 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
     v
 }
 
+/// The list's stage cell: the stage, with `settled/total` after it while a
+/// parallel group is current.
+fn stage_cell(t: &TaskSummary) -> String {
+    match (&t.current_stage, &t.branch_progress) {
+        (Some(stage), Some(p)) => format!("{stage} {}/{}", p.settled, p.total),
+        (Some(stage), None) => stage.clone(),
+        (None, _) => "-".to_string(),
+    }
+}
+
 fn cell(app: &App, section: Section, t: &TaskSummary, key: Key) -> String {
     match key {
         Key::Id => t.task.id.chars().take(8).collect(),
         Key::Project => app.project_label(&t.task.project_id),
         Key::Title => t.task.title.clone(),
-        Key::Stage => t.current_stage.clone().unwrap_or_else(|| "-".into()),
+        Key::Stage => stage_cell(t),
         Key::Reason => first_line(t.task.stuck_reason.as_deref().unwrap_or("")).to_string(),
         Key::Pr => {
             t.pr.as_ref()
@@ -945,6 +963,13 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
         }
     }
     let counters = d.data.as_ref().and_then(crate::render::loop_counters_line);
+    // The parallel group's branch table: all or nothing, between the field
+    // rows and the progress separator. Its height is 0 once it is dropped.
+    let branches = d
+        .data
+        .as_ref()
+        .and_then(|v| crate::render::detail_branches(v, app.now, Some(width)));
+    let branch_h = std::cell::Cell::new(branches.as_ref().map_or(0, |b| 2 + b.rows.len()));
 
     let events_n = d.events.len();
     // The tail used to be capped at five events; it now takes whatever
@@ -960,6 +985,7 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     let block = |rows: &[FRow], m: usize, header: bool| -> usize {
         let prog_h = if m < prog.len() { m + 1 } else { m };
         1 + if has_task { row_h(rows) } else { 0 }
+            + branch_h.get()
             + 1
             + usize::from(header)
             + prog_h
@@ -991,6 +1017,11 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
             }
             rows.retain(|r| r.drop != cut);
             label_w_cell.set(widest(&rows));
+        }
+        // After the row drops, the whole branch table goes before any
+        // progress step does.
+        if block(&rows, keep_prog, show_header) > body_h {
+            branch_h.set(0);
         }
         if block(&rows, keep_prog, show_header) <= body_h {
             // The drops can free several lines at once: the tail gets them.
@@ -1029,7 +1060,11 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
                     prog.len().min(if cuttable { 2 } else { 1 })
                 };
                 let prog_h = if keep_prog < prog.len() { m + 1 } else { m };
-                1 + if has_task { row_h(rows) } else { 0 } + 1 + usize::from(header) + prog_h
+                1 + if has_task { row_h(rows) } else { 0 }
+                    + branch_h.get()
+                    + 1
+                    + usize::from(header)
+                    + prog_h
             };
             const KEEP: [&str; 5] = [
                 LABEL_ID,
@@ -1063,6 +1098,19 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
             for l in row_lines(r, label_w_cell.get(), width) {
                 lines.push(Line::styled(l, style));
             }
+        }
+    }
+    if let Some(b) = branches.as_ref().filter(|_| branch_h.get() > 0) {
+        lines.push(Line::styled(
+            fit(&separator("branches", width), width),
+            colored(app, ACCENT),
+        ));
+        lines.push(Line::styled(
+            fit(&b.header, width),
+            colored(app, Color::DarkGray),
+        ));
+        for row in &b.rows {
+            lines.push(Line::raw(fit(row, width)));
         }
     }
     lines.push(Line::styled(

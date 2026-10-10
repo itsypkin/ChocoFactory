@@ -1,4 +1,4 @@
-use chocofactory_core::models::{PullRequestRef, Task, TaskSummary, UsageTotal};
+use chocofactory_core::models::{BranchProgress, PullRequestRef, Task, TaskSummary, UsageTotal};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::types::Json;
@@ -159,6 +159,8 @@ struct SummaryRow {
     loop_counters: Option<Json<Value>>,
     pr_url: Option<String>,
     waiting_on_human: bool,
+    branch_total: Option<i64>,
+    branch_settled: Option<i64>,
     usage_cost_usd: Option<f64>,
     usage_tokens: Option<i64>,
     usage_all_subscription: Option<bool>,
@@ -199,6 +201,18 @@ pub async fn list_summaries(
              AND json_extract(j.value, '$.url') LIKE '%/pull/%' \
            LIMIT 1) AS pr_url, \
          COALESCE(t.status = 'open' AND w.stage_kind = 'human_gate', 0) AS waiting_on_human, \
+         CASE WHEN w.stage_kind = 'parallel' \
+         AND json_extract(w.payload, '$.parallel.stage') = w.current_stage \
+         AND json_type(w.payload, '$.parallel.branches') = 'object' \
+              THEN (SELECT COUNT(*) FROM json_each(w.payload, '$.parallel.branches')) END \
+              AS branch_total, \
+         CASE WHEN w.stage_kind = 'parallel' \
+         AND json_extract(w.payload, '$.parallel.stage') = w.current_stage \
+         AND json_type(w.payload, '$.parallel.branches') = 'object' \
+              THEN (SELECT COUNT(*) FROM json_each(w.payload, '$.parallel.branches') j \
+                     WHERE (CASE WHEN j.type = 'object' THEN json_extract(j.value, '$.state') END) \
+                           IS NOT 'running') END \
+              AS branch_settled, \
          u.cost_usd AS usage_cost_usd, u.tokens AS usage_tokens, \
          u.all_subscription AS usage_all_subscription, \
          u.turns_without_cost AS usage_turns_without_cost \
@@ -265,6 +279,13 @@ pub async fn list_summaries(
                         .and_then(|n| u64::try_from(n).ok())
                         .unwrap_or(0),
                 }),
+            branch_progress: match row.branch_total {
+                Some(total) if total > 0 => Some(BranchProgress {
+                    settled: u32::try_from(row.branch_settled.unwrap_or(0)).unwrap_or(u32::MAX),
+                    total: u32::try_from(total).unwrap_or(u32::MAX),
+                }),
+                _ => None,
+            },
         })
         .collect())
 }

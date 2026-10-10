@@ -103,6 +103,15 @@ command in step 3 and the pre-merge check in step 4.
   daemon's version before blaming a prompt for a run's behaviour. A workflow
   file's name line reads like a built-in; see
   [reference/watch.md](reference/watch.md#the-workflow-file-line).
+  A task in a parallel group shows a `Branches` table under its `Stage`
+  line: branch, kind, state, result or reason, time and cost. `no data` in
+  cost means no turn recorded usage for that branch's entry, and `-` in time
+  means the branch is not running (the task is not open) or a time is
+  missing. `choco --json task status <id> | jq '.workflow_state.branches'`
+  gives the same as JSON. The dashboard's stage cell reads
+  `<group> settled/total`, and `choco task events` has one line per branch
+  start and finish. See
+  [reference/watch.md](reference/watch.md#reading-a-parallel-group).
   It ends with a `Cost & time` block: the task's cost (`≈ $…`, marked
   `(API-equivalent)` when every turn ran under a subscription login and
   `(estimated)` otherwise), tokens, wall and active time, and the same split

@@ -384,6 +384,139 @@ pub fn detail_progress(
     ))
 }
 
+/// The branch table of a parallel group (see [`detail_branches`]).
+pub struct BranchTable {
+    /// Column titles, laid out at the same widths as the rows.
+    pub header: String,
+    /// One line per branch.
+    pub rows: Vec<String>,
+}
+
+/// Longest "result or reason" text the CLI shows before cutting it.
+const BRANCH_TEXT_MAX: usize = 60;
+
+/// The cost cell of one branch: the `usage.by_lap` line for this branch's
+/// name at the group's entry, or `no data`. A null lap never matches.
+fn branch_cost(detail: &Value, name: &str, entry: i64) -> String {
+    detail
+        .get("usage")
+        .and_then(|u| u.get("by_lap"))
+        .and_then(Value::as_array)
+        .and_then(|laps| {
+            laps.iter().find(|lap| {
+                lap.get("stage").and_then(Value::as_str) == Some(name)
+                    && lap.get("lap").and_then(Value::as_i64) == Some(entry)
+            })
+        })
+        .filter(|lap| lap.get("tokens").is_some_and(Value::is_object))
+        .map_or_else(
+            || "no data".to_string(),
+            |lap| {
+                lap.get("cost_usd")
+                    .and_then(Value::as_f64)
+                    .map_or_else(|| "cost unknown".to_string(), money)
+            },
+        )
+}
+
+/// The detail's branch table for a task in a parallel group, from
+/// `workflow_state.branches`; `None` when there is none (no key, null, not
+/// an array, or empty — an older daemon, or no group is current).
+///
+/// `width` is the screen width when the table is drawn in a view of fixed
+/// width: the result column is then cut so the line fits, if the other
+/// columns allow. Without it the text is cut to [`BRANCH_TEXT_MAX`].
+pub fn detail_branches(
+    detail: &Value,
+    now: DateTime<Utc>,
+    width: Option<usize>,
+) -> Option<BranchTable> {
+    let branches = detail
+        .get("workflow_state")?
+        .get("branches")?
+        .as_array()
+        .filter(|b| !b.is_empty())?;
+    let open = detail.get("status").and_then(Value::as_str) == Some("open");
+    let stamp = |b: &Value, key: &str| {
+        b.get(key)
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+    };
+    let text = |b: &Value, key: &str| b.get(key).and_then(Value::as_str).map(single_line);
+    // [branch, kind, state, result or reason, time, cost]
+    let mut cells: Vec<[String; 6]> = branches
+        .iter()
+        .map(|b| {
+            let name = text(b, "name").unwrap_or_else(|| "?".to_string());
+            let state = text(b, "state").unwrap_or_else(|| "?".to_string());
+            let outcome = match state.as_str() {
+                "done" => text(b, "result"),
+                "failed" => text(b, "reason"),
+                _ => None,
+            }
+            .unwrap_or_default();
+            let (started, ended) = (stamp(b, "started_at"), stamp(b, "ended_at"));
+            let elapsed = match (state.as_str(), started, ended) {
+                ("done" | "failed", Some(s), Some(e)) => Some(e - s),
+                ("running", Some(s), _) if open => Some(now - s),
+                _ => None,
+            };
+            let entry = b.get("entry").and_then(Value::as_i64).unwrap_or(0);
+            [
+                name.clone(),
+                text(b, "kind").unwrap_or_else(|| "?".to_string()),
+                state,
+                outcome,
+                elapsed.map_or_else(|| "-".to_string(), crate::dashboard::app::fmt_duration),
+                branch_cost(detail, &name, entry),
+            ]
+        })
+        .collect();
+    const TITLES: [&str; 6] = [
+        "branch",
+        "kind",
+        "state",
+        "result or reason",
+        "time",
+        "cost",
+    ];
+    let col_width = |cells: &[[String; 6]], i: usize| {
+        cells
+            .iter()
+            .map(|row| row[i].chars().count())
+            .chain([TITLES[i].chars().count()])
+            .max()
+            .unwrap_or(0)
+    };
+    let others: usize = (0..6)
+        .filter(|&i| i != 3)
+        .map(|i| col_width(&cells, i))
+        .sum();
+    let limit = match width {
+        None => BRANCH_TEXT_MAX,
+        Some(w) => w.saturating_sub(2 + others + 5 * 2),
+    };
+    for row in &mut cells {
+        row[3] = cut_cell(&row[3], limit);
+    }
+    let widths: Vec<usize> = (0..6).map(|i| col_width(&cells, i)).collect();
+    let line = |row: [&str; 6]| {
+        let mut out = String::from(" ");
+        for (cell, w) in row.iter().zip(&widths) {
+            out.push_str(&format!(" {cell:<w$} "));
+        }
+        out.trim_end().to_string()
+    };
+    Some(BranchTable {
+        header: line(TITLES),
+        rows: cells
+            .iter()
+            .map(|row| line(std::array::from_fn(|i| row[i].as_str())))
+            .collect(),
+    })
+}
+
 /// The loop count of one `loop_counters` value: a bare number, or the
 /// engine's `{count: N, ...}` object.
 pub fn loop_count(v: &Value) -> u64 {
@@ -440,6 +573,14 @@ fn watch_timed_out_hint(detail: &Value) -> Option<String> {
 /// `workflow_state`) from raw JSON — it has no exported Rust type.
 pub fn task_detail(detail: &Value, now: DateTime<Utc>) -> String {
     let mut out = fields(&task_fields(detail));
+    if let Some(table) = detail_branches(detail, now, None) {
+        out.push_str("\n\nBranches\n");
+        out.push_str(&table.header);
+        for row in &table.rows {
+            out.push('\n');
+            out.push_str(row);
+        }
+    }
     if let Some(hint) = watch_timed_out_hint(detail) {
         out.push_str("\n\n");
         out.push_str(&hint);
@@ -953,6 +1094,48 @@ fn event_summary_body(event: &Event) -> String {
             match payload.get("outcome").and_then(Value::as_str) {
                 Some(outcome) => format!("{stage}  (via {outcome})"),
                 None => stage.to_string(),
+            }
+        }
+        // `{group, branch, kind, entry, via}` and `{group, branch, entry,
+        // state, result | reason}` (#257): one line each, never raw JSON.
+        EventType::BranchStarted | EventType::BranchFinished => {
+            let field = |key: &str| {
+                payload
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(single_line)
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            let entry = payload
+                .get("entry")
+                .and_then(Value::as_i64)
+                .map_or_else(|| "?".to_string(), |n| n.to_string());
+            let head = format!("{} › {}", field("group"), field("branch"));
+            let line = if event.event_type == EventType::BranchStarted {
+                match payload.get("via").and_then(Value::as_str) {
+                    Some(via) => format!(
+                        "{head}  started ({}, entry {entry}, via {via})",
+                        field("kind")
+                    ),
+                    None => format!("{head}  started ({}, entry {entry})", field("kind")),
+                }
+            } else {
+                match payload.get("state").and_then(Value::as_str) {
+                    Some("done") => format!("{head}  done: {} (entry {entry})", field("result")),
+                    Some("failed") => {
+                        format!("{head}  failed: {} (entry {entry})", field("reason"))
+                    }
+                    _ => format!("{head}  {} (entry {entry})", field("state")),
+                }
+            };
+            // `one_line` would also collapse the two spaces that set the
+            // branch apart from what happened, so the fields are
+            // single-lined above and only the length is capped here.
+            let cap: String = line.chars().take(100).collect();
+            if cap.len() < line.len() {
+                format!("{cap}…")
+            } else {
+                line
             }
         }
         // Likewise `{stage, command, exit_code, …}` (P2-1): the fallback
@@ -2396,5 +2579,250 @@ mod tests {
         let rendered = task_detail(&detail, test_now());
         assert!(rendered.contains("Active time  no data"), "{rendered}");
         assert!(rendered.contains("Total        cost unknown"), "{rendered}");
+    }
+
+    // ---- parallel groups (#257, PG1-7) -----------------------------------
+
+    fn long_reason() -> String {
+        format!("{}\n{}", "a".repeat(39), "b".repeat(40))
+    }
+
+    fn group_detail(status: &str) -> Value {
+        json!({
+            "id": "t-7", "title": "x", "project_id": "p", "workflow_def": "review",
+            "status": status, "created_at": "2026-08-02T09:00:00Z",
+            "workflow_state": {
+                "current_stage": "review_panel", "loop_counters": {},
+                "branches": [
+                    {"name": "security_review", "kind": "agent_turn", "state": "running",
+                     "result": null, "reason": null, "entry": 2,
+                     "started_at": "2026-08-02T09:55:00Z", "ended_at": null},
+                    {"name": "architecture_review", "kind": "agent_turn", "state": "done",
+                     "result": "blocking", "reason": null, "entry": 2,
+                     "started_at": "2026-08-02T09:50:00Z", "ended_at": "2026-08-02T09:52:00Z"},
+                    {"name": "tests", "kind": null, "state": "failed",
+                     "result": null, "reason": long_reason(), "entry": 2,
+                     "started_at": "2026-08-02T09:50:00Z", "ended_at": "2026-08-02T09:53:00Z"},
+                ],
+            },
+            "stage_trail": [
+                {"created_at": "2026-08-02T09:50:00Z",
+                 "payload": {"stage": "review_panel", "outcome": null}},
+            ],
+            "usage": {
+                "cost_usd": 0.5, "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+                "billing_label": "api_equivalent",
+                "by_lap": [
+                    {"stage": "security_review", "lap": 2, "cost_usd": 0.42,
+                     "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0}},
+                    {"stage": "architecture_review", "lap": 2, "cost_usd": null,
+                     "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0}},
+                    {"stage": "tests", "lap": 1, "cost_usd": 0.1,
+                     "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0}},
+                ],
+            },
+        })
+    }
+
+    fn branch_cells(detail: &Value, width: Option<usize>) -> Vec<Vec<String>> {
+        detail_branches(detail, test_now(), width)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| {
+                r.split("  ")
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.trim().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_branch_table_renders_state_time_and_cost() {
+        let table = detail_branches(&group_detail("open"), test_now(), None).unwrap();
+        let rows = branch_cells(&group_detail("open"), None);
+        // Running: 5m since start, cost of lap 2.
+        assert_eq!(rows[0][..3], ["security_review", "agent_turn", "running"]);
+        assert_eq!(rows[0][3..], ["5m", "≈ $0.42"]);
+        // Done: ended − started; the element has tokens but a null cost.
+        assert_eq!(
+            rows[1][..4],
+            ["architecture_review", "agent_turn", "done", "blocking"]
+        );
+        assert_eq!(rows[1][4..], ["2m", "cost unknown"]);
+        // Failed with a null kind (`?`): the reason single-lined and cut to
+        // 60 characters; the only usage line is for lap 1, not entry 2.
+        let reason = format!("{} {}", "a".repeat(39), "b".repeat(40));
+        let cut: String = reason.chars().take(59).chain(['…']).collect();
+        assert_eq!(rows[2][..4], ["tests", "?", "failed", cut.as_str()]);
+        assert_eq!(rows[2][4..], ["3m", "no data"]);
+        assert!(table.header.starts_with("  branch"), "{}", table.header);
+        let cols = [
+            "branch",
+            "kind",
+            "state",
+            "result or reason",
+            "time",
+            "cost",
+        ];
+        let mut at = 0;
+        for c in cols {
+            at += table.header[at..].find(c).expect(&table.header);
+        }
+        assert!(!table.header.ends_with(' ') && table.rows.iter().all(|r| !r.ends_with(' ')));
+    }
+
+    #[test]
+    fn a_running_branch_has_no_time_unless_the_task_is_open() {
+        for status in ["cancelled", "stuck"] {
+            let rows = branch_cells(&group_detail(status), None);
+            assert_eq!(rows[0][3..], ["-", "≈ $0.42"], "{status}");
+            // A finished branch keeps its time.
+            assert_eq!(rows[1][4], "2m", "{status}");
+        }
+    }
+
+    #[test]
+    fn a_missing_start_time_gives_a_dash() {
+        let mut d = group_detail("open");
+        d["workflow_state"]["branches"][0]["started_at"] = Value::Null;
+        d["workflow_state"]["branches"][1]["started_at"] = json!("not a time");
+        let rows = branch_cells(&d, None);
+        assert_eq!(rows[0][3], "-");
+        assert_eq!(rows[1][4], "-");
+    }
+
+    #[test]
+    fn branch_cost_never_invents_a_figure() {
+        let mut d = group_detail("open");
+        d["usage"]["by_lap"][0]["lap"] = json!(null);
+        d["usage"]["by_lap"][1]["tokens"] = json!(null);
+        let rows = branch_cells(&d, None);
+        assert_eq!(rows[0].last().unwrap(), "no data");
+        assert_eq!(rows[1].last().unwrap(), "no data");
+        d["usage"] = Value::Null;
+        for row in branch_cells(&d, None) {
+            assert_eq!(row.last().unwrap(), "no data");
+        }
+        d.as_object_mut().unwrap().remove("usage");
+        for row in branch_cells(&d, None) {
+            assert_eq!(row.last().unwrap(), "no data");
+        }
+    }
+
+    #[test]
+    fn the_branch_table_sits_between_the_fields_and_progress() {
+        let out = task_detail(&group_detail("open"), test_now());
+        let stage = out.find("Stage").expect(&out);
+        let branches = out.find("\n\nBranches\n").expect(&out);
+        let progress = out.find("\n\nProgress\n").expect(&out);
+        assert!(stage < branches && branches < progress, "{out}");
+        let after_stage = &out[stage..branches];
+        assert_eq!(after_stage.lines().count(), 1, "{out}");
+        let progress_rows = out[progress..]
+            .lines()
+            .filter(|l| l.contains("review_panel"))
+            .count();
+        assert_eq!(progress_rows, 1, "{out}");
+        assert!(out.contains("\n\nCost & time\n"), "{out}");
+        let block = &out[branches + 2..progress];
+        assert_eq!(
+            block,
+            "Branches
+  branch               kind        state    result or reason                                              time  cost
+  security_review      agent_turn  running                                                                5m    ≈ $0.42
+  architecture_review  agent_turn  done     blocking                                                      2m    cost unknown
+  tests                ?           failed   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbb…  3m    no data"
+        );
+    }
+
+    #[test]
+    fn a_detail_without_branches_has_no_branch_block() {
+        let mut d = group_detail("open");
+        d["workflow_state"]["branches"] = json!([]);
+        assert!(!task_detail(&d, test_now()).contains("Branches"));
+        d["workflow_state"]["branches"] = Value::Null;
+        assert!(!task_detail(&d, test_now()).contains("Branches"));
+        d["workflow_state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("branches");
+        assert!(!task_detail(&d, test_now()).contains("Branches"));
+        assert!(detail_branches(&d, test_now(), None).is_none());
+        d["workflow_state"]["branches"] = json!("nope");
+        assert!(detail_branches(&d, test_now(), None).is_none());
+    }
+
+    #[test]
+    fn a_workflow_state_without_branches_decodes_to_none() {
+        let state: chocofactory_core::models::WorkflowState = serde_json::from_value(json!({
+            "task_id": "t", "current_stage": "s", "loop_counters": {}, "payload": {},
+            "updated_at": "2026-08-02T09:00:00Z", "stage_entered_at": null,
+        }))
+        .unwrap();
+        assert!(state.branches.is_empty());
+    }
+
+    #[test]
+    fn a_width_cuts_the_result_column_so_lines_fit() {
+        let d = group_detail("open");
+        let wide = detail_branches(&d, test_now(), None).unwrap();
+        let full = wide.rows.iter().map(|r| r.chars().count()).max().unwrap();
+        for width in [full - 10, full - 30, 100, 90] {
+            let t = detail_branches(&d, test_now(), Some(width)).unwrap();
+            for line in t.rows.iter() {
+                assert!(line.chars().count() <= width, "{width}: {line:?}");
+            }
+        }
+        let cut = detail_branches(&d, test_now(), Some(full - 10)).unwrap();
+        assert!(cut.rows[2].contains('…'), "{:?}", cut.rows[2]);
+        // Wider than the text needs: nothing is cut beyond the 60-column
+        // limit the CLI applies.
+        let roomy = detail_branches(&d, test_now(), Some(400)).unwrap();
+        assert!(roomy.rows[2].contains("aaaa bbbb"), "{:?}", roomy.rows[2]);
+    }
+
+    #[test]
+    fn branch_events_render_as_one_line_each() {
+        let started = |via: Value| {
+            event_summary(&event(
+                EventType::BranchStarted,
+                json!({"group": "review_panel", "branch": "security_review",
+                       "kind": "agent_turn", "entry": 2, "via": via}),
+            ))
+        };
+        assert_eq!(
+            started(Value::Null),
+            "review_panel › security_review  started (agent_turn, entry 2)"
+        );
+        assert_eq!(
+            started(json!("retry")),
+            "review_panel › security_review  started (agent_turn, entry 2, via retry)"
+        );
+        let finished = |payload: Value| event_summary(&event(EventType::BranchFinished, payload));
+        assert_eq!(
+            finished(
+                json!({"group": "review_panel", "branch": "architecture_review",
+                            "entry": 2, "state": "done", "result": "blocking"})
+            ),
+            "review_panel › architecture_review  done: blocking (entry 2)"
+        );
+        let failed = finished(json!({"group": "g", "branch": "b", "entry": 1,
+                                     "state": "failed", "reason": "line one\nline two"}));
+        assert_eq!(failed, "g › b  failed: line one line two (entry 1)");
+        assert_eq!(
+            finished(json!({"group": "g", "branch": "b", "entry": 1, "state": "paused"})),
+            "g › b  paused (entry 1)"
+        );
+        assert_eq!(finished(json!({})), "? › ?  ? (entry ?)");
+        assert_eq!(
+            started(Value::Null).matches('{').count() + finished(json!({})).matches('{').count(),
+            0
+        );
+        assert_eq!(
+            event_summary(&event(EventType::BranchStarted, json!({}))),
+            "? › ?  started (?, entry ?)"
+        );
     }
 }
