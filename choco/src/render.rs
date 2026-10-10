@@ -218,6 +218,28 @@ pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
             outcome.stage
         );
     }
+    if !outcome.branches.is_empty() {
+        let mut lines = vec![format!(
+            "Retrying parallel stage '{}': re-running {} failed branch(es); finished branches \
+             are kept.",
+            outcome.stage,
+            outcome.branches.len()
+        )];
+        for b in &outcome.branches {
+            lines.push(match (b.resumed, &b.adapter_session_id, &b.fresh_reason) {
+                (true, Some(id), _) => {
+                    format!("  {}: resuming its interrupted session ({id}).", b.branch)
+                }
+                (true, None, _) => format!("  {}: resuming its interrupted session.", b.branch),
+                (false, _, Some(why)) => {
+                    format!("  {}: from scratch, in a fresh session: {why}.", b.branch)
+                }
+                (false, _, None) => format!("  {}: from scratch, in a fresh session.", b.branch),
+            });
+        }
+        lines.push(format!("See `choco task status {task_id}`."));
+        return lines.join("\n");
+    }
     let what = match &outcome.adapter_session_id {
         Some(adapter_session_id) if outcome.resumed => format!(
             "Retrying stage '{}' by resuming its interrupted session ({adapter_session_id}) — it \
@@ -1488,6 +1510,7 @@ mod tests {
                 adapter_session_id: None,
                 fresh_reason: None,
                 rewatched: true,
+                branches: Vec::new(),
             },
         );
         assert_eq!(
@@ -1539,6 +1562,7 @@ mod tests {
                 adapter_session_id: Some("sess-123".to_string()),
                 fresh_reason: None,
                 rewatched: false,
+                branches: Vec::new(),
             },
         );
         assert!(
@@ -1558,6 +1582,7 @@ mod tests {
                 adapter_session_id: None,
                 fresh_reason: Some("its turn ended 'no_report'".to_string()),
                 rewatched: false,
+                branches: Vec::new(),
             },
         );
         assert!(
@@ -1565,6 +1590,50 @@ mod tests {
             "{fresh}"
         );
     }
+
+    #[test]
+    fn retried_lists_each_branch_of_a_group() {
+        use chocofactory_core::models::RetriedBranch;
+        let branch = |branch: &str, resumed, id: Option<&str>, why: Option<&str>| RetriedBranch {
+            branch: branch.to_string(),
+            resumed,
+            adapter_session_id: id.map(str::to_string),
+            fresh_reason: why.map(str::to_string),
+        };
+        let outcome = |branches| RetryOutcome {
+            stage: "panel".to_string(),
+            resumed: false,
+            adapter_session_id: None,
+            fresh_reason: None,
+            rewatched: false,
+            branches,
+        };
+        let out = super::retried(
+            "task-1",
+            &outcome(vec![
+                branch("one", true, Some("sess-1"), None),
+                branch("two", false, None, Some("a fresh start was asked for")),
+                branch("three", true, None, None),
+                branch("four", false, None, None),
+            ]),
+        );
+        assert_eq!(
+            out,
+            "Retrying parallel stage 'panel': re-running 4 failed branch(es); finished branches are kept.\n\
+             \x20 one: resuming its interrupted session (sess-1).\n\
+             \x20 two: from scratch, in a fresh session: a fresh start was asked for.\n\
+             \x20 three: resuming its interrupted session.\n\
+             \x20 four: from scratch, in a fresh session.\n\
+             See `choco task status task-1`."
+        );
+        // Without branches the output is the single-stage sentence.
+        let plain = super::retried("task-1", &outcome(Vec::new()));
+        assert_eq!(
+            plain,
+            "Retrying stage 'panel' from scratch, in a fresh session. See `choco task status task-1`."
+        );
+    }
+
     use serde_json::json;
 
     /// One `stage_entered` event per entry, shaped as the daemon serializes

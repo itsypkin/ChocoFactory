@@ -300,6 +300,23 @@ pub struct RetryOutcome {
     /// stage that timed out, instead of re-running a stuck stage.
     #[serde(default)]
     pub rewatched: bool,
+    /// For a retry of a parallel group: one entry per re-run branch, in
+    /// declaration order. Empty for any other retry.
+    #[serde(default)]
+    pub branches: Vec<RetriedBranch>,
+}
+
+/// One re-run branch of a parallel group's retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetriedBranch {
+    /// The branch's name.
+    pub branch: String,
+    /// Whether its interrupted session was resumed.
+    pub resumed: bool,
+    /// The CLI adapter's identifier for the resumed session, when resumed.
+    pub adapter_session_id: Option<String>,
+    /// Why it started fresh instead of resuming, when it did.
+    pub fresh_reason: Option<String>,
 }
 
 /// One row per underlying agent subprocess session a task has had (§3).
@@ -678,6 +695,16 @@ pub struct PullRequestRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_outcome_without_branches_deserializes_to_an_empty_list() {
+        let outcome: RetryOutcome = serde_json::from_str(
+            r#"{"stage":"coding","resumed":false,"adapter_session_id":null,"fresh_reason":null}"#,
+        )
+        .unwrap();
+        assert!(outcome.branches.is_empty());
+        assert!(!outcome.rewatched);
+    }
 
     #[test]
     fn session_status_round_trips_through_display_and_from_str() {

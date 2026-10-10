@@ -1089,9 +1089,17 @@ pub enum RetryTaskError {
     /// only marks a task stuck once it has given up on that stage's run.
     /// Carries the stage name.
     RunStillActive(String),
-    /// The current stage is a parallel group. Retrying one comes with a later
-    /// version; until then the task stays stuck as it was.
-    ParallelGroupRetryNotYet {
+    /// A branch of the parallel group has a live session; nothing is changed.
+    BranchStillActive {
+        stage: String,
+        branch: String,
+    },
+    /// The parallel group's branch state is missing from the workflow payload.
+    GroupStateMissing {
+        stage: String,
+    },
+    /// Every branch of the parallel group is done; none failed.
+    NothingToRetry {
         stage: String,
     },
     Resolve(ResolveError),
@@ -1133,10 +1141,20 @@ impl fmt::Display for RetryTaskError {
             RetryTaskError::UnknownStage(stage) => {
                 write!(f, "workflow_state references unknown stage '{stage}'")
             }
-            RetryTaskError::ParallelGroupRetryNotYet { stage } => write!(
+            RetryTaskError::BranchStillActive { stage, branch } => write!(
                 f,
-                "retrying parallel stage '{stage}' comes in a later version; cancel the task to \
-                 stop it"
+                "branch '{branch}' of parallel stage '{stage}' still has a live session; wait \
+                 for it to end, then retry (or cancel the task)"
+            ),
+            RetryTaskError::GroupStateMissing { stage } => write!(
+                f,
+                "parallel stage '{stage}' has no branch state in the workflow payload, so there \
+                 is nothing to retry"
+            ),
+            RetryTaskError::NothingToRetry { stage } => write!(
+                f,
+                "every branch of parallel stage '{stage}' is done; there is no failed branch to \
+                 retry"
             ),
             RetryTaskError::RunStillActive(stage) => write!(
                 f,
@@ -2386,12 +2404,10 @@ impl WorkflowEngine {
             .get(&current_stage)
             .ok_or_else(|| RetryTaskError::UnknownStage(current_stage.clone()))?;
 
-        // Fails closed until retrying a group exists: refused in step 1,
-        // before any write, so the task keeps its stuck reason.
         if matches!(stage_def.kind, StageKind::Parallel { .. }) {
-            return Err(RetryTaskError::ParallelGroupRetryNotYet {
-                stage: current_stage,
-            });
+            return self
+                .retry_group_locked(&task, &definition, &current_stage, stage_def, &state, mode)
+                .await;
         }
 
         // Defensive, not a case any path today produces: the engine only
@@ -2542,6 +2558,7 @@ impl WorkflowEngine {
             adapter_session_id: resume.map(|resume| resume.adapter_session_id),
             fresh_reason,
             rewatched: false,
+            branches: Vec::new(),
         })
     }
 
@@ -2608,6 +2625,7 @@ impl WorkflowEngine {
             adapter_session_id: None,
             fresh_reason: None,
             rewatched: true,
+            branches: Vec::new(),
         })
     }
 

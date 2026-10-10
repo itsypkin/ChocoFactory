@@ -243,6 +243,17 @@ pub async fn get_current_for_stage(
     Ok(row.map(Into::into))
 }
 
+/// The lap stored on a session row: `None` for a missing row or a row whose
+/// lap is NULL. Read-only; a retry uses it to tell whether a branch's last
+/// session belongs to the group's current entry.
+pub async fn lap(pool: &SqlitePool, session_id: &str) -> Result<Option<i64>, sqlx::Error> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as("SELECT lap FROM sessions WHERE id = ?")
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|(lap,)| lap))
+}
+
 /// Persists the CLI's `adapter_session_id` for later resume (§4.1).
 pub async fn set_adapter_session_id(
     pool: &SqlitePool,
@@ -371,6 +382,38 @@ mod tests {
         .await
         .unwrap()
         .id
+    }
+
+    #[tokio::test]
+    async fn lap_reads_the_stored_lap_and_is_none_for_null_or_a_missing_row() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+        let session = create(
+            &pool,
+            NewSession {
+                task_id: &task_id,
+                stage: "coding",
+                role: "coder",
+                cli_adapter: "claude",
+                model: "sonnet",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(lap(&pool, &session.id).await.unwrap(), Some(1));
+        sqlx::query("UPDATE sessions SET lap = 4 WHERE id = ?")
+            .bind(&session.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(lap(&pool, &session.id).await.unwrap(), Some(4));
+        sqlx::query("UPDATE sessions SET lap = NULL WHERE id = ?")
+            .bind(&session.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(lap(&pool, &session.id).await.unwrap(), None);
+        assert_eq!(lap(&pool, "no-such-session").await.unwrap(), None);
     }
 
     /// #92: a resumed session records the session it continued and starts

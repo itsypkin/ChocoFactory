@@ -215,8 +215,11 @@ impl From<RetryTaskError> for ApiError {
             | RetryTaskError::NoWorkflowState
             | RetryTaskError::UnknownStage(_)
             | RetryTaskError::RunStillActive(_)
-            // A parallel group can't be retried yet: the task's state, not the request.
-            | RetryTaskError::ParallelGroupRetryNotYet { .. }
+            // A group retry refused: a branch still runs, the group has no
+            // branch state, or nothing failed. The task's state, not the request.
+            | RetryTaskError::BranchStillActive { .. }
+            | RetryTaskError::GroupStateMissing { .. }
+            | RetryTaskError::NothingToRetry { .. }
             // Same shape: `--resume` was asked for and this task's last run
             // is not one that can be resumed (#92). The caller could retry
             // without it, so it is the task's state that conflicts, not the
@@ -262,6 +265,20 @@ impl From<InitWorkflowsError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_retry_refusals_map_to_409() {
+        for err in [
+            RetryTaskError::BranchStillActive {
+                stage: "g".into(),
+                branch: "b".into(),
+            },
+            RetryTaskError::GroupStateMissing { stage: "g".into() },
+            RetryTaskError::NothingToRetry { stage: "g".into() },
+        ] {
+            assert!(matches!(ApiError::from(err), ApiError::Conflict(_)));
+        }
+    }
 
     #[test]
     fn rewatch_and_marker_only_errors_map_to_409_and_400() {
