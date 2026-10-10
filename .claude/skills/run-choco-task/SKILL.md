@@ -195,8 +195,9 @@ explicit out-of-scope list.
   needs an agent turn or GitHub); see
   [reference/spec.md](reference/spec.md#docs-only-tasks).
 - **Text an agent or a reader acts on** (a prompt, a skill, docs): the spec
-  carries behavioural acceptance criteria and names the runs that prove them;
-  see
+  carries behavioural acceptance criteria and names the runs that prove them,
+  each with a budget and a way out that tells the internal reviewer to carry a
+  "not made: <reason>" item to the human gate; see
   [reference/spec.md](reference/spec.md#text-an-agent-or-a-reader-acts-on).
 
 ## 3. Create and watch
