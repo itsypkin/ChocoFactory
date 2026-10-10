@@ -946,3 +946,102 @@ fn set_parallel_block_counts_entries_and_removes_the_block_elsewhere() {
     assert!(payload.get("parallel").is_none());
     assert_eq!(payload["parallel_entries"]["panel"], 2);
 }
+
+#[tokio::test]
+async fn a_branch_that_already_ended_or_a_group_already_left_is_dropped() {
+    let g = group(Shape::new(), holding()).await;
+    g.start(None).await.unwrap();
+    let one = g.wait_sessions("one", 1).await.remove(0);
+    let two = g.wait_sessions("two", 1).await.remove(0);
+
+    let first = g
+        .finish(1, "one", &one.id, reported("clean", "sum-one"))
+        .await;
+    assert_eq!(first, BranchApplied::Recorded { done: true });
+    let after_first = g.state().await.payload;
+    // `one` is no longer running: a second end for it changes nothing.
+    let again = g
+        .finish(1, "one", &one.id, reported("blocking", "late"))
+        .await;
+    assert!(matches!(again, BranchApplied::Dropped(_)), "{again:?}");
+    assert_eq!(g.state().await.payload, after_first);
+
+    let last = g
+        .finish(1, "two", &two.id, reported("clean", "sum-two"))
+        .await;
+    assert_eq!(last, BranchApplied::Recorded { done: true });
+    g.wait_sessions("summarize", 1).await;
+    // The task has left the group: a late end for the settled entry is dropped.
+    let late = g
+        .finish(1, "two", &two.id, reported("clean", "again"))
+        .await;
+    assert!(matches!(late, BranchApplied::Dropped(_)), "{late:?}");
+    assert_eq!(g.state().await.current_stage, "summarize");
+}
+
+#[tokio::test]
+async fn a_failed_branch_start_record_starts_nothing_and_parks_the_group() {
+    let g = group(Shape::new(), holding()).await;
+    // Fails the second branch's insert: the first must be rolled back too.
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_branch_two BEFORE INSERT ON events
+         WHEN NEW.event_type = 'branch_started' AND json_extract(NEW.payload, '$.branch') = 'two'
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    g.start(None).await.unwrap();
+    let reason = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(reason.contains("2 of 2 branch(es) failed"), "{reason}");
+    assert!(
+        reason.contains("could not record the branch start"),
+        "{reason}"
+    );
+    assert!(g.events_of(EventType::BranchStarted).await.is_empty());
+    assert!(
+        sessions::list_for_task(&g.pool, &g.task_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let payload = g.state().await.payload;
+    assert_eq!(branch_slot(&payload, "one")["state"], "failed");
+    assert_eq!(branch_slot(&payload, "one")["resumable"], false);
+}
+
+#[tokio::test]
+async fn a_failed_settle_writes_neither_the_payload_nor_the_stuck_status() {
+    let g = group(Shape::new(), holding()).await;
+    g.start(None).await.unwrap();
+    let one = g.wait_sessions("one", 1).await.remove(0);
+    let two = g.wait_sessions("two", 1).await.remove(0);
+    let first = g
+        .finish(1, "two", &two.id, reported("clean", "sum-two"))
+        .await;
+    assert_eq!(first, BranchApplied::Recorded { done: true });
+    let before = g.state().await.payload;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_stuck BEFORE UPDATE ON tasks
+         WHEN NEW.status = 'stuck'
+         BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    ))
+    .execute(&g.pool)
+    .await
+    .unwrap();
+    let applied = g
+        .finish(
+            1,
+            "one",
+            &one.id,
+            BranchOutcome::Failed {
+                reason: "it broke".to_string(),
+            },
+        )
+        .await;
+    assert!(matches!(applied, BranchApplied::Parked(_)), "{applied:?}");
+    // The transaction rolled back: the branch is still running in the
+    // payload, and the task is still open.
+    assert_eq!(g.state().await.payload, before);
+    assert_eq!(g.status().await, "open");
+}
