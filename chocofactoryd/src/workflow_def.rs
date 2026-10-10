@@ -5316,13 +5316,71 @@ stages:
     }
 
     #[test]
-    fn a_group_may_be_an_on_or_loop_guard_target() {
-        // `then: review_panel` loads when it is not on every lap.
-        let yaml = panel_with("then: escalate", "then: escalate").replace(
+    fn a_group_may_be_an_on_target() {
+        let yaml = PANEL_YAML.replace(
             "on: { approved: done, changes_requested: coding }",
             "on: { approved: done, changes_requested: review_panel }",
         );
         WorkflowDefinition::parse(&yaml, &panel_dir().path).unwrap();
+    }
+
+    #[test]
+    fn a_group_may_be_a_loop_guard_then_target() {
+        // `then` is a group that is not on the guarded lap.
+        let alt = "  alt:\n    kind: parallel\n    branches:\n      p: { kind: agent_turn, role: security }\n      q: { kind: agent_turn, role: architect }\n    on: { done: lead_review }\n  escalate:";
+        let yaml = PANEL_YAML
+            .replace("  escalate:", alt)
+            .replace("then: escalate", "then: alt");
+        WorkflowDefinition::parse(&yaml, &panel_dir().path).unwrap();
+    }
+
+    #[test]
+    fn a_branch_may_read_a_branch_of_another_group() {
+        let second = r#"  review_panel:
+    kind: parallel
+    branches:
+      security_review:
+        kind: agent_turn
+        role: security
+        prompt_file: prompts/security.md
+        capture: json
+        results: [clean, blocking]
+      architecture_review:
+        kind: agent_turn
+        role: architect
+        prompt_file: prompts/architecture.md
+        capture: json
+        results: [clean, blocking]
+    on: { done: second }
+  second:
+    kind: parallel
+    branches:
+      x:
+        kind: agent_turn
+        role: security
+        prompt_file: prompts/x.md
+        capture: json
+      y:
+        kind: agent_turn
+        role: architect
+        prompt_file: prompts/y.md
+    on: { done: lead_review }
+"#;
+        let start = PANEL_YAML.find("  review_panel:").unwrap();
+        let end = PANEL_YAML.find("  lead_review:").unwrap();
+        let yaml = format!("{}{}{}", &PANEL_YAML[..start], second, &PANEL_YAML[end..]);
+        let dir = panel_dir();
+        dir.write("prompts/x.md", "{{ stages.security_review.summary }}");
+        dir.write("prompts/y.md", "{{ stages.security_review.summary }}");
+        let def = WorkflowDefinition::parse(&yaml, &dir.path).unwrap();
+        assert_eq!(def.branch("x").unwrap().group, "second");
+        // Same group is still refused.
+        dir.write("prompts/y.md", "{{ stages.x.summary }}");
+        let err = WorkflowDefinition::parse(&yaml, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::BranchReferencesSibling { sibling, .. } if sibling == "x"),
+            "{err:?}"
+        );
     }
 
     #[test]
