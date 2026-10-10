@@ -57,6 +57,7 @@ use crate::workflow_def::{
 use crate::worktree::{self, WorktreeError};
 
 mod gate;
+mod parallel;
 mod render;
 mod runners;
 mod shell_stage;
@@ -99,6 +100,8 @@ struct StageEntry<'a> {
     payload: &'a Value,
     input: Option<&'a str>,
     resume: Option<&'a ResumeSession>,
+    /// Set only when the entry starts a parallel group's branch.
+    branch: Option<parallel::BranchEntry<'a>>,
 }
 
 /// In-flight detached `shell`/`poll` runners, keyed by task id and then by
@@ -225,8 +228,9 @@ pub struct WorkflowEngine {
 
 #[derive(Debug)]
 pub enum EngineError {
-    /// The stage is a `kind: parallel` group, which the engine can't run yet.
-    ParallelGroupNotRunYet {
+    /// A parallel group was entered without its branch state in the
+    /// workflow payload. Defensive: no path produces it.
+    GroupStateMissing {
         stage: String,
     },
     NoWorkflowState,
@@ -318,10 +322,10 @@ impl fmt::Display for EngineError {
         match self {
             EngineError::NoWorkflowState => write!(f, "task has no workflow_state row"),
             EngineError::NoSuchTask => write!(f, "no such task"),
-            EngineError::ParallelGroupNotRunYet { stage } => write!(
+            EngineError::GroupStateMissing { stage } => write!(
                 f,
-                "stage '{stage}' is a parallel group, and parallel groups don't run yet in this \
-                 version"
+                "parallel stage '{stage}' was entered without its branch state in the workflow \
+                 payload"
             ),
             EngineError::UnknownStage(stage) => {
                 write!(f, "workflow_state references unknown stage '{stage}'")
@@ -1085,6 +1089,11 @@ pub enum RetryTaskError {
     /// only marks a task stuck once it has given up on that stage's run.
     /// Carries the stage name.
     RunStillActive(String),
+    /// The current stage is a parallel group. Retrying one comes with a later
+    /// version; until then the task stays stuck as it was.
+    ParallelGroupRetryNotYet {
+        stage: String,
+    },
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     /// This task's recorded `workflow_path` (issue #88) names a file that no
@@ -1124,6 +1133,11 @@ impl fmt::Display for RetryTaskError {
             RetryTaskError::UnknownStage(stage) => {
                 write!(f, "workflow_state references unknown stage '{stage}'")
             }
+            RetryTaskError::ParallelGroupRetryNotYet { stage } => write!(
+                f,
+                "retrying parallel stage '{stage}' comes in a later version; cancel the task to \
+                 stop it"
+            ),
             RetryTaskError::RunStillActive(stage) => write!(
                 f,
                 "stage '{stage}' still has an active session; nothing to retry"
@@ -2372,6 +2386,14 @@ impl WorkflowEngine {
             .get(&current_stage)
             .ok_or_else(|| RetryTaskError::UnknownStage(current_stage.clone()))?;
 
+        // Fails closed until retrying a group exists: refused in step 1,
+        // before any write, so the task keeps its stuck reason.
+        if matches!(stage_def.kind, StageKind::Parallel { .. }) {
+            return Err(RetryTaskError::ParallelGroupRetryNotYet {
+                stage: current_stage,
+            });
+        }
+
         // Defensive, not a case any path today produces: the engine only
         // marks a task stuck once it has given up on its current stage's
         // run, so there should be nothing left active to collide with a
@@ -2396,7 +2418,7 @@ impl WorkflowEngine {
         let resumable = match mode {
             RetryMode::Fresh => Err("a fresh start was asked for".to_string()),
             RetryMode::Auto | RetryMode::Resume => {
-                self.resumable_session(&task, &definition, stage_def, last_session.as_ref())
+                self.resumable_session(&task, &definition, stage_def, last_session.as_ref(), false)
                     .await?
             }
         };
@@ -2636,6 +2658,9 @@ impl WorkflowEngine {
         definition: &WorkflowDefinition,
         stage_def: &StageDef,
         last_session: Option<&Session>,
+        // A parallel branch's `on:` is always empty, but it is not a standing
+        // session: it is single-shot and resumes like any other turn.
+        is_branch: bool,
     ) -> Result<Result<ResumeSession, String>, RetryTaskError> {
         if !matches!(stage_def.kind, StageKind::AgentTurn { .. }) {
             return Ok(Err(
@@ -2650,7 +2675,7 @@ impl WorkflowEngine {
         // standing stage gets no turn watcher and so is never marked stuck
         // by one — and checked anyway, since the cost of being wrong is a
         // turn instructed to do something it cannot do.
-        if stage_def.on.is_empty() {
+        if !is_branch && stage_def.on.is_empty() {
             return Ok(Err(
                 "it is a standing session, which is resumed by sending it a message \
                  rather than by retrying"
@@ -2884,6 +2909,7 @@ impl WorkflowEngine {
             // An entry stage that is a `poll` gets its window in the same
             // INSERT as the row (#52).
             set_poll_window(&mut payload, definition, start, self.now())?;
+            parallel::set_parallel_block(&mut payload, definition, start, self.now());
             let start_kind = definition
                 .stages
                 .get(start)
@@ -2990,170 +3016,88 @@ impl WorkflowEngine {
 
         // The stage entered on success, so the caller below can tell
         // whether it just became terminal without a second query.
-        let result: Result<String, EngineError> =
-            async {
-                // The authoritative cancel guard (#69). Every detached
-                // runner in this file — the turn watcher, the shell runner,
-                // the poll runner — funnels its outcome through here, so
-                // one check inside the per-task lock stops all of them
-                // rather than each having to remember to look.
-                //
-                // Placed inside the lock for the same reason
-                // `expected_stage` is, and the reason it can't just be read
-                // in `cancel_task` and cached: `cancel_task` takes this same
-                // lock and writes `tasks.status` under it, so a read here
-                // either sees that write or is ordered entirely before it.
-                // Outside the lock, a turn finishing at the same instant as
-                // a cancel could read `open`, then advance a task the
-                // operator had already stopped.
-                if let Some(task) = tasks::get(&self.pool, task_id).await?
-                    && task.status == TASK_STATUS_CANCELLED
-                {
-                    return Err(EngineError::TaskCancelled(task_id.to_string()));
-                }
+        let result: Result<String, EngineError> = async {
+            // The authoritative cancel guard (#69). Every detached
+            // runner in this file — the turn watcher, the shell runner,
+            // the poll runner — funnels its outcome through here, so
+            // one check inside the per-task lock stops all of them
+            // rather than each having to remember to look.
+            //
+            // Placed inside the lock for the same reason
+            // `expected_stage` is, and the reason it can't just be read
+            // in `cancel_task` and cached: `cancel_task` takes this same
+            // lock and writes `tasks.status` under it, so a read here
+            // either sees that write or is ordered entirely before it.
+            // Outside the lock, a turn finishing at the same instant as
+            // a cancel could read `open`, then advance a task the
+            // operator had already stopped.
+            if let Some(task) = tasks::get(&self.pool, task_id).await?
+                && task.status == TASK_STATUS_CANCELLED
+            {
+                return Err(EngineError::TaskCancelled(task_id.to_string()));
+            }
 
-                let state = workflow_state::get(&self.pool, task_id)
-                    .await?
-                    .ok_or(EngineError::NoWorkflowState)?;
-                let from_stage = state.current_stage.clone();
-
-                // Checked inside the lock, against the same read the
-                // transition below is computed from — outside it, the
-                // answer could go stale before it was used.
-                if let Some(expected) = expected_stage
-                    && from_stage != expected
-                {
-                    return Err(EngineError::StageMovedOn {
-                        expected: expected.to_string(),
-                        actual: from_stage,
-                    });
-                }
-
-                let stage_def = definition
-                    .stages
-                    .get(&from_stage)
-                    .ok_or_else(|| EngineError::UnknownStage(from_stage.clone()))?;
-
-                if matches!(stage_def.kind, StageKind::Terminal) {
-                    return Err(EngineError::TerminalStageHasNoTransitions(from_stage));
-                }
-
-                let mut next_stage = stage_def.on.get(outcome).cloned().ok_or_else(|| {
-                    EngineError::UnknownOutcome {
-                        stage: from_stage.clone(),
-                        outcome: outcome.to_string(),
-                    }
-                })?;
-
-                let mut loop_counters = state.loop_counters;
-                if let Some(guard) = &stage_def.loop_guard {
-                    if guard.on == outcome {
-                        let count = bump_loop_counter(&mut loop_counters, &from_stage);
-                        if count > u64::from(guard.max) {
-                            next_stage = guard.then.clone();
-                        }
-                    } else {
-                        // Consecutive-count rule: any other outcome starts
-                        // the count over, in this transition's single write.
-                        reset_loop_counter(&mut loop_counters, &from_stage);
-                    }
-                }
-                clear_guards_escaping_to(&mut loop_counters, definition, &next_stage);
-
-                let mut payload = state.payload;
-                if let Some(value) = capture {
-                    // Keyed by the stage that produced it, which the check
-                    // above has confirmed is still the current one.
-                    merge_stage_capture(&mut payload, &from_stage, value);
-                }
-                // Records how the task arrived at `next_stage`, so
-                // `coder-revise.md` and any other template can branch on
-                // the actual transition (#112) instead of guessing from
-                // which stale `stages.*` capture happens to be non-empty.
-                // Written into this same payload/update so it commits
-                // atomically with `current_stage` — no second write.
-                set_arrival(&mut payload, &from_stage, outcome);
-                // Marks `from_stage` as having finished a run, in the same
-                // payload/update, so a later template can tell "never ran"
-                // from "ran but stored no capture".
-                mark_stage_finished(&mut payload, &from_stage);
-                // Records when the task left `from_stage`, truncated to the
-                // whole second (GitHub's timestamp format), in this same
-                // payload/update. The review gate fences on it.
-                set_left_at(
-                    &mut payload,
-                    &from_stage,
-                    &self.now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                );
-                // Stamps (or clears) the poll window for `next_stage`, in
-                // this same payload so the deadline commits in the one
-                // UPDATE that moves `current_stage` (#52).
-                set_poll_window(&mut payload, definition, &next_stage, self.now())?;
-                // Written in the same UPDATE as `current_stage`, so the two
-                // can never disagree. Looked up after any loop-guard
-                // redirect, and before the watcher is stopped: a missing
-                // stage must fail while the watcher is still running.
-                let stage_kind = definition
-                    .stages
-                    .get(&next_stage)
-                    .ok_or_else(|| EngineError::UnknownStage(next_stage.clone()))?
-                    .kind
-                    .name()
-                    .to_string();
-
-                // The reply path stops the gate's watcher here: under the
-                // task lock, after every check that can refuse the
-                // transition, and immediately before the write. Nothing
-                // fallible may sit between this and `workflow_state::update`
-                // — a refusal after the abort would leave the task open at
-                // the gate with nothing watching it. If the update itself
-                // fails, the caller marks the task stuck at the gate and
-                // `retry` starts a new watcher.
-                if stop_watcher {
-                    self.abort_detached_runners(task_id).await;
-                }
-
-                // The returned row is the authority on what was actually
-                // committed, and it's what the next stage renders its
-                // templates against (P2-3). A `None` here means the row
-                // vanished between this function's read and its write —
-                // impossible while the lock is held, but discarding the
-                // `Option` would turn that broken invariant into a task that
-                // silently transitions against state nothing persisted.
-                let updated = workflow_state::update(
-                    &self.pool,
-                    task_id,
-                    workflow_state::WorkflowStateUpdate {
-                        current_stage: next_stage.clone(),
-                        stage_kind,
-                        loop_counters,
-                        payload,
-                        // Also true for an `on:` edge back to the same
-                        // stage: that is a new entry.
-                        enters_stage: true,
-                    },
-                )
+            let state = workflow_state::get(&self.pool, task_id)
                 .await?
                 .ok_or(EngineError::NoWorkflowState)?;
-                committed.store(true, std::sync::atomic::Ordering::Relaxed);
+            let from_stage = state.current_stage.clone();
 
-                // `enter_stage` records the transition itself (X-3), so the
-                // trail this used to push onto `workflow_state.stage_history`
-                // now lives in the events timeline with a timestamp and the
-                // outcome that caused it.
-                self.enter_stage(
-                    task_id,
-                    definition,
-                    &next_stage,
-                    None,
-                    Some(outcome),
-                    &updated.payload,
-                    None,
-                )
-                .await?;
-                Ok(next_stage)
+            // Checked inside the lock, against the same read the
+            // transition below is computed from — outside it, the
+            // answer could go stale before it was used.
+            if let Some(expected) = expected_stage
+                && from_stage != expected
+            {
+                return Err(EngineError::StageMovedOn {
+                    expected: expected.to_string(),
+                    actual: from_stage,
+                });
             }
-            .await;
+
+            let (next_stage, transition) =
+                self.compute_transition(definition, state, outcome, capture)?;
+
+            // The reply path stops the gate's watcher here: under the
+            // task lock, after every check that can refuse the
+            // transition, and immediately before the write. Nothing
+            // fallible may sit between this and `workflow_state::update`
+            // — a refusal after the abort would leave the task open at
+            // the gate with nothing watching it. If the update itself
+            // fails, the caller marks the task stuck at the gate and
+            // `retry` starts a new watcher.
+            if stop_watcher {
+                self.abort_detached_runners(task_id).await;
+            }
+
+            // The returned row is the authority on what was actually
+            // committed, and it's what the next stage renders its
+            // templates against (P2-3). A `None` here means the row
+            // vanished between this function's read and its write —
+            // impossible while the lock is held, but discarding the
+            // `Option` would turn that broken invariant into a task that
+            // silently transitions against state nothing persisted.
+            let updated = workflow_state::update(&self.pool, task_id, transition)
+                .await?
+                .ok_or(EngineError::NoWorkflowState)?;
+            committed.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            // `enter_stage` records the transition itself (X-3), so the
+            // trail this used to push onto `workflow_state.stage_history`
+            // now lives in the events timeline with a timestamp and the
+            // outcome that caused it.
+            self.enter_stage(
+                task_id,
+                definition,
+                &next_stage,
+                None,
+                Some(outcome),
+                &updated.payload,
+                None,
+            )
+            .await?;
+            Ok(next_stage)
+        }
+        .await;
         // A reply that fails before the state write for any reason other
         // than a benign race leaves its caller to mark the task stuck at
         // the gate. "Stuck" must mean nothing is running for that gate, so
@@ -3188,6 +3132,109 @@ impl WorkflowEngine {
             self.evict_task_lock_if_unshared(task_id, &lock).await;
         }
         result.map(|_| ())
+    }
+
+    /// The pure half of a transition: from `state`'s current stage, applies
+    /// `outcome` through the stage's `on:` map (loop guard included), merges
+    /// `capture`, stamps every engine-owned payload fact and returns the next
+    /// stage with the one UPDATE that moves the task there. Shared by
+    /// `advance_from_stage` and a parallel group's all-done settle, so the two
+    /// can never write different things for "leaving a stage".
+    pub(super) fn compute_transition(
+        &self,
+        definition: &Arc<WorkflowDefinition>,
+        state: chocofactory_core::models::WorkflowState,
+        outcome: &str,
+        capture: Option<Value>,
+    ) -> Result<(String, workflow_state::WorkflowStateUpdate), EngineError> {
+        let from_stage = state.current_stage.clone();
+        let stage_def = definition
+            .stages
+            .get(&from_stage)
+            .ok_or_else(|| EngineError::UnknownStage(from_stage.clone()))?;
+
+        if matches!(stage_def.kind, StageKind::Terminal) {
+            return Err(EngineError::TerminalStageHasNoTransitions(from_stage));
+        }
+
+        let mut next_stage =
+            stage_def
+                .on
+                .get(outcome)
+                .cloned()
+                .ok_or_else(|| EngineError::UnknownOutcome {
+                    stage: from_stage.clone(),
+                    outcome: outcome.to_string(),
+                })?;
+
+        let mut loop_counters = state.loop_counters;
+        if let Some(guard) = &stage_def.loop_guard {
+            if guard.on == outcome {
+                let count = bump_loop_counter(&mut loop_counters, &from_stage);
+                if count > u64::from(guard.max) {
+                    next_stage = guard.then.clone();
+                }
+            } else {
+                // Consecutive-count rule: any other outcome starts
+                // the count over, in this transition's single write.
+                reset_loop_counter(&mut loop_counters, &from_stage);
+            }
+        }
+        clear_guards_escaping_to(&mut loop_counters, definition, &next_stage);
+
+        let mut payload = state.payload;
+        if let Some(value) = capture {
+            // Keyed by the stage that produced it, which the caller has
+            // confirmed is still the current one.
+            merge_stage_capture(&mut payload, &from_stage, value);
+        }
+        // Records how the task arrived at `next_stage`, so
+        // `coder-revise.md` and any other template can branch on
+        // the actual transition (#112) instead of guessing from
+        // which stale `stages.*` capture happens to be non-empty.
+        // Written into this same payload/update so it commits
+        // atomically with `current_stage` — no second write.
+        set_arrival(&mut payload, &from_stage, outcome);
+        // Marks `from_stage` as having finished a run, in the same
+        // payload/update, so a later template can tell "never ran"
+        // from "ran but stored no capture".
+        mark_stage_finished(&mut payload, &from_stage);
+        // Records when the task left `from_stage`, truncated to the
+        // whole second (GitHub's timestamp format), in this same
+        // payload/update. The review gate fences on it.
+        set_left_at(
+            &mut payload,
+            &from_stage,
+            &self.now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        );
+        // Stamps (or clears) the poll window for `next_stage`, in
+        // this same payload so the deadline commits in the one
+        // UPDATE that moves `current_stage` (#52).
+        set_poll_window(&mut payload, definition, &next_stage, self.now())?;
+        // Seeds the next entry of a parallel group, or drops the finished
+        // group's block, in the same UPDATE.
+        parallel::set_parallel_block(&mut payload, definition, &next_stage, self.now());
+        // Written in the same UPDATE as `current_stage`, so the two
+        // can never disagree. Looked up after any loop-guard
+        // redirect, and before the watcher is stopped: a missing
+        // stage must fail while the watcher is still running.
+        let stage_kind = definition
+            .stages
+            .get(&next_stage)
+            .ok_or_else(|| EngineError::UnknownStage(next_stage.clone()))?
+            .kind
+            .name()
+            .to_string();
+        let update = workflow_state::WorkflowStateUpdate {
+            current_stage: next_stage.clone(),
+            stage_kind,
+            loop_counters,
+            payload,
+            // Also true for an `on:` edge back to the same
+            // stage: that is a new entry.
+            enters_stage: true,
+        };
+        Ok((next_stage, update))
     }
 
     /// Dispatches the behavior for whichever kind `stage_name` is (§5.2),
@@ -3272,6 +3319,7 @@ impl WorkflowEngine {
             payload,
             input,
             resume,
+            branch: None,
         };
         let entered = self.dispatch_stage(&entry);
         let entered = entered.await;
@@ -3321,11 +3369,8 @@ impl WorkflowEngine {
             // and a gate with a `watch:` also starts that watcher (#175).
             StageKind::HumanGate { .. } => self.enter_gate(entry).await,
             StageKind::Terminal => self.enter_terminal(entry).await,
-            // Fails closed until groups run: no session is started, and
-            // every caller of `enter_stage` parks the task on the error.
-            StageKind::Parallel { .. } => Err(EngineError::ParallelGroupNotRunYet {
-                stage: entry.stage_name.to_string(),
-            }),
+            // Starts every branch; see `parallel.rs`.
+            StageKind::Parallel { .. } => self.enter_group(entry).await,
         }
     }
 }

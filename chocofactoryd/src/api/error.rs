@@ -215,6 +215,8 @@ impl From<RetryTaskError> for ApiError {
             | RetryTaskError::NoWorkflowState
             | RetryTaskError::UnknownStage(_)
             | RetryTaskError::RunStillActive(_)
+            // A parallel group can't be retried yet: the task's state, not the request.
+            | RetryTaskError::ParallelGroupRetryNotYet { .. }
             // Same shape: `--resume` was asked for and this task's last run
             // is not one that can be resumed (#92). The caller could retry
             // without it, so it is the task's state that conflicts, not the
