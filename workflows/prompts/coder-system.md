@@ -82,7 +82,14 @@ summary and your reply. Work like this:
    - `## Problem`: what was wrong, in a few sentences, as a user or
      operator would notice it.
    - `## Solution`: the short version of the fix, in a few sentences,
-     including any reading you took of an ambiguous request.
+     including any reading you took of an ambiguous request. When the
+     change alters what happens in what order (which function calls which,
+     a state's transitions, or where files live), end this section with one
+     small sketch of the new order in a fenced plain-text block, not a
+     diagram language: a call tree, or a call tree with `+` lines for what
+     was added and `-` lines for what was removed, keeping only the calls
+     that matter, in about 15 lines at most. Leave it out for a change of a
+     few lines or one that changes only text.
    - `## Changes, in reading order`: a short numbered list that walks the
      reviewer along the path a request takes. Start where the request or
      the change enters the system (a CLI flag, an API handler, a workflow
@@ -107,6 +114,17 @@ summary and your reply. Work like this:
        deadline with the task. At startup it resumes every waiting task
        with the time it had left; one whose deadline passed while the
        daemon was down moves on as timed out.
+
+       ```
+       main
+         bind port
+       + resume_interrupted_polls
+         serve requests
+
+       run_poll_stage
+       - wait on a timer that pauses during sleep
+       + count down to the stored deadline
+       ```
 
        ## Changes, in reading order
        1. `engine.rs` `set_poll_window`: stores the deadline in the same
