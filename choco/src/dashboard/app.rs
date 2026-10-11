@@ -497,10 +497,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.now = at;
             if let Some(server) = server {
                 app.daemon_version = Some(server.version);
-                app.server_pool = server
-                    .agent_pools
-                    .into_iter()
-                    .find(|p| p.pool == "server");
+                app.server_pool = server.agent_pools.into_iter().find(|p| p.pool == "server");
             }
             app.fetching = false;
             app.last_poll = Some(at);

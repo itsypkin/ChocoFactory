@@ -92,7 +92,8 @@ pub fn project(p: &Project) -> String {
 
 /// A project's own agent cap, or `-` when it shares the server's.
 fn max_agents_cell(p: &Project) -> String {
-    p.max_agents.map_or_else(|| "-".to_string(), |n| n.to_string())
+    p.max_agents
+        .map_or_else(|| "-".to_string(), |n| n.to_string())
 }
 
 pub fn projects(list: &[Project]) -> String {
@@ -222,9 +223,7 @@ pub fn tasks(list: &[TaskSummary]) -> String {
 pub fn queued_restart_note(queued: usize) -> Option<String> {
     match queued {
         0 => None,
-        1 => Some(
-            "1 queued turn will wait and start in order after the restart.".to_string(),
-        ),
+        1 => Some("1 queued turn will wait and start in order after the restart.".to_string()),
         n => Some(format!(
             "{n} queued turns will wait and start in order after the restart."
         )),
@@ -275,7 +274,10 @@ fn pool_phrase(name: &str, is_server: bool, limit: Option<u32>, running: u32) ->
             } else {
                 format!("{running} of {limit} busy")
             };
-            format!("{owner} {limit} agent slot{} ({state})", if limit == 1 { "" } else { "s" })
+            format!(
+                "{owner} {limit} agent slot{} ({state})",
+                if limit == 1 { "" } else { "s" }
+            )
         }
     }
 }
@@ -338,10 +340,10 @@ pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
                 }
                 (false, _, None) => format!("  {}: from scratch, in a fresh session.", b.branch),
             });
-            if let Some(position) = b.queued {
-                if let Some(last) = lines.last_mut() {
-                    last.push_str(&format!(" Queued, {} in line.", ordinal(position)));
-                }
+            if let Some(position) = b.queued
+                && let Some(last) = lines.last_mut()
+            {
+                last.push_str(&format!(" Queued, {} in line.", ordinal(position)));
             }
         }
         lines.push(format!("See `choco task status {task_id}`."));
@@ -608,7 +610,10 @@ pub fn detail_branches(
             // The usage line is keyed by the stored name, not the display one.
             let raw_name = b.get("name").and_then(Value::as_str).unwrap_or("?");
             let state = text(b, "state").unwrap_or_else(|| "?".to_string());
-            let state_cell = match (state.as_str(), b.get("queued_position").and_then(Value::as_u64)) {
+            let state_cell = match (
+                state.as_str(),
+                b.get("queued_position").and_then(Value::as_u64),
+            ) {
                 ("queued", Some(position)) => format!("queued ({})", ordinal(position as u32)),
                 _ => state.clone(),
             };
@@ -1390,7 +1395,10 @@ fn event_summary_body(event: &Event) -> String {
                 }
                 _ => {
                     let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("?");
-                    format!("{head}  left the queue without starting: {}", single_line(reason))
+                    format!(
+                        "{head}  left the queue without starting: {}",
+                        single_line(reason)
+                    )
                 }
             }
         }

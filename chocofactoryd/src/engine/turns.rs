@@ -19,9 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
-use chocofactory_core::models::{
-    AgentPool, QueuedTurn, ServerQueuedTurn,
-};
+use chocofactory_core::models::{AgentPool, QueuedTurn, ServerQueuedTurn};
 
 use super::parallel::BranchEntry;
 use super::turn::ResumeSession;
@@ -466,7 +464,8 @@ impl TurnGate {
         if let Some(candidate) = candidate {
             if let Some(expected) = issue_for {
                 if candidate.row.id == expected {
-                    picked.permit = Some(self.issue(&candidate.row.task_id, &candidate.row.project_id));
+                    picked.permit =
+                        Some(self.issue(&candidate.row.task_id, &candidate.row.project_id));
                     picked.row = Some(candidate.row);
                 }
             } else {
@@ -560,15 +559,12 @@ impl QueueSnapshot {
         group: Option<&str>,
         entry: Option<i64>,
     ) -> bool {
-        self.turns
-            .iter()
-            .zip(&self.entries)
-            .any(|(t, e)| {
-                t.task_id == task_id
-                    && t.turn.stage == stage
-                    && t.turn.group.as_deref() == group
-                    && (entry.is_none() || *e == entry)
-            })
+        self.turns.iter().zip(&self.entries).any(|(t, e)| {
+            t.task_id == task_id
+                && t.turn.stage == stage
+                && t.turn.group.as_deref() == group
+                && (entry.is_none() || *e == entry)
+        })
     }
 }
 
@@ -869,7 +865,11 @@ impl WorkflowEngine {
         // Step 4: rebuild the turn from the row and the current payload.
         let resume = match self.resume_for_row(&row).await {
             Ok(resume) => resume,
-            Err(err) => return self.fail_admission(&row, Some(&definition), err, permit).await,
+            Err(err) => {
+                return self
+                    .fail_admission(&row, Some(&definition), err, permit)
+                    .await;
+            }
         };
         let input = state
             .payload
@@ -919,7 +919,11 @@ impl WorkflowEngine {
         };
         let prepared = match self.prepare_turn(&entry).await {
             Ok(prepared) => prepared,
-            Err(err) => return self.fail_admission(&row, Some(&definition), err, permit).await,
+            Err(err) => {
+                return self
+                    .fail_admission(&row, Some(&definition), err, permit)
+                    .await;
+            }
         };
         match self.launch_turn(prepared, Some(permit), Some(row.id)).await {
             Ok(session_id) => {
@@ -950,7 +954,10 @@ impl WorkflowEngine {
             Err(EngineError::QueueRowVanished(_)) => Pass::Progress,
             // `launch_turn` owned the permit and dropped it; the row is
             // still there to clean up.
-            Err(err) => self.fail_admission_after_launch(&row, &definition, err).await,
+            Err(err) => {
+                self.fail_admission_after_launch(&row, &definition, err)
+                    .await
+            }
         }
     }
 

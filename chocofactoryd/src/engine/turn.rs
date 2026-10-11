@@ -1,12 +1,12 @@
 use super::parallel::{
     BranchApplied, BranchEntry, BranchOutcome, BranchWatch, agent_role_of, ran_beside,
 };
-use super::turns::{Claim, TurnPermit, TurnSpec};
 use super::stage_capture::{
     MAX_CAPTURE_BYTES, capture_label, derive_agent_reply_capture, outcome_from_report,
     turn_outcome, unwrap_code_fence,
 };
 use super::sweep::agent_reason;
+use super::turns::{Claim, TurnPermit, TurnSpec};
 use super::*;
 
 /// How a single-shot turn ended, as the watcher's poll loop saw it.
@@ -454,16 +454,14 @@ impl WorkflowEngine {
             adapter_session_id: &resume.adapter_session_id,
         });
         let session = match (from_queue, resumed_from) {
-            (Some(row), from) => {
-                sessions::create_from_queue(&self.pool, row, new_session, from)
-                    .await
-                    .map_err(|err| match err {
-                        sessions::CreateFromQueueError::Vanished => {
-                            EngineError::QueueRowVanished(stage_name.to_string())
-                        }
-                        sessions::CreateFromQueueError::Db(err) => EngineError::Db(err),
-                    })?
-            }
+            (Some(row), from) => sessions::create_from_queue(&self.pool, row, new_session, from)
+                .await
+                .map_err(|err| match err {
+                    sessions::CreateFromQueueError::Vanished => {
+                        EngineError::QueueRowVanished(stage_name.to_string())
+                    }
+                    sessions::CreateFromQueueError::Db(err) => EngineError::Db(err),
+                })?,
             (None, Some(from)) => sessions::create_resumed(&self.pool, new_session, from).await?,
             (None, None) => sessions::create(&self.pool, new_session).await?,
         };
@@ -1003,6 +1001,7 @@ impl WorkflowEngine {
     /// A crashed/non-zero exit is logged and left for a human to notice
     /// rather than guessing an outcome the stage's `on:` map was never
     /// designed to receive.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_turn_watcher(
         self: &Arc<Self>,
         task_id: String,

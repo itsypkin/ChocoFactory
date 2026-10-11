@@ -314,7 +314,12 @@ fn stage_cell(t: &TaskSummary) -> String {
     match (&t.current_stage, &t.branch_progress) {
         // A group with branches waiting for a slot: how many.
         (Some(stage), Some(p)) if !t.queued.is_empty() => {
-            format!("{stage} {}/{} · {} queued", p.settled, p.total, t.queued.len())
+            format!(
+                "{stage} {}/{} · {} queued",
+                p.settled,
+                p.total,
+                t.queued.len()
+            )
         }
         (Some(stage), Some(p)) => format!("{stage} {}/{}", p.settled, p.total),
         // A stage waiting for a slot: its place in line.

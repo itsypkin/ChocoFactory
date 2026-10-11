@@ -173,18 +173,32 @@ pub enum GlobalConfigError {
         path: PathBuf,
         source: serde_yaml::Error,
     },
-    InvalidFileReference { role: String, value: String },
-    MissingReferencedFile { role: String, path: PathBuf },
+    InvalidFileReference {
+        role: String,
+        value: String,
+    },
+    MissingReferencedFile {
+        role: String,
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for GlobalConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GlobalConfigError::Io { path, source } => {
-                write!(f, "failed to read global config {}: {source}", path.display())
+                write!(
+                    f,
+                    "failed to read global config {}: {source}",
+                    path.display()
+                )
             }
             GlobalConfigError::Yaml { path, source } => {
-                write!(f, "failed to parse global config {}: {source}", path.display())
+                write!(
+                    f,
+                    "failed to parse global config {}: {source}",
+                    path.display()
+                )
             }
             GlobalConfigError::InvalidFileReference { role, value } => write!(
                 f,
@@ -360,7 +374,11 @@ mod tests {
         let dir = TempDir::new();
         for body in ["roles: {}\n", "max_agents:\n", "max_agents: 0\n", ""] {
             let path = dir.write("config.yaml", body);
-            assert_eq!(GlobalConfig::load(&path).unwrap().max_agents, None, "{body:?}");
+            assert_eq!(
+                GlobalConfig::load(&path).unwrap().max_agents,
+                None,
+                "{body:?}"
+            );
         }
         let path = dir.write("config.yaml", "max_agents: 3\n");
         assert_eq!(GlobalConfig::load(&path).unwrap().max_agents, Some(3));

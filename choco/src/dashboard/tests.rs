@@ -638,7 +638,7 @@ fn a_failed_poll_keeps_the_rows_and_shows_the_red_line() {
     update(
         &mut app,
         Msg::List(Box::new(ListResult {
-        server: None,
+            server: None,
             at: now() + chrono::Duration::seconds(34),
             active: Err("connection refused".into()),
             closed: Err("connection refused".into()),
@@ -692,7 +692,7 @@ fn an_unknown_project_shows_its_short_id_and_is_refetched() {
     update(
         &mut app,
         Msg::List(Box::new(ListResult {
-        server: None,
+            server: None,
             at: now() + chrono::Duration::seconds(5),
             active: Ok(active),
             closed: Ok(vec![]),
@@ -715,7 +715,7 @@ fn a_failed_projects_fetch_goes_to_the_status_line_and_keeps_the_board() {
     update(
         &mut app,
         Msg::List(Box::new(ListResult {
-        server: None,
+            server: None,
             at: now(),
             active: Ok(active),
             closed: Ok(closed),
@@ -1261,7 +1261,7 @@ fn a_half_failed_poll_keeps_the_rows_and_reports_the_error() {
     update(
         &mut app,
         Msg::List(Box::new(ListResult {
-        server: None,
+            server: None,
             at: now(),
             active: Ok(vec![]),
             closed: Err("boom".into()),
@@ -1287,7 +1287,7 @@ fn a_poll_error_is_not_hidden_by_an_info_status() {
     update(
         &mut app,
         Msg::List(Box::new(ListResult {
-        server: None,
+            server: None,
             at: now(),
             active: Err("refused".into()),
             closed: Err("refused".into()),

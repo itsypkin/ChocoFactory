@@ -2182,8 +2182,14 @@ impl WorkflowEngine {
                 .1
         };
         for (stage, group) in &withdrawn {
-            crate::db::turn_queue::record_withdrawn(&self.pool, task_id, stage, group.as_deref(), "cancel")
-                .await;
+            crate::db::turn_queue::record_withdrawn(
+                &self.pool,
+                task_id,
+                stage,
+                group.as_deref(),
+                "cancel",
+            )
+            .await;
         }
         if !withdrawn.is_empty() {
             self.events_notify.notify_waiters();
@@ -2618,9 +2624,7 @@ impl WorkflowEngine {
             .await;
             return Err(RetryTaskError::Enter(err));
         }
-        let queued = self
-            .queued_position(task_id, &current_stage, None)
-            .await;
+        let queued = self.queued_position(task_id, &current_stage, None).await;
         Ok(RetryOutcome {
             stage: current_stage,
             resumed: resume.is_some(),
