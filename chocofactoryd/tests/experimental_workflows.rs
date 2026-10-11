@@ -310,6 +310,16 @@ fn the_security_reader_has_a_blocking_bar_and_reads_material_as_material() {
         how < mat && mat < bar,
         "material paragraph misplaced: {text}"
     );
+    for key in [
+        "A finding blocks only when you can name all four",
+        "An unconfirmed finding does not block on its own",
+    ] {
+        let at = text.find(key).unwrap();
+        assert!(
+            bar < at && at < report,
+            "{key:?} must sit between the bar heading and Report: {text}"
+        );
+    }
     let lower = text.to_lowercase();
     for banned in ["fails open", "fail open", "fail-open", "fails silently"] {
         assert!(!lower.contains(banned), "must not contain {banned}: {text}");
