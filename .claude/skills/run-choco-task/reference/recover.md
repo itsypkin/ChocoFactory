@@ -25,7 +25,7 @@ and `choco task list --status stuck` finds every stuck task.
   failed branch can't resume, and `--fresh` starts every failed branch
   fresh. The output lists each re-run branch and whether it resumed.
   A restart while branches run parks the task with those branches failed;
-  retry resumes them.
+  retry resumes them where it can and starts the rest fresh.
 - After a usage limit, wait for the reset time shown in the error event, then
   retry. omp's limit message gives no reset time, and on a free tier the limit
   covers every model on the account. To finish on another CLI instead, run
