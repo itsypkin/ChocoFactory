@@ -132,7 +132,8 @@ command in step 3 and the pre-merge check in step 4.
   `restart` refuse (see [Cost and safety](#cost-and-safety)).
   Tasks waiting on a poll or a human survive a restart.
   A forced restart while a parallel group's branches run parks the task
-  `stuck` with those branches failed; `choco task retry` resumes them.
+  `stuck` with those branches failed; `choco task retry` resumes them
+  where it can and starts the rest fresh.
   The daemon logs to `~/.config/chocofactory/logs/chocofactoryd.log`; kills,
   `stuck` marks and nudges show up there first.
 - **Keep the machine awake for the whole run.** On a sleeping laptop agent
@@ -220,6 +221,11 @@ choco task create --project <p> --workflow coding-task-planned \
   --prompt "$(cat spec.md)"
 ```
 
+- Keep `spec.md` outside the repository, in a temp directory, for example.
+  The task reads only the text `--prompt` passes, not files in your checkout.
+- After creating, compare the `Base` line in `choco task status` with the
+  commit you wrote the spec against. If they differ and the commits between
+  them touch files the spec names, check the spec still holds.
 - Per-task overrides beat editing shared config:
   `--role-model <role>=<model>`, `--role-system-prompt-file <role>=<path>`,
   `--role-cli <role>=<cli>`.

@@ -23,7 +23,7 @@ require one test that renders every fixture at every size from the
 minimum up. Name one test for each fail-closed path in the done
 criteria.
 
-Three more checks belong in the spec:
+Four more checks belong in the spec:
 
 - **Every statement the change makes false.** Grep the skills, docs and
   prompts for the old behaviour's wording and commands, and fix each hit
@@ -33,6 +33,10 @@ Three more checks belong in the spec:
   files) and requires a test that interrupts it and checks that state;
   or, if the operation can't be interrupted in a test, names the
   interrupt as an accepted cost, with the reason.
+- **A new value in a closed set.** When the change adds a value to an
+  enum, an event type or a status, list every exhaustive match or switch
+  over that set. Each one needs a case for the new value, so its file is in
+  scope.
 - **A new rule in a prompt.** The spec requires the coder to run one
   probe of the rule on the production model the role runs in the workflow,
   in its lap, and to report the probe and its result.
