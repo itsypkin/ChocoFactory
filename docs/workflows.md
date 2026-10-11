@@ -630,9 +630,12 @@ only if the branch has `capture:`.
 
 ### What it costs
 
-There is no cap on branches. N branches are N agent processes at once on one
-vendor account, so its rate limit is reached N times as fast (a usage-limit
-cut-off parks the branch as resumable). Whatever a branch's prompt does
+There is no cap on the number of branches. Unless an agent cap is set (see
+[the README](../README.md#limiting-how-many-agents-run-at-once)), N branches
+are N agent processes at once on one vendor account, so its rate limit is
+reached N times as fast (a usage-limit cut-off parks the branch as resumable).
+With a cap, the branches that don't fit wait in the queue and start as turns
+end. Whatever a branch's prompt does
 happens N times concurrently: if the prompts build the project, that is N
 builds. Bound how many branches build; the example below lets exactly one.
 Concurrent branches can't share one scratch build directory, because they
