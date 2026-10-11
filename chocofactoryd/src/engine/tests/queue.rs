@@ -542,7 +542,8 @@ async fn queued_turns_start_in_the_order_they_were_queued() {
 
 #[tokio::test]
 async fn a_full_capped_project_does_not_hold_up_the_server_pool() {
-    let q = Q::new(Some(1)).await;
+    // No dispatcher: only the claim itself can start a turn.
+    let q = Q::build(Some(1), queue_timers(), false).await;
     q.script(&[
         ("job-p1", Ending::Report),
         ("job-p2", Ending::Report),
@@ -553,15 +554,27 @@ async fn a_full_capped_project_does_not_hold_up_the_server_pool() {
     q.wait_started("job-p1").await;
     let p2 = q.create_in(&capped.id, "job-p2").await;
     assert_eq!(q.position(&p2.id).await, Some(1));
-    // The server pool has its slot free: its turn starts at once.
-    q.create("job-s1").await;
+    // The server pool has its slot free: its turn starts in the call that
+    // creates it, with no dispatcher to help and no queue row of its own.
+    let s1 = q.create("job-s1").await;
     q.wait_started("job-s1").await;
+    assert!(
+        q.queue_events(&s1.id, EventType::TurnQueued)
+            .await
+            .is_empty()
+    );
     q.assert_not_started("job-p2").await;
+    assert_eq!(
+        q.rows().await.len(),
+        1,
+        "only the capped project's p2 waits"
+    );
 }
 
 #[tokio::test]
 async fn a_project_caps_running_turns_do_not_count_toward_the_server_cap() {
-    let q = Q::new(Some(1)).await;
+    // No dispatcher: only the claim itself can start a turn.
+    let q = Q::build(Some(1), queue_timers(), false).await;
     let capped = q.project("capped", Some(3)).await;
     let names = ["job-p1", "job-p2", "job-p3", "job-s1", "job-s2"];
     q.script(&names.map(|n| (n, Ending::Report)));
@@ -574,8 +587,13 @@ async fn a_project_caps_running_turns_do_not_count_toward_the_server_cap() {
     }
     q.wait_running(3).await;
     // The server pool still has its own single slot.
-    q.create("job-s1").await;
+    let s1 = q.create("job-s1").await;
     q.wait_started("job-s1").await;
+    assert!(
+        q.queue_events(&s1.id, EventType::TurnQueued)
+            .await
+            .is_empty()
+    );
     let s2 = q.create("job-s2").await;
     assert_eq!(q.position(&s2.id).await, Some(1));
     q.assert_not_started("job-s2").await;
