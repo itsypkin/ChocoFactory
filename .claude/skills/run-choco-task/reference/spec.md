@@ -23,7 +23,7 @@ require one test that renders every fixture at every size from the
 minimum up. Name one test for each fail-closed path in the done
 criteria.
 
-Four more checks belong in the spec:
+Five more checks belong in the spec:
 
 - **Every statement the change makes false.** Grep the skills, docs and
   prompts for the old behaviour's wording and commands, and fix each hit
@@ -37,6 +37,14 @@ Four more checks belong in the spec:
   enum, an event type or a status, list every match, parser or list over
   that set, including ones with a catch-all arm the compiler won't flag.
   Each one needs a case for the new value, so its file is in scope.
+- **Tests that can't be fooled.** A rule over a set (every, all, any,
+  only) is tested with a mixed case, not only the uniform ones. Each
+  safety rule (who owns what, what is excluded, what is refused) has a
+  test that fails when that rule alone is removed, and no other rule can
+  produce the same result in that test. The coder checks a read from the
+  OS or another external system once, on the real machine, against an
+  independent source (for example a process list against `ps`), and
+  reports the result.
 - **A new rule in a prompt.** The spec requires the coder to run one
   probe of the rule on the production model the role runs in the workflow,
   in its lap, and to report the probe and its result.
@@ -69,6 +77,9 @@ From then on, the coder and the reviewer work from its report, not your
 and answer with `choco task send <id> --text "<answers>"`. The planner
 folds your answers in and checks again; an answer can tell it to decide a
 question itself.
+
+`choco task send` is refused while `spec_check` runs. To change the spec
+while it runs, cancel the task and create it again with the new spec.
 
 **Unverified claims.** The planner backs a claim about runtime behaviour
 with the command it ran and the output. A claim it couldn't run read-only
