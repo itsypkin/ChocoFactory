@@ -28,7 +28,9 @@ fn wrapper(dir: &Path, env: &[(&str, &str)]) -> String {
 }
 
 fn wrapper_for(dir: &Path, fixture: &str, env: &[(&str, &str)], marker: Option<&Path>) -> String {
-    let mut script = String::from("#!/bin/sh\n");
+    // The first arm lets `wrapper_for` run the script once (below) without
+    // touching the marker or the fixture.
+    let mut script = String::from("#!/bin/sh\n[ \"$1\" = --choco-warm-up ] && exit 0\n");
     if let Some(marker) = marker {
         script.push_str(&format!("touch '{}'\n", marker.display()));
     }
@@ -47,6 +49,19 @@ fn wrapper_for(dir: &Path, fixture: &str, env: &[(&str, &str)], marker: Option<&
     script.push_str(&format!("exec '{}' \"$@\"\n", fixture_binary(fixture)));
     let path = dir.join(format!("wrapper-{}", uuid::Uuid::new_v4()));
     crate::test_support::write_executable(&path, script);
+    // On macOS the first exec of a freshly written file pays a one-time
+    // Gatekeeper check (0.3 s to over 5 s under load). Pay it here, so the
+    // adapter's 5 s `--version` probe never includes it. A real omp binary
+    // has been run before and doesn't pay it per probe.
+    let status = std::process::Command::new(&path)
+        .arg("--choco-warm-up")
+        .status()
+        .unwrap_or_else(|e| panic!("warming up {}: {e}", path.display()));
+    assert!(
+        status.success(),
+        "warming up {} failed: {status}",
+        path.display()
+    );
     path.to_string_lossy().into_owned()
 }
 
