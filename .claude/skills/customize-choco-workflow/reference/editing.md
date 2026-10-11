@@ -87,7 +87,8 @@ above.
 A `prompt_file` holds the agent's turn prompt. These values are available,
 and nothing else:
 
-- `{{ task.title }}`, `{{ task.input }}`
+- `{{ task.title }}`, `{{ task.input }}`, `{{ task.closes }}` (the issues the
+  task closes, as `#152 #126`, empty when none)
 - `{{ stages.<stage> }}` for a `capture: text` stage
 - `{{ stages.<stage>.<field> }}` for a `capture: json` stage. A reviewer
   stage has `.summary` and `.outcome`; a script's JSON fields are available
@@ -108,7 +109,9 @@ in these places.
 - `command` runs with `sh -c` in the task's working directory. `script_file`
   is resolved next to the YAML.
 - `env` names use letters, digits and `_`, don't start with a digit, and
-  don't start with `CHOCO_`.
+  don't start with `CHOCO_`. The engine itself sets `CHOCO_TASK_ID`,
+  `CHOCO_WORKFLOW`, `CHOCO_STAGE`, `CHOCO_ROLE_MODELS` and `CHOCO_TASK_CLOSES`
+  (space-separated issue numbers, empty when none) for every shell stage.
 - `timeout` is optional.
 - `on:` needs `done`. A non-zero exit gives `error`.
 - Text an agent wrote reaches a script through `env:`, never inside

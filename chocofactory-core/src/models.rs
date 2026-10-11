@@ -95,8 +95,36 @@ pub struct Task {
     /// `base_ref`.
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// The issues the task's pull request closes, in the order given at
+    /// create (`choco task create --closes`). Empty for a task created
+    /// without it and for one made before the field existed.
+    #[serde(default)]
+    pub closes: Vec<u64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Task {
+    /// The closed issues as `CHOCO_TASK_CLOSES` carries them to a shell
+    /// stage: decimal numbers joined by one space (`152 126`), empty when
+    /// the task closes none. The script `open-pr.sh` parses this form.
+    pub fn closes_env(&self) -> String {
+        self.closes
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The closed issues as `{{ task.closes }}` renders them in a prompt:
+    /// `#152 #126`, empty when the task closes none.
+    pub fn closes_ref_list(&self) -> String {
+        self.closes
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 /// Lifecycle state of an agent subprocess session (design §4.1).

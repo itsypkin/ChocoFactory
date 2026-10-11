@@ -71,6 +71,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -163,6 +164,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await

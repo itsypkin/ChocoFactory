@@ -187,12 +187,13 @@ explicit out-of-scope list.
 - **Check for collisions against your default branch:** numbered files such
   as database migrations above all, then file names and flags. Two tasks that
   both take the next number conflict, and the second PR's CI may not run.
-- **The title decides what the PR closes.** A title ending in `(#N)` makes
-  the PR say `Closes #N`; any other `#N` in it gives `Refs #N`. For one part
-  of a multi-part issue, don't end the title with `(#N)`: merging would close
-  the whole issue. `open_pr` also keeps PR titles to 100 bytes, cutting at a
-  word boundary and keeping a trailing `(#N)`, so keep the task title well
-  under that.
+- **`--closes` decides what the PR closes.** Each `--closes <n>` makes the
+  PR say `Closes #n` (repeat the flag for several issues); a `#N` anywhere in
+  the title, including a trailing `(#N)`, only gives `Refs #N`. For one part
+  of a multi-part issue, don't pass `--closes`: merging would close the whole
+  issue. `open_pr` also keeps PR titles to 100 bytes, cutting at a word
+  boundary and keeping a trailing `(#N)`, so keep the task title well under
+  that.
 - **Recommended: have choco check the spec before coding**, with
   `--workflow coding-task-planned`. A planning agent checks the spec against
   the code, fixes stale references, decides the design choices your intent
@@ -217,7 +218,7 @@ explicit out-of-scope list.
 
 ```bash
 choco task create --project <p> --workflow coding-task-planned \
-  --title "<what it does> (#<n>)" --base origin/main \
+  --title "<what it does>" --closes <n> --base origin/main \
   --prompt "$(cat spec.md)"
 ```
 

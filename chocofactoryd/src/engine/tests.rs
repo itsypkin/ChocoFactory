@@ -41,6 +41,7 @@ async fn seed_task(pool: &SqlitePool, workflow_def: &str) -> String {
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -2032,6 +2033,7 @@ stages:
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -2066,7 +2068,7 @@ async fn a_stage_without_capture_writes_no_payload() {
     assert_eq!(
         without_left_at(payload_of(&pool, &task_id).await, "run"),
         json!({
-            "task": {"input": null, "title": "T"},
+            "task": {"input": null, "title": "T", "closes": ""},
             "arrival": {"from": "run", "outcome": "done"},
             "finished_stages": ["run"],
         })
@@ -2227,6 +2229,7 @@ async fn the_command_runs_in_the_tasks_configured_cwd() {
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -2430,7 +2433,7 @@ async fn an_outcome_for_a_stage_the_task_has_left_is_discarded() {
     assert_eq!(
         without_left_at(state.payload, "run"),
         json!({
-            "task": {"input": null, "title": "T"},
+            "task": {"input": null, "title": "T", "closes": ""},
             "arrival": {"from": "run", "outcome": "done"},
             "finished_stages": ["run"],
         })
@@ -2867,6 +2870,7 @@ async fn create_task_from_a_file_records_the_canonical_path_and_wins_over_the_re
             "hi",
             json!({}),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -2892,6 +2896,7 @@ async fn create_task_from_a_file_records_the_canonical_path_and_wins_over_the_re
             "hi",
             json!({}),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -2907,6 +2912,7 @@ async fn create_task_from_a_file_records_the_canonical_path_and_wins_over_the_re
             "hi",
             json!({}),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -2946,6 +2952,7 @@ async fn create_task_from_a_file_resolves_prompt_files_next_to_it() {
             "hi",
             json!({}),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -4243,6 +4250,7 @@ async fn seed_task_in(pool: &SqlitePool, workflow_def: &str, cwd: &Path) -> Stri
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -5502,7 +5510,7 @@ stages:
     assert_eq!(
         without_left_at(payload_of(&pool, &task_id).await, "coding"),
         json!({
-            "task": {"input": null, "title": "T"},
+            "task": {"input": null, "title": "T", "closes": ""},
             "arrival": {"from": "coding", "outcome": "done"},
             "finished_stages": ["coding"],
         })
@@ -6494,6 +6502,7 @@ stages:
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -6552,6 +6561,7 @@ stages:
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -6942,6 +6952,7 @@ async fn a_task_without_worktree_opt_in_never_creates_one() {
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -7020,6 +7031,7 @@ stages:
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -7429,6 +7441,7 @@ async fn seed_builtin_coding_task(
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -8481,6 +8494,7 @@ stages:
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -9701,6 +9715,7 @@ async fn start_read_only_task_prepped(
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -11834,6 +11849,7 @@ async fn seed_in_project(pool: &SqlitePool, project_id: &str, name: &str, cwd: &
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await
@@ -12849,6 +12865,76 @@ stages:
             "for sessions of {expected:?}"
         );
     }
+}
+
+/// A task with these `closes`, seeded straight into the table.
+async fn seed_task_closing(pool: &SqlitePool, workflow_def: &str, closes: &[u64]) -> String {
+    let project_id = projects::create(pool, "demo-closes", None)
+        .await
+        .unwrap()
+        .id;
+    tasks::create(
+        pool,
+        tasks::NewTask {
+            project_id: &project_id,
+            workflow_def,
+            title: "T",
+            config: json!({}),
+            workflow_path: None,
+            workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
+            closes,
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+#[tokio::test]
+async fn a_shell_stage_sees_the_closed_issues_in_the_env_and_the_template() {
+    let pool = connect_in_memory().await.unwrap();
+    let yaml = r#"
+name: closes-env
+stages:
+  show:
+    kind: shell
+    command: "printf '[%s][%s]' \"$CHOCO_TASK_CLOSES\" '{{ task.closes }}'"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+    let def = Arc::new(WorkflowDefinition::parse(yaml, Path::new(".")).unwrap());
+    let engine = engine_with_adapter(pool.clone(), "unused");
+    for (closes, expected) in [(vec![152, 126], "[152 126][#152 #126]"), (vec![], "[][]")] {
+        let task_id = seed_task_closing(&pool, &def.name, &closes).await;
+        engine.start_task(&task_id, &def, None).await.unwrap();
+        let event = wait_until_shell_event_for(&pool, &task_id, "show").await;
+        assert_eq!(event["stdout_tail"], json!(expected), "for {closes:?}");
+        // `task.closes` is seeded for every new task, so even the empty
+        // value is not an unresolved placeholder.
+        assert!(
+            template_unresolved_events(&pool, &task_id).await.is_empty(),
+            "for {closes:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stage_environment_for_a_missing_task_is_no_such_task() {
+    let pool = connect_in_memory().await.unwrap();
+    let def = WorkflowDefinition::parse(
+        "name: x\nstages:\n  s:\n    kind: terminal\n",
+        Path::new("."),
+    )
+    .unwrap();
+    let engine = engine_with_adapter(pool, "unused");
+    let err = engine
+        .stage_environment("no-such-task", &def, "s", &IndexMap::new(), &json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NoSuchTask), "{err:?}");
 }
 
 #[tokio::test]
@@ -14785,6 +14871,7 @@ async fn create_task_from_a_workflow_with_an_unknown_cli_creates_nothing() {
             "go",
             json!({}),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -14815,6 +14902,7 @@ async fn create_task_with_an_unknown_cli_in_its_config_creates_nothing() {
             "go",
             json!({"roles": {"coder": {"cli": "nope"}}}),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -14879,6 +14967,7 @@ async fn a_cli_that_slips_in_after_startup_fails_the_turn_closed() {
             "go",
             json!({}),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -15243,6 +15332,7 @@ async fn create_task_pointing_a_memory_role_at_omp_in_its_config_creates_nothing
             "go",
             json!({"roles": {"coder": {"cli": "omp"}}}),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -15292,6 +15382,7 @@ async fn a_memory_role_routed_to_omp_by_the_global_config_fails_the_turn_closed(
             "go",
             json!({}),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -16142,6 +16233,7 @@ impl BaseEnv {
                 "hi",
                 json!({ "cwd": repo.to_string_lossy() }),
                 base,
+                &[],
             )
             .await
     }
@@ -16596,6 +16688,7 @@ async fn a_worktree_workflow_with_no_repo_fails_before_the_insert() {
             "hi",
             json!({}),
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -16664,6 +16757,7 @@ async fn start_task_on_a_row_without_a_base_forks_from_the_repo_head() {
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         },
     )
     .await

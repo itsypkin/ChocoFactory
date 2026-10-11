@@ -37,6 +37,10 @@ pub struct CreateTaskRequest {
     /// --base`). Only valid for a workflow that creates a worktree.
     #[serde(default)]
     pub base: Option<String>,
+    /// The issues the task's pull request closes; absent means none. The
+    /// engine rejects a 0 or a repeat.
+    #[serde(default)]
+    pub closes: Vec<u64>,
 }
 
 pub async fn create(
@@ -62,6 +66,7 @@ pub async fn create(
     let title = body.title;
     let prompt = body.prompt;
     let base = body.base;
+    let closes = body.closes;
     let task = tokio::spawn(async move {
         engine
             .create_task_from(
@@ -71,6 +76,7 @@ pub async fn create(
                 &prompt,
                 config,
                 base.as_deref(),
+                &closes,
             )
             .await
     })
@@ -537,6 +543,89 @@ stages:
         assert!(bodies[1]["watch_timed_out"].is_null(), "{}", bodies[1]);
     }
 
+    async fn post_closes(
+        server: &TestServer,
+        project_id: &str,
+        closes: Value,
+    ) -> crate::api::tests::TestResponse {
+        server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "chat",
+                    "title": "t",
+                    "prompt": "hello",
+                    "closes": closes,
+                }),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn create_task_records_closes_in_order_and_status_carries_them() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+
+        let response = post_closes(&server, &project_id, json!([152, 126])).await;
+        assert_eq!(response.status(), 201);
+        let task = response.json();
+        assert_eq!(task["closes"], json!([152, 126]));
+        let detail = server
+            .get(&format!("/tasks/{}", task["id"].as_str().unwrap()))
+            .await
+            .json();
+        assert_eq!(detail["closes"], json!([152, 126]));
+
+        let response = post_closes(&server, &project_id, json!([])).await;
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.json()["closes"], json!([]));
+
+        let response = server
+            .post(
+                "/tasks",
+                json!({ "project_id": project_id, "workflow_def": "chat", "title": "t", "prompt": "hello" }),
+            )
+            .await;
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.json()["closes"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_a_bad_closes_list_and_creates_nothing() {
+        let server = TestServer::start().await;
+        server.seed_chat_workflow();
+        let project_id = create_project(&server).await;
+        for (closes, message) in [
+            (json!([0]), Some("closes has 0; issue numbers start at 1")),
+            (json!([5, 5]), Some("closes names issue 5 twice")),
+            (json!([-1]), None),
+            (json!(["7"]), None),
+        ] {
+            let response = post_closes(&server, &project_id, closes.clone()).await;
+            assert!(
+                response.status() == 400 || response.status() == 422,
+                "{closes}: {}",
+                response.status()
+            );
+            if let Some(message) = message {
+                assert_eq!(response.status(), 400);
+                assert!(
+                    response.json().to_string().contains(message),
+                    "{closes}: {}",
+                    response.json()
+                );
+            }
+            let listed = server.get("/tasks").await.json();
+            assert_eq!(
+                listed.as_array().map(Vec::len),
+                Some(0),
+                "{closes}: {listed}"
+            );
+        }
+    }
+
     async fn create_project(server: &TestServer) -> String {
         let project: Value = server
             .post("/projects", json!({ "name": "demo" }))
@@ -982,6 +1071,7 @@ stages:
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await

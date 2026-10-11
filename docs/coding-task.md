@@ -203,10 +203,13 @@ The PR body `open_pr` publishes holds the coder's description and the
 internal reviewer's report. A closing keyword followed by an issue reference
 in either is rewritten (`Resolves #84` becomes `Resolves issue 84`, inside
 code blocks too, since GitHub doesn't say whether it skips code), so only the
-line the script builds from the task title can close an issue.
+lines the script builds from the task's closes list can close an issue.
 
-The line that can close an issue is built from the task's title. A title that
-ends in `(#N)`, such as `Fix the login redirect (#42)`, puts `Closes #N` in the
-PR body, so merging the PR closes issue N. A title that mentions an issue
-number anywhere else gets `Refs #N`, which links but doesn't close. A title
-with no issue number says so in the PR body.
+`choco task create --closes N` (repeat it for several issues) decides what the
+PR closes. Each number puts one `Closes #N` line at the top of the generated
+block, so merging the PR closes those issues. A task created without
+`--closes` closes nothing. The title is plain text: every `#N` in it, including
+a trailing `(#N)`, only gets a `Refs #N` line, which links but doesn't close
+(an issue that is also closed gets just its `Closes` line). With neither, the
+PR body says so. The internal reviewer is told the closes list, and treats a
+description that says the PR closes or fixes any other issue as a false claim.

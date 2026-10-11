@@ -1444,6 +1444,74 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     }
 
     #[test]
+    fn coder_system_leaves_the_closing_to_the_task_and_forbids_claiming_others() {
+        let text = squash(embedded_prompt("coder-system.md"));
+        assert_says(
+            &text,
+            &[
+                "The issues the pull request closes are set by whoever created the task, and the publishing stage writes their `Closes` lines;",
+                "Don't write that the pull request closes or fixes an issue unless the task closes it (your turn prompt lists them on its `Closes:` line); mention any other issue as `#12`.",
+            ],
+            "coder-system.md",
+        );
+    }
+
+    fn closes_payload(closes: &str) -> serde_json::Value {
+        serde_json::json!({
+            "task": { "input": "do it", "title": "T", "closes": closes },
+            "arrival": { "from": "", "outcome": "" },
+            "stages": {},
+        })
+    }
+
+    #[test]
+    fn the_reviewer_is_told_exactly_which_issues_the_pr_closes() {
+        for name in ["reviewer-turn.md", "reviewer-turn-planned.md"] {
+            let (some, _) =
+                crate::template::render(embedded_prompt(name), &closes_payload("#152 #126"))
+                    .unwrap();
+            assert_says(
+                &squash(&some),
+                &[
+                    "This pull request closes exactly these issues: #152 #126 (if nothing follows the colon, it closes none).",
+                    "nothing else can close an issue",
+                    "Never report an issue as resolved, closed or fixed by this pull request unless it is on that list",
+                    "is a false claim and a blocking finding",
+                ],
+                name,
+            );
+            let (none, _) =
+                crate::template::render(embedded_prompt(name), &closes_payload("")).unwrap();
+            assert_says(
+                &squash(&none),
+                &[
+                    "This pull request closes exactly these issues: (if nothing follows the colon, it closes none).",
+                ],
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn the_coder_and_planner_turn_prompts_list_the_closed_issues() {
+        for name in [
+            "coder-turn.md",
+            "coder-turn-planned.md",
+            "coder-revise.md",
+            "coder-revise-planned.md",
+            "planner-turn.md",
+        ] {
+            let (out, _) =
+                crate::template::render(embedded_prompt(name), &closes_payload("#152 #126"))
+                    .unwrap();
+            assert!(
+                out.starts_with("Task: T\nCloses: #152 #126\n"),
+                "{name}: {out}"
+            );
+        }
+    }
+
+    #[test]
     fn coder_system_step_four_asks_for_the_pr_description() {
         let text = squash(embedded_prompt("coder-system.md"));
         assert_says(
@@ -2054,7 +2122,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 &[
                     "Keep every section the spec requires.",
                     "If the branch has an open PR, first read its published description: set `N` as the `awaiting_human_review` entry does, then `[ -n \"$N\" ] && gh pr view \"$N\" --json body -q .body`.",
-                    "Only the part between the issue line and `## Internal review` is your description; carry into the file every edit a person made there that is still true.",
+                    "Only the part between the issue lines and `## Internal review` is your description; carry into the file every edit a person made there that is still true.",
                 ],
                 name,
             );
@@ -2206,7 +2274,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             &[
                 blocking,
                 "A file longer than 16,384 bytes counts as truncated, because publishing keeps only that much.",
-                "To find a cut, compare the file with the diff and, on a re-review, with the published description (`gh pr view --json body -q .body`, the part between the issue line and `## Internal review`): a numbered list that skips items, a section that stops mid-sentence, or a section the earlier version had that is gone though the change didn't remove its subject, is a cut.",
+                "To find a cut, compare the file with the diff and, on a re-review, with the published description (`gh pr view --json body -q .body`, the part between the issue lines and `## Internal review`): a numbered list that skips items, a section that stops mid-sentence, or a section the earlier version had that is gone though the change didn't remove its subject, is a cut.",
                 "`## Look closely at`, `## Review history` and `## Not done` are left out when they would be empty, and their absence is not a cut; a section the task requires is never optional.",
                 "If you can't read the published description (no pull request yet, or `gh` fails), check the file alone and name under `Reviewed` what you couldn't compare.",
             ],

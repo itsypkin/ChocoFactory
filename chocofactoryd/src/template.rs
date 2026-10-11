@@ -6,7 +6,7 @@
 //! `{{ stages.<name>.<field> }}` in a later stage's `command:` or
 //! `prompt_file` against that payload.
 //!
-//! A second root, `{{ task.<field> }}` (`input`/`title`), reads a sibling
+//! A second root, `{{ task.<field> }}` (`input`/`title`/`closes`), reads a sibling
 //! key seeded once by `start_task` rather than any stage's `capture:` — it's
 //! how a task's own description reaches a `prompt_file` (P2-7a).
 //!
@@ -50,7 +50,7 @@ const CLOSE: &str = "}}";
 /// to be named after one (same reasoning as `merge_stage_capture`'s).
 const NAMESPACE: &str = "stages";
 
-/// The `task` root: the task's own title/initial input (P2-7a), seeded once
+/// The `task` root: the task's own title/input/closes (P2-7a), seeded once
 /// by `start_task` rather than any stage's `capture:`.
 const TASK_NAMESPACE: &str = "task";
 
@@ -117,7 +117,7 @@ pub enum TemplateError {
         stage: String,
         field: String,
     },
-    /// The `task` root has no such field — only `input`/`title` are ever
+    /// The `task` root has no such field — only `input`/`title`/`closes` are ever
     /// set, unlike a stage's capture there is no "hasn't run yet" state for
     /// it to be missing entirely (`start_task` always seeds it), so this is
     /// the only task-side counterpart to `UnresolvedField`.

@@ -64,16 +64,18 @@ summary and your reply. Work like this:
    Never put a closing keyword followed by an issue reference in a
    commit message (`Closes #12`, `fixes: #12`, `Resolves owner/repo#12`):
    GitHub closes that issue when the commit reaches the main branch,
-   whether or not the work finished it. The pull request already says
-   which issue it closes; write `#12` on its own if you need to mention
-   one.
+   whether or not the work finished it. The issues the pull request closes are set by whoever created the task,
+   and the publishing stage writes their `Closes` lines; write `#12` on its
+   own if you need to mention one.
 4. Write the pull request's description to the file this command prints:
    `echo "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`.
    It sits in git's private data for this worktree, so it is never
    committed: don't `git add` it or copy it into the tree. A later stage
-   publishes it as the PR's description and adds the linked issue, the
+   publishes it as the PR's description and adds the issue lines, the
    internal review's report and the task's provenance itself, so write
-   none of those, and no `Closes #…` line.
+   none of those, and no `Closes #…` line. Don't write that the pull request
+   closes or fixes an issue unless the task closes it (your turn prompt lists
+   them on its `Closes:` line); mention any other issue as `#12`.
 
    Write it as a short guide to the change for a human reviewer who
    hasn't read the task: concise, in plain English, with no codebase

@@ -388,8 +388,34 @@ pub struct TaskCreateArgs {
     /// literally named `origin/x` is shadowed by the remote form.
     #[arg(long)]
     pub base: Option<String>,
+    /// An issue the task's pull request closes. Repeat for several. Without
+    /// it the PR closes nothing; a `#N` in the title only links.
+    #[arg(long = "closes", value_name = "ISSUE", value_parser = parse_issue_number)]
+    pub closes: Vec<u64>,
     #[command(flatten)]
     pub roles: RoleOverrideArgs,
+}
+
+/// Parses one `--closes` value. An issue number is `^[1-9][0-9]*$`: checked
+/// on the text first, because `u64::from_str` takes `+5` and `012` would
+/// silently become 12.
+fn parse_issue_number(value: &str) -> Result<u64, String> {
+    if value == "0" {
+        return Err("closes has 0; issue numbers start at 1".to_string());
+    }
+    if let Some(digits) = value.strip_prefix('#') {
+        return Err(format!(
+            "'{value}' is not an issue number: write {digits}, not {value}"
+        ));
+    }
+    let well_formed = value.starts_with(|c: char| ('1'..='9').contains(&c))
+        && value.bytes().all(|b| b.is_ascii_digit());
+    well_formed
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
+        .ok_or_else(|| {
+            format!("'{value}' is not an issue number (a positive whole number such as 12)")
+        })
 }
 
 /// Per-role task-level config overrides (design §5.5, Q8) — shared by
@@ -549,6 +575,60 @@ mod tests {
             panic!("expected task create");
         };
         assert_eq!(args.base.as_deref(), Some("origin/main"));
+    }
+
+    fn create_argv<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        let mut argv = vec![
+            "choco",
+            "task",
+            "create",
+            "--project",
+            "p",
+            "--workflow",
+            "w",
+            "--title",
+            "t",
+            "--prompt",
+            "x",
+        ];
+        argv.extend(extra);
+        argv
+    }
+
+    #[test]
+    fn closes_repeats_in_order_and_defaults_to_none() {
+        let Command::Task(TaskCmd::Create(args)) =
+            Cli::try_parse_from(create_argv(&["--closes", "152", "--closes", "126"]))
+                .unwrap()
+                .command
+        else {
+            panic!("expected task create");
+        };
+        assert_eq!(args.closes, vec![152, 126]);
+        let Command::Task(TaskCmd::Create(args)) =
+            Cli::try_parse_from(create_argv(&[])).unwrap().command
+        else {
+            panic!("expected task create");
+        };
+        assert!(args.closes.is_empty());
+    }
+
+    #[test]
+    fn closes_rejects_anything_but_a_positive_whole_number() {
+        for (value, needle) in [
+            ("0", "closes has 0; issue numbers start at 1"),
+            ("abc", "'abc' is not an issue number"),
+            ("#12", "write 12, not #12"),
+            ("+5", "'+5' is not an issue number"),
+            ("012", "'012' is not an issue number"),
+            ("99999999999999999999999", "is not an issue number"),
+        ] {
+            let err = Cli::try_parse_from(create_argv(&["--closes", value]))
+                .err()
+                .unwrap_or_else(|| panic!("{value} was accepted"))
+                .to_string();
+            assert!(err.contains(needle), "{value}: {err}");
+        }
     }
 
     #[test]
