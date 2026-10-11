@@ -115,8 +115,10 @@ pub enum Command {
     Dashboard(DashboardArgs),
     /// Update choco and chocofactoryd to the latest release (only for copies
     /// installed by install.sh). Refuses, exit 3, while an agent turn or shell
-    /// step is running unless `--force`. Exit codes: 0 updated or up to date;
-    /// 1 error or not updatable; 3 refused because work is in flight.
+    /// step is running unless `--force`. A turn only waiting for an agent slot
+    /// is not running: it never blocks, and starts in its place after the
+    /// restart. Exit codes: 0 updated or up to date; 1 error or not updatable;
+    /// 3 refused because work is in flight.
     Update {
         /// Only report whether an update is available.
         #[arg(long)]
@@ -167,7 +169,8 @@ pub enum ServerCmd {
     /// Stop chocofactoryd gracefully (SIGTERM). Refuses, exit 3, while an agent
     /// turn or shell step is running, since stopping marks those tasks stuck
     /// (`choco task retry` continues them); `--force` stops anyway. Tasks
-    /// waiting on a poll or a human are not affected.
+    /// waiting on a poll or a human are not affected, nor are turns waiting
+    /// for an agent slot: they start in order after the restart.
     /// Exit codes: 0 stopped or not running; 1 error; 3 refused.
     Stop {
         /// Stop even if work is in flight; that work is marked stuck.
@@ -302,7 +305,8 @@ pub enum TaskCmd {
     /// On an `open` task waiting at a gate because a watcher (the PR review
     /// watch, CI polling) timed out: goes back to that watcher with its
     /// schedule starting over. No agent lap is spent, and `--resume` and
-    /// `--fresh` do not apply. Any other open task cannot be retried.
+    /// `--fresh` do not apply. Any other open task cannot be retried, including
+    /// one whose turn is waiting for an agent slot.
     ///
     /// When the stage's last agent turn was cut off from outside — a usage
     /// limit, or the daemon closing an idle session — the retry continues

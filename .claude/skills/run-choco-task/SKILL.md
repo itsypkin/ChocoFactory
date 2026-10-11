@@ -100,7 +100,7 @@ command in step 3 and the pre-merge check in step 4.
   means no limit, and an edit applies within seconds, without a restart. After
   editing, read the `agent slots` line of `choco server status`: it always
   shows the server pool's limit (`no limit` when unset), so a mistyped key
-  shows up there. A turn waiting for a slot reads `Queued:` in `choco task
+  shows up there. A turn waiting for a slot reads `Queued` in `choco task
   status` and `· queued N` in `choco task list`; it is waiting, not stuck
   (see [reference/watch.md](reference/watch.md#a-turn-waiting-for-an-agent-slot)).
 - **`choco server status`** shows the daemon's version, open tasks,
@@ -366,7 +366,7 @@ Read [reference/recover.md](reference/recover.md) when a task is `stuck`,
 parked at `escalate_to_human`, ignoring your review items, or needs
 cancelling. In short:
 
-- A task showing `Queued:` is waiting for an agent slot, not stuck: don't
+- A task showing `Queued` is waiting for an agent slot, not stuck: don't
   `retry`, `cancel` or `send` to it; see
   [reference/recover.md](reference/recover.md#queued-is-not-stuck).
 - `stuck` → find out why in `choco task status <id>`, then

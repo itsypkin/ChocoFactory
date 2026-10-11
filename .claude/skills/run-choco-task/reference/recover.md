@@ -10,7 +10,7 @@
 
 ## Queued is not stuck
 
-A task whose `choco task status` shows a `Queued:` line (or `· queued N` in
+A task whose `choco task status` shows a `Queued` line (or `· queued N` in
 `choco task list`) is waiting for an agent slot because the cap is reached.
 It is `open`. Don't `retry` it (refused: the task is not stuck), don't `send`
 to it (refused: the stage is not open-ended), and don't `cancel` it unless you

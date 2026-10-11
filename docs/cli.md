@@ -466,7 +466,7 @@ agent slots   server 2/2 running, 3 queued; project acme 1/1 running, 0 queued
 queued        7d22e1a8-…  internal_review (2nd in line, server)  add-x
 ```
 
-- `task status` has a `Queued:` line per waiting turn (a group's waiting
+- `task status` has a `Queued` line per waiting turn (a group's waiting
   branches show `queued (2nd)` in the `Branches` table, with `-` as their time).
   `task list` adds `· queued N` to the status cell (the place in line).
 - `server status` lists each pool as `running/limit, queued`, then each waiting

@@ -160,7 +160,7 @@ max_agents: 2
 - `choco project create <name> --max-agents N` (or `project update`) gives one project its **own** cap, in its own pool: its turns neither use nor wait for the server's slots. `--max-agents 0` removes it.
 - Unset or `0` means no limit. The cap counts single-shot agent turns only, never chat, shell steps or polls.
 - An edit to `config.yaml` applies within seconds, with no restart. A mistyped key such as `max_agent:` is ignored and means no limit, so check the `agent slots` line of `choco server status` after editing.
-- `choco task status` shows a waiting turn as `Queued: <stage>, 2nd in line…`; it is waiting, not stuck. Waiting turns don't block `choco update` or `choco server stop`.
+- `choco task status` shows a waiting turn as a `Queued` line (`<stage>, 2nd in line…`); it is waiting, not stuck. Waiting turns don't block `choco update` or `choco server stop`.
 
 Details: [docs/cli.md](docs/cli.md#limiting-how-many-agents-run-at-once).
 

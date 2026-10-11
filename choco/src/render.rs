@@ -788,6 +788,14 @@ fn agent_slot_lines(s: &chocofactory_core::models::ServerStatus) -> Vec<String> 
             };
             match p.limit {
                 Some(limit) => format!("{who} {}/{limit} running, {} queued", p.running, p.queued),
+                // The config could not be read, so the limit is not known:
+                // never shown as a healthy "no limit".
+                None if s.queue_error.is_some() && p.pool == "server" => {
+                    format!(
+                        "{who} {} running, limit unknown, {} queued",
+                        p.running, p.queued
+                    )
+                }
                 None => format!("{who} {} running, no limit, {} queued", p.running, p.queued),
             }
         })
@@ -3445,6 +3453,14 @@ mod queue_tests {
         let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
         assert!(
             out.contains("warning: queued turns cannot start: failed to parse global config /h/config.yaml: bad"),
+            "{out}"
+        );
+        // The limit is unknown, not "no limit".
+        assert!(out.contains("server 2/2 running"), "{out}");
+        s.agent_pools[0].limit = None;
+        let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
+        assert!(
+            out.contains("server 2 running, limit unknown, 3 queued"),
             "{out}"
         );
     }

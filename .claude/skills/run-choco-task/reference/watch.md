@@ -161,7 +161,7 @@ starts. Where to read it:
 - `choco task events` has `turn_queued`, `turn_dequeued` (with the time it
   waited) and `turn_withdrawn` lines.
 - `choco --json task status <id> | jq '.queued'` and `choco --json server
-  status | jq '.agent_pools'` give the same as JSON.
+  status | jq '.daemon.agent_pools'` give the same as JSON.
 
 A waiting turn is not in flight: it never blocks `choco update` or `choco
 server stop|restart`, and after a restart it is still queued, in order. A
