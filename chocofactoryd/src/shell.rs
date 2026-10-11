@@ -667,14 +667,14 @@ mod tests {
     /// that isn't a shell script.
     #[tokio::test]
     async fn runs_a_script_file_under_its_own_shebang() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = TempDir::new();
         let script = dir.path().join("script");
         // `print(...)` is a syntax error in sh, so this only produces the
         // expected stdout if the shebang was actually honored.
-        std::fs::write(&script, "#!/usr/bin/env python3\nprint('from python')\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(
+            &script,
+            "#!/usr/bin/env python3\nprint('from python')\n",
+        );
 
         let outcome = run(
             &ShellCommand::ScriptFile(script),

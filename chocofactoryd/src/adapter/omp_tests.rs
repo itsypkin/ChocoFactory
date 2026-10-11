@@ -4,8 +4,6 @@
 //! environment variables, never through this process's own environment, so
 //! tests running in parallel can't affect each other.
 
-use std::os::unix::fs::PermissionsExt;
-
 use super::*;
 use crate::adapter::{ClaudeAdapter, TokenCounts};
 use tokio::io::AsyncWriteExt;
@@ -40,10 +38,15 @@ fn wrapper_for(dir: &Path, fixture: &str, env: &[(&str, &str)], marker: Option<&
             value.replace('\'', "'\\''")
         ));
     }
+    // Answer `--version` here: the adapter probes it with a 5 s timeout, and
+    // starting the Python fixture just to print a constant is what blew that
+    // budget under load. Mirrors `fake_omp.py`'s own `--version` branch.
+    script.push_str(
+        "case \"$1\" in\n--version)\n    if [ -n \"${FAKE_OMP_VERSION_FAIL:-}\" ]; then exit 1; fi\n    echo 'omp/fake-1.0'\n    exit 0\n    ;;\nesac\n",
+    );
     script.push_str(&format!("exec '{}' \"$@\"\n", fixture_binary(fixture)));
     let path = dir.join(format!("wrapper-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_support::write_executable(&path, script);
     path.to_string_lossy().into_owned()
 }
 

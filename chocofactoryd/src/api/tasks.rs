@@ -708,14 +708,12 @@ stages:
     /// row insert.
     #[tokio::test]
     async fn a_client_disconnect_mid_create_still_ends_in_a_complete_task() {
-        use std::os::unix::fs::PermissionsExt;
         let server = TestServer::start().await;
         server.write_workflow("wt", WT_YAML);
         let project_id = create_project(&server).await;
         let repo = repo_in(&server);
         let hook = repo.join(".git/hooks/post-checkout");
-        std::fs::write(&hook, "#!/bin/sh\nsleep 3\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&hook, "#!/bin/sh\nsleep 3\n");
 
         let client = server.spawn_post(
             "/tasks",
