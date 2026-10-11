@@ -101,6 +101,62 @@ pub enum View {
     Detail(Detail),
 }
 
+/// Where the search popup's task list stands.
+pub enum SearchLoad {
+    Loading,
+    Failed(String),
+    Loaded(Vec<TaskSummary>),
+}
+
+/// The `/` search popup (#292): an overlay on whatever view is open.
+pub struct Search {
+    /// Which open of the popup this is; a load result for another one is stale.
+    pub generation: u64,
+    pub query: String,
+    pub load: SearchLoad,
+    /// Id of the highlighted result.
+    pub selected: Option<String>,
+    /// Draw-time feedback: result rows visible, and the scroll offset.
+    pub page: Cell<usize>,
+    pub offset: Cell<usize>,
+}
+
+impl Search {
+    /// The loaded tasks that match the query, newest first. Recomputed on
+    /// every call so it can never be stale.
+    pub fn results(&self) -> Vec<&TaskSummary> {
+        match &self.load {
+            SearchLoad::Loaded(tasks) => super::search::search(tasks, &self.query),
+            SearchLoad::Loading | SearchLoad::Failed(_) => Vec::new(),
+        }
+    }
+
+    /// Keeps the selected task if it is still a result, else the first one.
+    fn reselect(&mut self) {
+        let results = self.results();
+        let keep = self
+            .selected
+            .as_ref()
+            .is_some_and(|id| results.iter().any(|t| &t.task.id == id));
+        if !keep {
+            self.selected = results.first().map(|t| t.task.id.clone());
+        }
+    }
+
+    fn step(&mut self, delta: isize) {
+        let ids: Vec<String> = self.results().iter().map(|t| t.task.id.clone()).collect();
+        let Some(pos) = self
+            .selected
+            .as_ref()
+            .and_then(|sel| ids.iter().position(|i| i == sel))
+        else {
+            return;
+        };
+        let to = pos.saturating_add_signed(delta).min(ids.len() - 1);
+        self.selected = Some(ids[to].clone());
+    }
+}
+
 /// Outcome of one poll.
 pub struct ListResult {
     pub at: DateTime<Utc>,
@@ -144,6 +200,11 @@ pub enum Msg {
         id: String,
         result: Result<ActionOk, String>,
     },
+    /// The search popup's task list (or why it could not load).
+    Search {
+        generation: u64,
+        result: Result<Vec<TaskSummary>, String>,
+    },
     /// Launching the browser failed.
     OpenFailed {
         url: String,
@@ -153,10 +214,16 @@ pub enum Msg {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
-    Fetch { projects: bool },
+    Fetch {
+        projects: bool,
+    },
     FetchDetail(String),
     OpenSocket(String),
     CloseSocket,
+    /// Load every task for the search popup opened as `generation`.
+    LoadSearch {
+        generation: u64,
+    },
     Cancel(String),
     Retry(String),
     OpenUrl(String),
@@ -189,6 +256,9 @@ pub struct App {
     pub help: bool,
     pub prompt: Option<Prompt>,
     pub status: Option<StatusLine>,
+    pub search: Option<Search>,
+    /// Opens of the search popup so far; only ever rises.
+    pub search_gen: u64,
 
     /// Draw-time feedback: rows visible in the list, and the scroll offset.
     pub list_page: Cell<usize>,
@@ -226,6 +296,8 @@ impl App {
             help: false,
             prompt: None,
             status: None,
+            search: None,
+            search_gen: 0,
             list_page: Cell::new(10),
             list_offset: Cell::new(0),
         }
@@ -517,6 +589,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 projects: app.needs_projects(),
             }]
         }
+        Msg::Search { generation, result } => {
+            // A result for a popup that was closed or reopened since is
+            // dropped on purpose: its request just finishes unseen.
+            if let Some(s) = &mut app.search
+                && s.generation == generation
+            {
+                s.load = match result {
+                    Ok(tasks) => SearchLoad::Loaded(tasks),
+                    Err(e) => SearchLoad::Failed(e),
+                };
+                s.reselect();
+            }
+            Vec::new()
+        }
         Msg::OpenFailed { url, error } => {
             app.set_status(format!("could not open {url}: {error}"), Level::Error);
             Vec::new()
@@ -530,6 +616,11 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return vec![Effect::Quit];
+    }
+    // The popup owns every key (it is typed into), and handling one must not
+    // clear the board's status line.
+    if app.search.is_some() {
+        return search_key(app, key);
     }
     app.status = None;
 
@@ -557,6 +648,19 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             app.help = true;
             return Vec::new();
         }
+        KeyCode::Char('/') => {
+            app.search_gen = app.search_gen.wrapping_add(1);
+            let generation = app.search_gen;
+            app.search = Some(Search {
+                generation,
+                query: String::new(),
+                load: SearchLoad::Loading,
+                selected: None,
+                page: Cell::new(10),
+                offset: Cell::new(0),
+            });
+            return vec![Effect::LoadSearch { generation }];
+        }
         KeyCode::Char('o') => return open_pr(app),
         KeyCode::Char('r') => {
             retry_prompt(app);
@@ -573,6 +677,73 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         return detail_key(app, key);
     }
     list_key(app, key)
+}
+
+fn search_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
+    let Some(s) = app.search.as_mut() else {
+        return Vec::new();
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let page = s.page.get().max(1) as isize;
+    match key.code {
+        KeyCode::Esc => app.search = None,
+        KeyCode::Enter => return open_search_result(app),
+        KeyCode::Up => s.step(-1),
+        KeyCode::Down => s.step(1),
+        KeyCode::Char('p') if ctrl => s.step(-1),
+        KeyCode::Char('n') if ctrl => s.step(1),
+        KeyCode::PageUp => s.step(-page),
+        KeyCode::PageDown => s.step(page),
+        KeyCode::Backspace => {
+            s.query.pop();
+            s.reselect();
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            s.query.push(c);
+            s.reselect();
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// `⏎` in the popup: open the highlighted task's detail view.
+fn open_search_result(app: &mut App) -> Vec<Effect> {
+    let Some(s) = &app.search else {
+        return Vec::new();
+    };
+    let Some(found) = s
+        .selected
+        .as_ref()
+        .and_then(|id| s.results().into_iter().find(|t| &t.task.id == id))
+        .cloned()
+    else {
+        return Vec::new();
+    };
+    app.search = None;
+    let id = found.task.id.clone();
+    if let Some(pos) = app.flat_ids().iter().position(|i| *i == id) {
+        app.selected = Some(id.clone());
+        app.selected_pos = pos;
+    }
+    open_detail(app, id, Some(found))
+}
+
+fn open_detail(app: &mut App, id: String, snapshot: Option<TaskSummary>) -> Vec<Effect> {
+    app.view = View::Detail(Detail {
+        id: id.clone(),
+        snapshot,
+        data: None,
+        error: None,
+        expanded: false,
+        events: Vec::new(),
+        reconnecting: false,
+        following: true,
+        scroll_back: 0,
+        page: Cell::new(10),
+    });
+    vec![Effect::FetchDetail(id.clone()), Effect::OpenSocket(id)]
 }
 
 fn open_pr(app: &mut App) -> Vec<Effect> {
@@ -658,19 +829,7 @@ fn list_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         KeyCode::Enter => {
             if let Some(id) = app.selected.clone() {
                 let snapshot = app.find(&id).cloned();
-                app.view = View::Detail(Detail {
-                    id: id.clone(),
-                    snapshot,
-                    data: None,
-                    error: None,
-                    expanded: false,
-                    events: Vec::new(),
-                    reconnecting: false,
-                    following: true,
-                    scroll_back: 0,
-                    page: Cell::new(10),
-                });
-                return vec![Effect::FetchDetail(id.clone()), Effect::OpenSocket(id)];
+                return open_detail(app, id, snapshot);
             }
         }
         _ => {}

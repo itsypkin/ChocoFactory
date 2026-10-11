@@ -645,15 +645,18 @@ impl Client {
     }
 
     /// `GET /tasks` summary rows with the dashboard's filters: `status` may
-    /// be a comma-separated list, `order` is `id` or `updated_desc`.
+    /// be a comma-separated list (`None` sends no filter), `order` is `id` or `updated_desc`.
     pub async fn list_task_summaries(
         &self,
         project_id: Option<&str>,
-        status: &str,
+        status: Option<&str>,
         order: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<chocofactory_core::models::TaskSummary>, ClientError> {
-        let mut query: Vec<(&str, String)> = vec![("status", status.to_string())];
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(status) = status {
+            query.push(("status", status.to_string()));
+        }
         if let Some(project_id) = project_id {
             query.push(("project_id", project_id.to_string()));
         }
