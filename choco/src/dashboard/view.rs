@@ -212,7 +212,16 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid 
             })
             .max()
             .unwrap_or(5)
-            .clamp(6, 22)
+            // Room for a waiting turn's `· queued N` suffix, only when some
+            // row has one.
+            .clamp(
+                6,
+                if sections.iter().flatten().any(|t| !t.queued.is_empty()) {
+                    30
+                } else {
+                    22
+                },
+            )
     } else {
         0
     };
@@ -240,8 +249,12 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid 
             .zip(Section::ALL)
             .filter(|(_, s)| matches!(s, Section::NeedsYou | Section::InProgress))
             .flat_map(|(ts, _)| ts.iter())
-            .filter(|t| t.branch_progress.is_some())
-            .map(|t| stage_cell(t).chars().count().clamp(6, 22))
+            .filter(|t| t.branch_progress.is_some() || !t.queued.is_empty())
+            .map(|t| {
+                // A waiting turn's `· queued N` is the point of its cell.
+                let most = if t.queued.is_empty() { 22 } else { 30 };
+                stage_cell(t).chars().count().clamp(6, most)
+            })
             .max()
             .unwrap_or(0)
             .max(8);

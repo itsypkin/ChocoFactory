@@ -4347,3 +4347,151 @@ async fn search_in_one_project_mode_asks_for_that_project_only() {
             .expect("Ctrl-C quits from the popup");
     result.unwrap();
 }
+
+// ---- queued agent turns -----------------------------------------------------
+
+fn queued_turn(stage: &str, position: u32) -> chocofactory_core::models::QueuedTurn {
+    chocofactory_core::models::QueuedTurn {
+        stage: stage.to_string(),
+        group: None,
+        position,
+        pool: "server".to_string(),
+        pool_name: "server".to_string(),
+        limit: Some(2),
+        running: 2,
+        queued_at: now(),
+    }
+}
+
+#[test]
+fn a_queued_stage_reads_its_place_in_line() {
+    let mut app = board();
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == BUSY)
+        .unwrap()
+        .queued = vec![queued_turn("internal_review", 2)];
+    for w in [80u16, 100, 140] {
+        let s = render(&app, w, 24);
+        assert!(s.contains("internal_review · queued 2"), "{w}\n{s}");
+    }
+}
+
+#[test]
+fn a_group_with_waiting_branches_counts_them() {
+    let mut app = board();
+    let task = app.active.iter_mut().find(|t| t.task.id == BUSY).unwrap();
+    task.branch_progress = progress_of(1, 3);
+    task.queued = vec![queued_turn("security", 1)];
+    let s = render(&app, 120, 24);
+    assert!(s.contains("internal_review 1/3 · 1 queued"), "{s}");
+    // Without waiting branches the cell is the plain progress.
+    app.active
+        .iter_mut()
+        .find(|t| t.task.id == BUSY)
+        .unwrap()
+        .queued
+        .clear();
+    let s = render(&app, 120, 24);
+    assert!(s.contains("internal_review 1/3"), "{s}");
+    assert!(!s.contains("queued"), "{s}");
+}
+
+fn pool(limit: Option<u32>, running: u32, queued: u32) -> chocofactory_core::models::AgentPool {
+    chocofactory_core::models::AgentPool {
+        pool: "server".into(),
+        name: "server".into(),
+        limit,
+        running,
+        queued,
+    }
+}
+
+fn server_status_with(
+    pools: Vec<chocofactory_core::models::AgentPool>,
+) -> chocofactory_core::models::ServerStatus {
+    chocofactory_core::models::ServerStatus {
+        version: "0.0.1".into(),
+        commit: None,
+        pid: 1,
+        port: 4141,
+        started_at: now(),
+        config_root: "/r".into(),
+        exe: "/e".into(),
+        exe_replaced: None,
+        choco_binary: "/c".into(),
+        choco_binary_found: true,
+        tasks: Default::default(),
+        in_flight: vec![],
+        agent_pools: pools,
+        queued: vec![],
+        queue_error: None,
+    }
+}
+
+fn list_with_server(server: Option<chocofactory_core::models::ServerStatus>) -> Msg {
+    Msg::List(Box::new(ListResult {
+        server,
+        at: now(),
+        active: Ok(vec![]),
+        closed: Ok(vec![]),
+        projects: None,
+    }))
+}
+
+#[test]
+fn the_header_shows_the_server_pools_slots_and_follows_each_refresh() {
+    let mut app = board();
+    assert!(!render(&app, 140, 12).contains("agents"));
+    update(
+        &mut app,
+        list_with_server(Some(server_status_with(vec![pool(Some(2), 2, 3)]))),
+    );
+    let first = render(&app, 140, 12).lines().next().unwrap().to_string();
+    assert!(first.contains("agents 2/2 · 3 queued"), "{first}");
+    // The next refresh brings new counts; the header follows.
+    update(
+        &mut app,
+        list_with_server(Some(server_status_with(vec![pool(Some(2), 1, 0)]))),
+    );
+    let second = render(&app, 140, 12).lines().next().unwrap().to_string();
+    assert!(
+        second.contains("agents 1/2") && !second.contains("queued"),
+        "{second}"
+    );
+    // A failed read keeps the last values.
+    update(&mut app, list_with_server(None));
+    let third = render(&app, 140, 12).lines().next().unwrap().to_string();
+    assert!(third.contains("agents 1/2"), "{third}");
+    // No limit reads as the running count alone.
+    update(
+        &mut app,
+        list_with_server(Some(server_status_with(vec![pool(None, 4, 0)]))),
+    );
+    let fourth = render(&app, 140, 12).lines().next().unwrap().to_string();
+    assert!(
+        fourth.contains("agents 4") && !fourth.contains("agents 4/"),
+        "{fourth}"
+    );
+}
+
+#[test]
+fn a_project_pool_does_not_show_in_the_server_header() {
+    let mut app = board();
+    let mut project_pool = pool(Some(1), 1, 5);
+    project_pool.pool = "project:p1".into();
+    update(
+        &mut app,
+        list_with_server(Some(server_status_with(vec![project_pool]))),
+    );
+    assert!(!render(&app, 140, 12).contains("agents"));
+}
+
+#[test]
+fn a_summary_from_an_older_daemon_has_no_queued_turns() {
+    let mut v =
+        serde_json::to_value(summary("t1", "T", "open", Some("coding"), Some(5), "p")).unwrap();
+    v.as_object_mut().unwrap().remove("queued");
+    let t: TaskSummary = serde_json::from_value(v).unwrap();
+    assert!(t.queued.is_empty());
+}

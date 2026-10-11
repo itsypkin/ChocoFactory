@@ -1652,6 +1652,10 @@ pub fn server_status(
 mod tests {
     use super::*;
 
+    pub(super) fn sample_status_pub() -> chocofactory_core::models::ServerStatus {
+        sample_status()
+    }
+
     fn sample_status() -> chocofactory_core::models::ServerStatus {
         use chocofactory_core::models::{InFlight, ServerStatus};
         let now = Utc::now();
@@ -3195,4 +3199,371 @@ mod tests {
             "? › ?  started (?, entry ?)"
         );
     }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use chocofactory_core::models::{AgentPool, ServerQueuedTurn, ServerStatus};
+    use serde_json::json;
+
+    fn queued_turn(stage: &str, group: Option<&str>, position: u32, pool: &str) -> QueuedTurn {
+        QueuedTurn {
+            stage: stage.to_string(),
+            group: group.map(str::to_string),
+            position,
+            pool: pool.to_string(),
+            pool_name: if pool == "server" { "server" } else { "acme" }.to_string(),
+            limit: Some(2),
+            running: 2,
+            queued_at: "2026-08-01T14:02:09Z".parse().unwrap(),
+        }
+    }
+
+    fn detail(queued: Value) -> Value {
+        json!({
+            "id": "t1", "title": "T", "project_id": "p", "workflow_def": "w",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "workflow_state": {"current_stage": "internal_review", "branches": []},
+            "queued": queued,
+        })
+    }
+
+    #[test]
+    fn ordinals() {
+        let got: Vec<String> = [1, 2, 3, 4, 11, 12, 13, 21, 22, 101, 111]
+            .into_iter()
+            .map(ordinal)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "101st",
+                "111th"
+            ]
+        );
+    }
+
+    #[test]
+    fn task_status_has_a_queued_line_per_waiting_turn() {
+        let turn = |stage, group, position, pool| {
+            serde_json::to_value(queued_turn(stage, group, position, pool)).unwrap()
+        };
+        let out = task_detail(
+            &detail(json!([
+                turn("internal_review", None, 2, "server"),
+                turn("security", Some("panel"), 1, "project:p1"),
+            ])),
+            Utc::now(),
+        );
+        assert!(
+            out.contains(
+                "Queued    internal_review, 2nd in line for the server's 2 agent slots (both busy), since 14:02 UTC"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("Queued    panel › security, 1st in line for project acme's 2 agent slots (both busy)"),
+            "{out}"
+        );
+        // The line sits under Stage.
+        assert!(
+            out.find("Stage").unwrap() < out.find("Queued").unwrap(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn task_status_has_no_queued_line_when_nothing_waits() {
+        assert!(!task_detail(&detail(json!([])), Utc::now()).contains("Queued"));
+        let mut old = detail(json!([]));
+        old.as_object_mut().unwrap().remove("queued");
+        assert!(!task_detail(&old, Utc::now()).contains("Queued"));
+    }
+
+    #[test]
+    fn a_pool_with_a_free_slot_says_how_busy_it_is() {
+        let mut turn = queued_turn("coding", None, 1, "server");
+        turn.running = 1;
+        turn.limit = Some(3);
+        let line = queued_line(&serde_json::to_value(&turn).unwrap());
+        assert!(
+            line.contains("the server's 3 agent slots (1 of 3 busy)"),
+            "{line}"
+        );
+        turn.limit = Some(1);
+        turn.running = 1;
+        let line = queued_line(&serde_json::to_value(&turn).unwrap());
+        assert!(line.contains("the server's 1 agent slot (busy)"), "{line}");
+        turn.limit = None;
+        let line = queued_line(&serde_json::to_value(&turn).unwrap());
+        assert!(line.contains("(the daemon is stopping)"), "{line}");
+    }
+
+    #[test]
+    fn a_queued_branch_reads_queued_with_its_place_and_no_time() {
+        let mut d = detail(json!([]));
+        d["workflow_state"]["branches"] = json!([
+            {"name": "a", "kind": "agent_turn", "state": "running",
+             "started_at": "2026-08-01T12:00:00Z", "entry": 1},
+            {"name": "b", "kind": "agent_turn", "state": "queued", "queued_position": 2,
+             "started_at": "2026-08-01T12:00:00Z", "entry": 1},
+        ]);
+        let table = detail_branches(&d, "2026-08-01T12:05:00Z".parse().unwrap(), None).unwrap();
+        let running = table.rows[0].split_whitespace().collect::<Vec<_>>();
+        assert_eq!(running[2], "running");
+        assert_eq!(running[3], "5m");
+        let queued = &table.rows[1];
+        assert!(queued.contains("queued (2nd)"), "{queued}");
+        // The time cell is `-`: the branch is not running.
+        assert!(queued.contains(" -  "), "{queued}");
+    }
+
+    #[test]
+    fn the_task_list_marks_queued_tasks_in_the_status_cell() {
+        let mut waiting = TaskSummary {
+            task: serde_json::from_value(json!({
+                "id": "t1", "project_id": "p", "workflow_def": "w", "title": "add x",
+                "status": "open", "config": {}, "worktree_repo": null,
+                "worktree_project": null, "stuck_reason": null, "workflow_path": null,
+                "workflow_sha256": null, "created_at": "2026-08-01T12:33:51Z",
+                "updated_at": "2026-08-01T12:33:51Z"
+            }))
+            .unwrap(),
+            current_stage: Some("internal_review".into()),
+            stage_entered_at: None,
+            loop_counters: json!({}),
+            pr: None,
+            waiting_on_human: false,
+            usage_total: None,
+            branch_progress: None,
+            queued: vec![queued_turn("internal_review", None, 2, "server")],
+        };
+        let out = tasks(&[waiting.clone()]);
+        assert!(out.contains("open · queued 2"), "{out}");
+        waiting
+            .queued
+            .push(queued_turn("b", Some("panel"), 4, "server"));
+        assert!(tasks(&[waiting.clone()]).contains("open · queued 2,4"));
+        waiting.queued.clear();
+        let plain = tasks(&[waiting]);
+        assert!(!plain.contains("queued"), "{plain}");
+    }
+
+    #[test]
+    fn project_list_has_a_max_agents_column() {
+        let project = |name: &str, cap| Project {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            repo_path: None,
+            created_at: "2026-08-01T12:33:51Z".parse().unwrap(),
+            max_agents: cap,
+        };
+        let out = projects(&[project("acme", Some(2)), project("shared", None)]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("MAX AGENTS"), "{out}");
+        assert!(lines[1].split_whitespace().any(|c| c == "2"), "{out}");
+        // `-` for a project that shares the server's cap (REPO is `-` too).
+        assert_eq!(
+            lines[2].split_whitespace().filter(|c| *c == "-").count(),
+            2,
+            "{out}"
+        );
+        assert!(super::project(&project("acme", Some(3))).contains("Max agents  3"));
+    }
+
+    fn pools_status() -> ServerStatus {
+        let mut s = crate::render::tests_support_status();
+        s.in_flight.clear();
+        s.agent_pools = vec![
+            AgentPool {
+                pool: "server".into(),
+                name: "server".into(),
+                limit: Some(2),
+                running: 2,
+                queued: 3,
+            },
+            AgentPool {
+                pool: "project:p1".into(),
+                name: "foo".into(),
+                limit: Some(1),
+                running: 1,
+                queued: 0,
+            },
+        ];
+        s.queued = vec![ServerQueuedTurn {
+            task_id: "t9".into(),
+            title: "do\nit".into(),
+            turn: queued_turn("coding", None, 1, "server"),
+        }];
+        s
+    }
+
+    #[test]
+    fn server_status_prints_each_pool_and_every_queued_turn() {
+        let s = pools_status();
+        let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
+        assert!(
+            out.contains(
+                "agent slots   server 2/2 running, 3 queued; project foo 1/1 running, 0 queued"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("queued        t9  coding (1st in line, server)  do it"),
+            "{out}"
+        );
+        assert!(!out.contains("queued turns cannot start"), "{out}");
+    }
+
+    #[test]
+    fn server_status_always_prints_the_server_limit_even_when_unset() {
+        let mut s = pools_status();
+        s.agent_pools = vec![AgentPool {
+            pool: "server".into(),
+            name: "server".into(),
+            limit: None,
+            running: 1,
+            queued: 0,
+        }];
+        s.queued.clear();
+        let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
+        assert!(
+            out.contains("agent slots   server 1 running, no limit, 0 queued"),
+            "{out}"
+        );
+        // An older daemon sends no pools at all.
+        s.agent_pools.clear();
+        let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
+        assert!(out.contains("agent slots   server: no limit"), "{out}");
+    }
+
+    #[test]
+    fn server_status_shows_the_queue_error() {
+        let mut s = pools_status();
+        s.queue_error = Some("failed to parse global config /h/config.yaml: bad".into());
+        let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
+        assert!(
+            out.contains("warning: queued turns cannot start: failed to parse global config /h/config.yaml: bad"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_restart_note_counts_queued_turns() {
+        assert_eq!(queued_restart_note(0), None);
+        assert_eq!(
+            queued_restart_note(1).unwrap(),
+            "1 queued turn will wait and start in order after the restart."
+        );
+        assert_eq!(
+            queued_restart_note(3).unwrap(),
+            "3 queued turns will wait and start in order after the restart."
+        );
+    }
+
+    #[test]
+    fn retry_output_says_where_a_queued_turn_stands() {
+        let outcome = RetryOutcome {
+            stage: "coding".into(),
+            resumed: false,
+            adapter_session_id: None,
+            fresh_reason: None,
+            rewatched: false,
+            branches: Vec::new(),
+            queued: Some(2),
+        };
+        let out = retried("t1", &outcome);
+        assert!(
+            out.contains("It is queued, 2nd in line. See `choco task status t1`."),
+            "{out}"
+        );
+        let started = RetryOutcome {
+            queued: None,
+            ..outcome
+        };
+        assert!(!retried("t1", &started).contains("queued"));
+    }
+
+    #[test]
+    fn retry_output_marks_queued_branches() {
+        let outcome = RetryOutcome {
+            stage: "panel".into(),
+            resumed: false,
+            adapter_session_id: None,
+            fresh_reason: None,
+            rewatched: false,
+            branches: vec![
+                chocofactory_core::models::RetriedBranch {
+                    branch: "a".into(),
+                    resumed: false,
+                    adapter_session_id: None,
+                    fresh_reason: None,
+                    queued: Some(1),
+                },
+                chocofactory_core::models::RetriedBranch {
+                    branch: "b".into(),
+                    resumed: false,
+                    adapter_session_id: None,
+                    fresh_reason: None,
+                    queued: None,
+                },
+            ],
+            queued: None,
+        };
+        let out = retried("t1", &outcome);
+        assert!(
+            out.contains("a: from scratch, in a fresh session. Queued, 1st in line."),
+            "{out}"
+        );
+        assert!(
+            !out.contains("b: from scratch, in a fresh session. Queued"),
+            "{out}"
+        );
+    }
+
+    fn event(event_type: EventType, payload: Value) -> Event {
+        Event {
+            id: "e".into(),
+            task_id: "t".into(),
+            session_id: None,
+            event_type,
+            payload,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn queue_events_are_one_readable_line_each() {
+        let queued = event_summary(&event(
+            EventType::TurnQueued,
+            json!({"stage": "coding", "group": null, "entry": null, "pool": "server",
+                   "limit": 2, "running": 2, "position": 3}),
+        ));
+        assert_eq!(queued, "coding  queued, 3rd in line (server, limit 2)");
+        let unlimited = event_summary(&event(
+            EventType::TurnQueued,
+            json!({"stage": "coding", "pool": "server", "limit": null, "position": 1}),
+        ));
+        assert!(unlimited.contains("no limit"), "{unlimited}");
+        let dequeued = event_summary(&event(
+            EventType::TurnDequeued,
+            json!({"stage": "three", "group": "panel", "waited_ms": 125_000, "session_id": "s"}),
+        ));
+        assert_eq!(
+            dequeued,
+            "panel › three  started after waiting 2m5s in the queue"
+        );
+        let withdrawn = event_summary(&event(
+            EventType::TurnWithdrawn,
+            json!({"stage": "coding", "group": null, "reason": "retry"}),
+        ));
+        assert_eq!(withdrawn, "coding  left the queue without starting: retry");
+    }
+}
+
+/// `render::tests::sample_status` for the sibling test module.
+#[cfg(test)]
+pub(crate) fn tests_support_status() -> chocofactory_core::models::ServerStatus {
+    tests::sample_status_pub()
 }

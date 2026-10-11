@@ -505,7 +505,11 @@ without `capture: json` may only report `done`.
 
 ### The join
 
-Every branch starts at once. The group waits for every branch, then always
+Every branch starts at once when a slot is free for it; with an agent cap (see
+[the README](../README.md#limiting-how-many-agents-run-at-once)) the first
+branches in declaration order start and the rest wait in the queue, possibly
+between other tasks' turns, and the group's time in stage includes that wait. A
+running branch never waits on a queued one. The group waits for every branch, then always
 leaves through `done`, whatever results the branches reported. Any decision
 belongs to a later stage that reads the branches' captures, and that stage
 owns the review loop's `loop_guard` too (a group can't have one). `choco task
@@ -590,7 +594,10 @@ branch that was running:
 - `choco task retry` then re-runs every failed branch, resuming it where it
   can and starting it fresh otherwise.
 - While any branch runs, `choco server status` lists the task as in flight:
-  its stage is the group and its kind is the running branches' kinds.
+  its stage is the group and its kind is the running branches' kinds. A branch
+  that is only waiting for an agent slot is not running and not in flight (it
+  shows as `queued` in `choco task status`, and keeps its place across a
+  restart).
   `choco update`, `choco server stop` and `choco server restart` warn or
   refuse as they do for a single running stage, and `--force` goes ahead.
 

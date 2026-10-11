@@ -114,6 +114,18 @@ struct StageEntry<'a> {
 /// spawning caller can observe.
 type DetachedRunners = HashMap<String, HashMap<u64, Option<JoinHandle<()>>>>;
 
+/// `1st`, `2nd`, `3rd`, `4th`: a place in line, for messages.
+fn ordinal_suffix(n: u32) -> String {
+    let suffix = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
 /// `tasks.status` for a task that reached a `terminal` stage (§5.4).
 const TASK_STATUS_CLOSED: &str = "closed";
 
@@ -1115,6 +1127,12 @@ pub enum RetryTaskError {
     /// The task isn't `stuck` — carries its actual status, the same way
     /// `CancelTaskError::NotCancellable` does.
     NotStuck(String),
+    /// The task is `open` because its turn is waiting for an agent slot, so
+    /// there is nothing to retry; carries the stage and its place in line.
+    Queued {
+        stage: String,
+        position: u32,
+    },
     /// The task has no `workflow_state` row at all, so there is no current
     /// stage to re-enter — e.g. `create_task`'s `start_task` failed before
     /// `workflow_state::create` ever ran.
@@ -1175,6 +1193,12 @@ impl fmt::Display for RetryTaskError {
                     "task is '{status}', not 'stuck', so it cannot be retried"
                 )
             }
+            RetryTaskError::Queued { stage, position } => write!(
+                f,
+                "stage '{stage}' is waiting for an agent slot ({} in line), not stuck, so it \
+                 cannot be retried; it starts when a turn ends",
+                ordinal_suffix(*position)
+            ),
             RetryTaskError::NoWorkflowState => write!(f, "task has no workflow_state row"),
             RetryTaskError::UnknownStage(stage) => {
                 write!(f, "workflow_state references unknown stage '{stage}'")
@@ -2448,8 +2472,21 @@ impl WorkflowEngine {
         let current_stage = state.current_stage.clone();
 
         // An open task is retryable only when a watcher's timeout parked it
-        // at a gate (#179): then retry watches again.
+        // at a gate (#179): then retry watches again. One whose turn is
+        // waiting for an agent slot is not stuck at all.
         if task.status == TASK_STATUS_OPEN {
+            if let Some(turn) = self
+                .queue_snapshot()
+                .await?
+                .queued_for(task_id)
+                .into_iter()
+                .next()
+            {
+                return Err(RetryTaskError::Queued {
+                    stage: turn.stage,
+                    position: turn.position,
+                });
+            }
             let Some(timed_out) = timed_out_watch(&definition, &current_stage, &state.payload)
             else {
                 return Err(RetryTaskError::NotStuck(task.status));

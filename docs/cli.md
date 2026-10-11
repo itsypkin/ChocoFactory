@@ -42,7 +42,7 @@ own.
 choco server start [--port N]      # background, own session; waits until it answers
 choco server stop [--force]        # graceful stop (SIGTERM)
 choco server restart [--force] [--port N]   # keeps the port unless --port is given
-choco server status                # version, pid, port, uptime, open tasks, in-flight work
+choco server status                # version, pid, port, uptime, open tasks, in-flight work, agent slots
 ```
 
 - **Log:** `~/.config/chocofactory/logs/chocofactoryd.log`. At start, a log over
@@ -54,6 +54,12 @@ choco server status                # version, pid, port, uptime, open tasks, in-
   tasks marked `stuck` (`choco task retry <id>` continues them; an agent turn
   resumes its session). Tasks waiting on a poll or a human are not affected.
   Without `--force`, `stop` refuses (exit 3) and lists in-flight work instead.
+  A turn that is still waiting for an agent slot (see
+  [below](#limiting-how-many-agents-run-at-once)) is not in flight: it has no
+  process, so it never blocks `stop`, `restart` or `choco update`, and it stays
+  queued, in order, across the restart. When any turn is queued, these
+  commands add a line below their output: `N queued turns will wait and start
+  in order after the restart.`
 
 **One daemon per config directory.** It holds a lock on
 `~/.config/chocofactory/chocofactoryd.lock` for as long as it runs and writes
@@ -416,6 +422,65 @@ $ choco task list --status open           # free-form, not a fixed enum
 $ choco task list --status cancelled      # open | closed | cancelled | stuck today
 $ choco project list
 ```
+
+## Limiting how many agents run at once
+
+Agent turns are not limited unless you ask. Two caps exist, and both count
+single-shot agent turns only (every branch of a parallel group included).
+Chat sessions, shell steps and polls never wait and never take a slot.
+
+- **The server cap**: `max_agents: N` at the top level of
+  `~/.config/chocofactory/config.yaml`. It is read at every decision, so an
+  edit applies within seconds, with no restart. Unset, empty or `0` means no
+  limit. A value that is not a non-negative whole number (`two`, `-1`, `1.5`)
+  is an error, never "no limit". Other keys are ignored as ever, so a typo such
+  as `max_agent:` means no limit; the `agent slots` line of `choco server
+  status` always prints the limit (`no limit` when unset).
+- **A project cap**: `choco project create <name> --max-agents N`, or
+  `choco project update <project> --max-agents N`. `0` removes it. A project
+  with a cap is its **own pool**: its turns are limited only by it, and neither
+  use nor wait for the server cap's slots. The server cap counts only the
+  turns of projects without a cap of their own. `choco project list` has a
+  `MAX AGENTS` column (`-` for a project that shares the server's cap).
+
+A turn due to start while its pool is full **waits in a queue**, first in
+first out within the pool; a turn held by its project's cap never blocks
+another project's. A waiting turn has no session and no process, so no stage
+timer, silence nudge, post-report grace, job-wait limit or idle reaper runs
+for it; they all start when the turn starts. After a daemon restart queued
+turns are still queued, in their original order.
+
+```
+$ choco task status 7d22e1a8-…
+…
+Stage   internal_review
+Queued  internal_review, 2nd in line for the server's 2 agent slots (both busy), since 14:02 UTC
+
+$ choco task list
+TITLE   ID        STATUS            WORKFLOW     CREATED
+add-x   7d22e1a8  open · queued 2   coding-task  2026-08-01 12:33:51 UTC
+
+$ choco server status
+…
+agent slots   server 2/2 running, 3 queued; project acme 1/1 running, 0 queued
+queued        7d22e1a8-…  internal_review (2nd in line, server)  add-x
+```
+
+- `task status` has a `Queued:` line per waiting turn (a group's waiting
+  branches show `queued (2nd)` in the `Branches` table, with `-` as their time).
+  `task list` adds `· queued N` to the status cell (the place in line).
+- `server status` lists each pool as `running/limit, queued`, then each waiting
+  turn. If `config.yaml` cannot be read, nothing waiting starts and the line
+  `warning: queued turns cannot start: …` names the file; fix it and the queue
+  drains within seconds. A task whose turn was due to start at that moment
+  parks `stuck` with a reason naming the file; `choco task retry` it after the
+  fix.
+- A waiting task is `open`, not `stuck`: don't `retry`, `cancel` or `send` to
+  it. `cancel` removes its place in line.
+- `choco task retry` of a stuck task whose stage must wait says so: `It is
+  queued, 2nd in line.`
+- The timeline records `turn_queued`, `turn_dequeued` (with how long it waited)
+  and `turn_withdrawn` events.
 
 ## Scripting it
 

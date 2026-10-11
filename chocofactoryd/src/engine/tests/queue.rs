@@ -1168,14 +1168,18 @@ async fn retrying_into_a_full_pool_queues_the_turn_and_reports_its_place() {
     assert_eq!(outcome.queued, Some(1));
     assert_eq!(q.status(&a.id).await, "open");
     assert_eq!(q.rows().await.len(), 1);
-    // A queued task is open, so retrying it again is refused.
-    assert!(matches!(
-        q.engine
-            .retry_task(&a.id, RetryMode::Fresh)
-            .await
-            .unwrap_err(),
-        RetryTaskError::NotStuck(_)
-    ));
+    // A queued task is open, so retrying it again is refused, and the
+    // refusal names its place in line.
+    let err = q
+        .engine
+        .retry_task(&a.id, RetryMode::Fresh)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::Queued { position: 1, .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("1st in line"), "{err}");
 }
 
 // ---- test 11: a queued retry --resume resumes the recorded session --------

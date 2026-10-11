@@ -424,4 +424,94 @@ mod tests {
             .await;
         assert_eq!(response.status(), 409);
     }
+
+    // ---- max_agents ----
+
+    #[tokio::test]
+    async fn a_projects_agent_cap_round_trips_and_zero_removes_it() {
+        let server = TestServer::start().await;
+        let created: Value = server
+            .post("/projects", json!({ "name": "capped", "max_agents": 2 }))
+            .await
+            .json();
+        assert_eq!(created["max_agents"], 2);
+        let id = created["id"].as_str().unwrap().to_string();
+        let plain: Value = server
+            .post("/projects", json!({ "name": "plain" }))
+            .await
+            .json();
+        assert!(plain["max_agents"].is_null());
+
+        let listed: Value = server.get("/projects").await.json();
+        let caps: Vec<&Value> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| &p["max_agents"])
+            .collect();
+        assert!(
+            caps.contains(&&json!(2)) && caps.contains(&&Value::Null),
+            "{caps:?}"
+        );
+
+        // A PATCH with only the cap is accepted, and leaves the name alone.
+        let raised: Value = server
+            .patch(&format!("/projects/{id}"), json!({ "max_agents": 5 }))
+            .await
+            .json();
+        assert_eq!(raised["max_agents"], 5);
+        assert_eq!(raised["name"], "capped");
+        // A PATCH without the key leaves it alone.
+        let renamed: Value = server
+            .patch(&format!("/projects/{id}"), json!({ "name": "renamed" }))
+            .await
+            .json();
+        assert_eq!(renamed["max_agents"], 5);
+        // 0 stores no cap, and so does null.
+        let zero: Value = server
+            .patch(&format!("/projects/{id}"), json!({ "max_agents": 0 }))
+            .await
+            .json();
+        assert!(zero["max_agents"].is_null(), "{zero}");
+        server
+            .patch(&format!("/projects/{id}"), json!({ "max_agents": 3 }))
+            .await;
+        let null: Value = server
+            .patch(&format!("/projects/{id}"), json!({ "max_agents": null }))
+            .await
+            .json();
+        assert!(null["max_agents"].is_null(), "{null}");
+        // Created with 0 means no cap too.
+        let zero_create: Value = server
+            .post("/projects", json!({ "name": "zero", "max_agents": 0 }))
+            .await
+            .json();
+        assert!(zero_create["max_agents"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_project_cap_that_is_not_a_non_negative_integer_is_rejected() {
+        let server = TestServer::start().await;
+        for bad in [json!(-1), json!("two"), json!(1.5)] {
+            let response = server
+                .post("/projects", json!({ "name": "p", "max_agents": bad }))
+                .await;
+            assert!(
+                response.status() == 422 || response.status() == 400,
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_patch_is_rejected() {
+        let server = TestServer::start().await;
+        let project: Value = server
+            .post("/projects", json!({ "name": "p" }))
+            .await
+            .json();
+        let id = project["id"].as_str().unwrap();
+        let response = server.patch(&format!("/projects/{id}"), json!({})).await;
+        assert_eq!(response.status(), 400);
+    }
 }

@@ -310,7 +310,15 @@ def main():
         elif op == "sleep":
             time.sleep(step["seconds"])
         elif op == "wait_file":
+            # Gives up when the test is gone (its directory removed) so no
+            # process outlives it; a bound of two minutes backs that up.
+            give_up = time.monotonic() + 120
             while not os.path.exists(step["path"]):
+                if (
+                    not os.path.isdir(os.path.dirname(step["path"]))
+                    or time.monotonic() > give_up
+                ):
+                    sys.exit(1)
                 time.sleep(0.02)
         elif op == "emit_forever":
             while True:
