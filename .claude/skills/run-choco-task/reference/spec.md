@@ -34,9 +34,9 @@ Four more checks belong in the spec:
   or, if the operation can't be interrupted in a test, names the
   interrupt as an accepted cost, with the reason.
 - **A new value in a closed set.** When the change adds a value to an
-  enum, an event type or a status, list every exhaustive match or switch
-  over that set. Each one needs a case for the new value, so its file is in
-  scope.
+  enum, an event type or a status, list every match, parser or list over
+  that set, including ones with a catch-all arm the compiler won't flag.
+  Each one needs a case for the new value, so its file is in scope.
 - **A new rule in a prompt.** The spec requires the coder to run one
   probe of the rule on the production model the role runs in the workflow,
   in its lap, and to report the probe and its result.

@@ -274,10 +274,14 @@ async fn snapshot(g: &Group) -> (String, Option<String>, Value, usize, usize) {
             .await
             .unwrap()
             .len(),
+        // Task-level events only: a branch session kept live by the fixture
+        // can still append its own events between two snapshots.
         events::list_for_task(&g.pool, &g.task_id)
             .await
             .unwrap()
-            .len(),
+            .iter()
+            .filter(|e| e.session_id.is_none())
+            .count(),
     )
 }
 

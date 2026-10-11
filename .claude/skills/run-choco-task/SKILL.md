@@ -223,12 +223,12 @@ choco task create --project <p> --workflow coding-task-planned \
 
 - Keep `spec.md` outside the repository, in a temp directory, for example.
   The task reads only the text `--prompt` passes, not files in your checkout.
-- After creating, compare the `Base` line in `choco task status` with the
-  commit you wrote the spec against. If they differ and the commits between
-  them touch files the spec names, check the spec still holds.
 - Per-task overrides beat editing shared config:
   `--role-model <role>=<model>`, `--role-system-prompt-file <role>=<path>`,
   `--role-cli <role>=<cli>`.
+- After creating, compare the `Base` line in `choco task status` with the
+  commit you wrote the spec against. If they differ and the commits between
+  them touch files the spec names, check the spec still holds.
 - **Running a role on omp** (`--role-cli <role>=omp`): see
   [reference/spec.md](reference/spec.md#running-a-role-on-omp).
 - **Wait for the task to stop.** One command covers the whole run:
