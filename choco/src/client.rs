@@ -135,6 +135,8 @@ pub struct CreateTaskParams<'a> {
     pub config: Option<Value>,
     /// The `--base` value, sent only when given.
     pub base: Option<&'a str>,
+    /// The `--closes` issues, sent only when there are any.
+    pub closes: &'a [u64],
 }
 
 /// Assembles the task-level `config` object (design §5.5) from the CLI's
@@ -563,6 +565,9 @@ impl Client {
         if let Some(base) = params.base {
             body["base"] = json!(base);
         }
+        if !params.closes.is_empty() {
+            body["closes"] = json!(params.closes);
+        }
         match params.workflow {
             WorkflowArg::Name(name) => body["workflow_def"] = json!(name),
             WorkflowArg::File(path) => body["workflow_file"] = json!(path),
@@ -740,6 +745,7 @@ mod tests {
             prompt: "hi",
             config,
             base: None,
+            closes: &[],
         }
     }
 
@@ -751,6 +757,16 @@ mod tests {
         with.base = Some("origin/main");
         let body = body_of(client().create_task_request(&with));
         assert_eq!(body["base"], "origin/main");
+    }
+
+    #[test]
+    fn create_task_request_sends_closes_only_when_given() {
+        let body = body_of(client().create_task_request(&params(None)));
+        assert!(body.get("closes").is_none(), "{body}");
+        let mut with = params(None);
+        with.closes = &[152, 126];
+        let body = body_of(client().create_task_request(&with));
+        assert_eq!(body["closes"], json!([152, 126]));
     }
 
     fn body_of(req: reqwest::RequestBuilder) -> Value {

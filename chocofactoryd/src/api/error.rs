@@ -57,7 +57,8 @@ impl From<CreateTaskError> for ApiError {
             // The caller picked the workflow or the config that names the
             // unknown CLI. A task that already exists and is stuck on one
             // (global config edited since daemon start) is the same fault.
-            CreateTaskError::UnknownCli(_)
+            CreateTaskError::InvalidCloses(_)
+            | CreateTaskError::UnknownCli(_)
             | CreateTaskError::RoleRejected(_)
             | CreateTaskError::WorkflowDef(
                 WorkflowDefError::UnknownCli(_) | WorkflowDefError::RoleRejected(_),

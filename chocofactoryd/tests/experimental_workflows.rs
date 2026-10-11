@@ -263,3 +263,24 @@ fn the_docs_parallel_example_loads() {
         assert!(def.roles[role].read_only, "branch {n} role not read_only");
     }
 }
+
+/// The panel's internal reviewer reads the shipped reviewer prompt, so it is
+/// told which issues the pull request closes.
+#[test]
+fn the_panels_reviewer_is_told_the_closes_list() {
+    let wf = load(&exp().join("review-panel.yaml"));
+    let StageKind::Parallel { branches } = &wf.stages["review_panel"].kind else {
+        panic!("review_panel is not a parallel stage");
+    };
+    let (_, pf, _) = agent_turn_parts(&branches["internal_review"].def.kind);
+    let text = fs::read_to_string(pf.expect("internal_review prompt_file")).unwrap();
+    let payload = serde_json::json!({
+        "task": { "input": "i", "title": "t", "closes": "#7" },
+        "arrival": { "from": "", "outcome": "" },
+        "stages": {},
+    });
+    let (out, _) = chocofactoryd::template::render(&text, &payload).unwrap();
+    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(out.contains("closes exactly these issues: #7"), "{out}");
+    assert!(out.contains("nothing else can close an issue"), "{out}");
+}

@@ -614,8 +614,30 @@ pub enum ConfigPatchError {
     Db(sqlx::Error),
 }
 
+/// Checks the issue numbers a task is created to close: each at least 1, and
+/// none twice (the first repeated value is named).
+fn validate_closes(closes: &[u64]) -> Result<(), CreateTaskError> {
+    let mut seen = std::collections::HashSet::new();
+    for &n in closes {
+        if n == 0 {
+            return Err(CreateTaskError::InvalidCloses(
+                "closes has 0; issue numbers start at 1".to_string(),
+            ));
+        }
+        if !seen.insert(n) {
+            return Err(CreateTaskError::InvalidCloses(format!(
+                "closes names issue {n} twice"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum CreateTaskError {
+    /// The `closes` list holds a 0 or the same issue twice. Nothing was
+    /// written.
+    InvalidCloses(String),
     /// The task config's `roles.<name>.cli` names no known adapter.
     UnknownCli(UnknownCliError),
     /// A role's adapter can't run the role as the workflow and the task
@@ -667,6 +689,7 @@ pub enum CreateTaskError {
 impl fmt::Display for CreateTaskError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CreateTaskError::InvalidCloses(message) => write!(f, "{message}"),
             CreateTaskError::UnknownCli(err) => write!(f, "{err}"),
             CreateTaskError::RoleRejected(message) => write!(f, "{message}"),
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
@@ -1546,6 +1569,7 @@ impl WorkflowEngine {
             initial_input,
             config,
             None,
+            &[],
         )
         .await
     }
@@ -1570,6 +1594,7 @@ impl WorkflowEngine {
     /// branch, freshly fetched. Both are recorded on the row by the one
     /// INSERT. A `base` for a workflow without a worktree is an error; such a
     /// workflow resolves and fetches nothing.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_task_from(
         self: &Arc<Self>,
         project_id: &str,
@@ -1578,7 +1603,10 @@ impl WorkflowEngine {
         initial_input: &str,
         mut config: Value,
         base: Option<&str>,
+        closes: &[u64],
     ) -> Result<Task, CreateTaskError> {
+        // First of all, so a bad list creates nothing.
+        validate_closes(closes)?;
         // Before any read or write: an unknown `cli` in the task's own
         // config is rejected without creating anything.
         crate::adapter::check_task_config_clis(&config, self.registry())
@@ -1690,6 +1718,7 @@ impl WorkflowEngine {
                 workflow_sha256: Some(&workflow_sha256),
                 base_ref: resolved_base.as_ref().map(|b| b.base_ref.as_str()),
                 base_commit: resolved_base.as_ref().map(|b| b.base_commit.as_str()),
+                closes,
             },
         )
         .await?;
@@ -2951,7 +2980,11 @@ impl WorkflowEngine {
             // same treatment `task` gets, and for the same reason: nothing
             // has transitioned yet.
             let mut payload = json!({
-                "task": { "input": initial_input, "title": task.title },
+                "task": {
+                    "input": initial_input,
+                    "title": task.title,
+                    "closes": task.closes_ref_list(),
+                },
                 "arrival": { "from": "", "outcome": "" },
             });
             // An entry stage that is a `poll` gets its window in the same

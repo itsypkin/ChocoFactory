@@ -160,6 +160,9 @@ starting with the stage it began in:
 $ choco task status bb93ada3-...
 Title     ship the thing
 ...
+Closes    #152, #126
+Status    open
+...
 Stage     internal_review
 
 Progress
@@ -608,5 +611,11 @@ keeps the config it started with.
   from the repo's HEAD when it has no remote. A ref that doesn't resolve, or
   a failed or timed-out fetch, creates nothing. Only valid for a worktree
   workflow. `choco task status` shows the result on its `Base` line.
+- `--closes <n>` on `task create` names an issue the task's pull request
+  closes. An issue number is a positive whole number with no sign, no leading
+  zero and no `#` (`12`, not `#12`). Repeat the flag for several issues
+  (`--closes 152 --closes 126`); naming one twice, or 0, is rejected and
+  creates nothing. Without it the PR closes nothing, and a `#N` in the title
+  only links. `choco task status` shows the list on its `Closes` line.
 - `--base-url <url>` targets a daemon on a non-default port, e.g. one
   started with `CHOCOFACTORY_PORT=41500`.

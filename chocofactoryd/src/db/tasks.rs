@@ -11,7 +11,7 @@ macro_rules! columns {
     () => {
         "id, project_id, workflow_def, title, status, config, \
      worktree_repo, worktree_project, stuck_reason, kept_work, workflow_path, workflow_sha256, \
-     base_ref, base_commit, created_at, updated_at"
+     base_ref, base_commit, closes, created_at, updated_at"
     };
 }
 
@@ -31,6 +31,8 @@ struct TaskRow {
     workflow_sha256: Option<String>,
     base_ref: Option<String>,
     base_commit: Option<String>,
+    /// A JSON array of positive integers; anything else fails to decode.
+    closes: Json<Vec<std::num::NonZeroU64>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -52,6 +54,12 @@ impl From<TaskRow> for Task {
             workflow_sha256: row.workflow_sha256,
             base_ref: row.base_ref,
             base_commit: row.base_commit,
+            closes: row
+                .closes
+                .0
+                .into_iter()
+                .map(std::num::NonZeroU64::get)
+                .collect(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -77,6 +85,9 @@ pub struct NewTask<'a> {
     /// this one INSERT and never changed.
     pub base_ref: Option<&'a str>,
     pub base_commit: Option<&'a str>,
+    /// The issues the task's PR closes, in the order given; written by this
+    /// one INSERT and never changed.
+    pub closes: &'a [u64],
 }
 
 pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::Error> {
@@ -84,8 +95,8 @@ pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::E
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRow>(concat!(
         "INSERT INTO tasks (id, project_id, workflow_def, title, status, config, \
-         workflow_path, workflow_sha256, base_ref, base_commit, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
+         workflow_path, workflow_sha256, base_ref, base_commit, closes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING ",
         columns!()
     ))
@@ -98,6 +109,7 @@ pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::E
     .bind(new.workflow_sha256)
     .bind(new.base_ref)
     .bind(new.base_commit)
+    .bind(serde_json::to_string(new.closes).map_err(|e| sqlx::Error::Encode(Box::new(e)))?)
     .bind(now)
     .bind(now)
     .fetch_one(pool)
@@ -537,6 +549,7 @@ mod tests {
                     workflow_sha256: None,
                     base_ref: None,
                     base_commit: None,
+                    closes: &[],
                 },
             )
             .await
@@ -580,6 +593,7 @@ mod tests {
                     workflow_sha256: None,
                     base_ref: None,
                     base_commit: None,
+                    closes: &[],
                 },
             )
             .await
@@ -610,6 +624,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -652,6 +667,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -765,6 +781,7 @@ mod tests {
                 ),
                 base_ref: Some("origin/main"),
                 base_commit: Some("1e209f7000000000000000000000000000000000"),
+                closes: &[],
             },
         )
         .await
@@ -811,6 +828,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -932,6 +950,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -947,6 +966,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -1082,5 +1102,65 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, "cancelled");
         assert_eq!(updated.stuck_reason, None);
+    }
+
+    #[tokio::test]
+    async fn closes_round_trips_in_order_and_defaults_to_empty() {
+        let pool = connect_in_memory().await.unwrap();
+        let project_id = seed_project(&pool).await;
+        let created = create(
+            &pool,
+            NewTask {
+                project_id: &project_id,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
+                closes: &[152, 126],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.closes, vec![152, 126]);
+        assert_eq!(
+            get(&pool, &created.id).await.unwrap().unwrap().closes,
+            [152, 126]
+        );
+        assert_eq!(list(&pool, None, None).await.unwrap()[0].closes, [152, 126]);
+
+        // A row written without the column (as before migration 0015) reads
+        // back as an empty list.
+        sqlx::query(
+            "INSERT INTO tasks (id, project_id, workflow_def, title, status, config, \
+             created_at, updated_at) VALUES ('old', ?, 'chat', 'T', 'open', '{}', \
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&project_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            get(&pool, "old").await.unwrap().unwrap().closes,
+            Vec::<u64>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_closes_value_is_an_error_not_an_empty_list() {
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_open_task(&pool).await;
+        for bad in ["not json", "{}", "[0]", "[-1]", "[\"7\"]"] {
+            sqlx::query("UPDATE tasks SET closes = ? WHERE id = ?")
+                .bind(bad)
+                .bind(&task_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(get(&pool, &task_id).await.is_err(), "{bad} was accepted");
+            assert!(list(&pool, None, None).await.is_err(), "{bad} was listed");
+        }
     }
 }

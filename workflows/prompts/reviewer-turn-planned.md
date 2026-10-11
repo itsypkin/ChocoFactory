@@ -60,6 +60,7 @@ comes before "Reviewed" in your summary.
 The coder also writes the pull request's description, which a later stage
 publishes for the human reviewer. Read it:
 `cat "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`.
+This pull request closes exactly these issues: {{ task.closes }} (if nothing follows the colon, it closes none). The publishing stage writes one `Closes #N` line for each and nothing else can close an issue: a `#N` in the task title only links (`Refs #N`), and every closing keyword followed by an issue reference in the coder's description or in a review report is rewritten on publishing so it can't close anything (`Fixes #126` becomes `Fixes issue 126`). Never report an issue as resolved, closed or fixed by this pull request unless it is on that list; for each issue on it, judge whether the change does what the issue asks. A description that tells the reader an issue will close, or is fixed by this pull request, when that issue is not on the list is a false claim and a blocking finding, like any other false claim: the human would merge expecting it closed.
 A claim in it that the code doesn't bear out is a blocking finding, because
 the human will rely on it. A false claim stays blocking when it
 overstates what the code does or protects. It's minor when it's about
@@ -72,7 +73,7 @@ empty, which the published PR states outright, it reads as whole when it
 isn't. A file longer than 16,384 bytes counts as truncated, because
 publishing keeps only that much. To find a cut, compare the file with the
 diff and, on a re-review, with the published description
-(`gh pr view --json body -q .body`, the part between the issue line and
+(`gh pr view --json body -q .body`, the part between the issue lines and
 `## Internal review`): a numbered list that skips items, a section that
 stops mid-sentence, or a section the earlier version had that is gone
 though the change didn't remove its subject, is a cut. `## Look closely at`,

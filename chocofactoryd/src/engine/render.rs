@@ -142,14 +142,17 @@ impl WorkflowEngine {
     }
 
     /// The variables the engine itself sets on a `shell`/`poll` command
-    /// (#101): the task, workflow and stage, and the distinct `role=model`
-    /// pairs the task's sessions ran on.
+    /// (#101): the task, workflow and stage, the distinct `role=model`
+    /// pairs the task's sessions ran on, and the issues the task closes.
     async fn engine_env(
         &self,
         task_id: &str,
         definition: &WorkflowDefinition,
         stage_name: &str,
     ) -> Result<Vec<(String, String)>, EngineError> {
+        let task = tasks::get(&self.pool, task_id)
+            .await?
+            .ok_or(EngineError::NoSuchTask)?;
         let sessions = sessions::list_for_task(&self.pool, task_id).await?;
         let mut pairs: Vec<(String, String)> = sessions
             .into_iter()
@@ -174,6 +177,7 @@ impl WorkflowEngine {
             ("CHOCO_WORKFLOW".to_string(), definition.name.clone()),
             ("CHOCO_STAGE".to_string(), stage_name.to_string()),
             ("CHOCO_ROLE_MODELS".to_string(), role_models),
+            ("CHOCO_TASK_CLOSES".to_string(), task.closes_env()),
         ])
     }
 

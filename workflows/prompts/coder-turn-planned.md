@@ -1,4 +1,5 @@
 Task: {{ task.title }}
+Closes: {{ task.closes }}
 
 {{ stages.spec_check.summary }}
 

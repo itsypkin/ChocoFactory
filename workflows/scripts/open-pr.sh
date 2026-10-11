@@ -15,7 +15,8 @@
 # the 2 KB `stderr_tail` on the timeline keeps them.
 #
 # Inputs: PR_TASK_TITLE, PR_REVIEW_VERDICT, PR_REVIEW_REPORT (stage `env:`);
-# CHOCO_TASK_ID, CHOCO_WORKFLOW, CHOCO_ROLE_MODELS (the engine).
+# CHOCO_TASK_ID, CHOCO_WORKFLOW, CHOCO_ROLE_MODELS, CHOCO_TASK_CLOSES (the
+# engine; the last is the issue numbers the task closes, space separated).
 set -eu
 LC_ALL=C
 export LC_ALL
@@ -53,8 +54,8 @@ strip_markers() {
 
 # Rewrites every GitHub issue reference that follows a closing keyword, so
 # that agent text can never close an issue (#131). The rule: a PR body choco
-# writes has exactly one authoritative issue line, the one built from the task
-# title; no agent-written text may form "closing keyword + issue reference".
+# writes has only the issue lines built from the task's closes list, which the
+# operator set with `choco task create --closes`; no agent-written text may form "closing keyword + issue reference".
 # Why: merging PR #127 closed #84, because the reviewer's report said
 # "no Closes/Fixes/Resolves #84" and GitHub's parser ignores negation, slash
 # lists and the <details> fold.
@@ -269,6 +270,27 @@ splice() {
 T=$(printf '%s' "${PR_TASK_TITLE:-}" | tr '\n\r\t' '   ' | tr -s ' ' | sed 's/^ //; s/ $//')
 [ -n "$T" ] || die "the task has no title; refusing to open a PR named after the branch"
 
+# The issues the task closes (CHOCO_TASK_CLOSES, set by the engine). Checked
+# before any gh or git call so a malformed value publishes nothing.
+CLOSE_LINES=""
+SEEN=" "
+set -f
+for TOK in ${CHOCO_TASK_CLOSES:-}; do
+    case "$TOK" in
+    "" | *[!0-9]* | 0*)
+        set +f
+        die "CHOCO_TASK_CLOSES has '$TOK'; each entry must be an issue number such as 12; nothing was pushed"
+        ;;
+    esac
+    case "$SEEN" in
+    *" $TOK "*) continue ;;
+    esac
+    SEEN="$SEEN$TOK "
+    CLOSE_LINES="${CLOSE_LINES}Closes #$TOK
+"
+done
+set +f
+
 # Pushed only once the title is known good, so a task that is going to
 # escalate does not publish a branch first.
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
@@ -342,26 +364,39 @@ cap 1024 < "$TMP/push-err" >&2
 NEW_TIP=$(git rev-parse HEAD) || die "cannot read HEAD"
 printf '%s %s\n' "$BRANCH" "$NEW_TIP" >> "$PUSHED_FILE" || die "cannot record the pushed commit"
 
-ISSUE=$(printf '%s' "$T" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')
-if [ -n "$ISSUE" ]; then
-    ISSUE_LINE="Closes #$ISSUE"
-else
-    FIRST=$(printf '%s' "$T" | awk '{ if (match($0, /#[0-9]+/)) print substr($0, RSTART + 1, RLENGTH - 1) }')
-    if [ -n "$FIRST" ]; then
-        ISSUE_LINE="Refs #$FIRST"
-    else
-        ISSUE_LINE="No linked issue: the task's title names none."
-        note "no issue number in the task title"
-    fi
+# Every #N in the title (before any cut) that is not already closed becomes a
+# "Refs" line; the title never closes anything.
+REFS=$(printf '%s' "$T" | awk -v seen="$SEEN" '
+    {
+        s = $0
+        while (match(s, /#[1-9][0-9]*/)) {
+            n = substr(s, RSTART + 1, RLENGTH - 1)
+            s = substr(s, RSTART + RLENGTH)
+            if (index(seen, " " n " ") == 0 && !(n in done)) {
+                done[n] = 1
+                print "Refs #" n
+            }
+        }
+    }')
+ISSUE_LINES="$CLOSE_LINES"
+if [ -n "$REFS" ]; then
+    ISSUE_LINES="$ISSUE_LINES$REFS
+"
 fi
+if [ -z "$ISSUE_LINES" ]; then
+    ISSUE_LINES="No linked issue: the task closes none and its title names none.
+"
+    note "no issue to close or link"
+fi
+TRAIL=$(printf '%s' "$T" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p')
 
 # GitHub caps a title at 256 characters, and a long one is unreadable in a
 # list: keep it to 100 bytes at a word boundary, preserving a trailing "(#N)".
 TLEN=$(printf '%s' "$T" | wc -c | tr -d ' ')
 if [ "$TLEN" -gt 100 ]; then
     SUFFIX=""
-    if [ -n "$ISSUE" ]; then
-        SUFFIX=" (#$ISSUE)"
+    if [ -n "$TRAIL" ]; then
+        SUFFIX=" (#$TRAIL)"
     fi
     BASE=${T%"$SUFFIX"}
     SLEN=$(printf '%s' "$SUFFIX" | wc -c | tr -d ' ')
@@ -396,7 +431,7 @@ DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
 
 {
     printf '%s\n' "$BEGIN"
-    printf '%s\n' "$ISSUE_LINE"
+    printf '%s' "$ISSUE_LINES"
     printf '\n'
     if [ -f "$DESC" ] && grep -q '[^[:space:]]' "$DESC"; then
         # Stepwise through files, not one pipe: a pipe's status is its last

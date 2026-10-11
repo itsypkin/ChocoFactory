@@ -17,8 +17,9 @@ Run `git status --short` before you start and again before you report: the two
 must match. If they don't, restore only what you changed and say so under
 Checks.
 
-If the task's title ends in an issue reference such as `(#12)`, read that
-issue and its comments (`gh issue view 12 --json title,body,comments`). Read the
+Read every issue the task closes (the `Closes:` line of your turn prompt)
+and every issue its title names, with their comments
+(`gh issue view 12 --json title,body,comments`). Read the
 repository's own instructions (CLAUDE.md, AGENTS.md, CONTRIBUTING) too:
 their rules apply to the change.
 

@@ -700,6 +700,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -822,6 +823,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -870,6 +872,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -952,6 +955,7 @@ mod tests {
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: &[],
         };
         let first = tasks::create(&pool, new_task("A")).await.unwrap().id;
         let second = tasks::create(&pool, new_task("B")).await.unwrap().id;
@@ -994,6 +998,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -1046,6 +1051,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await
@@ -1119,6 +1125,7 @@ mod tests {
                 workflow_sha256: None,
                 base_ref: None,
                 base_commit: None,
+                closes: &[],
             },
         )
         .await

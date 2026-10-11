@@ -59,6 +59,7 @@ fn summary(
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: vec![],
             created_at: mins_ago(500),
             updated_at: mins_ago(60),
         },
@@ -1798,6 +1799,26 @@ fn the_status_view_shows_fields_progress_counters_and_the_event_tail() {
     ]
     .join("\n");
     assert_screen(&render(&app, 100, 30), &expected);
+}
+
+#[test]
+fn the_dashboard_status_view_leaves_out_the_closes_row() {
+    let mut app = board();
+    open_detail(&mut app, BUSY);
+    let mut detail = busy_detail();
+    detail["closes"] = json!([152, 126]);
+    assert!(
+        crate::render::task_fields(&detail)
+            .iter()
+            .any(|(l, _)| *l == crate::render::LABEL_CLOSES)
+    );
+    answer(&mut app, BUSY, Ok(detail));
+    let screen = render(&app, 100, 30);
+    assert!(screen.contains("Status    open"), "{screen}");
+    assert!(
+        !screen.contains("Closes") && !screen.contains("#152"),
+        "{screen}"
+    );
 }
 
 fn with_detail_status(mut v: Value, status: &str, stage: &str) -> Value {

@@ -26,7 +26,9 @@ Read this while watching a task, when its behaviour surprises you.
   which PR comments are new by comparing their times with its last commit,
   and it can get that wrong across time zones, so a comment of yours may be
   treated as already handled.
-- **internal_review.** The reviewer can't use the file-editing tools, and a
+- **internal_review.** The reviewer is told the task's closes list and treats
+  a description that claims the PR closes any other issue as a false claim.
+  The reviewer can't use the file-editing tools, and a
   turn that changes HEAD or `git status` anyway parks the task as `stuck`,
   with the change left in place for you to inspect (same coverage and gaps
   as `spec_check`: not ignored paths, not anything inside `.git`). Before it
@@ -42,7 +44,9 @@ Read this while watching a task, when its behaviour surprises you.
   items the coder ignored.
 - **open_pr.** Pushes the branch `task/<task-id>` and opens or refreshes the
   PR. The title comes from the task title; the body is the coder's own
-  description plus the internal reviewer's report. A closing keyword followed
+  description plus the internal reviewer's report. The issue lines at the top
+  come from the task's `--closes` list (`Closes #N` each); a `#N` in the title
+  only gives `Refs #N`. A closing keyword followed
   by an issue reference in the body is rewritten so it can't close anything,
   but markdown-wrapped forms (`**Fixes** #N`, `[#N](url)`, `GH-N`) aren't
   verified. Commit messages are not rewritten at all: the coder is told not

@@ -155,14 +155,25 @@ impl Fixture {
     }
 
     fn run(&self, title: &str, verdict: &str, report: &str) -> Output {
+        self.run_closes(title, Some(""), verdict, report)
+    }
+
+    /// Like `run`, with `CHOCO_TASK_CLOSES` set to `closes`, or removed from
+    /// the environment for `None`. The variable is always set or removed
+    /// explicitly, so one in the outer environment never leaks in.
+    fn run_closes(&self, title: &str, closes: Option<&str>, verdict: &str, report: &str) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/scripts/open-pr.sh");
         let path = format!(
             "{}:{}",
             self.root.join("bin").display(),
             std::env::var("PATH").unwrap()
         );
-        Command::new(script)
-            .current_dir(&self.wt)
+        let mut cmd = Command::new(script);
+        match closes {
+            Some(value) => cmd.env("CHOCO_TASK_CLOSES", value),
+            None => cmd.env_remove("CHOCO_TASK_CLOSES"),
+        };
+        cmd.current_dir(&self.wt)
             .env("PATH", path)
             .env("GH_FAKE_DIR", self.root.join("gh"))
             .env("PR_TASK_TITLE", title)
@@ -250,7 +261,12 @@ fn hostile(dir: &Path) -> String {
 fn first_lap_creates_a_named_described_pr() {
     let fx = Fixture::new();
     fx.write_description(b"## Problem\nIt was broken.\n");
-    let out = fx.run("Name the PRs (#101)", "approved", "All good.\nSecond line.");
+    let out = fx.run_closes(
+        "Name the PRs (#101)",
+        Some("101"),
+        "approved",
+        "All good.\nSecond line.",
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stdout(&out), READ_BACK);
 
@@ -313,31 +329,145 @@ fn hostile_text_is_never_parsed_by_a_shell() {
     }
 }
 
+fn pr_body(fx: &Fixture) -> String {
+    String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap()
+}
+
+fn body_with_closes(title: &str, closes: Option<&str>) -> (String, String) {
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    let out = fx.run_closes(title, closes, "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    (pr_body(&fx), stderr(&out))
+}
+
 #[test]
-fn the_issue_line_follows_the_title() {
-    let fx = Fixture::new();
-    fx.write_description(b"d\n");
-    let out = fx.run("Fix it (#101)", "approved", "r");
-    assert!(out.status.success());
-    let body = String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap();
-    assert!(body.contains("\nCloses #101\n"));
-    assert!(!stderr(&out).contains("no issue number"));
+fn the_closes_list_makes_the_closing_lines_at_the_top_of_the_block() {
+    let (body, _) = body_with_closes("Do things", Some("152 126 130"));
+    assert!(
+        body.starts_with(&format!(
+            "{BEGIN}\nCloses #152\nCloses #126\nCloses #130\n\n"
+        )),
+        "{body}"
+    );
+    assert_eq!(body.matches("Closes").count(), 3);
+}
 
-    let fx = Fixture::new();
-    fx.write_description(b"d\n");
-    let out = fx.run("Part of #101 and #7 here", "approved", "r");
-    assert!(out.status.success());
-    let body = String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap();
-    assert!(body.contains("\nRefs #101\n"));
-    assert!(!body.contains("Closes"));
+#[test]
+fn a_repeated_number_gives_one_closing_line() {
+    let (body, _) = body_with_closes("Do things", Some("5 5"));
+    assert_eq!(body.matches("Closes #5\n").count(), 1, "{body}");
+}
 
+#[test]
+fn a_number_in_the_title_only_links_when_nothing_is_closed() {
+    for closes in [Some(""), None] {
+        let (body, _) = body_with_closes("Fix X (#42)", closes);
+        assert!(body.contains("\nRefs #42\n"), "{body}");
+        assert!(!body.contains("Closes"), "{body}");
+    }
+}
+
+#[test]
+fn a_closed_number_in_the_title_is_not_linked_as_well() {
+    let (body, _) = body_with_closes("Fix X (#42)", Some("42"));
+    assert!(body.contains("\nCloses #42\n"), "{body}");
+    assert!(!body.contains("Refs #42"), "{body}");
+}
+
+#[test]
+fn every_distinct_title_number_gets_one_refs_line_in_title_order() {
+    let (body, _) = body_with_closes("Part of #3 and #4, again #3", Some(""));
+    assert_eq!(body.matches("Refs #").count(), 2, "{body}");
+    assert!(body.contains("\nRefs #3\nRefs #4\n"), "{body}");
+    // A leading zero is not an issue number.
+    let (body, _) = body_with_closes("Odd #012", Some(""));
+    assert!(!body.contains("Refs"), "{body}");
+}
+
+#[test]
+fn closes_lines_come_before_refs_lines() {
+    let (body, _) = body_with_closes("Part of #3 (#4)", Some("9 4"));
+    assert!(
+        body.starts_with(&format!("{BEGIN}\nCloses #9\nCloses #4\nRefs #3\n\n")),
+        "{body}"
+    );
+}
+
+#[test]
+fn agent_text_cannot_close_anything_beyond_the_closes_list() {
+    let fx = Fixture::new();
+    fx.write_description(b"Fixes #126\n");
+    let out = fx.run_closes("Do things", Some("152"), "approved", "Resolves #84");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = pr_body(&fx);
+    assert!(body.contains("Fixes issue 126"), "{body}");
+    assert!(body.contains("Resolves issue 84"), "{body}");
+    assert!(!body.contains("Fixes #126") && !body.contains("Resolves #84"));
+    let found: Vec<_> = closing_regex()
+        .find_iter(&body)
+        .map(|m| m.as_str().trim().to_string())
+        .collect();
+    assert_eq!(found, vec!["Closes #152"], "{body}");
+}
+
+#[test]
+fn no_closes_and_no_title_number_says_so() {
+    let (body, err) = body_with_closes("No number here", Some(""));
+    assert!(
+        body.contains("\nNo linked issue: the task closes none and its title names none.\n"),
+        "{body}"
+    );
+    assert!(!body.contains("Closes"), "{body}");
+    assert!(
+        err.contains("choco open-pr: note: no issue to close or link"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_malformed_closes_value_fails_before_anything_is_pushed() {
+    for bad in ["12 abc", "0", "#12", "012", "*"] {
+        let fx = Fixture::new();
+        fx.write_description(b"d\n");
+        let out = fx.run_closes("Fix X", Some(bad), "approved", "r");
+        assert!(!out.status.success(), "{bad}");
+        let tok = bad.split(' ').next_back().unwrap();
+        let err = stderr(&out);
+        assert!(
+            err.contains(&format!("CHOCO_TASK_CLOSES has '{tok}'")),
+            "{bad}: {err}"
+        );
+        assert!(stdout(&out).is_empty());
+        assert!(fx.calls().is_empty(), "{bad}: gh was called");
+        let remote = git(&fx.root.join("origin.git"), &["branch", "--list", "task/*"]);
+        assert!(
+            remote.trim().is_empty(),
+            "{bad}: branch was pushed: {remote}"
+        );
+    }
+}
+
+#[test]
+fn a_refresh_turns_an_old_closing_line_into_a_link_and_keeps_human_text() {
     let fx = Fixture::new();
     fx.write_description(b"d\n");
-    let out = fx.run("No number here", "approved", "r");
-    assert!(out.status.success());
-    let body = String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap();
-    assert!(body.contains("\nNo linked issue: the task's title names none.\n"));
-    assert!(stderr(&out).contains("choco open-pr: note: no issue number in the task title"));
+    fx.cfg("open-number", "7\n");
+    fx.cfg(
+        "body",
+        &format!("human intro\n{BEGIN}\nCloses #42\n\nold\n{END}\nhuman outro\n"),
+    );
+    let out = fx.run_closes("Fix X (#42)", Some(""), "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let edits = fx.calls_to("pr edit");
+    assert_eq!(edits.len(), 1);
+    let body = String::from_utf8(edits[0].body.clone().unwrap()).unwrap();
+    assert!(
+        body.contains("\nRefs #42\n") && !body.contains("Closes"),
+        "{body}"
+    );
+    assert!(body.starts_with("human intro\n"), "{body}");
+    assert!(body.ends_with("\nhuman outro\n"), "{body}");
 }
 
 #[test]
@@ -637,11 +767,15 @@ fn closing_regex() -> regex::Regex {
 const AGENT_LINES: &str = "Its message has no Closes/Fixes/Resolves #84.\nfixes: #12\nCloses owner/repo#3\ncloses https://github.com/o/r/issues/5\nFIXED #6\nresolved:#7\ncloses http://www.github.com/o/r/issues/55/\nfixes https://github.com/o/r/issues/6#issuecomment-1 tail\nresolves github.com/o/r/issues/7?x=1\nfixed:\n#78\nfixes #1 and closes #2\nFixes GH-13\nfixes gh-17\nFixes <https://github.com/o/r/issues/21>\nFixes [#12](https://github.com/o/r/issues/12)\nFixes [issue 18](https://github.com/o/r/issues/18)\nFixes [x](https://github.com/o/r/issues/4 \"title\")\nFixes [x](<https://github.com/o/r/issues/4>)\nFixes [x]( https://github.com/o/r/issues/4 )\nFixes [x](https://github.com/o/r/issues/4 'title')\nFixes [x](https://github.com/o/r/issues/4 (title))\nFixes gh-1/repo#3";
 
 fn body_for(title: &str, desc: Option<&[u8]>, report: &str) -> String {
+    body_for_closes(title, "", desc, report)
+}
+
+fn body_for_closes(title: &str, closes: &str, desc: Option<&[u8]>, report: &str) -> String {
     let fx = Fixture::new();
     if let Some(d) = desc {
         fx.write_description(d);
     }
-    let out = fx.run(title, "approved", report);
+    let out = fx.run_closes(title, Some(closes), "approved", report);
     assert!(out.status.success(), "{}", stderr(&out));
     String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap()
 }
@@ -672,7 +806,7 @@ fn assert_rewritten(body: &str) {
 
 #[test]
 fn the_84_regression_report_cannot_close_issues() {
-    let body = body_for("T (#131)", Some(b"d\n"), AGENT_LINES);
+    let body = body_for_closes("T (#131)", "131", Some(b"d\n"), AGENT_LINES);
     assert_rewritten(&body);
     assert_eq!(body.matches("Closes #131\n").count(), 1);
 }
@@ -680,7 +814,7 @@ fn the_84_regression_report_cannot_close_issues() {
 #[test]
 fn only_the_scripts_own_issue_line_matches_a_closing_pattern() {
     let re = closing_regex();
-    let body = body_for("T (#131)", Some(AGENT_LINES.as_bytes()), AGENT_LINES);
+    let body = body_for_closes("T (#131)", "131", Some(AGENT_LINES.as_bytes()), AGENT_LINES);
     let found: Vec<_> = re.find_iter(&body).map(|m| m.as_str().trim()).collect();
     assert_eq!(found, vec!["Closes #131"], "{body}");
     let body = body_for("T (#84 part 4)", Some(AGENT_LINES.as_bytes()), AGENT_LINES);
@@ -747,7 +881,7 @@ fn text_without_keywords_keeps_every_byte() {
 fn the_caps_still_hold_for_keyword_floods() {
     let big = "Fixes #1 ".repeat(12_000);
     assert!(big.len() > 100_000);
-    let body = body_for("T (#131)", Some(big.as_bytes()), &big);
+    let body = body_for_closes("T (#131)", "131", Some(big.as_bytes()), &big);
     assert!(body.len() < 60_000, "{} bytes", body.len());
     assert_eq!(body.matches("[truncated: ").count(), 2);
     let found: Vec<_> = closing_regex()

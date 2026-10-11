@@ -279,6 +279,8 @@ pub const LABEL_PROJECT: &str = "Project";
 pub const LABEL_WORKFLOW: &str = "Workflow";
 pub const LABEL_WORKFLOW_FILE: &str = "Workflow file";
 pub const LABEL_BASE: &str = "Base";
+/// Shown by `task status` only; the dashboard leaves it out.
+pub const LABEL_CLOSES: &str = "Closes";
 pub const LABEL_STATUS: &str = "Status";
 pub const LABEL_STUCK: &str = "Stuck";
 pub const LABEL_KEPT_WORKTREE: &str = "Kept worktree";
@@ -335,6 +337,20 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
             LABEL_BASE,
             format!("{base_ref} @ {}", &commit[..commit.len().min(7)]),
         ));
+    }
+    // The issues the task's PR closes; no line for a task that closes none.
+    if let Some(closes) = detail.get("closes").and_then(Value::as_array)
+        && !closes.is_empty()
+    {
+        let list = closes
+            .iter()
+            .map(|n| match n.as_u64() {
+                Some(n) => format!("#{n}"),
+                None => n.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        pairs.push((LABEL_CLOSES, list));
     }
     pairs.push((LABEL_STATUS, get("status").to_string()));
     // Right after Status, so the reason for a stuck task (X-4, #61) reads
@@ -2024,6 +2040,7 @@ mod tests {
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2232,6 +2249,24 @@ mod tests {
         });
         let rendered = task_detail(&detail, test_now());
         assert!(!rendered.contains("Workflow file"), "{rendered}");
+    }
+
+    #[test]
+    fn task_fields_list_the_closed_issues_right_after_base() {
+        let sha = "1e209f7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut detail = json!({
+            "id": "t1", "title": "x", "project_id": "p", "workflow_def": "chat",
+            "status": "open", "created_at": "2026-08-01T12:00:00Z",
+            "base_ref": "origin/main", "base_commit": sha,
+            "closes": [152, 126],
+        });
+        let fields = task_fields(&detail);
+        let base = fields.iter().position(|(l, _)| *l == LABEL_BASE).unwrap();
+        assert_eq!(fields[base + 1], (LABEL_CLOSES, "#152, #126".to_string()));
+        detail["closes"] = json!([]);
+        assert!(task_fields(&detail).iter().all(|(l, _)| *l != LABEL_CLOSES));
+        detail.as_object_mut().unwrap().remove("closes");
+        assert!(task_fields(&detail).iter().all(|(l, _)| *l != LABEL_CLOSES));
     }
 
     #[test]
@@ -2509,6 +2544,7 @@ mod tests {
             workflow_sha256: None,
             base_ref: None,
             base_commit: None,
+            closes: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

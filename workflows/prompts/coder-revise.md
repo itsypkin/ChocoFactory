@@ -1,4 +1,5 @@
 Task: {{ task.title }}
+Closes: {{ task.closes }}
 
 {{ task.input }}
 
@@ -112,7 +113,7 @@ around a heading.
 Keep every section the spec requires. If the branch has an open PR, first
 read its published description: set `N` as the `awaiting_human_review`
 entry does, then `[ -n "$N" ] && gh pr view "$N" --json body -q .body`.
-Only the part between the issue line and `## Internal review` is your
+Only the part between the issue lines and `## Internal review` is your
 description; carry into the file every edit a person made there that is
 still true.
 The self-check in step 2 of your instructions applies to every branch this
