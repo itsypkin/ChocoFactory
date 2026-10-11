@@ -241,6 +241,10 @@ pub struct WorkflowEngine {
     /// Decides whether an agent turn starts or queues, and holds the slots
     /// of the turns that are running.
     turn_gate: Arc<TurnGate>,
+    /// Every turn watcher this engine spawned, so a test can stop them all
+    /// at once the way a crash does.
+    #[cfg(test)]
+    watchers: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 #[derive(Debug)]
@@ -1406,6 +1410,8 @@ impl WorkflowEngine {
     ) -> Arc<Self> {
         Arc::new(Self {
             turn_gate: TurnGate::new(pool.clone(), global_config_path.clone()),
+            #[cfg(test)]
+            watchers: std::sync::Mutex::new(Vec::new()),
             pool,
             session_manager,
             task_locks: Mutex::new(HashMap::new()),
@@ -1421,6 +1427,17 @@ impl WorkflowEngine {
                 worktree::BASE_NETWORK_TIMEOUT.as_millis() as u64
             ),
         })
+    }
+
+    /// What a crash does to this engine's in-memory work: every turn watcher
+    /// stops, and the gate stops admitting. The database and the agent
+    /// processes are left as they are, for a restart sweep to find.
+    #[cfg(test)]
+    pub(crate) fn simulate_crash(&self) {
+        self.turn_gate.stop();
+        for handle in self.watchers.lock().unwrap().drain(..) {
+            handle.abort();
+        }
     }
 
     /// Shortens the per-call network timeout used when resolving a new

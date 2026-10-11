@@ -163,6 +163,13 @@ stages:
         /// with the global workflows directory `workflows_dir` already is.
         repo_dir: TempDir,
         pool: SqlitePool,
+        dispatcher: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.dispatcher.abort();
+        }
     }
 
     impl TestServer {
@@ -232,6 +239,13 @@ stages:
                 global_config_path,
                 Arc::clone(&events_notify),
             );
+            // The queue dispatcher, as the daemon runs it, but with a tick so
+            // long that only a wake can start a queued turn: a test that
+            // changes a cap proves the change wakes it.
+            engine
+                .turn_gate()
+                .set_tick(std::time::Duration::from_secs(3600));
+            let dispatcher = engine.start_dispatcher();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let state = AppState {
@@ -257,6 +271,7 @@ stages:
                 workflows_dir,
                 repo_dir: TempDir::new(),
                 pool,
+                dispatcher,
             }
         }
 

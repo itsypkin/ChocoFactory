@@ -614,7 +614,7 @@ impl WorkflowEngine {
         // This is also why the loader rejects `capture:` on such a stage:
         // with no watcher there is no moment at which it could be taken.
         if session_kind == SessionKind::SingleShot {
-            self.spawn_turn_watcher(
+            let watcher = self.spawn_turn_watcher(
                 task_id.to_string(),
                 Arc::clone(definition),
                 stage_name.to_string(),
@@ -626,6 +626,10 @@ impl WorkflowEngine {
                 }),
                 permit,
             );
+            #[cfg(test)]
+            self.watchers.lock().unwrap().push(watcher.abort_handle());
+            #[cfg(not(test))]
+            drop(watcher);
         }
         Ok(session.id)
     }

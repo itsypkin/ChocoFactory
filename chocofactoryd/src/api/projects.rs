@@ -514,4 +514,49 @@ mod tests {
         let response = server.patch(&format!("/projects/{id}"), json!({})).await;
         assert_eq!(response.status(), 400);
     }
+
+    #[tokio::test]
+    async fn raising_a_project_cap_wakes_the_dispatcher_at_once() {
+        // The test server's dispatcher ticks once an hour, so only the wake
+        // that `PATCH /projects/{id}` sends can start the queued turn.
+        let server = TestServer::start().await;
+        server.write_workflow(
+            "one",
+            "name: one\nroles:\n  r:\n    cli: claude\n    model: sonnet\nstages:\n  work:\n    kind: agent_turn\n    role: r\n    on: { done: finished }\n  finished:\n    kind: terminal\n",
+        );
+        let project: Value = server
+            .post("/projects", json!({ "name": "capped", "max_agents": 1 }))
+            .await
+            .json();
+        let project_id = project["id"].as_str().unwrap().to_string();
+        let create = |title: &'static str| {
+            let body = json!({
+                "project_id": project_id, "workflow_def": "one", "title": title, "prompt": "go",
+            });
+            let server = &server;
+            async move { server.post("/tasks", body).await.json() }
+        };
+        let first: Value = create("first").await;
+        let second: Value = create("second").await;
+        let second_id = second["id"].as_str().unwrap().to_string();
+        let detail: Value = server.get(&format!("/tasks/{second_id}")).await.json();
+        assert_eq!(detail["queued"][0]["position"], 1, "{detail}");
+        assert!(first["id"].is_string());
+
+        server
+            .patch(
+                &format!("/projects/{project_id}"),
+                json!({ "max_agents": 2 }),
+            )
+            .await;
+        crate::test_support::wait_until("the queued turn to start", || async {
+            let detail: Value = server.get(&format!("/tasks/{second_id}")).await.json();
+            if detail["queued"] == json!([]) {
+                Ok(())
+            } else {
+                Err(detail["queued"].to_string())
+            }
+        })
+        .await;
+    }
 }

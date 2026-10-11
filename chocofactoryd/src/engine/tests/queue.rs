@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::db::turn_queue::{self, QueueRow};
-use crate::engine::turns::{Claim, RowFate, TurnSpec, is_admissible, queue_row_fate};
+use crate::engine::turns::{Claim, Pass, RowFate, TurnSpec, is_admissible, queue_row_fate};
 use chocofactory_core::models::Project;
 
 const FLOW: &str = "name: qflow\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
@@ -921,7 +921,16 @@ impl Q {
         engine
     }
 
-    /// What `main` does at startup, before serving.
+    /// The old daemon dies, and the new one does what `main` does at
+    /// startup, before serving.
+    async fn crash_and_sweep(&self, engine: &Arc<WorkflowEngine>) {
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.abort();
+        }
+        self.engine.simulate_crash();
+        Q::sweep(engine).await;
+    }
+
     async fn sweep(engine: &Arc<WorkflowEngine>) {
         sessions::recover_stale_active_sessions(&engine.pool)
             .await
@@ -937,7 +946,28 @@ impl Q {
     /// An open task parked at `coding` with a workflow state, as if its turn
     /// had been entered.
     async fn task_at(&self, stage: &str, status: &str) -> Task {
-        let task = self.create_in_without_start("row").await;
+        self.task_with(stage, status, &self.flow.display().to_string(), json!({}))
+            .await
+    }
+
+    /// [`Self::task_at`] with the workflow file and the task config chosen.
+    async fn task_with(&self, stage: &str, status: &str, workflow: &str, config: Value) -> Task {
+        let task = tasks::create(
+            &self.pool,
+            tasks::NewTask {
+                project_id: &self.project.id,
+                workflow_def: "qflow",
+                title: "row",
+                config,
+                workflow_path: Some(workflow),
+                workflow_sha256: Some("0"),
+                base_ref: None,
+                base_commit: None,
+                closes: &[],
+            },
+        )
+        .await
+        .unwrap();
         workflow_state::create(
             &self.pool,
             &task.id,
@@ -1448,9 +1478,8 @@ async fn after_a_restart_queued_turns_are_still_queued_in_order_and_running_ones
     let c = q.create("job-c").await;
     let before: Vec<i64> = q.rows().await.iter().map(|r| r.id).collect();
     // The old daemon dies; the new one sweeps.
-    q.dispatcher.as_ref().unwrap().abort();
     let next = q.restarted_engine();
-    Q::sweep(&next).await;
+    q.crash_and_sweep(&next).await;
     assert_eq!(q.status(&a.id).await, "stuck", "the running turn is parked");
     assert_eq!(q.status(&b.id).await, "open");
     assert_eq!(q.status(&c.id).await, "open");
@@ -1585,9 +1614,8 @@ async fn a_queued_branch_survives_a_restart_while_its_running_siblings_are_parke
     let g = q.create_group().await;
     q.wait_started("one").await;
     q.wait_started("two").await;
-    q.dispatcher.as_ref().unwrap().abort();
     let next = q.restarted_engine();
-    Q::sweep(&next).await;
+    q.crash_and_sweep(&next).await;
     // The queued branch is neither failed nor parked; the group is still
     // waiting on it.
     assert_eq!(q.status(&g.id).await, "open");
@@ -1873,4 +1901,533 @@ async fn a_project_pool_is_listed_with_its_own_limit_and_counts() {
         (snapshot.pools[1].running, snapshot.pools[1].limit),
         (1, Some(2))
     );
+}
+
+// ---- the dispatcher's other branches ---------------------------------------
+
+#[tokio::test]
+async fn a_row_whose_task_has_no_workflow_state_is_withdrawn() {
+    let q = Q::new(Some(1)).await;
+    let task = q.task_row("job-n").await;
+    q.insert_row(&task.id, "coding").await;
+    q.wait_rows(0).await;
+    let withdrawn = q.queue_events(&task.id, EventType::TurnWithdrawn).await;
+    assert_eq!(withdrawn[0]["reason"], "the task has no workflow state");
+}
+
+#[tokio::test]
+async fn a_row_for_a_stage_that_is_not_an_agent_turn_is_withdrawn() {
+    let q = Q::new(Some(1)).await;
+    let task = q.task_at("finished", "open").await;
+    q.insert_row(&task.id, "finished").await;
+    q.wait_rows(0).await;
+    let withdrawn = q.queue_events(&task.id, EventType::TurnWithdrawn).await;
+    assert!(
+        withdrawn[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not an agent_turn"),
+        "{withdrawn:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_turn_whose_workflow_cannot_load_parks_the_task_and_deletes_its_row() {
+    let q = Q::new(Some(1)).await;
+    let task = q
+        .task_with("coding", "open", "/no/such/workflow.yaml", json!({}))
+        .await;
+    q.insert_row(&task.id, "coding").await;
+    q.wait_status(&task.id, "stuck").await;
+    q.wait_rows(0).await;
+    let reason = tasks::get(&q.pool, &task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap();
+    assert!(
+        reason.contains("failed to start after waiting in the queue")
+            && reason.contains("could not be loaded"),
+        "{reason}"
+    );
+    q.wait_running(0).await;
+}
+
+#[tokio::test]
+async fn a_queued_turn_that_fails_to_prepare_parks_the_task_and_deletes_its_row() {
+    let q = Q::new(Some(1)).await;
+    // The task's own config names a CLI nobody has.
+    let task = q
+        .task_with(
+            "coding",
+            "open",
+            &q.flow.display().to_string(),
+            json!({ "roles": { "coder": { "cli": "no-such-cli" } } }),
+        )
+        .await;
+    q.insert_row(&task.id, "coding").await;
+    q.wait_status(&task.id, "stuck").await;
+    q.wait_rows(0).await;
+    let reason = tasks::get(&q.pool, &task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap();
+    assert!(reason.contains("no-such-cli"), "{reason}");
+    assert!(q.sessions(&task.id).await.is_empty());
+    q.wait_running(0).await;
+}
+
+/// A group of three branches at cap 1: `one` runs, `two` and `three` wait.
+/// `edit` changes what the head row (`two`) says before `one` ends; the head
+/// is then refused, withdrawn with a reason containing `why`, and `three`
+/// takes the slot.
+async fn a_head_row_the_group_no_longer_matches(edit: impl AsyncFnOnce(&Q, &Task), why: &str) {
+    let q = Q::new(Some(1)).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = q.create_group().await;
+    q.wait_started("one").await;
+    assert_eq!(q.rows().await.len(), 2);
+    edit(&q, &g).await;
+    q.release("one");
+    q.wait_started("three").await;
+    let withdrawn = q.queue_events(&g.id, EventType::TurnWithdrawn).await;
+    assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+    assert_eq!(withdrawn[0]["stage"], "two");
+    assert!(withdrawn[0]["group"].is_string(), "{withdrawn:?}");
+    assert!(
+        withdrawn[0]["reason"].as_str().unwrap().contains(why),
+        "{withdrawn:?} should contain {why}"
+    );
+    // No turn was started for the refused branch.
+    assert!(!q.started("two"));
+}
+
+#[tokio::test]
+async fn a_queued_branch_that_has_already_settled_is_withdrawn() {
+    a_head_row_the_group_no_longer_matches(
+        async |q, g| {
+            // The branch's slot is settled while its row is still queued.
+            sqlx::query(
+                "UPDATE workflow_state SET payload = \
+                 json_set(payload, '$.parallel.branches.two.state', 'failed') \
+                 WHERE task_id = ?",
+            )
+            .bind(&g.id)
+            .execute(&q.pool)
+            .await
+            .unwrap();
+        },
+        "has already settled",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_queued_branch_of_an_earlier_entry_is_withdrawn() {
+    a_head_row_the_group_no_longer_matches(
+        async |q, _| {
+            sqlx::query("UPDATE turn_queue SET group_entry = 99 WHERE stage = 'two'")
+                .execute(&q.pool)
+                .await
+                .unwrap();
+        },
+        "entered again",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_queued_branch_of_another_group_is_withdrawn() {
+    a_head_row_the_group_no_longer_matches(
+        async |q, _| {
+            sqlx::query("UPDATE turn_queue SET group_stage = 'elsewhere' WHERE stage = 'two'")
+                .execute(&q.pool)
+                .await
+                .unwrap();
+        },
+        "moved on",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_queued_branch_that_somehow_has_a_live_session_is_withdrawn() {
+    a_head_row_the_group_no_longer_matches(
+        async |q, g| {
+            sessions::create(
+                &q.pool,
+                sessions::NewSession {
+                    task_id: &g.id,
+                    stage: "two",
+                    role: "coder",
+                    cli_adapter: "claude",
+                    model: "sonnet",
+                },
+            )
+            .await
+            .unwrap();
+        },
+        "live session",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_queued_branch_the_workflow_no_longer_declares_is_withdrawn() {
+    let q = Q::new(Some(1)).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = q.create_group().await;
+    q.wait_started("one").await;
+    // A running slot and a row for a branch the definition does not have.
+    sqlx::query(
+        "UPDATE workflow_state SET payload = json_set(payload, '$.parallel.branches.ghost', \
+         json('{\"state\":\"running\"}')) WHERE task_id = ?",
+    )
+    .bind(&g.id)
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM turn_queue")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    turn_queue::insert(
+        &q.pool,
+        turn_queue::NewQueueRow {
+            task_id: &g.id,
+            stage: "ghost",
+            group_stage: Some("panel"),
+            group_entry: Some(1),
+            resume_session_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    q.release("one");
+    q.wait_rows(0).await;
+    let withdrawn = q.queue_events(&g.id, EventType::TurnWithdrawn).await;
+    assert!(
+        withdrawn[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no longer in the workflow"),
+        "{withdrawn:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_queued_branch_that_fails_to_start_is_failed_in_its_group() {
+    let q = Q::new(Some(1)).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = q.create_group().await;
+    q.wait_started("one").await;
+    // The agent binary goes away: every queued branch fails when admitted.
+    fs::remove_file(q.dir.join("fake-claude-queue")).unwrap();
+    q.release("one");
+    q.wait_status(&g.id, "stuck").await;
+    q.wait_rows(0).await;
+    let state = workflow_state::get(&q.pool, &g.id).await.unwrap().unwrap();
+    for branch in ["two", "three"] {
+        assert_eq!(
+            state.payload["parallel"]["branches"][branch]["state"], "failed",
+            "{branch}"
+        );
+    }
+    q.wait_running(0).await;
+}
+
+#[tokio::test]
+async fn a_queued_retry_whose_session_cannot_be_resumed_parks_the_task() {
+    let q = Q::new(Some(1)).await;
+    // A session with no adapter session id: nothing to resume.
+    let task = q.task_at("coding", "open").await;
+    let old = sessions::create(
+        &q.pool,
+        sessions::NewSession {
+            task_id: &task.id,
+            stage: "coding",
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        },
+    )
+    .await
+    .unwrap();
+    turn_queue::insert(
+        &q.pool,
+        turn_queue::NewQueueRow {
+            task_id: &task.id,
+            stage: "coding",
+            group_stage: None,
+            group_entry: None,
+            resume_session_id: Some(&old.id),
+        },
+    )
+    .await
+    .unwrap();
+    q.wait_status(&task.id, "stuck").await;
+    let reason = tasks::get(&q.pool, &task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap();
+    assert!(reason.contains("has no adapter session id"), "{reason}");
+    q.wait_rows(0).await;
+
+    // With an adapter session id but no end reason, it is refused too.
+    let task = q.task_at("coding", "open").await;
+    let old = sessions::create(
+        &q.pool,
+        sessions::NewSession {
+            task_id: &task.id,
+            stage: "coding",
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        },
+    )
+    .await
+    .unwrap();
+    sessions::set_adapter_session_id(&q.pool, &old.id, "adapter-1")
+        .await
+        .unwrap();
+    turn_queue::insert(
+        &q.pool,
+        turn_queue::NewQueueRow {
+            task_id: &task.id,
+            stage: "coding",
+            group_stage: None,
+            group_entry: None,
+            resume_session_id: Some(&old.id),
+        },
+    )
+    .await
+    .unwrap();
+    q.wait_status(&task.id, "stuck").await;
+    let reason = tasks::get(&q.pool, &task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap();
+    assert!(reason.contains("has no end reason"), "{reason}");
+}
+
+#[tokio::test]
+async fn a_claim_for_a_task_that_does_not_exist_is_an_error() {
+    let q = Q::new(Some(1)).await;
+    let spec = TurnSpec {
+        stage: "coding",
+        group: None,
+        resume_session_id: None,
+    };
+    let err = q
+        .engine
+        .turn_gate()
+        .claim("no-such-task", &spec)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NoSuchTask), "{err}");
+    assert_eq!(q.engine.running_total(), 0);
+}
+
+// ---- a row that vanishes mid-admission, and a queue that cannot be written --
+
+#[tokio::test]
+async fn a_row_that_vanishes_between_the_pick_and_the_launch_starts_nothing() {
+    let q = Q::build(Some(1), queue_timers(), false).await;
+    q.script(&[("job-r", Ending::Report)]);
+    let task = q.task_at("coding", "open").await;
+    let id = q.insert_row(&task.id, "coding").await;
+    let picked = q
+        .engine
+        .turn_gate()
+        .pick(Some(id), false)
+        .await
+        .ok()
+        .unwrap();
+    let (row, permit) = (picked.row.unwrap(), picked.permit.unwrap());
+    assert_eq!(q.engine.running_total(), 1);
+    // Cancelled (or withdrawn) in the moment before the session insert.
+    assert!(turn_queue::delete(&q.pool, id).await.unwrap());
+    let pass = q.engine.admit(row, permit).await;
+    assert_eq!(pass, Pass::Progress);
+    assert!(q.sessions(&task.id).await.is_empty());
+    assert!(!q.started("job-r"), "no process was started");
+    assert_eq!(q.engine.running_total(), 0, "the permit was dropped");
+    assert_eq!(q.status(&task.id).await, "open", "nothing was failed");
+}
+
+#[tokio::test]
+async fn a_queue_that_cannot_be_written_leaves_the_dispatcher_idle_and_the_task_stuck() {
+    let q = Q::build(None, queue_timers(), false).await;
+    // A task whose queued turn will fail to prepare, with a permit in hand.
+    let task = q
+        .task_with(
+            "coding",
+            "open",
+            &q.flow.display().to_string(),
+            json!({ "roles": { "coder": { "cli": "no-such-cli" } } }),
+        )
+        .await;
+    q.insert_row(&task.id, "coding").await;
+    let row = q.rows().await.remove(0);
+    let spec = TurnSpec {
+        stage: "coding",
+        group: None,
+        resume_session_id: None,
+    };
+    let Claim::Start(permit) = q.engine.turn_gate().claim(&task.id, &spec).await.unwrap() else {
+        panic!("no cap: the turn starts");
+    };
+    // Now the queue table is gone: deleting the failed turn's row fails.
+    sqlx::query("DROP TABLE turn_queue")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    let pass = q.engine.admit(row, permit).await;
+    assert_eq!(
+        pass,
+        Pass::Idle,
+        "no hot loop on a row that cannot be deleted"
+    );
+    assert_eq!(
+        q.status(&task.id).await,
+        "stuck",
+        "the failure is still recorded"
+    );
+    assert_eq!(q.engine.running_total(), 0);
+
+    // And with the table gone the dispatcher cannot even read the queue: it
+    // goes idle rather than spinning.
+    let picked = q.engine.turn_gate().pick(None, true).await;
+    assert!(
+        matches!(picked, Err(crate::engine::turns::PickError::Db(_))),
+        "an unreadable queue is a read error"
+    );
+    assert_eq!(q.engine.dispatch_pass().await, Pass::Idle);
+}
+
+#[tokio::test]
+async fn withdrawing_a_row_that_cannot_be_deleted_goes_idle() {
+    let q = Q::build(None, queue_timers(), false).await;
+    let stuck = q.task_at("coding", "stuck").await;
+    let spec = TurnSpec {
+        stage: "coding",
+        group: None,
+        resume_session_id: None,
+    };
+    let Claim::Start(permit) = q.engine.turn_gate().claim(&stuck.id, &spec).await.unwrap() else {
+        panic!("no cap: the turn starts");
+    };
+    q.insert_row(&stuck.id, "coding").await;
+    let row = q.rows().await.remove(0);
+    sqlx::query("DROP TABLE turn_queue")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
+    assert_eq!(q.engine.running_total(), 0);
+}
+
+// ---- retry of a group clears its leftover rows ---------------------------
+
+#[tokio::test]
+async fn retrying_a_group_withdraws_a_leftover_row_instead_of_colliding_with_it() {
+    let q = Q::build(None, queue_timers(), false).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Crash),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = q.create_group().await;
+    for name in ["one", "two", "three"] {
+        q.wait_started(name).await;
+        q.release(name);
+    }
+    q.wait_status(&g.id, "stuck").await;
+    q.wait_running(0).await;
+    turn_queue::insert(
+        &q.pool,
+        turn_queue::NewQueueRow {
+            task_id: &g.id,
+            stage: "two",
+            group_stage: Some("panel"),
+            group_entry: Some(1),
+            resume_session_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    fs::remove_file(q.dir.join("release-two")).unwrap();
+    fs::remove_file(q.dir.join("started-two")).unwrap();
+    q.script_branches(&[("BRANCH-TWO", "two", Ending::Report)]);
+    let outcome = q.engine.retry_task(&g.id, RetryMode::Fresh).await.unwrap();
+    assert_eq!(outcome.branches[0].queued, None);
+    let withdrawn = q.queue_events(&g.id, EventType::TurnWithdrawn).await;
+    assert_eq!(withdrawn.len(), 1);
+    assert_eq!(withdrawn[0]["reason"], "retry");
+    assert!(q.rows().await.is_empty());
+    q.wait_started("two").await;
+}
+
+// ---- a turn's own slot does not hold up its next turn ----------------------
+
+const TWO_STEP_FLOW: &str = "name: qtwo\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    on: { done: reviewing }\n  reviewing:\n    kind: agent_turn\n    role: coder\n    prompt_file: second.md\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
+
+#[tokio::test]
+async fn a_tasks_next_turn_does_not_wait_for_its_own_previous_slot() {
+    // Cap 1 and nobody else: when the coder's turn ends, the same task's
+    // review turn takes the slot the coder just freed, in the call that
+    // advances the task. If the permit were still held while the turn's
+    // result is handled, the review would queue behind its own task.
+    let q = Q::new(Some(1)).await;
+    q.script(&[("job-t", Ending::Report)]);
+    let two = q.dir.join("qtwo.yaml");
+    fs::write(&two, TWO_STEP_FLOW).unwrap();
+    fs::write(q.dir.join("second.md"), "job-t again").unwrap();
+    let task = q
+        .engine
+        .create_task_from(
+            &q.project.id,
+            WorkflowRef::File(two),
+            "two steps",
+            "job-t",
+            json!({}),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+    q.wait_started("job-t").await;
+    q.release("job-t");
+    q.wait_status(&task.id, "closed").await;
+    assert_eq!(q.sessions(&task.id).await.len(), 2, "both turns ran");
+    for kind in [
+        EventType::TurnQueued,
+        EventType::TurnDequeued,
+        EventType::TurnWithdrawn,
+    ] {
+        assert!(
+            q.queue_events(&task.id, kind).await.is_empty(),
+            "the follow-up turn queued behind its own task: {kind}"
+        );
+    }
+    assert!(q.rows().await.is_empty());
 }

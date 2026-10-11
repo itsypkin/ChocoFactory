@@ -401,7 +401,7 @@ impl TurnGate {
     /// head of its pool and whose pool has a free slot; with `issue_for`, it
     /// only counts when it is that row, and the permit is issued in the same
     /// critical section.
-    async fn pick(
+    pub(super) async fn pick(
         self: &Arc<Self>,
         issue_for: Option<i64>,
         withdraw: bool,
@@ -478,7 +478,7 @@ impl TurnGate {
 
 /// A queue row dropped without starting.
 #[derive(Debug)]
-struct Withdrawn {
+pub(super) struct Withdrawn {
     task_id: String,
     stage: String,
     group: Option<String>,
@@ -486,13 +486,13 @@ struct Withdrawn {
 }
 
 #[derive(Default)]
-struct Picked {
+pub(super) struct Picked {
     withdrawn: Vec<Withdrawn>,
-    row: Option<QueueRow>,
-    permit: Option<TurnPermit>,
+    pub(super) row: Option<QueueRow>,
+    pub(super) permit: Option<TurnPermit>,
 }
 
-enum PickError {
+pub(super) enum PickError {
     /// `config.yaml` cannot be read; carries the error.
     Config(String),
     Db(sqlx::Error),
@@ -500,7 +500,7 @@ enum PickError {
 
 /// What the dispatcher did in one pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pass {
+pub(super) enum Pass {
     /// Something changed; look again at once.
     Progress,
     /// Nothing can start now; wait for a wake or the tick.
@@ -711,7 +711,7 @@ impl WorkflowEngine {
     ///    insert are one transaction.
     /// 5. On a prepare or launch failure, fail the stage or branch as a
     ///    detached failure is failed, then delete the row.
-    async fn dispatch_pass(self: &Arc<Self>) -> Pass {
+    pub(super) async fn dispatch_pass(self: &Arc<Self>) -> Pass {
         let candidate = match self.turn_gate.pick(None, true).await {
             Ok(picked) => {
                 self.record_withdrawn(&picked.withdrawn).await;
@@ -802,7 +802,7 @@ impl WorkflowEngine {
     }
 
     /// Steps 3-5 of the pass, under the task lock, holding `permit`.
-    async fn admit(self: &Arc<Self>, row: QueueRow, permit: TurnPermit) -> Pass {
+    pub(super) async fn admit(self: &Arc<Self>, row: QueueRow, permit: TurnPermit) -> Pass {
         let task_id = row.task_id.as_str();
         let stage = row.stage.as_str();
         macro_rules! read {
