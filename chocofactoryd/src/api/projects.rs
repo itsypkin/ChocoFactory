@@ -40,6 +40,10 @@ fn validate_repo_path(repo_path: &str) -> Result<(), ApiError> {
 pub struct CreateProjectRequest {
     pub name: String,
     pub repo_path: Option<String>,
+    /// The project's own cap on agent turns running at once; `0` or absent:
+    /// the project shares the server's cap.
+    #[serde(default)]
+    pub max_agents: Option<u32>,
 }
 
 pub async fn create(
@@ -49,7 +53,13 @@ pub async fn create(
     if let Some(repo_path) = &body.repo_path {
         validate_repo_path(repo_path)?;
     }
-    let project = projects::create(&state.pool, &body.name, body.repo_path.as_deref()).await?;
+    let project = projects::create_capped(
+        &state.pool,
+        &body.name,
+        body.repo_path.as_deref(),
+        body.max_agents,
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -78,6 +88,9 @@ pub struct UpdateProjectRequest {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub repo_path: Option<Option<String>>,
+    /// Absent: unchanged. `0` or `null`: remove the project's own cap.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub max_agents: Option<Option<u32>>,
 }
 
 pub async fn update(
@@ -85,18 +98,30 @@ pub async fn update(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UpdateProjectRequest>,
 ) -> Result<Json<Project>, ApiError> {
-    if body.name.is_none() && body.repo_path.is_none() {
+    if body.name.is_none() && body.repo_path.is_none() && body.max_agents.is_none() {
         return Err(ApiError::BadRequest(
-            "PATCH /projects/{id} requires at least one of 'name'/'repo_path'".to_string(),
+            "PATCH /projects/{id} requires at least one of 'name'/'repo_path'/'max_agents'"
+                .to_string(),
         ));
     }
     if let Some(Some(repo_path)) = &body.repo_path {
         validate_repo_path(repo_path)?;
     }
     let repo_path = body.repo_path.as_ref().map(|inner| inner.as_deref());
-    let project = projects::update(&state.pool, &id, body.name.as_deref(), repo_path)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("no such project '{id}'")))?;
+    let project = projects::update_capped(
+        &state.pool,
+        &id,
+        body.name.as_deref(),
+        repo_path,
+        body.max_agents,
+    )
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("no such project '{id}'")))?;
+    if body.max_agents.is_some() {
+        // A raised or removed cap, or a project leaving the server pool, can
+        // let queued turns start.
+        state.engine.wake_dispatcher();
+    }
     Ok(Json(project))
 }
 

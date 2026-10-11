@@ -20,6 +20,9 @@ use crate::fileref::{self, FileRefError};
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GlobalConfig {
     pub roles: HashMap<String, GlobalRoleConfig>,
+    /// The server pool's cap on agent turns running at once. `None`: no
+    /// limit (the key is absent, null or `0`).
+    pub max_agents: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -54,10 +57,18 @@ impl GlobalConfig {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
-            Err(err) => return Err(GlobalConfigError::Io(err)),
+            Err(err) => {
+                return Err(GlobalConfigError::Io {
+                    path: path.to_path_buf(),
+                    source: err,
+                });
+            }
         };
         let parsed: RawGlobalConfig =
-            serde_yaml::from_str(&raw).map_err(GlobalConfigError::Yaml)?;
+            serde_yaml::from_str(&raw).map_err(|source| GlobalConfigError::Yaml {
+                path: path.to_path_buf(),
+                source,
+            })?;
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
         let roles = parsed
@@ -92,7 +103,10 @@ impl GlobalConfig {
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
 
-        Ok(GlobalConfig { roles })
+        Ok(GlobalConfig {
+            roles,
+            max_agents: parsed.max_agents.filter(|n| *n > 0),
+        })
     }
 }
 
@@ -133,6 +147,10 @@ struct RawGlobalConfig {
         deserialize_with = "crate::serde_util::deserialize_map_rejecting_duplicate_keys"
     )]
     roles: IndexMap<String, RawGlobalRoleConfig>,
+    /// A non-negative integer; anything else (`-1`, `two`, `1.5`) is a parse
+    /// error, never "no limit".
+    #[serde(default)]
+    max_agents: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,8 +165,14 @@ struct RawGlobalRoleConfig {
 
 #[derive(Debug)]
 pub enum GlobalConfigError {
-    Io(std::io::Error),
-    Yaml(serde_yaml::Error),
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Yaml {
+        path: PathBuf,
+        source: serde_yaml::Error,
+    },
     InvalidFileReference { role: String, value: String },
     MissingReferencedFile { role: String, path: PathBuf },
 }
@@ -156,8 +180,12 @@ pub enum GlobalConfigError {
 impl fmt::Display for GlobalConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GlobalConfigError::Io(err) => write!(f, "failed to read global config: {err}"),
-            GlobalConfigError::Yaml(err) => write!(f, "failed to parse global config: {err}"),
+            GlobalConfigError::Io { path, source } => {
+                write!(f, "failed to read global config {}: {source}", path.display())
+            }
+            GlobalConfigError::Yaml { path, source } => {
+                write!(f, "failed to parse global config {}: {source}", path.display())
+            }
             GlobalConfigError::InvalidFileReference { role, value } => write!(
                 f,
                 "role '{role}' references system_prompt_file '{value}', which is an absolute path or escapes the global config's directory"
@@ -216,7 +244,7 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.write("config.yaml", "roles: [not, a, map]\n");
         let err = GlobalConfig::load(&path).unwrap_err();
-        assert!(matches!(err, GlobalConfigError::Yaml(_)));
+        assert!(matches!(err, GlobalConfigError::Yaml { .. }));
     }
 
     #[test]
@@ -283,7 +311,7 @@ mod tests {
             "roles:\n  chat:\n    model: opus\n  chat:\n    cli: claude\n",
         );
         let err = GlobalConfig::load(&path).unwrap_err();
-        assert!(matches!(err, GlobalConfigError::Yaml(_)));
+        assert!(matches!(err, GlobalConfigError::Yaml { .. }));
         assert!(err.to_string().contains("duplicate key"));
     }
 
@@ -325,5 +353,40 @@ mod tests {
         assert!(check_known_clis(Some(&model_only), &registry).is_ok());
         let malformed = dir.write("bad.yaml", "roles: [not, a, map");
         assert!(check_known_clis(Some(&malformed), &registry).is_ok());
+    }
+
+    #[test]
+    fn max_agents_absent_null_and_zero_mean_no_limit() {
+        let dir = TempDir::new();
+        for body in ["roles: {}\n", "max_agents:\n", "max_agents: 0\n", ""] {
+            let path = dir.write("config.yaml", body);
+            assert_eq!(GlobalConfig::load(&path).unwrap().max_agents, None, "{body:?}");
+        }
+        let path = dir.write("config.yaml", "max_agents: 3\n");
+        assert_eq!(GlobalConfig::load(&path).unwrap().max_agents, Some(3));
+    }
+
+    #[test]
+    fn max_agents_that_is_not_a_non_negative_integer_is_an_error_naming_the_file() {
+        let dir = TempDir::new();
+        for body in ["max_agents: two\n", "max_agents: -1\n", "max_agents: 1.5\n"] {
+            let path = dir.write("config.yaml", body);
+            let err = GlobalConfig::load(&path).unwrap_err();
+            assert!(matches!(err, GlobalConfigError::Yaml { .. }), "{body:?}");
+            let text = err.to_string();
+            assert!(text.contains(&path.display().to_string()), "{text}");
+            assert!(text.starts_with("failed to parse global config "), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_config_names_the_file() {
+        let dir = TempDir::new();
+        // A directory at the path makes the read fail without chmod.
+        let path = dir.path.join("config.yaml");
+        std::fs::create_dir(&path).unwrap();
+        let err = GlobalConfig::load(&path).unwrap_err();
+        assert!(matches!(err, GlobalConfigError::Io { .. }));
+        assert!(err.to_string().contains(&path.display().to_string()));
     }
 }

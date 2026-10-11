@@ -309,6 +309,10 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
                          (`choco task status <id>`), or pass --force to update anyway: they are marked stuck,\n\
                          and `choco task retry <id>` continues them (an agent turn resumes its session).",
                     );
+                    if let Some(note) = crate::render::queued_restart_note(server.queued.len()) {
+                        text.push('\n');
+                        text.push_str(&note);
+                    }
                     println!("{text}");
                     return Ok(EXIT_REFUSED);
                 }

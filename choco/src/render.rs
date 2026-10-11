@@ -3,7 +3,9 @@
 //! is the machine half). No colour/ANSI: output is routinely piped, and
 //! this repo ships no terminal-styling dependency.
 
-use chocofactory_core::models::{Event, EventType, Project, RetryOutcome, Task};
+use chocofactory_core::models::{
+    Event, EventType, Project, QueuedTurn, RetryOutcome, Task, TaskSummary,
+};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -83,8 +85,14 @@ pub fn project(p: &Project) -> String {
         ("Name", single_line(&p.name)),
         ("ID", p.id.clone()),
         ("Repo", p.repo_path.as_deref().unwrap_or("-").to_string()),
+        ("Max agents", max_agents_cell(p)),
         ("Created", timestamp(&p.created_at)),
     ])
+}
+
+/// A project's own agent cap, or `-` when it shares the server's.
+fn max_agents_cell(p: &Project) -> String {
+    p.max_agents.map_or_else(|| "-".to_string(), |n| n.to_string())
 }
 
 pub fn projects(list: &[Project]) -> String {
@@ -98,11 +106,12 @@ pub fn projects(list: &[Project]) -> String {
                 one_line(&p.name),
                 p.id.clone(),
                 p.repo_path.as_deref().unwrap_or("-").to_string(),
+                max_agents_cell(p),
                 timestamp(&p.created_at),
             ]
         })
         .collect();
-    table(&["NAME", "ID", "REPO", "CREATED"], &rows)
+    table(&["NAME", "ID", "REPO", "MAX AGENTS", "CREATED"], &rows)
 }
 
 /// `choco project init-workflows`'s result (issue #88).
@@ -187,23 +196,116 @@ fn role_summaries(config: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-pub fn tasks(list: &[Task]) -> String {
+pub fn tasks(list: &[TaskSummary]) -> String {
     if list.is_empty() {
         return "No tasks matched.".to_string();
     }
     let rows: Vec<Vec<String>> = list
         .iter()
-        .map(|t| {
+        .map(|summary| {
+            let t = &summary.task;
             vec![
                 one_line(&t.title),
                 t.id.clone(),
-                t.status.clone(),
+                format!("{}{}", t.status, queued_suffix(&summary.queued)),
                 t.workflow_def.clone(),
                 timestamp(&t.created_at),
             ]
         })
         .collect();
     table(&["TITLE", "ID", "STATUS", "WORKFLOW", "CREATED"], &rows)
+}
+
+/// The line `server stop|restart` and `update` add about turns waiting for a
+/// slot: they are not in flight, so they do not block, and they start in
+/// order after the restart. `None` when nothing is queued.
+pub fn queued_restart_note(queued: usize) -> Option<String> {
+    match queued {
+        0 => None,
+        1 => Some(
+            "1 queued turn will wait and start in order after the restart.".to_string(),
+        ),
+        n => Some(format!(
+            "{n} queued turns will wait and start in order after the restart."
+        )),
+    }
+}
+
+/// `1st`, `2nd`, `3rd`, `4th`, `11th`, `21st`.
+pub fn ordinal(n: u32) -> String {
+    let suffix = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+/// ` · queued 2` (or ` · queued 1,3` for several waiting turns) for a task
+/// that has turns waiting for a slot; empty otherwise.
+fn queued_suffix(queued: &[QueuedTurn]) -> String {
+    if queued.is_empty() {
+        return String::new();
+    }
+    let places: Vec<String> = queued.iter().map(|q| q.position.to_string()).collect();
+    format!(" · queued {}", places.join(","))
+}
+
+/// What a waiting turn waits for, from the pool it was read with:
+/// `the server's 2 agent slots (both busy)`.
+fn pool_phrase(name: &str, is_server: bool, limit: Option<u32>, running: u32) -> String {
+    let owner = if is_server {
+        "the server's".to_string()
+    } else {
+        format!("project {name}'s")
+    };
+    match limit {
+        None => format!("{owner} agent slots (the daemon is stopping)"),
+        Some(limit) => {
+            let state = if running >= limit {
+                if limit == 2 {
+                    "both busy".to_string()
+                } else if limit == 1 {
+                    "busy".to_string()
+                } else {
+                    "all busy".to_string()
+                }
+            } else {
+                format!("{running} of {limit} busy")
+            };
+            format!("{owner} {limit} agent slot{} ({state})", if limit == 1 { "" } else { "s" })
+        }
+    }
+}
+
+/// `internal_review, 2nd in line for the server's 2 agent slots (both busy),
+/// since 14:02 UTC` — one line for a waiting turn of the raw `TaskDetail`.
+fn queued_line(turn: &Value) -> String {
+    let text = |key: &str| turn.get(key).and_then(Value::as_str);
+    let stage = text("stage").unwrap_or("?");
+    let head = match text("group") {
+        Some(group) => format!("{group} › {stage}"),
+        None => stage.to_string(),
+    };
+    let position = turn
+        .get("position")
+        .and_then(Value::as_u64)
+        .map(|n| ordinal(n as u32))
+        .unwrap_or_else(|| "?".to_string());
+    let pool = text("pool").unwrap_or("server");
+    let waits_for = pool_phrase(
+        text("pool_name").filter(|n| !n.is_empty()).unwrap_or(pool),
+        pool == "server",
+        turn.get("limit").and_then(Value::as_u64).map(|n| n as u32),
+        turn.get("running").and_then(Value::as_u64).unwrap_or(0) as u32,
+    );
+    let since = text("queued_at")
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|at| format!(", since {}", at.with_timezone(&Utc).format("%H:%M UTC")))
+        .unwrap_or_default();
+    format!("{head}, {position} in line for {waits_for}{since}")
 }
 
 /// Says which of the two things `task retry` did (#92). Named in the first
@@ -236,6 +338,11 @@ pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
                 }
                 (false, _, None) => format!("  {}: from scratch, in a fresh session.", b.branch),
             });
+            if let Some(position) = b.queued {
+                if let Some(last) = lines.last_mut() {
+                    last.push_str(&format!(" Queued, {} in line.", ordinal(position)));
+                }
+            }
         }
         lines.push(format!("See `choco task status {task_id}`."));
         return lines.join("\n");
@@ -266,8 +373,12 @@ pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
             ),
         },
     };
+    let queued = match outcome.queued {
+        Some(position) => format!(" It is queued, {} in line.", ordinal(position)),
+        None => String::new(),
+    };
     // The same "where to look next" pointer `cancel` and `send` end with.
-    format!("{what} See `choco task status {task_id}`.")
+    format!("{what}{queued} See `choco task status {task_id}`.")
 }
 
 /// Labels of the rows [`task_fields`] produces. The dashboard matches on
@@ -289,6 +400,8 @@ pub const LABEL_REPO: &str = "Repo";
 pub const LABEL_ROLE: &str = "Role";
 pub const LABEL_CREATED: &str = "Created";
 pub const LABEL_STAGE: &str = "Stage";
+/// One row per turn waiting for a slot; absent when nothing waits.
+pub const LABEL_QUEUED: &str = "Queued";
 
 /// The field rows `choco task status` prints for the daemon's `TaskDetail`
 /// JSON, as `(label, value)` pairs: the order and wording are the CLI's, and
@@ -386,6 +499,11 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
 
     if let Some(current) = detail_stage(detail) {
         pairs.push((LABEL_STAGE, current.to_string()));
+    }
+    if let Some(queued) = detail.get("queued").and_then(Value::as_array) {
+        for turn in queued {
+            pairs.push((LABEL_QUEUED, queued_line(turn)));
+        }
     }
     pairs
 }
@@ -490,6 +608,10 @@ pub fn detail_branches(
             // The usage line is keyed by the stored name, not the display one.
             let raw_name = b.get("name").and_then(Value::as_str).unwrap_or("?");
             let state = text(b, "state").unwrap_or_else(|| "?".to_string());
+            let state_cell = match (state.as_str(), b.get("queued_position").and_then(Value::as_u64)) {
+                ("queued", Some(position)) => format!("queued ({})", ordinal(position as u32)),
+                _ => state.clone(),
+            };
             let outcome = match state.as_str() {
                 "done" => text(b, "result"),
                 "failed" => text(b, "reason"),
@@ -506,7 +628,7 @@ pub fn detail_branches(
             [
                 name.clone(),
                 text(b, "kind").unwrap_or_else(|| "?".to_string()),
-                state,
+                state_cell,
                 outcome,
                 elapsed.map_or_else(|| "-".to_string(), crate::dashboard::app::fmt_duration),
                 branch_cost(detail, raw_name, entry),
@@ -641,6 +763,58 @@ pub fn task_detail(detail: &Value, now: DateTime<Utc>) -> String {
     }
     out.push_str("\n\n");
     out.push_str(&cost_and_time(detail));
+    out
+}
+
+/// The `Agent slots:` line (the server pool first, then each capped project),
+/// the queued turns below it, and the queue error when there is one. The
+/// server pool's limit is always printed (`no limit` when unset), so a
+/// mistyped `max_agents` key shows up here.
+fn agent_slot_lines(s: &chocofactory_core::models::ServerStatus) -> Vec<String> {
+    let mut out = Vec::new();
+    let pools: Vec<String> = s
+        .agent_pools
+        .iter()
+        .map(|p| {
+            let who = if p.pool == "server" {
+                "server".to_string()
+            } else {
+                format!("project {}", single_line(&p.name))
+            };
+            match p.limit {
+                Some(limit) => format!("{who} {}/{limit} running, {} queued", p.running, p.queued),
+                None => format!("{who} {} running, no limit, {} queued", p.running, p.queued),
+            }
+        })
+        .collect();
+    if pools.is_empty() {
+        out.push("agent slots   server: no limit".to_string());
+    } else {
+        out.push(format!("agent slots   {}", pools.join("; ")));
+    }
+    for q in &s.queued {
+        out.push(format!(
+            "queued        {}  {} ({} in line, {})  {}",
+            q.task_id,
+            match &q.turn.group {
+                Some(group) => format!("{group} › {}", q.turn.stage),
+                None => q.turn.stage.clone(),
+            },
+            ordinal(q.turn.position),
+            if q.turn.pool == "server" {
+                "server".to_string()
+            } else {
+                format!("project {}", single_line(&q.turn.pool_name))
+            },
+            single_line(&q.title)
+        ));
+    }
+    if let Some(error) = &s.queue_error {
+        out.push(format!(
+            "warning: queued turns cannot start: {}; fix config.yaml and they start within seconds",
+            single_line(error)
+        ));
+    }
     out
 }
 
@@ -1179,6 +1353,47 @@ fn event_summary_body(event: &Event) -> String {
                 line
             }
         }
+        // `{stage, group, entry, pool, limit, running, position}`, `{stage,
+        // group, entry, waited_ms, session_id}` and `{stage, group, reason}`:
+        // one line each, never raw JSON.
+        EventType::TurnQueued | EventType::TurnDequeued | EventType::TurnWithdrawn => {
+            let stage = payload.get("stage").and_then(Value::as_str).unwrap_or("?");
+            let head = match payload.get("group").and_then(Value::as_str) {
+                Some(group) => format!("{} › {}", single_line(group), single_line(stage)),
+                None => single_line(stage),
+            };
+            match event.event_type {
+                EventType::TurnQueued => {
+                    let position = payload
+                        .get("position")
+                        .and_then(Value::as_u64)
+                        .map(|n| ordinal(n as u32))
+                        .unwrap_or_else(|| "?".to_string());
+                    let pool = payload.get("pool").and_then(Value::as_str).unwrap_or("?");
+                    let limit = payload
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .map_or_else(|| "no limit".to_string(), |n| format!("limit {n}"));
+                    format!("{head}  queued, {position} in line ({pool}, {limit})")
+                }
+                EventType::TurnDequeued => {
+                    let waited = payload
+                        .get("waited_ms")
+                        .and_then(Value::as_u64)
+                        .map(|ms| {
+                            chocofactory_core::duration::format_duration(
+                                std::time::Duration::from_secs(ms / 1000),
+                            )
+                        })
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{head}  started after waiting {waited} in the queue")
+                }
+                _ => {
+                    let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("?");
+                    format!("{head}  left the queue without starting: {}", single_line(reason))
+                }
+            }
+        }
         // Likewise `{stage, command, exit_code, …}` (P2-1): the fallback
         // would find no "text"-ish key and dump the raw object, when what
         // a reader wants is the command and whether it worked.
@@ -1405,6 +1620,7 @@ pub fn server_status(
             ));
         }
     }
+    out.extend(agent_slot_lines(s));
     out.push(format!("log           {}", log.display()));
     if s.version != VERSION {
         out.push(format!(
@@ -1432,6 +1648,9 @@ mod tests {
         use chocofactory_core::models::{InFlight, ServerStatus};
         let now = Utc::now();
         ServerStatus {
+            agent_pools: vec![],
+            queued: vec![],
+            queue_error: None,
             version: "0.0.0".into(),
             commit: Some("abc1234".into()),
             pid: 42,
@@ -1527,6 +1746,7 @@ mod tests {
                 fresh_reason: None,
                 rewatched: true,
                 branches: Vec::new(),
+                queued: None,
             },
         );
         assert_eq!(
@@ -1579,6 +1799,7 @@ mod tests {
                 fresh_reason: None,
                 rewatched: false,
                 branches: Vec::new(),
+                queued: None,
             },
         );
         assert!(
@@ -1599,6 +1820,7 @@ mod tests {
                 fresh_reason: Some("its turn ended 'no_report'".to_string()),
                 rewatched: false,
                 branches: Vec::new(),
+                queued: None,
             },
         );
         assert!(
@@ -1615,6 +1837,7 @@ mod tests {
             resumed,
             adapter_session_id: id.map(str::to_string),
             fresh_reason: why.map(str::to_string),
+            queued: None,
         };
         let outcome = |branches| RetryOutcome {
             stage: "panel".to_string(),
@@ -1623,6 +1846,7 @@ mod tests {
             fresh_reason: None,
             rewatched: false,
             branches,
+            queued: None,
         };
         let out = super::retried(
             "task-1",
@@ -2549,7 +2773,18 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let rendered = tasks(std::slice::from_ref(&task));
+        let summary = TaskSummary {
+            task: task.clone(),
+            current_stage: None,
+            stage_entered_at: None,
+            loop_counters: serde_json::json!({}),
+            pr: None,
+            waiting_on_human: false,
+            usage_total: None,
+            branch_progress: None,
+            queued: Vec::new(),
+        };
+        let rendered = tasks(std::slice::from_ref(&summary));
         assert_eq!(
             rendered.lines().count(),
             2,

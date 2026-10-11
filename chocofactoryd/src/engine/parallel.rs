@@ -190,9 +190,46 @@ pub(crate) fn branch_statuses_from(
                 entry,
                 started_at: time(slot, "started_at"),
                 ended_at: time(slot, "ended_at"),
+                queued_position: None,
             }
         })
         .collect()
+}
+
+/// Where one branch of the current group entry stands, apart from what its
+/// payload slot says: the one helper the restart sweep (and a later resume)
+/// asks about a branch whose slot is not settled: `Queued` (a queue row for
+/// this entry), `Live` (an active session of this entry), `Ended` (a session
+/// of this entry that is over) or `NeverStarted`.
+#[derive(Debug)]
+pub(super) enum BranchWork {
+    Queued,
+    Live(Session),
+    Ended(Session),
+    NeverStarted,
+}
+
+impl WorkflowEngine {
+    pub(super) async fn branch_progress(
+        &self,
+        task_id: &str,
+        branch: &str,
+        entry_no: i64,
+    ) -> Result<BranchWork, sqlx::Error> {
+        if crate::db::turn_queue::exists(&self.pool, task_id, branch, Some(entry_no)).await? {
+            return Ok(BranchWork::Queued);
+        }
+        if let Some(current) = sessions::get_current_for_stage(&self.pool, task_id, branch).await?
+            && sessions::lap(&self.pool, &current.id).await? == Some(entry_no)
+        {
+            return Ok(if current.status == SessionStatus::Active {
+                BranchWork::Live(current)
+            } else {
+                BranchWork::Ended(current)
+            });
+        }
+        Ok(BranchWork::NeverStarted)
+    }
 }
 
 /// The `parallel` block when it belongs to `group`.
@@ -209,6 +246,7 @@ pub(super) fn running_branch_kinds(
     payload: &Value,
     definition: &WorkflowDefinition,
     group: &str,
+    is_queued: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let Some(slots) = block_for(payload, group)
         .and_then(|block| block.get("branches"))
@@ -218,7 +256,9 @@ pub(super) fn running_branch_kinds(
     };
     let mut kinds: Vec<&str> = slots
         .iter()
-        .filter(|(_, slot)| slot.get("state").and_then(Value::as_str) == Some("running"))
+        .filter(|(name, slot)| {
+            slot.get("state").and_then(Value::as_str) == Some("running") && !is_queued(name)
+        })
         .map(|(name, _)| {
             definition
                 .branch(name)
@@ -564,13 +604,13 @@ impl WorkflowEngine {
                     continue;
                 }
             }
-            let mut session = None;
-            if let Some(current) =
-                sessions::get_current_for_stage(&self.pool, task_id, name).await?
-                && sessions::lap(&self.pool, &current.id).await? == Some(entry_no)
-            {
-                session = Some(current);
-            }
+            // A branch waiting for a slot has no session yet and is not
+            // stranded by a restart: it keeps its place in the queue.
+            let session = match self.branch_progress(task_id, name, entry_no).await? {
+                BranchWork::Queued => continue,
+                BranchWork::Live(session) | BranchWork::Ended(session) => Some(session),
+                BranchWork::NeverStarted => None,
+            };
             let Some(session) = session else {
                 let reason = format!(
                     "branch '{name}' of parallel stage '{group}': the daemon stopped before the \
@@ -800,6 +840,12 @@ impl WorkflowEngine {
             .and_then(|task| task.get("input"))
             .and_then(Value::as_str);
 
+        // Before anything is re-entered, the stuck task's leftover queue rows
+        // go (they can never start, and one that survived to the re-claim
+        // would collide with it): one DELETE under the task lock held here
+        // and the slot lock.
+        self.withdraw_task_rows(task_id, "retry").await?;
+
         // Step 2, write 1: the re-entered slots become `running` in one UPDATE.
         let mut new_payload = state.payload.clone();
         let started_at = stamp(self.now());
@@ -930,6 +976,7 @@ impl WorkflowEngine {
             return Err(RetryTaskError::Enter(err));
         }
 
+        let snapshot = self.queue_snapshot().await.map_err(RetryTaskError::from)?;
         let retried: Vec<chocofactory_core::models::RetriedBranch> = rerun
             .iter()
             .map(|r| chocofactory_core::models::RetriedBranch {
@@ -937,6 +984,7 @@ impl WorkflowEngine {
                 resumed: r.resume.is_some(),
                 adapter_session_id: r.resume.as_ref().map(|x| x.adapter_session_id.clone()),
                 fresh_reason: r.fresh_reason.clone(),
+                queued: snapshot.position_of(task_id, r.name, Some(group)),
             })
             .collect();
         let fresh: Vec<String> = rerun
@@ -962,6 +1010,7 @@ impl WorkflowEngine {
             fresh_reason,
             rewatched: false,
             branches: retried,
+            queued: None,
         })
     }
 
@@ -991,7 +1040,7 @@ impl WorkflowEngine {
     /// Marks every branch in `failures` failed in one UPDATE (re-reading the
     /// state under the lock the caller holds); that UPDATE is the settle when
     /// no branch is left running.
-    async fn record_start_failures(
+    pub(super) async fn record_start_failures(
         &self,
         task_id: &str,
         group: &str,

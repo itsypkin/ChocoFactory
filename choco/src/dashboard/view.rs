@@ -312,7 +312,15 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
 /// parallel group is current.
 fn stage_cell(t: &TaskSummary) -> String {
     match (&t.current_stage, &t.branch_progress) {
+        // A group with branches waiting for a slot: how many.
+        (Some(stage), Some(p)) if !t.queued.is_empty() => {
+            format!("{stage} {}/{} · {} queued", p.settled, p.total, t.queued.len())
+        }
         (Some(stage), Some(p)) => format!("{stage} {}/{}", p.settled, p.total),
+        // A stage waiting for a slot: its place in line.
+        (Some(stage), None) if !t.queued.is_empty() => {
+            format!("{stage} · queued {}", t.queued[0].position)
+        }
         (Some(stage), None) => stage.clone(),
         (None, _) => "-".to_string(),
     }
@@ -526,6 +534,20 @@ fn version_text(app: &App) -> String {
     }
 }
 
+/// `agents 2/2 · 3 queued` for the server pool; `None` until the daemon has
+/// answered `GET /server` once.
+fn agents_text(app: &App) -> Option<String> {
+    let pool = app.server_pool.as_ref()?;
+    let mut text = match pool.limit {
+        Some(limit) => format!("agents {}/{limit}", pool.running),
+        None => format!("agents {}", pool.running),
+    };
+    if pool.queued > 0 {
+        text.push_str(&format!(" · {} queued", pool.queued));
+    }
+    Some(text)
+}
+
 fn draw_header(frame: &mut Frame, app: &App, area: Rect, name: &str) {
     let width = area.width as usize;
     let mode = match &app.scope {
@@ -537,7 +559,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, name: &str) {
         Some(t) => format!("refreshed {} ago", fmt_duration(app.now - t)),
         None => "not refreshed yet".to_string(),
     };
-    let ver = version_text(app);
+    let mut ver = version_text(app);
+    if let Some(agents) = agents_text(app) {
+        ver = format!("{ver} · {agents}");
+    }
     let lefts = [
         format!("{base} · {} · {ver}", app.base_url),
         format!("{base} · {ver}"),

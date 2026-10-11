@@ -529,7 +529,10 @@ fn ends_a_message(event_type: &str) -> bool {
         | EventType::EnvTruncated
         | EventType::BranchCleanup
         | EventType::BranchStarted
-        | EventType::BranchFinished => false,
+        | EventType::BranchFinished
+        | EventType::TurnQueued
+        | EventType::TurnDequeued
+        | EventType::TurnWithdrawn => false,
     }
 }
 

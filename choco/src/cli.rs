@@ -478,8 +478,13 @@ pub enum ProjectCmd {
         /// or isn't a directory.
         #[arg(long)]
         repo: Option<String>,
+        /// The project's own cap on agent turns running at once. A project
+        /// with a cap is its own pool: its turns neither use nor wait for the
+        /// server's slots. `0` means no cap of its own.
+        #[arg(long, value_name = "N")]
+        max_agents: Option<u32>,
     },
-    /// Change a project's name and/or repo path.
+    /// Change a project's name, repo path and/or agent cap.
     Update {
         /// Project name or id.
         project: String,
@@ -493,6 +498,11 @@ pub enum ProjectCmd {
         /// Clears the project's repo path. Conflicts with `--repo`.
         #[arg(long, conflicts_with = "repo")]
         no_repo: bool,
+        /// The project's own cap on agent turns running at once; `0` removes
+        /// it, so the project shares the server's cap again. Applies to the
+        /// next start decision, with no restart.
+        #[arg(long, value_name = "N")]
+        max_agents: Option<u32>,
     },
     /// List all projects.
     List,

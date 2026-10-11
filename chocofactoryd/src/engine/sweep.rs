@@ -219,6 +219,20 @@ impl WorkflowEngine {
                 }
             }
             RestartEffect::StrandsAgentTurn => {
+                // A turn waiting for a slot has no process to strand: it
+                // stays `open` and queued, in its place.
+                match self.current_work_held(task_id, &stage).await {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(err) => {
+                        let reason = format!(
+                            "restart sweep could not tell whether stage '{stage}' was waiting \
+                             in the queue: {err}"
+                        );
+                        self.park_mark_stuck(task_id, &reason, report).await;
+                        return;
+                    }
+                }
                 let mut reason = agent_reason(&stage);
                 match sessions::get_current_for_stage(&self.pool, task_id, &stage).await {
                     Ok(Some(session)) => {
@@ -269,6 +283,7 @@ impl WorkflowEngine {
     /// listed with kind `"unknown"` rather than hidden.
     pub async fn in_flight(&self) -> Result<Vec<InFlight>, sqlx::Error> {
         let mut out = Vec::new();
+        let queue = self.queue_snapshot().await?;
         for task in tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await? {
             let Some(state) = workflow_state::get(&self.pool, &task.id).await? else {
                 continue;
@@ -282,10 +297,17 @@ impl WorkflowEngine {
                             &state.payload,
                             &definition,
                             &stage,
+                            |branch| queue.is_queued(&task.id, branch, Some(&stage), None),
                         ) {
                             Some(kind) => kind,
                             None => continue,
                         }
+                    }
+                    // Waiting for a slot is not running: nothing is stranded.
+                    Some(RestartEffect::StrandsAgentTurn)
+                        if queue.is_queued(&task.id, &stage, None, None) =>
+                    {
+                        continue;
                     }
                     Some(RestartEffect::StrandsAgentTurn) => "agent_turn".to_string(),
                     Some(RestartEffect::StrandsShell) => "shell".to_string(),

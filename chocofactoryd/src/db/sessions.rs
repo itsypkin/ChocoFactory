@@ -110,8 +110,8 @@ pub async fn create_resumed(
 // branch's session has the branch's name as its stage, so its lap counts the
 // `branch_started` events for that branch (retries excluded): a branch's lap
 // equals its group's entry.
-async fn create_inner(
-    pool: &SqlitePool,
+async fn create_inner<'e>(
+    pool: impl sqlx::SqliteExecutor<'e>,
     new: NewSession<'_>,
     from: Option<ResumedFrom<'_>>,
 ) -> Result<Session, sqlx::Error> {
@@ -148,6 +148,58 @@ async fn create_inner(
     .fetch_one(pool)
     .await?;
     Ok(row.into())
+}
+
+/// Why [`create_from_queue`] started nothing.
+#[derive(Debug)]
+pub enum CreateFromQueueError {
+    /// The queue row was already gone (withdrawn, cancelled, or started by
+    /// someone else). The transaction rolled back; no session row exists.
+    Vanished,
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for CreateFromQueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreateFromQueueError::Vanished => {
+                f.write_str("the queued turn was withdrawn before it could start")
+            }
+            CreateFromQueueError::Db(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for CreateFromQueueError {}
+
+impl From<sqlx::Error> for CreateFromQueueError {
+    fn from(err: sqlx::Error) -> Self {
+        CreateFromQueueError::Db(err)
+    }
+}
+
+/// Takes queue row `queue_row_id` off the queue and creates the session that
+/// replaces it, in one transaction (resuming `from` when given, like
+/// [`create_resumed`]). When the row is already gone the transaction rolls
+/// back and nothing is created.
+pub async fn create_from_queue(
+    pool: &SqlitePool,
+    queue_row_id: i64,
+    new: NewSession<'_>,
+    from: Option<ResumedFrom<'_>>,
+) -> Result<Session, CreateFromQueueError> {
+    let mut tx = pool.begin().await?;
+    let deleted = sqlx::query("DELETE FROM turn_queue WHERE id = ?")
+        .bind(queue_row_id)
+        .execute(&mut *tx)
+        .await?;
+    if deleted.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Err(CreateFromQueueError::Vanished);
+    }
+    let session = create_inner(&mut *tx, new, from).await?;
+    tx.commit().await?;
+    Ok(session)
 }
 
 /// How many consecutive resumes led to `session_id` — 0 for a session that

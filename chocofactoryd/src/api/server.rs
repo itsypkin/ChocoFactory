@@ -74,6 +74,7 @@ pub async fn get(State(state): State<AppState>) -> Result<Json<ServerStatus>, Ap
     let info = &state.server;
     let tasks = tasks::count_by_status(&state.pool).await?;
     let in_flight = state.engine.in_flight().await?;
+    let queue = state.engine.queue_snapshot().await?;
     Ok(Json(ServerStatus {
         version: chocofactory_core::version::VERSION.to_string(),
         commit: chocofactory_core::version::BUILD_COMMIT.map(str::to_string),
@@ -91,6 +92,9 @@ pub async fn get(State(state): State<AppState>) -> Result<Json<ServerStatus>, Ap
         choco_binary_found: Path::new(&info.choco_binary).is_file(),
         tasks,
         in_flight,
+        agent_pools: queue.pools,
+        queued: queue.turns,
+        queue_error: queue.queue_error,
     }))
 }
 
