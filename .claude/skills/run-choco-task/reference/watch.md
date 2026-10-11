@@ -107,8 +107,8 @@ choosing `--timeout`:
 While a task is in a parallel group, `choco task status <id>` prints a
 `Branches` table between the fields and `Progress`. The `Progress` table
 still has one row for the whole group. The group lasts as long as its
-slowest branch; a read-only branch that reviews a diff has been observed to
-finish in under 30 s.
+slowest branch; a read-only branch that reviews a small diff took 15–25 s
+in the one run measured.
 
 ```
 Branches

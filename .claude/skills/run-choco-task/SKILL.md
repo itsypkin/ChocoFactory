@@ -186,7 +186,7 @@ explicit out-of-scope list.
   its `--help` (see [reference/spec.md](reference/spec.md#which---help-to-trust)).
 - **Check for collisions against your default branch and open PRs:**
   numbered files such as database migrations above all, then file names and
-  flags, including a file another PR copies or pins in a test. Two tasks that
+  flags, including a file another PR's tests copy or pin. Two tasks that
   both take the next number conflict, and the second PR's CI may not run.
 - **`--closes` decides what the PR closes.** Each `--closes <n>` makes the
   PR say `Closes #n` (repeat the flag for several issues); a `#N` anywhere in

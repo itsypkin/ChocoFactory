@@ -41,9 +41,10 @@ Five more checks belong in the spec:
   only) is tested with a mixed case, not only the uniform ones. Each
   safety rule (who owns what, what is excluded, what is refused) has a
   test that fails when that rule alone is removed, and no other rule can
-  produce the same result in that test. A read from the OS or another
-  external system is checked once, on the real machine, against an
-  independent source (for example a process list against `ps`).
+  produce the same result in that test. The coder checks a read from the
+  OS or another external system once, on the real machine, against an
+  independent source (for example a process list against `ps`), and
+  reports the result.
 - **A new rule in a prompt.** The spec requires the coder to run one
   probe of the rule on the production model the role runs in the workflow,
   in its lap, and to report the probe and its result.
@@ -78,7 +79,7 @@ folds your answers in and checks again; an answer can tell it to decide a
 question itself.
 
 `choco task send` is refused while `spec_check` runs. To change the spec
-then, cancel the task and create it again with the new spec.
+while it runs, cancel the task and create it again with the new spec.
 
 **Unverified claims.** The planner backs a claim about runtime behaviour
 with the command it ran and the output. A claim it couldn't run read-only
