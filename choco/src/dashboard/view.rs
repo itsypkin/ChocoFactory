@@ -15,7 +15,10 @@ use crate::render::{
     LABEL_STAGE, LABEL_STATUS, LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW, LABEL_WORKFLOW_FILE,
 };
 
-use super::app::{App, Detail, Level, PromptKind, Scope, Section, View, fmt_duration, max_laps};
+use super::app::{
+    App, Detail, Level, PromptKind, Scope, Search, SearchLoad, Section, View, fmt_duration,
+    max_laps,
+};
 
 pub const MIN_WIDTH: u16 = 40;
 pub const MIN_HEIGHT: u16 = 10;
@@ -35,6 +38,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.view {
         View::List => draw_list(frame, app, area),
         View::Detail(d) => draw_detail(frame, app, d, area),
+    }
+    if let Some(search) = &app.search {
+        draw_search(frame, app, search, area);
     }
     if let Some(prompt) = &app.prompt {
         draw_prompt(frame, app, prompt, area);
@@ -508,7 +514,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         app,
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
-        "↑↓ move  ⏎ open  o PR  r retry  c cancel  ? help  q quit",
+        "↑↓ move  ⏎ open  / search  o PR  r retry  c cancel  ? help  q quit",
     );
 }
 
@@ -1225,6 +1231,119 @@ fn draw_prompt(frame: &mut Frame, app: &App, prompt: &super::app::Prompt, area: 
     );
 }
 
+/// The `/` search popup (#292): input line, count line, result rows, hints.
+fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
+    let box_area = centered(
+        area,
+        area.width.saturating_sub(4).min(100),
+        area.height.saturating_sub(2),
+    );
+    frame.render_widget(Clear, box_area);
+    let block = Block::default().borders(Borders::ALL).title(" search ");
+    let inner_area = block.inner(box_area);
+    frame.render_widget(block, box_area);
+    let inner = inner_area.width as usize;
+
+    // Line 1: the query, its tail when too long, then the cursor mark.
+    let avail = inner.saturating_sub(3);
+    let q: Vec<char> = search.query.chars().collect();
+    let shown: String = if q.len() > avail {
+        let tail: String = q[q.len() - avail.saturating_sub(1)..].iter().collect();
+        format!("…{tail}")
+    } else {
+        search.query.clone()
+    };
+    let input = fit(&format!("/ {shown}_"), inner);
+
+    let results = search.results();
+    let (status, status_style) = match &search.load {
+        SearchLoad::Loading => ("loading…".to_string(), Style::default()),
+        SearchLoad::Failed(err) => (format!("could not load tasks: {err}"), error_style(app)),
+        SearchLoad::Loaded(all) => (
+            format!("{} of {} tasks", results.len(), all.len()),
+            Style::default(),
+        ),
+    };
+
+    let mut lines = vec![
+        Line::from(input),
+        Line::styled(fit(&status, inner), status_style),
+    ];
+
+    // Result rows fill what is left between the count line and the hints.
+    let rows_h = (inner_area.height as usize).saturating_sub(3);
+    if matches!(search.load, SearchLoad::Loaded(_)) && results.is_empty() && rows_h > 0 {
+        lines.push(Line::from("no matching tasks"));
+    }
+    let sel = search
+        .selected
+        .as_ref()
+        .and_then(|id| results.iter().position(|t| &t.task.id == id));
+    let mut off = search.offset.get();
+    if let Some(i) = sel {
+        if i < off {
+            off = i;
+        }
+        if i >= off + rows_h {
+            off = i + 1 - rows_h;
+        }
+    }
+    off = off.min(results.len().saturating_sub(rows_h));
+    search.offset.set(off);
+    search.page.set(rows_h);
+
+    let cols = cols_for(app, area.width);
+    let proj_w = results
+        .iter()
+        .map(|t| app.project_label(&t.task.project_id).chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(7, 14);
+    let fixed = ID_W
+        + if cols.project { proj_w + 2 } else { 0 }
+        + if cols.stage { 9 + 2 } else { 0 }
+        + if cols.pr { PR_W + 2 } else { 0 }
+        + 2;
+    let title_w = inner.saturating_sub(2 + fixed).max(1);
+    for (i, t) in results.iter().enumerate().skip(off).take(rows_h) {
+        let mut parts = vec![pad(&t.task.id, ID_W)];
+        if cols.project {
+            parts.push(pad(&app.project_label(&t.task.project_id), proj_w));
+        }
+        parts.push(pad(&t.task.title, title_w));
+        if cols.stage {
+            parts.push(pad(&t.task.status, 9));
+        }
+        if cols.pr {
+            let pr =
+                t.pr.as_ref()
+                    .map_or("-".to_string(), |p| format!("#{}", p.number));
+            parts.push(pad(&pr, PR_W));
+        }
+        let selected = Some(i) == sel;
+        let text = format!("{}{}", if selected { "▶ " } else { "  " }, parts.join("  "));
+        let style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(fit(&text, inner), style));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner_area);
+    if inner_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(fit("↑↓ move  ⏎ open  Esc back", inner)),
+            Rect::new(
+                inner_area.x,
+                inner_area.y + inner_area.height - 1,
+                inner_area.width,
+                1,
+            ),
+        );
+    }
+}
+
 /// Word wrap. A token longer than a line ends the current line and is split
 /// into `w`-character chunks, the last of which later words may join. Empty
 /// input is one empty line.
@@ -1268,6 +1387,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("?           this help       c     cancel"),
         Line::from("q  Ctrl-C   quit"),
         Line::from("e           events / status"),
+        Line::from("/           search"),
     ];
     let r = centered(area, 52, lines.len() as u16 + 2);
     frame.render_widget(Clear, r);

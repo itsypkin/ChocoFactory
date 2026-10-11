@@ -5,6 +5,7 @@
 //! per-task event socket and the actions.
 
 pub mod app;
+pub mod search;
 pub mod view;
 
 use std::io::{self, Stdout};
@@ -439,6 +440,21 @@ fn run_effect(
             )));
         }
         Effect::CloseSocket => abort(socket),
+        Effect::LoadSearch { generation } => {
+            let (client, tx) = (Arc::clone(client), tx.clone());
+            let (project_id, timeout) = (config.project_id.clone(), config.timeout);
+            tokio::spawn(async move {
+                // No status, order or limit: every task in scope (see #292).
+                let result = tokio::time::timeout(
+                    timeout,
+                    client.list_task_summaries(project_id.as_deref(), None, None, None),
+                )
+                .await
+                .map_err(|_| timed_out())
+                .and_then(|r| r.map_err(|e| e.to_string()));
+                let _ = tx.send(Msg::Search { generation, result });
+            });
+        }
     }
     false
 }
@@ -446,7 +462,7 @@ fn run_effect(
 /// Both lists, and the project names when asked for.
 async fn fetch(client: &Client, config: &LoopConfig, projects: bool) -> ListResult {
     let pid = config.project_id.as_deref();
-    let active = client.list_task_summaries(pid, "open,stuck", None, None);
+    let active = client.list_task_summaries(pid, Some("open,stuck"), None, None);
     // `--closed 0` shows no closed section rows: skip the request.
     let closed = async {
         if config.closed == 0 {
@@ -455,7 +471,7 @@ async fn fetch(client: &Client, config: &LoopConfig, projects: bool) -> ListResu
             client
                 .list_task_summaries(
                     pid,
-                    "closed,cancelled",
+                    Some("closed,cancelled"),
                     Some("updated_desc"),
                     Some(config.closed),
                 )

@@ -122,6 +122,7 @@ Keys for day one:
 | `o` | open the task's pull request |
 | `r` | retry a stuck task |
 | `c` | cancel a task |
+| `/` | search every task by PR number, title or id |
 | `?` | list all keys |
 | `q` | quit |
 

@@ -893,6 +893,8 @@ struct Fake {
     keeps: Arc<Mutex<Vec<Value>>>,
     /// When set, the detail, cancel and retry endpoints never answer.
     hang: bool,
+    /// The query string of each `GET /tasks`, in order.
+    queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
 }
 
 async fn fake_server(state: Fake) -> String {
@@ -914,16 +916,23 @@ async fn fake_server(state: Fake) -> String {
         State(s): State<Fake>,
         Query(q): Query<HashMap<String, String>>,
     ) -> axum::Json<Value> {
+        s.queries.lock().unwrap().push(q.clone());
         let statuses: Vec<&str> = q
             .get("status")
             .map(|s| s.split(',').collect())
             .unwrap_or_default();
-        let rows: Vec<&TaskSummary> = s
+        let mut rows: Vec<&TaskSummary> = s
             .tasks
             .iter()
             .filter(|t| statuses.is_empty() || statuses.contains(&t.task.status.as_str()))
             .filter(|t| q.get("project_id").is_none_or(|p| &t.task.project_id == p))
             .collect();
+        if q.get("order").is_some_and(|o| o == "updated_desc") {
+            rows.sort_by_key(|a| std::cmp::Reverse(a.task.updated_at));
+        }
+        if let Some(limit) = q.get("limit").and_then(|l| l.parse::<usize>().ok()) {
+            rows.truncate(limit);
+        }
         axum::Json(serde_json::to_value(rows).unwrap())
     }
     async fn task(State(s): State<Fake>, Path(id): Path<String>) -> axum::Json<Value> {
@@ -1055,6 +1064,7 @@ async fn the_real_loop_against_a_fake_daemon() {
         cancels: Arc::new(Mutex::new(Vec::new())),
         keeps: Arc::new(Mutex::new(Vec::new())),
         hang: false,
+        queries: Arc::default(),
     };
     let base_url = fake_server(fake.clone()).await;
     let client = Arc::new(Client::new(base_url.clone()).without_version_check());
@@ -1399,6 +1409,7 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
         cancels: Arc::new(Mutex::new(Vec::new())),
         keeps: Arc::new(Mutex::new(Vec::new())),
         hang: true,
+        queries: Arc::default(),
     };
     let base_url = fake_server(fake).await;
     let client = Arc::new(Client::new(base_url).without_version_check());
@@ -3451,4 +3462,751 @@ fn a_stuck_groups_stage_cell_does_not_shrink_the_title_column() {
             .to_string()
     };
     assert_eq!(busy(&plain), busy(&grouped));
+}
+
+// ---- search popup (#292) -------------------------------------------------
+
+const ANCIENT: &str = "ffff9999-0";
+
+/// The board's tasks plus one old closed task that is not on the board.
+fn search_tasks(app: &App) -> Vec<TaskSummary> {
+    let mut all: Vec<TaskSummary> = app
+        .active
+        .iter()
+        .chain(app.closed.iter())
+        .cloned()
+        .collect();
+    let mut old = with_pr(
+        summary(
+            ANCIENT,
+            "Ancient migration fix",
+            "closed",
+            None,
+            None,
+            "p-alpha",
+        ),
+        77,
+    );
+    old.task.created_at = mins_ago(90_000);
+    all.push(old);
+    for (i, t) in all.iter_mut().enumerate().take(5) {
+        t.task.created_at = mins_ago(100 + i as i64 * 10);
+    }
+    all
+}
+
+fn key_with(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Vec<Effect> {
+    update(app, Msg::Key(KeyEvent::new(code, mods)))
+}
+
+fn open_search(app: &mut App) -> u64 {
+    match ch(app, '/').as_slice() {
+        [Effect::LoadSearch { generation }] => *generation,
+        other => panic!("expected LoadSearch, got {other:?}"),
+    }
+}
+
+fn deliver(app: &mut App, generation: u64, tasks: Vec<TaskSummary>) {
+    update(
+        app,
+        Msg::Search {
+            generation,
+            result: Ok(tasks),
+        },
+    );
+}
+
+fn opened(app: &mut App) -> u64 {
+    let tasks = search_tasks(app);
+    let g = open_search(app);
+    deliver(app, g, tasks);
+    g
+}
+
+fn typed(app: &mut App, s: &str) {
+    for c in s.chars() {
+        assert!(ch(app, c).is_empty(), "{c:?} must only be typed");
+    }
+}
+
+fn query(app: &App) -> String {
+    app.search.as_ref().unwrap().query.clone()
+}
+
+fn sel(app: &App) -> Option<String> {
+    app.search.as_ref().unwrap().selected.clone()
+}
+
+fn found(app: &App) -> Vec<String> {
+    ids(&app.search.as_ref().unwrap().results())
+}
+
+fn detail_id(app: &App) -> Option<String> {
+    match &app.view {
+        View::Detail(d) => Some(d.id.clone()),
+        View::List => None,
+    }
+}
+
+fn into_detail(app: &mut App) {
+    press(app, KeyCode::Enter);
+    assert!(detail_id(app).is_some());
+}
+
+#[test]
+fn slash_opens_the_popup_and_esc_closes_it_unchanged_from_the_list() {
+    let mut app = board();
+    ch(&mut app, 'j');
+    ch(&mut app, 'j');
+    let (selected, pos) = (app.selected.clone(), app.selected_pos);
+    let effects = ch(&mut app, '/');
+    assert_eq!(effects, vec![Effect::LoadSearch { generation: 1 }]);
+    let s = app.search.as_ref().unwrap();
+    assert!(matches!(s.load, SearchLoad::Loading));
+    assert!(matches!(app.view, View::List));
+    assert!(press(&mut app, KeyCode::Esc).is_empty());
+    assert!(app.search.is_none());
+    assert!(matches!(app.view, View::List));
+    assert_eq!((app.selected.clone(), app.selected_pos), (selected, pos));
+}
+
+#[test]
+fn slash_then_esc_in_the_detail_view_keeps_the_view_and_the_socket() {
+    let mut app = board();
+    into_detail(&mut app);
+    let id = detail_id(&app);
+    assert_eq!(ch(&mut app, '/').len(), 1);
+    assert!(press(&mut app, KeyCode::Esc).is_empty());
+    assert_eq!(detail_id(&app), id);
+    assert!(app.search.is_none());
+}
+
+#[test]
+fn esc_in_the_popup_keeps_the_boards_status_line() {
+    let mut app = board();
+    ch(&mut app, '/');
+    // A status set while the popup is open (a failed browser launch).
+    update(
+        &mut app,
+        Msg::OpenFailed {
+            url: "u".into(),
+            error: "e".into(),
+        },
+    );
+    let status = app.status.clone();
+    assert!(status.is_some());
+    ch(&mut app, 'x');
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.status, status);
+}
+
+#[test]
+fn slash_does_nothing_in_help_and_only_closes_a_confirmation() {
+    let mut app = board();
+    ch(&mut app, '?');
+    assert!(ch(&mut app, '/').is_empty());
+    assert!(app.search.is_none());
+    assert!(app.help);
+    ch(&mut app, '?');
+
+    let mut app = board();
+    // Select the stuck task and ask to cancel it.
+    ch(&mut app, 'G');
+    ch(&mut app, 'k');
+    ch(&mut app, 'c');
+    assert!(app.prompt.is_some());
+    assert!(ch(&mut app, '/').is_empty());
+    assert!(app.prompt.is_none());
+    assert!(app.search.is_none());
+}
+
+#[test]
+fn printable_keys_are_typed_not_acted_on_over_the_list_and_the_detail() {
+    for in_detail in [false, true] {
+        let mut app = board();
+        // A stuck task with a PR selected.
+        app.active
+            .iter_mut()
+            .find(|t| t.task.id == "7d22e1a8-dddd")
+            .unwrap()
+            .pr = Some(PullRequestRef {
+            number: 5,
+            url: "https://x/pull/5".into(),
+        });
+        ch(&mut app, 'G');
+        ch(&mut app, 'k');
+        if in_detail {
+            into_detail(&mut app);
+        }
+        let before = (
+            app.selected.clone(),
+            app.selected_pos,
+            detail_id(&app),
+            matches!(&app.view, View::Detail(d) if d.expanded),
+        );
+        ch(&mut app, '/');
+        let text = "qorcjkgG?e";
+        typed(&mut app, text);
+        assert_eq!(query(&app), text);
+        assert!(app.prompt.is_none() && !app.help);
+        let after = (
+            app.selected.clone(),
+            app.selected_pos,
+            detail_id(&app),
+            matches!(&app.view, View::Detail(d) if d.expanded),
+        );
+        assert_eq!(before, after);
+        assert_eq!(
+            key_with(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            vec![Effect::Quit]
+        );
+    }
+}
+
+#[test]
+fn ctrl_chords_other_than_navigation_and_other_keys_are_ignored() {
+    let mut app = board();
+    opened(&mut app);
+    typed(&mut app, "re");
+    for (code, mods) in [
+        (KeyCode::Char('x'), KeyModifiers::CONTROL),
+        (KeyCode::Char('x'), KeyModifiers::ALT),
+        (KeyCode::Tab, KeyModifiers::NONE),
+        (KeyCode::BackTab, KeyModifiers::SHIFT),
+        (KeyCode::Home, KeyModifiers::NONE),
+        (KeyCode::End, KeyModifiers::NONE),
+        (KeyCode::Left, KeyModifiers::NONE),
+        (KeyCode::Right, KeyModifiers::NONE),
+        (KeyCode::Delete, KeyModifiers::NONE),
+    ] {
+        assert!(key_with(&mut app, code, mods).is_empty());
+    }
+    assert_eq!(query(&app), "re");
+    // Shift is part of typing a capital.
+    key_with(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT);
+    assert_eq!(query(&app), "reR");
+}
+
+#[test]
+fn a_poll_result_does_not_touch_the_popup() {
+    let mut app = board();
+    opened(&mut app);
+    typed(&mut app, "st");
+    let g = (query(&app), found(&app), sel(&app));
+    assert!(g.1.len() >= 2);
+    key_with(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    let moved = sel(&app);
+    load(
+        &mut app,
+        vec![summary(
+            "zzzz",
+            "Brand new",
+            "open",
+            Some("coding"),
+            Some(1),
+            "p-beta",
+        )],
+        vec![],
+    );
+    assert_eq!((query(&app), found(&app)), (g.0, g.1));
+    assert_eq!(sel(&app), moved);
+}
+
+#[test]
+fn a_stale_search_result_changes_nothing() {
+    let mut app = board();
+    let tasks = search_tasks(&app);
+    let first = open_search(&mut app);
+    press(&mut app, KeyCode::Esc);
+    let second = open_search(&mut app);
+    assert!(second > first);
+    deliver(&mut app, first, tasks.clone());
+    let s = app.search.as_ref().unwrap();
+    assert!(matches!(s.load, SearchLoad::Loading));
+    assert_eq!(s.selected, None);
+
+    press(&mut app, KeyCode::Esc);
+    let board_sel = (app.selected.clone(), app.selected_pos);
+    deliver(&mut app, second, tasks);
+    assert!(app.search.is_none());
+    assert_eq!((app.selected.clone(), app.selected_pos), board_sel);
+}
+
+#[test]
+fn a_failed_load_shows_the_error_and_the_board_still_works() {
+    let mut app = board();
+    let g = open_search(&mut app);
+    update(
+        &mut app,
+        Msg::Search {
+            generation: g,
+            result: Err("boom".into()),
+        },
+    );
+    let screen = render(&app, 100, 24);
+    assert!(screen.contains("could not load tasks: boom"), "{screen}");
+    assert!(!screen.contains("no matching tasks"));
+    assert!(press(&mut app, KeyCode::Enter).is_empty());
+    assert!(app.search.is_some());
+    press(&mut app, KeyCode::Esc);
+    assert!(app.search.is_none());
+    let before = app.selected_pos;
+    ch(&mut app, 'j');
+    assert_eq!(app.selected_pos, before + 1);
+    let again = open_search(&mut app);
+    assert!(again > g);
+}
+
+#[test]
+fn enter_on_a_task_outside_the_closed_window_opens_its_detail() {
+    let mut app = board();
+    let before = (app.selected.clone(), app.selected_pos);
+    opened(&mut app);
+    typed(&mut app, "ancient");
+    assert_eq!(found(&app), [ANCIENT]);
+    assert_eq!(sel(&app).as_deref(), Some(ANCIENT));
+    assert_eq!(
+        press(&mut app, KeyCode::Enter),
+        vec![
+            Effect::FetchDetail(ANCIENT.into()),
+            Effect::OpenSocket(ANCIENT.into())
+        ]
+    );
+    assert!(app.search.is_none());
+    match &app.view {
+        View::Detail(d) => assert_eq!(d.snapshot.as_ref().unwrap().task.id, ANCIENT),
+        View::List => panic!("expected the detail view"),
+    }
+    assert_eq!((app.selected.clone(), app.selected_pos), before);
+    assert_eq!(
+        ch(&mut app, 'o'),
+        vec![Effect::OpenUrl("https://github.com/o/r/pull/77".into())]
+    );
+}
+
+#[test]
+fn enter_on_a_task_on_the_board_selects_it_there() {
+    let mut app = board();
+    opened(&mut app);
+    typed(&mut app, "Release");
+    assert_eq!(found(&app), ["61b0f2e3-eeee"]);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.selected.as_deref(), Some("61b0f2e3-eeee"));
+    assert_eq!(app.selected_pos, 4);
+    assert_eq!(detail_id(&app).as_deref(), Some("61b0f2e3-eeee"));
+}
+
+#[test]
+fn enter_from_a_detail_replaces_it() {
+    let mut app = board();
+    into_detail(&mut app);
+    opened(&mut app);
+    typed(&mut app, "ancient");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(detail_id(&app).as_deref(), Some(ANCIENT));
+}
+
+#[test]
+fn enter_with_no_match_or_while_loading_does_nothing() {
+    let mut app = board();
+    open_search(&mut app);
+    assert!(press(&mut app, KeyCode::Enter).is_empty());
+    assert!(app.search.is_some());
+    assert!(matches!(app.view, View::List));
+
+    let mut app = board();
+    opened(&mut app);
+    typed(&mut app, "no such thing");
+    assert_eq!(sel(&app), None);
+    assert!(press(&mut app, KeyCode::Enter).is_empty());
+    assert!(app.search.is_some());
+}
+
+#[test]
+fn selection_moves_clamps_pages_and_follows_the_query() {
+    let mut app = board();
+    opened(&mut app);
+    let all = found(&app);
+    assert_eq!(all.len(), 6);
+    assert_eq!(sel(&app).as_ref(), Some(&all[0]));
+    // Up at the top clamps; Down, Ctrl-N, Ctrl-P move by one.
+    press(&mut app, KeyCode::Up);
+    assert_eq!(sel(&app).as_ref(), Some(&all[0]));
+    press(&mut app, KeyCode::Down);
+    assert_eq!(sel(&app).as_ref(), Some(&all[1]));
+    key_with(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+    assert_eq!(sel(&app).as_ref(), Some(&all[2]));
+    key_with(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    assert_eq!(sel(&app).as_ref(), Some(&all[1]));
+    // Paging uses the drawn page height, and clamps.
+    app.search.as_ref().unwrap().page.set(4);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(sel(&app).as_ref(), Some(&all[5]));
+    press(&mut app, KeyCode::Down);
+    assert_eq!(sel(&app).as_ref(), Some(&all[5]));
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(sel(&app).as_ref(), Some(&all[1]));
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(sel(&app).as_ref(), Some(&all[0]));
+    // Still a result after typing: stays. Filtered out: the first result.
+    press(&mut app, KeyCode::Down);
+    let keep = sel(&app).unwrap();
+    let title = app
+        .search
+        .as_ref()
+        .unwrap()
+        .results()
+        .into_iter()
+        .find(|t| t.task.id == keep)
+        .unwrap()
+        .task
+        .title
+        .clone();
+    typed(&mut app, &title[..4]);
+    assert_eq!(sel(&app).as_ref(), Some(&keep));
+    typed(&mut app, "zz");
+    assert_eq!(sel(&app), None);
+    // Backspace to a matching query: from none, the first result.
+    press(&mut app, KeyCode::Backspace);
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(sel(&app).as_ref(), found(&app).first());
+    // Backspace on an empty query is a no-op.
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    assert_eq!(query(&app), "");
+    assert_eq!(sel(&app).as_ref(), Some(&keep));
+}
+
+#[test]
+fn selection_is_the_first_result_when_the_load_arrives_after_typing() {
+    let mut app = board();
+    let tasks = search_tasks(&app);
+    let g = open_search(&mut app);
+    typed(&mut app, "re");
+    assert_eq!(sel(&app), None);
+    deliver(&mut app, g, tasks);
+    assert_eq!(sel(&app).as_ref(), found(&app).first());
+    assert!(sel(&app).is_some());
+}
+
+fn long_fixture() -> Vec<TaskSummary> {
+    let statuses = ["open", "stuck", "closed", "cancelled"];
+    (0..12)
+        .map(|i| {
+            let mut t = summary(
+                &format!("id{i:05}-aaaa"),
+                &format!("Long title {i} {}", "lorem ipsum dolor ".repeat(8)),
+                statuses[i % 4],
+                None,
+                None,
+                if i % 2 == 0 { "p-alpha" } else { "p-beta" },
+            );
+            if i % 3 == 0 {
+                t = with_pr(t, 1000 + i as u64);
+            }
+            t.task.created_at = mins_ago(i as i64);
+            t
+        })
+        .collect()
+}
+
+#[test]
+fn the_popup_fits_its_box_and_shows_the_right_columns_at_every_size() {
+    for all_projects in [true, false] {
+        for last in [false, true] {
+            for h in [10u16, 24, 40] {
+                for w in 40u16..=120 {
+                    let mut app = new_app(if all_projects {
+                        Scope::AllProjects
+                    } else {
+                        Scope::Project {
+                            name: "chocofactory".into(),
+                        }
+                    });
+                    app.projects.insert("p-alpha".into(), "chocofactory".into());
+                    app.projects.insert("p-beta".into(), "webshop".into());
+                    app.search_gen = 1;
+                    let mut s = Search {
+                        generation: 1,
+                        query: String::new(),
+                        load: SearchLoad::Loaded(long_fixture()),
+                        selected: None,
+                        page: std::cell::Cell::new(10),
+                        offset: std::cell::Cell::new(0),
+                    };
+                    let want = if last { s.results().len() - 1 } else { 0 };
+                    s.selected = Some(s.results()[want].task.id.clone());
+                    app.search = Some(s);
+                    let text = render(&app, w, h);
+                    let ctx = format!("{w}x{h} all={all_projects} last={last}\n{text}");
+                    let lines: Vec<Vec<char>> = text.lines().map(|l| l.chars().collect()).collect();
+                    let top = lines
+                        .iter()
+                        .position(|l| {
+                            l.contains(&'┌') && l.iter().collect::<String>().contains("search")
+                        })
+                        .unwrap_or_else(|| panic!("no box\n{ctx}"));
+                    let x0 = lines[top].iter().position(|c| *c == '┌').unwrap();
+                    let x1 = lines[top].iter().position(|c| *c == '┐').unwrap();
+                    let bottom = (top + 1..lines.len())
+                        .find(|y| lines[*y][x0] == '└')
+                        .unwrap_or_else(|| panic!("no bottom\n{ctx}"));
+                    for row in &lines[top + 1..bottom] {
+                        assert_eq!((row[x0], row[x1]), ('│', '│'), "{ctx}");
+                    }
+                    // Result rows only: skip input, count and hint lines.
+                    let rows: String = lines[top + 3..bottom - 1]
+                        .iter()
+                        .map(|r| r[x0 + 1..x1].iter().collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(rows.contains("▶ "), "{ctx}");
+                    assert_eq!(rows.contains('#'), w >= 80, "{ctx}");
+                    let status = ["open", "stuck", "closed", "cancelled"]
+                        .iter()
+                        .any(|s| rows.contains(s));
+                    assert_eq!(status, w >= 60, "{ctx}");
+                    let project = rows.contains("chocofactory") || rows.contains("webshop");
+                    assert_eq!(project, w >= 60 && all_projects, "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_popup_says_what_it_is_doing() {
+    let mut app = board();
+    let tasks = search_tasks(&app);
+    let g = open_search(&mut app);
+    assert!(render(&app, 100, 24).contains("loading…"));
+    deliver(&mut app, g, tasks);
+    let screen = render(&app, 100, 24);
+    assert!(screen.contains("6 of 6 tasks"), "{screen}");
+    typed(&mut app, "st");
+    assert!(render(&app, 100, 24).contains("2 of 6 tasks"));
+    assert!(render(&app, 100, 24).contains("/ st_"));
+    typed(&mut app, "qqqq");
+    let screen = render(&app, 100, 24);
+    assert!(screen.contains("no matching tasks"), "{screen}");
+    assert!(screen.contains("0 of 6 tasks"));
+}
+
+#[test]
+fn a_long_query_shows_its_tail_and_the_cursor() {
+    let mut app = board();
+    opened(&mut app);
+    typed(&mut app, &"x".repeat(80));
+    typed(&mut app, "END");
+    let screen = render(&app, 40, 12);
+    assert!(screen.contains("…xxx"), "{screen}");
+    assert!(screen.contains("xxxEND_"), "{screen}");
+}
+
+#[test]
+fn help_and_the_board_hints_mention_search() {
+    let mut app = board();
+    let hint = render(&app, 100, 24);
+    assert!(hint.contains("/ search"), "{hint}");
+    ch(&mut app, '?');
+    let help = render(&app, 100, 24);
+    assert!(help.contains("/           search"), "{help}");
+    // The 10-row help box still fits the smallest terminal.
+    let small = render(&app, 40, 10);
+    assert!(
+        small.contains("search") && small.contains("keys"),
+        "{small}"
+    );
+}
+
+#[tokio::test]
+async fn search_finds_a_task_beyond_the_closed_window_through_the_real_loop() {
+    let mut recent = summary(
+        "cccc3333-0",
+        "Recent release",
+        "closed",
+        None,
+        None,
+        "p-alpha",
+    );
+    recent.task.updated_at = mins_ago(10);
+    let mut old = summary(
+        "dddd4444-0",
+        "Ancient migration fix",
+        "closed",
+        None,
+        None,
+        "p-alpha",
+    );
+    old.task.updated_at = mins_ago(10_000);
+    let live = summary(
+        "aaaa1111-0",
+        "Fix the login",
+        "open",
+        Some("coding"),
+        Some(3),
+        "p-alpha",
+    );
+    let fake = Fake {
+        tasks: Arc::new(vec![live, recent, old]),
+        cancels: Arc::new(Mutex::new(Vec::new())),
+        keeps: Arc::new(Mutex::new(Vec::new())),
+        hang: false,
+        queries: Arc::default(),
+    };
+    let base_url = fake_server(fake.clone()).await;
+    let client = Arc::new(Client::new(base_url.clone()).without_version_check());
+    let mut app = App::new(
+        Scope::AllProjects,
+        base_url,
+        Duration::from_secs(1),
+        "1s".into(),
+        Utc::now(),
+    );
+    app.color = false;
+    app.ssh = false;
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 1,
+        project_id: None,
+        timeout: Duration::from_secs(30),
+        poll_timeout: Duration::from_secs(30),
+        panicked: Arc::default(),
+    };
+    let (ktx, mut krx) = mpsc::unbounded_channel();
+    let latest = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&latest);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    let driver = async {
+        let k = |c| {
+            ktx.send(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap()
+        };
+        wait_for(&latest, "Recent release").await;
+        assert!(!latest.lock().unwrap().contains("Ancient migration fix"));
+        k('/');
+        wait_for(&latest, "3 of 3 tasks").await;
+        {
+            let queries = fake.queries.lock().unwrap();
+            let search = queries
+                .iter()
+                .find(|q| !q.contains_key("status"))
+                .expect("a request without a status filter");
+            assert!(!search.contains_key("limit"));
+            assert!(!search.contains_key("project_id"));
+        }
+        for c in "ancient".chars() {
+            k(c);
+        }
+        wait_for(&latest, "1 of 3 tasks").await;
+        wait_for(&latest, "Ancient migration fix").await;
+        ktx.send(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&latest, "last events").await;
+        k('q');
+        wait_for(&latest, "RECENTLY CLOSED").await;
+        k('q');
+    };
+    let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let run = run_loop(
+        &mut terminal,
+        &mut app,
+        client,
+        &config,
+        &mut krx,
+        &mut on_frame,
+    );
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(run, driver) })
+            .await
+            .expect("the loop should end on q");
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn search_in_one_project_mode_asks_for_that_project_only() {
+    let fake = Fake {
+        tasks: Arc::new(vec![
+            summary(
+                "aaaa1111-0",
+                "Alpha task",
+                "open",
+                Some("coding"),
+                Some(3),
+                "p-alpha",
+            ),
+            summary(
+                "bbbb2222-0",
+                "Beta task",
+                "open",
+                Some("coding"),
+                Some(3),
+                "p-beta",
+            ),
+        ]),
+        cancels: Arc::new(Mutex::new(Vec::new())),
+        keeps: Arc::new(Mutex::new(Vec::new())),
+        hang: false,
+        queries: Arc::default(),
+    };
+    let base_url = fake_server(fake.clone()).await;
+    let client = Arc::new(Client::new(base_url.clone()).without_version_check());
+    let mut app = App::new(
+        Scope::Project {
+            name: "alpha-project".into(),
+        },
+        base_url,
+        Duration::from_secs(1),
+        "1s".into(),
+        Utc::now(),
+    );
+    app.color = false;
+    app.ssh = false;
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: Some("p-alpha".into()),
+        timeout: Duration::from_secs(30),
+        poll_timeout: Duration::from_secs(30),
+        panicked: Arc::default(),
+    };
+    let (ktx, mut krx) = mpsc::unbounded_channel();
+    let latest = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&latest);
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    let driver = async {
+        wait_for(&latest, "Alpha task").await;
+        ktx.send(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        wait_for(&latest, "1 of 1 tasks").await;
+        {
+            let queries = fake.queries.lock().unwrap();
+            let search = queries
+                .iter()
+                .find(|q| !q.contains_key("status"))
+                .expect("a request without a status filter");
+            assert_eq!(
+                search.get("project_id").map(String::as_str),
+                Some("p-alpha")
+            );
+            assert!(!search.contains_key("limit"));
+        }
+        ktx.send(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+    };
+    let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let run = run_loop(
+        &mut terminal,
+        &mut app,
+        client,
+        &config,
+        &mut krx,
+        &mut on_frame,
+    );
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(run, driver) })
+            .await
+            .expect("Ctrl-C quits from the popup");
+    result.unwrap();
 }

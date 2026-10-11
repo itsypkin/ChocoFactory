@@ -543,11 +543,30 @@ Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off
 | `o` | open the task's pull request |
 | `r` | retry a `stuck` task |
 | `c` | cancel an `open` or `stuck` task |
+| `/` | search every task by PR number, title or id (from the list or the detail view) |
 | `?` | list the keys |
 | `q`, `Ctrl-C` | quit |
 
 The selection follows the task, not the row, so it stays put when a refresh
 re-sorts the list.
+
+`/` opens a search popup over the current view. It searches every task in the
+dashboard's scope (all statuses, including closed and cancelled tasks beyond
+`--closed`); the list is loaded once, when the popup opens. The query matches
+like this, newest task first:
+
+- `#289` matches the task whose pull request is #289 exactly (`#28` and `#2890`
+  do not match);
+- digits alone (`289`) match that PR number, or ids starting with those digits;
+- any other text matches titles containing it (ignoring case) or ids starting
+  with it.
+
+Every printable key is typed into the query, so `j`, `k` and `q` go into the
+search instead of moving or quitting. `↑` `↓`, `Ctrl-P` `Ctrl-N` and `PgUp`
+`PgDn` move the selection, `⏎` opens the selected task's detail view (also for
+a task that is not on the board) and `Esc` closes the popup, leaving the
+dashboard as it was. `Ctrl-C` still quits. If the load fails the popup shows
+`could not load tasks: …`; close it and press `/` again to retry.
 
 Actions apply to the selected task (the open one, in the detail view):
 
