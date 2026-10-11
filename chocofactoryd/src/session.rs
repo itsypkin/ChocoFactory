@@ -2605,12 +2605,10 @@ mod tests {
     /// already documents: env is process-global and these tests run in
     /// parallel in one process.
     fn spawns_child_binary(dir: &std::path::Path) -> (String, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let heartbeat = dir.join("heartbeat");
         let child_pid = dir.join("child.pid");
         let wrapper = dir.join("fake-claude-spawns-child");
-        std::fs::write(
+        crate::test_support::write_executable(
             &wrapper,
             format!(
                 "#!/bin/sh\nCHOCO_TEST_HEARTBEAT='{}' CHOCO_TEST_CHILD_PID='{}' CHOCO_TEST_AGENT_PID='{}' exec '{}' \"$@\"\n",
@@ -2619,9 +2617,7 @@ mod tests {
                 dir.join("agent.pid").display(),
                 fixture_binary("fake_claude_spawns_child.py"),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         (wrapper.display().to_string(), heartbeat, child_pid)
     }
 
@@ -3099,21 +3095,17 @@ mod tests {
     /// A `fake_claude_script.py` wrapper following `steps`. A generated
     /// script rather than `set_var`, as in `spawns_child_binary`.
     fn script_binary(dir: &std::path::Path, steps: serde_json::Value) -> String {
-        use std::os::unix::fs::PermissionsExt;
-
         let script = dir.join("script.json");
         std::fs::write(&script, steps.to_string()).unwrap();
         let wrapper = dir.join("fake-claude-script");
-        std::fs::write(
+        crate::test_support::write_executable(
             &wrapper,
             format!(
                 "#!/bin/sh\nFAKE_CLAUDE_SCRIPT='{}' exec '{}' \"$@\"\n",
                 script.display(),
                 fixture_binary("fake_claude_script.py"),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         wrapper.display().to_string()
     }
 
@@ -4754,15 +4746,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("omp-was-run");
         let wrapper = dir.join("omp-wrapper");
-        std::fs::write(
+        crate::test_support::write_executable(
             &wrapper,
             format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let pool = connect_in_memory().await.unwrap();
         let claude = recording("claude");
         let omp = Arc::new(crate::adapter::OmpAdapter::with_binary(

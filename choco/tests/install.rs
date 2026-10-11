@@ -6,7 +6,10 @@
 //! command that could fetch gets `CHOCO_RELEASES_URL` pointing at the
 //! in-test server (or an unreachable local port), never github.com; daemons
 //! use `--port 0` and `mock-claude`/a fixture, and are signalled only by the
-//! pid in the temp lock.
+//! pid in the temp lock or by `support::kill_processes_under` (processes
+//! whose cwd is inside the temp home).
+
+mod support;
 
 use std::collections::HashMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -328,8 +331,50 @@ impl Drop for Env {
         if let Ok(LockState::Running(info)) = read_lock(&self.root()) {
             unsafe { libc::kill(info.pid as i32, libc::SIGKILL) };
         }
+        support::kill_processes_under(&self.home);
         let _ = std::fs::remove_dir_all(&self.home);
     }
+}
+
+/// Regression test for the leak: a daemon the lock file no longer names
+/// (here: the lock file was deleted) must still die when the `Env` is
+/// dropped by a panicking test.
+#[test]
+fn a_panicking_test_leaves_no_daemon_behind() {
+    let seen: std::sync::Mutex<Option<(i32, PathBuf)>> = std::sync::Mutex::new(None);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let env = Env::new();
+        env.install_from_archive();
+        let info = env.start_daemon();
+        *seen.lock().unwrap() = Some((info.pid as i32, std::fs::canonicalize(&env.home).unwrap()));
+        // The state the lock-only `Drop` misses: `read_lock` reports
+        // NotRunning while the daemon keeps running on the unlinked inode.
+        std::fs::remove_file(chocofactory_core::daemon_lock::lock_path(&env.root())).unwrap();
+        panic!("deliberate panic, as a failing test would");
+    }));
+    assert!(result.is_err());
+    let (pid, home) = seen.lock().unwrap().take().unwrap();
+
+    // The daemon is orphaned and pid 1 reaps it once killed, so waiting for
+    // the pid to disappear is the thing under test, not a load allowance.
+    let end = Instant::now() + DEADLINE;
+    let gone = loop {
+        let alive = unsafe { libc::kill(pid, 0) } != -1
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        if !alive {
+            break true;
+        }
+        if Instant::now() >= end {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if !gone {
+        // Don't leak when the fix is broken.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    assert!(gone, "daemon {pid} survived the Env being dropped");
+    assert_eq!(support::kill_processes_under(&home), Vec::<i32>::new());
 }
 
 // ---- 1. package-release.sh -------------------------------------------------

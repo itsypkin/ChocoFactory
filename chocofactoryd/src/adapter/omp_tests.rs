@@ -4,8 +4,6 @@
 //! environment variables, never through this process's own environment, so
 //! tests running in parallel can't affect each other.
 
-use std::os::unix::fs::PermissionsExt;
-
 use super::*;
 use crate::adapter::{ClaudeAdapter, TokenCounts};
 use tokio::io::AsyncWriteExt;
@@ -30,7 +28,9 @@ fn wrapper(dir: &Path, env: &[(&str, &str)]) -> String {
 }
 
 fn wrapper_for(dir: &Path, fixture: &str, env: &[(&str, &str)], marker: Option<&Path>) -> String {
-    let mut script = String::from("#!/bin/sh\n");
+    // The first arm lets `wrapper_for` run the script once (below) without
+    // touching the marker or the fixture.
+    let mut script = String::from("#!/bin/sh\n[ \"$1\" = --choco-warm-up ] && exit 0\n");
     if let Some(marker) = marker {
         script.push_str(&format!("touch '{}'\n", marker.display()));
     }
@@ -40,10 +40,28 @@ fn wrapper_for(dir: &Path, fixture: &str, env: &[(&str, &str)], marker: Option<&
             value.replace('\'', "'\\''")
         ));
     }
+    // Answer `--version` here: the adapter probes it with a 5 s timeout, and
+    // starting the Python fixture just to print a constant is what blew that
+    // budget under load. Mirrors `fake_omp.py`'s own `--version` branch.
+    script.push_str(
+        "case \"$1\" in\n--version)\n    if [ -n \"${FAKE_OMP_VERSION_FAIL:-}\" ]; then exit 1; fi\n    echo 'omp/fake-1.0'\n    exit 0\n    ;;\nesac\n",
+    );
     script.push_str(&format!("exec '{}' \"$@\"\n", fixture_binary(fixture)));
     let path = dir.join(format!("wrapper-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&path, script).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_support::write_executable(&path, script);
+    // On macOS the first exec of a freshly written file pays a one-time
+    // Gatekeeper check (0.3 s to over 5 s under load). Pay it here, so the
+    // adapter's 5 s `--version` probe never includes it. A real omp binary
+    // has been run before and doesn't pay it per probe.
+    let status = std::process::Command::new(&path)
+        .arg("--choco-warm-up")
+        .status()
+        .unwrap_or_else(|e| panic!("warming up {}: {e}", path.display()));
+    assert!(
+        status.success(),
+        "warming up {} failed: {status}",
+        path.display()
+    );
     path.to_string_lossy().into_owned()
 }
 
@@ -681,6 +699,33 @@ async fn protocol_v2_is_only_negotiated_when_offered_and_a_failure_keeps_v1() {
         );
         drain(&mut handle).await;
     }
+}
+
+/// The wrapper answers `--version` itself: pointed at a fixture that does not
+/// exist, only the wrapper's own arm can produce this output.
+#[test]
+fn the_wrapper_answers_version_without_starting_the_fixture() {
+    let env = Env::new();
+    let wrapper = wrapper_for(&env.dir, "no-such-fixture.py", &[], None);
+    let out = std::process::Command::new(&wrapper)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "omp/fake-1.0");
+
+    let failing = wrapper_for(
+        &env.dir,
+        "no-such-fixture.py",
+        &[("FAKE_OMP_VERSION_FAIL", "1")],
+        None,
+    );
+    let out = std::process::Command::new(&failing)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty());
 }
 
 #[tokio::test]

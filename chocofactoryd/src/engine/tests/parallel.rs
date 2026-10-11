@@ -320,7 +320,14 @@ async fn timeline_len(g: &Group) -> usize {
         EventType::BranchFinished,
         EventType::Error,
     ] {
-        n += g.events_of(kind).await.len();
+        // Task-level events only: a branch session kept live by the fixture
+        // can append its own (e.g. an `Error` when its process ends).
+        n += g
+            .events_of(kind)
+            .await
+            .iter()
+            .filter(|e| e.session_id.is_none())
+            .count();
     }
     n
 }

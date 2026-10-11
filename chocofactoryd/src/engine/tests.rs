@@ -2285,13 +2285,10 @@ stages:
 /// is.
 #[tokio::test]
 async fn a_script_file_stage_runs_and_captures() {
-    use std::os::unix::fs::PermissionsExt;
-
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
     let script = dir.join("do-it.sh");
-    std::fs::write(&script, "#!/bin/sh\nprintf 'from script'\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_support::write_executable(&script, "#!/bin/sh\nprintf 'from script'\n");
 
     let yaml = r#"
 name: script-flow
@@ -3119,7 +3116,7 @@ async fn a_builtin_shell_stage_runs_its_script_file() {
     let builtin_dir = tempdir();
     std::fs::create_dir_all(builtin_dir.join("scripts")).unwrap();
     let script = builtin_dir.join("scripts").join("hello.sh");
-    std::fs::write(&script, "#!/bin/sh\necho builtin-script-marker\n").unwrap();
+    crate::test_support::write_executable(&script, "#!/bin/sh\necho builtin-script-marker\n");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o555)).unwrap();
     std::fs::write(
         builtin_dir.join("scripted.yaml"),
@@ -4305,8 +4302,6 @@ async fn a_poll_takes_the_edge_of_the_outcome_that_matched() {
 /// thing this rule prevents.
 #[tokio::test]
 async fn a_poll_keeps_running_until_its_output_changes_and_records_only_the_changes() {
-    use std::os::unix::fs::PermissionsExt;
-
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
     // Counts its own runs through a file in the task's working
@@ -4314,13 +4309,11 @@ async fn a_poll_keeps_running_until_its_output_changes_and_records_only_the_chan
     // with the wrong directory the counter never accumulates and the
     // poll would run to its timeout instead.
     let script = dir.join("check.sh");
-    std::fs::write(
+    crate::test_support::write_executable(
         &script,
         "#!/bin/sh\nn=$(cat count 2>/dev/null || echo 0)\nn=$((n+1))\n\
              echo $n > count\nif [ $n -ge 3 ]; then echo SUCCESS; else echo PENDING; fi\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let yaml = format!(
         r#"
@@ -4756,22 +4749,18 @@ fn tempdir() -> TempDir {
 /// `std::env::set_var` is process-global, and these tests run in parallel
 /// in one process, so two of them would clobber each other's reply.
 fn reply_binary(dir: &Path, reply: &str) -> String {
-    use std::os::unix::fs::PermissionsExt;
-
     let reply_path = dir.join("reply.txt");
     fs::write(&reply_path, reply).unwrap();
 
     let wrapper = dir.join("fake-claude-reply");
-    fs::write(
+    crate::test_support::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\nFAKE_CLAUDE_REPLY_FILE='{}' exec '{}' \"$@\"\n",
             reply_path.display(),
             fixture_binary("fake_claude_reply.py"),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     wrapper.display().to_string()
 }
 
@@ -7096,14 +7085,7 @@ fn workspace_binary(name: &str) -> PathBuf {
 /// Writes an executable script to `dir/name` with `contents`.
 fn write_script(dir: &Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
-    fs::write(&path, contents).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
-    }
+    crate::test_support::write_executable(&path, contents);
     path
 }
 
@@ -10505,21 +10487,17 @@ async fn resuming_a_session_with_no_baseline_does_not_start_the_agent() {
 /// side by side in one test — a retry drives a *different* script than
 /// the run it is retrying.
 fn named_script_binary(dir: &Path, name: &str, steps: Value) -> String {
-    use std::os::unix::fs::PermissionsExt;
-
     let script = dir.join(format!("{name}.json"));
     fs::write(&script, steps.to_string()).unwrap();
     let wrapper = dir.join(name);
-    fs::write(
+    crate::test_support::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\nFAKE_CLAUDE_SCRIPT='{}' exec '{}' \"$@\"\n",
             script.display(),
             fixture_binary("fake_claude_script.py"),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     wrapper.display().to_string()
 }
 
@@ -11193,7 +11171,9 @@ stages:
         .await
         .unwrap()
         .into_iter()
-        .filter(|e| e.event_type == EventType::Error)
+        // Task-level only: the finished `first` stage's session is still
+        // there and can append its own `Error` events.
+        .filter(|e| e.event_type == EventType::Error && e.session_id.is_none())
         .collect();
     assert_eq!(
         error_events.len(),
@@ -13052,18 +13032,14 @@ stages:
 
 #[tokio::test]
 async fn a_poll_stages_env_reaches_every_attempt() {
-    use std::os::unix::fs::PermissionsExt;
-
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
     let script = dir.join("check.sh");
-    std::fs::write(
-            &script,
-            "#!/bin/sh\nn=$(cat count 2>/dev/null || echo 0)\nn=$((n+1))\n\
+    crate::test_support::write_executable(
+        &script,
+        "#!/bin/sh\nn=$(cat count 2>/dev/null || echo 0)\nn=$((n+1))\n\
              echo $n > count\nif [ $n -ge 2 ]; then echo \"SUCCESS $X\"; else echo \"PENDING $X\"; fi\n",
-        )
-        .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let yaml = format!(
         r#"
 name: poll-env
@@ -13604,14 +13580,12 @@ async fn the_park_sweep_names_what_it_could_not_check() {
 /// through the real shutdown path.
 #[tokio::test]
 async fn the_watcher_parks_a_turn_that_ended_daemon_stopped() {
-    use std::os::unix::fs::PermissionsExt;
-
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
     let def = coding_workflow(&dir);
     let task_id = seed_task_in(&pool, &def.name, &dir).await;
     let wrapper = dir.join("fake-claude-spawns-child");
-    std::fs::write(
+    crate::test_support::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\nCHOCO_TEST_HEARTBEAT='{}' CHOCO_TEST_CHILD_PID='{}' exec '{}' \"$@\"\n",
@@ -13619,9 +13593,7 @@ async fn the_watcher_parks_a_turn_that_ended_daemon_stopped() {
             dir.join("child.pid").display(),
             fixture_binary("fake_claude_spawns_child.py"),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let events_notify = Arc::new(Notify::new());
     let adapter: Arc<dyn AgentAdapter> =
@@ -14936,8 +14908,6 @@ async fn a_legacy_task_whose_workflow_has_an_unknown_cli_fails_to_load() {
 /// message, no session row exists, and nothing was spawned.
 #[tokio::test]
 async fn a_cli_that_slips_in_after_startup_fails_the_turn_closed() {
-    use std::os::unix::fs::PermissionsExt;
-
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
     let flow = write_cli_workflow(&dir, "flow.yaml", "");
@@ -14945,16 +14915,14 @@ async fn a_cli_that_slips_in_after_startup_fails_the_turn_closed() {
     fs::write(&global, "roles:\n  coder:\n    cli: bogus\n").unwrap();
     let marker = dir.join("claude-was-run");
     let wrapper = dir.join("claude-wrapper");
-    fs::write(
+    crate::test_support::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\ntouch '{}'\nexec '{}' \"$@\"\n",
             marker.display(),
             fixture_binary("fake_claude.py")
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
     let engine =
         engine_with_global_config(pool.clone(), &wrapper.display().to_string(), &dir, &global);
@@ -15273,16 +15241,12 @@ const OMP_MEMORY_REJECTION: &str = "role 'coder' runs on cli 'omp', which can't 
 /// A registry with the fake claude and a real `OmpAdapter` whose binary is a
 /// wrapper that leaves a marker if it is ever run.
 fn claude_and_omp_registry(dir: &Path) -> (Registry, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
-
     let marker = dir.join("omp-was-run");
     let wrapper = dir.join("omp-wrapper");
-    fs::write(
+    crate::test_support::write_executable(
         &wrapper,
         format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let registry = Registry::new(vec![
         Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"))),
         Arc::new(crate::adapter::OmpAdapter::with_binary(
@@ -16772,14 +16736,11 @@ async fn start_task_on_a_row_without_a_base_forks_from_the_repo_head() {
 /// Installs a `reference-transaction` hook that stalls every fetch at the
 /// `prepared` step, i.e. while git holds the ref's `.lock` file.
 fn stall_ref_transactions(repo: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     let hook = repo.join(".git/hooks/reference-transaction");
-    fs::write(
+    crate::test_support::write_executable(
         &hook,
         "#!/bin/sh\nif [ \"$1\" = prepared ]; then sleep 30 >/dev/null 2>&1; fi\n",
-    )
-    .unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 }
 
 fn lock_files(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -2004,14 +2004,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_reader_sends_the_plugin_warning_after_the_session_meta_for_isolated_roles() {
-        use std::os::unix::fs::PermissionsExt;
         let script = std::env::temp_dir().join(format!("choco-fake-{}.sh", uuid::Uuid::new_v4()));
-        std::fs::write(
+        crate::test_support::write_executable(
             &script,
             "#!/bin/sh\nread line\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"plugins\":[{\"name\":\"cc-plugin-telemetry\",\"source\":\"cc-plugin-telemetry@builtin\"}]}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"session_id\":\"s\"}'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         for (isolation, expect_warning) in [
             (Isolation::default(), true),
             (Isolation::InheritOperatorConfig, false),
@@ -2027,20 +2024,7 @@ mod tests {
                 report_sections: Vec::new(),
                 isolation,
             };
-            // A sibling test forking while the script was open for writing
-            // makes exec fail with ETXTBSY; that is transient, so retry.
-            let mut attempts = 0;
-            let mut handle = loop {
-                match adapter.start("go", &cfg) {
-                    Err(AdapterError::Spawn(e))
-                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 =>
-                    {
-                        attempts += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                    other => break other.unwrap(),
-                }
-            };
+            let mut handle = adapter.start("go", &cfg).unwrap();
             let mut seen = Vec::new();
             while let Some(event) = handle.recv().await {
                 let done = matches!(event, AgentEvent::TurnCompleted { .. });
@@ -2119,14 +2103,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_sub_agent_init_line_does_not_trigger_the_plugin_warning() {
-        use std::os::unix::fs::PermissionsExt;
         let script = std::env::temp_dir().join(format!("choco-fake-{}.sh", uuid::Uuid::new_v4()));
-        std::fs::write(
+        crate::test_support::write_executable(
             &script,
             "#!/bin/sh\nread line\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"parent_tool_use_id\":\"toolu_x\",\"plugins\":[{\"name\":\"cc-plugin-telemetry\",\"source\":\"cc-plugin-telemetry@builtin\"}]}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"session_id\":\"s\"}'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
         let cfg = RoleConfig {
             disallowed_tools: Vec::new(),
