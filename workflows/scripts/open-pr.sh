@@ -55,7 +55,8 @@ strip_markers() {
 # Rewrites every GitHub issue reference that follows a closing keyword, so
 # that agent text can never close an issue (#131). The rule: a PR body choco
 # writes has only the issue lines built from the task's closes list, which the
-# operator set with `choco task create --closes`; no agent-written text may form "closing keyword + issue reference".
+# operator set with `choco task create --closes`; no agent-written text may
+# form "closing keyword + issue reference".
 # Why: merging PR #127 closed #84, because the reviewer's report said
 # "no Closes/Fixes/Resolves #84" and GitHub's parser ignores negation, slash
 # lists and the <details> fold.

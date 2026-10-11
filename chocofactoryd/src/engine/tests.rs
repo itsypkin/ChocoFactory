@@ -12922,6 +12922,22 @@ stages:
 }
 
 #[tokio::test]
+async fn stage_environment_for_a_missing_task_is_no_such_task() {
+    let pool = connect_in_memory().await.unwrap();
+    let def = WorkflowDefinition::parse(
+        "name: x\nstages:\n  s:\n    kind: terminal\n",
+        Path::new("."),
+    )
+    .unwrap();
+    let engine = engine_with_adapter(pool, "unused");
+    let err = engine
+        .stage_environment("no-such-task", &def, "s", &IndexMap::new(), &json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NoSuchTask), "{err:?}");
+}
+
+#[tokio::test]
 async fn unresolved_env_placeholders_join_the_commands_in_one_note() {
     let pool = connect_in_memory().await.unwrap();
     let yaml = r#"

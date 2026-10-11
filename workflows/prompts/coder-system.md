@@ -71,7 +71,7 @@ summary and your reply. Work like this:
    `echo "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`.
    It sits in git's private data for this worktree, so it is never
    committed: don't `git add` it or copy it into the tree. A later stage
-   publishes it as the PR's description and adds the linked issue, the
+   publishes it as the PR's description and adds the issue lines, the
    internal review's report and the task's provenance itself, so write
    none of those, and no `Closes #…` line. Don't write that the pull request
    closes or fixes an issue unless the task closes it (your turn prompt lists

@@ -1299,3 +1299,22 @@ fn an_open_pr_without_a_record_of_our_push_gets_a_plain_push() {
         first_line(&out).starts_with("choco open-pr: the push was rejected (non-fast-forward)")
     );
 }
+
+#[test]
+fn a_ref_in_the_part_of_the_title_that_is_cut_still_gets_its_refs_line() {
+    let title = format!("{} part of #77 tail", "a".repeat(120));
+    let fx = Fixture::new();
+    fx.write_description(b"d\n");
+    let out = fx.run_closes(&title, Some(""), "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let create = &fx.calls_to("pr create")[0];
+    let body = String::from_utf8(create.body.clone().unwrap()).unwrap();
+    assert!(body.contains("\nRefs #77\n"), "{body}");
+    let arg = create
+        .args
+        .iter()
+        .find_map(|a| a.strip_prefix(b"--title="))
+        .unwrap();
+    let t = std::str::from_utf8(arg).unwrap();
+    assert!(!t.contains("#77"), "{t}");
+}

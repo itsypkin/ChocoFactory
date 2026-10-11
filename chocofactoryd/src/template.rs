@@ -50,7 +50,7 @@ const CLOSE: &str = "}}";
 /// to be named after one (same reasoning as `merge_stage_capture`'s).
 const NAMESPACE: &str = "stages";
 
-/// The `task` root: the task's own title/initial input (P2-7a), seeded once
+/// The `task` root: the task's own title/input/closes (P2-7a), seeded once
 /// by `start_task` rather than any stage's `capture:`.
 const TASK_NAMESPACE: &str = "task";
 
