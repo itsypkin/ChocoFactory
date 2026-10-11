@@ -1293,7 +1293,13 @@ fn draw_search(frame: &mut Frame, app: &App, search: &Search, area: Rect) {
     search.page.set(rows_h);
 
     let cols = cols_for(app, area.width);
-    let proj_w = results
+    // Sized over every loaded task, so the title column doesn't shift as the
+    // query narrows the results.
+    let loaded: &[TaskSummary] = match &search.load {
+        SearchLoad::Loaded(all) => all,
+        _ => &[],
+    };
+    let proj_w = loaded
         .iter()
         .map(|t| app.project_label(&t.task.project_id).chars().count())
         .max()

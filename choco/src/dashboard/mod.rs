@@ -246,6 +246,7 @@ pub async fn run_loop<B: Backend>(
 ) -> Result<(), String> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     let mut socket: Option<JoinHandle<()>> = None;
+    let mut search_load: Option<JoinHandle<()>> = None;
 
     // First data before the first draw: daemon version, project names (all
     // projects) and both lists.
@@ -278,7 +279,7 @@ pub async fn run_loop<B: Backend>(
         }
     };
     for effect in update(app, Msg::List(Box::new(first))) {
-        if run_effect(effect, &client, config, &tx, &mut socket) {
+        if run_effect(effect, &client, config, &tx, &mut socket, &mut search_load) {
             abort(&mut socket);
             return Ok(());
         }
@@ -301,7 +302,7 @@ pub async fn run_loop<B: Backend>(
             }
         };
         for effect in update(app, msg) {
-            if run_effect(effect, &client, config, &tx, &mut socket) {
+            if run_effect(effect, &client, config, &tx, &mut socket, &mut search_load) {
                 abort(&mut socket);
                 return Ok(());
             }
@@ -366,6 +367,7 @@ fn run_effect(
     config: &LoopConfig,
     tx: &mpsc::UnboundedSender<Msg>,
     socket: &mut Option<JoinHandle<()>>,
+    search_load: &mut Option<JoinHandle<()>>,
 ) -> bool {
     match effect {
         Effect::Quit => return true,
@@ -443,7 +445,9 @@ fn run_effect(
         Effect::LoadSearch { generation } => {
             let (client, tx) = (Arc::clone(client), tx.clone());
             let (project_id, timeout) = (config.project_id.clone(), config.timeout);
-            tokio::spawn(async move {
+            // An abandoned load is cut off so reopening cannot stack requests.
+            abort(search_load);
+            *search_load = Some(tokio::spawn(async move {
                 // No status, order or limit: every task in scope (see #292).
                 let result = tokio::time::timeout(
                     timeout,
@@ -453,7 +457,7 @@ fn run_effect(
                 .map_err(|_| timed_out())
                 .and_then(|r| r.map_err(|e| e.to_string()));
                 let _ = tx.send(Msg::Search { generation, result });
-            });
+            }));
         }
     }
     false

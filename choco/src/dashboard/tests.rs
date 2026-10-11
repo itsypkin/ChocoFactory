@@ -1587,6 +1587,134 @@ fn quit(ktx: &mpsc::UnboundedSender<KeyEvent>) {
         .unwrap();
 }
 
+/// A daemon whose board requests (with a `status`) work, but whose search
+/// request (no `status`) either never answers or fails with a 500.
+async fn broken_search_daemon(hang: bool) -> String {
+    async fn server() -> axum::Json<Value> {
+        axum::Json(json!({
+            "version": chocofactory_core::version::VERSION, "commit": null, "pid": 1,
+            "port": 1, "started_at": "2026-01-01T00:00:00Z", "config_root": "/x",
+            "exe": "/x", "exe_replaced": false, "choco_binary": "choco",
+            "choco_binary_found": true, "tasks": {}, "in_flight": []
+        }))
+    }
+    async fn projects() -> axum::Json<Value> {
+        axum::Json(json!([]))
+    }
+    async fn tasks(
+        State(hang): State<bool>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> (StatusCode, axum::Json<Value>) {
+        if q.contains_key("status") {
+            let t = summary(
+                "aaaa1111-0",
+                "Board row",
+                "open",
+                Some("coding"),
+                Some(3),
+                "p-alpha",
+            );
+            return (StatusCode::OK, axum::Json(json!([t])));
+        }
+        if hang {
+            std::future::pending::<()>().await;
+        }
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": "search exploded"})),
+        )
+    }
+    let app = Router::new()
+        .route("/server", get(server))
+        .route("/projects", get(projects))
+        .route("/tasks", get(tasks))
+        .with_state(hang);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+fn search_config(timeout: Duration) -> LoopConfig {
+    LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout,
+        poll_timeout: Duration::from_secs(30),
+        panicked: Arc::default(),
+    }
+}
+
+#[tokio::test]
+async fn a_search_load_times_out_at_the_request_timeout() {
+    let url = broken_search_daemon(true).await;
+    run_against(
+        url,
+        search_config(Duration::from_millis(300)),
+        |latest, ktx| async move {
+            wait_for(&latest, "Board row").await;
+            ktx.send(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+                .unwrap();
+            wait_for(&latest, "could not load tasks: request timed out").await;
+            ktx.send(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            wait_for(&latest, "Board row").await;
+            assert!(!latest.lock().unwrap().contains("could not load tasks"));
+            quit(&ktx);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_search_load_error_reaches_the_popup() {
+    let url = broken_search_daemon(false).await;
+    run_against(
+        url,
+        search_config(Duration::from_secs(5)),
+        |latest, ktx| async move {
+            wait_for(&latest, "Board row").await;
+            ktx.send(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+                .unwrap();
+            wait_for(&latest, "could not load tasks:").await;
+            wait_for(&latest, "search exploded").await;
+            ktx.send(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap();
+            quit(&ktx);
+        },
+    )
+    .await;
+}
+
+#[test]
+fn moving_with_nothing_selected_does_nothing() {
+    let mut app = board();
+    let g = open_search(&mut app);
+    update(
+        &mut app,
+        Msg::Search {
+            generation: g,
+            result: Ok(vec![summary(
+                "aaaa1111-0",
+                "One",
+                "open",
+                None,
+                None,
+                "p-alpha",
+            )]),
+        },
+    );
+    for c in "zz".chars() {
+        ch(&mut app, c);
+    }
+    assert!(press(&mut app, KeyCode::Down).is_empty());
+    assert!(press(&mut app, KeyCode::PageDown).is_empty());
+    assert_eq!(app.search.as_ref().unwrap().selected, None);
+}
+
 #[tokio::test]
 async fn list_polls_time_out_at_the_poll_timeout_not_the_request_timeout() {
     // The first load works; every poll after it hangs.
