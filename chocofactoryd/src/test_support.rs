@@ -85,6 +85,15 @@ pub(crate) fn write_executable(path: &std::path::Path, contents: impl AsRef<str>
 mod tests {
     use super::*;
 
+    #[test]
+    #[should_panic(expected = "writing")]
+    fn write_executable_panics_when_the_write_fails() {
+        write_executable(
+            std::path::Path::new("/nonexistent-dir-for-choco-test/x"),
+            "#!/bin/sh\n",
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn returns_the_first_ok_without_sleeping() {
         let start = tokio::time::Instant::now();

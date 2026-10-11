@@ -686,6 +686,33 @@ async fn protocol_v2_is_only_negotiated_when_offered_and_a_failure_keeps_v1() {
     }
 }
 
+/// The wrapper answers `--version` itself: pointed at a fixture that does not
+/// exist, only the wrapper's own arm can produce this output.
+#[test]
+fn the_wrapper_answers_version_without_starting_the_fixture() {
+    let env = Env::new();
+    let wrapper = wrapper_for(&env.dir, "no-such-fixture.py", &[], None);
+    let out = std::process::Command::new(&wrapper)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "omp/fake-1.0");
+
+    let failing = wrapper_for(
+        &env.dir,
+        "no-such-fixture.py",
+        &[("FAKE_OMP_VERSION_FAIL", "1")],
+        None,
+    );
+    let out = std::process::Command::new(&failing)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty());
+}
+
 #[tokio::test]
 async fn the_version_is_null_when_the_version_command_fails() {
     let env = Env::new();

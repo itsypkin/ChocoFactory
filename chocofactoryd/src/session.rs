@@ -4750,7 +4750,6 @@ mod tests {
             &wrapper,
             format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
         );
-        {}
         let pool = connect_in_memory().await.unwrap();
         let claude = recording("claude");
         let omp = Arc::new(crate::adapter::OmpAdapter::with_binary(
