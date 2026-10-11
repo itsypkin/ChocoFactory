@@ -2431,3 +2431,47 @@ async fn a_tasks_next_turn_does_not_wait_for_its_own_previous_slot() {
     }
     assert!(q.rows().await.is_empty());
 }
+
+// ---- count, decide, take is one critical section -----------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_claims_issue_exactly_the_free_slots_and_queue_the_rest_in_order() {
+    const CLAIMS: usize = 20;
+    // No dispatcher: nothing but `claim` decides who starts.
+    let q = Q::build(Some(3), queue_timers(), false).await;
+    let mut ids = Vec::new();
+    for i in 0..CLAIMS {
+        ids.push(q.task_row(&format!("claim-{i}")).await.id);
+    }
+    let barrier = Arc::new(tokio::sync::Barrier::new(CLAIMS));
+    let mut claims = Vec::new();
+    for id in ids {
+        let (gate, barrier) = (Arc::clone(q.engine.turn_gate()), Arc::clone(&barrier));
+        claims.push(tokio::spawn(async move {
+            let spec = TurnSpec {
+                stage: "coding",
+                group: None,
+                resume_session_id: None,
+            };
+            barrier.wait().await;
+            gate.claim(&id, &spec).await.unwrap()
+        }));
+    }
+    let mut permits = Vec::new();
+    let mut places = Vec::new();
+    for claim in claims {
+        match claim.await.unwrap() {
+            Claim::Start(permit) => permits.push(permit),
+            Claim::Queued(at) => places.push(at.position),
+        }
+    }
+    assert_eq!(permits.len(), 3, "exactly the free slots start");
+    assert_eq!(q.engine.running_total(), 3);
+    places.sort_unstable();
+    assert_eq!(
+        places,
+        (1..=(CLAIMS as u32 - 3)).collect::<Vec<_>>(),
+        "the rest queue in distinct places with no gap"
+    );
+    assert_eq!(q.rows().await.len(), CLAIMS - 3);
+}
