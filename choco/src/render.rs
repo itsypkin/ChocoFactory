@@ -254,14 +254,27 @@ fn queued_suffix(queued: &[QueuedTurn]) -> String {
 
 /// What a waiting turn waits for, from the pool it was read with:
 /// `the server's 2 agent slots (both busy)`.
-fn pool_phrase(name: &str, is_server: bool, limit: Option<u32>, running: u32) -> String {
+fn pool_phrase(
+    name: &str,
+    is_server: bool,
+    limit: Option<u32>,
+    running: u32,
+    why_unlimited: Option<&str>,
+) -> String {
     let owner = if is_server {
         "the server's".to_string()
     } else {
         format!("project {name}'s")
     };
     match limit {
-        None => format!("{owner} agent slots (the daemon is stopping)"),
+        None => match why_unlimited {
+            Some("stopping") => format!("{owner} agent slots (the daemon is stopping)"),
+            Some(why) => {
+                let why = why.strip_prefix("config: ").unwrap_or(why);
+                format!("{owner} agent slots (the limit cannot be read: {why})")
+            }
+            None => format!("{owner} agent slots (no limit now)"),
+        },
         Some(limit) => {
             let state = if running >= limit {
                 if limit == 2 {
@@ -302,6 +315,7 @@ fn queued_line(turn: &Value) -> String {
         pool == "server",
         turn.get("limit").and_then(Value::as_u64).map(|n| n as u32),
         turn.get("running").and_then(Value::as_u64).unwrap_or(0) as u32,
+        text("unlimited_because"),
     );
     let since = text("queued_at")
         .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
@@ -3224,6 +3238,7 @@ mod queue_tests {
             pool_name: if pool == "server" { "server" } else { "acme" }.to_string(),
             limit: Some(2),
             running: 2,
+            unlimited_because: None,
             queued_at: "2026-08-01T14:02:09Z".parse().unwrap(),
         }
     }
@@ -3305,7 +3320,20 @@ mod queue_tests {
         assert!(line.contains("the server's 1 agent slot (busy)"), "{line}");
         turn.limit = None;
         let line = queued_line(&serde_json::to_value(&turn).unwrap());
+        assert!(line.contains("(no limit now)"), "{line}");
+        turn.unlimited_because = Some("stopping".to_string());
+        let line = queued_line(&serde_json::to_value(&turn).unwrap());
         assert!(line.contains("(the daemon is stopping)"), "{line}");
+        turn.unlimited_because =
+            Some("config: failed to parse global config /x/config.yaml: bad".to_string());
+        let line = queued_line(&serde_json::to_value(&turn).unwrap());
+        assert!(
+            line.contains(
+                "(the limit cannot be read: failed to parse global config /x/config.yaml: bad)"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("stopping"), "{line}");
     }
 
     #[test]

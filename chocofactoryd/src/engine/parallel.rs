@@ -976,7 +976,15 @@ impl WorkflowEngine {
             return Err(RetryTaskError::Enter(err));
         }
 
-        let snapshot = self.queue_snapshot().await.map_err(RetryTaskError::from)?;
+        // The retry has taken effect; the queue places are informational, so
+        // a failed read is logged and must not turn it into an error.
+        let snapshot = match self.queue_snapshot().await {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                tracing::error!(task_id, group, %err, "could not read the queue positions after a group retry");
+                None
+            }
+        };
         let retried: Vec<chocofactory_core::models::RetriedBranch> = rerun
             .iter()
             .map(|r| chocofactory_core::models::RetriedBranch {
@@ -984,7 +992,9 @@ impl WorkflowEngine {
                 resumed: r.resume.is_some(),
                 adapter_session_id: r.resume.as_ref().map(|x| x.adapter_session_id.clone()),
                 fresh_reason: r.fresh_reason.clone(),
-                queued: snapshot.position_of(task_id, r.name, Some(group)),
+                queued: snapshot
+                    .as_ref()
+                    .and_then(|s| s.position_of(task_id, r.name, Some(group))),
             })
             .collect();
         let fresh: Vec<String> = rerun

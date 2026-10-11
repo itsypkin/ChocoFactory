@@ -616,10 +616,19 @@ impl WorkflowEngine {
                     stage: p.row.stage.clone(),
                     group: p.row.group_stage.clone(),
                     position: p.position,
-                    pool: wire,
+                    pool: wire.clone(),
                     pool_name: pool.map(|pool| pool.name.clone()).unwrap_or_default(),
                     limit: pool.and_then(|pool| pool.limit),
                     running: pool.map(|pool| pool.running).unwrap_or(0),
+                    unlimited_because: if pool.and_then(|pool| pool.limit).is_some() {
+                        None
+                    } else if wire == PoolKey::Server.wire() && config_error.is_some() {
+                        config_error.as_ref().map(|e| format!("config: {e}"))
+                    } else if gate.stopping() {
+                        Some("stopping".to_string())
+                    } else {
+                        None
+                    },
                     queued_at: p.row.queued_at,
                 },
             });

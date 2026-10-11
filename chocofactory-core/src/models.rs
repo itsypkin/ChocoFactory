@@ -337,6 +337,11 @@ pub struct QueuedTurn {
     /// How many turns the pool was running when this was read.
     #[serde(default)]
     pub running: u32,
+    /// Why `limit` is `None` while the turn waits: `"stopping"` (the daemon
+    /// is stopping), or `"config: <error>"` (`config.yaml` cannot be read).
+    /// `None` with no limit means the pool really has no limit now.
+    #[serde(default)]
+    pub unlimited_because: Option<String>,
     pub queued_at: DateTime<Utc>,
 }
 

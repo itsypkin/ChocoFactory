@@ -4359,6 +4359,7 @@ fn queued_turn(stage: &str, position: u32) -> chocofactory_core::models::QueuedT
         pool_name: "server".to_string(),
         limit: Some(2),
         running: 2,
+        unlimited_because: None,
         queued_at: now(),
     }
 }

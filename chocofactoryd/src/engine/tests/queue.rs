@@ -1358,6 +1358,15 @@ async fn a_dispatcher_that_cannot_read_the_config_starts_nothing_reports_it_and_
     })
     .await;
     assert!(error.contains(&q.config.display().to_string()), "{error}");
+    let snapshot = q.engine.queue_snapshot().await.unwrap();
+    let why = snapshot.queued_for(&b.id)[0]
+        .unlimited_because
+        .clone()
+        .expect("a queued turn says why it has no limit");
+    assert!(
+        why.starts_with("config: ") && why.contains(&q.config.display().to_string()),
+        "{why}"
+    );
     assert_eq!(
         q.engine.turn_gate().queue_error().as_deref(),
         Some(error.as_str())
@@ -1467,6 +1476,11 @@ async fn while_stopping_a_turn_queues_even_with_no_cap_and_starts_after_the_rest
     assert_eq!(rows[0].task_id, b.id);
     let queued = q.queue_events(&b.id, EventType::TurnQueued).await;
     assert_eq!(queued[0]["limit"], Value::Null);
+    let snapshot = q.engine.queue_snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.queued_for(&b.id)[0].unlimited_because.as_deref(),
+        Some("stopping")
+    );
     // Even with a free slot (the first turn ends), nothing is admitted.
     q.release("job-a");
     q.wait_running(0).await;
@@ -2492,4 +2506,156 @@ async fn concurrent_claims_issue_exactly_the_free_slots_and_queue_the_rest_in_or
         "the rest queue in distinct places with no gap"
     );
     assert_eq!(q.rows().await.len(), CLAIMS - 3);
+}
+
+// ---- read errors on the admission and restart side -------------------------
+
+async fn rename_table(q: &Q, table: &str) {
+    let sql = match table {
+        "workflow_state" => "ALTER TABLE workflow_state RENAME TO workflow_state_gone",
+        "sessions" => "ALTER TABLE sessions RENAME TO sessions_gone",
+        other => panic!("no rename for {other}"),
+    };
+    sqlx::query(sql).execute(&q.pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_admission_that_cannot_read_the_task_state_keeps_the_row_and_frees_the_slot() {
+    let q = Q::build(None, queue_timers(), false).await;
+    let task = q.task_at("coding", "open").await;
+    q.insert_row(&task.id, "coding").await;
+    let row = q.rows().await.remove(0);
+    let spec = TurnSpec {
+        stage: "coding",
+        group: None,
+        resume_session_id: None,
+    };
+    let Claim::Start(permit) = q.engine.turn_gate().claim(&task.id, &spec).await.unwrap() else {
+        panic!("no cap: the turn starts");
+    };
+    rename_table(&q, "workflow_state").await;
+    let pass = q.engine.admit(row, permit).await;
+    assert_eq!(pass, Pass::Idle, "an unreadable state is retried next tick");
+    assert_eq!(q.rows().await.len(), 1, "the turn stays queued");
+    assert_eq!(q.engine.running_total(), 0, "the permit was dropped");
+    assert_eq!(q.status(&task.id).await, "open");
+}
+
+#[tokio::test]
+async fn a_branch_row_that_cannot_be_validated_stays_queued_and_frees_the_slot() {
+    let q = Q::build(Some(2), queue_timers(), false).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = q.create_group().await;
+    q.wait_started("one").await;
+    q.wait_started("two").await;
+    let row = q.rows().await.remove(0);
+    assert_eq!(row.stage, "three");
+    // No limit now, so a permit can be had for the queued branch.
+    fs::write(&q.config, "max_agents: 0\n").unwrap();
+    let spec = TurnSpec {
+        stage: "three",
+        group: Some(("panel", row.group_entry.unwrap())),
+        resume_session_id: None,
+    };
+    let Claim::Start(permit) = q.engine.turn_gate().claim(&g.id, &spec).await.unwrap() else {
+        panic!("no limit: the turn starts");
+    };
+    let before = q.engine.running_total();
+    rename_table(&q, "sessions").await;
+    let pass = q.engine.admit(row, permit).await;
+    assert_eq!(pass, Pass::Idle);
+    assert_eq!(q.rows().await.len(), 1, "the branch stays queued");
+    assert_eq!(
+        q.engine.running_total(),
+        before - 1,
+        "the permit was dropped"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_sweep_that_cannot_read_the_queue_parks_the_agent_task_stuck() {
+    let q = Q::build(None, queue_timers(), false).await;
+    let task = q.task_at("coding", "open").await;
+    sqlx::query("DROP TABLE turn_queue")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    let next = q.restarted_engine();
+    next.park_interrupted_turns().await.unwrap();
+    assert_eq!(q.status(&task.id).await, "stuck");
+    let reason = tasks::get(&q.pool, &task.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stuck_reason
+        .unwrap();
+    assert!(
+        reason.contains("could not tell whether stage 'coding' was waiting"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_retry_that_took_effect_succeeds_even_if_the_queue_places_cannot_be_read() {
+    let q = Q::build(None, queue_timers(), false).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Crash),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = q.create_group().await;
+    q.wait_started("two").await;
+    q.release("two");
+    q.release("one");
+    q.release("three");
+    q.wait_status(&g.id, "stuck").await;
+    q.wait_running(0).await;
+    q.script_branches(&[("BRANCH-TWO", "two", Ending::Report)]);
+    fs::remove_file(q.dir.join("release-two")).unwrap();
+    // Only the snapshot lists projects in full; the claim reads their caps.
+    sqlx::query("ALTER TABLE projects DROP COLUMN created_at")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    assert!(q.engine.queue_snapshot().await.is_err());
+    let outcome = q.engine.retry_task(&g.id, RetryMode::Fresh).await.unwrap();
+    assert_eq!(outcome.branches.len(), 1);
+    assert_eq!(outcome.branches[0].queued, None);
+    q.wait_started("two").await;
+}
+
+#[tokio::test]
+async fn a_new_turn_does_not_jump_the_queue_when_a_slot_frees_before_the_dispatcher_runs() {
+    // No dispatcher: only `claim` decides.
+    let q = Q::build(Some(1), queue_timers(), false).await;
+    let spec = TurnSpec {
+        stage: "coding",
+        group: None,
+        resume_session_id: None,
+    };
+    let a = q.task_at("coding", "open").await;
+    let b = q.task_at("coding", "open").await;
+    let c = q.task_at("coding", "open").await;
+    let Claim::Start(permit) = q.engine.turn_gate().claim(&a.id, &spec).await.unwrap() else {
+        panic!("a free slot: A starts");
+    };
+    assert!(matches!(
+        q.engine.turn_gate().claim(&b.id, &spec).await.unwrap(),
+        Claim::Queued(_)
+    ));
+    // A's slot frees, with B still waiting for the dispatcher.
+    drop(permit);
+    assert_eq!(q.engine.running_total(), 0);
+    let claim = q.engine.turn_gate().claim(&c.id, &spec).await.unwrap();
+    assert!(
+        matches!(claim, Claim::Queued(_)),
+        "C waits behind B even though a slot is free"
+    );
+    let snapshot = q.engine.queue_snapshot().await.unwrap();
+    assert_eq!(snapshot.position_of(&b.id, "coding", None), Some(1));
+    assert_eq!(snapshot.position_of(&c.id, "coding", None), Some(2));
 }
