@@ -370,8 +370,9 @@ cancelling. In short:
   `retry`, `cancel` or `send` to it; see
   [reference/recover.md](reference/recover.md#queued-is-not-stuck).
 - `pausing` or `paused` → you (or someone) held the task:
-  `choco task resume <id>` continues it. `retry` and `send` are refused on it,
-  and the message names `resume`. See
+  `choco task resume <id>` continues it. `retry` and a `send` to a chat are
+  refused on it, and the message names `resume`; a reply at a gate is accepted
+  and recorded, and the stage it leads to starts on resume. See
   [reference/recover.md](reference/recover.md#pausing-a-task).
 - `stuck` → find out why in `choco task status <id>`, then
   `choco task retry <id>`. On a task stuck in a parallel group, retry

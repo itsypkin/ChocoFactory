@@ -99,6 +99,9 @@ enum ResumePlan {
     Stage(Option<ResumeSession>),
     /// The group was entered while held: enter it now.
     EnterGroup,
+    /// The stage's current-entry run ended in a failure: starting nothing
+    /// would leave the task `open` with no work, so `resume` marks it stuck.
+    Failed(String),
     /// Restart these unsettled branches.
     Branches(Vec<(String, Option<ResumeSession>)>),
 }
@@ -204,10 +207,16 @@ impl WorkflowEngine {
 
         // Step 3 — stop. Nothing here can fail the pause: a failure is
         // logged and listed in the event, and that work ends on its own.
+        let mut stop_failures: Vec<String> = Vec::new();
         let state = match workflow_state::get(&self.pool, task_id).await {
             Ok(state) => state,
             Err(err) => {
                 tracing::error!(task_id, %err, "could not read the stage of a task being paused");
+                if now {
+                    stop_failures.push(format!(
+                        "could not read the task's stage, so no running turn was stopped: {err}"
+                    ));
+                }
                 None
             }
         };
@@ -223,8 +232,7 @@ impl WorkflowEngine {
             &[DetachedKind::Poll]
         };
         self.abort_detached_runners_of(task_id, kinds).await;
-        let mut stop_failures: Vec<String> = Vec::new();
-        if now {
+        if now && state.is_some() {
             match self.live_turn_sessions(&task, state.as_ref()).await {
                 Ok(live) => {
                     for (label, session_id) in live {
@@ -428,6 +436,11 @@ impl WorkflowEngine {
         let plan = self
             .plan_resume(&task, &definition, &stage, stage_def, &state)
             .await?;
+        if let ResumePlan::Failed(why) = &plan {
+            let reason = format!("stage '{stage}' cannot resume: {why}; retry continues it");
+            self.mark_stuck(task_id, &reason, false).await;
+            return refuse(format!("{reason} (the task is now stuck)"));
+        }
 
         // Step 2 — one transaction: the poll window shift and `→ open`.
         let mut payload = state.payload.clone();
@@ -469,6 +482,7 @@ impl WorkflowEngine {
         let mut resumed: Vec<String> = Vec::new();
         let started_result: Result<(), EngineError> = match plan {
             ResumePlan::Nothing => Ok(()),
+            ResumePlan::Failed(_) => unreachable!("a failed plan returned above"),
             ResumePlan::Stage(resume) => {
                 if resume.is_some() {
                     resumed.push(stage.clone());
@@ -597,6 +611,9 @@ impl WorkflowEngine {
                 let Some(session) = this_entry else {
                     return Ok(ResumePlan::Stage(None));
                 };
+                if !standing && let Some(why) = Self::pause_failure(&session) {
+                    return Ok(ResumePlan::Failed(why));
+                }
                 if standing || !Self::pause_left_unsettled(&session) {
                     return Ok(ResumePlan::Nothing);
                 }
@@ -630,6 +647,9 @@ impl WorkflowEngine {
                     match self.branch_progress(task_id, name, entry_no).await? {
                         BranchWork::Queued | BranchWork::Live(_) => {}
                         BranchWork::Ended(session) => {
+                            if let Some(why) = Self::pause_failure(&session) {
+                                return Ok(ResumePlan::Failed(format!("branch '{name}' {why}")));
+                            }
                             if Self::pause_left_unsettled(&session) {
                                 let resume = self
                                     .resumable_or_fresh(
@@ -652,6 +672,21 @@ impl WorkflowEngine {
                     ResumePlan::Branches(restarts)
                 })
             }
+        }
+    }
+
+    /// An explicit failure end reason on this session, if it has one.
+    fn pause_failure(session: &Session) -> Option<String> {
+        match (session.status, session.end_reason) {
+            (SessionStatus::Exited, Some(reason))
+                if !matches!(
+                    reason,
+                    SessionEndReason::Paused | SessionEndReason::DaemonStopped
+                ) =>
+            {
+                Some(format!("its last run ended: {reason}"))
+            }
+            _ => None,
         }
     }
 

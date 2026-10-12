@@ -57,7 +57,7 @@ pub(super) enum BranchApplied {
     Parked(String),
 }
 
-fn stamp(now: DateTime<Utc>) -> String {
+pub(super) fn stamp(now: DateTime<Utc>) -> String {
     now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
@@ -300,7 +300,13 @@ fn end_branch(payload: &mut Value, branch: &str, mut fields: Value, now: &str) {
     }
 }
 
-fn fail_branch(payload: &mut Value, branch: &str, reason: &str, resumable: bool, now: &str) {
+pub(super) fn fail_branch(
+    payload: &mut Value,
+    branch: &str,
+    reason: &str,
+    resumable: bool,
+    now: &str,
+) {
     end_branch(
         payload,
         branch,
@@ -366,7 +372,7 @@ pub(super) fn agent_role_of<'a>(definition: &'a WorkflowDefinition, name: &str) 
 impl WorkflowEngine {
     /// Best-effort `branch_finished` timeline entry, after the commit that
     /// recorded the end.
-    async fn record_branch_finished(
+    pub(super) async fn record_branch_finished(
         &self,
         task_id: &str,
         group: &str,

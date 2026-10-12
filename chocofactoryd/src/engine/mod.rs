@@ -2117,6 +2117,14 @@ impl WorkflowEngine {
                 .send_message(task_id, text)
                 .await
                 .map_err(SendMessageOrResumeError::SendMessage),
+            // A held task's stage is not mid-transition: name the way out
+            // rather than the generic stage-kind refusal (#295).
+            _ if is_pause_status(&task.status) => Err(SendMessageOrResumeError::SendMessage(
+                SendMessageError::TaskPaused {
+                    task_id: task.id.clone(),
+                    status: task.status.clone(),
+                },
+            )),
             _ => Err(SendMessageOrResumeError::UnsupportedStageKind(
                 current_stage,
             )),

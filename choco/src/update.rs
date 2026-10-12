@@ -307,7 +307,9 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
                     text.push_str(
                         "Tasks waiting on a poll or a human are not affected. Wait for these to move on\n\
                          (`choco task status <id>`), or pass --force to update anyway: they are marked stuck,\n\
-                         and `choco task retry <id>` continues them (an agent turn resumes its session).",
+                         and `choco task retry <id>` continues them (an agent turn resumes its session).\n\
+                         A `pausing` task is not marked stuck: it ends `paused`, and `choco task resume <id>`\n\
+                         continues it (`retry` is refused on it).",
                     );
                     if let Some(note) = crate::render::queued_restart_note(server.queued.len()) {
                         text.push('\n');

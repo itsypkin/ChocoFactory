@@ -351,6 +351,7 @@ impl WorkflowEngine {
         };
         // (stage or branch name, its session) pairs to record.
         let mut cut_off: Vec<(String, Option<Session>)> = Vec::new();
+        let mut group: Option<(i64, &IndexMap<String, crate::workflow_def::Branch>)> = None;
         match restart_effect(stage_def) {
             RestartEffect::StrandsAgentTurn => {
                 let current = sessions::get_current_for_stage(&self.pool, task_id, &stage)
@@ -380,6 +381,7 @@ impl WorkflowEngine {
                 else {
                     return Ok(Vec::new());
                 };
+                group = Some((entry_no, branches));
                 for name in branches.keys() {
                     if super::parallel::branch_slot_state(&state.payload, name) != Some("running") {
                         continue;
@@ -402,8 +404,25 @@ impl WorkflowEngine {
             RestartEffect::Survives | RestartEffect::StrandsShell => {}
         }
         let mut findings = Vec::new();
+        let mut failed_branches: Vec<(String, String)> = Vec::new();
         for (name, session) in cut_off {
             let Some(session) = session else { continue };
+            // A turn that ended in a failure before the crash is the same
+            // failure its watcher would have handled: it must not become
+            // `paused`, which `resume` would then strand.
+            if let Some(why) = pause_failure(&session) {
+                let what = if group.is_some() {
+                    format!("branch '{name}' of '{stage}'")
+                } else {
+                    format!("the turn of stage '{stage}'")
+                };
+                let reason =
+                    format!("{what} failed before the restart ({why}); retry continues it");
+                findings.push(reason.clone());
+                if group.is_some() {
+                    failed_branches.push((name.clone(), reason));
+                }
+            }
             if session.status == SessionStatus::Idle
                 && session.end_reason.is_none()
                 && let Err(err) = sessions::mark_daemon_stopped(&self.pool, &session.id).await
@@ -421,6 +440,37 @@ impl WorkflowEngine {
                 ReadOnlyVerdict::Violation(found) | ReadOnlyVerdict::Unverified(found) => {
                     findings.push(found)
                 }
+            }
+        }
+        if let (Some((entry_no, _)), false) = (group, failed_branches.is_empty()) {
+            let mut payload = state.payload.clone();
+            let now = super::parallel::stamp(self.now());
+            for (name, reason) in &failed_branches {
+                super::parallel::fail_branch(&mut payload, name, reason, false, &now);
+            }
+            let update = workflow_state::WorkflowStateUpdate {
+                current_stage: state.current_stage.clone(),
+                stage_kind: "parallel".to_string(),
+                loop_counters: state.loop_counters.clone(),
+                payload,
+                enters_stage: false,
+            };
+            match workflow_state::update(&self.pool, task_id, update).await {
+                Ok(_) => {
+                    for (name, reason) in &failed_branches {
+                        self.record_branch_finished(
+                            task_id,
+                            &stage,
+                            name,
+                            entry_no,
+                            super::events::BranchEnd::Failed { reason },
+                        )
+                        .await;
+                    }
+                }
+                Err(err) => findings.push(format!(
+                    "the failed branch(es) of '{stage}' could not be recorded ({err})"
+                )),
             }
         }
         Ok(findings)
@@ -675,5 +725,19 @@ impl WorkflowEngine {
                 }
             }
         }
+    }
+}
+
+/// Why a cut-off session of a pausing task ended in a failure, or `None` when
+/// it ended the way a pause or a daemon stop ends a turn (or was recovered
+/// from `idle`, or is live).
+fn pause_failure(session: &Session) -> Option<String> {
+    match (session.status, session.end_reason) {
+        (SessionStatus::Active, _) | (SessionStatus::Idle, None) => None,
+        (_, Some(SessionEndReason::Paused | SessionEndReason::DaemonStopped)) => None,
+        (status, reason) => Some(format!(
+            "its session ended: {status}, end reason {}",
+            reason.map_or_else(|| "none".to_string(), |r| r.to_string())
+        )),
     }
 }
