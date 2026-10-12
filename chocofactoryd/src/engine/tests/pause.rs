@@ -1231,6 +1231,38 @@ async fn a_resume_whose_start_fails_marks_the_task_stuck() {
 }
 
 #[tokio::test]
+async fn a_resume_whose_start_fails_and_cannot_mark_stuck_says_so() {
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = q.create("job-a").await;
+    q.wait_started("job-a").await;
+    q.engine.pause_task(&a.id, true).await.unwrap();
+    q.wait_status(&a.id, "paused").await;
+    sqlx::query("UPDATE tasks SET config = ? WHERE id = ?")
+        .bind(json!({ "roles": { "coder": { "cli": "no-such-cli" } } }).to_string())
+        .bind(&a.id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_stuck BEFORE UPDATE ON tasks WHEN NEW.status = 'stuck' \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    let err = q.engine.resume_task(&a.id).await.unwrap_err();
+    assert!(
+        matches!(err, ResumeTaskError::StartFailedNotStuck(_)),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("marking the task stuck failed"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn a_pause_write_that_fails_is_an_error_and_stops_nothing() {
     let q = Q::new(None).await;
     let a = create_flow(&q, POLL_FLOW, "ppoll.yaml", "poll").await;

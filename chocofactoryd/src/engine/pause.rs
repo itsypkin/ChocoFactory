@@ -62,6 +62,10 @@ pub enum ResumeTaskError {
     /// The stage could not be resumed and marking the task stuck failed too;
     /// the task keeps its status.
     StuckWriteFailed(String),
+    /// Starting what was held failed after the task was already `open`, and
+    /// the task was not marked stuck either; the message says why and what
+    /// status the task has now.
+    StartFailedNotStuck(String),
 }
 
 impl fmt::Display for ResumeTaskError {
@@ -80,6 +84,7 @@ impl fmt::Display for ResumeTaskError {
                 f,
                 "{reason}; marking the task stuck failed, so it keeps its status"
             ),
+            ResumeTaskError::StartFailedNotStuck(why) => write!(f, "{why}"),
         }
     }
 }
@@ -444,9 +449,11 @@ impl WorkflowEngine {
             .plan_resume(&task, &definition, &stage, stage_def, &state)
             .await?;
         if let ResumePlan::Failed(why) = &plan {
-            let reason = format!("stage '{stage}' cannot resume: {why}; retry continues it");
+            let reason = format!("stage '{stage}' cannot resume: {why}");
             return match self.mark_stuck(task_id, &reason, false).await {
-                StuckMark::Marked => refuse(format!("{reason} (the task is now stuck)")),
+                StuckMark::Marked => refuse(format!(
+                    "{reason}; retry continues it (the task is now stuck)"
+                )),
                 StuckMark::WriteFailed => Err(ResumeTaskError::StuckWriteFailed(reason)),
                 StuckMark::NotMarked => {
                     let now = tasks::get(&self.pool, task_id).await?;
@@ -559,13 +566,27 @@ impl WorkflowEngine {
         if let Err(err) = started_result {
             // `enter_stage` already appends its own `Error` event for a
             // template failure — see `mark_stuck`'s doc comment.
-            self.mark_stuck(
-                task_id,
-                &format!("stage '{stage}': resume failed: {err}"),
-                matches!(err, EngineError::Template { .. }),
-            )
-            .await;
-            return Err(ResumeTaskError::Enter(err));
+            let marked = self
+                .mark_stuck(
+                    task_id,
+                    &format!("stage '{stage}': resume failed: {err}"),
+                    matches!(err, EngineError::Template { .. }),
+                )
+                .await;
+            return match marked {
+                StuckMark::Marked => Err(ResumeTaskError::Enter(err)),
+                StuckMark::WriteFailed => Err(ResumeTaskError::StartFailedNotStuck(format!(
+                    "stage '{stage}': resume failed: {err}; marking the task stuck failed too, \
+                     so it was left open with nothing started"
+                ))),
+                StuckMark::NotMarked => {
+                    let now = tasks::get(&self.pool, task_id).await?;
+                    let status = now.map_or("gone".to_string(), |t| t.status);
+                    Err(ResumeTaskError::StartFailedNotStuck(format!(
+                        "stage '{stage}': resume failed: {err}; the task is '{status}' now"
+                    )))
+                }
+            };
         }
         self.wake_dispatcher();
         self.append_task_event(
