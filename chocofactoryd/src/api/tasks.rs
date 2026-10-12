@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use chocofactory_core::models::{Event, RetryMode, RetryOutcome, Task, TaskSummary, WorkflowState};
+use chocofactory_core::models::{
+    Event, PauseOutcome, ResumeOutcome, RetryMode, RetryOutcome, Task, TaskSummary, WorkflowState,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -146,10 +148,10 @@ pub async fn list(
     Ok(Json(rows))
 }
 
-/// A task plus its current `workflow_state` — bare `Task.status` is
-/// `"open"`/`"closed"` (§5.4), `"cancelled"` (#69), or `"stuck"` (X-4,
-/// issue #61, which also carries a `stuck_reason` via `Task`'s own flattened
-/// fields), so `choco task status <id>` needs `current_stage` too for this
+/// A task plus its current `workflow_state` — bare `Task.status` is one of
+/// `"open"`, `"pausing"`, `"paused"` (#295, which also carry `paused_at`),
+/// `"closed"` (§5.4), `"cancelled"` (#69), or `"stuck"` (X-4, issue #61,
+/// which also carries a `stuck_reason` via `Task`'s own flattened fields), so `choco task status <id>` needs `current_stage` too for this
 /// to actually be useful as a status view.
 #[derive(Serialize)]
 pub struct TaskDetail {
@@ -280,6 +282,7 @@ async fn read_usage(
             status: &task.status,
             created_at: task.created_at,
             updated_at: task.updated_at,
+            paused_at: task.paused_at,
         },
         &usage_sessions,
         &usage_rows,
@@ -477,6 +480,48 @@ pub async fn retry(
 ) -> Result<(StatusCode, Json<RetryOutcome>), ApiError> {
     let mode = body.map(|Json(body)| body.mode).unwrap_or_default();
     let outcome = state.engine.retry_task(&id, mode).await?;
+    Ok((StatusCode::ACCEPTED, Json(outcome)))
+}
+
+/// The optional body of `POST …/pause` (#295). Absent, `{}` and `{"now":
+/// false}` all mean a graceful pause: running turns and commands finish.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PauseBody {
+    now: bool,
+}
+
+/// Pauses `id`: its watchers stop at once, nothing new starts, and the
+/// running work finishes (`now: false`) or is stopped (`now: true`). `202`
+/// carries the outcome: `pausing` while work is still running, `paused` when
+/// nothing is.
+///
+/// The call runs on its own task and the handler awaits it, as `create`
+/// does: a client that goes away cannot cut a pause short between its write
+/// and its stops.
+pub async fn pause(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<PauseBody>>,
+) -> Result<(StatusCode, Json<PauseOutcome>), ApiError> {
+    let now = body.map(|Json(body)| body.now).unwrap_or_default();
+    let engine = state.engine.clone();
+    let outcome = tokio::spawn(async move { engine.pause_task(&id, now).await })
+        .await
+        .map_err(|e| ApiError::Internal(format!("pause aborted: {e}")))??;
+    Ok((StatusCode::ACCEPTED, Json(outcome)))
+}
+
+/// Resumes a `pausing` or `paused` task and starts what was held. `202`
+/// carries what was started. Spawned like [`pause`].
+pub async fn resume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ResumeOutcome>), ApiError> {
+    let engine = state.engine.clone();
+    let outcome = tokio::spawn(async move { engine.resume_task(&id).await })
+        .await
+        .map_err(|e| ApiError::Internal(format!("resume aborted: {e}")))??;
     Ok((StatusCode::ACCEPTED, Json(outcome)))
 }
 
@@ -1770,6 +1815,134 @@ stages:
         let server = TestServer::start().await;
         let response = server.post("/tasks/no-such-task/retry", json!({})).await;
         assert_eq!(response.status(), 404);
+    }
+
+    // ---- pause and resume (#295) ----
+
+    async fn gate_task(server: &TestServer) -> String {
+        seed_gate_only(server);
+        let project_id = create_project(server).await;
+        make_task(server, &project_id, "g").await
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_answer_202_with_the_outcome_and_refuse_with_409() {
+        let server = TestServer::start().await;
+        let id = gate_task(&server).await;
+
+        // The body is optional: none, `{}` and `{"now": false}` are graceful.
+        let response = server.post_empty(&format!("/tasks/{id}/pause")).await;
+        assert_eq!(response.status(), 202);
+        let outcome = response.json();
+        assert_eq!(outcome["status"], "paused");
+        assert_eq!(outcome["mode"], "graceful");
+        let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
+        assert_eq!(detail["status"], "paused");
+        assert!(detail["paused_at"].is_string());
+        let listed: Value = server.get("/tasks?status=pausing,paused").await.json();
+        assert_eq!(ids(&listed), vec![id.clone()]);
+
+        let again = server
+            .post(&format!("/tasks/{id}/pause"), json!({ "now": true }))
+            .await;
+        assert_eq!(again.status(), 409);
+        assert!(
+            again.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("already paused")
+        );
+        let retry = server.post(&format!("/tasks/{id}/retry"), json!({})).await;
+        assert_eq!(retry.status(), 409);
+        assert!(
+            retry.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("choco task resume {id}"))
+        );
+
+        let response = server.post_empty(&format!("/tasks/{id}/resume")).await;
+        assert_eq!(response.status(), 202);
+        let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
+        assert_eq!(detail["status"], "open");
+        assert!(detail["paused_at"].is_null());
+        let again = server.post_empty(&format!("/tasks/{id}/resume")).await;
+        assert_eq!(again.status(), 409);
+        assert!(
+            again.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("not paused")
+        );
+        for verb in ["pause", "resume"] {
+            let missing = server.post_empty(&format!("/tasks/nope/{verb}")).await;
+            assert_eq!(missing.status(), 404, "{verb}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sending_to_a_paused_chat_is_409_and_names_resume() {
+        let server = TestServer::start().await;
+        let id = chat_task(&server).await;
+        let response = server.post_empty(&format!("/tasks/{id}/pause")).await;
+        assert_eq!(response.status(), 202);
+        let sent = server
+            .post(&format!("/tasks/{id}/messages"), json!({ "text": "hi" }))
+            .await;
+        assert_eq!(sent.status(), 409);
+        assert!(
+            sent.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("choco task resume {id}"))
+        );
+        let detail: Value = server.get(&format!("/tasks/{id}")).await.json();
+        assert_eq!(detail["status"], "paused");
+        server.post_empty(&format!("/tasks/{id}/resume")).await;
+    }
+
+    /// A client that goes away right after sending cannot cut a pause or a
+    /// resume short: the handler runs the engine call on its own task.
+    #[tokio::test]
+    async fn an_abandoned_pause_or_resume_still_completes() {
+        use axum::extract::{Path, State};
+        use futures_util::FutureExt;
+        let server = TestServer::start().await;
+        let id = gate_task(&server).await;
+        let state = server.state();
+        // Poll the handler once, so it has started, then drop it.
+        let dropped = super::pause(State(state.clone()), Path(id.clone()), None).now_or_never();
+        assert!(
+            dropped.is_none(),
+            "the handler was still waiting when dropped"
+        );
+        crate::test_support::wait_until("the abandoned pause to finish", || async {
+            let status = crate::db::tasks::get(server.pool(), &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == "paused" {
+                Ok(())
+            } else {
+                Err(status)
+            }
+        })
+        .await;
+        let dropped = super::resume(State(state), Path(id.clone())).now_or_never();
+        assert!(dropped.is_none());
+        crate::test_support::wait_until("the abandoned resume to finish", || async {
+            let task = crate::db::tasks::get(server.pool(), &id)
+                .await
+                .unwrap()
+                .unwrap();
+            if task.status == "open" && task.paused_at.is_none() {
+                Ok(())
+            } else {
+                Err(task.status)
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

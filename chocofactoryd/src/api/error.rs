@@ -8,8 +8,9 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::engine::{
-    CancelTaskError, CreateTaskError, EngineError, InitWorkflowsError, ResolveError,
-    RetryTaskError, SendMessageError, SendMessageOrResumeError,
+    CancelTaskError, CreateTaskError, EngineError, InitWorkflowsError, LoadTaskWorkflowError,
+    PauseTaskError, ResolveError, ResumeTaskError, RetryTaskError, SendMessageError,
+    SendMessageOrResumeError,
 };
 use crate::session::SessionError;
 use crate::workflow_def::WorkflowDefError;
@@ -150,7 +151,9 @@ impl From<SendMessageOrResumeError> for ApiError {
             // Same conflict reached through the `agent_turn` branch, where
             // `send_message` re-checks the status under the per-task lock.
             SendMessageOrResumeError::SendMessage(
-                SendMessageError::TaskCancelled | SendMessageError::TaskStuck { .. },
+                SendMessageError::TaskCancelled
+                | SendMessageError::TaskStuck { .. }
+                | SendMessageError::TaskPaused { .. },
             ) => ApiError::Conflict(err.to_string()),
             // This task's recorded workflow file (issue #88) is gone — a
             // conflict with the task's own state (someone deleted the file
@@ -213,6 +216,8 @@ impl From<RetryTaskError> for ApiError {
             // state right now", the same conflict shape `CancelTaskError`
             // uses for its own state-mismatch cases.
             RetryTaskError::NotStuck(_)
+            // Paused or pausing (#295): `resume` is what continues it.
+            | RetryTaskError::Paused { .. }
             | RetryTaskError::Queued { .. }
             | RetryTaskError::NoWorkflowState
             | RetryTaskError::UnknownStage(_)
@@ -241,6 +246,35 @@ impl From<RetryTaskError> for ApiError {
             // start) is unknown: a conflict with the task's config, not a
             // server fault. Create reports the same fault as 400.
             | RetryTaskError::Enter(EngineError::UnknownCli(_) | EngineError::RoleRejected(_)) => {
+                ApiError::Conflict(err.to_string())
+            }
+            _ => ApiError::Internal(err.to_string()),
+        }
+    }
+}
+
+impl From<PauseTaskError> for ApiError {
+    fn from(err: PauseTaskError) -> Self {
+        match &err {
+            PauseTaskError::NoSuchTask => ApiError::NotFound(err.to_string()),
+            // The task's status, not the request: well formed, wrong state.
+            PauseTaskError::Refused(_) => ApiError::Conflict(err.to_string()),
+            PauseTaskError::Db(_) => ApiError::Internal(err.to_string()),
+        }
+    }
+}
+
+impl From<ResumeTaskError> for ApiError {
+    fn from(err: ResumeTaskError) -> Self {
+        match &err {
+            ResumeTaskError::NoSuchTask => ApiError::NotFound(err.to_string()),
+            ResumeTaskError::Refused(_)
+            | ResumeTaskError::NoWorkflowState
+            | ResumeTaskError::UnknownStage(_)
+            | ResumeTaskError::Load(
+                LoadTaskWorkflowError::MissingFile(_) | LoadTaskWorkflowError::BuiltinGone(_),
+            )
+            | ResumeTaskError::Enter(EngineError::UnknownCli(_) | EngineError::RoleRejected(_)) => {
                 ApiError::Conflict(err.to_string())
             }
             _ => ApiError::Internal(err.to_string()),

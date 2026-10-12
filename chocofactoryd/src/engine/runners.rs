@@ -23,6 +23,7 @@ impl WorkflowEngine {
     pub(super) fn spawn_registered_runner<F>(
         &self,
         task_id: &str,
+        kind: DetachedKind,
         make: impl FnOnce(u64) -> F,
     ) -> bool
     where
@@ -40,7 +41,7 @@ impl WorkflowEngine {
         runners
             .entry(task_id.to_string())
             .or_default()
-            .insert(id, Some(handle));
+            .insert(id, (kind, Some(handle)));
         true
     }
 
@@ -72,7 +73,7 @@ impl WorkflowEngine {
             self.runners_stopping.store(true, Ordering::SeqCst);
             runners
                 .drain()
-                .flat_map(|(_, task)| task.into_values().flatten())
+                .flat_map(|(_, task)| task.into_values().filter_map(|(_, handle)| handle))
                 .collect()
         };
         for handle in handles {
@@ -104,7 +105,11 @@ impl WorkflowEngine {
                 .expect("detached_runners mutex poisoned");
             runners
                 .remove(task_id)
-                .map(|task| task.into_values().flatten().collect())
+                .map(|task| {
+                    task.into_values()
+                        .filter_map(|(_, handle)| handle)
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         if handles.is_empty() {
@@ -131,6 +136,47 @@ impl WorkflowEngine {
             // neither is worth handling here, only waiting for.
             let _ = handle.await;
         }
+    }
+
+    /// Like [`Self::abort_detached_runners`], but only the runners of the
+    /// given `kinds` (pause: a graceful pause aborts `Poll`, `--now` also
+    /// `Shell`). The aborted entries are removed here, because an aborted
+    /// runner never reaches its own `finish_runner`. Returns how many were
+    /// aborted.
+    pub(super) async fn abort_detached_runners_of(
+        &self,
+        task_id: &str,
+        kinds: &[DetachedKind],
+    ) -> usize {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut runners = self
+                .detached_runners
+                .lock()
+                .expect("detached_runners mutex poisoned");
+            let Some(task) = runners.get_mut(task_id) else {
+                return 0;
+            };
+            let ids: Vec<u64> = task
+                .iter()
+                .filter(|(_, (kind, _))| kinds.contains(kind))
+                .map(|(id, _)| *id)
+                .collect();
+            let handles = ids
+                .iter()
+                .filter_map(|id| task.remove(id))
+                .filter_map(|(_, handle)| handle)
+                .collect();
+            if task.is_empty() {
+                runners.remove(task_id);
+            }
+            handles
+        };
+        let count = handles.len();
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+        count
     }
 
     /// Whether `task_id` has been cancelled (#69).

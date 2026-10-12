@@ -240,6 +240,8 @@ pub struct TaskTimes<'a> {
     pub status: &'a str,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the task was asked to pause; set while `pausing` or `paused`.
+    pub paused_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -333,7 +335,7 @@ fn active_time_ms(trail: &[Event], end: DateTime<Utc>) -> Option<i64> {
         .filter(|e| {
             !matches!(
                 e.payload.get("outcome").and_then(|o| o.as_str()),
-                Some("retry" | "retry_resume")
+                Some("retry" | "retry_resume" | "resume" | "resume_resume")
             )
         })
         .collect();
@@ -370,10 +372,20 @@ pub fn aggregate(
         "estimated"
     };
     let turns_without_cost = rows.iter().filter(|r| r.cost_usd.is_none()).count();
-    let open = task.status == "open";
-    let live = open || task.status == "stuck";
+    // `pausing` counts like `open` (its turn is still running). `paused`: wall
+    // time runs to now, active time ends when the pause was asked for. Known
+    // limit: after a resume the time spent paused counts as active.
+    let open = task.status == "open" || task.status == "pausing";
+    let live = open || task.status == "stuck" || task.status == "paused";
     let wall_time_ms = clamp_ms(task.created_at, if live { now } else { task.updated_at });
-    let active_time_ms = active_time_ms(trail, if open { now } else { task.updated_at });
+    let active_end = if open {
+        now
+    } else if task.status == "paused" {
+        task.paused_at.unwrap_or(task.updated_at)
+    } else {
+        task.updated_at
+    };
+    let active_time_ms = active_time_ms(trail, active_end);
     let sessions_without_data = sessions
         .iter()
         .filter(|s| s.ended && !rows.iter().any(|r| r.session_id == s.id))
@@ -678,6 +690,7 @@ mod tests {
             status,
             created_at: at(0),
             updated_at: at(500),
+            paused_at: None,
         }
     }
 

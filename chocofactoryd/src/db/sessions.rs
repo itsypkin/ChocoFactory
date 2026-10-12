@@ -127,10 +127,10 @@ async fn create_inner<'e>(
                      WHERE task_id = ?2 AND (
                          (event_type = 'stage_entered'
                            AND json_extract(payload, '$.stage') = ?3
-                           AND COALESCE(json_extract(payload, '$.outcome'), '') NOT IN ('retry', 'retry_resume'))
+                           AND COALESCE(json_extract(payload, '$.outcome'), '') NOT IN ('retry', 'retry_resume', 'resume', 'resume_resume'))
                       OR (event_type = 'branch_started'
                            AND json_extract(payload, '$.branch') = ?3
-                           AND COALESCE(json_extract(payload, '$.via'), '') NOT IN ('retry', 'retry_resume')))))
+                           AND COALESCE(json_extract(payload, '$.via'), '') NOT IN ('retry', 'retry_resume', 'resume', 'resume_resume')))))
              END)
          RETURNING ",
         columns!()

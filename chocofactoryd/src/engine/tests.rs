@@ -6,6 +6,7 @@ use serde_json::json;
 use super::*;
 
 mod parallel;
+mod pause;
 mod queue;
 
 #[test]
@@ -13428,10 +13429,12 @@ stages:
 
     // The helper itself refuses, and never invokes the future factory.
     let called = std::sync::atomic::AtomicBool::new(false);
-    assert!(!engine.spawn_registered_runner("t", |_| {
-        called.store(true, Ordering::SeqCst);
-        async {}
-    }));
+    assert!(
+        !engine.spawn_registered_runner("t", runners::DetachedKind::Shell, |_| {
+            called.store(true, Ordering::SeqCst);
+            async {}
+        })
+    );
     assert!(!called.load(Ordering::SeqCst));
 
     // And end to end: retry enters the shell stage, nothing runs.

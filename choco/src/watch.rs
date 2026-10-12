@@ -236,7 +236,11 @@ pub fn start_line(id: &str, snap: &Snapshot, now: DateTime<Utc>) -> String {
 pub fn reached(target: &Until, first: &Snapshot, now: &Snapshot) -> bool {
     match target {
         Until::Status(s) => now.status == *s,
-        Until::Attention => now.status == "open" && now.stage_kind.as_deref() == Some("human_gate"),
+        // A paused task needs the user too: nothing happens until `resume`.
+        Until::Attention => {
+            now.status == "paused"
+                || (now.status == "open" && now.stage_kind.as_deref() == Some("human_gate"))
+        }
         Until::Stage(name) => {
             now.stage.as_deref() == Some(name.as_str())
                 || now
@@ -255,6 +259,8 @@ pub enum WatchEnd {
     Cancelled,
     TimedOut,
     ClosedWithoutTarget,
+    /// The task paused and `paused` was not the target.
+    Paused,
 }
 
 impl WatchEnd {
@@ -265,6 +271,7 @@ impl WatchEnd {
             WatchEnd::Cancelled => 4,
             WatchEnd::TimedOut => 5,
             WatchEnd::ClosedWithoutTarget => 6,
+            WatchEnd::Paused => 7,
         }
     }
 
@@ -286,6 +293,10 @@ pub fn outcome(target: Option<&Until>, now: &Snapshot) -> Option<WatchEnd> {
         ("closed", None) => Some(WatchEnd::Reached),
         ("closed", Some(_)) => Some(WatchEnd::ClosedWithoutTarget),
         ("cancelled", _) => Some(WatchEnd::Cancelled),
+        // A paused task does nothing until `resume`, so a targeted watch
+        // gives up on it; `--live` alone keeps watching, and `pausing`
+        // never ends a watch (its turn is still finishing).
+        ("paused", Some(_)) => Some(WatchEnd::Paused),
         // `--live` alone keeps watching through stuck: a human may retry.
         ("stuck", Some(_)) => Some(WatchEnd::Stuck),
         _ => None,
@@ -342,9 +353,16 @@ fn end_message(
     let stage = snap.stage.as_deref().unwrap_or("-");
     let attention = matches!(until, Some(Until::Attention));
     let msg = match end {
+        WatchEnd::Reached if attention && snap.status == "paused" => {
+            format!("task {id} is paused in stage '{stage}'; run 'choco task resume {id}'")
+        }
         WatchEnd::Reached if attention => {
             format!("task {id} is waiting for you in stage '{stage}'")
         }
+        WatchEnd::Paused => format!(
+            "task {id} is paused in stage '{stage}' without reaching {target}; run 'choco task \
+             resume {id}' to continue it"
+        ),
         WatchEnd::Reached => return None,
         WatchEnd::Stuck => format!(
             "task {id} is stuck in stage '{stage}': {}",
@@ -750,6 +768,64 @@ mod tests {
         assert_eq!(WatchEnd::Cancelled.code(), 4);
         assert_eq!(WatchEnd::TimedOut.code(), 5);
         assert_eq!(WatchEnd::ClosedWithoutTarget.code(), 6);
+        assert_eq!(WatchEnd::Paused.code(), 7);
+    }
+
+    #[test]
+    fn paused_is_a_valid_target_and_ends_every_other_targeted_watch_with_7() {
+        assert_eq!(
+            "paused".parse::<Until>(),
+            Ok(Until::Status("paused".into()))
+        );
+        let paused = kind("paused", Some("agent_turn"));
+        let targets = [
+            Until::Status("closed".into()),
+            Until::Status("stuck".into()),
+            Until::Stage("later".into()),
+        ];
+        for target in &targets {
+            assert_eq!(
+                outcome(Some(target), &paused),
+                Some(WatchEnd::Paused),
+                "{target}"
+            );
+        }
+        // The awaited target itself is reached, not an ending of its own.
+        let target = Until::Status("paused".into());
+        assert_eq!(outcome(Some(&target), &paused), Some(WatchEnd::Reached));
+        // `--live` alone keeps watching through a pause.
+        assert_eq!(outcome(None, &paused), None);
+        // `pausing` never ends a watch.
+        let pausing = kind("pausing", Some("agent_turn"));
+        for target in targets.iter().map(Some).chain([None]) {
+            assert_eq!(outcome(target, &pausing), None);
+        }
+        let msg = end_message(
+            WatchEnd::Paused,
+            "X",
+            &paused,
+            Some(&targets[0]),
+            "closed",
+            None,
+        )
+        .unwrap();
+        assert!(
+            msg.contains("paused") && msg.contains("choco task resume X"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn attention_includes_paused_and_names_how_to_continue() {
+        let a = Until::Attention;
+        let paused = kind("paused", Some("agent_turn"));
+        assert!(reached(&a, &paused, &paused));
+        assert!(!reached(&a, &paused, &kind("pausing", Some("human_gate"))));
+        let m = end_message(WatchEnd::Reached, "X", &paused, Some(&a), "attention", None).unwrap();
+        assert!(
+            m.contains("paused") && m.contains("choco task resume X"),
+            "{m}"
+        );
     }
 
     #[test]
@@ -766,7 +842,7 @@ mod tests {
         );
         assert_eq!(
             "foo".parse::<Until>().unwrap_err(),
-            "'foo' is not a valid target — use attention, closed, cancelled, stuck or stage:<name>"
+            "'foo' is not a valid target — use attention, closed, cancelled, stuck, paused or stage:<name>"
         );
     }
 

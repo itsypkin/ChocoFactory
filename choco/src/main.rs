@@ -13,7 +13,9 @@ mod watch;
 
 use std::process::ExitCode;
 
-use chocofactory_core::models::{Project, RetryMode, RetryOutcome, Task};
+use chocofactory_core::models::{
+    PauseOutcome, Project, ResumeOutcome, RetryMode, RetryOutcome, Task,
+};
 use clap::Parser;
 use cli::{Cli, Command, ProjectCmd, RoleOverrideArgs, TaskCmd};
 use client::{
@@ -257,6 +259,10 @@ enum Output {
     /// task id rides along only so the human rendering can point at
     /// `choco task status` the way every other accepted call does.
     Retried(String, RetryOutcome),
+    /// `task pause`'s `202` (#295).
+    Paused(String, PauseOutcome),
+    /// `task resume`'s `202` (#295).
+    Resumed(String, ResumeOutcome),
 }
 
 impl Output {
@@ -271,6 +277,8 @@ impl Output {
             Output::InitWorkflows(r) => serde_json::to_string(r),
             Output::Accepted(_) => return None,
             Output::Retried(_, r) => serde_json::to_string(r),
+            Output::Paused(_, r) => serde_json::to_string(r),
+            Output::Resumed(_, r) => serde_json::to_string(r),
         };
         Some(value.expect("API models are always serializable"))
     }
@@ -286,6 +294,8 @@ impl Output {
             Output::InitWorkflows(r) => render::init_workflows(r),
             Output::Accepted(msg) => msg.clone(),
             Output::Retried(id, r) => render::retried(id, r),
+            Output::Paused(id, r) => render::paused(id, r),
+            Output::Resumed(id, r) => render::resumed(id, r),
         })
     }
 }
@@ -393,6 +403,23 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         }
         Command::Task(TaskCmd::Send { id, text }) => {
             client.send_message(&id, &text).await?;
+            // A reply at a gate of a paused task is recorded, but the stage
+            // it leads to starts only on resume (#295). The status is read
+            // after the reply; a failed read just gives the ordinary line.
+            let held = match client.get_task(&id).await {
+                Ok(detail) => detail
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .filter(|status| matches!(*status, "pausing" | "paused"))
+                    .map(str::to_owned),
+                Err(_) => None,
+            };
+            if let Some(status) = held {
+                return Ok(Output::Accepted(format!(
+                    "Reply recorded; the task is {status}, so the next stage starts when you run \
+                     `choco task resume {id}`."
+                )));
+            }
             Ok(Output::Accepted(format!(
                 "Message accepted for task {id}. The reply is recorded as an \
                  event — see `choco task events {id}`."
@@ -423,6 +450,14 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                 "Task {id} cancelled. Any running agent process, worktree and \
                  local branch have been cleaned up — see `choco task status {id}`."
             )))
+        }
+        Command::Task(TaskCmd::Pause { id, now }) => {
+            let outcome = client.pause_task(&id, now).await?;
+            Ok(Output::Paused(id, outcome))
+        }
+        Command::Task(TaskCmd::Resume { id }) => {
+            let outcome = client.resume_task(&id).await?;
+            Ok(Output::Resumed(id, outcome))
         }
         Command::Task(TaskCmd::Retry { id, resume, fresh }) => {
             let mode = match (resume, fresh) {

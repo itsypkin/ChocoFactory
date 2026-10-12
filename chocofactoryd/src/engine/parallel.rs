@@ -57,7 +57,7 @@ pub(super) enum BranchApplied {
     Parked(String),
 }
 
-fn stamp(now: DateTime<Utc>) -> String {
+pub(super) fn stamp(now: DateTime<Utc>) -> String {
     now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
@@ -233,7 +233,7 @@ impl WorkflowEngine {
 }
 
 /// The `parallel` block when it belongs to `group`.
-fn block_for<'a>(payload: &'a Value, group: &str) -> Option<&'a Value> {
+pub(super) fn block_for<'a>(payload: &'a Value, group: &str) -> Option<&'a Value> {
     payload
         .get("parallel")
         .filter(|block| block.get("stage").and_then(Value::as_str) == Some(group))
@@ -273,6 +273,10 @@ pub(super) fn running_branch_kinds(
     Some(kinds.join(", "))
 }
 
+pub(super) fn branch_slot_state<'a>(payload: &'a Value, branch: &str) -> Option<&'a str> {
+    branch_state(payload, branch)
+}
+
 fn branch_state<'a>(payload: &'a Value, branch: &str) -> Option<&'a str> {
     payload
         .get("parallel")?
@@ -296,7 +300,13 @@ fn end_branch(payload: &mut Value, branch: &str, mut fields: Value, now: &str) {
     }
 }
 
-fn fail_branch(payload: &mut Value, branch: &str, reason: &str, resumable: bool, now: &str) {
+pub(super) fn fail_branch(
+    payload: &mut Value,
+    branch: &str,
+    reason: &str,
+    resumable: bool,
+    now: &str,
+) {
     end_branch(
         payload,
         branch,
@@ -362,7 +372,7 @@ pub(super) fn agent_role_of<'a>(definition: &'a WorkflowDefinition, name: &str) 
 impl WorkflowEngine {
     /// Best-effort `branch_finished` timeline entry, after the commit that
     /// recorded the end.
-    async fn record_branch_finished(
+    pub(super) async fn record_branch_finished(
         &self,
         task_id: &str,
         group: &str,
@@ -1166,7 +1176,9 @@ impl WorkflowEngine {
         let Some(task) = tasks::get(&self.pool, task_id).await? else {
             return dropped("the task no longer exists".to_string());
         };
-        if task.status != TASK_STATUS_OPEN {
+        // A pausing or paused task still records its branches' ends (#295):
+        // only the next stage is held.
+        if task.status != TASK_STATUS_OPEN && !is_pause_status(&task.status) {
             return dropped(format!("the task is {}", task.status));
         }
         let Some(state) = workflow_state::get(&self.pool, task_id).await? else {

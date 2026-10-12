@@ -53,6 +53,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{id}/messages", post(tasks::send_message))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/tasks/{id}/retry", post(tasks::retry))
+        .route("/tasks/{id}/pause", post(tasks::pause))
+        .route("/tasks/{id}/resume", post(tasks::resume))
         .route("/tasks/{id}/events", get(events::list))
         .route("/tasks/{id}/events/live", get(ws::task_events))
         .route("/server", get(server::get))
@@ -164,6 +166,7 @@ stages:
         repo_dir: TempDir,
         pool: SqlitePool,
         dispatcher: tokio::task::JoinHandle<()>,
+        state: AppState,
     }
 
     impl Drop for TestServer {
@@ -261,6 +264,7 @@ stages:
                     choco_binary: choco_binary.to_string(),
                 }),
             };
+            let handler_state = state.clone();
             tokio::spawn(async move {
                 let _ = axum::serve(listener, router(state)).await;
             });
@@ -272,7 +276,13 @@ stages:
                 repo_dir: TempDir::new(),
                 pool,
                 dispatcher,
+                state: handler_state,
             }
+        }
+
+        /// The state the handlers get, for a test that calls one directly.
+        pub fn state(&self) -> AppState {
+            self.state.clone()
         }
 
         pub fn pool(&self) -> &SqlitePool {

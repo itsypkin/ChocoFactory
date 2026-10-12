@@ -11,7 +11,7 @@ macro_rules! columns {
     () => {
         "id, project_id, workflow_def, title, status, config, \
      worktree_repo, worktree_project, stuck_reason, kept_work, workflow_path, workflow_sha256, \
-     base_ref, base_commit, closes, created_at, updated_at"
+     base_ref, base_commit, closes, paused_at, created_at, updated_at"
     };
 }
 
@@ -33,6 +33,7 @@ struct TaskRow {
     base_commit: Option<String>,
     /// A JSON array of positive integers; anything else fails to decode.
     closes: Json<Vec<std::num::NonZeroU64>>,
+    paused_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -60,6 +61,7 @@ impl From<TaskRow> for Task {
                 .into_iter()
                 .map(std::num::NonZeroU64::get)
                 .collect(),
+            paused_at: row.paused_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -303,14 +305,14 @@ pub async fn list_summaries(
         .collect())
 }
 
-/// How many `open` or `stuck` tasks have a `workflow_path` starting with
+/// How many `open`, `pausing`, `paused` or `stuck` tasks have a `workflow_path` starting with
 /// `prefix` (a plain string prefix, no pattern characters).
 pub async fn count_active_with_workflow_path_prefix(
     pool: &SqlitePool,
     prefix: &str,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tasks WHERE status IN ('open', 'stuck') \
+        "SELECT COUNT(*) FROM tasks WHERE status IN ('open', 'pausing', 'paused', 'stuck') \
          AND substr(workflow_path, 1, length(?1)) = ?1",
     )
     .bind(prefix)
@@ -318,13 +320,13 @@ pub async fn count_active_with_workflow_path_prefix(
     .await
 }
 
-/// The `workflow_def` of every `open` or `stuck` task with no recorded
+/// The `workflow_def` of every `open`, `pausing`, `paused` or `stuck` task with no recorded
 /// `workflow_path` (created before #88).
 pub async fn active_workflow_defs_without_path(
     pool: &SqlitePool,
 ) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT workflow_def FROM tasks WHERE status IN ('open', 'stuck') \
+        "SELECT workflow_def FROM tasks WHERE status IN ('open', 'pausing', 'paused', 'stuck') \
          AND workflow_path IS NULL",
     )
     .fetch_all(pool)
@@ -344,7 +346,7 @@ pub async fn update_status(
 ) -> Result<Option<Task>, sqlx::Error> {
     let now = Utc::now();
     let row = sqlx::query_as::<_, TaskRow>(concat!(
-        "UPDATE tasks SET status = ?, stuck_reason = NULL, updated_at = ? \
+        "UPDATE tasks SET status = ?, stuck_reason = NULL, paused_at = NULL, updated_at = ? \
          WHERE id = ? RETURNING ",
         columns!()
     ))
@@ -374,7 +376,7 @@ pub async fn mark_cancelled(
     let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, TaskRow>(concat!(
         "UPDATE tasks SET status = 'cancelled', kept_work = ?, stuck_reason = NULL, \
-         updated_at = ? WHERE id = ? RETURNING ",
+         paused_at = NULL, updated_at = ? WHERE id = ? RETURNING ",
         columns!()
     ))
     .bind(kept_work)
@@ -394,20 +396,21 @@ pub async fn mark_cancelled(
     Ok(Some((row.into(), withdrawn)))
 }
 
-/// Marks `id` `stuck` with `reason`, but only if it is currently `open`.
-/// See [`mark_stuck_in`] for the compare-and-set semantics; this is the
+/// Marks `id` `stuck` with `reason`, but only if it is currently `open`,
+/// `pausing` or `paused`. See [`mark_stuck_in`] for the compare-and-set semantics; this is the
 /// pool wrapper.
 pub async fn mark_stuck(pool: &SqlitePool, id: &str, reason: &str) -> Result<bool, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     mark_stuck_in(&mut conn, id, reason).await
 }
 
-/// Marks `id` `stuck` with `reason`, but only if it is currently `open`
-/// (X-4, issue #61) — a single conditional `UPDATE`, not a read-then-write,
+/// Marks `id` `stuck` with `reason`, but only if it is currently `open`,
+/// `pausing` or `paused` (a failure that lands after a pause must still
+/// reach `stuck`, and the same write clears `paused_at`) (X-4, issue #61) — a single conditional `UPDATE`, not a read-then-write,
 /// so a late failure can never clobber a task a human already `cancelled`
 /// or that reached `closed`/`stuck` through some other path in the
 /// meantime. Returns whether a row actually changed: `false` means the task
-/// was no longer `open` when this ran, which callers treat as "nothing to
+/// was no longer open, pausing or paused when this ran, which callers treat as "nothing to
 /// do" rather than an error. Runs on the given connection, so it can join a
 /// caller's transaction (pass `&mut *tx`).
 pub async fn mark_stuck_in(
@@ -417,11 +420,59 @@ pub async fn mark_stuck_in(
 ) -> Result<bool, sqlx::Error> {
     let now = Utc::now();
     let result = sqlx::query(
-        "UPDATE tasks SET status = 'stuck', stuck_reason = ?, updated_at = ? \
-         WHERE id = ? AND status = 'open'",
+        "UPDATE tasks SET status = 'stuck', stuck_reason = ?, paused_at = NULL, \
+         updated_at = ? WHERE id = ? AND status IN ('open', 'pausing', 'paused')",
     )
     .bind(reason)
     .bind(now)
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// `open → pausing`, recording when the pause was asked for. One conditional
+/// `UPDATE`; `false` means the task was not `open`.
+pub async fn mark_pausing(
+    pool: &SqlitePool,
+    id: &str,
+    paused_at: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'pausing', paused_at = ?, updated_at = ? \
+         WHERE id = ? AND status = 'open'",
+    )
+    .bind(paused_at)
+    .bind(Utc::now())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// `pausing → paused`; `paused_at` is left as the pause request set it.
+/// `false` means the task was not `pausing`.
+pub async fn mark_paused(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'paused', updated_at = ? \
+         WHERE id = ? AND status = 'pausing'",
+    )
+    .bind(Utc::now())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// `pausing`/`paused → open`, clearing `paused_at`, on the caller's
+/// connection so it can share a transaction with the poll-window shift.
+/// `false` means the task was neither.
+pub async fn resume_in(conn: &mut sqlx::SqliteConnection, id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'open', paused_at = NULL, updated_at = ? \
+         WHERE id = ? AND status IN ('pausing', 'paused')",
+    )
+    .bind(Utc::now())
     .bind(id)
     .execute(&mut *conn)
     .await?;

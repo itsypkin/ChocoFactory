@@ -17,6 +17,11 @@ enum TurnEnd {
     Incomplete(String),
     /// An operator cancelled the run; nothing to advance or park.
     Cancelled,
+    /// An operator paused the task with `--now` and the run was killed (#295).
+    Paused,
+    /// The daemon stopped under the run (#84); carries the reason a park
+    /// gives when the task is `open`.
+    DaemonStopped(String),
     /// The session row vanished (the task was deleted).
     SessionGone,
 }
@@ -137,6 +142,7 @@ impl ResumeSession {
             SessionEndReason::DaemonStopped => {
                 "the daemon was stopped or restarted while you were working"
             }
+            SessionEndReason::Paused => "the operator paused the task while you were working",
             SessionEndReason::Reaped => {
                 "the daemon closed it after it went quiet for longer than its idle timeout"
             }
@@ -1091,7 +1097,17 @@ impl WorkflowEngine {
                             session_id,
                             "the daemon stopped during this turn; not auto-advancing"
                         );
-                        break TurnEnd::Incomplete(agent_reason(&stage_name));
+                        break TurnEnd::DaemonStopped(agent_reason(&stage_name));
+                    }
+                    // #295: `pause --now` killed the run. Nothing failed; the
+                    // task is resumed by `resume`.
+                    Ok(Some(run)) if run.end_reason == Some(SessionEndReason::Paused) => {
+                        tracing::info!(
+                            task_id,
+                            session_id,
+                            "the turn was stopped by a pause; not auto-advancing"
+                        );
+                        break TurnEnd::Paused;
                     }
                     Ok(Some(run)) if run.status == SessionStatus::Idle => break TurnEnd::Completed,
                     // #90: the two ways `drain_session` ends a single-shot
@@ -1191,23 +1207,126 @@ impl WorkflowEngine {
                         )
                         .await;
                 }
+                TurnEnd::Paused => {
+                    engine
+                        .handle_requested_end(
+                            &task_id,
+                            &definition,
+                            &stage_name,
+                            &session_id,
+                            None,
+                            branch.as_ref(),
+                        )
+                        .await;
+                }
+                TurnEnd::DaemonStopped(reason) => {
+                    engine
+                        .handle_requested_end(
+                            &task_id,
+                            &definition,
+                            &stage_name,
+                            &session_id,
+                            Some(&reason),
+                            branch.as_ref(),
+                        )
+                        .await;
+                }
                 TurnEnd::Cancelled | TurnEnd::SessionGone => {}
             }
             // The one point every end reaches, after the result is handled.
-            engine.after_turn_end(&task_id, &session_id);
+            engine.after_turn_end(&task_id, &session_id).await;
         })
     }
 
     /// Reached by every end of a single-shot turn, after its result has been
-    /// handled and its slot freed. The place a later feature hooks in to act
-    /// when a task's last running turn is over.
-    fn after_turn_end(&self, task_id: &str, session_id: &str) {
+    /// handled and its slot freed: when the task was pausing and this was its
+    /// last running work, it becomes `paused` (#295).
+    async fn after_turn_end(&self, task_id: &str, session_id: &str) {
         tracing::debug!(
             task_id,
             session_id,
             running_for_task = self.turn_gate.running_for_task(task_id),
             "agent turn ended"
         );
+        self.settle_pause(task_id).await;
+    }
+
+    /// A turn ended because it was stopped from outside: a pause (`reason`
+    /// `None`) or the daemon stopping (`reason` is the park's wording). The
+    /// task's status, read under its lock, decides what that means.
+    ///
+    /// - `pausing` or `paused`: nothing failed. Not parked, no branch is
+    ///   recorded failed; only a read-only violation makes the task stuck.
+    /// - `open`, daemon stopped: parked as today.
+    /// - `open`, paused: a `resume` landed while the killed run was still
+    ///   draining and left it to this watcher, which restarts it.
+    ///
+    /// Accepted race: a pause landing between the status read and the park
+    /// of a daemon-stopped turn leaves the task stuck (or the branch failed),
+    /// the same as without the pause; no error is lost and retry recovers it.
+    pub(super) async fn handle_requested_end(
+        self: &Arc<Self>,
+        task_id: &str,
+        definition: &Arc<WorkflowDefinition>,
+        stage_name: &str,
+        session_id: &str,
+        daemon_stopped: Option<&str>,
+        branch: Option<&BranchWatch>,
+    ) {
+        let status = {
+            let lock = self.lock_for_task(task_id).await;
+            let status = {
+                let _guard = lock.lock().await;
+                tasks::get(&self.pool, task_id).await
+            };
+            self.evict_task_lock_if_unshared(task_id, &lock).await;
+            status
+        };
+        let status = match status {
+            Ok(Some(task)) => task.status,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::error!(
+                    task_id, session_id, %err,
+                    "could not read the task after a stopped turn"
+                );
+                match daemon_stopped {
+                    Some(reason) => {
+                        self.park_incomplete_turn(
+                            task_id, definition, stage_name, session_id, reason, branch,
+                        )
+                        .await;
+                    }
+                    None => {
+                        // A paused end nobody can place would leave the stage
+                        // with no work and no signal: make the task stuck.
+                        let reason = format!(
+                            "could not read the task after a paused turn ended: {err}; \
+                             retry to continue"
+                        );
+                        self.mark_stuck(task_id, &reason, false).await;
+                    }
+                }
+                return;
+            }
+        };
+        if is_pause_status(&status) {
+            self.check_pause_end(task_id, definition, stage_name, session_id, branch)
+                .await;
+        } else if status == TASK_STATUS_OPEN {
+            match daemon_stopped {
+                Some(reason) => {
+                    self.park_incomplete_turn(
+                        task_id, definition, stage_name, session_id, reason, branch,
+                    )
+                    .await;
+                }
+                None => {
+                    self.reenter_after_pause(task_id, definition, stage_name, session_id, branch)
+                        .await;
+                }
+            }
+        }
     }
 
     /// Applies a completed turn's capture and outcome. Runs detached, like

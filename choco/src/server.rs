@@ -295,7 +295,9 @@ pub(crate) async fn stop_daemon(root: &Path, info: LockInfo, force: bool) -> Res
                 text.push_str(
                     "Tasks waiting on a poll or a human are not affected. Wait for these to move on\n\
                      (`choco task status <id>`), or pass --force: they are marked stuck, and\n\
-                     `choco task retry <id>` continues them (an agent turn resumes its session).",
+                     `choco task retry <id>` continues them (an agent turn resumes its session).\n\
+                     A `pausing` task is not marked stuck: it ends `paused`, and `choco task resume <id>`\n\
+                     continues it (`retry` is refused on it).",
                 );
                 if let Some(note) = render::queued_restart_note(server.queued.len()) {
                     text.push('\n');

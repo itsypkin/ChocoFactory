@@ -11,8 +11,9 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::render::{
-    LABEL_BASE, LABEL_CLOSES, LABEL_CREATED, LABEL_ID, LABEL_PROJECT, LABEL_REPO, LABEL_ROLE,
-    LABEL_STAGE, LABEL_STATUS, LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW, LABEL_WORKFLOW_FILE,
+    LABEL_BASE, LABEL_CLOSES, LABEL_CREATED, LABEL_ID, LABEL_PAUSED, LABEL_PROJECT, LABEL_REPO,
+    LABEL_ROLE, LABEL_STAGE, LABEL_STATUS, LABEL_STUCK, LABEL_TITLE, LABEL_WORKFLOW,
+    LABEL_WORKFLOW_FILE,
 };
 
 use super::app::{
@@ -67,6 +68,7 @@ fn section_style(app: &App, s: Section) -> Style {
     let c = match s {
         Section::NeedsYou => Color::Yellow,
         Section::InProgress => Color::Cyan,
+        Section::Paused => Color::Blue,
         Section::Stuck => Color::Red,
         Section::Closed => Color::DarkGray,
     };
@@ -187,7 +189,7 @@ const COST_W: usize = 9;
 /// Project and stage shrink before the title drops below this.
 const TITLE_MIN: usize = 20;
 
-fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid {
+fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 5], width: usize) -> Grid {
     let cols = cols_for(app, width as u16);
     let mut project_w = if cols.project {
         sections
@@ -206,7 +208,9 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid 
             .zip(Section::ALL)
             .flat_map(|(ts, s)| ts.iter().map(move |t| (s, t)))
             .filter_map(|(s, t)| match s {
-                Section::NeedsYou | Section::InProgress => Some(stage_cell(t).chars().count()),
+                Section::NeedsYou | Section::InProgress | Section::Paused => {
+                    Some(stage_cell(t).chars().count())
+                }
                 Section::Closed => Some(t.task.status.chars().count()),
                 Section::Stuck => None,
             })
@@ -247,7 +251,7 @@ fn grid_for(app: &App, sections: &[Vec<&TaskSummary>; 4], width: usize) -> Grid 
         let floor = sections
             .iter()
             .zip(Section::ALL)
-            .filter(|(_, s)| matches!(s, Section::NeedsYou | Section::InProgress))
+            .filter(|(_, s)| matches!(s, Section::NeedsYou | Section::InProgress | Section::Paused))
             .flat_map(|(ts, _)| ts.iter())
             .filter(|t| t.branch_progress.is_some() || !t.queued.is_empty())
             .map(|t| {
@@ -283,7 +287,7 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
     let mut mid = None;
     let mut pr = g.cols.pr;
     match section {
-        Section::NeedsYou | Section::InProgress => {
+        Section::NeedsYou | Section::InProgress | Section::Paused => {
             if g.cols.stage {
                 mid = Some(c(Key::Stage, g.stage_w));
             }
@@ -324,6 +328,15 @@ fn columns(section: Section, g: &Grid) -> Vec<Col> {
 /// The list's stage cell: the stage, with `settled/total` after it while a
 /// parallel group is current.
 fn stage_cell(t: &TaskSummary) -> String {
+    let base = base_stage_cell(t);
+    match t.task.status.as_str() {
+        // The turn that was running is still finishing.
+        "pausing" => format!("{base} · pausing"),
+        _ => base,
+    }
+}
+
+fn base_stage_cell(t: &TaskSummary) -> String {
     match (&t.current_stage, &t.branch_progress) {
         // A group with branches waiting for a slot: how many.
         (Some(stage), Some(p)) if !t.queued.is_empty() => {
@@ -358,6 +371,10 @@ fn cell(app: &App, section: Section, t: &TaskSummary, key: Key) -> String {
         }
         Key::Time => match section {
             Section::NeedsYou | Section::InProgress => age(app, t.stage_entered_at),
+            // "paused for", from when the pause was asked for.
+            Section::Paused => {
+                fmt_duration(app.now - t.task.paused_at.unwrap_or(t.task.updated_at))
+            }
             Section::Stuck => fmt_duration(app.now - t.task.updated_at),
             Section::Closed => format!("{} ago", fmt_duration(app.now - t.task.updated_at)),
         },
@@ -440,6 +457,7 @@ fn header_line(section: Section, count: usize, cols: &[Col]) -> String {
             Key::Time => match section {
                 Section::NeedsYou => "waiting",
                 Section::InProgress => "in stage",
+                Section::Paused => "paused for",
                 Section::Stuck => "stuck for",
                 Section::Closed => "closed",
             },
@@ -540,7 +558,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         app,
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
-        "↑↓ move  ⏎ open  / search  o PR  r retry  c cancel  ? help  q quit",
+        "↑↓ move  ⏎ open  / search  o PR  r retry  p pause  c cancel  ? help  q quit",
     );
 }
 
@@ -732,7 +750,7 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
                     }
                 }
                 // The snapshot is fresher: rebuilt after Status below.
-                LABEL_STUCK if snap.is_some() => continue,
+                LABEL_STUCK | LABEL_PAUSED if snap.is_some() => continue,
                 LABEL_STUCK => {
                     row.error = true;
                     row.wrap = true;
@@ -763,6 +781,17 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
         row.wrap = true;
         rows.insert(pos + 1, row);
     }
+    if let Some(t) = snap
+        && let Some(pos) = rows.iter().position(|r| r.label == LABEL_STATUS)
+        && let Some(value) = crate::render::paused_value(
+            &t.task.status,
+            t.task.paused_at.map(|at| at.to_rfc3339()).as_deref(),
+            &t.task.id,
+            t.current_stage.as_deref(),
+        )
+    {
+        rows.insert(pos + 1, FRow::new(LABEL_PAUSED, value));
+    }
 
     // Stage, with the time in it (or how long ago it ended), then PR and
     // what the task waits for.
@@ -777,6 +806,10 @@ fn field_rows(app: &App, d: &Detail) -> Vec<FRow> {
                     "{name} ({} {} ago)",
                     t.task.status,
                     fmt_duration(app.now - t.task.updated_at)
+                ),
+                "paused" => format!(
+                    "{name} (paused {} ago)",
+                    fmt_duration(app.now - t.task.paused_at.unwrap_or(t.task.updated_at))
                 ),
                 _ => match t.stage_entered_at {
                     Some(at) => format!("{name} for {}", fmt_duration(app.now - at)),
@@ -1212,8 +1245,9 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     draw_detail_body(frame, app, lines, area, STATUS_HINTS);
 }
 
-const STATUS_HINTS: &str = "e events  o PR  r retry  c cancel  Esc back";
-const EXPANDED_HINTS: &str = "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  c cancel";
+const STATUS_HINTS: &str = "e events  o PR  r retry  p pause  c cancel  Esc back";
+const EXPANDED_HINTS: &str =
+    "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  c cancel";
 
 fn draw_detail_body(frame: &mut Frame, app: &App, lines: Vec<Line>, area: Rect, hints: &str) {
     let body_h = area.height.saturating_sub(1);
@@ -1434,7 +1468,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("g / G       top / bottom    o     open PR"),
         Line::from("⇥ / ⇧⇥      next section    r     retry stuck"),
         Line::from("?           this help       c     cancel"),
-        Line::from("q  Ctrl-C   quit"),
+        Line::from("q  Ctrl-C   quit            p     pause / resume"),
         Line::from("e           events / status"),
         Line::from("/           search"),
     ];

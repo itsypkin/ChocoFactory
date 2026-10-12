@@ -62,6 +62,7 @@ mod tests {
                 worktree_repo: None,
                 worktree_project: None,
                 stuck_reason: None,
+                paused_at: None,
                 kept_work: false,
                 workflow_path: None,
                 workflow_sha256: None,

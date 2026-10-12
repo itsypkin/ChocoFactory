@@ -5,6 +5,7 @@
 - `stuck`: retry
 - `escalate_to_human`: watch again or send a note
 - Getting your review items done when the coder ignores them
+- Pausing a task
 - Cancelling a task
 - Stray processes
 
@@ -148,6 +149,40 @@ The other options cost more:
 - Leave the PR without a verdict until the review window (about 4 days) parks it,
   then send the note. No command moves a task from `awaiting_human_review` to
   `escalate_to_human`, so this is the last resort.
+
+## Pausing a task
+
+`choco task pause <id>` holds a running task without losing anything, to free
+the machine for a while or to stop one task while another finishes. The task
+has two statuses on the way:
+
+- `pausing`: the pause was asked for, and an agent turn or shell command the
+  task had already started is still running. It shows a `Paused` line,
+  `waiting for <stage>'s turn to finish`.
+- `paused`: nothing of the task's is running. The line reads
+  `since HH:MM — choco task resume <id>`.
+
+A graceful pause stops polls and watchers at once, lets a running turn or
+command finish and apply its result, and enters the next stage without
+starting it. `--now` also stops the running turn (it ends as `paused`;
+`resume` continues the same session where the CLI can, otherwise starts
+fresh) and kills a running shell command (`resume` runs it again). A paused
+poll keeps the part of its timeout it had left.
+
+`choco task resume <id>` starts what was held. Queued turns keep their place
+and start ahead of later arrivals. A reply at a gate while paused is recorded,
+but its next stage waits for `resume`.
+
+Refused with a `409`, nothing started and the status unchanged: `pause` of a
+task that is already paused, pausing (without `--now`), stuck, closed or
+cancelled; `resume` of an open, stuck, closed or cancelled task; `retry` and
+`send` to a chat on a pausing or paused task (both name `choco task resume`).
+A turn that fails while the task is `pausing` makes it `stuck`, and
+`choco task cancel` works from either status.
+
+To wait for a pause: `choco task status <id> --until paused`. Any other
+`--until` target ends with exit 7 when the task pauses, and `--until attention`
+returns with exit 0.
 
 ## Cancelling a task
 

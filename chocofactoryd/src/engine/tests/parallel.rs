@@ -629,6 +629,7 @@ async fn usage_has_one_lap_line_per_branch() {
             status: "open",
             created_at: now,
             updated_at: now,
+            paused_at: None,
         },
         &facts,
         &rows,

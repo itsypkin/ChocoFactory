@@ -136,7 +136,9 @@ impl WorkflowEngine {
     /// failure ends in `mark_stuck` naming it, and only a failure to list
     /// the candidates is returned.
     pub async fn park_interrupted_turns(self: &Arc<Self>) -> Result<ParkReport, sqlx::Error> {
-        let candidates = tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await?;
+        let mut candidates = tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await?;
+        // A `pausing` task lost its running work too; it ends `paused`.
+        candidates.extend(tasks::list(&self.pool, None, Some(TASK_STATUS_PAUSING)).await?);
         let mut report = ParkReport::default();
         for task in candidates {
             let lock = self.lock_for_task(&task.id).await;
@@ -168,6 +170,10 @@ impl WorkflowEngine {
                 return;
             }
         };
+        if task.status == TASK_STATUS_PAUSING {
+            self.park_pausing_turn_locked(&task, report).await;
+            return;
+        }
         if task.status != TASK_STATUS_OPEN {
             return;
         }
@@ -278,19 +284,240 @@ impl WorkflowEngine {
         }
     }
 
-    /// The `open` tasks a restart would strand right now (`GET /server`).
-    /// A workflow that cannot be loaded, or a stage it no longer has, is
+    /// The startup sweep for one `pausing` task, under its lock. Records
+    /// every cut-off session of the current stage (each running branch's, for
+    /// a group) as `daemon_stopped`, checks read-only roles, and then makes
+    /// the task `paused` — or `stuck` with the finding when a session could
+    /// not be recorded or a read-only role changed the worktree. Branch slots
+    /// are not failed: `resume` continues them.
+    async fn park_pausing_turn_locked(&self, task: &Task, report: &mut ParkReport) {
+        let task_id = task.id.as_str();
+        match self.pausing_findings(task).await {
+            Ok(findings) if findings.is_empty() => {
+                match tasks::mark_paused(&self.pool, task_id).await {
+                    Ok(true) => {
+                        self.append_task_event(
+                            task_id,
+                            EventType::TaskPaused,
+                            json!({ "restart": true }),
+                        )
+                        .await
+                    }
+                    Ok(false) => {}
+                    Err(err) => tracing::error!(
+                        task_id, %err,
+                        "restart sweep could not mark a pausing task paused; it stays pausing"
+                    ),
+                }
+            }
+            Ok(findings) => {
+                let reason = format!(
+                    "the daemon restarted while the task was pausing: {}",
+                    findings.join("; ")
+                );
+                self.park_mark_stuck(task_id, &reason, report).await;
+            }
+            Err(reason) => {
+                self.park_mark_stuck(task_id, &reason, report).await;
+            }
+        }
+    }
+
+    /// For [`Self::park_pausing_turn_locked`]: records the cut-off sessions
+    /// and returns what must stop the task from simply becoming `paused`.
+    /// `Err` is a failure to read what the sweep needs.
+    async fn pausing_findings(&self, task: &Task) -> Result<Vec<String>, String> {
+        let task_id = task.id.as_str();
+        let state = workflow_state::get(&self.pool, task_id)
+            .await
+            .map_err(|err| {
+                format!("restart sweep could not read the task's workflow state: {err}")
+            })?;
+        let Some(state) = state else {
+            return Ok(Vec::new());
+        };
+        let stage = state.current_stage.clone();
+        let definition = self.load_task_workflow(task).await.map_err(|err| {
+            format!(
+                "the daemon restarted and could not load this task's workflow to check \
+                 whether stage '{stage}' was interrupted: {err}; fix the workflow file, \
+                 then retry"
+            )
+        })?;
+        let Some(stage_def) = definition.stages.get(&stage) else {
+            return Err(format!(
+                "stage '{stage}' no longer exists in the task's workflow"
+            ));
+        };
+        // (stage or branch name, its session) pairs to record.
+        let mut cut_off: Vec<(String, Option<Session>)> = Vec::new();
+        let mut group: Option<(i64, &IndexMap<String, crate::workflow_def::Branch>)> = None;
+        match restart_effect(stage_def) {
+            RestartEffect::StrandsAgentTurn => {
+                let current = sessions::get_current_for_stage(&self.pool, task_id, &stage)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "the interrupted session of stage '{stage}' could not be read ({err})"
+                        )
+                    })?;
+                // Only a session started on this entry of the stage was cut
+                // off; an earlier lap's belongs to a finished turn.
+                let this_entry = current.filter(|s| {
+                    state
+                        .stage_entered_at
+                        .is_none_or(|entered| s.started_at >= entered)
+                });
+                cut_off.push((stage.clone(), this_entry));
+            }
+            RestartEffect::PerBranch => {
+                let entry_no = state
+                    .payload
+                    .get("parallel")
+                    .and_then(|block| block.get("entry"))
+                    .and_then(Value::as_i64);
+                let (Some(entry_no), StageKind::Parallel { branches }) =
+                    (entry_no, &stage_def.kind)
+                else {
+                    return Ok(Vec::new());
+                };
+                group = Some((entry_no, branches));
+                for name in branches.keys() {
+                    if super::parallel::branch_slot_state(&state.payload, name) != Some("running") {
+                        continue;
+                    }
+                    let work = self
+                        .branch_progress(task_id, name, entry_no)
+                        .await
+                        .map_err(|err| {
+                            format!("branch '{name}' of '{stage}' could not be read ({err})")
+                        })?;
+                    match work {
+                        super::parallel::BranchWork::Live(session)
+                        | super::parallel::BranchWork::Ended(session) => {
+                            cut_off.push((name.clone(), Some(session)))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            RestartEffect::Survives | RestartEffect::StrandsShell => {}
+        }
+        let mut findings = Vec::new();
+        let mut failed_branches: Vec<(String, String)> = Vec::new();
+        for (name, session) in cut_off {
+            let Some(session) = session else { continue };
+            // A turn that ended in a failure before the crash is the same
+            // failure its watcher would have handled: it must not become
+            // `paused`, which `resume` would then strand.
+            if let Some(why) = pause_failure(&session) {
+                let what = if group.is_some() {
+                    format!("branch '{name}' of '{stage}'")
+                } else {
+                    format!("the turn of stage '{stage}'")
+                };
+                let reason =
+                    format!("{what} failed before the restart ({why}); retry continues it");
+                findings.push(reason.clone());
+                if group.is_some() {
+                    failed_branches.push((name.clone(), reason));
+                }
+            }
+            if session.status == SessionStatus::Idle
+                && session.end_reason.is_none()
+                && let Err(err) = sessions::mark_daemon_stopped(&self.pool, &session.id).await
+            {
+                findings.push(format!(
+                    "the interrupted session of '{name}' could not be recorded ({err}), so \
+                     resume will start it fresh"
+                ));
+            }
+            match self
+                .read_only_verdict(task_id, &definition, &name, &session.id, false)
+                .await
+            {
+                ReadOnlyVerdict::Clean => {}
+                ReadOnlyVerdict::Violation(found) | ReadOnlyVerdict::Unverified(found) => {
+                    findings.push(found)
+                }
+            }
+        }
+        if let (Some((entry_no, _)), false) = (group, failed_branches.is_empty()) {
+            let mut payload = state.payload.clone();
+            let now = super::parallel::stamp(self.now());
+            for (name, reason) in &failed_branches {
+                super::parallel::fail_branch(&mut payload, name, reason, false, &now);
+            }
+            let update = workflow_state::WorkflowStateUpdate {
+                current_stage: state.current_stage.clone(),
+                stage_kind: "parallel".to_string(),
+                loop_counters: state.loop_counters.clone(),
+                payload,
+                enters_stage: false,
+            };
+            match workflow_state::update(&self.pool, task_id, update).await {
+                Ok(_) => {
+                    for (name, reason) in &failed_branches {
+                        self.record_branch_finished(
+                            task_id,
+                            &stage,
+                            name,
+                            entry_no,
+                            super::events::BranchEnd::Failed { reason },
+                        )
+                        .await;
+                    }
+                }
+                Err(err) => findings.push(format!(
+                    "the failed branch(es) of '{stage}' could not be recorded ({err})"
+                )),
+            }
+        }
+        Ok(findings)
+    }
+
+    /// The tasks a restart would strand right now (`GET /server`): `open`
+    /// ones decided by their stage, and `pausing` ones with work still
+    /// running. A `paused` task is never listed. A workflow that cannot be loaded, or a stage it no longer has, is
     /// listed with kind `"unknown"` rather than hidden.
     pub async fn in_flight(&self) -> Result<Vec<InFlight>, sqlx::Error> {
         let mut out = Vec::new();
         let queue = self.queue_snapshot().await?;
-        for task in tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await? {
+        let mut candidates = tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await?;
+        candidates.extend(tasks::list(&self.pool, None, Some(TASK_STATUS_PAUSING)).await?);
+        for task in candidates {
             let Some(state) = workflow_state::get(&self.pool, &task.id).await? else {
                 continue;
             };
             let stage = state.current_stage;
+            // A pausing task's current stage may be held (no row, no
+            // session), so the stage kind alone would wrongly list it: it is
+            // stranded only while something of its own is running.
+            let pausing = task.status == TASK_STATUS_PAUSING;
+            let permits = self.turn_gate.running_for_task(&task.id) > 0;
+            if pausing && !permits && !self.has_detached_runner(&task.id) {
+                continue;
+            }
             let kind = match self.load_task_workflow(&task).await {
                 Ok(definition) => match definition.stages.get(&stage).map(restart_effect) {
+                    Some(RestartEffect::PerBranch) if pausing => {
+                        // A pausing task's queue rows are not admissible and
+                        // so not in the snapshot: read them directly.
+                        let rows = crate::db::turn_queue::list(&self.pool).await?;
+                        match super::parallel::running_branch_kinds(
+                            &state.payload,
+                            &definition,
+                            &stage,
+                            |branch| {
+                                rows.iter()
+                                    .any(|r| r.task_id == task.id && r.stage == branch)
+                            },
+                        ) {
+                            Some(kind) => kind,
+                            None => continue,
+                        }
+                    }
+                    Some(_) if pausing => if permits { "agent_turn" } else { "shell" }.to_string(),
                     Some(RestartEffect::Survives) => continue,
                     Some(RestartEffect::PerBranch) => {
                         match super::parallel::running_branch_kinds(
@@ -498,5 +725,19 @@ impl WorkflowEngine {
                 }
             }
         }
+    }
+}
+
+/// Why a cut-off session of a pausing task ended in a failure, or `None` when
+/// it ended the way a pause or a daemon stop ends a turn (or was recovered
+/// from `idle`, or is live).
+fn pause_failure(session: &Session) -> Option<String> {
+    match (session.status, session.end_reason) {
+        (SessionStatus::Active, _) | (SessionStatus::Idle, None) => None,
+        (_, Some(SessionEndReason::Paused | SessionEndReason::DaemonStopped)) => None,
+        (status, reason) => Some(format!(
+            "its session ended: {status}, end reason {}",
+            reason.map_or_else(|| "none".to_string(), |r| r.to_string())
+        )),
     }
 }
