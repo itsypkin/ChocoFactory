@@ -339,6 +339,7 @@ async fn fetch_bounded(
             active: Err(timed_out()),
             closed: Err(timed_out()),
             projects: None,
+            server: None,
         })
 }
 
@@ -489,12 +490,17 @@ async fn fetch(client: &Client, config: &LoopConfig, projects: bool) -> ListResu
             None
         }
     };
-    let (active, closed, projects) = tokio::join!(active, closed, names);
+    // The header's agent-slot counts: re-read with every refresh. A failed
+    // read is `None` and keeps the last values; the list fetches already
+    // report an unreachable daemon.
+    let server = client.server_status(config.timeout.min(Duration::from_secs(5)));
+    let (active, closed, projects, server) = tokio::join!(active, closed, names, server);
     ListResult {
         at: Utc::now(),
         active: active.map_err(|e| e.to_string()),
         closed: closed.map_err(|e| e.to_string()),
         projects,
+        server: server.ok(),
     }
 }
 

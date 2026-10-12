@@ -40,6 +40,10 @@ fn validate_repo_path(repo_path: &str) -> Result<(), ApiError> {
 pub struct CreateProjectRequest {
     pub name: String,
     pub repo_path: Option<String>,
+    /// The project's own cap on agent turns running at once; `0` or absent:
+    /// the project shares the server's cap.
+    #[serde(default)]
+    pub max_agents: Option<u32>,
 }
 
 pub async fn create(
@@ -49,7 +53,13 @@ pub async fn create(
     if let Some(repo_path) = &body.repo_path {
         validate_repo_path(repo_path)?;
     }
-    let project = projects::create(&state.pool, &body.name, body.repo_path.as_deref()).await?;
+    let project = projects::create_capped(
+        &state.pool,
+        &body.name,
+        body.repo_path.as_deref(),
+        body.max_agents,
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -78,6 +88,9 @@ pub struct UpdateProjectRequest {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_some")]
     pub repo_path: Option<Option<String>>,
+    /// Absent: unchanged. `0` or `null`: remove the project's own cap.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub max_agents: Option<Option<u32>>,
 }
 
 pub async fn update(
@@ -85,18 +98,30 @@ pub async fn update(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UpdateProjectRequest>,
 ) -> Result<Json<Project>, ApiError> {
-    if body.name.is_none() && body.repo_path.is_none() {
+    if body.name.is_none() && body.repo_path.is_none() && body.max_agents.is_none() {
         return Err(ApiError::BadRequest(
-            "PATCH /projects/{id} requires at least one of 'name'/'repo_path'".to_string(),
+            "PATCH /projects/{id} requires at least one of 'name'/'repo_path'/'max_agents'"
+                .to_string(),
         ));
     }
     if let Some(Some(repo_path)) = &body.repo_path {
         validate_repo_path(repo_path)?;
     }
     let repo_path = body.repo_path.as_ref().map(|inner| inner.as_deref());
-    let project = projects::update(&state.pool, &id, body.name.as_deref(), repo_path)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("no such project '{id}'")))?;
+    let project = projects::update_capped(
+        &state.pool,
+        &id,
+        body.name.as_deref(),
+        repo_path,
+        body.max_agents,
+    )
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("no such project '{id}'")))?;
+    if body.max_agents.is_some() {
+        // A raised or removed cap, or a project leaving the server pool, can
+        // let queued turns start.
+        state.engine.wake_dispatcher();
+    }
     Ok(Json(project))
 }
 
@@ -398,5 +423,140 @@ mod tests {
             .post(&format!("/projects/{id}/init-workflows"), json!({}))
             .await;
         assert_eq!(response.status(), 409);
+    }
+
+    // ---- max_agents ----
+
+    #[tokio::test]
+    async fn a_projects_agent_cap_round_trips_and_zero_removes_it() {
+        let server = TestServer::start().await;
+        let created: Value = server
+            .post("/projects", json!({ "name": "capped", "max_agents": 2 }))
+            .await
+            .json();
+        assert_eq!(created["max_agents"], 2);
+        let id = created["id"].as_str().unwrap().to_string();
+        let plain: Value = server
+            .post("/projects", json!({ "name": "plain" }))
+            .await
+            .json();
+        assert!(plain["max_agents"].is_null());
+
+        let listed: Value = server.get("/projects").await.json();
+        let caps: Vec<&Value> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| &p["max_agents"])
+            .collect();
+        assert!(
+            caps.contains(&&json!(2)) && caps.contains(&&Value::Null),
+            "{caps:?}"
+        );
+
+        // A PATCH with only the cap is accepted, and leaves the name alone.
+        let raised: Value = server
+            .patch(&format!("/projects/{id}"), json!({ "max_agents": 5 }))
+            .await
+            .json();
+        assert_eq!(raised["max_agents"], 5);
+        assert_eq!(raised["name"], "capped");
+        // A PATCH without the key leaves it alone.
+        let renamed: Value = server
+            .patch(&format!("/projects/{id}"), json!({ "name": "renamed" }))
+            .await
+            .json();
+        assert_eq!(renamed["max_agents"], 5);
+        // 0 stores no cap, and so does null.
+        let zero: Value = server
+            .patch(&format!("/projects/{id}"), json!({ "max_agents": 0 }))
+            .await
+            .json();
+        assert!(zero["max_agents"].is_null(), "{zero}");
+        server
+            .patch(&format!("/projects/{id}"), json!({ "max_agents": 3 }))
+            .await;
+        let null: Value = server
+            .patch(&format!("/projects/{id}"), json!({ "max_agents": null }))
+            .await
+            .json();
+        assert!(null["max_agents"].is_null(), "{null}");
+        // Created with 0 means no cap too.
+        let zero_create: Value = server
+            .post("/projects", json!({ "name": "zero", "max_agents": 0 }))
+            .await
+            .json();
+        assert!(zero_create["max_agents"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_project_cap_that_is_not_a_non_negative_integer_is_rejected() {
+        let server = TestServer::start().await;
+        for bad in [json!(-1), json!("two"), json!(1.5)] {
+            let response = server
+                .post("/projects", json!({ "name": "p", "max_agents": bad }))
+                .await;
+            assert!(
+                response.status() == 422 || response.status() == 400,
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_project_patch_is_rejected() {
+        let server = TestServer::start().await;
+        let project: Value = server
+            .post("/projects", json!({ "name": "p" }))
+            .await
+            .json();
+        let id = project["id"].as_str().unwrap();
+        let response = server.patch(&format!("/projects/{id}"), json!({})).await;
+        assert_eq!(response.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn raising_a_project_cap_wakes_the_dispatcher_at_once() {
+        // The test server's dispatcher ticks once an hour, so only the wake
+        // that `PATCH /projects/{id}` sends can start the queued turn.
+        let server = TestServer::start().await;
+        server.write_workflow(
+            "one",
+            "name: one\nroles:\n  r:\n    cli: claude\n    model: sonnet\nstages:\n  work:\n    kind: agent_turn\n    role: r\n    on: { done: finished }\n  finished:\n    kind: terminal\n",
+        );
+        let project: Value = server
+            .post("/projects", json!({ "name": "capped", "max_agents": 1 }))
+            .await
+            .json();
+        let project_id = project["id"].as_str().unwrap().to_string();
+        let create = |title: &'static str| {
+            let body = json!({
+                "project_id": project_id, "workflow_def": "one", "title": title, "prompt": "go",
+            });
+            let server = &server;
+            async move { server.post("/tasks", body).await.json() }
+        };
+        let first: Value = create("first").await;
+        let second: Value = create("second").await;
+        let second_id = second["id"].as_str().unwrap().to_string();
+        let detail: Value = server.get(&format!("/tasks/{second_id}")).await.json();
+        assert_eq!(detail["queued"][0]["position"], 1, "{detail}");
+        assert!(first["id"].is_string());
+
+        server
+            .patch(
+                &format!("/projects/{project_id}"),
+                json!({ "max_agents": 2 }),
+            )
+            .await;
+        crate::test_support::wait_until("the queued turn to start", || async {
+            let detail: Value = server.get(&format!("/tasks/{second_id}")).await.json();
+            if detail["queued"] == json!([]) {
+                Ok(())
+            } else {
+                Err(detail["queued"].to_string())
+            }
+        })
+        .await;
     }
 }

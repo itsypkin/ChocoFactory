@@ -65,8 +65,10 @@ mod stage_capture;
 mod sweep;
 mod terminal;
 mod turn;
+mod turns;
 mod watch;
 pub use sweep::{ParkReport, PollSweepReport, RestartEffect, restart_effect};
+pub use turns::{QueueSnapshot, TurnGate};
 
 #[cfg(test)]
 pub(crate) use gate::reply_verdict;
@@ -111,6 +113,18 @@ struct StageEntry<'a> {
 /// claimed and its `JoinHandle` being attached, which is a window only the
 /// spawning caller can observe.
 type DetachedRunners = HashMap<String, HashMap<u64, Option<JoinHandle<()>>>>;
+
+/// `1st`, `2nd`, `3rd`, `4th`: a place in line, for messages.
+fn ordinal_suffix(n: u32) -> String {
+    let suffix = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
 
 /// `tasks.status` for a task that reached a `terminal` stage (§5.4).
 const TASK_STATUS_CLOSED: &str = "closed";
@@ -224,6 +238,13 @@ pub struct WorkflowEngine {
     /// new task's base is resolved. Defaults to
     /// `worktree::BASE_NETWORK_TIMEOUT`; a test shortens it.
     base_network_timeout_ms: AtomicU64,
+    /// Decides whether an agent turn starts or queues, and holds the slots
+    /// of the turns that are running.
+    turn_gate: Arc<TurnGate>,
+    /// Every turn watcher this engine spawned, so a test can stop them all
+    /// at once the way a crash does.
+    #[cfg(test)]
+    watchers: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 #[derive(Debug)]
@@ -315,6 +336,11 @@ pub enum EngineError {
     /// Resolving or creating a worktree-enabled workflow's working
     /// directory failed (§5.5 Q7, issue #58) — see `WorkingDirError`.
     Worktree(WorkingDirError),
+    /// A queued turn's row was already gone when its session was to be
+    /// created (cancelled or withdrawn meanwhile). Nothing started.
+    QueueRowVanished(String),
+    /// A queued turn could not be rebuilt for admission.
+    QueueAdmission(String),
 }
 
 impl fmt::Display for EngineError {
@@ -379,6 +405,11 @@ impl fmt::Display for EngineError {
             EngineError::GlobalConfig(err) => write!(f, "{err}"),
             EngineError::RoleConfig(err) => write!(f, "{err}"),
             EngineError::Worktree(err) => write!(f, "{err}"),
+            EngineError::QueueRowVanished(stage) => write!(
+                f,
+                "the queued turn for stage '{stage}' was withdrawn before it could start"
+            ),
+            EngineError::QueueAdmission(message) => write!(f, "{message}"),
         }
     }
 }
@@ -1100,6 +1131,12 @@ pub enum RetryTaskError {
     /// The task isn't `stuck` — carries its actual status, the same way
     /// `CancelTaskError::NotCancellable` does.
     NotStuck(String),
+    /// The task is `open` because its turn is waiting for an agent slot, so
+    /// there is nothing to retry; carries the stage and its place in line.
+    Queued {
+        stage: String,
+        position: u32,
+    },
     /// The task has no `workflow_state` row at all, so there is no current
     /// stage to re-enter — e.g. `create_task`'s `start_task` failed before
     /// `workflow_state::create` ever ran.
@@ -1160,6 +1197,12 @@ impl fmt::Display for RetryTaskError {
                     "task is '{status}', not 'stuck', so it cannot be retried"
                 )
             }
+            RetryTaskError::Queued { stage, position } => write!(
+                f,
+                "stage '{stage}' is waiting for an agent slot ({} in line), not stuck, so it \
+                 cannot be retried; it starts when a turn ends",
+                ordinal_suffix(*position)
+            ),
             RetryTaskError::NoWorkflowState => write!(f, "task has no workflow_state row"),
             RetryTaskError::UnknownStage(stage) => {
                 write!(f, "workflow_state references unknown stage '{stage}'")
@@ -1366,6 +1409,9 @@ impl WorkflowEngine {
         wall_clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            turn_gate: TurnGate::new(pool.clone(), global_config_path.clone()),
+            #[cfg(test)]
+            watchers: std::sync::Mutex::new(Vec::new()),
             pool,
             session_manager,
             task_locks: Mutex::new(HashMap::new()),
@@ -1381,6 +1427,17 @@ impl WorkflowEngine {
                 worktree::BASE_NETWORK_TIMEOUT.as_millis() as u64
             ),
         })
+    }
+
+    /// What a crash does to this engine's in-memory work: every turn watcher
+    /// stops, and the gate stops admitting. The database and the agent
+    /// processes are left as they are, for a restart sweep to find.
+    #[cfg(test)]
+    pub(crate) fn simulate_crash(&self) {
+        self.turn_gate.stop();
+        for handle in self.watchers.lock().unwrap().drain(..) {
+            handle.abort();
+        }
     }
 
     /// Shortens the per-call network timeout used when resolving a new
@@ -2150,13 +2207,34 @@ impl WorkflowEngine {
         // `keep` (#102) is recorded by this same `UPDATE`: a second
         // statement could be lost to a crash, leaving a cancelled task whose
         // kept worktree nobody is told about.
-        tasks::mark_cancelled(&self.pool, task_id, keep)
-            .await?
-            // `None` means the row vanished between this function's own
-            // read and this write — impossible while the lock is held, but
-            // surfaced rather than discarded, the same way `start_task`
-            // treats it.
-            .ok_or(CancelTaskError::NoSuchTask)?;
+        //
+        // The task's queued turns are deleted by the same transaction (the
+        // slot lock is held around it because it writes `turn_queue`), so no
+        // queued turn of a cancelled task can outlive the cancel.
+        let withdrawn = {
+            let _slot = self.turn_gate.slot_lock().await;
+            tasks::mark_cancelled(&self.pool, task_id, keep)
+                .await?
+                // `None` means the row vanished between this function's own
+                // read and this write — impossible while the lock is held,
+                // but surfaced rather than discarded, the same way
+                // `start_task` treats it.
+                .ok_or(CancelTaskError::NoSuchTask)?
+                .1
+        };
+        for (stage, group) in &withdrawn {
+            crate::db::turn_queue::record_withdrawn(
+                &self.pool,
+                task_id,
+                stage,
+                group.as_deref(),
+                "cancel",
+            )
+            .await;
+        }
+        if !withdrawn.is_empty() {
+            self.events_notify.notify_waiters();
+        }
         tracing::info!(task_id, "task cancelled");
 
         // Step 3 — stop the work. Nothing below is allowed to fail the
@@ -2411,8 +2489,21 @@ impl WorkflowEngine {
         let current_stage = state.current_stage.clone();
 
         // An open task is retryable only when a watcher's timeout parked it
-        // at a gate (#179): then retry watches again.
+        // at a gate (#179): then retry watches again. One whose turn is
+        // waiting for an agent slot is not stuck at all.
         if task.status == TASK_STATUS_OPEN {
+            if let Some(turn) = self
+                .queue_snapshot()
+                .await?
+                .queued_for(task_id)
+                .into_iter()
+                .next()
+            {
+                return Err(RetryTaskError::Queued {
+                    stage: turn.stage,
+                    position: turn.position,
+                });
+            }
             let Some(timed_out) = timed_out_watch(&definition, &current_stage, &state.payload)
             else {
                 return Err(RetryTaskError::NotStuck(task.status));
@@ -2504,6 +2595,12 @@ impl WorkflowEngine {
         // For a stage that is no longer a poll, the same call removes a stale
         // window (so a later restart can't mistake it for an interrupted
         // poll); nothing is written when the payload comes out unchanged.
+        //
+        // Before anything is re-entered, the stuck task's leftover queue
+        // rows go: they can never start, and one that survived to the
+        // re-claim would collide with it (`UNIQUE (task_id, stage)`). Under
+        // the task lock held here and the slot lock, one DELETE.
+        self.withdraw_task_rows(task_id, "retry").await?;
         let mut new_payload = state.payload.clone();
         set_poll_window(&mut new_payload, &definition, &current_stage, self.now())
             .map_err(RetryTaskError::Enter)?;
@@ -2581,6 +2678,7 @@ impl WorkflowEngine {
             .await;
             return Err(RetryTaskError::Enter(err));
         }
+        let queued = self.queued_position(task_id, &current_stage, None).await;
         Ok(RetryOutcome {
             stage: current_stage,
             resumed: resume.is_some(),
@@ -2588,6 +2686,7 @@ impl WorkflowEngine {
             fresh_reason,
             rewatched: false,
             branches: Vec::new(),
+            queued,
         })
     }
 
@@ -2655,6 +2754,7 @@ impl WorkflowEngine {
             fresh_reason: None,
             rewatched: true,
             branches: Vec::new(),
+            queued: None,
         })
     }
 
@@ -2684,6 +2784,23 @@ impl WorkflowEngine {
         })
     }
 
+    /// The place in line of `(task, stage)` of `group` when it is queued.
+    /// Informational: a failed read is logged and reads as "not queued".
+    pub(super) async fn queued_position(
+        &self,
+        task_id: &str,
+        stage: &str,
+        group: Option<&str>,
+    ) -> Option<u32> {
+        match self.queue_snapshot().await {
+            Ok(snapshot) => snapshot.position_of(task_id, stage, group),
+            Err(err) => {
+                tracing::error!(task_id, stage, %err, "could not read the queue position");
+                None
+            }
+        }
+    }
+
     /// The branches of the task's current parallel group, for
     /// `GET /tasks/{id}`. Read-only, and unlike `watch_timed_out` it does not
     /// filter on task status: a stuck or cancelled task shows its branches.
@@ -2706,12 +2823,39 @@ impl WorkflowEngine {
                 None
             }
         };
-        parallel::branch_statuses_from(
+        let mut branches = parallel::branch_statuses_from(
             &state.payload,
             &state.current_stage,
             stage_kind,
             definition.as_ref(),
-        )
+        );
+        // A branch the payload calls `running` that has a queue row for this
+        // group entry is waiting for a slot, not running.
+        match self.queue_snapshot().await {
+            Ok(snapshot) => {
+                for branch in &mut branches {
+                    if branch.state == "running"
+                        && snapshot.is_queued(
+                            &task.id,
+                            &branch.name,
+                            Some(&state.current_stage),
+                            Some(branch.entry),
+                        )
+                    {
+                        branch.state = "queued".to_string();
+                        branch.queued_position = snapshot.position_of(
+                            &task.id,
+                            &branch.name,
+                            Some(&state.current_stage),
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::error!(task_id = %task.id, %err, "could not read the queue to describe a parallel group's branches");
+            }
+        }
+        branches
     }
 
     /// Whether the stuck stage's last run can be picked up where it left

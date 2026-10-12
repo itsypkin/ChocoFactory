@@ -442,6 +442,94 @@ fn stop_refuses_while_an_agent_turn_runs_and_force_parks_it() {
     });
 }
 
+/// A turn waiting for an agent slot has no process: it is not in flight, so
+/// it never blocks `stop`/`restart`, the CLI says where it will be, and after
+/// the restart it starts in its place (it is not parked `stuck`).
+#[test]
+fn queued_turns_do_not_block_stop_and_start_after_the_restart() {
+    let probe = Env::new();
+    let claude = blocking_claude(&probe.home);
+    let env = Env {
+        home: probe.home.clone(),
+        claude,
+    };
+    std::mem::forget(probe); // `env` owns the same directory now
+    std::fs::create_dir_all(env.root()).unwrap();
+    std::fs::write(env.root().join("config.yaml"), "max_agents: 1\n").unwrap();
+    env.start();
+    let wf = env.home.join("wf.yaml");
+    std::fs::write(&wf, AGENT_WF).unwrap();
+    let repo = env.home.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    env.json(&[
+        "project",
+        "create",
+        "demo",
+        "--repo",
+        repo.to_str().unwrap(),
+    ]);
+    let create = |title: &str| -> String {
+        let task = env.json(&[
+            "task",
+            "create",
+            "--project",
+            "demo",
+            "--workflow",
+            wf.to_str().unwrap(),
+            "--title",
+            title,
+            "--prompt",
+            "go",
+        ]);
+        task["id"].as_str().unwrap().to_string()
+    };
+    let first = create("first");
+    wait_in_flight(&env);
+    let second = create("second");
+
+    // The first is running; the second is waiting, with its place in line.
+    let detail = env.json(&["task", "status", &second]);
+    assert_eq!(detail["status"], "open", "{detail}");
+    assert_eq!(detail["queued"][0]["position"], 1, "{detail}");
+    assert_eq!(detail["queued"][0]["pool"], "server", "{detail}");
+    let status = env.choco(&["server", "status"]);
+    let all = stdout(&status);
+    assert!(all.contains("server 1/1 running, 1 queued"), "{all}");
+    assert!(all.contains("queued") && all.contains(&second), "{all}");
+
+    // Stop refuses for the running turn only, and says what happens to the
+    // queued one.
+    let out = env.choco(&["server", "stop"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    let all = stdout(&out);
+    assert!(all.contains(&first) && !all.contains(&second), "{all}");
+    assert!(
+        all.contains("1 queued turn will wait and start in order after the restart."),
+        "{all}"
+    );
+
+    let out = env.choco(&["server", "stop", "--force"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("1 queued turn will wait and start in order after the restart."),
+        "{}",
+        text(&out)
+    );
+    env.start();
+    // The running turn was parked; the queued one was not, and now runs.
+    wait_for("the first task to be stuck", || {
+        env.json(&["task", "status", &first])["status"] == "stuck"
+    });
+    wait_for("the queued turn to start", || {
+        let detail = env.json(&["task", "status", &second]);
+        detail["status"] == "open"
+            && detail["queued"].as_array().is_some_and(|q| q.is_empty())
+            && env.json(&["server", "status"])["daemon"]["in_flight"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|f| f["task_id"] == second.as_str()))
+    });
+}
+
 #[test]
 fn stop_allows_a_waiting_poll_without_force() {
     let env = Env::new();

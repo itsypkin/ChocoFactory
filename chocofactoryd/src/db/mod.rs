@@ -3,6 +3,7 @@ pub mod pool;
 pub mod projects;
 pub mod sessions;
 pub mod tasks;
+pub mod turn_queue;
 pub mod usage;
 pub mod workflow_state;
 

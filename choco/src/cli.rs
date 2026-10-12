@@ -115,8 +115,10 @@ pub enum Command {
     Dashboard(DashboardArgs),
     /// Update choco and chocofactoryd to the latest release (only for copies
     /// installed by install.sh). Refuses, exit 3, while an agent turn or shell
-    /// step is running unless `--force`. Exit codes: 0 updated or up to date;
-    /// 1 error or not updatable; 3 refused because work is in flight.
+    /// step is running unless `--force`. A turn only waiting for an agent slot
+    /// is not running: it never blocks, and starts in its place after the
+    /// restart. Exit codes: 0 updated or up to date; 1 error or not updatable;
+    /// 3 refused because work is in flight.
     Update {
         /// Only report whether an update is available.
         #[arg(long)]
@@ -167,7 +169,8 @@ pub enum ServerCmd {
     /// Stop chocofactoryd gracefully (SIGTERM). Refuses, exit 3, while an agent
     /// turn or shell step is running, since stopping marks those tasks stuck
     /// (`choco task retry` continues them); `--force` stops anyway. Tasks
-    /// waiting on a poll or a human are not affected.
+    /// waiting on a poll or a human are not affected, nor are turns waiting
+    /// for an agent slot: they start in order after the restart.
     /// Exit codes: 0 stopped or not running; 1 error; 3 refused.
     Stop {
         /// Stop even if work is in flight; that work is marked stuck.
@@ -302,7 +305,8 @@ pub enum TaskCmd {
     /// On an `open` task waiting at a gate because a watcher (the PR review
     /// watch, CI polling) timed out: goes back to that watcher with its
     /// schedule starting over. No agent lap is spent, and `--resume` and
-    /// `--fresh` do not apply. Any other open task cannot be retried.
+    /// `--fresh` do not apply. Any other open task cannot be retried, including
+    /// one whose turn is waiting for an agent slot.
     ///
     /// When the stage's last agent turn was cut off from outside — a usage
     /// limit, or the daemon closing an idle session — the retry continues
@@ -478,8 +482,13 @@ pub enum ProjectCmd {
         /// or isn't a directory.
         #[arg(long)]
         repo: Option<String>,
+        /// The project's own cap on agent turns running at once. A project
+        /// with a cap is its own pool: its turns neither use nor wait for the
+        /// server's slots. `0` means no cap of its own.
+        #[arg(long, value_name = "N")]
+        max_agents: Option<u32>,
     },
-    /// Change a project's name and/or repo path.
+    /// Change a project's name, repo path and/or agent cap.
     Update {
         /// Project name or id.
         project: String,
@@ -493,6 +502,11 @@ pub enum ProjectCmd {
         /// Clears the project's repo path. Conflicts with `--repo`.
         #[arg(long, conflicts_with = "repo")]
         no_repo: bool,
+        /// The project's own cap on agent turns running at once; `0` removes
+        /// it, so the project shares the server's cap again. Applies to the
+        /// next start decision, with no restart.
+        #[arg(long, value_name = "N")]
+        max_agents: Option<u32>,
     },
     /// List all projects.
     List,

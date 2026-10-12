@@ -280,10 +280,7 @@ impl Output {
             Output::Project(p) => render::project(p),
             Output::Projects(p) => render::projects(p),
             Output::Task(t) => render::task(t),
-            Output::Tasks(t) => {
-                let tasks: Vec<Task> = t.iter().map(|s| s.task.clone()).collect();
-                render::tasks(&tasks)
-            }
+            Output::Tasks(t) => render::tasks(t),
             Output::TaskDetail(d) => render::task_detail(d, chrono::Utc::now()),
             Output::Events(e) => render::events(e),
             Output::InitWorkflows(r) => render::init_workflows(r),
@@ -295,10 +292,16 @@ impl Output {
 
 async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
     match command {
-        Command::Project(ProjectCmd::Create { name, repo }) => {
+        Command::Project(ProjectCmd::Create {
+            name,
+            repo,
+            max_agents,
+        }) => {
             let repo_path = repo.as_deref().map(canonicalize_repo).transpose()?;
             Ok(Output::Project(
-                client.create_project(&name, repo_path.as_deref()).await?,
+                client
+                    .create_project(&name, repo_path.as_deref(), max_agents)
+                    .await?,
             ))
         }
         Command::Project(ProjectCmd::Update {
@@ -306,10 +309,12 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             name,
             repo,
             no_repo,
+            max_agents,
         }) => {
-            if name.is_none() && repo.is_none() && !no_repo {
+            if name.is_none() && repo.is_none() && !no_repo && max_agents.is_none() {
                 return Err(ClientError::InvalidConfig(
-                    "nothing to change — pass at least one of --name/--repo/--no-repo".to_string(),
+                    "nothing to change — pass at least one of --name/--repo/--no-repo/--max-agents"
+                        .to_string(),
                 ));
             }
             // `--repo`/`--no-repo` conflict (clap), so at most one of these
@@ -328,6 +333,7 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
                     &project_id,
                     name.as_deref(),
                     repo_path.as_ref().map(|p| p.as_deref()),
+                    max_agents,
                 )
                 .await?;
             Ok(Output::Project(updated))

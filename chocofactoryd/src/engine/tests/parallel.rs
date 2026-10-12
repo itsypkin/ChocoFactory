@@ -1415,6 +1415,7 @@ async fn retry_resumes_a_usage_limited_branch() {
             resumed: true,
             adapter_session_id: Some(old.adapter_session_id.clone().unwrap()),
             fresh_reason: None,
+            queued: None,
         }]
     );
     let starts = started_events(&g, "one").await;
@@ -1466,6 +1467,7 @@ async fn a_mixed_retry_reports_resumed_false_and_names_only_the_fresh_branch() {
             resumed: true,
             adapter_session_id: Some(old.adapter_session_id.clone().unwrap()),
             fresh_reason: None,
+            queued: None,
         }
     );
     assert_eq!(outcome.branches[1].branch, "two");

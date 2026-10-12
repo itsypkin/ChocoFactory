@@ -62,8 +62,9 @@ choco --version
   differ from what this skill describes.
 - `choco: command not found`: install it as in the
   [README](https://github.com/itsypkin/ChocoFactory#install), then go on.
-- `choco update` refuses while work is in flight; see
-  [Cost and safety](#cost-and-safety).
+- `choco update` refuses while work is in flight, meaning an agent turn or
+  shell step that is running. A turn only waiting for an agent slot is not in
+  flight; see [Cost and safety](#cost-and-safety).
 - It refuses with exit 1 for a copy that wasn't installed by the install
   script; the error says what to run instead.
 
@@ -91,8 +92,20 @@ command in step 3 and the pre-merge check in step 4.
   first; any other ref is used as the repo has it. A ref that doesn't
   resolve, or a failed fetch, creates nothing. `choco task status` shows the
   `Base` line.
-- **`choco server status`** shows the daemon's version, open tasks and
-  in-flight work. It warns when `choco` and the daemon differ in version, or
+- **Agent caps.** A cap on how many agent turns run at once is off by
+  default. Set the server's with `max_agents: N` in
+  `~/.config/chocofactory/config.yaml`, and one project's own with
+  `choco project create|update --max-agents N` (`0` removes it; a project with
+  a cap is its own pool and doesn't use the server's slots). Unset or `0`
+  means no limit, and an edit applies within seconds, without a restart. After
+  editing, read the `agent slots` line of `choco server status`: it always
+  shows the server pool's limit (`no limit` when unset), so a mistyped key
+  shows up there. A turn waiting for a slot reads `Queued` in `choco task
+  status` and `· queued N` in `choco task list`; it is waiting, not stuck
+  (see [reference/watch.md](reference/watch.md#a-turn-waiting-for-an-agent-slot)).
+- **`choco server status`** shows the daemon's version, open tasks,
+  in-flight work and agent slots (each pool's running count, limit and
+  queued turns). It warns when `choco` and the daemon differ in version, or
   the daemon binary changed on disk since it started: run
   `choco server restart` then if the daemon is yours, otherwise tell its
   owner.
@@ -130,7 +143,9 @@ command in step 3 and the pre-merge check in step 4.
 - **Don't stop or restart the daemon while an agent turn (including a
   parallel group's running branches) or shell step runs.** `stop` and
   `restart` refuse (see [Cost and safety](#cost-and-safety)).
-  Tasks waiting on a poll or a human survive a restart.
+  Tasks waiting on a poll or a human survive a restart, and so do turns
+  queued for an agent slot: they don't block `update`, `stop` or `restart`,
+  and they start in their order after the restart.
   A forced restart while a parallel group's branches run parks the task
   `stuck` with those branches failed; `choco task retry` resumes them
   where it can and starts the rest fresh.
@@ -351,6 +366,9 @@ Read [reference/recover.md](reference/recover.md) when a task is `stuck`,
 parked at `escalate_to_human`, ignoring your review items, or needs
 cancelling. In short:
 
+- A task showing `Queued` is waiting for an agent slot, not stuck: don't
+  `retry`, `cancel` or `send` to it; see
+  [reference/recover.md](reference/recover.md#queued-is-not-stuck).
 - `stuck` → find out why in `choco task status <id>`, then
   `choco task retry <id>`. On a task stuck in a parallel group, retry
   re-runs only the failed branches and keeps the finished ones, listing
@@ -378,4 +396,6 @@ cancelling. In short:
   with exit 3 while an agent turn (including a parallel group's running
   branches) or shell step is running.** `--force` goes
   ahead and marks that work `stuck`; use it only if you are prepared to
-  `choco task retry` those tasks.
+  `choco task retry` those tasks. Turns queued for an agent slot are not
+  running: they never block these commands, and the commands print `N queued
+  turns will wait and start in order after the restart.`

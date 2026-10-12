@@ -1,11 +1,34 @@
 # Recover a choco task
 
 ## Contents
+- Queued is not stuck
 - `stuck`: retry
 - `escalate_to_human`: watch again or send a note
 - Getting your review items done when the coder ignores them
 - Cancelling a task
 - Stray processes
+
+## Queued is not stuck
+
+A task whose `choco task status` shows a `Queued` line (or `· queued N` in
+`choco task list`) is waiting for an agent slot because the cap is reached.
+It is `open`. Don't `retry` it (refused: the task is not stuck), don't `send`
+to it (refused: the stage is not open-ended), and don't `cancel` it unless you
+want to drop it: cancelling removes its place in line. It starts when a turn
+ends. Read `choco server status` for the pool's running and queued counts; to
+let it start sooner, raise `max_agents` in `config.yaml` or the project's
+`--max-agents` (it applies within seconds, without a restart).
+
+**A malformed `max_agents`** (for example `max_agents: two`) shows up as:
+
+- a task whose turn was due to start parks `stuck`, with a reason that names
+  the `config.yaml` path;
+- `choco server status` prints `warning: queued turns cannot start: …` naming
+  the same file;
+- queued turns keep waiting; none is failed.
+
+Fix the file (`max_agents: 2`, or delete the line). The queue drains within
+seconds; then `choco task retry <id>` each task that parked `stuck`.
 
 ## `stuck`: retry
 

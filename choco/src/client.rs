@@ -434,12 +434,17 @@ impl Client {
         &self,
         name: &str,
         repo_path: Option<&str>,
+        max_agents: Option<u32>,
     ) -> Result<Project, ClientError> {
         let resp = self
             .send(
                 self.http
                     .post(format!("{}/projects", self.base_url))
-                    .json(&json!({ "name": name, "repo_path": repo_path })),
+                    .json(&json!({
+                        "name": name,
+                        "repo_path": repo_path,
+                        "max_agents": max_agents,
+                    })),
             )
             .await?;
         let resp = self.check_status(resp).await?;
@@ -460,6 +465,7 @@ impl Client {
         id: &str,
         name: Option<&str>,
         repo_path: Option<Option<&str>>,
+        max_agents: Option<u32>,
     ) -> reqwest::RequestBuilder {
         let mut body = serde_json::Map::new();
         if let Some(name) = name {
@@ -467,6 +473,10 @@ impl Client {
         }
         if let Some(repo_path) = repo_path {
             body.insert("repo_path".to_string(), json!(repo_path));
+        }
+        // `0` removes the project's own cap; absent leaves it alone.
+        if let Some(max_agents) = max_agents {
+            body.insert("max_agents".to_string(), json!(max_agents));
         }
         self.http
             .patch(format!("{}/projects/{id}", self.base_url))
@@ -478,9 +488,10 @@ impl Client {
         id: &str,
         name: Option<&str>,
         repo_path: Option<Option<&str>>,
+        max_agents: Option<u32>,
     ) -> Result<Project, ClientError> {
         let resp = self
-            .send(self.update_project_request(id, name, repo_path))
+            .send(self.update_project_request(id, name, repo_path, max_agents))
             .await?;
         let resp = self.check_status(resp).await?;
         self.decode(resp).await
@@ -801,7 +812,7 @@ mod tests {
 
     #[test]
     fn update_project_request_omits_repo_path_when_not_given() {
-        let body = body_of(client().update_project_request("p1", Some("renamed"), None));
+        let body = body_of(client().update_project_request("p1", Some("renamed"), None, None));
         assert_eq!(body["name"], "renamed");
         assert!(
             body.get("repo_path").is_none(),
@@ -811,14 +822,22 @@ mod tests {
 
     #[test]
     fn update_project_request_sends_null_to_clear_repo_path() {
-        let body = body_of(client().update_project_request("p1", None, Some(None)));
+        let body = body_of(client().update_project_request("p1", None, Some(None), None));
         assert!(body.get("name").is_none());
         assert!(body["repo_path"].is_null());
     }
 
     #[test]
+    fn update_project_request_sends_max_agents_only_when_given() {
+        let body = body_of(client().update_project_request("p1", None, None, Some(0)));
+        assert_eq!(body, json!({ "max_agents": 0 }));
+        let body = body_of(client().update_project_request("p1", Some("n"), None, None));
+        assert!(body.get("max_agents").is_none(), "{body}");
+    }
+
+    #[test]
     fn update_project_request_sends_the_new_repo_path() {
-        let body = body_of(client().update_project_request("p1", None, Some(Some("/repo"))));
+        let body = body_of(client().update_project_request("p1", None, Some(Some("/repo")), None));
         assert_eq!(body["repo_path"], "/repo");
     }
 

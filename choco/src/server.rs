@@ -297,8 +297,17 @@ pub(crate) async fn stop_daemon(root: &Path, info: LockInfo, force: bool) -> Res
                      (`choco task status <id>`), or pass --force: they are marked stuck, and\n\
                      `choco task retry <id>` continues them (an agent turn resumes its session).",
                 );
+                if let Some(note) = render::queued_restart_note(server.queued.len()) {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
                 println!("{text}");
                 return Ok(EXIT_NOT_RUNNING_OR_REFUSED);
+            }
+            // Proceeding: queued turns hold no process, so they are not
+            // stopped; say where they will be.
+            if let Some(note) = render::queued_restart_note(server.queued.len()) {
+                println!("{note}");
             }
         }
         Err(e) if !force => {

@@ -298,6 +298,7 @@ pub async fn list_summaries(
                 }),
                 _ => None,
             },
+            queued: Vec::new(),
         })
         .collect())
 }
@@ -364,8 +365,13 @@ pub async fn mark_cancelled(
     pool: &SqlitePool,
     id: &str,
     kept_work: bool,
-) -> Result<Option<Task>, sqlx::Error> {
+) -> Result<Option<(Task, Vec<(String, Option<String>)>)>, sqlx::Error> {
+    // One transaction: the status flips and the task's queued turns go
+    // together, so no queued turn of a cancelled task can outlive the cancel.
+    // Its first statement is a write, so the deferred BEGIN takes the write
+    // lock at once.
     let now = Utc::now();
+    let mut tx = pool.begin().await?;
     let row = sqlx::query_as::<_, TaskRow>(concat!(
         "UPDATE tasks SET status = 'cancelled', kept_work = ?, stuck_reason = NULL, \
          updated_at = ? WHERE id = ? RETURNING ",
@@ -374,9 +380,18 @@ pub async fn mark_cancelled(
     .bind(kept_work)
     .bind(now)
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.map(Into::into))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let withdrawn: Vec<(String, Option<String>)> =
+        sqlx::query_as("DELETE FROM turn_queue WHERE task_id = ? RETURNING stage, group_stage")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(Some((row.into(), withdrawn)))
 }
 
 /// Marks `id` `stuck` with `reason`, but only if it is currently `open`.
@@ -515,10 +530,18 @@ pub async fn set_worktree(
 }
 
 pub async fn delete(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    // The queue rows reference the task, so they go first, in the same
+    // transaction.
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM turn_queue WHERE task_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     let result = sqlx::query("DELETE FROM tasks WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 

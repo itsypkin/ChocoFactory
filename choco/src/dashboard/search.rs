@@ -51,6 +51,7 @@ mod tests {
 
     fn t(id: &str, title: &str, pr: Option<u64>, created_min: u32) -> TaskSummary {
         TaskSummary {
+            queued: Vec::new(),
             task: Task {
                 id: id.to_string(),
                 project_id: "p".to_string(),

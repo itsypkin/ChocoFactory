@@ -1,10 +1,25 @@
-use super::parallel::{BranchApplied, BranchOutcome, BranchWatch, agent_role_of, ran_beside};
+use super::parallel::{
+    BranchApplied, BranchEntry, BranchOutcome, BranchWatch, agent_role_of, ran_beside,
+};
 use super::stage_capture::{
     MAX_CAPTURE_BYTES, capture_label, derive_agent_reply_capture, outcome_from_report,
     turn_outcome, unwrap_code_fence,
 };
 use super::sweep::agent_reason;
+use super::turns::{Claim, TurnPermit, TurnSpec};
 use super::*;
+
+/// How a single-shot turn ended, as the watcher's poll loop saw it.
+enum TurnEnd {
+    /// The session went idle: the turn is complete.
+    Completed,
+    /// The turn did not complete; the task is parked with this reason.
+    Incomplete(String),
+    /// An operator cancelled the run; nothing to advance or park.
+    Cancelled,
+    /// The session row vanished (the task was deleted).
+    SessionGone,
+}
 
 /// How often the `agent_turn` completion watcher polls a `session`'s
 /// status. Not configurable (yet) — this is an internal implementation
@@ -134,11 +149,71 @@ impl ResumeSession {
     }
 }
 
+/// An agent turn that has passed every check that can fail before anything
+/// is written: the prompt is rendered, the role and the global config are
+/// resolved and the adapter is found and has accepted the role. Nothing
+/// exists yet — no queue row, session or process.
+pub(super) struct PreparedTurn<'a> {
+    pub(super) task_id: &'a str,
+    definition: &'a Arc<WorkflowDefinition>,
+    pub(super) stage_name: &'a str,
+    role: &'a str,
+    read_only: bool,
+    capture: Option<Capture>,
+    /// The prompt came from the stage's `prompt_file`, not from a person.
+    prompt_from_file: bool,
+    prompt: String,
+    resolved: role_config::ResolvedRoleConfig,
+    adapter_name: String,
+    pub(super) resume: Option<&'a ResumeSession>,
+    pub(super) branch: Option<BranchEntry<'a>>,
+    pub(super) session_kind: SessionKind,
+}
+
 impl WorkflowEngine {
+    /// Starts an agent turn, or — when its pool is full — queues it.
+    ///
+    /// `prepare_turn` first (everything that can fail before anything is
+    /// written; its errors return to the caller), then, for a single-shot
+    /// turn only, [`TurnGate::claim`] decides between starting and queueing,
+    /// and `launch_turn` creates the session and the process. A standing
+    /// (chat) turn skips the gate and launches with no permit.
     pub(super) async fn enter_agent_turn(
         self: &Arc<Self>,
         entry: &StageEntry<'_>,
     ) -> Result<(), EngineError> {
+        let prepared = self.prepare_turn(entry).await?;
+        let permit = if prepared.session_kind == SessionKind::SingleShot {
+            let spec = TurnSpec {
+                stage: prepared.stage_name,
+                group: prepared.branch.map(|b| (b.group, b.entry)),
+                resume_session_id: prepared.resume.map(|r| r.previous_session_id.as_str()),
+            };
+            match self.turn_gate.claim(prepared.task_id, &spec).await? {
+                Claim::Start(permit) => Some(permit),
+                Claim::Queued(at) => {
+                    tracing::info!(
+                        task_id = prepared.task_id,
+                        stage = prepared.stage_name,
+                        position = at.position,
+                        "agent turn queued: its pool is full"
+                    );
+                    self.events_notify.notify_waiters();
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        self.launch_turn(prepared, permit, None).await.map(|_| ())
+    }
+
+    /// Everything that can fail before anything is written (the first half of
+    /// the old `enter_agent_turn`, moved unchanged).
+    pub(super) async fn prepare_turn<'a>(
+        self: &Arc<Self>,
+        entry: &StageEntry<'a>,
+    ) -> Result<PreparedTurn<'a>, EngineError> {
         let StageEntry {
             task_id,
             definition,
@@ -287,11 +362,69 @@ impl WorkflowEngine {
             .validate_role(role, &resolved.role_config.isolation)
             .map_err(EngineError::RoleRejected)?;
         let adapter_name = adapter.name();
+        // A stage with an empty `on:` map (chat, §5.4) never concludes — it
+        // just keeps accepting further live messages into the same session
+        // indefinitely. Everything else is single-shot: it completes once the
+        // agent reports and its turn ends (#90), which is what the watcher
+        // waits for — computed once here, so the claim and the launch can't
+        // diverge.
+        //
+        // A branch is always single-shot, though its `on:` is empty: the
+        // group waits on its watcher.
+        let session_kind = if branch.is_none() && stage_def.on.is_empty() {
+            SessionKind::Standing
+        } else {
+            SessionKind::SingleShot
+        };
+        Ok(PreparedTurn {
+            task_id,
+            definition,
+            stage_name,
+            role,
+            read_only: role_def.read_only,
+            capture,
+            prompt_from_file: prompt_file.is_some(),
+            prompt,
+            resolved,
+            adapter_name: adapter_name.to_string(),
+            resume,
+            branch,
+            session_kind,
+        })
+    }
+
+    /// Creates the session and the process for a prepared turn that holds a
+    /// slot (the second half of the old `enter_agent_turn`). `from_queue` is
+    /// the queue row being replaced: its deletion and the session insert are
+    /// one transaction. The permit is owned here until the watcher takes it;
+    /// any error returns and drops it. Returns the new session's id.
+    pub(super) async fn launch_turn(
+        self: &Arc<Self>,
+        prepared: PreparedTurn<'_>,
+        permit: Option<TurnPermit>,
+        from_queue: Option<i64>,
+    ) -> Result<String, EngineError> {
+        let PreparedTurn {
+            task_id,
+            definition,
+            stage_name,
+            role,
+            read_only,
+            capture,
+            prompt_from_file,
+            prompt,
+            resolved,
+            adapter_name,
+            resume,
+            branch,
+            session_kind,
+        } = prepared;
+        let adapter_name = adapter_name.as_str();
 
         // #172: a read-only role's baseline is taken (or, for a resumed turn,
         // looked up) before any session row exists, so a failure here leaves
         // nothing behind and the agent is never started.
-        let baseline = if role_def.read_only {
+        let baseline = if read_only {
             Some(
                 self.read_only_baseline(
                     stage_name,
@@ -316,19 +449,21 @@ impl WorkflowEngine {
         // stays one row per attempt, and `resumed_from` is what records
         // that this attempt continued the previous one's conversation
         // rather than starting another.
-        let session = match resume {
-            Some(resume) => {
-                sessions::create_resumed(
-                    &self.pool,
-                    new_session,
-                    sessions::ResumedFrom {
-                        session_id: &resume.previous_session_id,
-                        adapter_session_id: &resume.adapter_session_id,
-                    },
-                )
-                .await?
-            }
-            None => sessions::create(&self.pool, new_session).await?,
+        let resumed_from = resume.map(|resume| sessions::ResumedFrom {
+            session_id: &resume.previous_session_id,
+            adapter_session_id: &resume.adapter_session_id,
+        });
+        let session = match (from_queue, resumed_from) {
+            (Some(row), from) => sessions::create_from_queue(&self.pool, row, new_session, from)
+                .await
+                .map_err(|err| match err {
+                    sessions::CreateFromQueueError::Vanished => {
+                        EngineError::QueueRowVanished(stage_name.to_string())
+                    }
+                    sessions::CreateFromQueueError::Db(err) => EngineError::Db(err),
+                })?,
+            (None, Some(from)) => sessions::create_resumed(&self.pool, new_session, from).await?,
+            (None, None) => sessions::create(&self.pool, new_session).await?,
         };
 
         // Written before the agent is spawned, so it always precedes anything
@@ -402,7 +537,7 @@ impl WorkflowEngine {
         // conversation the way a chat task's initial message does.
         // Best-effort: a transient DB failure here shouldn't block
         // starting the turn.
-        if prompt_file.is_none()
+        if !prompt_from_file
             && resume.is_none()
             && let Err(err) = events::append(
                 &self.pool,
@@ -414,21 +549,6 @@ impl WorkflowEngine {
         {
             tracing::error!(session_id = %session.id, %err, "failed to record human message event");
         }
-
-        // A stage with an empty `on:` map (chat, §5.4) never concludes — it
-        // just keeps accepting further live messages into the same session
-        // indefinitely. Everything else is single-shot: it completes once the
-        // agent reports and its turn ends (#90), which is what the watcher
-        // below waits for — computed once here rather than at each site
-        // separately, so the two decisions can't diverge.
-        //
-        // A branch is always single-shot, though its `on:` is empty: the
-        // group waits on its watcher.
-        let session_kind = if branch.is_none() && stage_def.on.is_empty() {
-            SessionKind::Standing
-        } else {
-            SessionKind::SingleShot
-        };
 
         let started = match resume {
             Some(resume) => {
@@ -494,19 +614,24 @@ impl WorkflowEngine {
         // This is also why the loader rejects `capture:` on such a stage:
         // with no watcher there is no moment at which it could be taken.
         if session_kind == SessionKind::SingleShot {
-            self.spawn_turn_watcher(
+            let watcher = self.spawn_turn_watcher(
                 task_id.to_string(),
                 Arc::clone(definition),
                 stage_name.to_string(),
                 capture,
-                session.id,
+                session.id.clone(),
                 branch.map(|b| BranchWatch {
                     group: b.group.to_string(),
                     entry: b.entry,
                 }),
+                permit,
             );
+            #[cfg(test)]
+            self.watchers.lock().unwrap().push(watcher.abort_handle());
+            #[cfg(not(test))]
+            drop(watcher);
         }
-        Ok(())
+        Ok(session.id)
     }
 
     /// The `worktree_baseline` payload for a read-only role's turn (#172):
@@ -880,6 +1005,7 @@ impl WorkflowEngine {
     /// A crashed/non-zero exit is logged and left for a human to notice
     /// rather than guessing an outcome the stage's `on:` map was never
     /// designed to receive.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_turn_watcher(
         self: &Arc<Self>,
         task_id: String,
@@ -888,10 +1014,16 @@ impl WorkflowEngine {
         capture: Option<Capture>,
         session_id: String,
         branch: Option<BranchWatch>,
-    ) {
+        permit: Option<TurnPermit>,
+    ) -> JoinHandle<()> {
         let engine = Arc::clone(self);
         tokio::spawn(async move {
-            loop {
+            // The slot this turn holds. It lives exactly as long as the
+            // turn's process can: the loop below ends only once the session
+            // row says the process is gone. If this task is aborted or
+            // panics, the future is dropped and the permit with it.
+            let permit = permit;
+            let end = loop {
                 match sessions::get(&engine.pool, &session_id).await {
                     // `Idle` is also what the idle reaper leaves behind
                     // when it force-closes a stalled turn's stdin
@@ -915,7 +1047,7 @@ impl WorkflowEngine {
                             session_id,
                             "session was cancelled; not auto-advancing"
                         );
-                        return;
+                        break TurnEnd::Cancelled;
                     }
                     // Either status: a reaper-closed turn that exited cleanly
                     // is `Idle`, one whose process then had to be killed is
@@ -926,21 +1058,11 @@ impl WorkflowEngine {
                             session_id,
                             "session was force-closed by the idle reaper before completing its turn; not auto-advancing"
                         );
-                        engine
-                            .park_incomplete_turn(
-                                &task_id,
-                                &definition,
-                                &stage_name,
-                                &session_id,
-                                &format!(
-                                    "stage '{stage_name}': the agent turn was force-closed by \
-                                     the idle reaper before completing; 'choco task retry' will \
-                                     resume it"
-                                ),
-                                branch.as_ref(),
-                            )
-                            .await;
-                        return;
+                        break TurnEnd::Incomplete(format!(
+                            "stage '{stage_name}': the agent turn was force-closed by \
+                             the idle reaper before completing; 'choco task retry' will \
+                             resume it"
+                        ));
                     }
                     // #92: the turn was cut off from outside, not by
                     // anything the agent did. Parked like any other
@@ -954,21 +1076,11 @@ impl WorkflowEngine {
                             session_id,
                             "session was interrupted by a usage limit; not auto-advancing"
                         );
-                        engine
-                            .park_incomplete_turn(
-                                &task_id,
-                                &definition,
-                                &stage_name,
-                                &session_id,
-                                &format!(
-                                    "stage '{stage_name}': the agent's turn was interrupted by a \
-                                     usage limit before it could report; 'choco task retry' will \
-                                     resume it"
-                                ),
-                                branch.as_ref(),
-                            )
-                            .await;
-                        return;
+                        break TurnEnd::Incomplete(format!(
+                            "stage '{stage_name}': the agent's turn was interrupted by a \
+                             usage limit before it could report; 'choco task retry' will \
+                             resume it"
+                        ));
                     }
                     // #84: the daemon stopped under this turn (graceful
                     // shutdown records it itself; the startup park sweep
@@ -979,19 +1091,9 @@ impl WorkflowEngine {
                             session_id,
                             "the daemon stopped during this turn; not auto-advancing"
                         );
-                        engine
-                            .park_incomplete_turn(
-                                &task_id,
-                                &definition,
-                                &stage_name,
-                                &session_id,
-                                &agent_reason(&stage_name),
-                                branch.as_ref(),
-                            )
-                            .await;
-                        return;
+                        break TurnEnd::Incomplete(agent_reason(&stage_name));
                     }
-                    Ok(Some(run)) if run.status == SessionStatus::Idle => break,
+                    Ok(Some(run)) if run.status == SessionStatus::Idle => break TurnEnd::Completed,
                     // #90: the two ways `drain_session` ends a single-shot
                     // turn it could not treat as complete. Each gets its own
                     // reason, since "exited without completing" would send a
@@ -1005,20 +1107,10 @@ impl WorkflowEngine {
                             session_id,
                             "session ended without reporting its outcome; not auto-advancing"
                         );
-                        engine
-                            .park_incomplete_turn(
-                                &task_id,
-                                &definition,
-                                &stage_name,
-                                &session_id,
-                                &format!(
-                                    "stage '{stage_name}': the agent's turn ended without \
-                                     calling report_outcome"
-                                ),
-                                branch.as_ref(),
-                            )
-                            .await;
-                        return;
+                        break TurnEnd::Incomplete(format!(
+                            "stage '{stage_name}': the agent's turn ended without \
+                             calling report_outcome"
+                        ));
                     }
                     Ok(Some(run))
                         if run.status == SessionStatus::Exited
@@ -1029,21 +1121,11 @@ impl WorkflowEngine {
                             session_id,
                             "session's process kept running after its turn ended and was killed; not auto-advancing"
                         );
-                        engine
-                            .park_incomplete_turn(
-                                &task_id,
-                                &definition,
-                                &stage_name,
-                                &session_id,
-                                &format!(
-                                    "stage '{stage_name}': the agent process kept running after \
-                                     its turn ended and was killed; work it started may be \
-                                     incomplete"
-                                ),
-                                branch.as_ref(),
-                            )
-                            .await;
-                        return;
+                        break TurnEnd::Incomplete(format!(
+                            "stage '{stage_name}': the agent process kept running after \
+                             its turn ended and was killed; work it started may be \
+                             incomplete"
+                        ));
                     }
                     Ok(Some(run)) if run.status == SessionStatus::Exited => {
                         tracing::warn!(
@@ -1051,20 +1133,10 @@ impl WorkflowEngine {
                             session_id,
                             "session exited without completing its turn cleanly; not auto-advancing"
                         );
-                        engine
-                            .park_incomplete_turn(
-                                &task_id,
-                                &definition,
-                                &stage_name,
-                                &session_id,
-                                &format!(
-                                    "stage '{stage_name}': the agent process exited without \
-                                     completing its turn"
-                                ),
-                                branch.as_ref(),
-                            )
-                            .await;
-                        return;
+                        break TurnEnd::Incomplete(format!(
+                            "stage '{stage_name}': the agent process exited without \
+                             completing its turn"
+                        ));
                     }
                     Ok(Some(_)) => {}
                     // The session row is gone, which means the task itself was
@@ -1075,41 +1147,67 @@ impl WorkflowEngine {
                             session_id,
                             "session disappeared while watching for turn completion; not auto-advancing"
                         );
-                        return;
+                        break TurnEnd::SessionGone;
                     }
                     Err(err) => {
                         tracing::error!(
                             task_id, session_id, %err,
                             "failed to poll session while watching for turn completion; not auto-advancing"
                         );
-                        engine
-                            .park_incomplete_turn(
-                                &task_id,
-                                &definition,
-                                &stage_name,
-                                &session_id,
-                                &format!(
-                                    "stage '{stage_name}': lost track of the agent turn: {err}"
-                                ),
-                                branch.as_ref(),
-                            )
-                            .await;
-                        return;
+                        break TurnEnd::Incomplete(format!(
+                            "stage '{stage_name}': lost track of the agent turn: {err}"
+                        ));
                     }
                 }
                 tokio::time::sleep(TURN_WATCH_INTERVAL).await;
+            };
+            // The turn's process is gone (or its row is unreadable): the slot
+            // frees *before* the result is handled, so the same task's next
+            // turn never waits for this one's permit, and a slow read-only
+            // check does not hold a slot. Every way a turn ends passes here.
+            drop(permit);
+            match end {
+                TurnEnd::Completed => {
+                    engine
+                        .finish_turn(
+                            &task_id,
+                            &definition,
+                            &stage_name,
+                            capture,
+                            &session_id,
+                            branch.as_ref(),
+                        )
+                        .await;
+                }
+                TurnEnd::Incomplete(reason) => {
+                    engine
+                        .park_incomplete_turn(
+                            &task_id,
+                            &definition,
+                            &stage_name,
+                            &session_id,
+                            &reason,
+                            branch.as_ref(),
+                        )
+                        .await;
+                }
+                TurnEnd::Cancelled | TurnEnd::SessionGone => {}
             }
-            engine
-                .finish_turn(
-                    &task_id,
-                    &definition,
-                    &stage_name,
-                    capture,
-                    &session_id,
-                    branch.as_ref(),
-                )
-                .await;
-        });
+            // The one point every end reaches, after the result is handled.
+            engine.after_turn_end(&task_id, &session_id);
+        })
+    }
+
+    /// Reached by every end of a single-shot turn, after its result has been
+    /// handled and its slot freed. The place a later feature hooks in to act
+    /// when a task's last running turn is over.
+    fn after_turn_end(&self, task_id: &str, session_id: &str) {
+        tracing::debug!(
+            task_id,
+            session_id,
+            running_for_task = self.turn_gate.running_for_task(task_id),
+            "agent turn ended"
+        );
     }
 
     /// Applies a completed turn's capture and outcome. Runs detached, like

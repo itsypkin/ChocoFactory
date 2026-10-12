@@ -74,6 +74,7 @@ pub async fn get(State(state): State<AppState>) -> Result<Json<ServerStatus>, Ap
     let info = &state.server;
     let tasks = tasks::count_by_status(&state.pool).await?;
     let in_flight = state.engine.in_flight().await?;
+    let queue = state.engine.queue_snapshot().await?;
     Ok(Json(ServerStatus {
         version: chocofactory_core::version::VERSION.to_string(),
         commit: chocofactory_core::version::BUILD_COMMIT.map(str::to_string),
@@ -91,6 +92,9 @@ pub async fn get(State(state): State<AppState>) -> Result<Json<ServerStatus>, Ap
         choco_binary_found: Path::new(&info.choco_binary).is_file(),
         tasks,
         in_flight,
+        agent_pools: queue.pools,
+        queued: queue.turns,
+        queue_error: queue.queue_error,
     }))
 }
 
@@ -165,6 +169,35 @@ stages:
             bare.get("/server").await.json()["choco_binary_found"],
             false
         );
+    }
+
+    #[tokio::test]
+    async fn get_server_lists_the_server_pool_with_no_queue_by_default() {
+        let server = TestServer::start().await;
+        let body = server.get("/server").await.json();
+        assert_eq!(body["agent_pools"][0]["pool"], "server");
+        assert_eq!(body["agent_pools"][0]["name"], "server");
+        assert!(body["agent_pools"][0]["limit"].is_null());
+        assert_eq!(body["agent_pools"][0]["running"], 0);
+        assert_eq!(body["agent_pools"][0]["queued"], 0);
+        assert_eq!(body["queued"], json!([]));
+        assert!(body["queue_error"].is_null());
+        let _: ServerStatus = serde_json::from_value(body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_server_lists_a_capped_project_as_its_own_pool() {
+        let server = TestServer::start().await;
+        let project = server
+            .post("/projects", json!({ "name": "acme", "max_agents": 2 }))
+            .await;
+        let id = project.json()["id"].as_str().unwrap().to_string();
+        let body = server.get("/server").await.json();
+        let pools = body["agent_pools"].as_array().unwrap();
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[1]["pool"], format!("project:{id}"));
+        assert_eq!(pools[1]["name"], "acme");
+        assert_eq!(pools[1]["limit"], 2);
     }
 
     const GROUP_WORKFLOW: &str = r#"

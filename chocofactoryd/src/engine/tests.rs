@@ -6,6 +6,7 @@ use serde_json::json;
 use super::*;
 
 mod parallel;
+mod queue;
 
 #[test]
 fn set_arrival_replaces_a_non_object_payload() {
@@ -1773,6 +1774,7 @@ async fn a_turn_reaped_by_the_idle_timeout_does_not_auto_advance() {
         None,
         session.id.clone(),
         None,
+        None,
     );
 
     // Also marks the task stuck (X-4, issue #61; review round 2): the
@@ -2511,6 +2513,7 @@ fn resolve_task_workflow_only_accepts_a_safe_allowlisted_name() {
         name: "demo".to_string(),
         repo_path: Some(repo.display().to_string()),
         created_at: chrono::Utc::now(),
+        max_agents: None,
     };
 
     assert!(resolve_task_workflow(&workflows_dir, &project, "chat").is_ok());
@@ -6908,10 +6911,11 @@ async fn cancel_with_keep_leaves_worktree_and_branch_and_sets_the_flag() {
 async fn mark_cancelled_sets_status_and_flag_in_one_write() {
     let pool = connect_in_memory().await.unwrap();
     let task_id = seed_task(&pool, "wf").await;
-    let task = tasks::mark_cancelled(&pool, &task_id, true)
+    let (task, withdrawn) = tasks::mark_cancelled(&pool, &task_id, true)
         .await
         .unwrap()
         .unwrap();
+    assert!(withdrawn.is_empty());
     assert_eq!(task.status, "cancelled");
     assert!(
         task.kept_work,
@@ -10613,6 +10617,7 @@ async fn retry_resumes_the_session_a_usage_limit_interrupted() {
             fresh_reason: None,
             rewatched: false,
             branches: Vec::new(),
+            queued: None,
         }
     );
     wait_until_task_status(&pool, &task_id, "closed").await;
@@ -15760,6 +15765,7 @@ async fn retry_at_a_gate_after_a_watcher_timeout_watches_again() {
                 fresh_reason: None,
                 rewatched: true,
                 branches: Vec::new(),
+                queued: None,
             }
         );
         wait_for_poll_attempt(&pool, &task_id).await;

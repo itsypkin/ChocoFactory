@@ -6,6 +6,7 @@
 - Watching commits in a revise lap
 - Stage times
 - Reading a parallel group
+- A turn waiting for an agent slot
 - The workflow-file line
 
 ## Waiting with `--until`
@@ -118,7 +119,7 @@ Branches
   tests                ?           failed   aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbb…  3m    no data
 ```
 
-- `state` is `running`, `done` or `failed`, as stored.
+- `state` is `running`, `queued` (waiting for an agent slot), `done` or `failed`.
 - `result or reason` is the result of a `done` branch and the reason of a
   `failed` one, cut to 60 characters; the full text is in the JSON.
 - `time` is `ended − started` for a finished branch. For a `running` branch
@@ -132,9 +133,40 @@ Branches
 
 `choco --json task status <id> | jq '.workflow_state.branches'` lists the same
 rows with `name`, `kind`, `state`, `result`, `reason`, `entry`, `started_at`
-and `ended_at`; it is `[]` when no group is current. In the dashboard the
+and `ended_at` (plus `queued_position` for a `queued` branch); it is `[]` when no
+group is current. A branch waiting for an agent slot has state `queued`. In the dashboard the
 stage cell reads `<group> settled/total` (a branch is settled once it is not
 `running`), and `choco task events` has one line per branch start and finish.
+
+## A turn waiting for an agent slot
+
+With an agent cap set (`max_agents` in `config.yaml`, or a project's
+`--max-agents`), a turn due to start while its pool is full waits in a queue,
+first in first out within the pool. It is `open`, not stuck, and has no
+session and no process, so none of its timers run; they start when the turn
+starts. Where to read it:
+
+- `choco task status <id>` has a line under `Stage`:
+  `Queued  internal_review, 2nd in line for the server's 2 agent slots (both busy), since 14:02 UTC`.
+  In a parallel group a waiting branch reads `queued (2nd)` in the `Branches`
+  table, with `-` as its time.
+- `choco task list` adds `· queued 2` to the status cell.
+- `choco server status` has an `agent slots` line, for example
+  `server 2/2 running, 3 queued; project acme 1/1 running, 0 queued`, and one
+  `queued` line per waiting turn with its place in line. The server pool's
+  limit is always printed (`no limit` when unset): after editing
+  `config.yaml`, check it, because a mistyped key means no limit.
+- The dashboard shows `<stage> · queued 2` (or `<group> 1/3 · 1 queued`) in
+  the stage cell and `agents 2/2 · 3 queued` in the header.
+- `choco task events` has `turn_queued`, `turn_dequeued` (with the time it
+  waited) and `turn_withdrawn` lines.
+- `choco --json task status <id> | jq '.queued'` and `choco --json server
+  status | jq '.daemon.agent_pools'` give the same as JSON.
+
+A waiting turn is not in flight: it never blocks `choco update` or `choco
+server stop|restart`, and after a restart it is still queued, in order. A
+project with its own cap is its own pool: its turns neither use nor wait for
+the server's slots, and a full project pool never holds up another project.
 
 ## The workflow-file line
 

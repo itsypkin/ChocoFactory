@@ -213,6 +213,7 @@ impl From<RetryTaskError> for ApiError {
             // state right now", the same conflict shape `CancelTaskError`
             // uses for its own state-mismatch cases.
             RetryTaskError::NotStuck(_)
+            | RetryTaskError::Queued { .. }
             | RetryTaskError::NoWorkflowState
             | RetryTaskError::UnknownStage(_)
             | RetryTaskError::RunStillActive(_)

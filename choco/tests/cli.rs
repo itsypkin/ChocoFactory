@@ -381,6 +381,65 @@ async fn project_create_and_list_round_trip() {
     );
 }
 
+/// `--max-agents` end to end: set on create and update, shown by `project
+/// list`, removed by `0`.
+#[tokio::test]
+async fn project_max_agents_is_set_listed_and_removed() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+
+    let created = run_choco_json(
+        &daemon.base_url,
+        &["project", "create", "capped", "--max-agents", "2"],
+    )
+    .await;
+    assert_eq!(created.code, Some(0), "stderr: {}", created.stderr);
+    assert_eq!(created.json()["max_agents"], 2);
+    run_choco(&daemon.base_url, &["project", "create", "plain"]).await;
+
+    let listed = run_choco(&daemon.base_url, &["project", "list"]).await;
+    let header = listed.stdout.lines().next().unwrap();
+    assert!(header.contains("MAX AGENTS"), "{}", listed.stdout);
+    let capped_row = listed
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("capped"))
+        .unwrap();
+    assert!(
+        capped_row.split_whitespace().any(|c| c == "2"),
+        "{capped_row}"
+    );
+
+    let raised = run_choco_json(
+        &daemon.base_url,
+        &["project", "update", "capped", "--max-agents", "5"],
+    )
+    .await;
+    assert_eq!(raised.code, Some(0), "stderr: {}", raised.stderr);
+    assert_eq!(raised.json()["max_agents"], 5);
+    let removed = run_choco_json(
+        &daemon.base_url,
+        &["project", "update", "capped", "--max-agents", "0"],
+    )
+    .await;
+    assert!(removed.json()["max_agents"].is_null(), "{}", removed.stdout);
+
+    // A cap that is not a number is refused before any request.
+    let bad = run_choco(
+        &daemon.base_url,
+        &["project", "update", "capped", "--max-agents", "two"],
+    )
+    .await;
+    assert_ne!(bad.code, Some(0));
+    // Nothing to change is still an error.
+    let nothing = run_choco(&daemon.base_url, &["project", "update", "capped"]).await;
+    assert_eq!(nothing.code, Some(1));
+    assert!(
+        nothing.stderr.contains("--max-agents"),
+        "{}",
+        nothing.stderr
+    );
+}
+
 /// Proves the `--workflow` correction (design §6.2 vs. §2.2): a custom,
 /// non-builtin workflow name is accepted and started, not rejected by a
 /// `chat|coding_task` enum.

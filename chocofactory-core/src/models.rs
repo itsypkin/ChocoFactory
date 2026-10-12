@@ -21,6 +21,11 @@ pub struct Project {
     pub name: String,
     pub repo_path: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// The project's own cap on agent turns running at once. `None`: the
+    /// project shares the server's cap. A project with a cap is its own
+    /// pool.
+    #[serde(default)]
+    pub max_agents: Option<u32>,
 }
 
 /// One unit of work, driven by a workflow definition (design §3, §5).
@@ -285,6 +290,68 @@ pub struct ServerStatus {
     pub choco_binary_found: bool,
     pub tasks: std::collections::BTreeMap<String, i64>,
     pub in_flight: Vec<InFlight>,
+    /// Every pool of agent turns: the server pool first, then one per
+    /// project with its own cap.
+    #[serde(default)]
+    pub agent_pools: Vec<AgentPool>,
+    /// Every queued turn that is waiting, with its task and place in line.
+    #[serde(default)]
+    pub queued: Vec<ServerQueuedTurn>,
+    /// Why the dispatcher cannot start queued turns right now (a
+    /// `config.yaml` that cannot be read); `None` when it can.
+    #[serde(default)]
+    pub queue_error: Option<String>,
+}
+
+/// One pool of agent turns that share a limit, as `GET /server` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPool {
+    /// `"server"` or `"project:<id>"`.
+    pub pool: String,
+    /// `"server"` or the project's name.
+    pub name: String,
+    /// `None`: no limit.
+    pub limit: Option<u32>,
+    pub running: u32,
+    pub queued: u32,
+}
+
+/// A turn waiting for a slot: where it is and what it waits for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedTurn {
+    /// The agent stage, or the branch of a parallel group.
+    pub stage: String,
+    /// The parallel group, for a branch.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// 1-based place among the admissible turns of its pool.
+    pub position: u32,
+    /// The pool, as in [`AgentPool::pool`].
+    pub pool: String,
+    /// The pool's display name, as in [`AgentPool::name`].
+    #[serde(default)]
+    pub pool_name: String,
+    /// The pool's limit when this was read; `None`: no limit.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// How many turns the pool was running when this was read.
+    #[serde(default)]
+    pub running: u32,
+    /// Why `limit` is `None` while the turn waits: `"stopping"` (the daemon
+    /// is stopping), or `"config: <error>"` (`config.yaml` cannot be read).
+    /// `None` with no limit means the pool really has no limit now.
+    #[serde(default)]
+    pub unlimited_because: Option<String>,
+    pub queued_at: DateTime<Utc>,
+}
+
+/// One entry of `GET /server`'s queue list: a [`QueuedTurn`] and its task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerQueuedTurn {
+    pub task_id: String,
+    pub title: String,
+    #[serde(flatten)]
+    pub turn: QueuedTurn,
 }
 
 /// What `choco task retry` should do with the agent session a stuck stage
@@ -333,6 +400,10 @@ pub struct RetryOutcome {
     /// declaration order. Empty for any other retry.
     #[serde(default)]
     pub branches: Vec<RetriedBranch>,
+    /// The place in line, when the re-entered stage was queued for a slot
+    /// instead of starting.
+    #[serde(default)]
+    pub queued: Option<u32>,
 }
 
 /// One re-run branch of a parallel group's retry.
@@ -346,6 +417,9 @@ pub struct RetriedBranch {
     pub adapter_session_id: Option<String>,
     /// Why it started fresh instead of resuming, when it did.
     pub fresh_reason: Option<String>,
+    /// The place in line, when the branch was queued for a slot.
+    #[serde(default)]
+    pub queued: Option<u32>,
 }
 
 /// One row per underlying agent subprocess session a task has had (§3).
@@ -532,6 +606,19 @@ pub enum EventType {
     /// `"result"` when `state` is `"done"` (the outcome the branch reported)
     /// or `"reason"` when it is `"failed"` (the failure text); never both.
     BranchFinished,
+    /// An agent turn was due to start but its pool was full, so it was put
+    /// on the queue. Task-scoped. Payload is `{"stage", "group", "entry",
+    /// "pool", "limit", "running", "position"}`; `group`/`entry` are null for
+    /// a top-level stage.
+    TurnQueued,
+    /// A queued turn got a slot and started. Task-scoped. Payload is
+    /// `{"stage", "group", "entry", "waited_ms", "session_id"}`.
+    TurnDequeued,
+    /// A queued turn was dropped without starting because it could never
+    /// start (its task was cancelled, closed, stuck or moved on, the turn no
+    /// longer passed validation, or a retry replaced it). Task-scoped.
+    /// Payload is `{"stage", "group", "reason"}`.
+    TurnWithdrawn,
 }
 
 impl fmt::Display for EventType {
@@ -556,6 +643,9 @@ impl fmt::Display for EventType {
             EventType::WorktreeChanged => "worktree_changed",
             EventType::BranchStarted => "branch_started",
             EventType::BranchFinished => "branch_finished",
+            EventType::TurnQueued => "turn_queued",
+            EventType::TurnDequeued => "turn_dequeued",
+            EventType::TurnWithdrawn => "turn_withdrawn",
         })
     }
 }
@@ -595,6 +685,9 @@ impl FromStr for EventType {
             "worktree_changed" => Ok(EventType::WorktreeChanged),
             "branch_started" => Ok(EventType::BranchStarted),
             "branch_finished" => Ok(EventType::BranchFinished),
+            "turn_queued" => Ok(EventType::TurnQueued),
+            "turn_dequeued" => Ok(EventType::TurnDequeued),
+            "turn_withdrawn" => Ok(EventType::TurnWithdrawn),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -652,7 +745,7 @@ pub struct BranchStatus {
     /// workflow does not declare the branch (or could not be loaded).
     #[serde(default)]
     pub kind: Option<String>,
-    /// `running`, `done`, `failed`, or `unknown`; kept a string so a state a
+    /// `running`, `queued`, `done`, `failed`, or `unknown`; kept a string so a state a
     /// later version adds still decodes.
     pub state: String,
     #[serde(default)]
@@ -666,6 +759,9 @@ pub struct BranchStatus {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub ended_at: Option<DateTime<Utc>>,
+    /// The place in line, for a `queued` branch; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_position: Option<u32>,
 }
 
 /// How far the current parallel group has got, for the task list.
@@ -697,6 +793,9 @@ pub struct TaskSummary {
     /// when no group is current.
     #[serde(default)]
     pub branch_progress: Option<BranchProgress>,
+    /// The task's turns waiting for a slot; empty when none is.
+    #[serde(default)]
+    pub queued: Vec<QueuedTurn>,
 }
 
 /// A task's cost and token total as `GET /tasks` reports it.
@@ -804,6 +903,9 @@ mod tests {
             EventType::WorktreeChanged,
             EventType::BranchStarted,
             EventType::BranchFinished,
+            EventType::TurnQueued,
+            EventType::TurnDequeued,
+            EventType::TurnWithdrawn,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),

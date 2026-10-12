@@ -33,6 +33,8 @@ Steps, run in order:
 - `{"op": "init"}` — another `system/init` line, as the real CLI sends at the
   start of each follow-up turn.
 - `{"op": "sleep", "seconds": 0.5}` — pause without output.
+- `{"op": "wait_file", "path": p}` — pause without output until `p` exists, so
+  a test holds a turn (and the slot it occupies) for as long as it likes.
 - `{"op": "emit_forever", "text": "..."}` — ignore stdin and keep emitting
   assistant messages until killed.
 - `{"op": "run", "command": "..."}` — run `command` with `/bin/sh -c` in this
@@ -307,6 +309,17 @@ def main():
             emit({"type": "system", "subtype": "init", "session_id": session_id})
         elif op == "sleep":
             time.sleep(step["seconds"])
+        elif op == "wait_file":
+            # Gives up when the test is gone (its directory removed) so no
+            # process outlives it; a bound of two minutes backs that up.
+            give_up = time.monotonic() + 120
+            while not os.path.exists(step["path"]):
+                if (
+                    not os.path.isdir(os.path.dirname(step["path"]))
+                    or time.monotonic() > give_up
+                ):
+                    sys.exit(1)
+                time.sleep(0.02)
         elif op == "emit_forever":
             while True:
                 assistant_text(session_id, step["text"])

@@ -129,7 +129,7 @@ pub async fn list(
         }
     };
     let limit = query.limit.map(|l| l.clamp(1, MAX_LIST_LIMIT) as i64);
-    let rows = tasks::list_summaries(
+    let mut rows = tasks::list_summaries(
         &state.pool,
         query.project_id.as_deref(),
         &statuses,
@@ -137,6 +137,12 @@ pub async fn list(
         limit,
     )
     .await?;
+    // The same read the detail uses, so the list and the detail cannot
+    // disagree about who is waiting.
+    let queue = state.engine.queue_snapshot().await?;
+    for row in &mut rows {
+        row.queued = queue.queued_for(&row.task.id);
+    }
     Ok(Json(rows))
 }
 
@@ -175,6 +181,8 @@ pub struct TaskDetail {
     /// (#179): which stage stopped watching, after how long, and where a
     /// note goes. `null` otherwise.
     pub watch_timed_out: Option<crate::engine::WatchTimedOutInfo>,
+    /// The task's turns waiting for a slot; empty when none is.
+    pub queued: Vec<chocofactory_core::models::QueuedTurn>,
 }
 
 /// The worktree path and branch a `cancel --keep` handed to a person.
@@ -308,7 +316,9 @@ pub async fn get(
         Some(ws) => state.engine.watch_timed_out(&task, ws).await,
         None => None,
     };
+    let queued = state.engine.queue_snapshot().await?.queued_for(&id);
     Ok(Json(TaskDetail {
+        queued,
         usage,
         watch_timed_out,
         task,

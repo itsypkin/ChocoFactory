@@ -164,6 +164,9 @@ pub struct ListResult {
     pub closed: Result<Vec<TaskSummary>, String>,
     /// `Some` only when this poll also fetched the project names.
     pub projects: Option<Result<Vec<Project>, String>>,
+    /// The daemon's `GET /server`, read with the lists. `None` when the read
+    /// failed: the header keeps the last values it had.
+    pub server: Option<chocofactory_core::models::ServerStatus>,
 }
 
 pub enum SocketMsg {
@@ -234,6 +237,8 @@ pub struct App {
     pub scope: Scope,
     pub base_url: String,
     pub daemon_version: Option<String>,
+    /// The server pool of agent turns, as the last `GET /server` said.
+    pub server_pool: Option<chocofactory_core::models::AgentPool>,
     pub interval: Duration,
     pub interval_label: String,
     pub color: bool,
@@ -277,6 +282,7 @@ impl App {
             scope,
             base_url,
             daemon_version: None,
+            server_pool: None,
             interval,
             interval_label,
             color: std::env::var_os("NO_COLOR").is_none(),
@@ -486,8 +492,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 active,
                 closed,
                 projects,
+                server,
             } = *result;
             app.now = at;
+            if let Some(server) = server {
+                app.daemon_version = Some(server.version);
+                app.server_pool = server.agent_pools.into_iter().find(|p| p.pool == "server");
+            }
             app.fetching = false;
             app.last_poll = Some(at);
             match projects {

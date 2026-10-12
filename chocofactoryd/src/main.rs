@@ -274,6 +274,22 @@ async fn main() {
         "resumed interrupted poll stages"
     );
 
+    // After both sweeps (the park sweep leaves queued turns queued), before
+    // serving: the queue drains in its old order. From the moment shutdown
+    // is signalled the gate is stopped: a turn due to start is queued
+    // instead, and the dispatcher exits. Without that, a slot freed by the
+    // shutdown kill would admit a queued turn whose spawn is refused, and its
+    // task would go stuck.
+    let dispatcher = engine.start_dispatcher();
+    {
+        let gate = Arc::clone(engine.turn_gate());
+        let stop_rx = stop_rx.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown(stop_rx).await;
+            gate.stop();
+        });
+    }
+
     let state = AppState {
         pool,
         engine: engine.clone(),
@@ -302,6 +318,10 @@ async fn main() {
         ),
     }
 
+    engine.turn_gate().stop();
+    if let Err(err) = dispatcher.await {
+        tracing::error!(%err, "the queue dispatcher ended abnormally");
+    }
     session_manager.shutdown(SESSION_DRAIN_GRACE).await;
     // Kill every shell/poll runner's process group *before* releasing the
     // lock, so a successor never overlaps with live runners of this daemon.
