@@ -59,6 +59,9 @@ pub enum ResumeTaskError {
     Db(sqlx::Error),
     /// Starting what was held failed; the task has been marked stuck.
     Enter(EngineError),
+    /// The stage could not be resumed and marking the task stuck failed too;
+    /// the task keeps its status.
+    StuckWriteFailed(String),
 }
 
 impl fmt::Display for ResumeTaskError {
@@ -73,6 +76,10 @@ impl fmt::Display for ResumeTaskError {
             ResumeTaskError::Load(err) => write!(f, "{err}"),
             ResumeTaskError::Db(err) => write!(f, "{err}"),
             ResumeTaskError::Enter(err) => write!(f, "resume failed: {err}"),
+            ResumeTaskError::StuckWriteFailed(reason) => write!(
+                f,
+                "{reason}; marking the task stuck failed, so it keeps its status"
+            ),
         }
     }
 }
@@ -405,7 +412,7 @@ impl WorkflowEngine {
         result
     }
 
-    async fn resume_task_locked(
+    pub(crate) async fn resume_task_locked(
         self: &Arc<Self>,
         task_id: &str,
     ) -> Result<ResumeOutcome, ResumeTaskError> {
@@ -438,8 +445,15 @@ impl WorkflowEngine {
             .await?;
         if let ResumePlan::Failed(why) = &plan {
             let reason = format!("stage '{stage}' cannot resume: {why}; retry continues it");
-            self.mark_stuck(task_id, &reason, false).await;
-            return refuse(format!("{reason} (the task is now stuck)"));
+            return match self.mark_stuck(task_id, &reason, false).await {
+                StuckMark::Marked => refuse(format!("{reason} (the task is now stuck)")),
+                StuckMark::WriteFailed => Err(ResumeTaskError::StuckWriteFailed(reason)),
+                StuckMark::NotMarked => {
+                    let now = tasks::get(&self.pool, task_id).await?;
+                    let status = now.map_or("gone".to_string(), |t| t.status);
+                    refuse(format!("{reason}; the task is '{status}' now"))
+                }
+            };
         }
 
         // Step 2 — one transaction: the poll window shift and `→ open`.
@@ -647,8 +661,11 @@ impl WorkflowEngine {
                     match self.branch_progress(task_id, name, entry_no).await? {
                         BranchWork::Queued | BranchWork::Live(_) => {}
                         BranchWork::Ended(session) => {
-                            if let Some(why) = Self::pause_failure(&session) {
-                                return Ok(ResumePlan::Failed(format!("branch '{name}' {why}")));
+                            // A failed branch is left to its watcher: it may still
+                            // be about to record the end, and siblings may be running.
+                            // The crash case is the pausing sweep's.
+                            if Self::pause_failure(&session).is_some() {
+                                continue;
                             }
                             if Self::pause_left_unsettled(&session) {
                                 let resume = self
