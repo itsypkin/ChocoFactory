@@ -1070,6 +1070,29 @@ async fn cancel_and_the_queue_delete_are_one_transaction() {
 }
 
 #[tokio::test]
+async fn a_cancel_whose_queue_delete_fails_leaves_the_task_not_cancelled() {
+    let q = Q::new(None).await;
+    let task = q.task_at("coding", "open").await;
+    q.insert_row(&task.id, "coding").await;
+    // The delete (the second statement) fails.
+    sqlx::query(
+        "CREATE TRIGGER refuse_delete BEFORE DELETE ON turn_queue \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    assert!(
+        tasks::mark_cancelled(&q.pool, &task.id, false)
+            .await
+            .is_err()
+    );
+    // The status update (the first statement) was rolled back with it.
+    assert_eq!(q.status(&task.id).await, "open");
+    assert_eq!(q.rows().await.len(), 1);
+}
+
+#[tokio::test]
 async fn deleting_a_task_deletes_its_queue_rows_first() {
     let q = Q::new(None).await;
     let task = q.task_row("job-d").await;
@@ -1434,6 +1457,35 @@ async fn a_dequeue_whose_row_vanished_rolls_back_and_creates_no_session() {
     assert!(q.sessions(&task.id).await.is_empty());
     assert_eq!(q.engine.running_total(), 0);
     assert!(!q.started("job-v"));
+}
+
+#[tokio::test]
+async fn a_dequeue_whose_session_insert_fails_keeps_the_row() {
+    let q = Q::new(None).await;
+    let task = q.task_row("job-v").await;
+    let row = q.insert_row(&task.id, "coding").await;
+    // The session insert (the second statement) fails on its foreign key.
+    let err = sessions::create_from_queue(
+        &q.pool,
+        row,
+        sessions::NewSession {
+            task_id: "no-such-task",
+            stage: "coding",
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        !matches!(err, sessions::CreateFromQueueError::Vanished),
+        "{err}"
+    );
+    // The delete (the first statement) was rolled back with it.
+    assert_eq!(q.rows().await.len(), 1);
+    assert!(q.sessions(&task.id).await.is_empty());
 }
 
 #[tokio::test]
@@ -1807,6 +1859,12 @@ impl Rng {
     }
 }
 
+/// What this proves: liveness (every queued turn starts, whatever way the
+/// turns before it end) and gap-free positions throughout. It does NOT guard
+/// the cap bound: that passed with the slot lock removed from `claim`. The
+/// bound is guarded by
+/// `concurrent_claims_issue_exactly_the_free_slots_and_queue_the_rest_in_order`.
+/// The sampled `running <= 3` below is a cheap extra check only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn twenty_tasks_claiming_at_once_under_cap_three_never_exceed_it_and_all_start() {
     const TASKS: usize = 20;
@@ -2354,6 +2412,180 @@ async fn a_queue_that_cannot_be_written_leaves_the_dispatcher_idle_and_the_task_
         "an unreadable queue is a read error"
     );
     assert_eq!(q.engine.dispatch_pass().await, Pass::Idle);
+}
+
+/// Captures what the code under test logs, on this thread.
+#[derive(Clone, Default)]
+struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+impl LogBuf {
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// A row whose task has a status the queue keeps (not `open`, not one that
+/// can never start) never blocks an admissible row behind it in its pool.
+#[tokio::test]
+async fn a_kept_row_ahead_does_not_block_an_admissible_row_behind_it() {
+    let q = Q::build(Some(1), queue_timers(), false).await;
+    q.script(&[("job-r", Ending::Report)]);
+    let kept = q.task_at("coding", "paused").await;
+    let kept_row = q.insert_row(&kept.id, "coding").await;
+    let open = q.task_at("coding", "open").await;
+    q.insert_row(&open.id, "coding").await;
+    assert_eq!(q.engine.dispatch_pass().await, Pass::Progress);
+    q.wait_started("job-r").await;
+    let rows = q.rows().await;
+    assert_eq!(rows.len(), 1, "the kept row stays, the started one is gone");
+    assert_eq!(rows[0].id, kept_row);
+    assert!(
+        q.queue_events(&kept.id, EventType::TurnWithdrawn)
+            .await
+            .is_empty()
+    );
+    assert_eq!(q.position(&kept.id).await, None, "a kept row has no place");
+}
+
+#[tokio::test]
+async fn a_read_error_while_taking_the_slot_is_logged_and_the_pass_goes_idle() {
+    let logs = LogBuf::default();
+    let _logging = logs.capture();
+    let q = Q::build(Some(1), queue_timers(), false).await;
+    let task = q.task_at("coding", "open").await;
+    q.insert_row(&task.id, "coding").await;
+    // Hold the task's lock so the pass stops between its two picks.
+    let lock = q.engine.lock_for_task(&task.id).await;
+    let guard = lock.lock().await;
+    let engine = Arc::clone(&q.engine);
+    let pass = tokio::spawn(async move { engine.dispatch_pass().await });
+    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    sqlx::query("DROP TABLE turn_queue")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    drop(guard);
+    assert_eq!(pass.await.unwrap(), Pass::Idle);
+    let text = logs.text();
+    assert!(
+        text.contains("taking the slot for a turn") && text.contains("could not be read"),
+        "{text}"
+    );
+}
+
+/// A failed admission deletes its row before it records the failure, so a
+/// record that goes on to enter a stage finds no old row.
+#[tokio::test]
+async fn a_failed_admission_deletes_its_row_before_it_records_the_failure() {
+    let q = Q::build(None, queue_timers(), false).await;
+    let task = q
+        .task_with(
+            "coding",
+            "open",
+            &q.flow.display().to_string(),
+            json!({ "roles": { "coder": { "cli": "no-such-cli" } } }),
+        )
+        .await;
+    q.insert_row(&task.id, "coding").await;
+    sqlx::query("CREATE TABLE probe (queue_rows INTEGER NOT NULL)")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER probe_stuck AFTER UPDATE OF status ON tasks \
+         BEGIN INSERT INTO probe SELECT count(*) FROM turn_queue; END",
+    )
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    let row = q.rows().await.remove(0);
+    let spec = TurnSpec {
+        stage: "coding",
+        group: None,
+        resume_session_id: None,
+    };
+    let Claim::Start(permit) = q.engine.turn_gate().claim(&task.id, &spec).await.unwrap() else {
+        panic!("no cap: the turn starts");
+    };
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Progress);
+    assert_eq!(q.status(&task.id).await, "stuck");
+    let seen: Vec<i64> = sqlx::query_scalar("SELECT queue_rows FROM probe")
+        .fetch_all(&q.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        seen,
+        vec![0],
+        "the row was already gone when the task was marked"
+    );
+    assert_eq!(q.engine.running_total(), 0);
+}
+
+/// If the failure cannot be recorded, the turn stays queued so a later pass
+/// retries: never an open task with neither a row nor a session.
+#[tokio::test]
+async fn a_failed_admission_that_cannot_be_recorded_keeps_its_row_and_logs() {
+    let logs = LogBuf::default();
+    let _logging = logs.capture();
+    let q = Q::build(None, queue_timers(), false).await;
+    let task = q
+        .task_with(
+            "coding",
+            "open",
+            &q.flow.display().to_string(),
+            json!({ "roles": { "coder": { "cli": "no-such-cli" } } }),
+        )
+        .await;
+    let id = q.insert_row(&task.id, "coding").await;
+    sqlx::query(
+        "CREATE TRIGGER refuse_stuck BEFORE UPDATE ON tasks WHEN NEW.status = 'stuck' \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    let row = q.rows().await.remove(0);
+    let spec = TurnSpec {
+        stage: "coding",
+        group: None,
+        resume_session_id: None,
+    };
+    let Claim::Start(permit) = q.engine.turn_gate().claim(&task.id, &spec).await.unwrap() else {
+        panic!("no cap: the turn starts");
+    };
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
+    assert_eq!(q.status(&task.id).await, "open");
+    let rows = q.rows().await;
+    assert_eq!(rows.len(), 1, "the row is back");
+    assert_eq!(rows[0].id, id, "in its old place");
+    assert_eq!(q.engine.running_total(), 0);
+    let text = logs.text();
+    assert!(text.contains("could not be recorded"), "{text}");
 }
 
 #[tokio::test]

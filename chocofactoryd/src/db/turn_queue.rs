@@ -86,6 +86,26 @@ pub async fn insert(pool: &SqlitePool, row: NewQueueRow<'_>) -> Result<i64, sqlx
     .await
 }
 
+/// Puts a row back with its old id and time, so it keeps its place in line.
+/// Used when a failed admission could be neither recorded nor left: the
+/// turn must stay queued rather than vanish.
+pub async fn restore(pool: &SqlitePool, row: &QueueRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO turn_queue (id, task_id, stage, group_stage, group_entry, \
+         resume_session_id, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(row.id)
+    .bind(&row.task_id)
+    .bind(&row.stage)
+    .bind(&row.group_stage)
+    .bind(row.group_entry)
+    .bind(&row.resume_session_id)
+    .bind(row.queued_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Deletes one row; whether it existed.
 pub async fn delete(pool: &SqlitePool, id: i64) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM turn_queue WHERE id = ?")

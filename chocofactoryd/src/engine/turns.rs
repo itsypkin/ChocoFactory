@@ -476,6 +476,20 @@ impl TurnGate {
     }
 }
 
+/// Logs why a dispatcher pass could not pick, and goes idle until the next
+/// wake or tick. Every pick in a pass reports its error the same way.
+fn log_pick_error(err: &PickError, doing: &str) -> Pass {
+    match err {
+        PickError::Config(err) => {
+            tracing::error!(%err, doing, "the queue cannot start turns: config.yaml is unusable");
+        }
+        PickError::Db(err) => {
+            tracing::error!(%err, doing, "the queue could not be read");
+        }
+    }
+    Pass::Idle
+}
+
 /// A queue row dropped without starting.
 #[derive(Debug)]
 pub(super) struct Withdrawn {
@@ -735,14 +749,7 @@ impl WorkflowEngine {
                     }
                 }
             }
-            Err(PickError::Config(err)) => {
-                tracing::error!(%err, "the queue cannot start turns: config.yaml is unusable");
-                return Pass::Idle;
-            }
-            Err(PickError::Db(err)) => {
-                tracing::error!(%err, "the queue could not be read");
-                return Pass::Idle;
-            }
+            Err(err) => return log_pick_error(&err, "looking for a turn to start"),
         };
 
         let lock = self.lock_for_task(&candidate.task_id).await;
@@ -755,7 +762,7 @@ impl WorkflowEngine {
                     ..
                 }) => self.admit(row, permit).await,
                 Ok(_) => Pass::Progress,
-                Err(_) => Pass::Idle,
+                Err(err) => log_pick_error(&err, "taking the slot for a turn"),
             }
         };
         self.evict_task_lock_if_unshared(&candidate.task_id, &lock)
@@ -1061,9 +1068,8 @@ impl WorkflowEngine {
         err: EngineError,
         permit: TurnPermit,
     ) -> Pass {
-        let pass = self.fail_admission_inner(row, definition, err).await;
-        drop(permit);
-        pass
+        self.fail_admission_inner(row, definition, err, Some(permit))
+            .await
     }
 
     async fn fail_admission_after_launch(
@@ -1072,40 +1078,67 @@ impl WorkflowEngine {
         definition: &Arc<WorkflowDefinition>,
         err: EngineError,
     ) -> Pass {
-        self.fail_admission_inner(row, Some(definition), err).await
+        self.fail_admission_inner(row, Some(definition), err, None)
+            .await
     }
 
     /// Handles a prepare or launch failure as a detached failure is handled
     /// today (`mark_stuck` for a stage, `record_start_failures` for a
-    /// branch), then deletes the row. When that delete fails the pass goes
-    /// idle until the next tick instead of starting the same turn again at
-    /// once.
+    /// branch).
+    ///
+    /// Order matters. The row is deleted and the permit dropped *first*:
+    /// handling a branch failure can settle its group, and a settle that
+    /// goes on to enter a stage must find neither this row (UNIQUE on
+    /// task and stage) nor this dead permit (counted against the cap).
+    ///
+    /// Then the failure is handled. When it cannot be recorded at all (the
+    /// status write fails), the task would be open in an agent stage with
+    /// neither a row nor a session, and nothing would show it. So the row
+    /// is put back, in its old place, and a later pass tries again.
+    ///
+    /// The pass goes idle, not on, whenever the row is still there, so a row
+    /// that cannot be dealt with is not retried in a hot loop.
     async fn fail_admission_inner(
         self: &Arc<Self>,
         row: &QueueRow,
         definition: Option<&Arc<WorkflowDefinition>>,
         err: EngineError,
+        permit: Option<TurnPermit>,
     ) -> Pass {
         let task_id = row.task_id.as_str();
         let stage = row.stage.as_str();
         tracing::error!(task_id, stage, %err, "a queued turn failed to start");
+        let deleted = {
+            let _slot = self.turn_gate.slot.lock().await;
+            let deleted = turn_queue::delete(&self.pool, row.id).await;
+            drop(permit);
+            deleted
+        };
+        if let Err(delete_err) = &deleted {
+            tracing::error!(
+                task_id, stage, %delete_err,
+                "failed to delete the queue row of a turn that failed to start; the next \
+                 pass withdraws it when its task is no longer open"
+            );
+        }
         let branches = row.group_stage.as_deref().and_then(|group| {
             match definition?.stages.get(group).map(|d| &d.kind) {
                 Some(StageKind::Parallel { branches }) => Some((group, branches)),
                 _ => None,
             }
         });
-        match (&row.group_stage, branches) {
+        let recorded = match (&row.group_stage, branches) {
             (None, _) => {
                 self.mark_stuck(
                     task_id,
                     &format!("stage '{stage}': failed to start after waiting in the queue: {err}"),
                     false,
                 )
-                .await;
+                .await
+                    != StuckMark::WriteFailed
             }
             (Some(_), Some((group, branches))) => {
-                if let Err(record_err) = self
+                match self
                     .record_start_failures(
                         task_id,
                         group,
@@ -1115,16 +1148,20 @@ impl WorkflowEngine {
                     )
                     .await
                 {
-                    self.mark_stuck(
-                        task_id,
-                        &format!(
-                            "stage '{}': branch '{stage}' failed to start ({err}) and the \
-                             failure could not be recorded: {record_err}",
-                            row.group_stage.as_deref().unwrap_or_default()
-                        ),
-                        false,
-                    )
-                    .await;
+                    Ok(()) => true,
+                    Err(record_err) => {
+                        self.mark_stuck(
+                            task_id,
+                            &format!(
+                                "stage '{}': branch '{stage}' failed to start ({err}) and the \
+                                 failure could not be recorded: {record_err}",
+                                row.group_stage.as_deref().unwrap_or_default()
+                            ),
+                            false,
+                        )
+                        .await
+                            != StuckMark::WriteFailed
+                    }
                 }
             }
             (Some(group), None) => {
@@ -1136,24 +1173,36 @@ impl WorkflowEngine {
                     ),
                     false,
                 )
-                .await;
+                .await
+                    != StuckMark::WriteFailed
             }
-        }
-        self.events_notify.notify_waiters();
-        let deleted = {
-            let _slot = self.turn_gate.slot.lock().await;
-            turn_queue::delete(&self.pool, row.id).await
         };
+        self.events_notify.notify_waiters();
+        if !recorded {
+            tracing::error!(
+                task_id,
+                stage,
+                "the failure of a queued turn could not be recorded; the turn stays queued and \
+                 a later pass tries again"
+            );
+            if matches!(deleted, Ok(true)) {
+                let restored = {
+                    let _slot = self.turn_gate.slot.lock().await;
+                    turn_queue::restore(&self.pool, row).await
+                };
+                if let Err(restore_err) = restored {
+                    tracing::error!(
+                        task_id, stage, %restore_err,
+                        "failed to put a queued turn back after its failure could not be \
+                         recorded: the task is open in this stage with no queue row"
+                    );
+                }
+            }
+            return Pass::Idle;
+        }
         match deleted {
             Ok(_) => Pass::Progress,
-            Err(delete_err) => {
-                tracing::error!(
-                    task_id, stage, %delete_err,
-                    "failed to delete the queue row of a turn that failed to start; the next \
-                     pass withdraws it when its task is no longer open"
-                );
-                Pass::Idle
-            }
+            Err(_) => Pass::Idle,
         }
     }
 

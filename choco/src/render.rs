@@ -837,10 +837,19 @@ fn agent_slot_lines(s: &chocofactory_core::models::ServerStatus) -> Vec<String> 
         ));
     }
     if let Some(error) = &s.queue_error {
-        out.push(format!(
-            "warning: queued turns cannot start: {}; fix config.yaml and they start within seconds",
-            single_line(error)
-        ));
+        // The error is also kept when nothing is waiting: say what it will
+        // do, not that queued turns are stuck.
+        if s.queued.is_empty() {
+            out.push(format!(
+                "warning: config.yaml cannot be read: {}; new agent turns will fail until it is fixed",
+                single_line(error)
+            ));
+        } else {
+            out.push(format!(
+                "warning: queued turns cannot start: {}; fix config.yaml and they start within seconds",
+                single_line(error)
+            ));
+        }
     }
     out
 }
@@ -3472,6 +3481,19 @@ mod queue_tests {
         s.agent_pools.clear();
         let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
         assert!(out.contains("agent slots   server: no limit"), "{out}");
+    }
+
+    #[test]
+    fn server_status_with_a_queue_error_and_nothing_queued_does_not_say_turns_cannot_start() {
+        let mut s = pools_status();
+        s.queued.clear();
+        s.queue_error = Some("failed to parse global config /h/config.yaml: bad".into());
+        let out = server_status(&s, std::path::Path::new("/log"), s.started_at);
+        assert!(!out.contains("queued turns cannot start"), "{out}");
+        assert!(
+            out.contains("warning: config.yaml cannot be read: failed to parse global config /h/config.yaml: bad"),
+            "{out}"
+        );
     }
 
     #[test]
