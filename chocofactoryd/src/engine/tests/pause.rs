@@ -411,6 +411,10 @@ async fn the_sweep_ignores_a_session_from_an_earlier_entry_of_a_pausing_stage() 
     )
     .await
     .unwrap();
+    // Left idle with no end reason, as a crash leaves a live session.
+    sessions::set_adapter_session_id(&q.pool, &old.id, "adapter-old")
+        .await
+        .unwrap();
     sqlx::query("UPDATE tasks SET status = 'pausing', paused_at = ? WHERE id = ?")
         .bind(Utc::now())
         .bind(&task.id)
