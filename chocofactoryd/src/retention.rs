@@ -221,6 +221,7 @@ mod tests {
                     status: "closed",
                     created_at: task.created_at,
                     updated_at: task.updated_at,
+                    paused_at: None,
                 },
                 &facts,
                 &rows,

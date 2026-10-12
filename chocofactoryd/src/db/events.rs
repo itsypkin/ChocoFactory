@@ -200,7 +200,7 @@ pub async fn branch_start_exists(
          WHERE task_id = ? AND event_type = 'branch_started'
            AND json_extract(payload, '$.branch') = ?
            AND json_extract(payload, '$.entry') = ?
-           AND COALESCE(json_extract(payload, '$.via'), '') NOT IN ('retry', 'retry_resume')
+           AND COALESCE(json_extract(payload, '$.via'), '') NOT IN ('retry', 'retry_resume', 'resume', 'resume_resume')
          LIMIT 1",
     )
     .bind(task_id)
@@ -532,7 +532,11 @@ fn ends_a_message(event_type: &str) -> bool {
         | EventType::BranchFinished
         | EventType::TurnQueued
         | EventType::TurnDequeued
-        | EventType::TurnWithdrawn => false,
+        | EventType::TurnWithdrawn
+        | EventType::TaskPausing
+        | EventType::TaskPaused
+        | EventType::TaskResumed
+        | EventType::StageHeld => false,
     }
 }
 

@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use chocofactory_core::models::{Event, RetryMode, RetryOutcome, Task, TaskSummary, WorkflowState};
+use chocofactory_core::models::{
+    Event, PauseOutcome, ResumeOutcome, RetryMode, RetryOutcome, Task, TaskSummary, WorkflowState,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -146,10 +148,10 @@ pub async fn list(
     Ok(Json(rows))
 }
 
-/// A task plus its current `workflow_state` — bare `Task.status` is
-/// `"open"`/`"closed"` (§5.4), `"cancelled"` (#69), or `"stuck"` (X-4,
-/// issue #61, which also carries a `stuck_reason` via `Task`'s own flattened
-/// fields), so `choco task status <id>` needs `current_stage` too for this
+/// A task plus its current `workflow_state` — bare `Task.status` is one of
+/// `"open"`, `"pausing"`, `"paused"` (#295, which also carry `paused_at`),
+/// `"closed"` (§5.4), `"cancelled"` (#69), or `"stuck"` (X-4, issue #61,
+/// which also carries a `stuck_reason` via `Task`'s own flattened fields), so `choco task status <id>` needs `current_stage` too for this
 /// to actually be useful as a status view.
 #[derive(Serialize)]
 pub struct TaskDetail {
@@ -280,6 +282,7 @@ async fn read_usage(
             status: &task.status,
             created_at: task.created_at,
             updated_at: task.updated_at,
+            paused_at: task.paused_at,
         },
         &usage_sessions,
         &usage_rows,
@@ -477,6 +480,48 @@ pub async fn retry(
 ) -> Result<(StatusCode, Json<RetryOutcome>), ApiError> {
     let mode = body.map(|Json(body)| body.mode).unwrap_or_default();
     let outcome = state.engine.retry_task(&id, mode).await?;
+    Ok((StatusCode::ACCEPTED, Json(outcome)))
+}
+
+/// The optional body of `POST …/pause` (#295). Absent, `{}` and `{"now":
+/// false}` all mean a graceful pause: running turns and commands finish.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PauseBody {
+    now: bool,
+}
+
+/// Pauses `id`: its watchers stop at once, nothing new starts, and the
+/// running work finishes (`now: false`) or is stopped (`now: true`). `202`
+/// carries the outcome: `pausing` while work is still running, `paused` when
+/// nothing is.
+///
+/// The call runs on its own task and the handler awaits it, as `create`
+/// does: a client that goes away cannot cut a pause short between its write
+/// and its stops.
+pub async fn pause(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<PauseBody>>,
+) -> Result<(StatusCode, Json<PauseOutcome>), ApiError> {
+    let now = body.map(|Json(body)| body.now).unwrap_or_default();
+    let engine = state.engine.clone();
+    let outcome = tokio::spawn(async move { engine.pause_task(&id, now).await })
+        .await
+        .map_err(|e| ApiError::Internal(format!("pause aborted: {e}")))??;
+    Ok((StatusCode::ACCEPTED, Json(outcome)))
+}
+
+/// Resumes a `pausing` or `paused` task and starts what was held. `202`
+/// carries what was started. Spawned like [`pause`].
+pub async fn resume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ResumeOutcome>), ApiError> {
+    let engine = state.engine.clone();
+    let outcome = tokio::spawn(async move { engine.resume_task(&id).await })
+        .await
+        .map_err(|e| ApiError::Internal(format!("resume aborted: {e}")))??;
     Ok((StatusCode::ACCEPTED, Json(outcome)))
 }
 

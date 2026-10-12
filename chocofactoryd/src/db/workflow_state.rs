@@ -135,15 +135,15 @@ pub async fn update_in(
 #[derive(Debug)]
 pub struct SettledWithFailures {
     pub state: WorkflowState,
-    /// true: the task was `open` and is now `stuck` with `reason`.
-    /// false: "not marked" — the task was no longer `open`; its status and
+    /// true: the task was open, pausing or paused and is now `stuck` with `reason`.
+    /// false: "not marked" — the task was no longer open, pausing or paused; its status and
     /// stuck_reason are untouched.
     pub marked_stuck: bool,
 }
 
 /// Writes the `workflow_state` update and marks the task `stuck` in one
 /// transaction, so neither lands without the other. `Ok(None)` means no
-/// `workflow_state` row (nothing written). A task no longer `open` still gets
+/// `workflow_state` row (nothing written). A task no longer open, pausing or paused still gets
 /// the payload committed and comes back with `marked_stuck: false`. Any
 /// failure drops the transaction, which rolls both writes back. The `Error`
 /// timeline event is the caller's to append after this returns.

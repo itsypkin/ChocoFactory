@@ -418,6 +418,37 @@ fn run_effect(
                 });
             });
         }
+        Effect::Pause(id) => {
+            let (client, tx) = (Arc::clone(client), tx.clone());
+            let timeout = config.timeout;
+            tokio::spawn(async move {
+                // Never `--now`: stopping running work is a CLI-only choice.
+                let result = tokio::time::timeout(timeout, client.pause_task(&id, false))
+                    .await
+                    .map_err(|_| timed_out())
+                    .and_then(|r| r.map(ActionOk::Paused).map_err(|e| e.to_string()));
+                let _ = tx.send(Msg::Action {
+                    kind: ActionKind::Pause,
+                    id,
+                    result,
+                });
+            });
+        }
+        Effect::Resume(id) => {
+            let (client, tx) = (Arc::clone(client), tx.clone());
+            let timeout = config.timeout;
+            tokio::spawn(async move {
+                let result = tokio::time::timeout(timeout, client.resume_task(&id))
+                    .await
+                    .map_err(|_| timed_out())
+                    .and_then(|r| r.map(|_| ActionOk::Resumed).map_err(|e| e.to_string()));
+                let _ = tx.send(Msg::Action {
+                    kind: ActionKind::Resume,
+                    id,
+                    result,
+                });
+            });
+        }
         Effect::Retry(id) => {
             let (client, tx) = (Arc::clone(client), tx.clone());
             let timeout = config.timeout;
@@ -467,7 +498,7 @@ fn run_effect(
 /// Both lists, and the project names when asked for.
 async fn fetch(client: &Client, config: &LoopConfig, projects: bool) -> ListResult {
     let pid = config.project_id.as_deref();
-    let active = client.list_task_summaries(pid, Some("open,stuck"), None, None);
+    let active = client.list_task_summaries(pid, Some("open,pausing,paused,stuck"), None, None);
     // `--closed 0` shows no closed section rows: skip the request.
     let closed = async {
         if config.closed == 0 {

@@ -19,6 +19,14 @@ use crate::adapter::{
 };
 use crate::db::{events, sessions, usage};
 
+/// Why [`SessionManager::stop`] kills a session. The reason is recorded
+/// before the kill, so the run ends with the matching end reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Cancelled,
+    Paused,
+}
+
 /// Drives the active ⇄ idle ⇄ resume state machine (§4.1) on top of
 /// `sessions`: keeps a live `AgentHandle` per active `session_id`,
 /// drains its events into the `events` table, and resumes a fresh
@@ -111,6 +119,10 @@ struct SessionSignals {
     /// case cancel exists for, so the kill happens inline in `cancel` and
     /// only the *reason* travels through shared state.
     cancelled: Arc<AtomicBool>,
+    /// Set by `SessionManager::stop(.., StopReason::Paused)` before the kill,
+    /// exactly as `cancelled` is: the reason travels through shared state and
+    /// the kill happens inline. Ranks below `cancelled` and above `stopping`.
+    paused: Arc<AtomicBool>,
     /// Set (shared with `SessionManager::shutting_down`) when the daemon is
     /// stopping. Read by `drain_session` to record `DaemonStopped`; unlike
     /// `cancelled` it is never set per run, so it can't make an operator's
@@ -447,6 +459,14 @@ impl SessionManager {
     /// expected-status guard — would resolve by silently letting the later
     /// writer win.
     pub async fn cancel(&self, session_id: &str) -> Result<(), SessionError> {
+        self.stop(session_id, StopReason::Cancelled).await
+    }
+
+    /// Kills a live session's process group, recording `reason` first so the
+    /// run ends as `Cancelled` or `Paused` (a pause `--now`, #295). Rank:
+    /// Cancelled > Paused > DaemonStopped. Everything `cancel` documents
+    /// holds for both reasons.
+    pub async fn stop(&self, session_id: &str, reason: StopReason) -> Result<(), SessionError> {
         let sessions = self.sessions.lock().await;
         match sessions.get(session_id) {
             Some(SessionSlot::Live(session)) => {
@@ -456,7 +476,12 @@ impl SessionManager {
                 // immediately. Setting the flag afterwards would leave that
                 // read racing this write and reporting a cancelled run as
                 // an ordinary crash.
-                session.signals.cancelled.store(true, Ordering::SeqCst);
+                match reason {
+                    StopReason::Cancelled => {
+                        session.signals.cancelled.store(true, Ordering::SeqCst)
+                    }
+                    StopReason::Paused => session.signals.paused.store(true, Ordering::SeqCst),
+                }
                 // Held across the kill, and it's the same lock
                 // `drain_session` takes to clear the pgid before reaping.
                 // That mutual exclusion is what makes the pid safe to
@@ -528,6 +553,7 @@ impl SessionManager {
         let signals = SessionSignals {
             last_activity: Arc::new(Mutex::new(Utc::now())),
             cancelled: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             stopping: Arc::clone(&self.shutting_down),
             // Read before `handle` moves into the drain task below — that
             // task owns it exclusively from then on, and `cancel` needs the
@@ -754,6 +780,7 @@ async fn drain_session(
     let SessionSignals {
         last_activity,
         cancelled,
+        paused,
         stopping,
         pgid,
         tracker,
@@ -1131,12 +1158,13 @@ async fn drain_session(
         tracing::error!(session_id, %err, "failed to reap subprocess");
     }
 
-    let (final_status, end_reason) = final_run_state(
+    let (final_status, end_reason) = final_run_state_ranked(
         kind,
         &turn,
         clean_exit,
         reaped,
         cancelled.load(Ordering::SeqCst),
+        paused.load(Ordering::SeqCst),
         stopping.load(Ordering::SeqCst),
     );
     if turn.completed && !clean_exit && !turn.lingered {
@@ -1543,6 +1571,7 @@ async fn close_after_job_wait(
 /// completed or errored but whose process had to be killed is `Lingered`.
 /// Anything else that exits without having completed is `exited`: cleanly
 /// means it never reported (`NoReport`), otherwise it crashed (no reason).
+#[cfg(test)]
 fn final_run_state(
     kind: SessionKind,
     turn: &SingleShotTurn,
@@ -1551,7 +1580,25 @@ fn final_run_state(
     cancelled: bool,
     stopping: bool,
 ) -> (SessionStatus, Option<SessionEndReason>) {
-    use SessionEndReason::{Cancelled, DaemonStopped, Interrupted, Lingered, NoReport, Reaped};
+    final_run_state_ranked(kind, turn, clean_exit, reaped, cancelled, false, stopping)
+}
+
+/// [`final_run_state`] with the pause request: Cancelled > Paused >
+/// DaemonStopped. A single-shot turn that had not completed ends
+/// `(Exited, Paused)`; a completed one keeps its ordinary result. A
+/// standing session is never stopped by a pause.
+fn final_run_state_ranked(
+    kind: SessionKind,
+    turn: &SingleShotTurn,
+    clean_exit: bool,
+    reaped: bool,
+    cancelled: bool,
+    paused: bool,
+    stopping: bool,
+) -> (SessionStatus, Option<SessionEndReason>) {
+    use SessionEndReason::{
+        Cancelled, DaemonStopped, Interrupted, Lingered, NoReport, Paused, Reaped,
+    };
     use SessionStatus::{Exited, Idle};
     match kind {
         // A clean exit (reaper-driven close, or a one-shot process finishing on
@@ -1583,6 +1630,8 @@ fn final_run_state(
                     Exited
                 };
                 (status, Some(Cancelled))
+            } else if paused && !turn.completed {
+                (Exited, Some(Paused))
             } else if stopping && !turn.completed {
                 (Exited, Some(DaemonStopped))
             } else if turn.gave_up {

@@ -6,7 +6,10 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chocofactory_core::models::{Event, Project, RetryOutcome, TaskSummary};
+use chocofactory_core::models::{
+    Event, PauseOutcome, Project, RetryOutcome, TASK_STATUS_CANCELLED, TASK_STATUS_CLOSED,
+    TASK_STATUS_OPEN, TASK_STATUS_PAUSED, TASK_STATUS_PAUSING, TASK_STATUS_STUCK, TaskSummary,
+};
 use chrono::{DateTime, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
@@ -18,14 +21,18 @@ const MAX_EVENTS: usize = 1000;
 pub enum Section {
     NeedsYou,
     InProgress,
+    /// Tasks an operator paused, and the ones still finishing a turn
+    /// before they are paused.
+    Paused,
     Stuck,
     Closed,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [
+    pub const ALL: [Section; 5] = [
         Section::NeedsYou,
         Section::InProgress,
+        Section::Paused,
         Section::Stuck,
         Section::Closed,
     ];
@@ -34,6 +41,7 @@ impl Section {
         match self {
             Section::NeedsYou => "NEEDS YOU",
             Section::InProgress => "IN PROGRESS",
+            Section::Paused => "PAUSED",
             Section::Stuck => "STUCK",
             Section::Closed => "RECENTLY CLOSED",
         }
@@ -179,11 +187,15 @@ pub enum SocketMsg {
 pub enum ActionKind {
     Cancel,
     Retry,
+    Pause,
+    Resume,
 }
 
 pub enum ActionOk {
     Cancelled,
     Retried(RetryOutcome),
+    Paused(PauseOutcome),
+    Resumed,
 }
 
 pub enum Msg {
@@ -229,6 +241,9 @@ pub enum Effect {
     },
     Cancel(String),
     Retry(String),
+    /// A graceful pause only: the dashboard has no `--now`.
+    Pause(String),
+    Resume(String),
     OpenUrl(String),
     Quit,
 }
@@ -313,21 +328,28 @@ impl App {
         matches!(self.scope, Scope::AllProjects)
     }
 
-    /// The four sections, each in its display order.
-    pub fn sections(&self) -> [Vec<&TaskSummary>; 4] {
+    /// The five sections, each in its display order. Every status in
+    /// `ALL_TASK_STATUSES` has its own arm, so a new one cannot land in
+    /// none of them unnoticed (a test pins that).
+    pub fn sections(&self) -> [Vec<&TaskSummary>; 5] {
         let mut needs: Vec<&TaskSummary> = Vec::new();
         let mut progress: Vec<&TaskSummary> = Vec::new();
+        let mut paused: Vec<&TaskSummary> = Vec::new();
         let mut stuck: Vec<&TaskSummary> = Vec::new();
+        let mut closed: Vec<&TaskSummary> = Vec::new();
         for t in &self.active {
             match t.task.status.as_str() {
-                "stuck" => stuck.push(t),
-                "open" => {
+                TASK_STATUS_STUCK => stuck.push(t),
+                TASK_STATUS_PAUSING | TASK_STATUS_PAUSED => paused.push(t),
+                TASK_STATUS_OPEN => {
                     if t.waiting_on_human {
                         needs.push(t);
                     } else {
                         progress.push(t);
                     }
                 }
+                // Not fetched into `active`, but classified all the same.
+                TASK_STATUS_CLOSED | TASK_STATUS_CANCELLED => closed.push(t),
                 _ => {}
             }
         }
@@ -344,8 +366,15 @@ impl App {
                 .cmp(&b.task.updated_at)
                 .then_with(|| a.task.id.cmp(&b.task.id))
         });
-        let closed: Vec<&TaskSummary> = self.closed.iter().collect();
-        [needs, progress, stuck, closed]
+        // Longest-paused last: the one that has waited longest is on top.
+        paused.sort_by(|a, b| {
+            a.task
+                .paused_at
+                .cmp(&b.task.paused_at)
+                .then_with(|| a.task.id.cmp(&b.task.id))
+        });
+        closed.extend(self.closed.iter());
+        [needs, progress, paused, stuck, closed]
     }
 
     /// Every task id in display order.
@@ -585,6 +614,28 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     Level::Info,
                 ),
                 (ActionKind::Retry, Ok(_)) => app.set_status("retried", Level::Info),
+                (ActionKind::Pause, Ok(ActionOk::Paused(outcome))) => app.set_status(
+                    if outcome.status == "paused" {
+                        format!("paused {short}")
+                    } else {
+                        format!("pausing {short}: waiting for its turn to finish")
+                    },
+                    Level::Info,
+                ),
+                (ActionKind::Pause, Ok(_)) => {
+                    app.set_status(format!("paused {short}"), Level::Info)
+                }
+                (ActionKind::Resume, Ok(_)) => {
+                    app.set_status(format!("resumed {short}"), Level::Info)
+                }
+                (ActionKind::Pause, Err(e)) => {
+                    app.set_status(format!("pause failed: {e}"), Level::Error);
+                    return Vec::new();
+                }
+                (ActionKind::Resume, Err(e)) => {
+                    app.set_status(format!("resume failed: {e}"), Level::Error);
+                    return Vec::new();
+                }
                 (ActionKind::Cancel, Err(e)) => {
                     app.set_status(format!("cancel failed: {e}"), Level::Error);
                     return Vec::new();
@@ -681,6 +732,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             cancel_prompt(app);
             return Vec::new();
         }
+        KeyCode::Char('p') => return pause_toggle(app),
         _ => {}
     }
 
@@ -791,6 +843,16 @@ fn retry_prompt(app: &mut App) {
     let Some(t) = target_summary(app) else {
         return;
     };
+    if matches!(
+        t.task.status.as_str(),
+        TASK_STATUS_PAUSING | TASK_STATUS_PAUSED
+    ) {
+        app.set_status(
+            format!("task is {}; press p to resume", t.task.status),
+            Level::Info,
+        );
+        return;
+    }
     if t.task.status != "stuck" {
         app.set_status(
             format!("retry: task is {}, not stuck", t.task.status),
@@ -805,13 +867,38 @@ fn retry_prompt(app: &mut App) {
     });
 }
 
+/// `p`: pauses an `open` task (graceful) and resumes a `pausing` or
+/// `paused` one. No confirmation: both are undone by the other.
+fn pause_toggle(app: &mut App) -> Vec<Effect> {
+    let Some(t) = target_summary(app) else {
+        return Vec::new();
+    };
+    match t.task.status.as_str() {
+        TASK_STATUS_OPEN => vec![Effect::Pause(t.task.id)],
+        TASK_STATUS_PAUSING | TASK_STATUS_PAUSED => vec![Effect::Resume(t.task.id)],
+        other => {
+            app.set_status(
+                format!("pause: task is {other}, not open or paused"),
+                Level::Info,
+            );
+            Vec::new()
+        }
+    }
+}
+
 fn cancel_prompt(app: &mut App) {
     let Some(t) = target_summary(app) else {
         return;
     };
-    if !matches!(t.task.status.as_str(), "open" | "stuck") {
+    if !matches!(
+        t.task.status.as_str(),
+        TASK_STATUS_OPEN | TASK_STATUS_PAUSING | TASK_STATUS_PAUSED | TASK_STATUS_STUCK
+    ) {
         app.set_status(
-            format!("cancel: task is {}, not open or stuck", t.task.status),
+            format!(
+                "cancel: task is {}, not open, paused or stuck",
+                t.task.status
+            ),
             Level::Info,
         );
         return;

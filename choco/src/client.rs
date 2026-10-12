@@ -8,7 +8,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chocofactory_core::models::{Event, Project, RetryMode, RetryOutcome, Task};
+use chocofactory_core::models::{
+    Event, PauseOutcome, Project, ResumeOutcome, RetryMode, RetryOutcome, Task,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -728,6 +730,31 @@ impl Client {
     /// an empty body, which is reported as a decode failure rather than
     /// guessed at. The two binaries ship from this repo together, so that
     /// is a skewed install to fix, not a case to paper over.
+    /// Pauses a task (#295). `now` also stops running turns and commands.
+    pub async fn pause_task(&self, id: &str, now: bool) -> Result<PauseOutcome, ClientError> {
+        let resp = self
+            .send(
+                self.http
+                    .post(format!("{}/tasks/{id}/pause", self.base_url))
+                    .json(&json!({ "now": now })),
+            )
+            .await?;
+        let resp = self.check_status(resp).await?;
+        self.decode(resp).await
+    }
+
+    /// Resumes a pausing or paused task (#295).
+    pub async fn resume_task(&self, id: &str) -> Result<ResumeOutcome, ClientError> {
+        let resp = self
+            .send(
+                self.http
+                    .post(format!("{}/tasks/{id}/resume", self.base_url)),
+            )
+            .await?;
+        let resp = self.check_status(resp).await?;
+        self.decode(resp).await
+    }
+
     pub async fn retry_task(&self, id: &str, mode: RetryMode) -> Result<RetryOutcome, ClientError> {
         let resp = self
             .send(

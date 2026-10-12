@@ -135,8 +135,10 @@ impl WorkflowEngine {
         // command it's running (#69) — a `shell` stage has no `session`,
         // so killing the task's agent session would not reach it.
         let registered_task_id = task_id.clone();
-        let spawned =
-            self.spawn_registered_runner(&registered_task_id, move |runner_id| async move {
+        let spawned = self.spawn_registered_runner(
+            &registered_task_id,
+            DetachedKind::Shell,
+            move |runner_id| async move {
                 engine
                     .run_shell_stage(
                         &task_id,
@@ -150,7 +152,10 @@ impl WorkflowEngine {
                     )
                     .await;
                 engine.finish_runner(&task_id, runner_id);
-            });
+                // The last running work of a pausing task ends here (#295).
+                engine.settle_pause(&task_id).await;
+            },
+        );
         if !spawned {
             tracing::warn!(
                 task_id = %registered_task_id,

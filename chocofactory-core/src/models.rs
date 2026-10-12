@@ -28,6 +28,24 @@ pub struct Project {
     pub max_agents: Option<u32>,
 }
 
+pub const TASK_STATUS_OPEN: &str = "open";
+pub const TASK_STATUS_PAUSING: &str = "pausing";
+pub const TASK_STATUS_PAUSED: &str = "paused";
+pub const TASK_STATUS_STUCK: &str = "stuck";
+pub const TASK_STATUS_CLOSED: &str = "closed";
+pub const TASK_STATUS_CANCELLED: &str = "cancelled";
+
+/// Every value `tasks.status` can hold. Tests iterate this list instead of
+/// keeping their own, so a new status fails every place that forgot it.
+pub const ALL_TASK_STATUSES: [&str; 6] = [
+    TASK_STATUS_OPEN,
+    TASK_STATUS_PAUSING,
+    TASK_STATUS_PAUSED,
+    TASK_STATUS_STUCK,
+    TASK_STATUS_CLOSED,
+    TASK_STATUS_CANCELLED,
+];
+
 /// One unit of work, driven by a workflow definition (design §3, §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
@@ -35,8 +53,8 @@ pub struct Task {
     pub project_id: String,
     pub workflow_def: String,
     pub title: String,
-    /// Free-form for now (e.g. "open", "closed") — the full set of values
-    /// is driven by workflow definitions, not fixed by this crate (§5.4).
+    /// One of [`ALL_TASK_STATUSES`]: `open`, `pausing`, `paused`, `stuck`,
+    /// `closed` or `cancelled`.
     pub status: String,
     pub config: Value,
     /// The repo path and project name `worktree::ensure` actually used to
@@ -57,6 +75,10 @@ pub struct Task {
     /// `db::tasks::mark_stuck`. `choco task retry <id>` re-runs the current
     /// stage and clears it via `db::tasks::reopen_stuck`.
     pub stuck_reason: Option<String>,
+    /// When the task was asked to pause; set exactly while `status` is
+    /// `pausing` or `paused`.
+    #[serde(default)]
+    pub paused_at: Option<DateTime<Utc>>,
     /// `true` when the task was cancelled with `--keep` (#102): its agents
     /// were stopped but its worktree and branch were left in place for a
     /// person to take over. Written in the same `UPDATE` as the
@@ -217,6 +239,10 @@ pub enum SessionEndReason {
     /// group, or the startup park sweep records it after a crash); like
     /// `Interrupted` the transcript is intact, so `retry` resumes it.
     DaemonStopped,
+    /// An operator paused the task with `--now` and `SessionManager::stop`
+    /// killed this run. Requested like `DaemonStopped`; the transcript is
+    /// intact, so `resume` continues it.
+    Paused,
 }
 
 impl fmt::Display for SessionEndReason {
@@ -229,6 +255,7 @@ impl fmt::Display for SessionEndReason {
             SessionEndReason::NoReport => "no_report",
             SessionEndReason::Interrupted => "interrupted",
             SessionEndReason::DaemonStopped => "daemon_stopped",
+            SessionEndReason::Paused => "paused",
         })
     }
 }
@@ -256,9 +283,40 @@ impl FromStr for SessionEndReason {
             "no_report" => Ok(SessionEndReason::NoReport),
             "interrupted" => Ok(SessionEndReason::Interrupted),
             "daemon_stopped" => Ok(SessionEndReason::DaemonStopped),
+            "paused" => Ok(SessionEndReason::Paused),
             other => Err(ParseSessionEndReasonError(other.to_string())),
         }
     }
+}
+
+/// What `POST /tasks/{id}/pause` did (#295).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseOutcome {
+    /// The task's status when the call returned: `pausing` while work it had
+    /// started is still running, `paused` once nothing is.
+    pub status: String,
+    /// `"graceful"` or `"now"`.
+    pub mode: String,
+    /// The stage the task was in when the pause was asked for.
+    pub stage: String,
+    /// How many agent turns and shell commands were running at that moment.
+    pub running: u32,
+    /// Work that could not be stopped (`--now`); it ends on its own.
+    #[serde(default)]
+    pub stop_failures: Vec<String>,
+}
+
+/// What `POST /tasks/{id}/resume` did (#295).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeOutcome {
+    /// The stage the task was in.
+    pub stage: String,
+    /// What was started again: the stage, or the branches of a group.
+    #[serde(default)]
+    pub started: Vec<String>,
+    /// Which of those continued an agent session instead of starting fresh.
+    #[serde(default)]
+    pub resumed: Vec<String>,
 }
 
 /// One `open` task whose current stage a daemon restart would strand
@@ -619,6 +677,18 @@ pub enum EventType {
     /// longer passed validation, or a retry replaced it). Task-scoped.
     /// Payload is `{"stage", "group", "reason"}`.
     TurnWithdrawn,
+    /// An operator asked the task to pause. Task-scoped. Payload is
+    /// `{"mode": "graceful"|"now", "stage", "running", "stop_failures"}`.
+    TaskPausing,
+    /// The task's running work is over and it is now `paused`. Task-scoped.
+    /// Payload is `{"stage"}` (plus `"restart": true` after a restart).
+    TaskPaused,
+    /// An operator resumed the task. Task-scoped. Payload is
+    /// `{"stage", "started": [..]}`.
+    TaskResumed,
+    /// A stage was entered while the task was pausing or paused and not
+    /// started. Task-scoped. Payload is `{"stage"}`.
+    StageHeld,
 }
 
 impl fmt::Display for EventType {
@@ -646,6 +716,10 @@ impl fmt::Display for EventType {
             EventType::TurnQueued => "turn_queued",
             EventType::TurnDequeued => "turn_dequeued",
             EventType::TurnWithdrawn => "turn_withdrawn",
+            EventType::TaskPausing => "task_pausing",
+            EventType::TaskPaused => "task_paused",
+            EventType::TaskResumed => "task_resumed",
+            EventType::StageHeld => "stage_held",
         })
     }
 }
@@ -688,6 +762,10 @@ impl FromStr for EventType {
             "turn_queued" => Ok(EventType::TurnQueued),
             "turn_dequeued" => Ok(EventType::TurnDequeued),
             "turn_withdrawn" => Ok(EventType::TurnWithdrawn),
+            "task_pausing" => Ok(EventType::TaskPausing),
+            "task_paused" => Ok(EventType::TaskPaused),
+            "task_resumed" => Ok(EventType::TaskResumed),
+            "stage_held" => Ok(EventType::StageHeld),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -862,6 +940,7 @@ mod tests {
             SessionEndReason::NoReport,
             SessionEndReason::Interrupted,
             SessionEndReason::DaemonStopped,
+            SessionEndReason::Paused,
         ] {
             assert_eq!(
                 reason.to_string().parse::<SessionEndReason>().unwrap(),
@@ -906,6 +985,10 @@ mod tests {
             EventType::TurnQueued,
             EventType::TurnDequeued,
             EventType::TurnWithdrawn,
+            EventType::TaskPausing,
+            EventType::TaskPaused,
+            EventType::TaskResumed,
+            EventType::StageHeld,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),

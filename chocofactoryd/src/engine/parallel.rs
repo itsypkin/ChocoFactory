@@ -233,7 +233,7 @@ impl WorkflowEngine {
 }
 
 /// The `parallel` block when it belongs to `group`.
-fn block_for<'a>(payload: &'a Value, group: &str) -> Option<&'a Value> {
+pub(super) fn block_for<'a>(payload: &'a Value, group: &str) -> Option<&'a Value> {
     payload
         .get("parallel")
         .filter(|block| block.get("stage").and_then(Value::as_str) == Some(group))
@@ -271,6 +271,10 @@ pub(super) fn running_branch_kinds(
     kinds.sort_unstable();
     kinds.dedup();
     Some(kinds.join(", "))
+}
+
+pub(super) fn branch_slot_state<'a>(payload: &'a Value, branch: &str) -> Option<&'a str> {
+    branch_state(payload, branch)
 }
 
 fn branch_state<'a>(payload: &'a Value, branch: &str) -> Option<&'a str> {
@@ -1166,7 +1170,9 @@ impl WorkflowEngine {
         let Some(task) = tasks::get(&self.pool, task_id).await? else {
             return dropped("the task no longer exists".to_string());
         };
-        if task.status != TASK_STATUS_OPEN {
+        // A pausing or paused task still records its branches' ends (#295):
+        // only the next stage is held.
+        if task.status != TASK_STATUS_OPEN && !is_pause_status(&task.status) {
             return dropped(format!("the task is {}", task.status));
         }
         let Some(state) = workflow_state::get(&self.pool, task_id).await? else {

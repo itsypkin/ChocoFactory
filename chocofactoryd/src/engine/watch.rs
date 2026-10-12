@@ -258,13 +258,16 @@ impl WorkflowEngine {
         // `run_watch` only fires *between* attempts; this stops one
         // already in flight.
         let registered_task_id = task_id.clone();
-        let spawned =
-            self.spawn_registered_runner(&registered_task_id, move |runner_id| async move {
+        let spawned = self.spawn_registered_runner(
+            &registered_task_id,
+            DetachedKind::Poll,
+            move |runner_id| async move {
                 engine
                     .run_watch(&task_id, &definition, &stage_name, run)
                     .await;
                 engine.finish_runner(&task_id, runner_id);
-            });
+            },
+        );
         if !spawned {
             tracing::warn!(
                 task_id = %registered_task_id,

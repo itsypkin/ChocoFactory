@@ -4,7 +4,8 @@
 //! this repo ships no terminal-styling dependency.
 
 use chocofactory_core::models::{
-    Event, EventType, Project, QueuedTurn, RetryOutcome, Task, TaskSummary,
+    Event, EventType, PauseOutcome, Project, QueuedTurn, ResumeOutcome, RetryOutcome, Task,
+    TaskSummary,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -145,6 +146,10 @@ pub fn task(t: &Task) -> String {
         && let Some(reason) = &t.stuck_reason
     {
         pairs.push(("Stuck", single_line(reason)));
+    }
+    let paused_at = t.paused_at.map(|at| at.to_rfc3339());
+    if let Some(value) = paused_value(&t.status, paused_at.as_deref(), &t.id, None) {
+        pairs.push((LABEL_PAUSED, value));
     }
     if let Some(cwd) = t.config.get("cwd").and_then(Value::as_str) {
         pairs.push(("Repo", cwd.to_string()));
@@ -329,6 +334,57 @@ fn queued_line(turn: &Value) -> String {
 /// starting a new one lead to very different next few minutes, and an
 /// operator who asked for one and got the other should not have to go
 /// looking for that.
+pub fn paused(task_id: &str, outcome: &PauseOutcome) -> String {
+    let mut text = match (outcome.status.as_str(), outcome.mode.as_str()) {
+        ("paused", _) => format!(
+            "Task {task_id} paused at '{}'. Nothing of its is running; `choco task resume \
+             {task_id}` continues it.",
+            outcome.stage
+        ),
+        (_, "now") => format!(
+            "Task {task_id} is pausing: stopping {} running at '{}'. It is paused once they \
+             end; `choco task resume {task_id}` continues it.",
+            outcome.running, outcome.stage
+        ),
+        _ => format!(
+            "Task {task_id} is pausing: waiting for '{}' to finish ({} running). It is paused \
+             once that ends; `choco task pause {task_id} --now` stops it sooner.",
+            outcome.stage, outcome.running
+        ),
+    };
+    for failure in &outcome.stop_failures {
+        text.push_str(&format!("\nCould not stop {failure}; it ends on its own."));
+    }
+    text
+}
+
+/// The human line for `task resume`: what was started again.
+pub fn resumed(task_id: &str, outcome: &ResumeOutcome) -> String {
+    if outcome.started.is_empty() {
+        return format!(
+            "Task {task_id} resumed at '{}'. Nothing needed starting: its work is running or \
+             queued already. See `choco task status {task_id}`.",
+            outcome.stage
+        );
+    }
+    let listed: Vec<String> = outcome
+        .started
+        .iter()
+        .map(|name| {
+            if outcome.resumed.contains(name) {
+                format!("{name} (resuming its session)")
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
+    format!(
+        "Task {task_id} resumed at '{}': started {}. See `choco task status {task_id}`.",
+        outcome.stage,
+        listed.join(", ")
+    )
+}
+
 pub fn retried(task_id: &str, outcome: &RetryOutcome) -> String {
     if outcome.rewatched {
         return format!(
@@ -410,6 +466,32 @@ pub const LABEL_BASE: &str = "Base";
 pub const LABEL_CLOSES: &str = "Closes";
 pub const LABEL_STATUS: &str = "Status";
 pub const LABEL_STUCK: &str = "Stuck";
+pub const LABEL_PAUSED: &str = "Paused";
+
+/// The value of the `Paused` line (#295): for a paused task when it paused
+/// and how to continue; for a pausing one what it is waiting for. `None` for
+/// every other status.
+pub fn paused_value(
+    status: &str,
+    paused_at: Option<&str>,
+    id: &str,
+    stage: Option<&str>,
+) -> Option<String> {
+    match status {
+        "paused" => {
+            let since = paused_at
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                .map(|at| format!("since {} — ", at.with_timezone(&Utc).format("%H:%M")))
+                .unwrap_or_default();
+            Some(format!("{since}choco task resume {id}"))
+        }
+        "pausing" => Some(match stage {
+            Some(stage) => format!("waiting for {}'s turn to finish", single_line(stage)),
+            None => "waiting for running work to finish".to_string(),
+        }),
+        _ => None,
+    }
+}
 pub const LABEL_KEPT_WORKTREE: &str = "Kept worktree";
 pub const LABEL_KEPT_BRANCH: &str = "Kept branch";
 pub const LABEL_REPO: &str = "Repo";
@@ -488,6 +570,14 @@ pub fn task_fields(detail: &Value) -> Vec<(&'static str, String)> {
         && let Some(reason) = detail.get("stuck_reason").and_then(Value::as_str)
     {
         pairs.push((LABEL_STUCK, single_line(reason)));
+    }
+    if let Some(value) = paused_value(
+        get("status"),
+        detail.get("paused_at").and_then(Value::as_str),
+        get("id"),
+        detail_stage(detail),
+    ) {
+        pairs.push((LABEL_PAUSED, value));
     }
     // A task cancelled with `--keep` (#102) handed its worktree and branch to
     // a person; say where, or the work is as good as lost.
@@ -608,7 +698,12 @@ pub fn detail_branches(
         .get("branches")?
         .as_array()
         .filter(|b| !b.is_empty())?;
-    let open = detail.get("status").and_then(Value::as_str) == Some("open");
+    // A branch's running time ticks while the task is `open` or `pausing`
+    // (its turn is still running), not while `paused`.
+    let open = matches!(
+        detail.get("status").and_then(Value::as_str),
+        Some("open" | "pausing")
+    );
     let stamp = |b: &Value, key: &str| {
         b.get(key)
             .and_then(Value::as_str)
@@ -1388,6 +1483,68 @@ fn event_summary_body(event: &Event) -> String {
             } else {
                 line
             }
+        }
+        // `{mode, stage, running, stop_failures}`, `{stage}` and
+        // `{stage, started}`: one line each, never raw JSON.
+        EventType::TaskPausing => {
+            let stage = payload.get("stage").and_then(Value::as_str).unwrap_or("?");
+            let mode = payload
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("graceful");
+            let running = payload.get("running").and_then(Value::as_u64).unwrap_or(0);
+            let mut line = if mode == "now" {
+                format!(
+                    "pause requested at {}: stopping {running} running",
+                    single_line(stage)
+                )
+            } else {
+                format!(
+                    "pause requested at {}: {running} running, left to finish",
+                    single_line(stage)
+                )
+            };
+            if let Some(failures) = payload.get("stop_failures").and_then(Value::as_array)
+                && !failures.is_empty()
+            {
+                let names: Vec<String> = failures
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(single_line)
+                    .collect();
+                line.push_str(&format!("; could not stop: {}", names.join(", ")));
+            }
+            line
+        }
+        EventType::TaskPaused => {
+            let stage = payload.get("stage").and_then(Value::as_str).unwrap_or("?");
+            format!("paused at {}", single_line(stage))
+        }
+        EventType::TaskResumed => {
+            let stage = payload.get("stage").and_then(Value::as_str).unwrap_or("?");
+            let started: Vec<String> = payload
+                .get("started")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(single_line)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if started.is_empty() {
+                format!("resumed at {}: nothing to start", single_line(stage))
+            } else {
+                format!(
+                    "resumed at {}: started {}",
+                    single_line(stage),
+                    started.join(", ")
+                )
+            }
+        }
+        EventType::StageHeld => {
+            let stage = payload.get("stage").and_then(Value::as_str).unwrap_or("?");
+            format!("{}  held: the task is paused", single_line(stage))
         }
         // `{stage, group, entry, pool, limit, running, position}`, `{stage,
         // group, entry, waited_ms, session_id}` and `{stage, group, reason}`:
@@ -2302,6 +2459,7 @@ mod tests {
             worktree_repo: None,
             worktree_project: None,
             stuck_reason: None,
+            paused_at: None,
             kept_work: false,
             workflow_path: None,
             workflow_sha256: None,
@@ -2806,6 +2964,7 @@ mod tests {
             worktree_repo: None,
             worktree_project: None,
             stuck_reason: None,
+            paused_at: None,
             kept_work: false,
             workflow_path: None,
             workflow_sha256: None,

@@ -236,7 +236,11 @@ pub fn start_line(id: &str, snap: &Snapshot, now: DateTime<Utc>) -> String {
 pub fn reached(target: &Until, first: &Snapshot, now: &Snapshot) -> bool {
     match target {
         Until::Status(s) => now.status == *s,
-        Until::Attention => now.status == "open" && now.stage_kind.as_deref() == Some("human_gate"),
+        // A paused task needs the user too: nothing happens until `resume`.
+        Until::Attention => {
+            now.status == "paused"
+                || (now.status == "open" && now.stage_kind.as_deref() == Some("human_gate"))
+        }
         Until::Stage(name) => {
             now.stage.as_deref() == Some(name.as_str())
                 || now
@@ -255,6 +259,8 @@ pub enum WatchEnd {
     Cancelled,
     TimedOut,
     ClosedWithoutTarget,
+    /// The task paused and `paused` was not the target.
+    Paused,
 }
 
 impl WatchEnd {
@@ -265,6 +271,7 @@ impl WatchEnd {
             WatchEnd::Cancelled => 4,
             WatchEnd::TimedOut => 5,
             WatchEnd::ClosedWithoutTarget => 6,
+            WatchEnd::Paused => 7,
         }
     }
 
@@ -286,6 +293,10 @@ pub fn outcome(target: Option<&Until>, now: &Snapshot) -> Option<WatchEnd> {
         ("closed", None) => Some(WatchEnd::Reached),
         ("closed", Some(_)) => Some(WatchEnd::ClosedWithoutTarget),
         ("cancelled", _) => Some(WatchEnd::Cancelled),
+        // A paused task does nothing until `resume`, so a targeted watch
+        // gives up on it; `--live` alone keeps watching, and `pausing`
+        // never ends a watch (its turn is still finishing).
+        ("paused", Some(_)) => Some(WatchEnd::Paused),
         // `--live` alone keeps watching through stuck: a human may retry.
         ("stuck", Some(_)) => Some(WatchEnd::Stuck),
         _ => None,
@@ -342,9 +353,16 @@ fn end_message(
     let stage = snap.stage.as_deref().unwrap_or("-");
     let attention = matches!(until, Some(Until::Attention));
     let msg = match end {
+        WatchEnd::Reached if attention && snap.status == "paused" => {
+            format!("task {id} is paused in stage '{stage}'; run 'choco task resume {id}'")
+        }
         WatchEnd::Reached if attention => {
             format!("task {id} is waiting for you in stage '{stage}'")
         }
+        WatchEnd::Paused => format!(
+            "task {id} is paused in stage '{stage}' without reaching {target}; run 'choco task \
+             resume {id}' to continue it"
+        ),
         WatchEnd::Reached => return None,
         WatchEnd::Stuck => format!(
             "task {id} is stuck in stage '{stage}': {}",

@@ -58,6 +58,7 @@ use crate::worktree::{self, WorktreeError};
 
 mod gate;
 mod parallel;
+mod pause;
 mod render;
 mod runners;
 mod shell_stage;
@@ -67,6 +68,7 @@ mod terminal;
 mod turn;
 mod turns;
 mod watch;
+pub use pause::{PauseTaskError, ResumeTaskError};
 pub use sweep::{ParkReport, PollSweepReport, RestartEffect, restart_effect};
 pub use turns::{QueueSnapshot, TurnGate};
 
@@ -112,7 +114,8 @@ struct StageEntry<'a> {
 /// The inner `Option` is the reservation: `None` between the slot being
 /// claimed and its `JoinHandle` being attached, which is a window only the
 /// spawning caller can observe.
-type DetachedRunners = HashMap<String, HashMap<u64, Option<JoinHandle<()>>>>;
+type DetachedRunners =
+    HashMap<String, HashMap<u64, (runners::DetachedKind, Option<JoinHandle<()>>)>>;
 
 /// `1st`, `2nd`, `3rd`, `4th`: a place in line, for messages.
 fn ordinal_suffix(n: u32) -> String {
@@ -126,39 +129,20 @@ fn ordinal_suffix(n: u32) -> String {
     format!("{n}{suffix}")
 }
 
-/// `tasks.status` for a task that reached a `terminal` stage (§5.4).
-const TASK_STATUS_CLOSED: &str = "closed";
+// The task statuses live in `chocofactory_core::models` (`ALL_TASK_STATUSES`).
+// `closed`: the workflow reached a terminal stage. `cancelled`: a human
+// stopped it for good. `stuck`: the engine gave up moving it on its own;
+// `retry` recovers it. `pausing`/`paused`: an operator held it (#295).
+pub(crate) use chocofactory_core::models::{
+    TASK_STATUS_CANCELLED, TASK_STATUS_CLOSED, TASK_STATUS_OPEN, TASK_STATUS_PAUSED,
+    TASK_STATUS_PAUSING, TASK_STATUS_STUCK,
+};
 
-/// `tasks.status` for a task an operator cancelled (#69) — a third value
-/// beyond §5.4's `open`/`closed`.
-///
-/// Distinct from `closed` on purpose: `closed` means the workflow reached
-/// an end it declared, and a task can only get there by traversing its
-/// graph. `cancelled` means a human stopped it somewhere it wasn't
-/// designed to stop, which is the thing an operator scanning
-/// `choco task list` most needs to be able to tell apart. It is also what
-/// every guard in this file keys off to refuse further work on the task,
-/// so collapsing the two would make "did this finish or was it killed?"
-/// unanswerable from the API.
-const TASK_STATUS_CANCELLED: &str = "cancelled";
-
-/// `tasks.status` for a task the engine gave up moving forward on its own
-/// (X-4, issue #61) — a fourth value beyond `open`/`closed`/`cancelled`.
-///
-/// Distinct from `open`: an `open` task is either actively running a stage
-/// or waiting on a human by *design* (a `human_gate`, a standing-open
-/// `agent_turn`); a `stuck` task stopped somewhere the workflow never
-/// intended it to stop — an outcome with no `on:` edge, a transition that
-/// failed, a session that never started, a run the idle reaper force-closed
-/// mid-turn, or a process that exited without completing. Distinct from
-/// `cancelled`: cancelling is a human's deliberate choice to stop the task
-/// for good, where `stuck` is the engine reporting its own failure to make
-/// progress, and — unlike `cancelled` — is recoverable: `retry_task`
-/// re-enters the current stage and reopens the task.
-const TASK_STATUS_STUCK: &str = "stuck";
-/// The status a task has while its workflow is running — the only status
-/// the startup poll sweep (#52) considers.
-const TASK_STATUS_OPEN: &str = "open";
+/// `true` for a task an operator asked to pause, whether or not its running
+/// work has ended yet.
+pub(crate) fn is_pause_status(status: &str) -> bool {
+    status == TASK_STATUS_PAUSING || status == TASK_STATUS_PAUSED
+}
 
 pub struct WorkflowEngine {
     pool: SqlitePool,
@@ -800,6 +784,12 @@ pub enum SendMessageError {
         reason: String,
         can_retry: bool,
     },
+    /// The task is `pausing` or `paused` (#295): a chat accepts no message
+    /// until `choco task resume`. Carries the task's id and status.
+    TaskPaused {
+        task_id: String,
+        status: String,
+    },
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     /// This task's recorded `workflow_path` (issue #88) names a file that no
@@ -857,6 +847,11 @@ impl fmt::Display for SendMessageError {
                     )
                 }
             }
+            SendMessageError::TaskPaused { task_id, status } => write!(
+                f,
+                "task is {status}, so it accepts no messages; run 'choco task resume {task_id}' \
+                 first. Nothing was sent."
+            ),
             SendMessageError::Resolve(err) => write!(f, "{err}"),
             SendMessageError::WorkflowDef(err) => write!(f, "{err}"),
             SendMessageError::MissingWorkflowFile(path) => write!(
@@ -1131,6 +1126,12 @@ pub enum RetryTaskError {
     /// The task isn't `stuck` — carries its actual status, the same way
     /// `CancelTaskError::NotCancellable` does.
     NotStuck(String),
+    /// The task is `pausing` or `paused` (#295): `retry` is for a stuck task,
+    /// and `resume` continues a held one. Carries the task's id and status.
+    Paused {
+        task_id: String,
+        status: String,
+    },
     /// The task is `open` because its turn is waiting for an agent slot, so
     /// there is nothing to retry; carries the stage and its place in line.
     Queued {
@@ -1197,6 +1198,11 @@ impl fmt::Display for RetryTaskError {
                     "task is '{status}', not 'stuck', so it cannot be retried"
                 )
             }
+            RetryTaskError::Paused { task_id, status } => write!(
+                f,
+                "task is {status}, not stuck, so it cannot be retried; run 'choco task resume \
+                 {task_id}' to continue it"
+            ),
             RetryTaskError::Queued { stage, position } => write!(
                 f,
                 "stage '{stage}' is waiting for an agent slot ({} in line), not stuck, so it \
@@ -1937,6 +1943,14 @@ impl WorkflowEngine {
             });
         }
 
+        // A held chat takes no message until it is resumed (#295).
+        if is_pause_status(&task.status) {
+            return Err(SendMessageError::TaskPaused {
+                task_id: task.id.clone(),
+                status: task.status.clone(),
+            });
+        }
+
         let definition = self.load_task_workflow(&task).await?;
 
         let state = workflow_state::get(&self.pool, task_id)
@@ -2387,7 +2401,7 @@ impl WorkflowEngine {
                 tracing::info!(
                     task_id,
                     reason,
-                    "task not marked stuck: it was no longer open"
+                    "task not marked stuck: it was no longer open, pausing or paused"
                 );
                 StuckMark::NotMarked
             }
@@ -2477,6 +2491,12 @@ impl WorkflowEngine {
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(RetryTaskError::NoSuchTask)?;
+        if is_pause_status(&task.status) {
+            return Err(RetryTaskError::Paused {
+                task_id: task_id.to_string(),
+                status: task.status,
+            });
+        }
         if task.status != TASK_STATUS_STUCK && task.status != TASK_STATUS_OPEN {
             return Err(RetryTaskError::NotStuck(task.status));
         }
@@ -2632,38 +2652,23 @@ impl WorkflowEngine {
             });
         }
 
-        // Step 3 — work out a prompt_file-less agent_turn's input the same
-        // way `start_task`/`advance_from_stage` do (P2-7a's
-        // `payload.task.input`), then re-enter the stage directly —
-        // `enter_stage`, not `advance`/`advance_from_stage`: this function
-        // already holds the per-task lock those acquire themselves, and
-        // `tokio::sync::Mutex` is not reentrant (see this module's header).
-        // `entered_via: Some("retry")` is what makes the timeline show
-        // `X --[retry]--> X` rather than reading as a fresh entry.
-        let input = match &stage_def.kind {
-            StageKind::AgentTurn {
-                prompt_file: None, ..
-            } => state
-                .payload
-                .get("task")
-                .and_then(|task| task.get("input"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            _ => None,
-        };
-
+        // Step 3 — re-enter the stage through the helper `resume` shares
+        // (`reenter_stage_locked`: it works out a prompt_file-less
+        // agent_turn's input and calls `enter_stage`, not `advance`, because
+        // this function already holds the per-task lock). `entered_via` is
+        // what makes the timeline show `X --[retry]--> X` rather than a
+        // fresh entry.
         let entered_via = match &resume {
             Some(_) => "retry_resume",
             None => "retry",
         };
         if let Err(err) = self
-            .enter_stage(
+            .reenter_stage_locked(
                 task_id,
                 &definition,
                 &current_stage,
-                input.as_deref(),
-                Some(entered_via),
                 &payload,
+                entered_via,
                 resume.as_ref(),
             )
             .await
@@ -2933,7 +2938,8 @@ impl WorkflowEngine {
             Some(
                 reason @ (SessionEndReason::Interrupted
                 | SessionEndReason::Reaped
-                | SessionEndReason::DaemonStopped),
+                | SessionEndReason::DaemonStopped
+                | SessionEndReason::Paused),
             ) => reason,
             Some(other) => {
                 return Ok(Err(format!(
@@ -3584,6 +3590,28 @@ impl WorkflowEngine {
     /// The per-kind behavior half of `enter_stage`, split out so the caller
     /// can act on the result once rather than at five `return` sites.
     async fn dispatch_stage(self: &Arc<Self>, entry: &StageEntry<'_>) -> Result<(), EngineError> {
+        // The one place a stage is held (#295). Every caller holds the task
+        // lock, which is the lock `pause` and `resume` take, so the status
+        // read here cannot change before the stage starts. The terminal stage
+        // is not work: closing replaces the pause.
+        if !matches!(entry.stage_def.kind, StageKind::Terminal)
+            && let Some(task) = tasks::get(&self.pool, entry.task_id).await?
+            && is_pause_status(&task.status)
+        {
+            tracing::info!(
+                task_id = entry.task_id,
+                stage = entry.stage_name,
+                "stage held: the task is {}",
+                task.status
+            );
+            self.append_task_event(
+                entry.task_id,
+                EventType::StageHeld,
+                json!({ "stage": entry.stage_name }),
+            )
+            .await;
+            return Ok(());
+        }
         match &entry.stage_def.kind {
             StageKind::AgentTurn { .. } => self.enter_agent_turn(entry).await,
             StageKind::Shell { .. } => self.enter_shell(entry).await,

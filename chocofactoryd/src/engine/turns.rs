@@ -49,8 +49,8 @@ pub(crate) enum RowFate {
     /// The row can never start (its task is gone, stuck, closed or
     /// cancelled): delete it.
     Withdraw,
-    /// The task is in a status this code does not know: leave the row where
-    /// it is.
+    /// The task is paused or pausing, or in a status this code does not
+    /// know: leave the row where it is.
     Keep,
 }
 
@@ -59,17 +59,31 @@ pub(crate) enum RowFate {
 /// new status lands in the last arm and keeps its rows until it is classified
 /// here.
 pub(crate) fn queue_row_fate(status: Option<&str>) -> RowFate {
-    match status {
-        None => RowFate::Withdraw,
-        Some(status) if is_admissible(status) => RowFate::Admissible,
-        Some(TASK_STATUS_STUCK | TASK_STATUS_CLOSED | TASK_STATUS_CANCELLED) => RowFate::Withdraw,
-        Some(other) => {
+    match classify_row_fate(status) {
+        Some(fate) => fate,
+        None => {
             tracing::warn!(
-                status = other,
+                status = status.unwrap_or_default(),
                 "a queued turn's task has a status the queue does not know; keeping its row"
             );
             RowFate::Keep
         }
+    }
+}
+
+/// The classification itself: `None` means the status is not one the queue
+/// knows. A `pausing` or `paused` task's rows are kept without a warning:
+/// they are not admissible, and they start again, in their old places, when
+/// the task resumes.
+pub(crate) fn classify_row_fate(status: Option<&str>) -> Option<RowFate> {
+    match status {
+        None => Some(RowFate::Withdraw),
+        Some(status) if is_admissible(status) => Some(RowFate::Admissible),
+        Some(TASK_STATUS_PAUSING | TASK_STATUS_PAUSED) => Some(RowFate::Keep),
+        Some(TASK_STATUS_STUCK | TASK_STATUS_CLOSED | TASK_STATUS_CANCELLED) => {
+            Some(RowFate::Withdraw)
+        }
+        Some(_) => None,
     }
 }
 
@@ -160,6 +174,14 @@ pub(crate) struct TurnPermit {
     id: u64,
 }
 
+impl TurnPermit {
+    /// This permit's id, for tests that must prove *this* permit was dropped.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl Drop for TurnPermit {
     fn drop(&mut self) {
         self.gate
@@ -216,6 +238,10 @@ pub struct TurnGate {
     /// back. A claim counts each as a turn ahead of it, so it cannot start
     /// in the gap and overtake that turn.
     restoring: std::sync::Mutex<Vec<String>>,
+    /// How many dispatcher passes have run (tests only; the product never
+    /// reads it).
+    #[cfg(test)]
+    passes: AtomicU64,
 }
 
 /// Registers a failed admission as "maybe coming back" for claims;
@@ -253,6 +279,8 @@ impl TurnGate {
             queue_error: std::sync::Mutex::new(None),
             tick_ms: AtomicU64::new(DEFAULT_DISPATCH_TICK.as_millis() as u64),
             restoring: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            passes: AtomicU64::new(0),
         })
     }
 
@@ -268,6 +296,21 @@ impl TurnGate {
             gate: Arc::clone(self),
             project_id: project_id.to_string(),
         }
+    }
+
+    /// Whether the permit with `id` is still held (tests).
+    #[cfg(test)]
+    pub(crate) fn holds(&self, id: u64) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&id)
+    }
+
+    /// How many dispatcher passes have run (tests).
+    #[cfg(test)]
+    pub(crate) fn passes(&self) -> u64 {
+        self.passes.load(Ordering::SeqCst)
     }
 
     /// Shortens the dispatcher's tick (tests).
@@ -568,6 +611,11 @@ pub(super) enum Pass {
     Progress,
     /// Nothing can start now; wait for a wake or the tick.
     Idle,
+    /// The pass left a row it could not deal with, after dropping a permit
+    /// (or a restoring guard) whose drop stored a wake. Waiting on that wake
+    /// would run the pass again at once, forever: wait a full tick instead,
+    /// whatever wakes arrive.
+    Stalled,
 }
 
 /// Why a picked row was not started: it can never start, so it is deleted
@@ -758,15 +806,42 @@ impl WorkflowEngine {
                 if engine.turn_gate.stopping() {
                     return;
                 }
-                while engine.dispatch_pass().await == Pass::Progress {
-                    if engine.turn_gate.stopping() {
-                        return;
+                let mut stalled = false;
+                loop {
+                    match engine.dispatch_pass().await {
+                        Pass::Progress => {
+                            if engine.turn_gate.stopping() {
+                                return;
+                            }
+                        }
+                        Pass::Idle => break,
+                        Pass::Stalled => {
+                            stalled = true;
+                            break;
+                        }
                     }
                 }
                 let gate = &engine.turn_gate;
-                tokio::select! {
-                    () = gate.wake.notified() => {}
-                    () = tokio::time::sleep(gate.tick()) => {}
+                if stalled {
+                    // A full tick, fixed now: the wakes that the stalled
+                    // pass's own drops stored (and any that arrive) are
+                    // consumed, and end the wait only when the gate stops.
+                    let until = tokio::time::Instant::now() + gate.tick();
+                    loop {
+                        tokio::select! {
+                            () = gate.wake.notified() => {
+                                if gate.stopping() {
+                                    return;
+                                }
+                            }
+                            () = tokio::time::sleep_until(until) => break,
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        () = gate.wake.notified() => {}
+                        () = tokio::time::sleep(gate.tick()) => {}
+                    }
                 }
             }
         })
@@ -784,6 +859,8 @@ impl WorkflowEngine {
     /// 5. On a prepare or launch failure, fail the stage or branch as a
     ///    detached failure is failed, then delete the row.
     pub(super) async fn dispatch_pass(self: &Arc<Self>) -> Pass {
+        #[cfg(test)]
+        self.turn_gate.passes.fetch_add(1, Ordering::SeqCst);
         let candidate = match self.turn_gate.pick(None, true).await {
             Ok(picked) => {
                 self.record_withdrawn(&picked.withdrawn).await;
@@ -861,7 +938,7 @@ impl WorkflowEngine {
                     task_id = %row.task_id, stage = %row.stage, %err,
                     "failed to withdraw a queued turn that can never start; retrying next tick"
                 );
-                Pass::Idle
+                Pass::Stalled
             }
         }
     }
@@ -876,7 +953,7 @@ impl WorkflowEngine {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::error!(task_id, stage, %err, "could not read the state of a queued turn; it stays queued");
-                        return Pass::Idle;
+                        return Pass::Stalled;
                     }
                 }
             };
@@ -894,10 +971,10 @@ impl WorkflowEngine {
                 drop(permit);
                 return self.withdraw_row(&row, &why).await;
             }
-            RowFate::Keep => return Pass::Idle,
+            RowFate::Keep => return Pass::Stalled,
         }
         let Some(task) = task else {
-            return Pass::Idle;
+            return Pass::Stalled;
         };
         let state = read!(workflow_state::get(&self.pool, task_id).await);
         let Some(state) = state else {
@@ -923,7 +1000,7 @@ impl WorkflowEngine {
             }
             Err(err) => {
                 tracing::error!(task_id, stage, %err, "could not validate a queued turn; it stays queued");
-                return Pass::Idle;
+                return Pass::Stalled;
             }
         }
 
@@ -1145,8 +1222,10 @@ impl WorkflowEngine {
     /// neither a row nor a session, and nothing would show it. So the row
     /// is put back, in its old place, and a later pass tries again.
     ///
-    /// The pass goes idle, not on, whenever the row is still there, so a row
-    /// that cannot be dealt with is not retried in a hot loop.
+    /// The pass is `Stalled`, not `Progress` or `Idle`, whenever the row is
+    /// still there: the permit and the restoring guard dropped above each
+    /// stored a wake, and only a full tick's wait keeps a row that cannot be
+    /// dealt with from being retried in a hot loop.
     async fn fail_admission_inner(
         self: &Arc<Self>,
         row: &QueueRow,
@@ -1260,11 +1339,11 @@ impl WorkflowEngine {
                     );
                 }
             }
-            return Pass::Idle;
+            return Pass::Stalled;
         }
         match deleted {
             Ok(_) => Pass::Progress,
-            Err(_) => Pass::Idle,
+            Err(_) => Pass::Stalled,
         }
     }
 
@@ -1279,20 +1358,35 @@ impl WorkflowEngine {
 mod tests {
     use super::*;
 
+    use chocofactory_core::models::ALL_TASK_STATUSES;
+
     #[test]
     fn queue_row_fate_classifies_every_known_status_and_keeps_the_unknown() {
         assert_eq!(queue_row_fate(None), RowFate::Withdraw);
+        // Every listed status must be classified: reaching the unknown arm
+        // for one fails here.
+        for status in ALL_TASK_STATUSES {
+            assert!(
+                classify_row_fate(Some(status)).is_some(),
+                "status '{status}' is not classified by the queue"
+            );
+        }
         assert_eq!(queue_row_fate(Some("open")), RowFate::Admissible);
+        assert_eq!(queue_row_fate(Some("pausing")), RowFate::Keep);
+        assert_eq!(queue_row_fate(Some("paused")), RowFate::Keep);
         assert_eq!(queue_row_fate(Some("stuck")), RowFate::Withdraw);
         assert_eq!(queue_row_fate(Some("closed")), RowFate::Withdraw);
         assert_eq!(queue_row_fate(Some("cancelled")), RowFate::Withdraw);
+        assert_eq!(classify_row_fate(Some("some_new_status")), None);
         assert_eq!(queue_row_fate(Some("some_new_status")), RowFate::Keep);
     }
 
     #[test]
     fn only_open_is_admissible() {
-        assert!(is_admissible("open"));
-        for status in ["stuck", "closed", "cancelled", "other", ""] {
+        for status in ALL_TASK_STATUSES {
+            assert_eq!(is_admissible(status), status == "open", "{status}");
+        }
+        for status in ["other", ""] {
             assert!(!is_admissible(status), "{status}");
         }
     }

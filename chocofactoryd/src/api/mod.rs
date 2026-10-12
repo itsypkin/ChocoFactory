@@ -53,6 +53,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{id}/messages", post(tasks::send_message))
         .route("/tasks/{id}/cancel", post(tasks::cancel))
         .route("/tasks/{id}/retry", post(tasks::retry))
+        .route("/tasks/{id}/pause", post(tasks::pause))
+        .route("/tasks/{id}/resume", post(tasks::resume))
         .route("/tasks/{id}/events", get(events::list))
         .route("/tasks/{id}/events/live", get(ws::task_events))
         .route("/server", get(server::get))

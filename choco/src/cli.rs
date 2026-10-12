@@ -33,12 +33,13 @@ fn parse_duration_arg(s: &str) -> Result<DurationArg, String> {
 /// What `task status --until` waits for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Until {
-    /// The task's `status` equals this (`closed`, `cancelled`, `stuck`).
+    /// The task's `status` equals this (`closed`, `cancelled`, `stuck`,
+    /// `paused`).
     Status(String),
     /// The task has entered this stage (`stage:<name>`).
     Stage(String),
-    /// The task needs the user: open at a `human_gate` stage, or stuck,
-    /// cancelled or closed.
+    /// The task needs the user: open at a `human_gate` stage, or paused,
+    /// stuck, cancelled or closed.
     Attention,
 }
 
@@ -48,11 +49,11 @@ impl FromStr for Until {
     fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "attention" => Ok(Until::Attention),
-            "closed" | "cancelled" | "stuck" => Ok(Until::Status(s.to_string())),
+            "closed" | "cancelled" | "stuck" | "paused" => Ok(Until::Status(s.to_string())),
             _ => match s.strip_prefix("stage:") {
                 Some(name) if !name.is_empty() => Ok(Until::Stage(name.to_string())),
                 _ => Err(format!(
-                    "'{s}' is not a valid target — use attention, closed, cancelled, stuck or stage:<name>"
+                    "'{s}' is not a valid target — use attention, closed, cancelled, stuck, paused or stage:<name>"
                 )),
             },
         }
@@ -246,9 +247,12 @@ pub enum TaskCmd {
     ///   4  the task was cancelled, and cancelled was not the target
     ///   5  --timeout elapsed first
     ///   6  the task closed without reaching the target
+    ///   7  the task paused, and paused was not the target
     ///
     /// With --until attention the codes mean: 0 the task is open at a
-    /// human_gate stage (stderr names it); 3 stuck; 4 cancelled; 6 closed.
+    /// human_gate stage or paused (stderr names it); 3 stuck; 4 cancelled;
+    /// 6 closed. A pausing task never ends a watch; --live alone keeps
+    /// watching through a pause.
     ///
     /// --live alone does not stop at stuck (a human may retry it).
     #[command(verbatim_doc_comment)]
@@ -262,9 +266,10 @@ pub enum TaskCmd {
         #[arg(long)]
         live: bool,
         /// Block until the task reaches TARGET, then exit 0: `closed`,
-        /// `cancelled`, `stuck`, `stage:<name>`, or `attention` (the task
-        /// needs you: open at a human_gate stage, or stuck, cancelled or
-        /// closed; looks at the current state only). Implies watching.
+        /// `cancelled`, `stuck`, `paused`, `stage:<name>`, or `attention`
+        /// (the task needs you: open at a human_gate stage, or paused,
+        /// stuck, cancelled or closed; looks at the current state only).
+        /// Implies watching.
         #[arg(long, value_name = "TARGET")]
         until: Option<Until>,
         /// Poll cadence, `<integer><s|m|h>`. Needs --live or --until.
@@ -324,6 +329,30 @@ pub enum TaskCmd {
         /// resumed — the way out of a turn that keeps failing on resume.
         #[arg(long)]
         fresh: bool,
+    },
+    /// Hold a running task: its polls and watchers stop, nothing new starts.
+    ///
+    /// Without --now, an agent turn or shell command that is already running
+    /// finishes and its result is applied; the next stage is entered but not
+    /// started. The task is `pausing` until that work ends, then `paused`.
+    /// With --now, running agent turns are stopped (`choco task resume`
+    /// continues the same session where it can) and shell commands are
+    /// killed (resume runs them again). `choco task resume` undoes either.
+    Pause {
+        /// Task id.
+        id: String,
+        /// Also stop running agent turns and kill running shell commands.
+        #[arg(long)]
+        now: bool,
+    },
+    /// Continue a pausing or paused task: starts what was held.
+    ///
+    /// A poll or watcher goes on with the time it had left. A queued turn
+    /// keeps its place in line. An agent turn stopped by `pause --now` picks
+    /// up its session where it can.
+    Resume {
+        /// Task id.
+        id: String,
     },
     /// List tasks, optionally filtered by project and/or status.
     List {
