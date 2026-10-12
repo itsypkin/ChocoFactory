@@ -2630,9 +2630,14 @@ async fn group_admission_that_cannot_be_recorded(q: &Q) -> (Task, QueueRow, Turn
 async fn a_branch_failure_that_cannot_be_recorded_puts_the_row_back() {
     let q = Q::build(Some(2), queue_timers(), false).await;
     let (g, row, permit) = group_admission_that_cannot_be_recorded(&q).await;
-    // The branch's prompt file goes away: preparing the turn fails, before
-    // anything is launched, so the row is still the only trace of the turn.
-    fs::remove_file(q.dir.join("three.md")).unwrap();
+    // The role's CLI is unknown: preparing the turn fails, before anything is
+    // launched, so the row is still the only trace of the turn.
+    sqlx::query("UPDATE tasks SET config = ? WHERE id = ?")
+        .bind(json!({ "roles": { "coder": { "cli": "no-such-cli" } } }).to_string())
+        .bind(&g.id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
     let id = row.id;
     let queued_at = row.queued_at;
     assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
