@@ -339,7 +339,9 @@ impl WorkflowEngine {
         let stage = state.current_stage.clone();
         let definition = self.load_task_workflow(task).await.map_err(|err| {
             format!(
-                "the daemon restarted and could not load this task's workflow to check whether                  stage '{stage}' was interrupted: {err}; fix the workflow file, then retry"
+                "the daemon restarted and could not load this task's workflow to check \
+                 whether stage '{stage}' was interrupted: {err}; fix the workflow file, \
+                 then retry"
             )
         })?;
         let Some(stage_def) = definition.stages.get(&stage) else {
@@ -358,7 +360,14 @@ impl WorkflowEngine {
                             "the interrupted session of stage '{stage}' could not be read ({err})"
                         )
                     })?;
-                cut_off.push((stage.clone(), current));
+                // Only a session started on this entry of the stage was cut
+                // off; an earlier lap's belongs to a finished turn.
+                let this_entry = current.filter(|s| {
+                    state
+                        .stage_entered_at
+                        .is_none_or(|entered| s.started_at >= entered)
+                });
+                cut_off.push((stage.clone(), this_entry));
             }
             RestartEffect::PerBranch => {
                 let entry_no = state

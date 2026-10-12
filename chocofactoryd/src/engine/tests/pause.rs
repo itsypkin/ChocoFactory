@@ -392,6 +392,86 @@ async fn a_graceful_stop_leaves_a_pausing_turn_paused_not_stuck() {
     assert!(task_of(&q, &a.id).await.stuck_reason.is_none());
 }
 
+#[tokio::test]
+async fn the_sweep_ignores_a_session_from_an_earlier_entry_of_a_pausing_stage() {
+    // A task left `pausing` whose stage was entered (held) after its last
+    // session ended: that session belongs to an earlier lap and was not cut
+    // off, so the sweep neither records nor judges it.
+    let q = Q::new(None).await;
+    let task = q.task_at("coding", "open").await;
+    let old = sessions::create(
+        &q.pool,
+        sessions::NewSession {
+            task_id: &task.id,
+            stage: "coding",
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE tasks SET status = 'pausing', paused_at = ? WHERE id = ?")
+        .bind(Utc::now())
+        .bind(&task.id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workflow_state SET stage_entered_at = ? WHERE task_id = ?")
+        .bind(Utc::now() + chrono::Duration::hours(1))
+        .bind(&task.id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    let next = q.restarted_engine();
+    Q::sweep(&next).await;
+    assert_eq!(q.status(&task.id).await, "paused");
+    let after = sessions::get(&q.pool, &old.id).await.unwrap().unwrap();
+    assert_ne!(
+        after.end_reason,
+        Some(SessionEndReason::DaemonStopped),
+        "an earlier entry's session was not cut off by the crash"
+    );
+}
+
+#[tokio::test]
+async fn a_paused_end_whose_task_cannot_be_read_marks_the_task_stuck() {
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = q.create("job-a").await;
+    q.wait_started("job-a").await;
+    q.engine.pause_task(&a.id, true).await.unwrap();
+    q.wait_status(&a.id, "paused").await;
+    let old = q.sessions(&a.id).await.remove(0);
+    // The task row can no longer be decoded, but can still be written.
+    sqlx::query(
+        "UPDATE tasks SET status = 'open', paused_at = NULL, created_at = 'garbage' WHERE id = ?",
+    )
+    .bind(&a.id)
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(super::queue::FLOW, &q.dir).unwrap());
+    q.engine
+        .handle_requested_end(&a.id, &def, "coding", &old.id, None, None)
+        .await;
+    let status: String = sqlx::query_scalar("SELECT status FROM tasks WHERE id = ?")
+        .bind(&a.id)
+        .fetch_one(&q.pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "stuck");
+    let reason: String = sqlx::query_scalar("SELECT stuck_reason FROM tasks WHERE id = ?")
+        .bind(&a.id)
+        .fetch_one(&q.pool)
+        .await
+        .unwrap();
+    assert!(
+        reason.contains("could not read the task after a paused turn ended"),
+        "{reason}"
+    );
+}
+
 /// The worktree of the group task `g` made by `Q::create_group`.
 fn group_worktree(q: &Q, g: &Task) -> PathBuf {
     crate::worktree::worktree_path(&q.dir.join("repo"), "demo", &g.id).unwrap()

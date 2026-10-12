@@ -407,15 +407,16 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             // it leads to starts only on resume (#295). The status is read
             // after the reply; a failed read just gives the ordinary line.
             let held = match client.get_task(&id).await {
-                Ok(detail) => matches!(
-                    detail.get("status").and_then(Value::as_str),
-                    Some("pausing" | "paused")
-                ),
-                Err(_) => false,
+                Ok(detail) => detail
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .filter(|status| matches!(*status, "pausing" | "paused"))
+                    .map(str::to_owned),
+                Err(_) => None,
             };
-            if held {
+            if let Some(status) = held {
                 return Ok(Output::Accepted(format!(
-                    "Reply recorded; the task is paused, so the next stage starts when you run \
+                    "Reply recorded; the task is {status}, so the next stage starts when you run \
                      `choco task resume {id}`."
                 )));
             }

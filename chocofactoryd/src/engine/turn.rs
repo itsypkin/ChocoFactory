@@ -1290,11 +1290,22 @@ impl WorkflowEngine {
                     task_id, session_id, %err,
                     "could not read the task after a stopped turn"
                 );
-                if let Some(reason) = daemon_stopped {
-                    self.park_incomplete_turn(
-                        task_id, definition, stage_name, session_id, reason, branch,
-                    )
-                    .await;
+                match daemon_stopped {
+                    Some(reason) => {
+                        self.park_incomplete_turn(
+                            task_id, definition, stage_name, session_id, reason, branch,
+                        )
+                        .await;
+                    }
+                    None => {
+                        // A paused end nobody can place would leave the stage
+                        // with no work and no signal: make the task stuck.
+                        let reason = format!(
+                            "could not read the task after a paused turn ended: {err}; \
+                             retry to continue"
+                        );
+                        self.mark_stuck(task_id, &reason, false).await;
+                    }
                 }
                 return;
             }

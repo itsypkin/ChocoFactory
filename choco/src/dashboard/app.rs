@@ -366,7 +366,7 @@ impl App {
                 .cmp(&b.task.updated_at)
                 .then_with(|| a.task.id.cmp(&b.task.id))
         });
-        // Longest-paused last: the one that has waited longest is on top.
+        // Ascending by pause time: the task paused longest is first.
         paused.sort_by(|a, b| {
             a.task
                 .paused_at
