@@ -6,7 +6,9 @@
 
 use super::*;
 use crate::db::turn_queue::{self, QueueRow};
-use crate::engine::turns::{Claim, Pass, RowFate, TurnSpec, is_admissible, queue_row_fate};
+use crate::engine::turns::{
+    Claim, Pass, QueuedAt, RowFate, TurnPermit, TurnSpec, is_admissible, queue_row_fate,
+};
 use chocofactory_core::models::Project;
 
 const FLOW: &str = "name: qflow\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
@@ -2586,6 +2588,118 @@ async fn a_failed_admission_that_cannot_be_recorded_keeps_its_row_and_logs() {
     assert_eq!(q.engine.running_total(), 0);
     let text = logs.text();
     assert!(text.contains("could not be recorded"), "{text}");
+}
+
+/// Sets up a group under cap 2 with branch `three` queued, then lifts the
+/// cap so a permit can be had for it. Returns the task, its row and the
+/// permit; two triggers make every way of recording a failure fail.
+async fn group_admission_that_cannot_be_recorded(q: &Q) -> (Task, QueueRow, TurnPermit) {
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = q.create_group().await;
+    q.wait_started("one").await;
+    q.wait_started("two").await;
+    let row = q.rows().await.remove(0);
+    assert_eq!(row.stage, "three");
+    fs::write(&q.config, "max_agents: 0\n").unwrap();
+    let spec = TurnSpec {
+        stage: "three",
+        group: Some(("panel", row.group_entry.unwrap())),
+        resume_session_id: None,
+    };
+    let Claim::Start(permit) = q.engine.turn_gate().claim(&g.id, &spec).await.unwrap() else {
+        panic!("no limit: the turn starts");
+    };
+    for trigger in [
+        "CREATE TRIGGER refuse_stuck BEFORE UPDATE ON tasks WHEN NEW.status = 'stuck' \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        "CREATE TRIGGER refuse_state BEFORE UPDATE ON workflow_state \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    ] {
+        sqlx::query(trigger).execute(&q.pool).await.unwrap();
+    }
+    (g, row, permit)
+}
+
+/// A branch whose start failure cannot be recorded (neither as a branch
+/// failure nor as a stuck task) goes back to its old place in the queue.
+#[tokio::test]
+async fn a_branch_failure_that_cannot_be_recorded_puts_the_row_back() {
+    let q = Q::build(Some(2), queue_timers(), false).await;
+    let (g, row, permit) = group_admission_that_cannot_be_recorded(&q).await;
+    // The branch's prompt file goes away: preparing the turn fails, before
+    // anything is launched, so the row is still the only trace of the turn.
+    fs::remove_file(q.dir.join("three.md")).unwrap();
+    let id = row.id;
+    let queued_at = row.queued_at;
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
+    assert_eq!(q.status(&g.id).await, "open");
+    let rows = q.rows().await;
+    assert_eq!(rows.len(), 1, "the row is back");
+    assert_eq!(rows[0].id, id, "in its old place");
+    assert_eq!(rows[0].queued_at, queued_at);
+}
+
+/// The same when the workflow cannot even be loaded, so the group's
+/// definition is unknown and only the task can be marked.
+#[tokio::test]
+async fn a_branch_whose_workflow_is_gone_and_cannot_be_marked_puts_the_row_back() {
+    let q = Q::build(Some(2), queue_timers(), false).await;
+    let (g, row, permit) = group_admission_that_cannot_be_recorded(&q).await;
+    fs::remove_file(q.dir.join("qgroup.yaml")).unwrap();
+    let id = row.id;
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
+    assert_eq!(q.status(&g.id).await, "open");
+    let rows = q.rows().await;
+    assert_eq!(rows.len(), 1, "the row is back");
+    assert_eq!(rows[0].id, id, "in its old place");
+}
+
+/// Queue ids are never reused: a turn queued after the highest row was
+/// deleted still sorts after everything that was ever queued.
+#[tokio::test]
+async fn queue_ids_are_not_reused_after_the_highest_row_is_deleted() {
+    let q = Q::build(None, queue_timers(), false).await;
+    let a = q.task_at("coding", "open").await;
+    let b = q.task_at("coding", "open").await;
+    let first = q.insert_row(&a.id, "coding").await;
+    assert!(turn_queue::delete(&q.pool, first).await.unwrap());
+    let second = q.insert_row(&b.id, "coding").await;
+    assert!(second > first, "{second} reuses {first}");
+}
+
+/// While a failed admission may still put its row back, a claim in the same
+/// pool queues behind it instead of starting in the gap. The turn then comes
+/// back first, and nothing collides.
+#[tokio::test]
+async fn a_claim_in_the_gap_of_a_failed_admission_does_not_overtake_the_head() {
+    let q = Q::build(Some(1), queue_timers(), false).await;
+    let head = q.task_at("coding", "open").await;
+    let other = q.task_at("coding", "open").await;
+    let head_id = q.insert_row(&head.id, "coding").await;
+    let row = q.rows().await.remove(0);
+    // The gap: the head's row is deleted and its permit dropped.
+    assert!(turn_queue::delete(&q.pool, head_id).await.unwrap());
+    let gap = q.engine.turn_gate().hold_restoring(&q.project.id);
+    let spec = TurnSpec {
+        stage: "coding",
+        group: None,
+        resume_session_id: None,
+    };
+    let claim = q.engine.turn_gate().claim(&other.id, &spec).await.unwrap();
+    assert!(
+        matches!(claim, Claim::Queued(QueuedAt { position: 2 })),
+        "a free slot, but the head may come back: the claim waits behind it"
+    );
+    turn_queue::restore(&q.pool, &row).await.unwrap();
+    drop(gap);
+    let rows = q.rows().await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].task_id, head.id, "the head is first again");
+    assert_eq!(rows[1].task_id, other.id);
 }
 
 #[tokio::test]

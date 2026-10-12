@@ -1,6 +1,6 @@
 -- Agent turns waiting for a slot, first in first out by `id`.
 CREATE TABLE turn_queue (
-    id INTEGER PRIMARY KEY,                -- queue order; a new row is always after every existing one
+    id INTEGER PRIMARY KEY AUTOINCREMENT,             -- queue order; a new row is always after every existing one
     task_id TEXT NOT NULL REFERENCES tasks (id),
     stage TEXT NOT NULL,                   -- the agent stage, or the branch of a parallel group
     group_stage TEXT,                      -- that group; NULL for a top-level stage

@@ -211,6 +211,33 @@ pub struct TurnGate {
     stopping: AtomicBool,
     queue_error: std::sync::Mutex<Option<String>>,
     tick_ms: AtomicU64,
+    /// Projects of queued turns whose failed admission is being handled: the
+    /// row is deleted and its permit dropped, but the row may still be put
+    /// back. A claim counts each as a turn ahead of it, so it cannot start
+    /// in the gap and overtake that turn.
+    restoring: std::sync::Mutex<Vec<String>>,
+}
+
+/// Registers a failed admission as "maybe coming back" for claims;
+/// unregisters and wakes the dispatcher when dropped.
+struct RestoringGuard {
+    gate: Arc<TurnGate>,
+    project_id: String,
+}
+
+impl Drop for RestoringGuard {
+    fn drop(&mut self) {
+        let mut held = self
+            .gate
+            .restoring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(at) = held.iter().position(|p| *p == self.project_id) {
+            held.swap_remove(at);
+        }
+        drop(held);
+        self.gate.wake.notify_one();
+    }
 }
 
 impl TurnGate {
@@ -225,7 +252,22 @@ impl TurnGate {
             stopping: AtomicBool::new(false),
             queue_error: std::sync::Mutex::new(None),
             tick_ms: AtomicU64::new(DEFAULT_DISPATCH_TICK.as_millis() as u64),
+            restoring: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Marks a queued turn of `project_id` as maybe coming back, the way a
+    /// failed admission does while it is handled (tests).
+    #[cfg(test)]
+    pub(crate) fn hold_restoring(self: &Arc<Self>, project_id: &str) -> impl Drop + use<> {
+        self.restoring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(project_id.to_string());
+        RestoringGuard {
+            gate: Arc::clone(self),
+            project_id: project_id.to_string(),
+        }
     }
 
     /// Shortens the dispatcher's tick (tests).
@@ -348,7 +390,14 @@ impl TurnGate {
             let pool = pool_of(&task.project_id, &caps);
             let limit = limit_of(&pool, &caps, config.max_agents);
             let placed = place(turn_queue::list(&self.pool).await?, &caps);
-            let ahead = placed.iter().filter(|p| p.pool == pool).count() as u32;
+            let restoring = self
+                .restoring
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|project| pool_of(project, &caps) == pool)
+                .count() as u32;
+            let ahead = placed.iter().filter(|p| p.pool == pool).count() as u32 + restoring;
             let running = self.running_in(&pool, &caps);
             let starts = !self.stopping()
                 && match limit {
@@ -1108,11 +1157,24 @@ impl WorkflowEngine {
         let task_id = row.task_id.as_str();
         let stage = row.stage.as_str();
         tracing::error!(task_id, stage, %err, "a queued turn failed to start");
-        let deleted = {
+        let (deleted, _restoring) = {
             let _slot = self.turn_gate.slot.lock().await;
             let deleted = turn_queue::delete(&self.pool, row.id).await;
             drop(permit);
-            deleted
+            // Registered under the same slot guard as the delete, so no
+            // claim sees the row gone without seeing it as maybe coming back.
+            self.turn_gate
+                .restoring
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(row.project_id.clone());
+            (
+                deleted,
+                RestoringGuard {
+                    gate: self.turn_gate.clone(),
+                    project_id: row.project_id.clone(),
+                },
+            )
         };
         if let Err(delete_err) = &deleted {
             tracing::error!(
