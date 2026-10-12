@@ -1392,7 +1392,11 @@ async fn resume_leaves_a_failed_branch_to_its_watcher_so_siblings_still_report()
     let result = q.engine.resume_task_locked(&g.id).await;
     drop(guard);
     assert!(result.is_ok(), "{result:?}");
-    assert_ne!(q.status(&g.id).await, "stuck", "resume pre-empted the watcher");
+    assert_ne!(
+        q.status(&g.id).await,
+        "stuck",
+        "resume pre-empted the watcher"
+    );
     q.release("two");
     q.release("three");
     wait_slot(&q, &g.id, "two", "done").await;
@@ -1433,7 +1437,10 @@ async fn a_resume_that_cannot_mark_the_task_stuck_says_so_and_keeps_the_status()
     .await
     .unwrap();
     let err = q.engine.resume_task(&task.id).await.unwrap_err();
-    assert!(matches!(err, ResumeTaskError::StuckWriteFailed(_)), "{err:?}");
+    assert!(
+        matches!(err, ResumeTaskError::StuckWriteFailed(_)),
+        "{err:?}"
+    );
     assert!(!err.to_string().contains("now stuck"), "{err}");
     assert_eq!(q.status(&task.id).await, "paused");
 }
