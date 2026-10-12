@@ -708,6 +708,27 @@ mod tests {
         assert_eq!(cli.base_url.as_deref(), Some("http://x:1"));
     }
 
+    /// #295: `pause` is graceful unless `--now`; `resume` takes only an id.
+    #[test]
+    fn pause_takes_now_and_resume_takes_an_id() {
+        let graceful = Cli::parse_from(["choco", "task", "pause", "t1"]);
+        assert!(matches!(
+            graceful.command,
+            Command::Task(TaskCmd::Pause { ref id, now: false }) if id == "t1"
+        ));
+        let now = Cli::parse_from(["choco", "task", "pause", "t1", "--now"]);
+        assert!(matches!(
+            now.command,
+            Command::Task(TaskCmd::Pause { now: true, .. })
+        ));
+        let resume = Cli::parse_from(["choco", "task", "resume", "t1"]);
+        assert!(matches!(
+            resume.command,
+            Command::Task(TaskCmd::Resume { ref id }) if id == "t1"
+        ));
+        assert!(Cli::try_parse_from(["choco", "task", "resume", "t1", "--now"]).is_err());
+    }
+
     /// #92: `--resume` and `--fresh` are opposites, so asking for both is
     /// a parse error rather than one of them silently winning.
     #[test]

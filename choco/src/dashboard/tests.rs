@@ -282,7 +282,7 @@ fn sections_group_and_order_tasks() {
         summary("z2", "z2", "cancelled", None, None, "p"),
     ];
     load(&mut app, active, closed);
-    let [needs, progress, stuck_s, closed_s] = app.sections();
+    let [needs, progress, _paused, stuck_s, closed_s] = app.sections();
     // Oldest first; an unknown entry time last.
     assert_eq!(ids(&needs), ["b", "a", "g"]);
     // A stuck task at awaiting_human_review is Stuck, not Needs you; an
@@ -308,7 +308,7 @@ fn a_task_at_the_planned_workflows_question_gate_needs_you() {
         summary("w", "w", "open", Some("coding"), Some(5), "p"),
     ];
     load(&mut app, active, vec![]);
-    let [needs, progress, _, _] = app.sections();
+    let [needs, progress, _, _, _] = app.sections();
     assert_eq!(ids(&needs), ["q"]);
     assert_eq!(ids(&progress), ["w"]);
 }
@@ -1250,7 +1250,7 @@ fn cancel_on_a_closed_task_says_why_and_opens_no_prompt() {
     assert!(app.prompt.is_none());
     assert_eq!(
         app.status.as_ref().unwrap().text,
-        "cancel: task is closed, not open or stuck"
+        "cancel: task is closed, not open, paused or stuck"
     );
 }
 
@@ -1944,7 +1944,7 @@ fn the_status_view_shows_fields_progress_counters_and_the_event_tail() {
         String::new(),
         String::new(),
         String::new(),
-        "e events  o PR  r retry  c cancel  Esc back".into(),
+        "e events  o PR  r retry  p pause  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 100, 30), &expected);
@@ -2155,7 +2155,9 @@ fn the_expanded_view_has_the_full_stream_and_its_own_footer() {
         expected.push(format!("  {}  human_message message {n}", at(n)));
     }
     expected.extend(std::iter::repeat_n(String::new(), 20));
-    expected.push("PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  c cancel".into());
+    expected.push(
+        "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  c cancel".into(),
+    );
     assert_screen(&render(&app, 100, 30), &expected.join("\n"));
     // Scrolling still works there.
     push_events(&mut app, BUSY, 60);
@@ -2282,7 +2284,7 @@ fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
         "  … 3 earlier steps".into(),
         "  4  revising         done               internal_review  11:48:00  ◀ current".into(),
         "Loop counters  internal_review=2".into(),
-        "e events  o PR  r retry  c cancel  Esc back".into(),
+        "e events  o PR  r retry  p pause  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 100, 12), &expected);
@@ -3025,7 +3027,7 @@ fn the_80x24_status_view_shows_the_aligned_table() {
         format!("  {}  human_message message 4", at(4)),
         format!("  {}  human_message message 5", at(5)),
         format!("  {}  human_message message 6", at(6)),
-        "e events  o PR  r retry  c cancel  Esc back".into(),
+        "e events  o PR  r retry  p pause  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 80, 24), &expected);
@@ -3429,7 +3431,7 @@ fn the_120x40_status_view_shows_the_aligned_table() {
         assert_eq!(&lines[i], e, "line {i}\n{s}");
     }
     assert_eq!(
-        lines[39], "e events  o PR  r retry  c cancel  Esc back",
+        lines[39], "e events  o PR  r retry  p pause  c cancel  Esc back",
         "{s}"
     );
 }
@@ -4029,13 +4031,13 @@ fn selection_is_the_first_result_when_the_load_arrives_after_typing() {
 }
 
 fn long_fixture() -> Vec<TaskSummary> {
-    let statuses = ["open", "stuck", "closed", "cancelled"];
+    let statuses = chocofactory_core::models::ALL_TASK_STATUSES;
     (0..12)
         .map(|i| {
             let mut t = summary(
                 &format!("id{i:05}-aaaa"),
                 &format!("Long title {i} {}", "lorem ipsum dolor ".repeat(8)),
-                statuses[i % 4],
+                statuses[i % statuses.len()],
                 None,
                 None,
                 if i % 2 == 0 { "p-alpha" } else { "p-beta" },
@@ -4496,4 +4498,164 @@ fn a_summary_from_an_older_daemon_has_no_queued_turns() {
     v.as_object_mut().unwrap().remove("queued");
     let t: TaskSummary = serde_json::from_value(v).unwrap();
     assert!(t.queued.is_empty());
+}
+
+// ---- pause and resume (#295) -------------------------------------------------
+
+fn paused_summary(id: &str, status: &str, mins: i64) -> TaskSummary {
+    let mut t = summary(id, "Held", status, Some("coding"), Some(30), "p");
+    t.task.paused_at = Some(mins_ago(mins));
+    t
+}
+
+/// Every status on the list lands in exactly one section; a status added to
+/// the list without a section arm fails here.
+#[test]
+fn every_listed_status_lands_in_exactly_one_section() {
+    use chocofactory_core::models::ALL_TASK_STATUSES;
+    let mut app = new_app(Scope::AllProjects);
+    let make = |status: &str| paused_summary(&format!("t-{status}"), status, 5);
+    let active: Vec<TaskSummary> = ["open", "pausing", "paused", "stuck"]
+        .into_iter()
+        .map(make)
+        .collect();
+    let closed: Vec<TaskSummary> = ["closed", "cancelled"].into_iter().map(make).collect();
+    load(&mut app, active, closed);
+    let sections = app.sections();
+    for status in ALL_TASK_STATUSES {
+        let id = format!("t-{status}");
+        let homes: Vec<usize> = sections
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.iter().any(|t| t.task.id == id))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(homes.len(), 1, "'{status}' is in sections {homes:?}");
+    }
+    let names: Vec<&str> = Section::ALL.iter().map(|s| s.title()).collect();
+    assert_eq!(
+        names,
+        [
+            "NEEDS YOU",
+            "IN PROGRESS",
+            "PAUSED",
+            "STUCK",
+            "RECENTLY CLOSED"
+        ]
+    );
+    // Pausing and paused tasks share the Paused section, between In
+    // progress and Stuck.
+    assert_eq!(
+        ids(&sections[2]),
+        ["t-paused", "t-pausing"].map(String::from)
+    );
+    assert_eq!(ids(&sections[1]), ["t-open"].map(String::from));
+}
+
+#[test]
+fn the_paused_section_reads_paused_for_and_marks_a_pausing_stage() {
+    let mut app = new_app(Scope::AllProjects);
+    load(
+        &mut app,
+        vec![
+            paused_summary("aaaa1111-0", "paused", 7),
+            paused_summary("bbbb2222-0", "pausing", 2),
+        ],
+        vec![],
+    );
+    let screen = render(&app, 120, 24);
+    assert!(screen.contains("PAUSED (2)"), "{screen}");
+    assert!(screen.contains("paused for"), "{screen}");
+    assert!(screen.contains("coding · pausing"), "{screen}");
+}
+
+#[test]
+fn p_pauses_an_open_task_and_resumes_a_pausing_or_paused_one() {
+    let mut app = new_app(Scope::AllProjects);
+    load(
+        &mut app,
+        vec![
+            summary(
+                "open0000-0",
+                "Running",
+                "open",
+                Some("coding"),
+                Some(1),
+                "p",
+            ),
+            paused_summary("held0000-0", "paused", 3),
+            paused_summary("slow0000-0", "pausing", 3),
+            summary(
+                "stuck000-0",
+                "Broken",
+                "stuck",
+                Some("coding"),
+                Some(1),
+                "p",
+            ),
+        ],
+        vec![],
+    );
+    let on = |app: &mut App, id: &str| {
+        app.selected = Some(id.to_string());
+        ch(app, 'p')
+    };
+    assert_eq!(
+        on(&mut app, "open0000-0"),
+        vec![Effect::Pause("open0000-0".into())]
+    );
+    assert_eq!(
+        on(&mut app, "held0000-0"),
+        vec![Effect::Resume("held0000-0".into())]
+    );
+    assert_eq!(
+        on(&mut app, "slow0000-0"),
+        vec![Effect::Resume("slow0000-0".into())]
+    );
+    assert!(on(&mut app, "stuck000-0").is_empty());
+    assert_eq!(
+        app.status.as_ref().unwrap().text,
+        "pause: task is stuck, not open or paused"
+    );
+}
+
+#[test]
+fn r_on_a_paused_task_says_to_press_p_and_c_is_allowed() {
+    let mut app = new_app(Scope::AllProjects);
+    load(
+        &mut app,
+        vec![
+            paused_summary("held0000-0", "paused", 3),
+            paused_summary("slow0000-0", "pausing", 3),
+        ],
+        vec![],
+    );
+    for (id, status) in [("held0000-0", "paused"), ("slow0000-0", "pausing")] {
+        app.selected = Some(id.to_string());
+        assert!(ch(&mut app, 'r').is_empty());
+        assert!(app.prompt.is_none());
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            format!("task is {status}; press p to resume")
+        );
+        ch(&mut app, 'c');
+        assert!(app.prompt.is_some(), "cancel is allowed on {status}");
+        press(&mut app, KeyCode::Esc);
+    }
+}
+
+#[test]
+fn the_detail_view_shows_the_paused_row_and_how_long_ago() {
+    let mut app = new_app(Scope::AllProjects);
+    load(
+        &mut app,
+        vec![paused_summary("held0000-0", "paused", 3)],
+        vec![],
+    );
+    app.selected = Some("held0000-0".to_string());
+    press(&mut app, KeyCode::Enter);
+    let screen = render(&app, 120, 30);
+    assert!(screen.contains("Paused"), "{screen}");
+    assert!(screen.contains("choco task resume held0000-0"), "{screen}");
+    assert!(screen.contains("(paused 3m ago)"), "{screen}");
 }

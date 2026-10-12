@@ -3132,6 +3132,135 @@ mod tests {
         format!("{}\n{}", "a".repeat(39), "b".repeat(40))
     }
 
+    #[test]
+    fn the_paused_line_says_when_and_how_to_continue() {
+        assert_eq!(
+            paused_value(
+                "paused",
+                Some("2026-08-02T14:05:00Z"),
+                "t-1",
+                Some("coding")
+            )
+            .unwrap(),
+            "since 14:05 — choco task resume t-1"
+        );
+        assert_eq!(
+            paused_value("pausing", None, "t-1", Some("coding")).unwrap(),
+            "waiting for coding's turn to finish"
+        );
+        for status in chocofactory_core::models::ALL_TASK_STATUSES {
+            let line = paused_value(status, None, "t-1", None);
+            assert_eq!(
+                line.is_some(),
+                matches!(status, "pausing" | "paused"),
+                "{status}"
+            );
+        }
+        let detail = json!({
+            "id": "t-1", "title": "x", "project_id": "p", "workflow_def": "w",
+            "status": "paused", "paused_at": "2026-08-02T14:05:00Z",
+            "created_at": "2026-08-02T09:00:00Z",
+            "workflow_state": {"current_stage": "coding", "loop_counters": {}},
+        });
+        let fields = task_fields(&detail);
+        let paused = fields
+            .iter()
+            .find(|(label, _)| *label == LABEL_PAUSED)
+            .unwrap();
+        assert_eq!(paused.1, "since 14:05 — choco task resume t-1");
+        // Right after Status.
+        let at = fields.iter().position(|(l, _)| *l == LABEL_STATUS).unwrap();
+        assert_eq!(fields[at + 1].0, LABEL_PAUSED);
+    }
+
+    #[test]
+    fn pause_and_resume_say_what_happened() {
+        let outcome = |status: &str, mode: &str| PauseOutcome {
+            status: status.into(),
+            mode: mode.into(),
+            stage: "coding".into(),
+            running: 1,
+            stop_failures: vec!["coding: boom".into()],
+        };
+        let text = paused("t-1", &outcome("paused", "graceful"));
+        assert!(text.contains("paused at 'coding'") && text.contains("choco task resume t-1"));
+        assert!(text.contains("Could not stop coding: boom"), "{text}");
+        let text = paused("t-1", &outcome("pausing", "graceful"));
+        assert!(
+            text.contains("waiting for 'coding' to finish") && text.contains("--now"),
+            "{text}"
+        );
+        assert!(paused("t-1", &outcome("pausing", "now")).contains("stopping 1 running"));
+        let resumed_text = resumed(
+            "t-1",
+            &ResumeOutcome {
+                stage: "coding".into(),
+                started: vec!["coding".into()],
+                resumed: vec!["coding".into()],
+            },
+        );
+        assert!(
+            resumed_text.contains("coding (resuming its session)"),
+            "{resumed_text}"
+        );
+        let none = resumed(
+            "t-1",
+            &ResumeOutcome {
+                stage: "coding".into(),
+                started: vec![],
+                resumed: vec![],
+            },
+        );
+        assert!(none.contains("Nothing needed starting"), "{none}");
+    }
+
+    #[test]
+    fn the_pause_events_read_as_one_line_each() {
+        let ev = |t, p| event(t, p);
+        assert_eq!(
+            event_summary(&ev(
+                EventType::TaskPausing,
+                json!({"mode": "graceful", "stage": "coding", "running": 1, "stop_failures": []})
+            )),
+            "pause requested at coding: 1 running, left to finish"
+        );
+        assert!(
+            event_summary(&ev(
+                EventType::TaskPausing,
+                json!({"mode": "now", "stage": "coding", "running": 2, "stop_failures": ["x: boom"]})
+            ))
+            .contains("stopping 2 running; could not stop: x: boom")
+        );
+        assert_eq!(
+            event_summary(&ev(EventType::TaskPaused, json!({"stage": "coding"}))),
+            "paused at coding"
+        );
+        assert_eq!(
+            event_summary(&ev(
+                EventType::TaskResumed,
+                json!({"stage": "coding", "started": ["coding"]})
+            )),
+            "resumed at coding: started coding"
+        );
+        assert_eq!(
+            event_summary(&ev(EventType::StageHeld, json!({"stage": "checks"}))),
+            "checks  held: the task is paused"
+        );
+    }
+
+    #[test]
+    fn a_branchs_running_time_ticks_while_pausing_but_not_while_paused() {
+        let ticking = |status: &str| {
+            let table = detail_branches(&group_detail(status), test_now(), None).unwrap();
+            let rows = branch_cells(&group_detail(status), None);
+            let _ = table;
+            rows.iter().any(|row| row.iter().any(|cell| cell == "5m"))
+        };
+        assert!(ticking("open"));
+        assert!(ticking("pausing"));
+        assert!(!ticking("paused"));
+    }
+
     fn group_detail(status: &str) -> Value {
         json!({
             "id": "t-7", "title": "x", "project_id": "p", "workflow_def": "review",

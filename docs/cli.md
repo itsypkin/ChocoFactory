@@ -54,7 +54,9 @@ choco server status                # version, pid, port, uptime, open tasks, in-
   tasks marked `stuck` (`choco task retry <id>` continues them; an agent turn
   resumes its session). Tasks waiting on a poll or a human are not affected.
   Without `--force`, `stop` refuses (exit 3) and lists in-flight work instead.
-  A turn that is still waiting for an agent slot (see
+  A `pausing` task with a turn or command still running counts as in-flight
+  work and blocks `stop` (exit 3); a `paused` task does not, and stays paused
+  across the restart. A turn that is still waiting for an agent slot (see
   [below](#limiting-how-many-agents-run-at-once)) is not in flight: it has no
   process, so it never blocks `stop`, `restart` or `choco update`, and it stays
   queued, in order, across the restart. When any turn is queued, these
@@ -251,7 +253,7 @@ include its sub-agents and side calls but not a response omp discarded, and the
 per-model split adds up to them. A task created by an older version, before
 usage was recorded, prints the single line `Cost & time  no data`.
 
-*Wall time* runs from creation to now while the task is open or stuck, and to its
+*Wall time* runs from creation to now while the task is open, pausing, paused or stuck, and to its
 last update after that. *Active time* adds up the stages the task spent working,
 leaving out time at a `human_gate` and in a `terminal` stage; it comes from the
 stage trail, so it reads `no data` once that trail has aged out of retention.
@@ -419,9 +421,61 @@ chat task  ed9e8a7d-e5d4-4aeb-b04c-b47d14145940  open    chat      2026-08-01 12
 
 $ choco task list --project acme          # by name or id
 $ choco task list --status open           # free-form, not a fixed enum
-$ choco task list --status cancelled      # open | closed | cancelled | stuck today
+$ choco task list --status cancelled      # open | pausing | paused | stuck | closed | cancelled
+$ choco task list --status pausing,paused # a comma list works too
 $ choco project list
 ```
+
+## Pausing a task
+
+To free the machine for a while, or to stop one task while another finishes,
+pause it instead of cancelling it:
+
+```
+$ choco task pause bb93ada3-...
+Task bb93ada3-... is pausing: waiting for 'coding' to finish (1 running). It is
+paused once that ends; `choco task pause bb93ada3-... --now` stops it sooner.
+$ choco task status bb93ada3-... --until paused
+$ choco task resume bb93ada3-...
+```
+
+A paused task has its own status, and so does the stretch before it:
+
+| Status | Means |
+|---|---|
+| `pausing` | The pause was asked for, and an agent turn or shell command the task had already started is still running. |
+| `paused` | The pause was asked for, and nothing of the task's is running. |
+
+`choco task status` shows a `Paused` line: `since 14:05 — choco task resume
+<id>` for a paused task, `waiting for <stage>'s turn to finish` for a pausing
+one.
+
+- **Graceful (the default).** Polls and gate watchers stop at once. A running
+  agent turn or shell command finishes and its result is applied; the next
+  stage is entered but not started. When the last one ends the task becomes
+  `paused`.
+- **`--now`.** Also stops running agent turns (the session ends `paused`, and
+  `resume` continues the same session where the CLI can) and kills running
+  shell commands (`resume` runs them again from the start). A parallel group
+  pauses as a whole: its running branches are stopped and their slots stay
+  unsettled.
+- **Queued turns** of a paused task keep their place in line, are skipped
+  while it is paused, and start ahead of turns queued later once it resumes.
+- **Time.** A poll or watcher keeps the part of its timeout it had left; the
+  time spent paused does not count. An agent turn's own timers run only while
+  its turn runs.
+- **Replies at a gate** while paused are recorded, but the stage they lead to
+  starts only on `resume`. `choco task send` says so.
+- **Refused with a `409`.** `pause` of a task that is already paused, pausing
+  without `--now`, stuck (`retry` or `cancel` it), closed or cancelled.
+  `resume` of an open, stuck, closed or cancelled task. `retry` and `send`
+  (to a chat) on a pausing or paused task both point to `choco task resume
+  <id>`. Nothing starts and the status does not change.
+- A turn or command that fails while the task is `pausing` makes the task
+  `stuck` (no longer paused). `choco task cancel` works from `pausing` and
+  `paused`.
+- A daemon restart keeps a paused task paused. A turn cut off while pausing
+  is continued by `resume`, which resumes that session as `retry` would.
 
 ## Limiting how many agents run at once
 
@@ -511,10 +565,10 @@ hand-written polling loop. It polls the daemon (`GET /tasks/<id>`).
 
 `<dur>` is `<integer><s|m|h>`, non-zero, the same spelling as workflow YAML
 (`5s`, `30s`, `5m`, `1h`). `<target>` is `attention`, `closed`, `cancelled`,
-`stuck`, or `stage:<name>` (the task has entered that stage, even if it
+`stuck`, `paused`, or `stage:<name>` (the task has entered that stage, even if it
 already left it between two polls). `attention` means the task needs you: it
 is open at any `human_gate` stage (whatever the stage is called), or it is
-stuck, cancelled or closed. It looks at the current state only, so a watch
+paused, stuck, cancelled or closed. It looks at the current state only, so a watch
 started while the task already sits at a gate returns at once. The `stage:` prefix keeps stage names apart from
 statuses. A `--live` watch alone does not stop at `stuck`, since a human may
 `choco task retry` it.
@@ -528,9 +582,12 @@ statuses. A `--live` watch alone does not stop at `stuck`, since a human may
 | 4 | The task was cancelled, and `cancelled` was not the target. |
 | 5 | `--timeout` elapsed first. |
 | 6 | The task closed without reaching the target. |
+| 7 | The task paused, and `paused` was not the target. |
 
 Under `--until attention` the codes mean: 0 the task is open at a
-`human_gate` stage (stderr says which stage); 3 stuck; 4 cancelled; 6 closed.
+`human_gate` stage or is paused (stderr says which stage); 3 stuck; 4
+cancelled; 6 closed. A `pausing` task never ends a watch, and `--live` alone
+keeps watching through a pause.
 
 Every non-zero exit from a watch explains itself on stderr.
 
@@ -581,12 +638,13 @@ $ choco dashboard [--project <name|id>] [--interval <dur>] [--closed <N>]
 
 `--interval` is how often it polls (default `2s`); `--closed` is how many
 recently closed or cancelled tasks to show (default 10). The screen is one
-scrollable list in four sections:
+scrollable list in five sections:
 
 | Section | Holds | Ordered |
 |---|---|---|
 | Needs you | `open` tasks at a `human_gate`, in any workflow | longest waiting first |
 | In progress | every other `open` task, with its laps (the largest loop counter, `×N`) | longest in its stage first |
+| Paused | `pausing` and `paused` tasks; the time column reads "paused for" | longest paused first |
 | Stuck | `stuck` tasks, whatever their stage, with the first line of the reason | longest stuck first |
 | Recently closed | the latest `closed` and `cancelled` tasks | newest first |
 
@@ -606,8 +664,9 @@ Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off
 | `⏎` | open the task's status view: the fields and progress `choco task status` shows (for a parallel group, its branch table too), the loop counters, what the task is waiting for, its PR, a `Cost` row (`≈ $0.09 (API-equivalent) · wall 2h05m · active 1h10m`, or `no data`) and the last 5 events, following new ones (`Esc` returns) |
 | `e` | in the detail: the full event stream (the last 200 events, following new ones; `PgUp`/`PgDn` scroll back, `End` follows again); `e` or `Esc` returns to the status view |
 | `o` | open the task's pull request |
-| `r` | retry a `stuck` task |
-| `c` | cancel an `open` or `stuck` task |
+| `r` | retry a `stuck` task (on a pausing or paused one it says to press `p`) |
+| `p` | pause an `open` task (graceful only; there is no `--now` here), or resume a `pausing` or `paused` one |
+| `c` | cancel an `open`, `pausing`, `paused` or `stuck` task |
 | `/` | search every task by PR number, title or id (from the list or the detail view) |
 | `?` | list the keys |
 | `q`, `Ctrl-C` | quit |

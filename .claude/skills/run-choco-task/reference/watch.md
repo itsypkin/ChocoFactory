@@ -14,18 +14,23 @@
 `choco task status <id> --until attention --timeout <dur>` waits for every
 stop that needs you: the task is open at a `human_gate` stage
 (`spec_questions`, `awaiting_human_review`, `escalate_to_human`, or any gate
-a custom workflow defines), or it is stuck, cancelled or closed. It looks at
+a custom workflow defines), or it is paused, stuck, cancelled or closed. It looks at
 the current state only, so started while the task already sits at a gate it
 returns at once. The exit code says how it ended:
 
 | Exit | Meaning under `attention` |
 |---|---|
-| 0 | waiting for you at a gate; stderr names the stage |
+| 0 | waiting for you at a gate, or paused; stderr names the stage |
 | 1 | error (unknown task, daemon unreachable) |
 | 3 | `stuck` |
 | 4 | cancelled |
 | 5 | `--timeout` elapsed |
 | 6 | closed |
+
+`--until paused` waits for a pause and exits 0. Any other target (`closed`,
+`stuck`, `stage:<name>`, and so on) ends with exit 7 when the task becomes
+`paused`; a `pausing` task never ends a watch, and `--live` alone keeps
+watching through a pause. `choco task resume <id>` continues a paused task.
 
 After a PR vote (a `/approve` or `/request-changes` comment) the task stays
 at `awaiting_human_review` until the daemon's poll reads the comment, up to
@@ -123,8 +128,9 @@ Branches
 - `result or reason` is the result of a `done` branch and the reason of a
   `failed` one, cut to 60 characters; the full text is in the JSON.
 - `time` is `ended − started` for a finished branch. For a `running` branch
-  it is the time since it started while the task is `open`; for a task that
-  is cancelled or stuck it is `-`, as it is when a time is missing.
+  it is the time since it started while the task is `open` or `pausing`; for a
+  task that is paused, cancelled or stuck it is `-`, as it is when a time is
+  missing.
 - `cost` is `≈ $…` for the branch's turn in the group's current entry,
   `cost unknown` when the turn recorded usage without a cost, and `no data`
   when no turn recorded usage for it.

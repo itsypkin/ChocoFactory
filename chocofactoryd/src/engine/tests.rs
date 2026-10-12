@@ -6,6 +6,7 @@ use serde_json::json;
 use super::*;
 
 mod parallel;
+mod pause;
 mod queue;
 
 #[test]

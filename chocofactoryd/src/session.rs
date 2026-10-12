@@ -4077,6 +4077,49 @@ mod tests {
         turn
     }
 
+    /// A pause `--now` (#295) ranks below a cancel and above the daemon
+    /// stopping; a completed turn keeps its ordinary result; a standing
+    /// session is never ended `paused`.
+    #[test]
+    fn a_pause_ranks_between_cancelled_and_daemon_stopped() {
+        use SessionEndReason::{Cancelled, DaemonStopped, Paused};
+        use SessionKind::{SingleShot, Standing};
+        use SessionStatus::{Exited, Idle};
+        let silent = SingleShotTurn::default();
+        let completed = turn_with(|t| t.completed = true);
+        let ranked = |kind, turn: &SingleShotTurn, cancelled, paused, stopping| {
+            final_run_state_ranked(kind, turn, false, false, cancelled, paused, stopping)
+        };
+        assert_eq!(
+            ranked(SingleShot, &silent, false, true, false),
+            (Exited, Some(Paused))
+        );
+        assert_eq!(
+            ranked(SingleShot, &silent, true, true, false),
+            (Exited, Some(Cancelled)),
+            "cancelled beats paused"
+        );
+        assert_eq!(
+            ranked(SingleShot, &silent, false, true, true),
+            (Exited, Some(Paused)),
+            "paused beats daemon stopped"
+        );
+        assert_eq!(
+            ranked(SingleShot, &silent, false, false, true),
+            (Exited, Some(DaemonStopped))
+        );
+        assert_eq!(
+            ranked(SingleShot, &completed, false, true, false),
+            (Idle, None),
+            "a completed turn keeps its ordinary result"
+        );
+        assert_eq!(
+            ranked(Standing, &silent, false, true, false).1,
+            None,
+            "a pause never stops a standing session"
+        );
+    }
+
     /// `final_run_state` is where every way a run can end is decided, so its
     /// precedence is pinned case by case rather than only through the live
     /// tests that happen to reach some of them.

@@ -11,13 +11,13 @@ use crate::engine::turns::{
 };
 use chocofactory_core::models::Project;
 
-const FLOW: &str = "name: qflow\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
+pub(super) const FLOW: &str = "name: qflow\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
 
 const GROUP_FLOW: &str = "name: qgroup\nworktree: true\nroles:\n  coder:\n    cli: claude\n    model: sonnet\n    read_only: true\n    disallowed_tools: [edit, write, notebook_edit]\nstages:\n  panel:\n    kind: parallel\n    branches:\n      one: { kind: agent_turn, role: coder, prompt_file: one.md }\n      two: { kind: agent_turn, role: coder, prompt_file: two.md }\n      three: { kind: agent_turn, role: coder, prompt_file: three.md }\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
 
 /// What a held turn does after its release file appears.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Ending {
+pub(super) enum Ending {
     /// Reports `done` and ends.
     Report,
     /// Exits without reporting.
@@ -30,7 +30,7 @@ enum Ending {
     Lingers,
 }
 
-fn held(dir: &Path, name: &str, ending: Ending) -> Vec<Value> {
+pub(super) fn held(dir: &Path, name: &str, ending: Ending) -> Vec<Value> {
     let mut steps = vec![
         json!({"op": "read_turn"}),
         json!({"op": "run", "command": format!("touch '{}'", dir.join(format!("started-{name}")).display())}),
@@ -60,15 +60,15 @@ fn held(dir: &Path, name: &str, ending: Ending) -> Vec<Value> {
     steps
 }
 
-struct Q {
-    pool: SqlitePool,
-    engine: Arc<WorkflowEngine>,
-    dir: TempDir,
-    config: PathBuf,
-    flow: PathBuf,
-    project: Project,
-    names: std::sync::Mutex<Vec<String>>,
-    dispatcher: Option<JoinHandle<()>>,
+pub(super) struct Q {
+    pub(super) pool: SqlitePool,
+    pub(super) engine: Arc<WorkflowEngine>,
+    pub(super) dir: TempDir,
+    pub(super) config: PathBuf,
+    pub(super) flow: PathBuf,
+    pub(super) project: Project,
+    pub(super) names: std::sync::Mutex<Vec<String>>,
+    pub(super) dispatcher: Option<JoinHandle<()>>,
 }
 
 impl Drop for Q {
@@ -83,7 +83,7 @@ impl Drop for Q {
     }
 }
 
-fn queue_timers() -> crate::session::TurnTimers {
+pub(super) fn queue_timers() -> crate::session::TurnTimers {
     crate::session::TurnTimers {
         grace: StdDuration::from_millis(300),
         nudge_after: StdDuration::from_millis(200),
@@ -94,11 +94,11 @@ fn queue_timers() -> crate::session::TurnTimers {
 
 impl Q {
     /// `max_agents` is written into `config.yaml` when given.
-    async fn new(max_agents: Option<u32>) -> Q {
+    pub(super) async fn new(max_agents: Option<u32>) -> Q {
         Q::build(max_agents, queue_timers(), true).await
     }
 
-    async fn build(
+    pub(super) async fn build(
         max_agents: Option<u32>,
         timers: crate::session::TurnTimers,
         dispatch: bool,
@@ -165,7 +165,7 @@ impl Q {
 
     /// Sets what each named turn does. A turn's name is the input its task is
     /// created with; none may contain another.
-    fn script(&self, turns: &[(&str, Ending)]) {
+    pub(super) fn script(&self, turns: &[(&str, Ending)]) {
         let mut by_prompt = serde_json::Map::new();
         let mut names = self.names.lock().unwrap();
         for (name, ending) in turns {
@@ -179,7 +179,7 @@ impl Q {
         .unwrap();
     }
 
-    async fn create_in(&self, project_id: &str, name: &str) -> Task {
+    pub(super) async fn create_in(&self, project_id: &str, name: &str) -> Task {
         self.engine
             .create_task_from(
                 project_id,
@@ -194,21 +194,21 @@ impl Q {
             .unwrap()
     }
 
-    async fn create(&self, name: &str) -> Task {
+    pub(super) async fn create(&self, name: &str) -> Task {
         self.create_in(&self.project.id.clone(), name).await
     }
 
-    async fn project(&self, name: &str, cap: Option<u32>) -> Project {
+    pub(super) async fn project(&self, name: &str, cap: Option<u32>) -> Project {
         projects::create_capped(&self.pool, name, None, cap)
             .await
             .unwrap()
     }
 
-    fn started(&self, name: &str) -> bool {
+    pub(super) fn started(&self, name: &str) -> bool {
         self.dir.join(format!("started-{name}")).exists()
     }
 
-    async fn wait_started(&self, name: &str) {
+    pub(super) async fn wait_started(&self, name: &str) {
         crate::test_support::wait_until(&format!("{name} to start"), || async {
             if self.started(name) {
                 Ok(())
@@ -221,20 +221,20 @@ impl Q {
 
     /// The turn has not started, and (after a pause long enough for a wrong
     /// start to show) still has not.
-    async fn assert_not_started(&self, name: &str) {
+    pub(super) async fn assert_not_started(&self, name: &str) {
         tokio::time::sleep(StdDuration::from_millis(250)).await;
         assert!(!self.started(name), "{name} started but should be waiting");
     }
 
-    fn release(&self, name: &str) {
+    pub(super) fn release(&self, name: &str) {
         fs::write(self.dir.join(format!("release-{name}")), "").unwrap();
     }
 
-    async fn rows(&self) -> Vec<QueueRow> {
+    pub(super) async fn rows(&self) -> Vec<QueueRow> {
         turn_queue::list(&self.pool).await.unwrap()
     }
 
-    async fn wait_rows(&self, n: usize) -> Vec<QueueRow> {
+    pub(super) async fn wait_rows(&self, n: usize) -> Vec<QueueRow> {
         crate::test_support::wait_until(&format!("{n} queue row(s)"), || async {
             let rows = self.rows().await;
             if rows.len() == n {
@@ -246,7 +246,7 @@ impl Q {
         .await
     }
 
-    async fn wait_running(&self, n: usize) {
+    pub(super) async fn wait_running(&self, n: usize) {
         crate::test_support::wait_until(&format!("{n} running turn(s)"), || async {
             let running = self.engine.running_total();
             if running == n {
@@ -258,15 +258,15 @@ impl Q {
         .await
     }
 
-    async fn sessions(&self, task_id: &str) -> Vec<Session> {
+    pub(super) async fn sessions(&self, task_id: &str) -> Vec<Session> {
         sessions::list_for_task(&self.pool, task_id).await.unwrap()
     }
 
-    async fn events(&self, task_id: &str) -> Vec<chocofactory_core::models::Event> {
+    pub(super) async fn events(&self, task_id: &str) -> Vec<chocofactory_core::models::Event> {
         events::list_for_task(&self.pool, task_id).await.unwrap()
     }
 
-    async fn queue_events(&self, task_id: &str, kind: EventType) -> Vec<Value> {
+    pub(super) async fn queue_events(&self, task_id: &str, kind: EventType) -> Vec<Value> {
         self.events(task_id)
             .await
             .into_iter()
@@ -275,7 +275,7 @@ impl Q {
             .collect()
     }
 
-    async fn status(&self, task_id: &str) -> String {
+    pub(super) async fn status(&self, task_id: &str) -> String {
         tasks::get(&self.pool, task_id)
             .await
             .unwrap()
@@ -283,12 +283,12 @@ impl Q {
             .status
     }
 
-    async fn wait_status(&self, task_id: &str, status: &str) {
+    pub(super) async fn wait_status(&self, task_id: &str, status: &str) {
         wait_until_task_status(&self.pool, task_id, status).await
     }
 
     /// The task's position in line, from the snapshot the API serves.
-    async fn position(&self, task_id: &str) -> Option<u32> {
+    pub(super) async fn position(&self, task_id: &str) -> Option<u32> {
         let snapshot = self.engine.queue_snapshot().await.unwrap();
         snapshot.queued_for(task_id).first().map(|q| q.position)
     }
@@ -303,14 +303,24 @@ fn queue_row_fate_has_an_arm_for_every_status() {
     assert_eq!(queue_row_fate(Some("stuck")), RowFate::Withdraw);
     assert_eq!(queue_row_fate(Some("closed")), RowFate::Withdraw);
     assert_eq!(queue_row_fate(Some("cancelled")), RowFate::Withdraw);
+    assert_eq!(queue_row_fate(Some("pausing")), RowFate::Keep);
     assert_eq!(queue_row_fate(Some("paused")), RowFate::Keep);
+    // Every listed status is classified: the unknown arm is for strings
+    // that are not on the list.
+    for status in chocofactory_core::models::ALL_TASK_STATUSES {
+        assert!(
+            crate::engine::turns::classify_row_fate(Some(status)).is_some(),
+            "'{status}' reaches the queue's unknown arm"
+        );
+    }
 }
 
 #[tokio::test]
 async fn the_sql_and_rust_admissible_predicates_agree_for_every_status() {
     let q = Q::new(None).await;
-    for (i, status) in ["open", "stuck", "closed", "cancelled", "other"]
+    for (i, status) in chocofactory_core::models::ALL_TASK_STATUSES
         .into_iter()
+        .chain(["other"])
         .enumerate()
     {
         let task = tasks::create(
@@ -856,7 +866,7 @@ async fn aborting_the_turn_watcher_frees_its_slot_and_the_next_turn_starts() {
 
 impl Q {
     /// A task row with its workflow state, but no turn started.
-    async fn create_in_without_start(&self, name: &str) -> Task {
+    pub(super) async fn create_in_without_start(&self, name: &str) -> Task {
         let def = Arc::new(WorkflowDefinition::parse(FLOW, &self.dir).unwrap());
         tasks::create(
             &self.pool,
@@ -882,7 +892,7 @@ impl Q {
 impl Q {
     /// Sets what each branch of the group workflow does: `(marker, name,
     /// ending)` where the marker is the branch's prompt text.
-    fn script_branches(&self, branches: &[(&str, &str, Ending)]) {
+    pub(super) fn script_branches(&self, branches: &[(&str, &str, Ending)]) {
         let mut by_prompt = serde_json::Map::new();
         let mut names = self.names.lock().unwrap();
         for (marker, name, ending) in branches {
@@ -896,7 +906,7 @@ impl Q {
         .unwrap();
     }
 
-    async fn create_group(&self) -> Task {
+    pub(super) async fn create_group(&self) -> Task {
         // Branches are read-only, so their turns snapshot a git worktree.
         let repo = self.dir.join("repo");
         if !repo.exists() {
@@ -918,7 +928,7 @@ impl Q {
     }
 
     /// A second daemon on the same database: what a restart builds.
-    fn restarted_engine(&self) -> Arc<WorkflowEngine> {
+    pub(super) fn restarted_engine(&self) -> Arc<WorkflowEngine> {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(
             self.dir.join("fake-claude-queue").display().to_string(),
         ));
@@ -943,7 +953,7 @@ impl Q {
 
     /// The old daemon dies, and the new one does what `main` does at
     /// startup, before serving.
-    async fn crash_and_sweep(&self, engine: &Arc<WorkflowEngine>) {
+    pub(super) async fn crash_and_sweep(&self, engine: &Arc<WorkflowEngine>) {
         if let Some(dispatcher) = &self.dispatcher {
             dispatcher.abort();
         }
@@ -951,7 +961,7 @@ impl Q {
         Q::sweep(engine).await;
     }
 
-    async fn sweep(engine: &Arc<WorkflowEngine>) {
+    pub(super) async fn sweep(engine: &Arc<WorkflowEngine>) {
         sessions::recover_stale_active_sessions(&engine.pool)
             .await
             .unwrap();
@@ -959,19 +969,25 @@ impl Q {
         engine.resume_interrupted_polls().await.unwrap();
     }
 
-    async fn task_row(&self, name: &str) -> Task {
+    pub(super) async fn task_row(&self, name: &str) -> Task {
         self.create_in_without_start(name).await
     }
 
     /// An open task parked at `coding` with a workflow state, as if its turn
     /// had been entered.
-    async fn task_at(&self, stage: &str, status: &str) -> Task {
+    pub(super) async fn task_at(&self, stage: &str, status: &str) -> Task {
         self.task_with(stage, status, &self.flow.display().to_string(), json!({}))
             .await
     }
 
     /// [`Self::task_at`] with the workflow file and the task config chosen.
-    async fn task_with(&self, stage: &str, status: &str, workflow: &str, config: Value) -> Task {
+    pub(super) async fn task_with(
+        &self,
+        stage: &str,
+        status: &str,
+        workflow: &str,
+        config: Value,
+    ) -> Task {
         let task = tasks::create(
             &self.pool,
             tasks::NewTask {
@@ -1009,7 +1025,7 @@ impl Q {
         task
     }
 
-    async fn insert_row(&self, task_id: &str, stage: &str) -> i64 {
+    pub(super) async fn insert_row(&self, task_id: &str, stage: &str) -> i64 {
         turn_queue::insert(
             &self.pool,
             turn_queue::NewQueueRow {
@@ -2396,7 +2412,7 @@ async fn a_queue_that_cannot_be_written_leaves_the_dispatcher_idle_and_the_task_
     let pass = q.engine.admit(row, permit).await;
     assert_eq!(
         pass,
-        Pass::Idle,
+        Pass::Stalled,
         "no hot loop on a row that cannot be deleted"
     );
     assert_eq!(
@@ -2418,7 +2434,7 @@ async fn a_queue_that_cannot_be_written_leaves_the_dispatcher_idle_and_the_task_
 
 /// Captures what the code under test logs, on this thread.
 #[derive(Clone, Default)]
-struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+pub(super) struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl std::io::Write for LogBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -2438,7 +2454,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
 }
 
 impl LogBuf {
-    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+    pub(super) fn capture(&self) -> tracing::subscriber::DefaultGuard {
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
@@ -2446,7 +2462,7 @@ impl LogBuf {
                 .finish(),
         )
     }
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
 }
@@ -2580,7 +2596,7 @@ async fn a_failed_admission_that_cannot_be_recorded_keeps_its_row_and_logs() {
     let Claim::Start(permit) = q.engine.turn_gate().claim(&task.id, &spec).await.unwrap() else {
         panic!("no cap: the turn starts");
     };
-    assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Stalled);
     assert_eq!(q.status(&task.id).await, "open");
     let rows = q.rows().await;
     assert_eq!(rows.len(), 1, "the row is back");
@@ -2640,7 +2656,7 @@ async fn a_branch_failure_that_cannot_be_recorded_puts_the_row_back() {
         .unwrap();
     let id = row.id;
     let queued_at = row.queued_at;
-    assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Stalled);
     assert_eq!(q.status(&g.id).await, "open");
     let rows = q.rows().await;
     assert_eq!(rows.len(), 1, "the row is back");
@@ -2656,7 +2672,7 @@ async fn a_branch_whose_workflow_is_gone_and_cannot_be_marked_puts_the_row_back(
     let (g, row, permit) = group_admission_that_cannot_be_recorded(&q).await;
     fs::remove_file(q.dir.join("qgroup.yaml")).unwrap();
     let id = row.id;
-    assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Stalled);
     assert_eq!(q.status(&g.id).await, "open");
     let rows = q.rows().await;
     assert_eq!(rows.len(), 1, "the row is back");
@@ -2725,7 +2741,7 @@ async fn withdrawing_a_row_that_cannot_be_deleted_goes_idle() {
         .execute(&q.pool)
         .await
         .unwrap();
-    assert_eq!(q.engine.admit(row, permit).await, Pass::Idle);
+    assert_eq!(q.engine.admit(row, permit).await, Pass::Stalled);
     assert_eq!(q.engine.running_total(), 0);
 }
 
@@ -2886,7 +2902,11 @@ async fn an_admission_that_cannot_read_the_task_state_keeps_the_row_and_frees_th
     };
     rename_table(&q, "workflow_state").await;
     let pass = q.engine.admit(row, permit).await;
-    assert_eq!(pass, Pass::Idle, "an unreadable state is retried next tick");
+    assert_eq!(
+        pass,
+        Pass::Stalled,
+        "an unreadable state is retried next tick"
+    );
     assert_eq!(q.rows().await.len(), 1, "the turn stays queued");
     assert_eq!(q.engine.running_total(), 0, "the permit was dropped");
     assert_eq!(q.status(&task.id).await, "open");
@@ -2915,14 +2935,17 @@ async fn a_branch_row_that_cannot_be_validated_stays_queued_and_frees_the_slot()
     let Claim::Start(permit) = q.engine.turn_gate().claim(&g.id, &spec).await.unwrap() else {
         panic!("no limit: the turn starts");
     };
-    let before = q.engine.running_total();
+    // Branches `one` and `two` are still running and either can end during
+    // `admit()`, so a count of running turns says nothing about *this*
+    // permit. Its id does: it must no longer be held afterwards.
+    let permit_id = permit.id();
+    assert!(q.engine.turn_gate().holds(permit_id));
     rename_table(&q, "sessions").await;
     let pass = q.engine.admit(row, permit).await;
-    assert_eq!(pass, Pass::Idle);
+    assert_eq!(pass, Pass::Stalled);
     assert_eq!(q.rows().await.len(), 1, "the branch stays queued");
-    assert_eq!(
-        q.engine.running_total(),
-        before - 1,
+    assert!(
+        !q.engine.turn_gate().holds(permit_id),
         "the permit was dropped"
     );
 }
@@ -3009,4 +3032,82 @@ async fn a_new_turn_does_not_jump_the_queue_when_a_slot_frees_before_the_dispatc
     let snapshot = q.engine.queue_snapshot().await.unwrap();
     assert_eq!(snapshot.position_of(&b.id, "coding", None), Some(1));
     assert_eq!(snapshot.position_of(&c.id, "coding", None), Some(2));
+}
+
+// ---- the dispatcher waits a full tick after a stalled pass ------------------------------
+
+/// A row whose admission fails (an unknown CLI) and whose failure cannot be
+/// recorded (the status write is refused): every pass leaves it behind.
+async fn a_row_that_cannot_be_dealt_with(q: &Q) -> Task {
+    let task = q
+        .task_with(
+            "coding",
+            "open",
+            &q.flow.display().to_string(),
+            json!({ "roles": { "coder": { "cli": "no-such-cli" } } }),
+        )
+        .await;
+    q.insert_row(&task.id, "coding").await;
+    sqlx::query(
+        "CREATE TRIGGER refuse_stuck BEFORE UPDATE ON tasks WHEN NEW.status = 'stuck' \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    task
+}
+
+#[tokio::test]
+async fn a_stalled_row_is_tried_once_per_tick_whatever_wakes_arrive() {
+    let logs = LogBuf::default();
+    let _logging = logs.capture();
+    let q = Q::build(None, queue_timers(), false).await;
+    let task = a_row_that_cannot_be_dealt_with(&q).await;
+    // A long tick: only a busy loop could try the row again within a second.
+    q.engine.turn_gate().set_tick(StdDuration::from_secs(10));
+    let dispatcher = q.engine.start_dispatcher();
+    for _ in 0..20 {
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        q.engine.wake_dispatcher();
+    }
+    dispatcher.abort();
+    // The clock started after the dispatcher did, so no pass was already
+    // under way: exactly the first pass tried it.
+    let attempts = logs.text().matches("a queued turn failed to start").count();
+    assert_eq!(attempts, 1, "{}", logs.text());
+    assert_eq!(q.status(&task.id).await, "open");
+    assert_eq!(q.rows().await.len(), 1, "the row is back");
+}
+
+#[tokio::test]
+async fn a_stop_ends_a_stalled_wait_at_once() {
+    let q = Q::build(None, queue_timers(), false).await;
+    let _task = a_row_that_cannot_be_dealt_with(&q).await;
+    q.engine.turn_gate().set_tick(StdDuration::from_secs(60));
+    let dispatcher = q.engine.start_dispatcher();
+    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    q.engine.turn_gate().stop();
+    tokio::time::timeout(StdDuration::from_secs(5), dispatcher)
+        .await
+        .expect("the dispatcher exits promptly on stop")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_paused_tasks_queued_row_costs_the_dispatcher_one_pass_per_tick() {
+    let q = Q::build(Some(1), queue_timers(), false).await;
+    let task = q.task_at("coding", "paused").await;
+    q.insert_row(&task.id, "coding").await;
+    q.engine.turn_gate().set_tick(StdDuration::from_millis(200));
+    let dispatcher = q.engine.start_dispatcher();
+    // `set_tick` stored a wake, so the first two passes come at once.
+    tokio::time::sleep(StdDuration::from_millis(60)).await;
+    let before = q.engine.turn_gate().passes();
+    assert!(before >= 1, "the dispatcher ran");
+    // Then no more than one pass per tick over (just under) two ticks.
+    tokio::time::sleep(StdDuration::from_millis(360)).await;
+    dispatcher.abort();
+    let passes = q.engine.turn_gate().passes() - before;
+    assert!(passes <= 2, "{passes} passes in two ticks");
 }

@@ -1468,8 +1468,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("g / G       top / bottom    o     open PR"),
         Line::from("⇥ / ⇧⇥      next section    r     retry stuck"),
         Line::from("?           this help       c     cancel"),
-        Line::from("p           pause / resume (graceful; no --now here)"),
-        Line::from("q  Ctrl-C   quit"),
+        Line::from("q  Ctrl-C   quit            p     pause / resume"),
         Line::from("e           events / status"),
         Line::from("/           search"),
     ];

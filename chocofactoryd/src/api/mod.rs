@@ -166,6 +166,7 @@ stages:
         repo_dir: TempDir,
         pool: SqlitePool,
         dispatcher: tokio::task::JoinHandle<()>,
+        state: AppState,
     }
 
     impl Drop for TestServer {
@@ -263,6 +264,7 @@ stages:
                     choco_binary: choco_binary.to_string(),
                 }),
             };
+            let handler_state = state.clone();
             tokio::spawn(async move {
                 let _ = axum::serve(listener, router(state)).await;
             });
@@ -274,7 +276,13 @@ stages:
                 repo_dir: TempDir::new(),
                 pool,
                 dispatcher,
+                state: handler_state,
             }
+        }
+
+        /// The state the handlers get, for a test that calls one directly.
+        pub fn state(&self) -> AppState {
+            self.state.clone()
         }
 
         pub fn pool(&self) -> &SqlitePool {

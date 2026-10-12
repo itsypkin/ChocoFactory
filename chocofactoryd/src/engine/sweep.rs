@@ -395,13 +395,14 @@ impl WorkflowEngine {
         let mut findings = Vec::new();
         for (name, session) in cut_off {
             let Some(session) = session else { continue };
-            if session.status == SessionStatus::Idle && session.end_reason.is_none() {
-                if let Err(err) = sessions::mark_daemon_stopped(&self.pool, &session.id).await {
-                    findings.push(format!(
-                        "the interrupted session of '{name}' could not be recorded ({err}), so \
-                         resume will start it fresh"
-                    ));
-                }
+            if session.status == SessionStatus::Idle
+                && session.end_reason.is_none()
+                && let Err(err) = sessions::mark_daemon_stopped(&self.pool, &session.id).await
+            {
+                findings.push(format!(
+                    "the interrupted session of '{name}' could not be recorded ({err}), so \
+                     resume will start it fresh"
+                ));
             }
             match self
                 .read_only_verdict(task_id, &definition, &name, &session.id, false)

@@ -1264,7 +1264,7 @@ impl WorkflowEngine {
     /// Accepted race: a pause landing between the status read and the park
     /// of a daemon-stopped turn leaves the task stuck (or the branch failed),
     /// the same as without the pause; no error is lost and retry recovers it.
-    async fn handle_requested_end(
+    pub(super) async fn handle_requested_end(
         self: &Arc<Self>,
         task_id: &str,
         definition: &Arc<WorkflowDefinition>,

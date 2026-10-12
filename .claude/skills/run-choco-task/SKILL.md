@@ -253,8 +253,8 @@ choco task create --project <p> --workflow coding-task-planned \
   when the task is open at `spec_questions` (the planner needs your answer;
   reply with `choco task send <id> --text "<answers>"`), at
   `awaiting_human_review` (vote, step 4) or at `escalate_to_human`
-  (`choco task retry` or `choco task send`, step 5), or when it is stuck, cancelled or closed.
-  Its stderr line and exit code say which. The exit codes are in
+  (`choco task retry` or `choco task send`, step 5), or when it is paused,
+  stuck, cancelled or closed. Its stderr line and exit code say which. The exit codes are in
   [reference/watch.md](reference/watch.md#waiting-with---until); typical
   stage times for choosing `--timeout` are in
   [reference/watch.md](reference/watch.md#stage-times).
@@ -369,6 +369,10 @@ cancelling. In short:
 - A task showing `Queued` is waiting for an agent slot, not stuck: don't
   `retry`, `cancel` or `send` to it; see
   [reference/recover.md](reference/recover.md#queued-is-not-stuck).
+- `pausing` or `paused` → you (or someone) held the task:
+  `choco task resume <id>` continues it. `retry` and `send` are refused on it,
+  and the message names `resume`. See
+  [reference/recover.md](reference/recover.md#pausing-a-task).
 - `stuck` → find out why in `choco task status <id>`, then
   `choco task retry <id>`. On a task stuck in a parallel group, retry
   re-runs only the failed branches and keeps the finished ones, listing
@@ -390,11 +394,16 @@ cancelling. In short:
   `cli: omp`). Don't create a task to try something out, except the budgeted acceptance tasks a spec assigns to the operator or another named person (see [reference/spec.md](reference/spec.md#docs-only-tasks)). For a first run, pick a small, real change.
 - **A repo's `.chocofactory/workflows/` and any `--workflow` file can run
   shell commands as you.** Pointing choco at a repo trusts its workflows.
+- **To free the machine for a while, or to hold one task while another
+  finishes, pause it** instead of cancelling it: `choco task pause <id>` lets
+  a running turn finish and starts nothing new; `--now` also stops the turn
+  (`choco task resume <id>` continues the same session where the CLI can).
 - **Cancel a task that is going round in circles** rather than letting it
   spend a coder lap per round.
 - **`choco update`, `choco server stop` and `choco server restart` refuse
   with exit 3 while an agent turn (including a parallel group's running
-  branches) or shell step is running.** `--force` goes
+  branches) or shell step is running, and while a `pausing` task still has
+  one running (a `paused` task never blocks them).** `--force` goes
   ahead and marks that work `stuck`; use it only if you are prepared to
   `choco task retry` those tasks. Turns queued for an agent slot are not
   running: they never block these commands, and the commands print `N queued
