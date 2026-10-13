@@ -859,7 +859,7 @@ async fn many_ends_in_any_order_move_the_task_to_paused_exactly_once_after_the_l
         ("BRANCH-TWO", "two", Ending::Report),
         ("BRANCH-THREE", "three", Ending::Report),
     ]);
-    let g = q.create_group().await;
+    let g = create_group_flow(&q, &three_group_flow(), "agroup3.yaml", "fix-job").await;
     for name in ["one", "two", "three"] {
         q.wait_started(name).await;
     }
@@ -876,8 +876,9 @@ async fn many_ends_in_any_order_move_the_task_to_paused_exactly_once_after_the_l
             while !stop.load(Ordering::SeqCst) {
                 let status = tasks::get(&pool, &id).await.unwrap().unwrap().status;
                 if status == "paused" {
-                    // Never paused while a turn of the task still runs.
-                    assert_eq!(engine.turn_gate().running_for_task(&id), 0);
+                    // Never paused while a turn of the task runs or is
+                    // still applying its result.
+                    assert_eq!(engine.turn_gate().busy_for_task(&id), 0);
                 }
                 tokio::time::sleep(StdDuration::from_millis(5)).await;
             }
@@ -886,20 +887,27 @@ async fn many_ends_in_any_order_move_the_task_to_paused_exactly_once_after_the_l
     for name in ["three", "one", "two"] {
         q.release(name);
     }
-    // The group's last end leads to the terminal stage, which is not held, so
-    // the task may close before a poll ever sees `paused`: wait for either.
-    crate::test_support::wait_until("paused or closed", || async {
-        match q.status(&g.id).await.as_str() {
-            "paused" | "closed" => Ok(()),
-            other => Err(format!("status {other:?}")),
-        }
-    })
-    .await;
+    q.wait_status(&g.id, "paused").await;
     tokio::time::sleep(StdDuration::from_millis(300)).await;
     stop.store(true, Ordering::SeqCst);
     sampler.await.unwrap();
-    // The move to paused happens at most once (a close can replace it).
-    assert!(q.queue_events(&g.id, EventType::TaskPaused).await.len() <= 1);
+    // The next stage is held: entered, with no session and no queue row.
+    assert_eq!(current_stage(&q, &g.id).await, "fix");
+    assert!(q.sessions(&g.id).await.iter().all(|s| s.stage != "fix"));
+    assert!(q.rows().await.is_empty());
+    let events = q.events(&g.id).await;
+    let paused: Vec<usize> = (0..events.len())
+        .filter(|i| events[*i].event_type == EventType::TaskPaused)
+        .collect();
+    assert_eq!(paused.len(), 1, "exactly one TaskPaused");
+    let last_branch = (0..events.len())
+        .filter(|i| events[*i].event_type == EventType::BranchFinished)
+        .max()
+        .unwrap();
+    assert!(
+        last_branch < paused[0],
+        "paused after the last branch ended"
+    );
 }
 
 // ---- test 13: a turn that fails while pausing --------------------------------------------------
@@ -1665,4 +1673,771 @@ async fn send_at_a_single_shot_stage_of_a_paused_task_names_resume() {
         );
         assert_eq!(q.status(&t.id).await, status);
     }
+}
+
+// ---- #304: a paused task is never left open with nothing running ---------------------------
+
+use crate::engine::pause::run_failure;
+
+fn group_flow(branches: &[&str]) -> String {
+    let list: String = branches
+        .iter()
+        .map(|b| format!("      {b}: {{ kind: agent_turn, role: coder, prompt_file: {b}.md }}\n"))
+        .collect();
+    format!(
+        "name: agroup\nworktree: true\nroles:\n  coder:\n    cli: claude\n    model: sonnet\n    read_only: true\n    disallowed_tools: [edit, write, notebook_edit]\nstages:\n  panel:\n    kind: parallel\n    branches:\n{list}    on: {{ done: fix }}\n  fix:\n    kind: agent_turn\n    role: coder\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
+    )
+}
+
+fn three_group_flow() -> String {
+    group_flow(&["one", "two", "three"])
+}
+
+/// Creates the task of a group flow the way `Q::create_group` does: in a git
+/// repository, since the read-only branches snapshot a worktree.
+async fn create_group_flow(q: &Q, yaml: &str, file: &str, name: &str) -> Task {
+    let repo = q.dir.join("repo");
+    if !repo.exists() {
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo).await;
+    }
+    let path = q.dir.join(file);
+    fs::write(&path, yaml).unwrap();
+    q.engine
+        .create_task_from(
+            &q.project.id,
+            WorkflowRef::File(path),
+            name,
+            name,
+            json!({ "cwd": repo.to_string_lossy() }),
+            None,
+            &[],
+        )
+        .await
+        .unwrap()
+}
+
+async fn new_session(q: &Q, task: &Task, stage: &str) -> Session {
+    sessions::create(
+        &q.pool,
+        sessions::NewSession {
+            task_id: &task.id,
+            stage,
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// Sets a session's end as a crash and the sweep's recovery would leave it.
+async fn set_end(q: &Q, session_id: &str, status: &str, reason: Option<&str>, adapter: bool) {
+    sqlx::query("UPDATE sessions SET status = ?, end_reason = ? WHERE id = ?")
+        .bind(status)
+        .bind(reason)
+        .bind(session_id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    if adapter {
+        sessions::set_adapter_session_id(&q.pool, session_id, &format!("adapter-{session_id}"))
+            .await
+            .unwrap();
+    }
+}
+
+async fn force_paused(q: &Q, task_id: &str) {
+    sqlx::query("UPDATE tasks SET status = 'paused', paused_at = ? WHERE id = ?")
+        .bind(Utc::now())
+        .bind(task_id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+}
+
+/// A `paused` task at `coding` whose current-entry session ended as given.
+async fn paused_single(
+    q: &Q,
+    status: &str,
+    reason: Option<&str>,
+    adapter: bool,
+) -> (Task, Session) {
+    let task = q.task_at("coding", "open").await;
+    let session = new_session(q, &task, "coding").await;
+    set_end(q, &session.id, status, reason, adapter).await;
+    force_paused(q, &task.id).await;
+    (task, session)
+}
+
+/// A group paused with `pause --now` while the branches not in `done` ran:
+/// their slots are `running` and their sessions ended `paused`.
+async fn paused_group(q: &Q, done: &[&str]) -> Task {
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = create_group_flow(q, &three_group_flow(), "agroup3.yaml", "fix-job").await;
+    for name in ["one", "two", "three"] {
+        q.wait_started(name).await;
+    }
+    for name in done {
+        q.release(name);
+        wait_slot(q, &g.id, name, "done").await;
+    }
+    q.engine.pause_task(&g.id, true).await.unwrap();
+    q.wait_status(&g.id, "paused").await;
+    g
+}
+
+async fn session_of(q: &Q, task_id: &str, stage: &str) -> Session {
+    q.sessions(task_id)
+        .await
+        .into_iter()
+        .find(|s| s.stage == stage)
+        .unwrap()
+}
+
+async fn reload(q: &Q, session_id: &str) -> Session {
+    sessions::get(&q.pool, session_id).await.unwrap().unwrap()
+}
+
+async fn set_slot(q: &Q, task_id: &str, branch: &str, state: &str) {
+    sqlx::query("UPDATE workflow_state SET payload = json_set(payload, ?, ?) WHERE task_id = ?")
+        .bind(format!("$.parallel.branches.{branch}.state"))
+        .bind(state)
+        .bind(task_id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+}
+
+fn refused_text(err: &ResumeTaskError) -> String {
+    assert!(matches!(err, ResumeTaskError::Refused(_)), "{err:?}");
+    err.to_string()
+}
+
+#[tokio::test]
+async fn run_failure_answers_every_row_of_the_table() {
+    let q = Q::new(None).await;
+    let task = q.task_at("coding", "open").await;
+    let base = new_session(&q, &task, "coding").await;
+    let rows: &[(SessionStatus, Option<SessionEndReason>, bool)] = &[
+        (SessionStatus::Active, None, false),
+        (SessionStatus::Idle, None, false),
+        (SessionStatus::Idle, Some(SessionEndReason::NoReport), false),
+        (SessionStatus::Idle, Some(SessionEndReason::Reaped), true),
+        (
+            SessionStatus::Idle,
+            Some(SessionEndReason::Cancelled),
+            false,
+        ),
+        (
+            SessionStatus::Idle,
+            Some(SessionEndReason::DaemonStopped),
+            false,
+        ),
+        (SessionStatus::Exited, None, true),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::NoReport),
+            true,
+        ),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::Lingered),
+            true,
+        ),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::StartFailed),
+            true,
+        ),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::Interrupted),
+            true,
+        ),
+        (SessionStatus::Exited, Some(SessionEndReason::Reaped), true),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::Cancelled),
+            false,
+        ),
+        (SessionStatus::Exited, Some(SessionEndReason::Paused), false),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::DaemonStopped),
+            false,
+        ),
+    ];
+    for (status, reason, failed) in rows {
+        let mut session = base.clone();
+        session.status = *status;
+        session.end_reason = *reason;
+        let got = run_failure(&session);
+        assert_eq!(got.is_some(), *failed, "{status:?}/{reason:?}: {got:?}");
+        if let Some(text) = got {
+            let want = reason.map_or("none".to_string(), |r| r.to_string());
+            assert_eq!(
+                text,
+                format!("its session ended: {status}, end reason {want}")
+            );
+        }
+    }
+}
+
+// (a)–(c) run on a restarted engine with an empty gate: the gate is not
+// consulted after a restart, only the database.
+#[tokio::test]
+async fn a_paused_task_whose_turn_failed_before_a_crash_is_stuck_after_the_sweep() {
+    let q = Q::new(None).await;
+    let (task, _) = paused_single(&q, "exited", None, false).await;
+    let next = q.restarted_engine();
+    Q::sweep(&next).await;
+    assert_eq!(q.status(&task.id).await, "stuck");
+    let t = task_of(&q, &task.id).await;
+    let reason = t.stuck_reason.unwrap();
+    assert!(
+        reason.contains("turn of stage 'coding' failed") && reason.contains("end reason none"),
+        "{reason}"
+    );
+    assert!(t.paused_at.is_none());
+    let err = next.resume_task(&task.id).await.unwrap_err();
+    assert!(refused_text(&err).contains("retry"), "{err}");
+    assert_eq!(q.sessions(&task.id).await.len(), 1);
+}
+
+#[tokio::test]
+async fn resume_on_a_failed_run_with_no_sweep_marks_the_task_stuck_and_starts_nothing() {
+    let q = Q::new(None).await;
+    let (task, _) = paused_single(&q, "exited", None, false).await;
+    let next = q.restarted_engine();
+    let err = next.resume_task(&task.id).await.unwrap_err();
+    assert!(refused_text(&err).contains("end reason none"), "{err}");
+    let t = task_of(&q, &task.id).await;
+    assert_eq!(t.status, "stuck");
+    assert!(t.paused_at.is_none());
+    assert!(t.stuck_reason.unwrap().contains("end reason none"));
+    assert_eq!(q.sessions(&task.id).await.len(), 1);
+    assert!(
+        q.queue_events(&task.id, EventType::TaskResumed)
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_paused_group_with_a_failed_branch_is_stuck_after_the_sweep_and_retry_restarts_only_it() {
+    let q = Q::new(None).await;
+    let g = paused_group(&q, &["two", "three"]).await;
+    let one = session_of(&q, &g.id, "one").await;
+    set_end(&q, &one.id, "exited", Some("no_report"), true).await;
+    let next = q.restarted_engine();
+    q.crash_and_sweep(&next).await;
+    assert_eq!(slot_state(&q, &g.id, "one").await, "failed");
+    let finished = q.queue_events(&g.id, EventType::BranchFinished).await;
+    assert!(
+        finished
+            .iter()
+            .any(|e| e["branch"] == "one" && e["state"] == "failed"),
+        "{finished:?}"
+    );
+    assert_eq!(q.status(&g.id).await, "stuck");
+    let t = task_of(&q, &g.id).await;
+    assert!(t.stuck_reason.unwrap().contains("branch 'one'"));
+    assert!(t.paused_at.is_none());
+    plain_script(&q, "one");
+    q.release("one");
+    next.retry_task(&g.id, RetryMode::Auto).await.unwrap();
+    let all = q.sessions(&g.id).await;
+    assert_eq!(all.iter().filter(|s| s.stage == "one").count(), 2);
+    assert_eq!(all.iter().filter(|s| s.stage == "two").count(), 1);
+    assert_eq!(all.iter().filter(|s| s.stage == "three").count(), 1);
+}
+
+#[tokio::test]
+async fn a_mixed_paused_group_fails_the_failed_branch_and_records_the_completed_one() {
+    let q = Q::new(None).await;
+    let g = paused_group(&q, &["three"]).await;
+    let one = session_of(&q, &g.id, "one").await;
+    let two = session_of(&q, &g.id, "two").await;
+    set_end(&q, &one.id, "exited", Some("no_report"), true).await;
+    set_end(&q, &two.id, "idle", None, true).await;
+    let next = q.restarted_engine();
+    q.crash_and_sweep(&next).await;
+    assert_eq!(slot_state(&q, &g.id, "one").await, "failed");
+    let two_after = reload(&q, &two.id).await;
+    assert_eq!(two_after.status, SessionStatus::Exited);
+    assert_eq!(two_after.end_reason, Some(SessionEndReason::DaemonStopped));
+    assert_eq!(q.status(&g.id).await, "stuck");
+    plain_script(&q, "one");
+    q.release("one");
+    next.retry_task(&g.id, RetryMode::Auto).await.unwrap();
+    let all = q.sessions(&g.id).await;
+    assert_eq!(all.iter().filter(|s| s.stage == "one").count(), 2);
+    assert_eq!(all.iter().filter(|s| s.stage == "two").count(), 2);
+    assert_eq!(all.iter().filter(|s| s.stage == "three").count(), 1);
+}
+
+#[tokio::test]
+async fn a_paused_single_stage_with_a_completed_unapplied_turn_stays_paused_and_resume_reruns_its_session()
+ {
+    let q = Q::new(None).await;
+    let (task, old) = paused_single(&q, "idle", None, true).await;
+    let next = q.restarted_engine();
+    Q::sweep(&next).await;
+    assert_eq!(q.status(&task.id).await, "paused");
+    let after = reload(&q, &old.id).await;
+    assert_eq!(after.end_reason, Some(SessionEndReason::DaemonStopped));
+    plain_script(&q, "job-c");
+    let outcome = next.resume_task(&task.id).await.unwrap();
+    assert_eq!(outcome.resumed, vec!["coding".to_string()]);
+    // The new turn was started before `resume` returned.
+    assert!(next.turn_gate().busy_for_task(&task.id) > 0);
+    assert!(task_of(&q, &task.id).await.stuck_reason.is_none());
+    q.release("job-c");
+    q.wait_status(&task.id, "closed").await;
+    let new = q
+        .sessions(&task.id)
+        .await
+        .into_iter()
+        .find(|s| s.id != old.id)
+        .unwrap();
+    assert_eq!(new.resumed_from.as_deref(), Some(old.id.as_str()));
+}
+
+#[tokio::test]
+async fn a_paused_group_branch_with_a_completed_unapplied_turn_stays_paused_and_resume_reruns_its_session()
+ {
+    let q = Q::new(None).await;
+    let g = paused_group(&q, &["two", "three"]).await;
+    let old = session_of(&q, &g.id, "one").await;
+    set_end(&q, &old.id, "idle", None, true).await;
+    let next = q.restarted_engine();
+    q.crash_and_sweep(&next).await;
+    assert_eq!(q.status(&g.id).await, "paused");
+    assert_eq!(
+        reload(&q, &old.id).await.end_reason,
+        Some(SessionEndReason::DaemonStopped)
+    );
+    plain_script(&q, "one");
+    let outcome = next.resume_task(&g.id).await.unwrap();
+    assert_eq!(outcome.resumed, vec!["one".to_string()]);
+    assert!(next.turn_gate().busy_for_task(&g.id) > 0);
+    q.release("one");
+    let new = {
+        crate::test_support::wait_until("the resumed session", || async {
+            q.sessions(&g.id)
+                .await
+                .into_iter()
+                .find(|s| s.stage == "one" && s.id != old.id)
+                .ok_or("none yet".to_string())
+        })
+        .await
+    };
+    assert_eq!(new.resumed_from.as_deref(), Some(old.id.as_str()));
+}
+
+#[tokio::test]
+async fn resume_with_nothing_to_start_or_wait_for_marks_a_single_stage_stuck() {
+    let q = Q::new(None).await;
+    let (task, session) = paused_single(&q, "idle", None, true).await;
+    let next = q.restarted_engine();
+    let err = next.resume_task(&task.id).await.unwrap_err();
+    let text = refused_text(&err);
+    assert!(
+        text.starts_with("stage 'coding' cannot resume: ")
+            && text.contains(&session.id)
+            && text.contains("idle")
+            && text.contains("; nothing is running or queued to move the task on")
+            && text.ends_with("; retry continues it (the task is now stuck)"),
+        "{text}"
+    );
+    let t = task_of(&q, &task.id).await;
+    assert_eq!(t.status, "stuck");
+    assert!(t.paused_at.is_none());
+    assert!(
+        q.queue_events(&task.id, EventType::TaskResumed)
+            .await
+            .is_empty()
+    );
+    plain_script(&q, "job-r");
+    q.release("job-r");
+    next.retry_task(&task.id, RetryMode::Auto).await.unwrap();
+    assert!(q.sessions(&task.id).await.len() >= 2);
+}
+
+#[tokio::test]
+async fn resume_marks_a_group_stuck_when_no_branch_can_move_on() {
+    // (d2-i) a failed run with no watcher.
+    let q = Q::new(None).await;
+    let g = paused_group(&q, &["two", "three"]).await;
+    let one = session_of(&q, &g.id, "one").await;
+    set_end(&q, &one.id, "exited", Some("no_report"), false).await;
+    let next = q.restarted_engine();
+    let err = next.resume_task(&g.id).await.unwrap_err();
+    assert!(refused_text(&err).contains("'one'"), "{err}");
+    assert_eq!(q.status(&g.id).await, "stuck");
+    // (d2-ii) the slot was already recorded failed: only the safety net sees it.
+    let q = Q::new(None).await;
+    let g = paused_group(&q, &["two", "three"]).await;
+    set_slot(&q, &g.id, "one", "failed").await;
+    let next = q.restarted_engine();
+    let err = next.resume_task(&g.id).await.unwrap_err();
+    let text = refused_text(&err);
+    assert!(
+        text.contains("'one'") && text.contains("nothing is running or queued"),
+        "{text}"
+    );
+    assert_eq!(q.status(&g.id).await, "stuck");
+}
+
+#[tokio::test]
+async fn a_failed_branch_with_no_watcher_fails_the_plan_instead_of_restarting_its_siblings() {
+    // (d2-iii)
+    let q = Q::new(None).await;
+    let g = paused_group(&q, &["three"]).await;
+    let one = session_of(&q, &g.id, "one").await;
+    set_end(&q, &one.id, "exited", Some("no_report"), false).await;
+    let before = q.sessions(&g.id).await.len();
+    let next = q.restarted_engine();
+    let err = next.resume_task(&g.id).await.unwrap_err();
+    assert!(refused_text(&err).contains("'one'"), "{err}");
+    assert_eq!(q.status(&g.id).await, "stuck");
+    assert_eq!(
+        q.sessions(&g.id).await.len(),
+        before,
+        "two was not restarted"
+    );
+}
+
+#[tokio::test]
+async fn the_safety_net_is_one_write_and_never_writes_open() {
+    // (d3)
+    let q = Q::new(None).await;
+    let (task, _) = paused_single(&q, "idle", None, true).await;
+    sqlx::query(
+        "CREATE TRIGGER refuse_stuck BEFORE UPDATE ON tasks WHEN NEW.status = 'stuck' \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE open_writes (n INTEGER); \
+         CREATE TRIGGER saw_open AFTER UPDATE ON tasks WHEN NEW.status = 'open' \
+         BEGIN INSERT INTO open_writes VALUES (1); END",
+    )
+    .execute(&q.pool)
+    .await
+    .unwrap();
+    let next = q.restarted_engine();
+    let err = next.resume_task(&task.id).await.unwrap_err();
+    assert!(
+        matches!(err, ResumeTaskError::StuckWriteFailed(_)),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains("now stuck"), "{err}");
+    assert_eq!(q.status(&task.id).await, "paused");
+    let opens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_writes")
+        .fetch_one(&q.pool)
+        .await
+        .unwrap();
+    assert_eq!(opens, 0, "open was never written");
+}
+
+#[tokio::test]
+async fn a_graceful_pause_holds_the_group_until_the_last_turn_has_applied_its_result() {
+    // (e1)
+    let q = Q::new(None).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+    ]);
+    let g = create_group_flow(&q, &group_flow(&["one", "two"]), "agroup2.yaml", "fix-job").await;
+    q.wait_started("one").await;
+    q.wait_started("two").await;
+    q.engine.pause_task(&g.id, false).await.unwrap();
+    q.engine.turn_gate().hold_after_free("one");
+    q.release("one");
+    crate::test_support::wait_until("one to be settling", || async {
+        let gate = q.engine.turn_gate();
+        if gate.busy_for_task(&g.id) == 2 && gate.running_for_task(&g.id) == 1 {
+            Ok(())
+        } else {
+            Err("not yet".to_string())
+        }
+    })
+    .await;
+    q.release("two");
+    wait_slot(&q, &g.id, "two", "done").await;
+    crate::test_support::wait_until("only one settling", || async {
+        if q.engine.turn_gate().busy_for_task(&g.id) == 1 {
+            Ok(())
+        } else {
+            Err("busy".to_string())
+        }
+    })
+    .await;
+    for _ in 0..30 {
+        assert_eq!(q.status(&g.id).await, "pausing");
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    q.engine.turn_gate().release_after_free("one");
+    q.wait_status(&g.id, "paused").await;
+    let events = q.events(&g.id).await;
+    let paused: Vec<usize> = (0..events.len())
+        .filter(|i| events[*i].event_type == EventType::TaskPaused)
+        .collect();
+    assert_eq!(paused.len(), 1);
+    let one_done = (0..events.len())
+        .filter(|i| {
+            events[*i].event_type == EventType::BranchFinished
+                && events[*i].payload["branch"] == "one"
+        })
+        .max()
+        .unwrap();
+    assert!(one_done < paused[0]);
+}
+
+#[tokio::test]
+async fn resume_during_a_turns_settling_gap_opens_and_the_result_is_applied() {
+    // (e2)
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = q.create("job-a").await;
+    q.wait_started("job-a").await;
+    q.engine.pause_task(&a.id, false).await.unwrap();
+    q.engine.turn_gate().hold_after_free("coding");
+    q.release("job-a");
+    crate::test_support::wait_until("the turn to be settling", || async {
+        let gate = q.engine.turn_gate();
+        if gate.busy_for_task(&a.id) == 1 && gate.running_for_task(&a.id) == 0 {
+            Ok(())
+        } else {
+            Err("not yet".to_string())
+        }
+    })
+    .await;
+    assert_eq!(
+        q.status(&a.id).await,
+        "pausing",
+        "not paused while settling"
+    );
+    let outcome = q.engine.resume_task(&a.id).await.unwrap();
+    assert!(outcome.started.is_empty(), "{outcome:?}");
+    assert_eq!(q.status(&a.id).await, "open");
+    assert!(task_of(&q, &a.id).await.stuck_reason.is_none());
+    q.engine.turn_gate().release_after_free("coding");
+    q.wait_status(&a.id, "closed").await;
+}
+
+#[tokio::test]
+async fn a_running_turn_counts_as_running_work_for_resume() {
+    // (f1)
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = q.create("job-a").await;
+    q.wait_started("job-a").await;
+    q.engine.pause_task(&a.id, false).await.unwrap();
+    let outcome = q.engine.resume_task(&a.id).await.unwrap();
+    assert!(outcome.started.is_empty());
+    assert_eq!(q.status(&a.id).await, "open");
+    assert!(task_of(&q, &a.id).await.stuck_reason.is_none());
+    q.release("job-a");
+    q.wait_status(&a.id, "closed").await;
+}
+
+#[tokio::test]
+async fn a_detached_runner_counts_as_running_work_for_resume() {
+    // (f2)
+    let q = Q::new(None).await;
+    let a = create_flow(&q, &shell_flow(&q), "pshell.yaml", "sh").await;
+    crate::test_support::wait_until("the command to start", || async {
+        if q.dir.join("started-sh").exists() {
+            Ok(())
+        } else {
+            Err("not started".to_string())
+        }
+    })
+    .await;
+    q.engine.pause_task(&a.id, false).await.unwrap();
+    assert_eq!(q.status(&a.id).await, "pausing");
+    let outcome = q.engine.resume_task(&a.id).await.unwrap();
+    assert!(outcome.started.is_empty(), "{outcome:?}");
+    assert_eq!(q.status(&a.id).await, "open");
+    assert!(task_of(&q, &a.id).await.stuck_reason.is_none());
+    fs::write(q.dir.join("release-sh"), "").unwrap();
+    q.wait_status(&a.id, "closed").await;
+}
+
+#[tokio::test]
+async fn a_paused_gate_and_a_paused_chat_stage_resume_open_with_nothing_started() {
+    let q = Q::new(None).await;
+    let gate = create_flow(&q, GATE_FLOW, "pgate.yaml", "gate").await;
+    q.engine.pause_task(&gate.id, false).await.unwrap();
+    assert_eq!(q.status(&gate.id).await, "paused");
+    let outcome = q.engine.resume_task(&gate.id).await.unwrap();
+    assert!(outcome.started.is_empty());
+    assert_eq!(q.status(&gate.id).await, "open");
+    assert!(task_of(&q, &gate.id).await.stuck_reason.is_none());
+
+    let chat = "name: chat\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  talk:\n    kind: agent_turn\n    role: coder\n";
+    let path = q.dir.join("chat.yaml");
+    fs::write(&path, chat).unwrap();
+    let task = q
+        .task_with("talk", "open", &path.display().to_string(), json!({}))
+        .await;
+    let session = new_session(&q, &task, "talk").await;
+    set_end(&q, &session.id, "idle", None, true).await;
+    force_paused(&q, &task.id).await;
+    let next = q.restarted_engine();
+    let outcome = next.resume_task(&task.id).await.unwrap();
+    assert!(outcome.started.is_empty(), "{outcome:?}");
+    assert_eq!(q.status(&task.id).await, "open");
+    assert!(task_of(&q, &task.id).await.stuck_reason.is_none());
+}
+
+const GATE_AFTER_AGENT: &str = "name: agate\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    on: { done: review }\n  review:\n    kind: human_gate\n    on: { resumed: finished }\n  finished:\n    kind: terminal\n";
+
+async fn wait_idle_gate(q: &Q, id: &str) {
+    crate::test_support::wait_until("the gate to hold no entry of the task", || async {
+        if q.engine.turn_gate().busy_for_task(id) == 0 {
+            Ok(())
+        } else {
+            Err("still busy".to_string())
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn the_settling_entry_is_removed_on_every_way_a_watcher_ends() {
+    // completed, next stage a human gate
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = create_flow(&q, GATE_AFTER_AGENT, "agate.yaml", "job-a").await;
+    q.wait_started("job-a").await;
+    q.release("job-a");
+    crate::test_support::wait_until("the gate stage", || async {
+        if current_stage(&q, &a.id).await == "review" {
+            Ok(())
+        } else {
+            Err("not yet".to_string())
+        }
+    })
+    .await;
+    wait_idle_gate(&q, &a.id).await;
+    let outcome = q.engine.pause_task(&a.id, false).await.unwrap();
+    assert_eq!(outcome.status, "paused");
+
+    // incomplete
+    let q = Q::new(None).await;
+    q.script(&[("job-b", Ending::NoReport)]);
+    let b = q.create("job-b").await;
+    q.wait_started("job-b").await;
+    q.release("job-b");
+    q.wait_status(&b.id, "stuck").await;
+    wait_idle_gate(&q, &b.id).await;
+
+    // pause --now
+    let q = Q::new(None).await;
+    q.script(&[("job-c", Ending::Report)]);
+    let c = q.create("job-c").await;
+    q.wait_started("job-c").await;
+    q.engine.pause_task(&c.id, true).await.unwrap();
+    q.wait_status(&c.id, "paused").await;
+    wait_idle_gate(&q, &c.id).await;
+
+    // a watcher that panics after freeing its slot
+    let q = Q::new(None).await;
+    q.script(&[("job-d", Ending::Report)]);
+    q.engine.turn_gate().panic_after_free("coding");
+    let d = q.create("job-d").await;
+    q.wait_started("job-d").await;
+    q.release("job-d");
+    wait_idle_gate(&q, &d.id).await;
+    assert_eq!(q.status(&d.id).await, "open");
+    assert_eq!(current_stage(&q, &d.id).await, "coding");
+    let outcome = q.engine.pause_task(&d.id, false).await.unwrap();
+    assert_eq!(outcome.status, "paused");
+}
+
+#[tokio::test]
+async fn a_paused_tasks_handled_end_is_not_judged_again_by_the_sweep() {
+    let q = Q::new(None).await;
+    let g = paused_group(&q, &[]).await;
+    let before = task_of(&q, &g.id).await;
+    // The branches' ends were handled by the pause. A read-only branch
+    // changing the worktree afterwards is not the sweep's to judge.
+    fs::write(group_worktree(&q, &g).join("changed.txt"), "x").unwrap();
+    let next = q.restarted_engine();
+    q.crash_and_sweep(&next).await;
+    let after = task_of(&q, &g.id).await;
+    assert_eq!(after.status, "paused");
+    assert!(after.stuck_reason.is_none());
+    assert_eq!(after.paused_at, before.paused_at);
+}
+
+#[tokio::test]
+async fn a_paused_task_at_a_held_stage_stays_paused_across_a_restart_and_resume_starts_it() {
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = create_flow(&q, PFLOW, "pflow.yaml", "job-a").await;
+    q.wait_started("job-a").await;
+    q.engine.pause_task(&a.id, false).await.unwrap();
+    q.release("job-a");
+    q.wait_status(&a.id, "paused").await;
+    let before = task_of(&q, &a.id).await;
+    let next = q.restarted_engine();
+    q.crash_and_sweep(&next).await;
+    let after = task_of(&q, &a.id).await;
+    assert_eq!(after.status, "paused");
+    assert_eq!(after.paused_at, before.paused_at);
+    let outcome = next.resume_task(&a.id).await.unwrap();
+    assert_eq!(outcome.started, vec!["checks".to_string()]);
+    q.wait_status(&a.id, "closed").await;
+}
+
+#[tokio::test]
+async fn a_pausing_group_cut_off_by_a_crash_is_paused_and_resume_restarts_its_branches() {
+    let q = Q::new(None).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+        ("BRANCH-THREE", "three", Ending::Report),
+    ]);
+    let g = create_group_flow(&q, &three_group_flow(), "agroup3.yaml", "fix-job").await;
+    for name in ["one", "two", "three"] {
+        q.wait_started(name).await;
+    }
+    q.engine.pause_task(&g.id, false).await.unwrap();
+    assert_eq!(q.status(&g.id).await, "pausing");
+    let next = q.restarted_engine();
+    q.crash_and_sweep(&next).await;
+    // Accepted cost: a turn that had completed would be re-run from its
+    // session; these were running.
+    assert_eq!(q.status(&g.id).await, "paused");
+    for name in ["one", "two", "three"] {
+        let s = session_of(&q, &g.id, name).await;
+        assert_eq!(
+            s.end_reason,
+            Some(SessionEndReason::DaemonStopped),
+            "{name}"
+        );
+        if s.adapter_session_id.is_none() {
+            sessions::set_adapter_session_id(&q.pool, &s.id, &format!("adapter-{name}"))
+                .await
+                .unwrap();
+        }
+    }
+    plain_script(&q, "rest");
+    q.release("rest");
+    let outcome = next.resume_task(&g.id).await.unwrap();
+    let mut started = outcome.started.clone();
+    started.sort();
+    assert_eq!(started, ["one", "three", "two"].map(String::from).to_vec());
 }

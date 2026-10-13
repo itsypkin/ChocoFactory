@@ -12,7 +12,11 @@
 //!
 //! A turn that starts holds a [`TurnPermit`] with exactly one owner at a time:
 //! `launch_turn` until the process is spawned, then the turn watcher until
-//! the process is gone. The queued turns are rows in `turn_queue`; the
+//! the process is gone. At that point the watcher calls
+//! [`TurnPermit::free_slot`]: the slot frees (the entry no longer counts
+//! toward any pool or `running_for_task`) but the entry stays in the gate as
+//! *settling* until the result is applied, so `busy_for_task` can tell a
+//! pause that nothing of the task's is unapplied. The queued turns are rows in `turn_queue`; the
 //! dispatcher (`run_dispatcher`) starts them in order as slots free.
 
 use std::collections::HashMap;
@@ -164,14 +168,44 @@ pub(crate) fn place(rows: Vec<QueueRow>, caps: &HashMap<String, u32>) -> Vec<Pla
 struct PermitInfo {
     task_id: String,
     project_id: String,
+    /// The stage, or for a branch the branch's name, this turn runs.
+    stage: String,
+    /// The turn's process is gone and its slot is free, but its watcher is
+    /// still handling the result. Counts toward no pool.
+    settling: bool,
 }
 
 /// A slot held by one running single-shot turn. Dropping it frees the slot
-/// (it cannot be dropped twice or skipped) and wakes the dispatcher.
+/// and removes the turn from the gate (it cannot be dropped twice or
+/// skipped) and wakes the dispatcher. [`TurnPermit::free_slot`] frees the
+/// slot but keeps the turn in the gate as *settling* until the returned
+/// guard drops, so "nothing of the task's is unapplied" can be asked of the
+/// gate.
 #[derive(Debug)]
 pub(crate) struct TurnPermit {
     gate: Arc<TurnGate>,
     id: u64,
+    /// `free_slot` has handed the entry to a [`SettlingGuard`].
+    settled: bool,
+}
+
+/// A turn whose slot is free but whose watcher is still applying its result.
+/// Dropping it (also when the watcher is aborted or panics) removes the
+/// turn from the gate.
+#[derive(Debug)]
+pub(crate) struct SettlingGuard {
+    gate: Arc<TurnGate>,
+    id: u64,
+}
+
+impl Drop for SettlingGuard {
+    fn drop(&mut self) {
+        self.gate
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
 }
 
 impl TurnPermit {
@@ -180,10 +214,34 @@ impl TurnPermit {
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
+
+    /// Frees the slot now (waking the dispatcher) and keeps the turn in the
+    /// gate as settling until the guard drops.
+    pub(crate) fn free_slot(mut self) -> SettlingGuard {
+        {
+            let mut running = self
+                .gate
+                .running
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(info) = running.get_mut(&self.id) {
+                info.settling = true;
+            }
+        }
+        self.settled = true;
+        self.gate.wake.notify_one();
+        SettlingGuard {
+            gate: Arc::clone(&self.gate),
+            id: self.id,
+        }
+    }
 }
 
 impl Drop for TurnPermit {
     fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
         self.gate
             .running
             .lock()
@@ -232,6 +290,14 @@ pub struct TurnGate {
     wake: Notify,
     stopping: AtomicBool,
     queue_error: std::sync::Mutex<Option<String>>,
+    /// Stage names whose watcher waits right after freeing its slot until
+    /// the test adds a permit (tests only).
+    #[cfg(test)]
+    after_free_holds: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Stage names whose watcher panics right after freeing its slot (tests
+    /// only).
+    #[cfg(test)]
+    after_free_panics: std::sync::Mutex<std::collections::HashSet<String>>,
     tick_ms: AtomicU64,
     /// Projects of queued turns whose failed admission is being handled: the
     /// row is deleted and its permit dropped, but the row may still be put
@@ -277,6 +343,10 @@ impl TurnGate {
             wake: Notify::new(),
             stopping: AtomicBool::new(false),
             queue_error: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            after_free_holds: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            after_free_panics: std::sync::Mutex::new(std::collections::HashSet::new()),
             tick_ms: AtomicU64::new(DEFAULT_DISPATCH_TICK.as_millis() as u64),
             restoring: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -304,7 +374,8 @@ impl TurnGate {
         self.running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(&id)
+            .get(&id)
+            .is_some_and(|info| !info.settling)
     }
 
     /// How many dispatcher passes have run (tests).
@@ -346,8 +417,19 @@ impl TurnGate {
         self.wake.notify_one();
     }
 
-    /// The agent turns of `task_id` that are running now.
+    /// The agent turns of `task_id` that are running now (holding a slot).
     pub(crate) fn running_for_task(&self, task_id: &str) -> usize {
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|info| info.task_id == task_id && !info.settling)
+            .count()
+    }
+
+    /// The agent turns of `task_id` that are running or whose watcher is
+    /// still applying the result.
+    pub(crate) fn busy_for_task(&self, task_id: &str) -> usize {
         self.running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -356,12 +438,103 @@ impl TurnGate {
             .count()
     }
 
+    /// Whether a turn of `stage` (or the branch of that name) of `task_id`
+    /// is running or settling.
+    pub(crate) fn busy_for_stage(&self, task_id: &str, stage: &str) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|info| info.task_id == task_id && info.stage == stage)
+    }
+
+    /// A settling entry for a watcher that holds no permit (tests only
+    /// spawn one). Its project is empty: settling entries count toward no
+    /// pool, so nothing reads it.
+    pub(crate) fn settling_entry(self: &Arc<Self>, task_id: &str, stage: &str) -> SettlingGuard {
+        let id = self.next_permit.fetch_add(1, Ordering::SeqCst);
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                id,
+                PermitInfo {
+                    task_id: task_id.to_string(),
+                    project_id: String::new(),
+                    stage: stage.to_string(),
+                    settling: true,
+                },
+            );
+        SettlingGuard {
+            gate: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// Makes the watcher of `stage` wait right after it frees its slot until
+    /// [`Self::release_after_free`] is called (tests).
+    #[cfg(test)]
+    pub(crate) fn hold_after_free(&self, stage: &str) {
+        self.after_free_holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stage.to_string(), Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    /// Lets the held watcher of `stage` go on (tests).
+    #[cfg(test)]
+    pub(crate) fn release_after_free(&self, stage: &str) {
+        if let Some(sem) = self
+            .after_free_holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(stage)
+        {
+            sem.add_permits(1);
+        }
+    }
+
+    /// Makes the watcher of `stage` panic right after it frees its slot
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn panic_after_free(&self, stage: &str) {
+        self.after_free_panics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stage.to_string());
+    }
+
+    /// The test hooks, run by a watcher right after it frees its slot.
+    #[cfg(test)]
+    pub(crate) async fn after_free_hooks(&self, stage: &str) {
+        let hold = self
+            .after_free_holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(stage)
+            .cloned();
+        if let Some(sem) = hold {
+            sem.acquire()
+                .await
+                .expect("the hold is never closed")
+                .forget();
+        }
+        let panics = self
+            .after_free_panics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(stage);
+        if panics {
+            panic!("test hook: the watcher of '{stage}' panics after freeing its slot");
+        }
+    }
+
     fn running_in(&self, pool: &PoolKey, caps: &HashMap<String, u32>) -> u32 {
         self.running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .values()
-            .filter(|info| &pool_of(&info.project_id, caps) == pool)
+            .filter(|info| !info.settling && &pool_of(&info.project_id, caps) == pool)
             .count() as u32
     }
 
@@ -370,10 +543,12 @@ impl TurnGate {
         self.running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+            .values()
+            .filter(|info| !info.settling)
+            .count()
     }
 
-    fn issue(self: &Arc<Self>, task_id: &str, project_id: &str) -> TurnPermit {
+    fn issue(self: &Arc<Self>, task_id: &str, project_id: &str, stage: &str) -> TurnPermit {
         let id = self.next_permit.fetch_add(1, Ordering::SeqCst);
         self.running
             .lock()
@@ -383,11 +558,14 @@ impl TurnGate {
                 PermitInfo {
                     task_id: task_id.to_string(),
                     project_id: project_id.to_string(),
+                    stage: stage.to_string(),
+                    settling: false,
                 },
             );
         TurnPermit {
             gate: Arc::clone(self),
             id,
+            settled: false,
         }
     }
 
@@ -448,7 +626,10 @@ impl TurnGate {
                     Some(limit) => ahead == 0 && running < limit,
                 };
             if starts {
-                (Claim::Start(self.issue(task_id, &task.project_id)), None)
+                (
+                    Claim::Start(self.issue(task_id, &task.project_id, spec.stage)),
+                    None,
+                )
             } else {
                 turn_queue::insert(
                     &self.pool,
@@ -556,8 +737,11 @@ impl TurnGate {
         if let Some(candidate) = candidate {
             if let Some(expected) = issue_for {
                 if candidate.row.id == expected {
-                    picked.permit =
-                        Some(self.issue(&candidate.row.task_id, &candidate.row.project_id));
+                    picked.permit = Some(self.issue(
+                        &candidate.row.task_id,
+                        &candidate.row.project_id,
+                        &candidate.row.stage,
+                    ));
                     picked.row = Some(candidate.row);
                 }
             } else {

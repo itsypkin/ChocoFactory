@@ -160,7 +160,8 @@ has two statuses on the way:
 - `pausing`: the pause was asked for, and an agent turn or shell command the
   task had already started is still running. It shows a `Paused` line,
   `waiting for <stage>'s turn to finish`.
-- `paused`: nothing of the task's is running. The line reads
+- `paused`: nothing of the task's is running and every finished turn's
+  result is applied. The line reads
   `since HH:MM — choco task resume <id>`.
 
 A graceful pause stops polls and watchers at once, lets a running turn or
@@ -178,6 +179,13 @@ Refused with a `409`, nothing started and the status unchanged: `pause` of a
 task that is already paused, pausing (without `--now`), stuck, closed or
 cancelled; `resume` of an open, stuck, closed or cancelled task; `retry` and
 `send` to a chat on a pausing or paused task (both name `choco task resume`).
+One `resume` refusal does change the status: at an agent or group stage with
+nothing to start and nothing running or queued, it marks the task `stuck`
+and the `409` reads `stage '<stage>' cannot resume: …; retry continues it
+(the task is now stuck)`; then `choco task retry <id>` continues it. A
+paused task at a human gate or a chat stage resumes to `open` with nothing
+started. A daemon restart keeps a paused task paused, except one whose turn
+had failed unapplied: that task is `stuck`.
 A turn that fails while the task is `pausing` makes it `stuck`, and
 `choco task cancel` works from either status.
 

@@ -1027,7 +1027,8 @@ impl WorkflowEngine {
             // The slot this turn holds. It lives exactly as long as the
             // turn's process can: the loop below ends only once the session
             // row says the process is gone. If this task is aborted or
-            // panics, the future is dropped and the permit with it.
+            // panics, the future is dropped and the permit (or, later, the
+            // settling guard) with it.
             let permit = permit;
             let end = loop {
                 match sessions::get(&engine.pool, &session_id).await {
@@ -1181,7 +1182,12 @@ impl WorkflowEngine {
             // frees *before* the result is handled, so the same task's next
             // turn never waits for this one's permit, and a slow read-only
             // check does not hold a slot. Every way a turn ends passes here.
-            drop(permit);
+            let settling = match permit {
+                Some(permit) => permit.free_slot(),
+                None => engine.turn_gate.settling_entry(&task_id, &stage_name),
+            };
+            #[cfg(test)]
+            engine.turn_gate.after_free_hooks(&stage_name).await;
             match end {
                 TurnEnd::Completed => {
                     engine
@@ -1233,13 +1239,15 @@ impl WorkflowEngine {
                 }
                 TurnEnd::Cancelled | TurnEnd::SessionGone => {}
             }
+            // The result is applied: the turn is no longer settling.
+            drop(settling);
             // The one point every end reaches, after the result is handled.
             engine.after_turn_end(&task_id, &session_id).await;
         })
     }
 
     /// Reached by every end of a single-shot turn, after its result has been
-    /// handled and its slot freed: when the task was pausing and this was its
+    /// handled, its slot freed and its settling entry gone: when the task was pausing and this was its
     /// last running work, it becomes `paused` (#295).
     async fn after_turn_end(&self, task_id: &str, session_id: &str) {
         tracing::debug!(

@@ -2,7 +2,8 @@
 //!
 //! `pause` moves an `open` task to `pausing`, stops its watchers (and, with
 //! `--now`, its running turns and commands), and lets [`settle_pause`] make it
-//! `paused` once nothing of its own is running. `resume` writes `open` and
+//! `paused` once nothing of its own is running and every ended turn's result
+//! is applied. `resume` writes `open` and
 //! then starts whatever was held. Every status change is one conditional
 //! `UPDATE` under the task's lock; `dispatch_stage` is the single place a
 //! stage is held.
@@ -103,9 +104,50 @@ impl From<LoadTaskWorkflowError> for ResumeTaskError {
     }
 }
 
+/// The tail of a `resume` failure that found no work to start or wait for.
+const NOTHING_MOVES: &str = "nothing is running or queued to move the task on";
+
+fn reason_text(session: &Session) -> String {
+    session
+        .end_reason
+        .map_or_else(|| "none".to_string(), |r| r.to_string())
+}
+
+/// Whether `session` ended in a failure its watcher would have parked, from
+/// the row alone, with the text to show. Mirrors the order of checks in
+/// `spawn_turn_watcher`: `cancelled` exits quietly; `paused` and
+/// `daemon_stopped` are requested ends; `reaped` and `interrupted` are
+/// parked on any status; otherwise `idle` is a completed run and `exited` is
+/// a failure, with or without a reason.
+pub(super) fn run_failure(session: &Session) -> Option<String> {
+    let failed = match (session.status, session.end_reason) {
+        (SessionStatus::Active, _) => false,
+        (
+            _,
+            Some(
+                SessionEndReason::Cancelled
+                | SessionEndReason::Paused
+                | SessionEndReason::DaemonStopped,
+            ),
+        ) => false,
+        (_, Some(SessionEndReason::Reaped | SessionEndReason::Interrupted)) => true,
+        (SessionStatus::Idle, _) => false,
+        (SessionStatus::Exited, _) => true,
+    };
+    failed.then(|| {
+        format!(
+            "its session ended: {}, end reason {}",
+            session.status,
+            reason_text(session)
+        )
+    })
+}
+
 /// What `resume` starts, decided from reads only.
 enum ResumePlan {
-    /// Nothing is held (or what exists is running or queued already).
+    /// Nothing is held, and what exists is running, queued or waiting for a
+    /// person already. At an agent or group stage `plan_resume` returns this
+    /// only when that holds; otherwise it returns `Failed`.
     Nothing,
     /// Re-enter the current stage, resuming `resume` when given.
     Stage(Option<ResumeSession>),
@@ -351,8 +393,9 @@ impl WorkflowEngine {
         Ok(live)
     }
 
-    /// Makes a `pausing` task `paused` when nothing of its own is running:
-    /// no turn permit and no detached runner. Takes the task lock.
+    /// Makes a `pausing` task `paused` when nothing of its own is running or
+    /// unapplied: no running or settling turn and no detached runner. Takes
+    /// the task lock.
     pub(super) async fn settle_pause(&self, task_id: &str) {
         let lock = self.lock_for_task(task_id).await;
         {
@@ -378,7 +421,7 @@ impl WorkflowEngine {
         if task.status != TASK_STATUS_PAUSING {
             return;
         }
-        if self.turn_gate.running_for_task(task_id) > 0 || self.has_detached_runner(task_id) {
+        if self.has_running_work(task_id) {
             return;
         }
         match tasks::mark_paused(&self.pool, task_id).await {
@@ -642,15 +685,32 @@ impl WorkflowEngine {
                         .stage_entered_at
                         .is_none_or(|entered| s.started_at >= entered)
                 });
+                // A standing chat stage waits for a person.
                 let standing = stage_def.on.is_empty();
                 let Some(session) = this_entry else {
                     return Ok(ResumePlan::Stage(None));
                 };
-                if !standing && let Some(why) = Self::pause_failure(&session) {
+                if standing {
+                    return Ok(ResumePlan::Nothing);
+                }
+                // Even when its watcher is still settling: the watcher would
+                // park it stuck, and nothing else would move the task.
+                if let Some(why) = run_failure(&session) {
                     return Ok(ResumePlan::Failed(why));
                 }
-                if standing || !Self::pause_left_unsettled(&session) {
-                    return Ok(ResumePlan::Nothing);
+                if !Self::pause_left_unsettled(&session) {
+                    // A completed run whose result is not applied yet is
+                    // moved on by its settling watcher; with none, nothing
+                    // would ever move the task.
+                    if self.has_running_work(task_id) {
+                        return Ok(ResumePlan::Nothing);
+                    }
+                    return Ok(ResumePlan::Failed(format!(
+                        "its last run, session {}, is {}/{}; {NOTHING_MOVES}",
+                        session.id,
+                        session.status,
+                        reason_text(&session)
+                    )));
                 }
                 let resume = self
                     .resumable_or_fresh(task, definition, stage_def, &session, false)
@@ -658,11 +718,17 @@ impl WorkflowEngine {
                 Ok(ResumePlan::Stage(resume))
             }
             StageKind::Parallel { branches } => {
-                let Some(entry_no) = block_for(&state.payload, stage)
+                let entry_no = block_for(&state.payload, stage)
                     .and_then(|block| block.get("entry"))
-                    .and_then(Value::as_i64)
-                else {
-                    return Ok(ResumePlan::Nothing);
+                    .and_then(Value::as_i64);
+                let Some(entry_no) = entry_no else {
+                    return Ok(if self.has_running_work(task_id) {
+                        ResumePlan::Nothing
+                    } else {
+                        ResumePlan::Failed(format!(
+                            "the group has no recorded entry; {NOTHING_MOVES}"
+                        ))
+                    });
                 };
                 let mut any_started = false;
                 for name in branches.keys() {
@@ -675,18 +741,34 @@ impl WorkflowEngine {
                     return Ok(ResumePlan::EnterGroup);
                 }
                 let mut restarts = Vec::new();
+                let mut work_remains = false;
+                let mut found: Vec<String> = Vec::new();
                 for (name, branch) in branches {
-                    if branch_slot_state(&state.payload, name) != Some("running") {
+                    let slot = branch_slot_state(&state.payload, name);
+                    if slot != Some("running") {
+                        if slot != Some("done") {
+                            found.push(format!("branch '{name}' is {}", slot.unwrap_or("unknown")));
+                        }
                         continue;
                     }
                     match self.branch_progress(task_id, name, entry_no).await? {
-                        BranchWork::Queued | BranchWork::Live(_) => {}
+                        BranchWork::Queued | BranchWork::Live(_) => work_remains = true,
                         BranchWork::Ended(session) => {
-                            // A failed branch is left to its watcher: it may still
-                            // be about to record the end, and siblings may be running.
-                            // The crash case is the pausing sweep's.
-                            if Self::pause_failure(&session).is_some() {
-                                continue;
+                            if let Some(why) = run_failure(&session) {
+                                // Its watcher may still be about to record the
+                                // end, and siblings may be running: leave it.
+                                // A failed branch whose watcher is gone is the
+                                // restart sweep's, for both pausing and paused
+                                // tasks; if it was not recorded, resume fails
+                                // the plan (restarting its siblings would
+                                // leave a slot that never settles).
+                                if self.turn_gate.busy_for_stage(task_id, name) {
+                                    work_remains = true;
+                                    continue;
+                                }
+                                return Ok(ResumePlan::Failed(format!(
+                                    "branch '{name}' cannot resume: {why}"
+                                )));
                             }
                             if Self::pause_left_unsettled(&session) {
                                 let resume = self
@@ -699,39 +781,45 @@ impl WorkflowEngine {
                                     )
                                     .await?;
                                 restarts.push((name.clone(), resume));
+                            } else {
+                                found.push(format!(
+                                    "branch '{name}' is running, its run {} is {}/{}",
+                                    session.id,
+                                    session.status,
+                                    reason_text(&session)
+                                ));
                             }
                         }
                         BranchWork::NeverStarted => restarts.push((name.clone(), None)),
                     }
                 }
-                Ok(if restarts.is_empty() {
-                    ResumePlan::Nothing
-                } else {
-                    ResumePlan::Branches(restarts)
-                })
+                if !restarts.is_empty() {
+                    return Ok(ResumePlan::Branches(restarts));
+                }
+                if work_remains || self.has_running_work(task_id) {
+                    return Ok(ResumePlan::Nothing);
+                }
+                if found.is_empty() {
+                    found.push("no branch has anything left to restart".to_string());
+                }
+                Ok(ResumePlan::Failed(format!(
+                    "{}; {NOTHING_MOVES}",
+                    found.join("; ")
+                )))
             }
         }
     }
 
-    /// An explicit failure end reason on this session, if it has one.
-    fn pause_failure(session: &Session) -> Option<String> {
-        match (session.status, session.end_reason) {
-            (SessionStatus::Exited, Some(reason))
-                if !matches!(
-                    reason,
-                    SessionEndReason::Paused | SessionEndReason::DaemonStopped
-                ) =>
-            {
-                Some(format!("its last run ended: {reason}"))
-            }
-            _ => None,
-        }
+    /// Whether anything of the task's is running or settling, or a detached
+    /// runner is registered.
+    fn has_running_work(&self, task_id: &str) -> bool {
+        self.turn_gate.busy_for_task(task_id) > 0 || self.has_detached_runner(task_id)
     }
 
-    /// Whether a pause (or the daemon stopping under a pausing task) ended
-    /// this session without its watcher settling anything: those are the
-    /// only ends `resume` restarts. A live or completing turn belongs to its
-    /// watcher, and any other end is a failure the watcher records itself.
+    /// Whether a pause (or the daemon stopping under the task) ended this
+    /// session without its watcher settling anything: those are the only
+    /// ends `resume` restarts. A live or completing turn belongs to its
+    /// watcher, and a failure is `run_failure`'s.
     fn pause_left_unsettled(session: &Session) -> bool {
         session.status == SessionStatus::Exited
             && matches!(
