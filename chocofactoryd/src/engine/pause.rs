@@ -781,13 +781,19 @@ impl WorkflowEngine {
                                     )
                                     .await?;
                                 restarts.push((name.clone(), resume));
+                            } else if self.turn_gate.busy_for_stage(task_id, name) {
+                                // A completed run its watcher is still applying.
+                                work_remains = true;
                             } else {
-                                found.push(format!(
+                                // Completed but never applied, and no watcher:
+                                // restarting its siblings would leave a slot
+                                // that never settles.
+                                return Ok(ResumePlan::Failed(format!(
                                     "branch '{name}' is running, its run {} is {}/{}",
                                     session.id,
                                     session.status,
                                     reason_text(&session)
-                                ));
+                                )));
                             }
                         }
                         BranchWork::NeverStarted => restarts.push((name.clone(), None)),

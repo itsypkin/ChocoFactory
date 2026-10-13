@@ -2115,6 +2115,27 @@ async fn a_failed_branch_with_no_watcher_fails_the_plan_instead_of_restarting_it
 }
 
 #[tokio::test]
+async fn a_completed_unapplied_branch_with_no_watcher_fails_the_plan_instead_of_restarting_its_siblings()
+ {
+    let q = Q::new(None).await;
+    let g = paused_group(&q, &["three"]).await;
+    let one = session_of(&q, &g.id, "one").await;
+    set_end(&q, &one.id, "idle", None, true).await;
+    let two = session_of(&q, &g.id, "two").await;
+    set_end(&q, &two.id, "exited", Some("paused"), true).await;
+    let before = q.sessions(&g.id).await.len();
+    let next = q.restarted_engine();
+    let err = next.resume_task(&g.id).await.unwrap_err();
+    assert!(refused_text(&err).contains("'one'"), "{err}");
+    assert_eq!(q.status(&g.id).await, "stuck");
+    assert_eq!(
+        q.sessions(&g.id).await.len(),
+        before,
+        "two was not restarted"
+    );
+}
+
+#[tokio::test]
 async fn the_safety_net_is_one_write_and_never_writes_open() {
     // (d3)
     let q = Q::new(None).await;
