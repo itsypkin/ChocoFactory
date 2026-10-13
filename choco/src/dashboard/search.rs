@@ -1,16 +1,15 @@
-//! Task search for the dashboard's `/` popup (#292). Pure: no terminal or
-//! app types, so `choco task list --search` (#293) can reuse it.
+//! Task matching shared by the dashboard's `/` popup and
+//! `choco task list --search`. Pure: no terminal or app types.
 
 use chocofactory_core::models::TaskSummary;
 
-/// Tasks matching `query`, newest first (`created_at` descending, ties by id
-/// ascending). The rules apply to the trimmed query:
+/// Whether `task` matches `query`. The rules apply to the trimmed query:
 ///
 /// 1. empty: every task;
 /// 2. `#` and digits: the task whose PR number is exactly that;
 /// 3. digits only: PR number exactly that, or an id starting with it;
 /// 4. anything else: title contains it, or id starts with it (any case).
-pub fn search<'a>(tasks: &'a [TaskSummary], query: &str) -> Vec<&'a TaskSummary> {
+pub fn matches(task: &TaskSummary, query: &str) -> bool {
     let q = query.trim();
     let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let pr_is = |t: &TaskSummary, digits: &str| {
@@ -18,21 +17,22 @@ pub fn search<'a>(tasks: &'a [TaskSummary], query: &str) -> Vec<&'a TaskSummary>
             .is_some_and(|pr| pr.number.to_string() == digits)
     };
     let lower = q.to_lowercase();
-    let mut out: Vec<&TaskSummary> = tasks
-        .iter()
-        .filter(|t| {
-            if q.is_empty() {
-                true
-            } else if let Some(digits) = q.strip_prefix('#').filter(|d| all_digits(d)) {
-                pr_is(t, digits)
-            } else if all_digits(q) {
-                pr_is(t, q) || t.task.id.to_lowercase().starts_with(&lower)
-            } else {
-                t.task.title.to_lowercase().contains(&lower)
-                    || t.task.id.to_lowercase().starts_with(&lower)
-            }
-        })
-        .collect();
+    if q.is_empty() {
+        true
+    } else if let Some(digits) = q.strip_prefix('#').filter(|d| all_digits(d)) {
+        pr_is(task, digits)
+    } else if all_digits(q) {
+        pr_is(task, q) || task.task.id.to_lowercase().starts_with(&lower)
+    } else {
+        task.task.title.to_lowercase().contains(&lower)
+            || task.task.id.to_lowercase().starts_with(&lower)
+    }
+}
+
+/// Tasks that `matches` the query, newest first (`created_at` descending,
+/// ties by id ascending).
+pub fn search<'a>(tasks: &'a [TaskSummary], query: &str) -> Vec<&'a TaskSummary> {
+    let mut out: Vec<&TaskSummary> = tasks.iter().filter(|t| matches(t, query)).collect();
     out.sort_by(|a, b| {
         b.task
             .created_at
@@ -43,13 +43,13 @@ pub fn search<'a>(tasks: &'a [TaskSummary], query: &str) -> Vec<&'a TaskSummary>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chocofactory_core::models::{PullRequestRef, Task};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
 
-    fn t(id: &str, title: &str, pr: Option<u64>, created_min: u32) -> TaskSummary {
+    pub(crate) fn t(id: &str, title: &str, pr: Option<u64>, created_min: u32) -> TaskSummary {
         TaskSummary {
             queued: Vec::new(),
             task: Task {

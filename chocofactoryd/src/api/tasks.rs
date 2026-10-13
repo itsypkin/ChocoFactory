@@ -3024,4 +3024,32 @@ stages:
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `choco task list --search` filters the full list client-side, so an
+    /// absent `limit` must never be capped.
+    #[tokio::test]
+    async fn list_without_limit_returns_more_than_the_limit_ceiling() {
+        let server = TestServer::start().await;
+        let project_id = create_project(&server).await;
+        for _ in 0..=super::MAX_LIST_LIMIT {
+            crate::db::tasks::create(
+                server.pool(),
+                crate::db::tasks::NewTask {
+                    project_id: &project_id,
+                    workflow_def: "chat",
+                    title: "t",
+                    config: json!({}),
+                    workflow_path: None,
+                    workflow_sha256: None,
+                    base_ref: None,
+                    base_commit: None,
+                    closes: &[],
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let list: Value = server.get("/tasks").await.json();
+        assert_eq!(list.as_array().unwrap().len(), super::MAX_LIST_LIMIT + 1);
+    }
 }

@@ -261,6 +261,8 @@ choco task create --project <p> --workflow coding-task-planned \
   `--state all` once it is merged or closed). The plain `choco task status`
   doesn't print it, but `choco --json task status <id>` carries it as
   `.workflow_state.payload.stages.open_pr.url` once `open_pr` has run.
+  Going the other way, `choco task list --search '#<n>'` finds the task behind
+  PR `<n>`.
 - **Read the newest events** by running
   `${CLAUDE_SKILL_DIR}/scripts/tail-events.sh <task-id> [n]` (needs `jq`).
   `choco task events` is oldest first, so `choco task events | tail` shows
