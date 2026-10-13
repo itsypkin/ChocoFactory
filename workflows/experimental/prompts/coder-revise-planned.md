@@ -108,7 +108,8 @@ Commit your revisions, and rewrite the PR description file whole (step 4 of your
 instructions) so it describes the branch as it now stands.
 Start your draft from the file's current text, change what this lap changes, and write
 the whole result in one write; never append to it, find-and-replace in it, or splice
-around a heading.
+around a heading. If the result is over 6,000 bytes, cut it as step 4 says, even in
+sections this lap didn't change and even when the task allows more.
 Keep every section the spec requires. If the branch has an open PR, first
 read its published description: set `N` as the `awaiting_human_review`
 entry does, then `[ -n "$N" ] && gh pr view "$N" --json body -q .body`.

@@ -40,7 +40,7 @@ Copy this checklist and tick it off:
 - [ ] 1. Prepare: choco up to date, or a shared daemon's version noted; daemon running
 - [ ] 2. Write the spec
 - [ ] 3. Create the task and wait for awaiting_human_review (or a parked state)
-- [ ] 4. Review the PR, vote, and run the pre-merge checks
+- [ ] 4. Review the PR, vote, run the pre-merge checks, and wrap up after the merge
 - [ ] 5. Recover if it got stuck or escalated
 ```
 
@@ -181,14 +181,8 @@ explicit out-of-scope list.
   instruction files in folders above the repo. Anything from your personal
   setup that the task needs goes in the spec.
 - **Check that the design holds, not only that it builds.** List every way a
-  protected event can end and say whether the protection runs on each. Also
-  grep for statements the change makes false and probe a new prompt rule on
-  the production model the role runs in the workflow; see
-  [reference/spec.md](reference/spec.md#check-that-the-design-holds).
-- **Abandoned operations.** For anything that can time out, be cancelled or
-  lose its client, the spec states what it leaves behind (locks, rows,
-  files) and requires a test of it, or, if it can't be interrupted in a test,
-  names the interrupt as an accepted cost with the reason; see
+  protected event can end and say whether the protection runs on each, and
+  carry in any spec checks your project's instruction files name; see
   [reference/spec.md](reference/spec.md#check-that-the-design-holds).
 - **Read the issue with comments:** `gh issue view <n> --json title,body,comments`
   (`gh issue view <n> --comments` can print nothing and exit 0).
@@ -199,7 +193,7 @@ explicit out-of-scope list.
 - **Which `--help`:** the installed `choco --help` matches your daemon. For a
   task that documents or changes the CLI, build the default branch and use
   its `--help` (see [reference/spec.md](reference/spec.md#which---help-to-trust)).
-- **Check for collisions against your default branch and open PRs:**
+- **Check for collisions against your default branch, open PRs and running tasks:**
   numbered files such as database migrations above all, then file names and
   flags, including a file another PR's tests copy or pin. Two tasks that
   both take the next number conflict, and the second PR's CI may not run.
@@ -332,9 +326,10 @@ moves the head past your comment without changing anything. What to do next
 is in [reference/recover.md](reference/recover.md).
 
 **`/approve` moves the task to `done`; merging the PR is still your job.**
-Merging the PR also moves the task to `done` within a minute, without a
-vote, so don't post `/approve` after merging; a PR closed without merging
-doesn't move the task. `done` deletes the task's local branch only if it was
+Merging the PR also moves the task to `done` at the gate's next check
+(every minute for its first 6 hours, then every 5 minutes, then every 30
+minutes after 30 hours), without a vote, so don't post `/approve` after
+merging; a PR closed without merging doesn't move the task. `done` deletes the task's local branch only if it was
 pushed or merged; the remote `task/<id>` branch stays unless the repo
 deletes merged head branches.
 
@@ -352,6 +347,11 @@ Before you merge, check what it will close:
    git log --format=%B origin/main..origin/<head-branch> \
      | grep -inE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[*_]*:?[*_]* +(([a-z0-9_.-]+/[a-z0-9_.-]+)?#[0-9]+|https?://github\.com/[^ ]+/issues/[0-9]+)'
    ```
+
+**After the merge,** check that `choco task status <id>` shows the task
+`closed` once the gate's next check has run, and remove what you made for
+it outside the repo: spec drafts, probe files, scratch worktrees and any
+throwaway daemon.
 
 **When someone else reviews,** drive the task to `awaiting_human_review`
 and run the sanity checks above: the PR merges cleanly, CI passed

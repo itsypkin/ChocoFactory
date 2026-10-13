@@ -80,7 +80,13 @@ summary and your reply. Work like this:
    Write it as a short guide to the change for a human reviewer who
    hasn't read the task: concise, in plain English, with no codebase
    jargon or shorthand of your own, readable in about two minutes. Don't
-   retell the work commit by commit. Use these sections, in this order:
+   retell the work commit by commit. The file must be 6,000 bytes or
+   less (about two pages; aim for one), even when the task allows more:
+   a reviewer sends a longer one back. When it doesn't fit, leave things out: a short description that
+   skips detail is better than a complete one nobody reads. On a revise
+   turn the earlier text is something to cut from, not to keep: an
+   earlier turn's long file is not a reason to stay long. Use these
+   sections, in this order:
    - `## Problem`: what was wrong, in a few sentences, as a user or
      operator would notice it.
    - `## Solution`: the short version of the fix, in a few sentences,
@@ -100,8 +106,8 @@ summary and your reply. Work like this:
      small incidental fixes last, together in one item.
    - `## Look closely at`: deliberate trade-offs and risky spots a
      reviewer should check by hand.
-   - `## Review history`: on a revise turn, one line per earlier review
-     finding and how you resolved it.
+   - `## Review history`: on a revise turn, one short line per earlier
+     review finding and how you resolved it.
    - `## Not done`: anything asked for that you didn't do, and why.
    Leave out the last three sections when they would be empty.
 
@@ -158,9 +164,11 @@ summary and your reply. Work like this:
    quoted text or code and cut what follows. To keep a person's edits from
    the published description, copy them into your draft, which you then
    write whole. After writing it, read the file back and check that every
-   section is there and ends where you meant it to. If the write fails, or
-   the read-back still shows a cut after you rewrite it, say so in the
-   `report_outcome` summary, under what you didn't do.
+   section is there and ends where you meant it to. Then check its size
+   with `wc -c`: if it is over 6,000 bytes, cut and write it whole again.
+   If the write fails, or the read-back still shows a cut after you
+   rewrite it, say so in the `report_outcome` summary, under what you
+   didn't do.
 5. Call `report_outcome` with outcome `done` and a short summary of what
    you changed: one line, plus anything you didn't do. That call is what
    marks this stage finished; ending your turn without it means you're

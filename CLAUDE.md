@@ -48,7 +48,11 @@ suites and still exits 0, because the harnesses that spawn the binaries aren't b
 below 10 means a short run, not deleted tests.
 
 If a timing-sensitive daemon test flakes under parallel load, check #98 and #85 before assuming you
-broke it.
+broke it. That covers only tests already on main: a test your change adds that fails even once is your
+change's defect, so find the race before approving it.
+
+Run one cargo command at a time in a worktree. A second build only waits on the first's lock on the
+target dir, and on this repo's 8 GB development machine it starves everything else.
 
 ## Self-check before opening a PR
 
@@ -58,6 +62,33 @@ Reviews on this repo repeatedly flag the same two defects. Check your own diff f
   interleave with. One write per fact.
 - **Swallowed errors** — a `Result` dropped, logged-and-continued, or collapsed into a default where
   the caller can no longer tell the operation failed.
+
+## What a spec on this repo covers
+
+When you write or check a spec for a change here, it also covers these. Each comes from a defect that
+reached a human reviewer.
+
+- **Every statement the change makes false.** Grep the skills, docs and prompts for the old
+  behaviour's wording and commands, and fix each hit in the same PR.
+- **Abandoned operations.** For anything that can time out, be cancelled or lose its client, the spec
+  states what is left behind (locks, rows, files) and requires a test that interrupts it and checks
+  that state; or, if the operation can't be interrupted in a test, names the interrupt as an accepted
+  cost, with the reason.
+- **A new value in a closed set.** When the change adds a value to an enum, an event type or a
+  status, list every match, parser or list over that set, including ones with a catch-all arm the
+  compiler won't flag. Each one needs a case for the new value, so its file is in scope.
+- **Tests that can't be fooled.**
+  - A rule over a set (every, all, any, only) is tested with a mixed case, not only the uniform ones.
+  - Each safety rule has a test that fails when that rule alone is removed, and no other rule can
+    produce the same result in that test. Safety rules include who owns what, what is excluded and
+    what is refused. They also include each lock, transaction, conditional write or filter that keeps
+    two writers apart. The spec lists each one with the break that must fail its test, and the coder
+    makes each break and reports the result.
+  - The coder checks a read from the OS or another external system once, on the real machine,
+    against an independent source (for example a process list against `ps`), and reports the
+    result. A claim about how long an operation takes is measured with that exact operation.
+- **A new rule in a prompt.** The coder runs one probe of the rule on the production model the role
+  runs in the workflow, in its lap, and reports the probe and its result.
 
 ## Conventions
 

@@ -45,7 +45,9 @@ is missing, cut short or failing blocks: report `changes_requested`, even when
 the security and architecture reviews are `clean`.
 
 Decide which findings are blocking. Reject a finding that is wrong, already
-handled or out of scope, and say why.
+handled or out of scope, and say why. A finding that something the agreed spec
+requires is missing or untested blocks, even when the pull request lists it as
+not done.
 
 ## Report
 
