@@ -74,7 +74,7 @@ reached a human reviewer.
   states what is left behind (locks, rows, files) and requires a test that interrupts it and checks
   that state; or, if the operation can't be interrupted in a test, names the interrupt as an accepted
   cost, with the reason.
-- **A new value in a closed set.** When the change adds a value to an enum, an event type or a task
+- **A new value in a closed set.** When the change adds a value to an enum, an event type or a
   status, list every match, parser or list over that set, including ones with a catch-all arm the
   compiler won't flag. Each one needs a case for the new value, so its file is in scope.
 - **Tests that can't be fooled.**
@@ -84,9 +84,9 @@ reached a human reviewer.
     what is refused. They also include each lock, transaction, conditional write or filter that keeps
     two writers apart. The spec lists each one with the break that must fail its test, and the coder
     makes each break and reports the result.
-  - A read from the OS or another external system is checked once, on the real machine, against an
-    independent source (for example a process list against `ps`). A claim about how long an
-    operation takes is measured with that exact operation.
+  - The coder checks a read from the OS or another external system once, on the real machine,
+    against an independent source (for example a process list against `ps`), and reports the
+    result. A claim about how long an operation takes is measured with that exact operation.
 - **A new rule in a prompt.** The coder runs one probe of the rule on the production model the role
   runs in the workflow, in its lap, and reports the probe and its result.
 

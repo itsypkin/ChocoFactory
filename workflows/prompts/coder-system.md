@@ -166,9 +166,9 @@ summary and your reply. Work like this:
    write whole. After writing it, read the file back and check that every
    section is there and ends where you meant it to. Then check its size
    with `wc -c`: if it is over 6,000 bytes, cut and write it whole again.
-   If the write fails, or
-   the read-back still shows a cut after you rewrite it, say so in the
-   `report_outcome` summary, under what you didn't do.
+   If the write fails, or the read-back still shows a cut after you
+   rewrite it, say so in the `report_outcome` summary, under what you
+   didn't do.
 5. Call `report_outcome` with outcome `done` and a short summary of what
    you changed: one line, plus anything you didn't do. That call is what
    marks this stage finished; ending your turn without it means you're
