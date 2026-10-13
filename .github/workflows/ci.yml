@@ -23,7 +23,7 @@ jobs:
           fi
           echo "$channel"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ steps.pin.outputs.channel }}
           components: rustfmt
@@ -45,7 +45,7 @@ jobs:
           fi
           echo "$channel"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ steps.pin.outputs.channel }}
           components: clippy
@@ -68,7 +68,7 @@ jobs:
           fi
           echo "$channel"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ steps.pin.outputs.channel }}
       - name: Show the toolchain
