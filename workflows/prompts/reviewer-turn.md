@@ -87,4 +87,4 @@ couldn't compare.
 These are non-blocking findings:
 a missing description; one that leaves out a change or a trade-off the diff makes;
 a change list that doesn't follow the path a request takes through the
-code; and one under 6,000 bytes that still isn't short and in plain English.
+code; and one that isn't short and in plain English.

@@ -328,8 +328,8 @@ is in [reference/recover.md](reference/recover.md).
 **`/approve` moves the task to `done`; merging the PR is still your job.**
 Merging the PR also moves the task to `done` at the gate's next check
 (every minute for its first 6 hours, then every 5 minutes, then every 30
-minutes after 30 hours), without a vote, so don't post `/approve` after merging; a PR closed without merging
-doesn't move the task. `done` deletes the task's local branch only if it was
+minutes after 30 hours), without a vote, so don't post `/approve` after
+merging; a PR closed without merging doesn't move the task. `done` deletes the task's local branch only if it was
 pushed or merged; the remote `task/<id>` branch stays unless the repo
 deletes merged head branches.
 
@@ -349,8 +349,9 @@ Before you merge, check what it will close:
    ```
 
 **After the merge,** check that `choco task status <id>` shows the task
-`closed` once the gate's next check has run, and remove what you made for it outside the
-repo: spec drafts, probe files, scratch worktrees and any throwaway daemon.
+`closed` once the gate's next check has run, and remove what you made for
+it outside the repo: spec drafts, probe files, scratch worktrees and any
+throwaway daemon.
 
 **When someone else reviews,** drive the task to `awaiting_human_review`
 and run the sanity checks above: the PR merges cleanly, CI passed

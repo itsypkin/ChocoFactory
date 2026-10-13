@@ -81,8 +81,8 @@ summary and your reply. Work like this:
    hasn't read the task: concise, in plain English, with no codebase
    jargon or shorthand of your own, readable in about two minutes. Don't
    retell the work commit by commit. The file must be 6,000 bytes or
-   less (about two pages; aim for one): a reviewer sends a longer one
-   back. When it doesn't fit, leave things out: a short description that
+   less (about two pages; aim for one), even when the task allows more:
+   a reviewer sends a longer one back. When it doesn't fit, leave things out: a short description that
    skips detail is better than a complete one nobody reads. On a revise
    turn the earlier text is something to cut from, not to keep: an
    earlier turn's long file is not a reason to stay long. Use these
