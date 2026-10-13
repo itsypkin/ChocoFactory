@@ -2225,6 +2225,40 @@ async fn a_graceful_pause_holds_the_group_until_the_last_turn_has_applied_its_re
 }
 
 #[tokio::test]
+async fn resume_while_a_completed_branch_is_still_settling_opens_and_does_not_mark_the_task_stuck()
+{
+    // A completed branch whose watcher is applying its result is running work.
+    let q = Q::new(None).await;
+    q.script_branches(&[
+        ("BRANCH-ONE", "one", Ending::Report),
+        ("BRANCH-TWO", "two", Ending::Report),
+    ]);
+    let g = create_group_flow(&q, &group_flow(&["one", "two"]), "agroup3.yaml", "fix-job").await;
+    q.wait_started("one").await;
+    q.wait_started("two").await;
+    q.engine.pause_task(&g.id, false).await.unwrap();
+    q.engine.turn_gate().hold_after_free("one");
+    q.release("one");
+    crate::test_support::wait_until("branch one to be settling", || async {
+        let gate = q.engine.turn_gate();
+        if gate.busy_for_stage(&g.id, "one") && gate.running_for_task(&g.id) == 1 {
+            Ok(())
+        } else {
+            Err("not yet".to_string())
+        }
+    })
+    .await;
+    let outcome = q.engine.resume_task(&g.id).await.unwrap();
+    assert!(outcome.started.is_empty(), "{outcome:?}");
+    assert_eq!(q.status(&g.id).await, "open");
+    assert!(task_of(&q, &g.id).await.stuck_reason.is_none());
+    q.engine.turn_gate().release_after_free("one");
+    q.release("two");
+    wait_slot(&q, &g.id, "one", "done").await;
+    assert!(task_of(&q, &g.id).await.stuck_reason.is_none());
+}
+
+#[tokio::test]
 async fn resume_during_a_turns_settling_gap_opens_and_the_result_is_applied() {
     // (e2)
     let q = Q::new(None).await;

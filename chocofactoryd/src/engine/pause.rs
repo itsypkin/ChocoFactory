@@ -789,7 +789,7 @@ impl WorkflowEngine {
                                 // restarting its siblings would leave a slot
                                 // that never settles.
                                 return Ok(ResumePlan::Failed(format!(
-                                    "branch '{name}' is running, its run {} is {}/{}",
+                                    "branch '{name}' completed (run {}, {}/{}) but its result was never applied; {NOTHING_MOVES}",
                                     session.id,
                                     session.status,
                                     reason_text(&session)
