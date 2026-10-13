@@ -80,7 +80,10 @@ summary and your reply. Work like this:
    Write it as a short guide to the change for a human reviewer who
    hasn't read the task: concise, in plain English, with no codebase
    jargon or shorthand of your own, readable in about two minutes. Don't
-   retell the work commit by commit. Use these sections, in this order:
+   retell the work commit by commit. Aim for one page; two pages (about
+   6,000 bytes) is the most a reviewer will read, and a longer file is
+   sent back. When it doesn't fit, leave things out: a short description
+   that skips detail is better than a complete one nobody reads. Use these sections, in this order:
    - `## Problem`: what was wrong, in a few sentences, as a user or
      operator would notice it.
    - `## Solution`: the short version of the fix, in a few sentences,
@@ -100,8 +103,8 @@ summary and your reply. Work like this:
      small incidental fixes last, together in one item.
    - `## Look closely at`: deliberate trade-offs and risky spots a
      reviewer should check by hand.
-   - `## Review history`: on a revise turn, one line per earlier review
-     finding and how you resolved it.
+   - `## Review history`: on a revise turn, one short line per earlier
+     review finding and how you resolved it.
    - `## Not done`: anything asked for that you didn't do, and why.
    Leave out the last three sections when they would be empty.
 

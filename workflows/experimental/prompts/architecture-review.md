@@ -20,7 +20,9 @@ do not make a scratch copy of the repository, and do not edit anything.
 
 Look at structure, coupling, module boundaries, consistency with the existing
 design, and whether the change follows the patterns the codebase already uses
-or invents a second way of doing something.
+or invents a second way of doing something. When the change keeps two copies
+of one rule, compare them and name an input on which they give different
+answers today, or say there is none.
 
 ## Report
 

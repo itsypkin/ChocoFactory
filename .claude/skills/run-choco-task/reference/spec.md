@@ -23,31 +23,11 @@ require one test that renders every fixture at every size from the
 minimum up. Name one test for each fail-closed path in the done
 criteria.
 
-Five more checks belong in the spec:
-
-- **Every statement the change makes false.** Grep the skills, docs and
-  prompts for the old behaviour's wording and commands, and fix each hit
-  in the same PR.
-- **Abandoned operations.** For anything that can time out, be cancelled,
-  or lose its client, the spec states what is left behind (locks, rows,
-  files) and requires a test that interrupts it and checks that state;
-  or, if the operation can't be interrupted in a test, names the
-  interrupt as an accepted cost, with the reason.
-- **A new value in a closed set.** When the change adds a value to an
-  enum, an event type or a status, list every match, parser or list over
-  that set, including ones with a catch-all arm the compiler won't flag.
-  Each one needs a case for the new value, so its file is in scope.
-- **Tests that can't be fooled.** A rule over a set (every, all, any,
-  only) is tested with a mixed case, not only the uniform ones. Each
-  safety rule (who owns what, what is excluded, what is refused) has a
-  test that fails when that rule alone is removed, and no other rule can
-  produce the same result in that test. The coder checks a read from the
-  OS or another external system once, on the real machine, against an
-  independent source (for example a process list against `ps`), and
-  reports the result.
-- **A new rule in a prompt.** The spec requires the coder to run one
-  probe of the rule on the production model the role runs in the workflow,
-  in its lap, and to report the probe and its result.
+A spec also says what the change makes untrue elsewhere (docs, prompts,
+skills), what an operation that is interrupted leaves behind, and which
+test shows that each rule the change adds actually matters. Your
+project's instruction files (`CLAUDE.md`, `AGENTS.md`) may name checks
+of their own; carry those into the spec too.
 
 **Every run the spec requires has a budget and a way out.** The spec
 states how many runs, and what the coder does when it can't make one (no

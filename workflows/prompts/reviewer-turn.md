@@ -71,7 +71,9 @@ A description that is cut off or truncated, or is missing `## Problem`,
 requires, is a blocking finding: unlike a description that is missing or
 empty, which the published PR states outright, it reads as whole when it
 isn't. A file longer than 16,384 bytes counts as truncated, because
-publishing keeps only that much. To find a cut, compare the file with the
+publishing keeps only that much. A file longer than 6,000 bytes is a
+blocking finding too, because a human reviewer reads about two pages: name
+its size and what to leave out. To find a cut, compare the file with the
 diff and, on a re-review, with the published description
 (`gh pr view --json body -q .body`, the part between the issue lines and
 `## Internal review`): a numbered list that skips items, a section that
