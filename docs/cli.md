@@ -423,8 +423,19 @@ $ choco task list --project acme          # by name or id
 $ choco task list --status open           # free-form, not a fixed enum
 $ choco task list --status cancelled      # open | pausing | paused | stuck | closed | cancelled
 $ choco task list --status pausing,paused # a comma list works too
+$ choco task list --search '#289'         # the task whose PR is #289
+$ choco task list --search 289            # PR 289, or an id starting 289
+$ choco task list --search parser         # title word (any case)
+$ choco task list --search ed9e8a7d       # id prefix
+$ choco task list --status open --search parser
 $ choco project list
 ```
+
+`--search` keeps the rows that match under the same rules as the dashboard's
+`/` popup (see the dashboard section below), after `--project` and `--status`
+have narrowed the list. Rows stay in id order, not newest first. No match
+prints `No tasks matched.` (or `[]` under `--json`) and exits 0; blank text is
+refused with exit 2.
 
 ## Pausing a task
 
@@ -684,6 +695,8 @@ like this, newest task first:
 - digits alone (`289`) match that PR number, or ids starting with those digits;
 - any other text matches titles containing it (ignoring case) or ids starting
   with it.
+
+`choco task list --search` uses the same rules.
 
 Every printable key is typed into the query, so `j`, `k` and `q` go into the
 search instead of moving or quitting. `↑` `↓`, `Ctrl-P` `Ctrl-N` and `PgUp`

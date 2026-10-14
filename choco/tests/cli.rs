@@ -2701,3 +2701,184 @@ async fn dashboard_needs_an_interactive_terminal() {
         assert!(out.stdout.is_empty());
     }
 }
+
+// ---- `task list --search` (#293) ----
+
+async fn make_project(daemon: &Daemon, name: &str) -> String {
+    let p = run_choco_json(&daemon.base_url, &["project", "create", name])
+        .await
+        .json();
+    p["id"].as_str().unwrap().to_string()
+}
+
+async fn make_chat_task(daemon: &Daemon, project_id: &str, title: &str) -> String {
+    let out = run_choco_json(
+        &daemon.base_url,
+        &[
+            "task",
+            "create",
+            "--project",
+            project_id,
+            "--workflow",
+            "chat",
+            "--title",
+            title,
+            "--prompt",
+            "hi",
+        ],
+    )
+    .await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    out.json()["id"].as_str().unwrap().to_string()
+}
+
+fn titles(v: &Value) -> Vec<String> {
+    let mut t: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["title"].as_str().unwrap().to_string())
+        .collect();
+    t.sort();
+    t
+}
+
+#[tokio::test]
+async fn task_list_search_keeps_only_matching_rows() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let p = make_project(&daemon, "p").await;
+    for title in ["alpha widget", "beta", "gamma"] {
+        make_chat_task(&daemon, &p, title).await;
+    }
+    let out = run_choco_json(&daemon.base_url, &["task", "list", "--search", "widget"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(titles(&out.json()), ["alpha widget"]);
+}
+
+#[tokio::test]
+async fn task_list_search_combines_with_status() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let p = make_project(&daemon, "p").await;
+    make_chat_task(&daemon, &p, "match one").await;
+    let two = make_chat_task(&daemon, &p, "match two").await;
+    make_chat_task(&daemon, &p, "other").await;
+    let c = run_choco(&daemon.base_url, &["task", "cancel", &two]).await;
+    assert_eq!(c.code, Some(0), "stderr: {}", c.stderr);
+    let out = run_choco_json(
+        &daemon.base_url,
+        &["task", "list", "--status", "open", "--search", "match"],
+    )
+    .await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(titles(&out.json()), ["match one"]);
+}
+
+#[tokio::test]
+async fn task_list_search_combines_with_project() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let a = make_project(&daemon, "a").await;
+    let b = make_project(&daemon, "b").await;
+    make_chat_task(&daemon, &a, "match").await;
+    make_chat_task(&daemon, &b, "match").await;
+    let out = run_choco_json(
+        &daemon.base_url,
+        &["task", "list", "--project", "a", "--search", "match"],
+    )
+    .await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    let rows = out.json();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["project_id"], a);
+}
+
+#[tokio::test]
+async fn task_list_search_refuses_blank_text_before_any_request() {
+    let base_url = format!("http://127.0.0.1:{}", free_port());
+    for blank in ["  ", ""] {
+        let out = run_choco(&base_url, &["task", "list", "--search", blank]).await;
+        assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+        assert!(out.stderr.contains("--search"), "stderr: {}", out.stderr);
+        assert!(out.stderr.contains("non-blank"), "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "");
+    }
+}
+
+#[tokio::test]
+async fn task_list_search_errors_are_not_empty_results() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let with = run_choco(
+        &daemon.base_url,
+        &[
+            "task",
+            "list",
+            "--search",
+            "x",
+            "--project",
+            "no-such-project",
+        ],
+    )
+    .await;
+    let without = run_choco(
+        &daemon.base_url,
+        &["task", "list", "--project", "no-such-project"],
+    )
+    .await;
+    assert_eq!(with.code, Some(1));
+    assert_eq!(without.code, Some(1));
+    assert_eq!(with.stderr, without.stderr);
+    assert_eq!(with.stdout, "");
+    assert_eq!(without.stdout, "");
+
+    let base_url = format!("http://127.0.0.1:{}", free_port());
+    for args in [
+        &["task", "list", "--search", "x"][..],
+        &["task", "list"][..],
+    ] {
+        let out = run_choco(&base_url, args).await;
+        assert_eq!(out.code, Some(1));
+        assert!(
+            out.stderr
+                .starts_with("error: failed to connect to chocofactoryd at"),
+            "stderr: {}",
+            out.stderr
+        );
+    }
+}
+
+#[tokio::test]
+async fn task_list_search_with_no_match_is_an_empty_success() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let p = make_project(&daemon, "p").await;
+    make_chat_task(&daemon, &p, "something").await;
+    let out = run_choco(&daemon.base_url, &["task", "list", "--search", "nomatch"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(out.stdout.trim(), "No tasks matched.");
+    let out = run_choco_json(&daemon.base_url, &["task", "list", "--search", "nomatch"]).await;
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(out.json(), serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn task_list_search_json_rows_are_whole() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let p = make_project(&daemon, "p").await;
+    let id = make_chat_task(&daemon, &p, "findable thing").await;
+    make_chat_task(&daemon, &p, "other").await;
+    let all = run_choco_json(&daemon.base_url, &["task", "list"])
+        .await
+        .json();
+    let full = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id)
+        .unwrap()
+        .clone();
+    let out = run_choco_json(&daemon.base_url, &["task", "list", "--search", "findable"]).await;
+    let rows = out.json();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], full);
+    assert!(rows[0].get("pr").is_some() && rows[0].get("usage_total").is_some());
+}

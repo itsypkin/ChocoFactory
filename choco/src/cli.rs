@@ -354,7 +354,7 @@ pub enum TaskCmd {
         /// Task id.
         id: String,
     },
-    /// List tasks, optionally filtered by project and/or status.
+    /// List tasks, optionally filtered by project, status and/or a search.
     List {
         /// Project name or id to filter by.
         #[arg(long)]
@@ -364,6 +364,11 @@ pub enum TaskCmd {
         /// `closed`, `cancelled`, or `stuck`.
         #[arg(long)]
         status: Option<String>,
+        /// Keep only tasks matching TEXT: `#289` is PR 289 exactly; digits
+        /// match that PR or an id prefix; other text matches a title
+        /// substring or id prefix (any case). Combines with --project/--status.
+        #[arg(long, value_name = "TEXT", value_parser = parse_search_text)]
+        search: Option<String>,
     },
     /// Change a task's per-role config after creation (design §5.5).
     ///
@@ -551,6 +556,15 @@ pub enum ProjectCmd {
         /// Project name or id.
         project: String,
     },
+}
+
+/// Refuses blank `--search` text, which would otherwise list every task.
+fn parse_search_text(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        Err("--search needs non-blank text".to_string())
+    } else {
+        Ok(s.to_string())
+    }
 }
 
 #[cfg(test)]

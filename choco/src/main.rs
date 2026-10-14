@@ -470,7 +470,11 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             let outcome = client.retry_task(&id, mode).await?;
             Ok(Output::Retried(id, outcome))
         }
-        Command::Task(TaskCmd::List { project, status }) => {
+        Command::Task(TaskCmd::List {
+            project,
+            status,
+            search,
+        }) => {
             // Resolved the same way as `task create`, so a name works in
             // both places rather than only where a task is born.
             let project_id = match project {
@@ -480,6 +484,10 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
             let tasks = client
                 .list_tasks(project_id.as_deref(), status.as_deref())
                 .await?;
+            let tasks = match search {
+                Some(text) => search_rows(tasks, &text),
+                None => tasks,
+            };
             Ok(Output::Tasks(tasks))
         }
         Command::Task(TaskCmd::Events { id, limit, after }) => Ok(Output::Events(
@@ -493,6 +501,16 @@ async fn run(client: &Client, command: Command) -> Result<Output, ClientError> {
         Command::Update { .. } => unreachable!("Update is handled in main() before run()"),
         Command::Dashboard(_) => unreachable!("Dashboard is handled in main() before run()"),
     }
+}
+
+/// Keeps the rows matching `text` under the dashboard's rules, in the order
+/// given (the daemon's id order, not newest first).
+fn search_rows(
+    mut tasks: Vec<chocofactory_core::models::TaskSummary>,
+    text: &str,
+) -> Vec<chocofactory_core::models::TaskSummary> {
+    tasks.retain(|t| dashboard::search::matches(t, text));
+    tasks
 }
 
 /// The success line for `cancel --keep`, from the task as the daemon
@@ -514,7 +532,8 @@ fn keep_cancel_message(id: &str, detail: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{keep_cancel_message, resolve_base_url_in};
+    use super::{keep_cancel_message, resolve_base_url_in, search_rows};
+    use crate::dashboard::search::tests::t;
     use std::os::unix::fs::PermissionsExt;
 
     const DEFAULT: &str = "http://127.0.0.1:4141";
@@ -632,5 +651,35 @@ mod tests {
         }
         let _ = std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn ids(v: &[chocofactory_core::models::TaskSummary]) -> Vec<&str> {
+        v.iter().map(|r| r.task.id.as_str()).collect()
+    }
+
+    #[test]
+    fn search_rows_uses_the_shared_matcher() {
+        let rows = || {
+            vec![
+                t("aaaa1111", "Fix the parser", Some(289), 1),
+                t("bbbb2222", "Mentions 289 and #289", None, 2),
+                t("cccc3333", "Other", Some(2890), 3),
+                t("289f0000", "x", None, 4),
+                t("dddd4444", "Add --closes flag", None, 5),
+            ]
+        };
+        assert_eq!(ids(&search_rows(rows(), "#289")), ["aaaa1111"]);
+        assert_eq!(ids(&search_rows(rows(), "289")), ["aaaa1111", "289f0000"]);
+        assert_eq!(ids(&search_rows(rows(), "CLOSES")), ["dddd4444"]);
+    }
+
+    #[test]
+    fn search_rows_keeps_input_order() {
+        let rows = vec![
+            t("a", "x", None, 1),
+            t("b", "x", None, 9),
+            t("c", "x", None, 5),
+        ];
+        assert_eq!(ids(&search_rows(rows, "x")), ["a", "b", "c"]);
     }
 }
