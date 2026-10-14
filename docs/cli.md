@@ -455,7 +455,7 @@ A paused task has its own status, and so does the stretch before it:
 | Status | Means |
 |---|---|
 | `pausing` | The pause was asked for, and an agent turn or shell command the task had already started is still running. |
-| `paused` | The pause was asked for, and nothing of the task's is running. |
+| `paused` | The pause was asked for, nothing of the task's is running, and every finished turn's result is applied. |
 
 `choco task status` shows a `Paused` line: `since 14:05 — choco task resume
 <id>` for a paused task, `waiting for <stage>'s turn to finish` for a pausing
@@ -481,12 +481,19 @@ one.
   without `--now`, stuck (`retry` or `cancel` it), closed or cancelled.
   `resume` of an open, stuck, closed or cancelled task. `retry` and `send`
   (to a chat) on a pausing or paused task both point to `choco task resume
-  <id>`. Nothing starts and the status does not change.
+  <id>`. Nothing starts and the status does not change. The one exception:
+  `resume` of a paused task at an agent or group stage, with nothing to
+  start and nothing running or queued, marks the task `stuck` with the
+  reason and refuses with a `409` that names `retry`. A paused task at a
+  human gate or a chat stage resumes to `open` with nothing started.
 - A turn or command that fails while the task is `pausing` makes the task
   `stuck` (no longer paused). `choco task cancel` works from `pausing` and
   `paused`.
-- A daemon restart keeps a paused task paused. A turn cut off while pausing
-  is continued by `resume`, which resumes that session as `retry` would.
+- A daemon restart keeps a paused task paused, unless a turn of it had failed
+  and its result was not yet applied: then the task is `stuck` and `retry`
+  continues it. A turn that completed but was not applied, or one cut off
+  while pausing, is re-run by `resume`, which resumes that session as
+  `retry` would.
 
 ## Limiting how many agents run at once
 

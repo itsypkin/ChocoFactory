@@ -1,3 +1,4 @@
+use super::pause::run_failure;
 use super::turn::{ReadOnlyVerdict, unverified_note};
 use super::watch::{PollWindow, poll_window_for, remaining_budget, set_poll_window};
 use super::*;
@@ -137,8 +138,12 @@ impl WorkflowEngine {
     /// the candidates is returned.
     pub async fn park_interrupted_turns(self: &Arc<Self>) -> Result<ParkReport, sqlx::Error> {
         let mut candidates = tasks::list(&self.pool, None, Some(TASK_STATUS_OPEN)).await?;
-        // A `pausing` task lost its running work too; it ends `paused`.
+        // A `pausing` task lost its running work too; it ends `paused`. A
+        // `paused` task may hold a failed or completed turn that its watcher
+        // never applied (a failed branch whose watcher is gone is this
+        // sweep's, for both pausing and paused tasks).
         candidates.extend(tasks::list(&self.pool, None, Some(TASK_STATUS_PAUSING)).await?);
+        candidates.extend(tasks::list(&self.pool, None, Some(TASK_STATUS_PAUSED)).await?);
         let mut report = ParkReport::default();
         for task in candidates {
             let lock = self.lock_for_task(&task.id).await;
@@ -172,6 +177,10 @@ impl WorkflowEngine {
         };
         if task.status == TASK_STATUS_PAUSING {
             self.park_pausing_turn_locked(&task, report).await;
+            return;
+        }
+        if task.status == TASK_STATUS_PAUSED {
+            self.park_paused_turn_locked(&task, report).await;
             return;
         }
         if task.status != TASK_STATUS_OPEN {
@@ -289,10 +298,11 @@ impl WorkflowEngine {
     /// a group) as `daemon_stopped`, checks read-only roles, and then makes
     /// the task `paused` — or `stuck` with the finding when a session could
     /// not be recorded or a read-only role changed the worktree. Branch slots
-    /// are not failed: `resume` continues them.
+    /// are failed only for a branch whose turn had failed; `resume` continues
+    /// the others.
     async fn park_pausing_turn_locked(&self, task: &Task, report: &mut ParkReport) {
         let task_id = task.id.as_str();
-        match self.pausing_findings(task).await {
+        match self.pausing_findings(task, false).await {
             Ok(findings) if findings.is_empty() => {
                 match tasks::mark_paused(&self.pool, task_id).await {
                     Ok(true) => {
@@ -323,10 +333,36 @@ impl WorkflowEngine {
         }
     }
 
-    /// For [`Self::park_pausing_turn_locked`]: records the cut-off sessions
+    /// The startup sweep for one `paused` task, under its lock. A paused
+    /// task stays paused: only an end nobody handled is judged. A failed
+    /// turn (or branch) makes the task `stuck` in one write; a completed run
+    /// is recorded `daemon_stopped` so `resume` continues its session. With
+    /// no findings nothing is written. A read error leaves the task
+    /// `paused`: `resume` re-reads and reports its own error.
+    async fn park_paused_turn_locked(&self, task: &Task, report: &mut ParkReport) {
+        let task_id = task.id.as_str();
+        match self.pausing_findings(task, true).await {
+            Ok(findings) if findings.is_empty() => {}
+            Ok(findings) => {
+                let reason = format!(
+                    "the daemon restarted while the task was paused: {}",
+                    findings.join("; ")
+                );
+                self.park_mark_stuck(task_id, &reason, report).await;
+            }
+            Err(reason) => tracing::error!(
+                task_id,
+                reason,
+                "restart sweep could not check a paused task; it stays paused"
+            ),
+        }
+    }
+
+    /// For [`Self::park_pausing_turn_locked`] and
+    /// [`Self::park_paused_turn_locked`] (`paused`): records the cut-off sessions
     /// and returns what must stop the task from simply becoming `paused`.
     /// `Err` is a failure to read what the sweep needs.
-    async fn pausing_findings(&self, task: &Task) -> Result<Vec<String>, String> {
+    async fn pausing_findings(&self, task: &Task, paused: bool) -> Result<Vec<String>, String> {
         let task_id = task.id.as_str();
         let state = workflow_state::get(&self.pool, task_id)
             .await
@@ -407,10 +443,18 @@ impl WorkflowEngine {
         let mut failed_branches: Vec<(String, String)> = Vec::new();
         for (name, session) in cut_off {
             let Some(session) = session else { continue };
+            // A paused task's handled ends (`paused`, `daemon_stopped`,
+            // `cancelled`, a completed run with a reason) are left alone.
+            if paused
+                && run_failure(&session).is_none()
+                && !(session.status == SessionStatus::Idle && session.end_reason.is_none())
+            {
+                continue;
+            }
             // A turn that ended in a failure before the crash is the same
             // failure its watcher would have handled: it must not become
             // `paused`, which `resume` would then strand.
-            if let Some(why) = pause_failure(&session) {
+            if let Some(why) = run_failure(&session) {
                 let what = if group.is_some() {
                     format!("branch '{name}' of '{stage}'")
                 } else {
@@ -478,8 +522,10 @@ impl WorkflowEngine {
 
     /// The tasks a restart would strand right now (`GET /server`): `open`
     /// ones decided by their stage, and `pausing` ones with work still
-    /// running. A `paused` task is never listed. A workflow that cannot be loaded, or a stage it no longer has, is
-    /// listed with kind `"unknown"` rather than hidden.
+    /// running (a watcher still applying a finished turn's result is not
+    /// counted). A `paused` task is never listed. A workflow that cannot be
+    /// loaded, or a stage it no longer has, is listed with kind `"unknown"`
+    /// rather than hidden.
     pub async fn in_flight(&self) -> Result<Vec<InFlight>, sqlx::Error> {
         let mut out = Vec::new();
         let queue = self.queue_snapshot().await?;
@@ -725,19 +771,5 @@ impl WorkflowEngine {
                 }
             }
         }
-    }
-}
-
-/// Why a cut-off session of a pausing task ended in a failure, or `None` when
-/// it ended the way a pause or a daemon stop ends a turn (or was recovered
-/// from `idle`, or is live).
-fn pause_failure(session: &Session) -> Option<String> {
-    match (session.status, session.end_reason) {
-        (SessionStatus::Active, _) | (SessionStatus::Idle, None) => None,
-        (_, Some(SessionEndReason::Paused | SessionEndReason::DaemonStopped)) => None,
-        (status, reason) => Some(format!(
-            "its session ended: {status}, end reason {}",
-            reason.map_or_else(|| "none".to_string(), |r| r.to_string())
-        )),
     }
 }

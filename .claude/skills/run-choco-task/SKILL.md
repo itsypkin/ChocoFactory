@@ -374,7 +374,9 @@ cancelling. In short:
 - `pausing` or `paused` → you (or someone) held the task:
   `choco task resume <id>` continues it. `retry` and a `send` to a chat are
   refused on it, and the message names `resume`; a reply at a gate is accepted
-  and recorded, and the stage it leads to starts on resume. See
+  and recorded, and the stage it leads to starts on resume. `resume` itself
+  can refuse: at an agent or group stage with nothing to start or wait for it
+  marks the task `stuck`, and `retry` then continues it. See
   [reference/recover.md](reference/recover.md#pausing-a-task).
 - `stuck` → find out why in `choco task status <id>`, then
   `choco task retry <id>`. On a task stuck in a parallel group, retry
