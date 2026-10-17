@@ -2185,6 +2185,226 @@ fn dump_probe_spawn() {
     .unwrap();
 }
 
+// -- memory: true against the real omp (#222) --
+
+/// What the operator's own omp state looks like, for the "untouched" checks:
+/// the legacy memories tree (path, size, mtime), whether the fastembed cache
+/// and the mnemopi run folder exist, and `agent.db`'s table list (opened
+/// read-only and immutable, never written).
+#[derive(Debug, PartialEq)]
+struct OmpHomeState {
+    memories: Option<Vec<(PathBuf, u64, std::time::SystemTime)>>,
+    fastembed: bool,
+    run_mnemopi: bool,
+    agent_db_tables: Vec<String>,
+}
+
+async fn omp_home_state() -> OmpHomeState {
+    let home = PathBuf::from(std::env::var("HOME").unwrap()).join(".omp");
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let meta = entry.metadata().unwrap();
+            out.push((entry.path(), meta.len(), meta.modified().unwrap()));
+            if meta.is_dir() {
+                walk(&entry.path(), out);
+            }
+        }
+    }
+    let memories_dir = home.join("agent/memories");
+    let memories = memories_dir.exists().then(|| {
+        let mut files = Vec::new();
+        walk(&memories_dir, &mut files);
+        files.sort();
+        files
+    });
+    let db = home.join("agent/agent.db");
+    let mut agent_db_tables = Vec::new();
+    if db.exists() {
+        use sqlx::ConnectOptions;
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .read_only(true)
+            .immutable(true)
+            .connect()
+            .await
+            .expect("agent.db opens read-only");
+        agent_db_tables =
+            sqlx::query_scalar::<_, String>("SELECT name FROM sqlite_master ORDER BY name")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+    }
+    OmpHomeState {
+        memories,
+        fastembed: home.join("cache/fastembed").exists(),
+        run_mnemopi: home.join("run/mnemopi").exists(),
+        agent_db_tables,
+    }
+}
+
+async fn next_frame(lines: &mut BufReader<ChildStdout>) -> Value {
+    let line = tokio::time::timeout(Duration::from_secs(60), read_lf_line(lines))
+        .await
+        .expect("omp didn't answer in 60 s")
+        .unwrap()
+        .expect("omp exited");
+    serde_json::from_str::<Value>(&line).unwrap()
+}
+
+/// Spawns the real omp with the adapter's own flags and overlay for a memory
+/// role of project `P`, runs the same protocol-v2 negotiation the driver
+/// runs, then `/memory stats` (no model call), and returns the verdict and
+/// the stats table text.
+async fn real_memory_stats(
+    env: &Env,
+    cfg: &RoleConfig,
+    db: &Path,
+) -> (Result<(), String>, String) {
+    let (mut command, overlay_path) = real_command("omp", &env.state, cfg, Some(db));
+    let mut child = command.spawn().expect("omp must be on PATH");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let ready = loop {
+        let frame = next_frame(&mut lines).await;
+        if frame["type"] == "ready" {
+            break frame;
+        }
+    };
+    let mut assembler = None;
+    if ready["supportedProtocolVersions"]
+        .as_array()
+        .is_some_and(|v| v.iter().any(|v| v == 2))
+    {
+        let frame = json!({"id": "neg", "type": "negotiate_protocol", "protocolVersion": 2});
+        stdin.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+        loop {
+            let frame = next_frame(&mut lines).await;
+            if frame["type"] == "response" && frame["id"] == "neg" {
+                if frame["success"] == true {
+                    assembler = Some(ChunkAssembler::new(DEFAULT_MAX_REASSEMBLED));
+                }
+                break;
+            }
+        }
+    }
+    let frame = json!({"id": "memory-1", "type": "prompt", "message": "/memory stats"});
+    stdin.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let mut frame = next_frame(&mut lines).await;
+        if let Some(assembler) = assembler.as_mut() {
+            match assembler.feed(frame) {
+                Reassembled::Frame(whole) => frame = whole,
+                _ => continue,
+            }
+        }
+        let ty = frame["type"].as_str().unwrap_or("").to_string();
+        if matches!(ty.as_str(), "command_output" | "prompt_result" | "message_end")
+            || (ty == "response" && frame["id"] == "memory-1")
+        {
+            let done = ty != "command_output";
+            seen.push(frame);
+            if done {
+                break;
+            }
+        }
+    }
+    drop(stdin);
+    let _ = child.wait().await;
+    let _ = std::fs::remove_file(overlay_path);
+    let text = seen
+        .iter()
+        .filter(|f| f["type"] == "command_output")
+        .filter_map(|f| f["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (memory_stats_verdict(&seen, "memory-1", db, &cfg.role), text)
+}
+
+/// No model call. The real omp, under the adapter's own flags and overlay
+/// for a `memory: true` role, opens its store under the temp state folder
+/// and nothing of the operator's omp state changes.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_opens_the_memory_store -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn omp_opens_the_memory_store_without_touching_the_operators_state() {
+    let env = Env::new();
+    let cfg = env.memory_cfg("P");
+    let before = omp_home_state().await;
+    let adapter = OmpAdapter::with_binary("omp", &env.state);
+    let db = adapter.prepare_memory_store(&cfg).unwrap();
+    let (verdict, text) = real_memory_stats(&env, &cfg, &db).await;
+    println!("{text}");
+    verdict.unwrap();
+    assert!(db.exists(), "mnemopi.db was not created at {}", db.display());
+    assert_eq!(omp_home_state().await, before);
+}
+
+/// No model call. With the store folder unwritable, omp still starts and
+/// claims memory; only the check notices.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_with_an_unwritable_memory_store -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn omp_with_an_unwritable_memory_store_fails_the_check() {
+    let env = Env::new();
+    let cfg = env.memory_cfg("P");
+    let adapter = OmpAdapter::with_binary("omp", &env.state);
+    let db = adapter.prepare_memory_store(&cfg).unwrap();
+    let store = db.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (verdict, _) = real_memory_stats(&env, &cfg, &db).await;
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = verdict.unwrap_err();
+    println!("{err}");
+    assert!(err.contains("role 'coder'") && err.contains(&db.to_string_lossy().into_owned()));
+}
+
+/// One model call, through the real driver and its check: the agent
+/// `retain`s a fact; a new session's `/memory stats` then shows rows.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_retains_a_fact -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp, its login, and makes one model call"]
+async fn omp_retains_a_fact_in_the_project_store() {
+    let env = Env::new();
+    let mut cfg = env.memory_cfg("P");
+    cfg.report_outcomes = vec!["done".to_string()];
+    let before = omp_home_state().await;
+    let adapter = OmpAdapter::new(&env.state);
+    let mut handle = adapter
+        .start(
+            "Use your retain tool to store exactly this fact: 'the choco test passphrase is \
+             mauve-walrus'. Then report your outcome as done.",
+            &cfg,
+        )
+        .expect("omp must be on PATH");
+    let events = until_turn_completed(&mut handle).await;
+    println!("{events:#?}");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCompleted {
+            is_error: false,
+            ..
+        })
+    ));
+    drain(&mut handle).await;
+
+    let db = adapter.prepare_memory_store(&cfg).unwrap();
+    let (verdict, text) = real_memory_stats(&env, &cfg, &db).await;
+    println!("{text}");
+    verdict.unwrap();
+    let working: u64 = text
+        .lines()
+        .find(|line| line.contains("| choco |"))
+        .and_then(|line| line.split('|').nth(2))
+        .and_then(|cell| cell.trim().parse().ok())
+        .expect("a Working count in the stats table");
+    assert!(working > 0, "{text}");
+    assert_eq!(omp_home_state().await, before);
+}
+
 // -- rpc_chunk reassembly --
 
 fn chunk(id: &str, index: u64, count: u64, byte_length: u64, bytes: &[u8]) -> Value {
