@@ -15318,7 +15318,10 @@ async fn create_task_pointing_a_memory_role_at_omp_in_its_config_creates_the_tas
         .await
         .unwrap();
     assert_eq!(
-        tasks::list(&pool, Some(&project_id), None).await.unwrap().len(),
+        tasks::list(&pool, Some(&project_id), None)
+            .await
+            .unwrap()
+            .len(),
         1
     );
 }

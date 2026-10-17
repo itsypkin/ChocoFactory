@@ -122,10 +122,17 @@ roles:
   `worktree: true` checkout can read files but has its edits and commands
   refused, and the agent sees the refusal. A role in a worktree has full
   tool access there, like a claude role.
-- **No memory.** `memory: true` on an omp role is rejected, with the role's
-  name, when the workflow loads, when a task is created or reconfigured, and
-  when a turn starts. A skill name containing `,` `*` `?` `[` `]` `{` or `}`
-  is rejected for the same reason: omp would read it as a pattern.
+- **Memory.** `memory: true` works on an omp role, but it is a different
+  memory from a claude role's. omp roles share one memory per choco project,
+  kept by choco in `~/.config/chocofactory/omp/memory/<project-id>/` (the id
+  is in `choco project list`) until the project is deleted. The agent gets
+  omp's `recall` and `retain` tools only; no embeddings are downloaded and
+  the memory makes no model calls of its own. If omp's memory doesn't open,
+  the turn fails naming the role and the store path; it never runs without
+  it. [What differs from claude](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#what-an-agent-inherits-from-your-claude-setup).
+  A skill name containing `,` `*` `?` `[` `]` `{` or `}` is rejected, with the
+  role's name, when the workflow loads, when a task is created or
+  reconfigured, and when a turn starts: omp would read it as a pattern.
 - **Thinking level.** `medium`, unless the model string ends in a level, such
   as `:high` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
   `auto` or `inherit`).

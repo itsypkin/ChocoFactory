@@ -251,7 +251,7 @@ the tool rejected.
 
 By default an agent role runs isolated from the operator's own Claude Code
 setup: no `~/.claude/CLAUDE.md`, no user plugins, hooks or output style, no
-MCP servers other than the daemon's, no skills, no auto-memory, no
+MCP servers other than the daemon's, no skills, no memory, no
 built-in `ReportFindings` tool, and no timer or wait tools (`ScheduleWakeup`,
 `Monitor`, `CronCreate`, `CronDelete`, `CronList`, `RemoteTrigger`):
 an agent that ends its turn to wait on its own timer races the daemon's
@@ -276,12 +276,34 @@ rest in the workflow file:
 roles:
   coder:
     skills: [run-tests]   # skills it may invoke; omitted = none
-    memory: true          # use auto-memory; omitted = no
+    memory: true          # use a memory (see below); omitted = none
   chat:
     inherit_operator_config: true   # your full setup, minus cron/remote-trigger tools
 ```
 
-`skills`/`memory` can't be combined with `inherit_operator_config`. None of
+`skills`/`memory` can't be combined with `inherit_operator_config`.
+
+`memory: true` means different things on the two CLIs, so one workflow file
+runs on either, but the two never share:
+
+- **Separate memories.** A claude role uses your own Claude auto-memory for
+  the repo, shared with your own Claude sessions. An omp role uses a memory
+  choco keeps for the choco project. Nothing passes between them.
+- **Shape.** Claude: notes files the agent writes. omp: saved conversations
+  and facts stored with `retain`, found by word matching at session start or
+  with `recall`.
+- **Where and how long.** omp: `~/.config/chocofactory/omp/memory/<project-id>/`
+  (the id is shown by `choco project list`), kept until the project is
+  deleted. To clear it by hand, delete that folder while no omp turn of the
+  project runs.
+- **Scope.** Claude: per repo. omp: per choco project, so two projects on one
+  repo don't share.
+- **Failure.** If omp's memory doesn't open, the turn fails naming the role
+  and the store path.
+- **Parallel turns.** Two omp turns of one project that start at the same
+  moment (parallel tasks or branches) can both open the store, yet one of
+  them may find its memory tools reporting "not initialised". Retry that
+  turn. None of
 these can be set from task config (`--config`, `--role-*`) or the global
 config file: only a workflow definition can loosen what its agents see. The
 built-in `chat` workflow inherits your setup; `coding-task` is isolated. A

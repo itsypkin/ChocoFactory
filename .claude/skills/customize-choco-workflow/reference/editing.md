@@ -125,8 +125,9 @@ A role has `cli`, `model` and `system_prompt_file`. Other fields:
   (those three names only; `read_only` needs all three and a workflow-level
   `worktree: true`). See [read-only roles](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#read-only-roles).
 - `inherit_operator_config`, `skills` and `memory` control what the agent
-  inherits from your Claude setup. `skills` and `memory` can't go with
-  `inherit_operator_config`. See
+  inherits from your Claude setup. `memory` means your Claude auto-memory on
+  a claude role and a memory choco keeps per project on an omp role.
+  `skills` and `memory` can't go with `inherit_operator_config`. See
   [what an agent inherits](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#what-an-agent-inherits-from-your-claude-setup).
 
 More: [how a role is configured](https://github.com/itsypkin/ChocoFactory/blob/main/docs/models.md#how-a-role-is-configured),

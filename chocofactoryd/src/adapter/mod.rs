@@ -111,7 +111,7 @@ pub enum Isolation {
     /// operator is the one talking to the agent.
     InheritOperatorConfig,
     /// Only the task repo's own settings and `CLAUDE.md`, only the daemon's
-    /// MCP server, no `ReportFindings`, and no auto-memory unless `memory`.
+    /// MCP server, no `ReportFindings`, and no memory unless `memory`.
     Isolated {
         /// The skills this turn may invoke. Empty means none: the `Skill`
         /// tool itself is removed.
@@ -123,13 +123,15 @@ pub enum Isolation {
     },
 }
 
-// Auto-memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) follows only the variant
-// above, never the daemon's own environment (#105): `Isolated { memory:
+// On claude, auto-memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) follows only the
+// variant above, never the daemon's own environment (#105): `Isolated { memory:
 // false }` sets it, `Isolated { memory: true }` and `InheritOperatorConfig`
 // both explicitly remove it. See `claude::apply_auto_memory_env` for why
 // removal — not "leave it alone" — is required for the latter two: a value
 // already in the daemon's environment is almost always an artifact of where
-// the daemon was launched, not a choice made for this role.
+// the daemon was launched, not a choice made for this role. That is the
+// claude meaning of `memory`; omp keeps a per-project store that choco owns
+// (#222, see `omp.rs`).
 
 impl Default for Isolation {
     /// Isolated, with no skills and no memory: the setting a role gets when

@@ -4872,11 +4872,11 @@ mod tests {
             "{result:?}"
         );
         for _ in 0..200 {
-        if marker.exists() {
-            break;
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
         assert!(marker.exists(), "omp must have been started");
         assert!(dir.join("state").join("memory").join("P").is_dir());
         // The same role on claude is fine.

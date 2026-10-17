@@ -1687,10 +1687,8 @@ fn a_memory_overlay_differs_from_the_plain_one_by_exactly_the_memory_block() {
         "autoRecall": true,
         "autoRetain": true,
     });
-    // The two memory tools run without asking: they touch only choco's own
-    // per-project store.
-    expected["tools"]["approval"]["recall"] = json!("allow");
-    expected["tools"]["approval"]["retain"] = json!("allow");
+    // No approval pin: omp runs both memory tools under `always-ask`.
+    assert!(memory["tools"]["approval"].get("recall").is_none());
     assert_eq!(memory, expected);
     assert_eq!(memory["memories"]["enabled"], false);
     // The plain overlay is untouched.
@@ -1782,7 +1780,9 @@ async fn the_store_is_keyed_by_project_not_by_cwd() {
 /// Events after a start (or resume) that fails: everything until the stream
 /// ends, which only happens once the process has been killed.
 async fn failed_session(env: &Env, stats: &str, resume: bool) -> (Vec<AgentEvent>, String) {
-    let log = env.dir.join(format!("prompts-{}.log", uuid::Uuid::new_v4()));
+    let log = env
+        .dir
+        .join(format!("prompts-{}.log", uuid::Uuid::new_v4()));
     let adapter = env.adapter(&[
         ("FAKE_OMP_MODES", "noreport"),
         ("FAKE_OMP_MEMORY_STATS", stats),
@@ -1885,7 +1885,13 @@ fn the_memory_verdict_needs_the_row_then_the_response_and_no_model_turn() {
                "success": true, "data": {"agentInvoked": agent}})
     };
     let verdict = |frames: &[Value]| memory_stats_verdict(frames, "m-1", db, "coder");
-    assert!(verdict(&[output("choco", "/state/memory/P/mnemopi.db"), response(false)]).is_ok());
+    assert!(
+        verdict(&[
+            output("choco", "/state/memory/P/mnemopi.db"),
+            response(false)
+        ])
+        .is_ok()
+    );
     // A mixed case: a wrong row before the right one still passes.
     assert!(
         verdict(&[
@@ -1897,10 +1903,19 @@ fn the_memory_verdict_needs_the_row_then_the_response_and_no_model_turn() {
     );
     for frames in [
         vec![response(false)],
-        vec![response(false), output("choco", "/state/memory/P/mnemopi.db")],
+        vec![
+            response(false),
+            output("choco", "/state/memory/P/mnemopi.db"),
+        ],
         vec![output("choco", "/elsewhere/mnemopi.db"), response(false)],
-        vec![output("choco-1a2b", "/state/memory/P/mnemopi.db"), response(false)],
-        vec![output("choco", "/state/memory/P/mnemopi.db"), response(true)],
+        vec![
+            output("choco-1a2b", "/state/memory/P/mnemopi.db"),
+            response(false),
+        ],
+        vec![
+            output("choco", "/state/memory/P/mnemopi.db"),
+            response(true),
+        ],
         vec![
             output("choco", "/state/memory/P/mnemopi.db"),
             json!({"type": "prompt_result", "id": "m-1"}),
@@ -1908,7 +1923,10 @@ fn the_memory_verdict_needs_the_row_then_the_response_and_no_model_turn() {
         vec![output("choco", "/state/memory/P/mnemopi.db")],
     ] {
         let err = verdict(&frames).unwrap_err();
-        assert!(err.contains("role 'coder'") && err.contains("mnemopi.db"), "{err}");
+        assert!(
+            err.contains("role 'coder'") && err.contains("mnemopi.db"),
+            "{err}"
+        );
     }
 }
 
@@ -1924,13 +1942,23 @@ fn a_store_path_that_is_a_file_fails_the_spawn_naming_the_role_and_path() {
     };
     let text = err.to_string();
     assert!(text.contains("role 'coder'"), "{text}");
-    assert!(text.contains(&env.state.join("memory/P").to_string_lossy().into_owned()), "{text}");
+    assert!(
+        text.contains(&env.state.join("memory/P").to_string_lossy().into_owned()),
+        "{text}"
+    );
     assert!(!log.exists(), "omp must not have been started");
 }
 
 #[test]
 fn a_memory_role_without_a_usable_project_id_fails_and_makes_no_store() {
-    for project in [None, Some("../x"), Some("a/b"), Some(""), Some(".."), Some("/abs")] {
+    for project in [
+        None,
+        Some("../x"),
+        Some("a/b"),
+        Some(""),
+        Some(".."),
+        Some("/abs"),
+    ] {
         let env = Env::new();
         let adapter = env.adapter(&[]);
         let mut cfg = env.memory_cfg("P");
@@ -2255,11 +2283,7 @@ async fn next_frame(lines: &mut BufReader<ChildStdout>) -> Value {
 /// role of project `P`, runs the same protocol-v2 negotiation the driver
 /// runs, then `/memory stats` (no model call), and returns the verdict and
 /// the stats table text.
-async fn real_memory_stats(
-    env: &Env,
-    cfg: &RoleConfig,
-    db: &Path,
-) -> (Result<(), String>, String) {
+async fn real_memory_stats(env: &Env, cfg: &RoleConfig, db: &Path) -> (Result<(), String>, String) {
     let (mut command, overlay_path) = real_command("omp", &env.state, cfg, Some(db));
     let mut child = command.spawn().expect("omp must be on PATH");
     let mut stdin = child.stdin.take().unwrap();
@@ -2276,7 +2300,10 @@ async fn real_memory_stats(
         .is_some_and(|v| v.iter().any(|v| v == 2))
     {
         let frame = json!({"id": "neg", "type": "negotiate_protocol", "protocolVersion": 2});
-        stdin.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+        stdin
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
         loop {
             let frame = next_frame(&mut lines).await;
             if frame["type"] == "response" && frame["id"] == "neg" {
@@ -2288,7 +2315,10 @@ async fn real_memory_stats(
         }
     }
     let frame = json!({"id": "memory-1", "type": "prompt", "message": "/memory stats"});
-    stdin.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+    stdin
+        .write_all(format!("{frame}\n").as_bytes())
+        .await
+        .unwrap();
     let mut seen = Vec::new();
     loop {
         let mut frame = next_frame(&mut lines).await;
@@ -2299,8 +2329,10 @@ async fn real_memory_stats(
             }
         }
         let ty = frame["type"].as_str().unwrap_or("").to_string();
-        if matches!(ty.as_str(), "command_output" | "prompt_result" | "message_end")
-            || (ty == "response" && frame["id"] == "memory-1")
+        if matches!(
+            ty.as_str(),
+            "command_output" | "prompt_result" | "message_end"
+        ) || (ty == "response" && frame["id"] == "memory-1")
         {
             let done = ty != "command_output";
             seen.push(frame);
@@ -2337,7 +2369,11 @@ async fn omp_opens_the_memory_store_without_touching_the_operators_state() {
     let (verdict, text) = real_memory_stats(&env, &cfg, &db).await;
     println!("{text}");
     verdict.unwrap();
-    assert!(db.exists(), "mnemopi.db was not created at {}", db.display());
+    assert!(
+        db.exists(),
+        "mnemopi.db was not created at {}",
+        db.display()
+    );
     assert_eq!(omp_home_state().await, before);
 }
 
@@ -2371,6 +2407,9 @@ async fn omp_retains_a_fact_in_the_project_store() {
     let env = Env::new();
     let mut cfg = env.memory_cfg("P");
     cfg.report_outcomes = vec!["done".to_string()];
+    // Outside a disposable worktree omp asks before it acts; the memory tools
+    // must still run (they are not pinned in the overlay).
+    cfg.sandboxed = false;
     let before = omp_home_state().await;
     let adapter = OmpAdapter::new(&env.state);
     let mut handle = adapter
@@ -2402,6 +2441,29 @@ async fn omp_retains_a_fact_in_the_project_store() {
         .and_then(|cell| cell.trim().parse().ok())
         .expect("a Working count in the stats table");
     assert!(working > 0, "{text}");
+
+    // A second task of the same project, in another working folder, finds
+    // the fact with `recall`.
+    let other_cwd = env.dir.join("worktree-2");
+    std::fs::create_dir_all(&other_cwd).unwrap();
+    cfg.cwd = other_cwd;
+    let mut handle = adapter
+        .start(
+            "Use your recall tool to look up the choco test passphrase. Then report your \
+             outcome as done, with the passphrase as the summary.",
+            &cfg,
+        )
+        .expect("omp must be on PATH");
+    let events = until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, output, is_error: false, .. }
+                if tool == "recall" && output.contains("mauve-walrus")
+        )),
+        "{events:#?}"
+    );
     assert_eq!(omp_home_state().await, before);
 }
 

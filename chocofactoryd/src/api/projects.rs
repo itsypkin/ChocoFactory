@@ -239,7 +239,10 @@ mod tests {
 
         // A project that never had a store deletes cleanly too.
         assert_eq!(
-            server.delete(&format!("/projects/{no_store}")).await.status(),
+            server
+                .delete(&format!("/projects/{no_store}"))
+                .await
+                .status(),
             204
         );
     }
@@ -291,8 +294,14 @@ mod tests {
         let response = server.delete(&format!("/projects/{id}")).await;
         assert_eq!(response.status(), 500, "{}", response.json());
         let error = response.json()["error"].as_str().unwrap().to_string();
-        assert!(error.contains(&format!("project '{id}' was deleted")), "{error}");
-        assert!(error.contains(&store.to_string_lossy().into_owned()), "{error}");
+        assert!(
+            error.contains(&format!("project '{id}' was deleted")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&store.to_string_lossy().into_owned()),
+            "{error}"
+        );
         let logged = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
         assert!(logged.contains("was deleted, but"), "{logged}");
         // The project row is gone even though the folder could not be.

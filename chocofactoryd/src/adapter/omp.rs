@@ -145,8 +145,7 @@ impl OmpAdapter {
                 .mode(0o700)
                 .create(dir)
                 .map_err(fail)?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(fail)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)?;
         }
         let canonical = std::fs::canonicalize(&store).map_err(fail)?;
         Ok(canonical.join("mnemopi.db"))
@@ -388,19 +387,14 @@ fn approval_mode(cfg: &RoleConfig) -> &'static str {
 /// store (#222); the other roles ignore it.
 pub fn overlay(cfg: &RoleConfig, memory_db: Option<&Path>) -> Value {
     let mut approval = json!({ REPORT_OUTCOME_TOOL_NAME: "allow" });
+    // No approval pin for `recall` and `retain`: the real omp runs both under
+    // `always-ask` (probed, #222).
     let memory_db = match cfg.isolation {
         Isolation::Isolated { memory: true, .. } => {
             Some(memory_db.expect("a memory role is spawned with its store path"))
         }
         _ => None,
     };
-    if memory_db.is_some() {
-        // choco's own per-project store: allowing these loosens no
-        // operator or repo boundary.
-        for tool in MEMORY_TOOLS {
-            approval[tool] = json!("allow");
-        }
-    }
     if !cfg.sandboxed {
         for tool in ["bash", "edit", "write"] {
             approval[tool] = json!("deny");
@@ -1605,7 +1599,10 @@ pub fn memory_stats_verdict(
             }
             Some("command_output") => {
                 let text = frame.get("text").and_then(Value::as_str).unwrap_or("");
-                for line in text.lines().filter(|line| line.trim_start().starts_with('|')) {
+                for line in text
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with('|'))
+                {
                     match stats_row(line, expected_db) {
                         Ok(()) => matched = true,
                         Err((bank, path)) => near_misses.push(format!("bank '{bank}' at '{path}'")),
