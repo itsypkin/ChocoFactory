@@ -79,6 +79,8 @@ wrapper script, never through the test process's own environment):
   other_bank  the row names bank `choco-1a2b`
   no_output   the response only
   agent       `agentInvoked: true`, then a `prompt_result`
+  exit        the process exits on the prompt
+  hang        the prompt is never answered
 """
 import base64
 import json
@@ -328,6 +330,10 @@ def memory_stats(request):
     mode = os.environ.get("FAKE_OMP_MEMORY_STATS", "healthy")
     db = config_value("dbPath") or ""
     bank = config_value("bank") or ""
+    if mode == "exit":
+        sys.exit(0)
+    if mode == "hang":
+        return
     if mode == "error":
         respond(request, success=False,
                 error="EACCES: permission denied, mkdir '{}'".format(os.path.dirname(db)))

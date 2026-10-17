@@ -87,9 +87,17 @@ const SUBSCRIPTION_PROVIDERS: [&str; 6] = [
 pub struct OmpAdapter {
     binary: String,
     state_dir: PathBuf,
+    /// How long a memory role's `/memory stats` check may take.
+    memory_check_timeout: Duration,
 }
 
 impl OmpAdapter {
+    /// Overrides the memory check's deadline (tests use a short one).
+    pub fn with_memory_check_timeout(mut self, timeout: Duration) -> Self {
+        self.memory_check_timeout = timeout;
+        self
+    }
+
     /// `omp` from `PATH`; sessions and overlay files live under `state_dir`.
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self::with_binary("omp", state_dir)
@@ -99,6 +107,7 @@ impl OmpAdapter {
         Self {
             binary: binary.into(),
             state_dir: state_dir.into(),
+            memory_check_timeout: REQUEST_TIMEOUT,
         }
     }
 
@@ -238,6 +247,7 @@ impl OmpAdapter {
                 isolation: cfg.isolation.describe(),
                 role: cfg.role.clone(),
                 memory_db,
+                memory_check_timeout: self.memory_check_timeout,
             },
         );
         tokio::spawn(driver.run(stdin_rx));
@@ -869,6 +879,22 @@ struct DriverConfig {
     /// The canonical `mnemopi.db` path of a `memory: true` role; the
     /// session must prove omp opened it before any prompt is sent.
     memory_db: Option<PathBuf>,
+    memory_check_timeout: Duration,
+}
+
+/// One startup lock per memory store. Two omp sessions that start on one
+/// store at the same moment can both pass `/memory stats` yet leave one
+/// with an uninitialised backend (#222 probe), so a memory role's startup,
+/// up to and including its check, runs alone per store.
+fn memory_startup_lock(db: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(db.to_path_buf()).or_default().clone()
 }
 
 /// A prompt omp has finished, waiting for its statistics.
@@ -1171,6 +1197,8 @@ impl Driver {
             })
             .unwrap_or_default();
         if let Some(db) = self.config.memory_db.clone() {
+            let lock = memory_startup_lock(&db);
+            let _startup = lock.lock().await;
             self.check_memory_store(&db).await?;
         }
         let omp_version = match version.await {
@@ -1214,7 +1242,7 @@ impl Driver {
         if !self.send_frame(&frame).await {
             return Err(memory_failure(&role, db, "stdin is closed"));
         }
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let deadline = Instant::now() + self.config.memory_check_timeout;
         let mut seen: Vec<Value> = Vec::new();
         loop {
             let frame = match tokio::time::timeout_at(deadline, self.frames.recv()).await {
@@ -1605,6 +1633,9 @@ pub fn memory_stats_verdict(
                 {
                     match stats_row(line, expected_db) {
                         Ok(()) => matched = true,
+                        // The header and separator rows are not banks.
+                        Err((bank, _))
+                            if bank == "Bank" || bank.chars().all(|c| c == '-' || c == ':') => {}
                         Err((bank, path)) => near_misses.push(format!("bank '{bank}' at '{path}'")),
                     }
                 }

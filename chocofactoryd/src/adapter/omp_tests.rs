@@ -1775,11 +1775,13 @@ async fn failed_session(env: &Env, stats: &str, resume: bool) -> (Vec<AgentEvent
     let log = env
         .dir
         .join(format!("prompts-{}.log", uuid::Uuid::new_v4()));
-    let adapter = env.adapter(&[
-        ("FAKE_OMP_MODES", "noreport"),
-        ("FAKE_OMP_MEMORY_STATS", stats),
-        ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
-    ]);
+    let adapter = env
+        .adapter(&[
+            ("FAKE_OMP_MODES", "noreport"),
+            ("FAKE_OMP_MEMORY_STATS", stats),
+            ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
+        ])
+        .with_memory_check_timeout(Duration::from_secs(if stats == "hang" { 2 } else { 60 }));
     let cfg = env.memory_cfg("P");
     let mut handle = if resume {
         adapter.resume("s1", "do the work", &cfg).unwrap()
@@ -1830,7 +1832,15 @@ async fn a_healthy_memory_check_runs_before_the_stage_prompt_without_follow_up()
 #[tokio::test]
 async fn a_memory_store_that_did_not_open_fails_the_turn_before_the_stage_prompt() {
     for resume in [false, true] {
-        for stats in ["error", "other_path", "other_bank", "no_output", "agent"] {
+        for stats in [
+            "error",
+            "other_path",
+            "other_bank",
+            "no_output",
+            "agent",
+            "exit",
+            "hang",
+        ] {
             let env = Env::new();
             let (events, log) = failed_session(&env, stats, resume).await;
             let db = std::fs::canonicalize(env.state.join("memory/P"))
@@ -1863,6 +1873,25 @@ async fn a_memory_store_that_did_not_open_fails_the_turn_before_the_stage_prompt
             );
         }
     }
+}
+
+#[tokio::test]
+async fn memory_roles_of_one_store_start_one_at_a_time() {
+    // Each session hangs on /memory stats until its 2 s check deadline. Run
+    // together on one store they must queue: the second's check starts only
+    // after the first's ended.
+    let env = Env::new();
+    let started = std::time::Instant::now();
+    let (a, b) = tokio::join!(
+        failed_session(&env, "hang", false),
+        failed_session(&env, "hang", false)
+    );
+    assert!(a.1.contains("/memory stats") && b.1.contains("/memory stats"));
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "the two checks overlapped: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

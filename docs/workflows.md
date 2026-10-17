@@ -300,11 +300,12 @@ runs on either, but the two never share:
   repo don't share.
 - **Failure.** If omp's memory doesn't open, the turn fails naming the role
   and the store path.
-- **Parallel turns.** Two omp turns of one project that start at the same
-  moment (parallel tasks or branches) can both open the store, yet one of
-  them may find its memory tools reporting "not initialised". Retry that
-  turn. None of
-these can be set from task config (`--config`, `--role-*`) or the global
+- **Parallel turns.** Memory roles of one project start one at a time, so
+  two started together don't open the store together. Two omp sessions that
+  did open it together were seen to leave one with a memory tool reporting
+  "not initialised"; if you see that, retry the turn.
+
+None of `skills`, `memory` or `inherit_operator_config` can be set from task config (`--config`, `--role-*`) or the global
 config file: only a workflow definition can loosen what its agents see. The
 built-in `chat` workflow inherits your setup; `coding-task` is isolated. A
 copy of `chat.yaml` you made yourself (in a repo, or run with
