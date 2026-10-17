@@ -1699,27 +1699,19 @@ fn a_memory_overlay_differs_from_the_plain_one_by_exactly_the_memory_block() {
 #[test]
 fn only_memory_roles_get_recall_and_retain() {
     let mut cfg = Env::new().memory_cfg("P");
-    let tools = |cfg: &RoleConfig, memory: bool| {
-        build_args(cfg, Path::new("/o.yml"), Path::new("/s"), None, None)
-            .iter()
-            .position(|arg| arg == "--tools")
-            .map(|at| {
-                let _ = memory;
-                at
-            })
-            .map(|at| {
-                build_args(cfg, Path::new("/o.yml"), Path::new("/s"), None, None)[at + 1].clone()
-            })
-            .unwrap()
+    let tools = |cfg: &RoleConfig| {
+        let args = build_args(cfg, Path::new("/o.yml"), Path::new("/s"), None, None);
+        let at = args.iter().position(|arg| arg == "--tools").unwrap();
+        args[at + 1].clone()
     };
     assert_eq!(
-        tools(&cfg, true),
+        tools(&cfg),
         "read,bash,edit,write,glob,grep,todo,recall,retain"
     );
     let plain = Env::new().cfg();
-    assert_eq!(tools(&plain, false), "read,bash,edit,write,glob,grep,todo");
+    assert_eq!(tools(&plain), "read,bash,edit,write,glob,grep,todo");
     cfg.disallowed_tools = vec![RoleTool::Edit, RoleTool::Write];
-    assert_eq!(tools(&cfg, true), "read,bash,glob,grep,todo,recall,retain");
+    assert_eq!(tools(&cfg), "read,bash,glob,grep,todo,recall,retain");
 }
 
 #[tokio::test]

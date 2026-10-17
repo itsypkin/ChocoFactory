@@ -86,6 +86,7 @@ pub fn resolve_cli(
 /// Resolves `role_name`'s final `cli`/`model`/system prompt against the
 /// three layers, plus `cwd`/`sandboxed`/`report` (stage- or task-wide, not
 /// per-role — passed straight through, not resolved here).
+#[allow(clippy::too_many_arguments)]
 pub fn resolve(
     role_name: &str,
     role_def: &RoleDef,
