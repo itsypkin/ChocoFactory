@@ -558,7 +558,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         app,
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
-        "↑↓ move  ⏎ open  / search  o PR  r retry  p pause  c cancel  ? help  q quit",
+        "↑↓ move  ⏎ open  / search  o PR  r retry  p pause  s send  c cancel  ? help  q quit",
     );
 }
 
@@ -646,7 +646,10 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect, hints: &str) {
             Level::Error => error_style(app),
             Level::Info => Style::default(),
         };
-        Line::styled(fit(&status.text, width), style)
+        let tail_len = status.tail.chars().count();
+        let room = width.saturating_sub(tail_len);
+        let whole = format!("{}{}", fit(&status.text, room), status.tail);
+        Line::styled(fit(&whole, width), style)
     } else if let Some(err) = &app.poll_error {
         let data = match app.last_refresh {
             Some(t) => format!("data {} old", fmt_duration(app.now - t)),
@@ -1245,9 +1248,9 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     draw_detail_body(frame, app, lines, area, STATUS_HINTS);
 }
 
-const STATUS_HINTS: &str = "e events  o PR  r retry  p pause  c cancel  Esc back";
+const STATUS_HINTS: &str = "e events  o PR  r retry  p pause  s send  c cancel  Esc back";
 const EXPANDED_HINTS: &str =
-    "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  c cancel";
+    "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  s send  c cancel";
 
 fn draw_detail_body(frame: &mut Frame, app: &App, lines: Vec<Line>, area: Rect, hints: &str) {
     let body_h = area.height.saturating_sub(1);
@@ -1469,7 +1472,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("⇥ / ⇧⇥      next section    r     retry stuck"),
         Line::from("?           this help       c     cancel"),
         Line::from("q  Ctrl-C   quit            p     pause / resume"),
-        Line::from("e           events / status"),
+        Line::from("e           events / status s     send a message"),
         Line::from("/           search"),
     ];
     let r = centered(area, 52, lines.len() as u16 + 2);
