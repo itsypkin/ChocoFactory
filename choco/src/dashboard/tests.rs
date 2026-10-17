@@ -5450,12 +5450,17 @@ async fn the_editor_gets_default_signal_handling() {
     )
     .await;
     assert!(o.posts().is_empty());
-    assert!(o.screen.contains("signal: 2"), "{}", o.screen);
+    // macOS /bin/sh reports the signal; dash (Linux CI) exits 128+2.
+    assert!(
+        o.screen.contains("signal: 2") || o.screen.contains("exit status: 130"),
+        "{}",
+        o.screen
+    );
     eprintln!(
         "ExitStatus text for a SIGINT-ended editor: {}",
         o.screen
             .lines()
-            .find(|l| l.contains("signal: 2"))
+            .find(|l| l.contains("signal: 2") || l.contains("exit status: 130"))
             .unwrap_or_default()
             .trim()
     );
