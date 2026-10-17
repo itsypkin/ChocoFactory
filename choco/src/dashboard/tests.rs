@@ -4933,7 +4933,7 @@ fn exit_report_lists_kept_and_unanswered_files() {
 #[test]
 fn the_kept_path_is_never_cut() {
     let path = "/tmp/choco-message-aaaa1111-1-1.md";
-    for w in [60u16, 80] {
+    for w in [60u16, 80, 100] {
         let mut app = two_tasks();
         update(
             &mut app,
@@ -4945,15 +4945,15 @@ fn the_kept_path_is_never_cut() {
         );
         let out = render(&app, w, 20);
         let last = out.lines().last().unwrap().to_string();
-        if w >= 80 {
+        // The reason has priority, so the directory may go; the file name stays.
+        assert!(
+            last.contains("choco-message-aaaa1111-1-1.md"),
+            "{w}: {last:?}"
+        );
+        if w >= 100 {
             assert!(
                 last.contains(&format!("; your text is in {path}")),
-                "{w}: {last:?}"
-            );
-        } else {
-            assert!(
-                last.contains("choco-message-aaaa1111-1-1.md"),
-                "{w}: {last:?}"
+                "{last:?}"
             );
         }
         assert!(last.starts_with("send f"), "{last:?}");
@@ -5619,6 +5619,27 @@ fn a_long_kept_path_shows_its_file_name() {
         "{last:?}"
     );
     assert!(last.starts_with("send failed:"), "{last:?}");
+    // A realistic refusal stays whole beside the file name at 80 columns.
+    let mut app = two_tasks();
+    update(
+        &mut app,
+        Msg::Sent {
+            id: "aaaa1111-0".into(),
+            path: path.into(),
+            result: Err(SendFailure::Failed("task is not at a gate".into())),
+        },
+    );
+    let out = render(&app, 80, 20);
+    let last = out.lines().last().unwrap().to_string();
+    assert!(
+        last.contains("send failed: task is not at a gate"),
+        "{last:?}"
+    );
+    assert!(
+        last.contains("choco-message-aaaa1111-12345-7.md"),
+        "{last:?}"
+    );
+    assert!(!last.contains("……"), "{last:?}");
 }
 
 #[tokio::test]

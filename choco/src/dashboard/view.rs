@@ -633,6 +633,45 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, name: &str) {
     );
 }
 
+/// Splits a status line into its shown text and shown tail for `width`.
+/// The reason (text) has priority: the full tail is shown while the text keeps
+/// up to `WANT` characters beside it; otherwise the tail shrinks to
+/// `; kept: …/<file name>` and the text takes the rest. Only when even that
+/// leaves the text under `FLOOR` characters is the tail cut from its left.
+fn status_parts(text: &str, tail: &str, width: usize) -> (String, String) {
+    const WANT: usize = 40;
+    const FLOOR: usize = 16;
+    let text_len = text.chars().count();
+    let tail_len = tail.chars().count();
+    if text_len.min(WANT) + tail_len <= width {
+        return (fit(text, width.saturating_sub(tail_len)), tail.to_string());
+    }
+    let compact = tail
+        .strip_prefix("; your text is in ")
+        .and_then(|p| p.rsplit('/').next())
+        .map(|file| format!("; kept: …/{file}"))
+        .filter(|c| c.chars().count() < tail_len)
+        .unwrap_or_else(|| tail.to_string());
+    let compact_len = compact.chars().count();
+    let room = width.saturating_sub(compact_len);
+    if room >= text_len.min(FLOOR) {
+        return (fit(text, room), compact);
+    }
+    // Very narrow: keep FLOOR characters of text, cut the tail from its left.
+    let text_room = text_len.min(FLOOR).min(width);
+    let tail_room = width - text_room;
+    let shown_tail = if tail_room == 0 {
+        String::new()
+    } else {
+        let keep: String = compact
+            .chars()
+            .skip(compact_len.saturating_sub(tail_room - 1))
+            .collect();
+        format!("…{keep}")
+    };
+    (fit(text, text_room), shown_tail)
+}
+
 fn draw_bottom(frame: &mut Frame, app: &App, area: Rect, hints: &str) {
     let width = area.width as usize;
     // A failed poll outranks an informational status (e.g. "cancelled x"),
@@ -646,31 +685,7 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect, hints: &str) {
             Level::Error => error_style(app),
             Level::Info => Style::default(),
         };
-        let tail_len = status.tail.chars().count();
-        // The text keeps at least MIN_TEXT characters; the tail gets the rest
-        // and, when it is longer, loses the start of its path, not the file name.
-        const MIN_TEXT: usize = 24;
-        let text_len = status.text.chars().count();
-        let text_room = width
-            .saturating_sub(tail_len)
-            .max(MIN_TEXT.min(text_len))
-            .min(width);
-        let shown_text = fit(&status.text, text_room);
-        let tail_room = width.saturating_sub(shown_text.chars().count());
-        let shown_tail = if tail_len > tail_room {
-            let keep: String = status
-                .tail
-                .chars()
-                .skip(tail_len - tail_room.saturating_sub(1))
-                .collect();
-            if tail_room == 0 {
-                String::new()
-            } else {
-                format!("…{keep}")
-            }
-        } else {
-            status.tail.clone()
-        };
+        let (shown_text, shown_tail) = status_parts(&status.text, &status.tail, width);
         let whole = format!("{shown_text}{shown_tail}");
         Line::styled(fit(&whole, width), style)
     } else if let Some(err) = &app.poll_error {
