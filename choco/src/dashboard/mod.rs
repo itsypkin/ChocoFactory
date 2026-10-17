@@ -513,9 +513,10 @@ pub async fn run_loop<B: Backend>(
         }
     };
     let effects = update(app, Msg::List(Box::new(first)));
-    if apply_effects(effects, terminal, app, handover, &mut rt).await? {
+    let quit = apply_effects(effects, terminal, app, handover, &mut rt).await;
+    if quit.is_err() || matches!(quit, Ok(true)) {
         abort(&mut rt.socket);
-        return Ok(());
+        return quit.map(|_| ());
     }
 
     let mut tick = tokio::time::interval(config.tick);
@@ -535,9 +536,10 @@ pub async fn run_loop<B: Backend>(
             }
         };
         let effects = update(app, msg);
-        if apply_effects(effects, terminal, app, handover, &mut rt).await? {
+        let quit = apply_effects(effects, terminal, app, handover, &mut rt).await;
+        if quit.is_err() || matches!(quit, Ok(true)) {
             abort(&mut rt.socket);
-            return Ok(());
+            return quit.map(|_| ());
         }
         draw(terminal, app, on_frame)?;
     }
@@ -602,6 +604,7 @@ static MESSAGE_FILES: AtomicU64 = AtomicU64::new(0);
 enum Ran {
     Handover(String),
     Spawn(String),
+    WaitFailed(String),
     Exited(std::process::ExitStatus),
 }
 
@@ -665,6 +668,15 @@ async fn compose<B: Backend>(
     let outcome = match ran {
         Ran::Handover(e) => EditOutcome::HandoverFailed(e),
         Ran::Spawn(error) => EditOutcome::SpawnFailed { editor, error },
+        Ran::WaitFailed(error) => {
+            let content = std::fs::read_to_string(&path).map_err(|e| e.to_string());
+            let exists = content.is_ok() || path.exists();
+            EditOutcome::WaitFailed {
+                error,
+                content,
+                exists,
+            }
+        }
         Ran::Exited(status) => {
             let content = std::fs::read_to_string(&path).map_err(|e| e.to_string());
             let exists = content.is_ok() || path.exists();
@@ -696,7 +708,7 @@ async fn run_editor(config: &LoopConfig, editor: &str, path: &Path) -> Ran {
         Err(e) => Ran::Spawn(e.to_string()),
         Ok(mut child) => match child.wait().await {
             Ok(status) => Ran::Exited(status),
-            Err(e) => Ran::Spawn(format!("waiting for the editor failed: {e}")),
+            Err(e) => Ran::WaitFailed(e.to_string()),
         },
     }
 }

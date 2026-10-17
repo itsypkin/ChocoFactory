@@ -109,6 +109,13 @@ pub enum EditOutcome {
         editor: String,
         error: String,
     },
+    /// The editor started but waiting for it failed; its file is judged by
+    /// content like any other, so text the operator wrote is never dropped.
+    WaitFailed {
+        error: String,
+        content: Result<String, String>,
+        exists: bool,
+    },
     Exited {
         status: ExitStatus,
         content: Result<String, String>,
@@ -948,6 +955,31 @@ fn edited(app: &mut App, id: String, path: PathBuf, outcome: EditOutcome) -> Vec
             );
             vec![Effect::RemoveFile { path }]
         }
+        EditOutcome::WaitFailed {
+            error,
+            content,
+            exists,
+        } => match content {
+            Err(e) => {
+                let text = format!("could not read the message: {e}; nothing sent");
+                if exists {
+                    keep(app, id, path, text);
+                } else {
+                    app.set_status(text, Level::Error);
+                }
+                Vec::new()
+            }
+            Ok(text) => {
+                let msg = format!("nothing sent: could not wait for the editor: {error}");
+                if worth_keeping(&text) {
+                    keep(app, id, path, msg);
+                    Vec::new()
+                } else {
+                    app.set_status(msg, Level::Error);
+                    vec![Effect::RemoveFile { path }]
+                }
+            }
+        },
         EditOutcome::Exited {
             status,
             content,

@@ -726,7 +726,7 @@ Actions apply to the selected task (the open one, in the detail view):
   verbatim on the bottom line, and a success refreshes the list at once.
 - `s` writes a reply in your editor and sends it, like `choco task send`.
   The dashboard hands the terminal to the editor (the screen is redrawn when it
-  exits) on a new empty file named `choco-message-<id>-<pid>-<n>.md` in the
+  exits) on a new empty file named `choco-message-<first 8 characters of the id>-<pid>-<n>.md` in the
   temp directory. The editor is `$VISUAL`, else `$EDITOR`; there is no `vi`
   fallback, and with neither set `s` says so on the bottom line and points to
   `choco task send <id>`. The value runs through `/bin/sh -c`, so arguments

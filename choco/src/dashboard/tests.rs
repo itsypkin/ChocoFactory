@@ -5514,6 +5514,83 @@ async fn a_failed_take_back_ends_the_loop_and_names_the_text() {
     assert!(err.contains("could not take the terminal back: tty gone"));
     assert!(!err.contains("unsent message"), "{err}");
     assert!(files_in(&o.msgs).is_empty());
+
+    // The file cannot be read but exists: kept and named, not deleted.
+    let mut sc = Scenario::new("bin", Wait::Nothing);
+    sc.resume_err = Some("tty gone");
+    let o = scenario("takeback-bin", sc).await;
+    let path = o.path();
+    let err = o.result.unwrap_err();
+    assert!(
+        err.contains(&format!("your unsent message is in {}", path.display())),
+        "{err}"
+    );
+    assert!(path.exists());
+
+    // An empty file that cannot be removed: the error says so.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        let mut sc = Scenario::new("chmod", Wait::Nothing);
+        sc.resume_err = Some("tty gone");
+        let o = scenario("takeback-rmfail", sc).await;
+        let path = o.path();
+        let err = o.result.unwrap_err();
+        assert!(
+            err.contains(&format!("; could not remove {}:", path.display())),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn a_wait_failure_keeps_text_and_removes_nothing_worth_keeping() {
+    let wait = |text: &str| EditOutcome::WaitFailed {
+        error: "boom".into(),
+        content: Ok(text.into()),
+        exists: true,
+    };
+    let mut app = two_tasks();
+    let fx = update(&mut app, edited("aaaa1111-0", wait("x\n")));
+    assert!(fx.is_empty());
+    assert_eq!(app.kept_messages.len(), 1);
+    assert!(
+        app.status
+            .as_ref()
+            .unwrap()
+            .full()
+            .starts_with("nothing sent: could not wait for the editor: boom")
+    );
+    let mut app = two_tasks();
+    let fx = update(&mut app, edited("aaaa1111-0", wait(" \n")));
+    assert!(matches!(&fx[..], [Effect::RemoveFile { .. }]));
+}
+
+#[test]
+fn a_failed_editor_with_an_empty_file_removes_it() {
+    let mut app = two_tasks();
+    let fx = update(&mut app, edited("aaaa1111-0", exited(256, "\n")));
+    assert!(matches!(&fx[..], [Effect::RemoveFile { .. }]));
+    assert!(app.kept_messages.is_empty());
+}
+
+#[test]
+fn a_long_kept_path_shows_its_file_name() {
+    let path = "/var/folders/nb/abcdefghijklmnopqrstuvwxyz0123/T/choco-message-aaaa1111-12345-7.md";
+    let mut app = two_tasks();
+    update(
+        &mut app,
+        Msg::Sent {
+            id: "aaaa1111-0".into(),
+            path: path.into(),
+            result: Err(SendFailure::Failed("refused".into())),
+        },
+    );
+    let out = render(&app, 60, 20);
+    let last = out.lines().last().unwrap().to_string();
+    assert!(
+        last.contains("choco-message-aaaa1111-12345-7.md"),
+        "{last:?}"
+    );
 }
 
 #[tokio::test]
