@@ -70,6 +70,8 @@ wrapper script, never through the test process's own environment):
 - FAKE_OMP_VERSION_FAIL: `--version` exits 1.
 - FAKE_OMP_PROMPT_LOG: a file; every received prompt appends one JSON line
   `{"message": ..., "streamingBehavior": ...}` to it.
+- FAKE_OMP_LAUNCH_LOG: a file; the process appends its start time (seconds)
+  to it as its first act.
 - FAKE_OMP_MEMORY_STATS: how the prompt `/memory stats` is answered (it makes
   no model call). The database path and bank are read from the `--config`
   file's `dbPath:` and `bank:` lines.
@@ -93,6 +95,11 @@ ARGS = sys.argv[1:]
 MODES = set(filter(None, os.environ.get("FAKE_OMP_MODES", "").split(",")))
 USAGE = {"input": 100, "output": 20, "cacheRead": 30, "cacheWrite": 5}
 COST = 0.0123
+
+
+if os.environ.get("FAKE_OMP_LAUNCH_LOG"):
+    with open(os.environ["FAKE_OMP_LAUNCH_LOG"], "a") as launch_log:
+        launch_log.write("%f\n" % time.time())
 
 
 def emit(obj):

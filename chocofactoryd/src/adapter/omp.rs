@@ -182,6 +182,14 @@ impl OmpAdapter {
             _ => None,
         };
 
+        // Held from before omp starts until the memory check ends: omp opens
+        // the store while it starts, so two starting together can leave one
+        // with an inert backend that `/memory stats` still reports healthy.
+        let startup_guard = match &memory_db {
+            Some(db) => Some(acquire_memory_startup(db, &cfg.role)?),
+            None => None,
+        };
+
         let session_dir = self.session_dir();
         let overlay_dir = self.state_dir.join("overlays");
         for dir in [&session_dir, &overlay_dir] {
@@ -248,6 +256,7 @@ impl OmpAdapter {
                 role: cfg.role.clone(),
                 memory_db,
                 memory_check_timeout: self.memory_check_timeout,
+                startup_guard,
             },
         );
         tokio::spawn(driver.run(stdin_rx));
@@ -880,21 +889,56 @@ struct DriverConfig {
     /// session must prove omp opened it before any prompt is sent.
     memory_db: Option<PathBuf>,
     memory_check_timeout: Duration,
+    /// The per-store startup lock; released once the check has ended.
+    startup_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// One startup lock per memory store. Two omp sessions that start on one
 /// store at the same moment can both pass `/memory stats` yet leave one
 /// with an uninitialised backend (#222 probe), so a memory role's startup,
-/// up to and including its check, runs alone per store.
+/// from before omp is spawned to the end of its check, runs alone per store.
 fn memory_startup_lock(db: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    > = std::sync::OnceLock::new();
+    use std::sync::{Arc, Mutex, Weak};
+    static LOCKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+        std::sync::OnceLock::new();
     let mut locks = LOCKS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks.entry(db.to_path_buf()).or_default().clone()
+    // Entries whose lock nobody holds any more are dropped.
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(db).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(db.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Takes the store's startup lock. `spawn` is not async, so a busy lock is
+/// waited for on a multi-threaded runtime (the daemon's); on any other
+/// runtime it fails the spawn rather than start omp unserialised.
+fn acquire_memory_startup(
+    db: &Path,
+    role: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, AdapterError> {
+    let lock = memory_startup_lock(db);
+    if let Ok(guard) = lock.clone().try_lock_owned() {
+        return Ok(guard);
+    }
+    let handle = tokio::runtime::Handle::try_current().ok();
+    match handle {
+        Some(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            Ok(tokio::task::block_in_place(|| {
+                handle.block_on(lock.lock_owned())
+            }))
+        }
+        _ => Err(AdapterError::Spawn(std::io::Error::other(format!(
+            "role '{role}': another memory role is starting on the omp memory store {}; \
+             try again",
+            db.display()
+        )))),
+    }
 }
 
 /// A prompt omp has finished, waiting for its statistics.
@@ -1197,9 +1241,10 @@ impl Driver {
             })
             .unwrap_or_default();
         if let Some(db) = self.config.memory_db.clone() {
-            let lock = memory_startup_lock(&db);
-            let _startup = lock.lock().await;
-            self.check_memory_store(&db).await?;
+            let guard = self.config.startup_guard.take();
+            let result = self.check_memory_store(&db).await;
+            drop(guard);
+            result?;
         }
         let omp_version = match version.await {
             Ok(version) => version,

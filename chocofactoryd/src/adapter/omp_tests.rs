@@ -1780,6 +1780,10 @@ async fn failed_session(env: &Env, stats: &str, resume: bool) -> (Vec<AgentEvent
             ("FAKE_OMP_MODES", "noreport"),
             ("FAKE_OMP_MEMORY_STATS", stats),
             ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
+            (
+                "FAKE_OMP_LAUNCH_LOG",
+                &env.dir.join("launch.log").to_string_lossy(),
+            ),
         ])
         .with_memory_check_timeout(Duration::from_secs(if stats == "hang" { 2 } else { 60 }));
     let cfg = env.memory_cfg("P");
@@ -1875,7 +1879,7 @@ async fn a_memory_store_that_did_not_open_fails_the_turn_before_the_stage_prompt
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn memory_roles_of_one_store_start_one_at_a_time() {
     // Each session hangs on /memory stats until its 2 s check deadline. Run
     // together on one store they must queue: the second's check starts only
@@ -1891,6 +1895,21 @@ async fn memory_roles_of_one_store_start_one_at_a_time() {
         started.elapsed() >= Duration::from_secs(4),
         "the two checks overlapped: {:?}",
         started.elapsed()
+    );
+    // The second omp process must not even launch until the first's check
+    // ended (about 2 s after its own launch), since omp opens the store as it
+    // starts.
+    let mut launches: Vec<f64> = std::fs::read_to_string(env.dir.join("launch.log"))
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    launches.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    assert_eq!(launches.len(), 2);
+    assert!(
+        launches[1] - launches[0] >= 1.9,
+        "the second omp launched {:.2}s after the first",
+        launches[1] - launches[0]
     );
 }
 
