@@ -298,8 +298,10 @@ runs on either, but the two never share:
   project runs.
 - **Scope.** Claude: per repo. omp: per choco project, so two projects on one
   repo don't share.
-- **Failure.** If omp's memory doesn't open, the turn fails naming the role
-  and the store path.
+- **Failure.** If omp can't open the store at startup, the turn fails naming
+  the role and the store path. The check can't see every way memory can
+  fail: a memory tool reporting "not initialised" means memory is off for
+  that turn, so retry it.
 - **Parallel turns.** Memory roles of one project start one at a time, so
   two started together don't open the store together. Two omp sessions that
   did open it together were seen to leave one with a memory tool reporting

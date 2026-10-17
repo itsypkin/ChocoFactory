@@ -127,8 +127,10 @@ roles:
   kept by choco in `~/.config/chocofactory/omp/memory/<project-id>/` (the id
   is in `choco project list`) until the project is deleted. The agent gets
   omp's `recall` and `retain` tools only; no embeddings are downloaded and
-  the memory makes no model calls of its own. If omp's memory doesn't open
-  at startup, the turn fails naming the role and the store path. Memory
+  the memory makes no model calls of its own. If omp can't open the
+  store at startup, the turn fails naming the role and the store path. That
+  check can't see every way memory can fail: a memory tool reporting "not
+  initialised" means memory is off for that turn, so retry it. Memory
   roles of one project start one at a time for that reason. [What differs from claude](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#what-an-agent-inherits-from-your-claude-setup).
   A skill name containing `,` `*` `?` `[` `]` `{` or `}` is rejected, with the
   role's name, when the workflow loads, when a task is created or
