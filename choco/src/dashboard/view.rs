@@ -647,18 +647,31 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect, hints: &str) {
             Level::Info => Style::default(),
         };
         let tail_len = status.tail.chars().count();
-        let whole = if tail_len > width {
-            // Too long for the row: drop the text and the tail's head, so the
-            // file name at the end of the path stays visible.
+        // The text keeps at least MIN_TEXT characters; the tail gets the rest
+        // and, when it is longer, loses the start of its path, not the file name.
+        const MIN_TEXT: usize = 24;
+        let text_len = status.text.chars().count();
+        let text_room = width
+            .saturating_sub(tail_len)
+            .max(MIN_TEXT.min(text_len))
+            .min(width);
+        let shown_text = fit(&status.text, text_room);
+        let tail_room = width.saturating_sub(shown_text.chars().count());
+        let shown_tail = if tail_len > tail_room {
             let keep: String = status
                 .tail
                 .chars()
-                .skip(tail_len - width.saturating_sub(1))
+                .skip(tail_len - tail_room.saturating_sub(1))
                 .collect();
-            format!("…{keep}")
+            if tail_room == 0 {
+                String::new()
+            } else {
+                format!("…{keep}")
+            }
         } else {
-            format!("{}{}", fit(&status.text, width - tail_len), status.tail)
+            status.tail.clone()
         };
+        let whole = format!("{shown_text}{shown_tail}");
         Line::styled(fit(&whole, width), style)
     } else if let Some(err) = &app.poll_error {
         let data = match app.last_refresh {

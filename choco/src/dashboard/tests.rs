@@ -4945,10 +4945,17 @@ fn the_kept_path_is_never_cut() {
         );
         let out = render(&app, w, 20);
         let last = out.lines().last().unwrap().to_string();
-        assert!(
-            last.contains(&format!("; your text is in {path}")),
-            "{w}: {last:?}"
-        );
+        if w >= 80 {
+            assert!(
+                last.contains(&format!("; your text is in {path}")),
+                "{w}: {last:?}"
+            );
+        } else {
+            assert!(
+                last.contains("choco-message-aaaa1111-1-1.md"),
+                "{w}: {last:?}"
+            );
+        }
         assert!(last.starts_with("send f"), "{last:?}");
     }
 }
@@ -5566,6 +5573,26 @@ fn a_wait_failure_keeps_text_and_removes_nothing_worth_keeping() {
 }
 
 #[test]
+fn a_wait_failure_with_an_unreadable_file_keeps_it_and_names_the_cause() {
+    let mut app = two_tasks();
+    let fx = update(
+        &mut app,
+        edited(
+            "aaaa1111-0",
+            EditOutcome::WaitFailed {
+                error: "boom".into(),
+                content: Err("bad utf8".into()),
+                exists: true,
+            },
+        ),
+    );
+    assert!(fx.is_empty());
+    assert_eq!(app.kept_messages.len(), 1);
+    let full = app.status.as_ref().unwrap().full();
+    assert!(full.contains("boom") && full.contains("bad utf8"), "{full}");
+}
+
+#[test]
 fn a_failed_editor_with_an_empty_file_removes_it() {
     let mut app = two_tasks();
     let fx = update(&mut app, edited("aaaa1111-0", exited(256, "\n")));
@@ -5591,6 +5618,7 @@ fn a_long_kept_path_shows_its_file_name() {
         last.contains("choco-message-aaaa1111-12345-7.md"),
         "{last:?}"
     );
+    assert!(last.starts_with("send failed:"), "{last:?}");
 }
 
 #[tokio::test]

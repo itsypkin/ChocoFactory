@@ -961,7 +961,9 @@ fn edited(app: &mut App, id: String, path: PathBuf, outcome: EditOutcome) -> Vec
             exists,
         } => match content {
             Err(e) => {
-                let text = format!("could not read the message: {e}; nothing sent");
+                let text = format!(
+                    "could not wait for the editor: {error}; could not read the message: {e}; nothing sent"
+                );
                 if exists {
                     keep(app, id, path, text);
                 } else {
