@@ -89,6 +89,8 @@ impl Env {
 
     fn cfg(&self) -> RoleConfig {
         RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             cwd: self.repo.clone(),
             model: Some("openai-codex/gpt-5.6-terra".to_string()),
             system_prompt: None,
@@ -97,6 +99,18 @@ impl Env {
             report_sections: Vec::new(),
             isolation: Isolation::default(),
             disallowed_tools: Vec::new(),
+        }
+    }
+
+    /// A `memory: true` role of project `project`.
+    fn memory_cfg(&self, project: &str) -> RoleConfig {
+        RoleConfig {
+            isolation: Isolation::Isolated {
+                skills: Vec::new(),
+                memory: true,
+            },
+            project_id: Some(project.to_string()),
+            ..self.cfg()
         }
     }
 }
@@ -1050,7 +1064,7 @@ async fn system_prompt_flags_skills_thinking_tools_and_the_profile_rule() {
 
 #[test]
 fn the_tool_allowlist_drops_what_the_role_disallows_and_never_lists_report_outcome() {
-    let tools = |disallowed: &[RoleTool]| allowed_tools(disallowed).join(",");
+    let tools = |disallowed: &[RoleTool]| allowed_tools(disallowed, false).join(",");
     assert_eq!(tools(&[]), "read,bash,edit,write,glob,grep,todo");
     assert_eq!(tools(&[RoleTool::Edit]), "read,bash,write,glob,grep,todo");
     assert_eq!(tools(&[RoleTool::Write]), "read,bash,edit,glob,grep,todo");
@@ -1596,7 +1610,7 @@ fn billing_follows_the_provider_and_the_environment() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn validate_role_rejects_memory_and_pattern_skill_names() {
+fn validate_role_accepts_memory_and_rejects_pattern_skill_names() {
     let adapter = OmpAdapter::new("/nonexistent");
     let isolated = |skills: &[&str], memory: bool| Isolation::Isolated {
         skills: skills.iter().map(|s| s.to_string()).collect(),
@@ -1612,13 +1626,7 @@ fn validate_role_rejects_memory_and_pattern_skill_names() {
             .validate_role("chat", &Isolation::InheritOperatorConfig)
             .is_ok()
     );
-    assert_eq!(
-        adapter
-            .validate_role("coder", &isolated(&[], true))
-            .unwrap_err(),
-        "role 'coder' runs on cli 'omp', which can't use memory: true; remove memory: true or \
-         run the role on cli: claude"
-    );
+    assert!(adapter.validate_role("coder", &isolated(&[], true)).is_ok());
     for bad in ["a,b", "a*", "a?", "[a]", "a{b}", "a}"] {
         assert_eq!(
             adapter
@@ -1650,13 +1658,325 @@ fn the_default_validate_role_accepts_everything() {
 }
 
 // ---------------------------------------------------------------------------
+// memory: true (#222)
+// ---------------------------------------------------------------------------
+
+fn memory_db_of(env: &Env, project: &str) -> PathBuf {
+    env.state.join("memory").join(project).join("mnemopi.db")
+}
+
+fn mode_of(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn a_memory_overlay_differs_from_the_plain_one_by_exactly_the_memory_block() {
+    let env = Env::new();
+    let db = memory_db_of(&env, "P");
+    let plain = overlay(&env.cfg(), None);
+    let memory = overlay(&env.memory_cfg("P"), Some(&db));
+
+    let mut expected = plain.clone();
+    expected["memory"] = json!({"backend": "mnemopi"});
+    expected["mnemopi"] = json!({
+        "dbPath": db.to_string_lossy(),
+        "bank": "choco",
+        "scoping": "global",
+        "noEmbeddings": true,
+        "llmMode": "none",
+        "autoRecall": true,
+        "autoRetain": true,
+    });
+    // The two memory tools run without asking: they touch only choco's own
+    // per-project store.
+    expected["tools"]["approval"]["recall"] = json!("allow");
+    expected["tools"]["approval"]["retain"] = json!("allow");
+    assert_eq!(memory, expected);
+    assert_eq!(memory["memories"]["enabled"], false);
+    // The plain overlay is untouched.
+    assert_eq!(plain["memory"], json!({"backend": "off"}));
+    assert!(plain.get("mnemopi").is_none());
+}
+
+#[test]
+fn only_memory_roles_get_recall_and_retain() {
+    let mut cfg = Env::new().memory_cfg("P");
+    let tools = |cfg: &RoleConfig, memory: bool| {
+        build_args(cfg, Path::new("/o.yml"), Path::new("/s"), None, None)
+            .iter()
+            .position(|arg| arg == "--tools")
+            .map(|at| {
+                let _ = memory;
+                at
+            })
+            .map(|at| {
+                build_args(cfg, Path::new("/o.yml"), Path::new("/s"), None, None)[at + 1].clone()
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        tools(&cfg, true),
+        "read,bash,edit,write,glob,grep,todo,recall,retain"
+    );
+    let plain = Env::new().cfg();
+    assert_eq!(tools(&plain, false), "read,bash,edit,write,glob,grep,todo");
+    cfg.disallowed_tools = vec![RoleTool::Edit, RoleTool::Write];
+    assert_eq!(tools(&cfg, true), "read,bash,glob,grep,todo,recall,retain");
+}
+
+#[tokio::test]
+async fn a_memory_start_and_resume_create_an_owner_only_store_and_others_create_nothing() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport")]);
+    let mut handle = adapter.start("hi", &env.memory_cfg("P")).unwrap();
+    until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    let memory = env.state.join("memory");
+    assert_eq!(mode_of(&memory), 0o700);
+    assert_eq!(mode_of(&memory.join("P")), 0o700);
+
+    // A resume tightens a folder that was made too open.
+    for dir in [&memory, &memory.join("P")] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut handle = adapter.resume("s1", "hi", &env.memory_cfg("P")).unwrap();
+    until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    assert_eq!(mode_of(&memory), 0o700);
+    assert_eq!(mode_of(&memory.join("P")), 0o700);
+
+    // memory: false and an inheriting (chat) role make no store.
+    let other = Env::new();
+    let adapter = other.adapter(&[("FAKE_OMP_MODES", "noreport")]);
+    let mut inherit = other.cfg();
+    inherit.isolation = Isolation::InheritOperatorConfig;
+    for cfg in [other.cfg(), inherit] {
+        let mut handle = adapter.start("hi", &cfg).unwrap();
+        until_turn_completed(&mut handle).await;
+        drain(&mut handle).await;
+    }
+    assert!(!other.state.join("memory").exists());
+}
+
+#[tokio::test]
+async fn the_store_is_keyed_by_project_not_by_cwd() {
+    let env = Env::new();
+    let other_cwd = env.dir.join("worktree-2");
+    std::fs::create_dir_all(&other_cwd).unwrap();
+    let db_of = |report: &Value| {
+        overlay_of(report)["mnemopi"]["dbPath"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mut cfg = env.memory_cfg("P");
+    let first = db_of(&echo_run(&env, &cfg).await);
+    cfg.cwd = other_cwd;
+    let second = db_of(&echo_run(&env, &cfg).await);
+    let third = db_of(&echo_run(&env, &env.memory_cfg("Q")).await);
+    assert_eq!(first, memory_db_of(&env, "P").to_string_lossy());
+    assert_eq!(first, second);
+    assert_ne!(first, third);
+}
+
+/// Events after a start (or resume) that fails: everything until the stream
+/// ends, which only happens once the process has been killed.
+async fn failed_session(env: &Env, stats: &str, resume: bool) -> (Vec<AgentEvent>, String) {
+    let log = env.dir.join(format!("prompts-{}.log", uuid::Uuid::new_v4()));
+    let adapter = env.adapter(&[
+        ("FAKE_OMP_MODES", "noreport"),
+        ("FAKE_OMP_MEMORY_STATS", stats),
+        ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
+    ]);
+    let cfg = env.memory_cfg("P");
+    let mut handle = if resume {
+        adapter.resume("s1", "do the work", &cfg).unwrap()
+    } else {
+        adapter.start("do the work", &cfg).unwrap()
+    };
+    let events = drain(&mut handle).await;
+    (events, std::fs::read_to_string(&log).unwrap_or_default())
+}
+
+#[tokio::test]
+async fn a_healthy_memory_check_runs_before_the_stage_prompt_without_follow_up() {
+    for resume in [false, true] {
+        let env = Env::new();
+        let log = env.dir.join("prompts.log");
+        let adapter = env.adapter(&[
+            ("FAKE_OMP_MODES", "noreport"),
+            ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
+        ]);
+        let cfg = env.memory_cfg("P");
+        let mut handle = if resume {
+            adapter.resume("s1", "do the work", &cfg).unwrap()
+        } else {
+            adapter.start("do the work", &cfg).unwrap()
+        };
+        let events = until_turn_completed(&mut handle).await;
+        drain(&mut handle).await;
+        assert!(
+            matches!(events[0], AgentEvent::SessionMeta { .. }),
+            "{events:?}"
+        );
+        let lines: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                json!({"message": "/memory stats", "streamingBehavior": null}),
+                json!({"message": "do the work", "streamingBehavior": null}),
+            ],
+            "resume={resume}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_memory_store_that_did_not_open_fails_the_turn_before_the_stage_prompt() {
+    for resume in [false, true] {
+        for stats in ["error", "other_path", "other_bank", "no_output", "agent"] {
+            let env = Env::new();
+            let (events, log) = failed_session(&env, stats, resume).await;
+            let db = std::fs::canonicalize(env.state.join("memory/P"))
+                .unwrap()
+                .join("mnemopi.db");
+            let message = events
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::Error { message } => Some(message.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{stats}: no Error in {events:?}"));
+            assert!(message.contains("role 'coder'"), "{stats}: {message}");
+            assert!(
+                message.contains(&db.to_string_lossy().into_owned()),
+                "{stats}: {message}"
+            );
+            if stats == "error" {
+                assert!(message.contains("EACCES"), "{message}");
+            }
+            assert!(
+                !log.contains("do the work"),
+                "{stats} resume={resume}: the stage prompt was sent: {log}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::SessionMeta { .. })),
+                "{stats}: SessionMeta was emitted"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_memory_verdict_needs_the_row_then_the_response_and_no_model_turn() {
+    let db = Path::new("/state/memory/P/mnemopi.db");
+    let output = |bank: &str, path: &str| {
+        json!({"type": "command_output", "text": format!(
+            "# Stats\n\n| Bank | Database |\n| --- | --- |\n| {bank} | `{path}` |\n")})
+    };
+    let response = |agent: bool| {
+        json!({"type": "response", "id": "m-1", "command": "prompt",
+               "success": true, "data": {"agentInvoked": agent}})
+    };
+    let verdict = |frames: &[Value]| memory_stats_verdict(frames, "m-1", db, "coder");
+    assert!(verdict(&[output("choco", "/state/memory/P/mnemopi.db"), response(false)]).is_ok());
+    // A mixed case: a wrong row before the right one still passes.
+    assert!(
+        verdict(&[
+            output("choco-1a2b", "/state/memory/P/mnemopi.db"),
+            output("choco", "/state/memory/P/mnemopi.db"),
+            response(false)
+        ])
+        .is_ok()
+    );
+    for frames in [
+        vec![response(false)],
+        vec![response(false), output("choco", "/state/memory/P/mnemopi.db")],
+        vec![output("choco", "/elsewhere/mnemopi.db"), response(false)],
+        vec![output("choco-1a2b", "/state/memory/P/mnemopi.db"), response(false)],
+        vec![output("choco", "/state/memory/P/mnemopi.db"), response(true)],
+        vec![
+            output("choco", "/state/memory/P/mnemopi.db"),
+            json!({"type": "prompt_result", "id": "m-1"}),
+        ],
+        vec![output("choco", "/state/memory/P/mnemopi.db")],
+    ] {
+        let err = verdict(&frames).unwrap_err();
+        assert!(err.contains("role 'coder'") && err.contains("mnemopi.db"), "{err}");
+    }
+}
+
+#[test]
+fn a_store_path_that_is_a_file_fails_the_spawn_naming_the_role_and_path() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.state.join("memory")).unwrap();
+    std::fs::write(env.state.join("memory/P"), "not a folder").unwrap();
+    let log = env.dir.join("prompts.log");
+    let adapter = env.adapter(&[("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy())]);
+    let Err(AdapterError::Spawn(err)) = adapter.start("hi", &env.memory_cfg("P")) else {
+        panic!("expected a spawn error");
+    };
+    let text = err.to_string();
+    assert!(text.contains("role 'coder'"), "{text}");
+    assert!(text.contains(&env.state.join("memory/P").to_string_lossy().into_owned()), "{text}");
+    assert!(!log.exists(), "omp must not have been started");
+}
+
+#[test]
+fn a_memory_role_without_a_usable_project_id_fails_and_makes_no_store() {
+    for project in [None, Some("../x"), Some("a/b"), Some(""), Some(".."), Some("/abs")] {
+        let env = Env::new();
+        let adapter = env.adapter(&[]);
+        let mut cfg = env.memory_cfg("P");
+        cfg.project_id = project.map(str::to_string);
+        let Err(AdapterError::Spawn(err)) = adapter.start("hi", &cfg) else {
+            panic!("{project:?}: expected a spawn error");
+        };
+        assert!(err.to_string().contains("role 'coder'"), "{err}");
+        assert!(!env.state.join("memory").exists(), "{project:?}");
+        assert!(!env.dir.join("x").exists());
+    }
+}
+
+#[test]
+fn removing_project_data_removes_only_that_projects_store() {
+    let env = Env::new();
+    let adapter = env.adapter(&[]);
+    for project in ["P", "Q"] {
+        let store = env.state.join("memory").join(project);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("mnemopi.db"), "x").unwrap();
+    }
+    adapter.remove_project_data("P").unwrap();
+    assert!(!env.state.join("memory/P").exists());
+    assert!(env.state.join("memory/Q/mnemopi.db").exists());
+    // Nothing to remove, and a bad id.
+    adapter.remove_project_data("P").unwrap();
+    adapter.remove_project_data("never-had-one").unwrap();
+    assert!(adapter.remove_project_data("../Q").is_err());
+    assert!(adapter.remove_project_data("").is_err());
+    assert!(env.state.join("memory/Q/mnemopi.db").exists());
+}
+
+// ---------------------------------------------------------------------------
 // Opt-in tests against the real `omp` (ignored by default)
 // ---------------------------------------------------------------------------
 
 /// Everything `spawn` does before starting the process, for tests that talk
 /// to the real omp themselves: the overlay on disk, the arguments, and the
 /// scrubbed command.
-fn real_command(binary: &str, state: &Path, cfg: &RoleConfig) -> (Command, PathBuf) {
+fn real_command(
+    binary: &str,
+    state: &Path,
+    cfg: &RoleConfig,
+    memory_db: Option<&Path>,
+) -> (Command, PathBuf) {
     let (files, _warnings) = read_repo_instructions(&cfg.cwd, &INSTRUCTION_FILES);
     let append = match &cfg.isolation {
         Isolation::Isolated { .. } => Some(append_block(&render_instruction_files(&files), cfg)),
@@ -1669,7 +1989,7 @@ fn real_command(binary: &str, state: &Path, cfg: &RoleConfig) -> (Command, PathB
     let overlay_path = overlay_dir.join(format!("{}.yml", uuid::Uuid::new_v4()));
     write_private_file(
         &overlay_path,
-        &serde_yaml::to_string(&overlay(cfg)).unwrap(),
+        &serde_yaml::to_string(&overlay(cfg, memory_db)).unwrap(),
     )
     .unwrap();
     let args = build_args(cfg, &overlay_path, &session_dir, append.as_deref(), None);
@@ -1739,7 +2059,7 @@ async fn omp_loads_only_the_repos_own_instructions() {
 
     let mut cfg = env.cfg();
     cfg.cwd = repo;
-    let (mut command, overlay_path) = real_command("omp", &env.state, &cfg);
+    let (mut command, overlay_path) = real_command("omp", &env.state, &cfg, None);
     let mut child = command.spawn().expect("omp must be on PATH");
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap());
@@ -1836,6 +2156,8 @@ fn dump_probe_spawn() {
     let out = std::env::var("CHOCO_PROBE_OUT").unwrap();
     let state = PathBuf::from(&out).with_extension("state");
     let mut cfg = RoleConfig {
+        role: "coder".to_string(),
+        project_id: None,
         cwd,
         model: Some("openai-codex/gpt-5.6-terra".to_string()),
         system_prompt: None,
@@ -1846,7 +2168,7 @@ fn dump_probe_spawn() {
         disallowed_tools: Vec::new(),
     };
     cfg.report_outcomes = vec!["done".to_string()];
-    let (command, overlay_path) = real_command("omp", &state, &cfg);
+    let (command, overlay_path) = real_command("omp", &state, &cfg, None);
     let std_command = command.as_std();
     let args: Vec<String> = std_command
         .get_args()

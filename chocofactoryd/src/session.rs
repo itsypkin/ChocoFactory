@@ -2052,6 +2052,8 @@ mod tests {
 
     fn role_config() -> RoleConfig {
         RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -2067,6 +2069,8 @@ mod tests {
     /// makes the adapter tell the turn to report, and the fixtures report.
     fn single_shot_role_config() -> RoleConfig {
         RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             report_outcomes: vec!["done".to_string()],
             report_sections: Vec::new(),
             ..role_config()
@@ -4038,6 +4042,8 @@ mod tests {
             Arc::new(Notify::new()),
         );
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             isolation: crate::adapter::Isolation::Isolated {
                 skills: vec!["run-tests".to_string()],
                 memory: false,
@@ -4824,6 +4830,8 @@ mod tests {
 
     fn memory_role_config() -> RoleConfig {
         RoleConfig {
+            role: "coder".to_string(),
+            project_id: Some("P".to_string()),
             isolation: crate::adapter::Isolation::Isolated {
                 skills: Vec::new(),
                 memory: true,
@@ -4833,7 +4841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_resume_on_omp_with_memory_is_refused_and_a_claude_one_is_not() {
+    async fn chat_resume_on_omp_with_memory_is_accepted_like_a_claude_one() {
         let dir = std::env::temp_dir().join(format!("choco-omp-chat-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("omp-was-run");
@@ -4856,20 +4864,21 @@ mod tests {
         );
 
         let session_id = idle_chat_session_on(&pool, "omp").await;
-        let err = manager
+        let result = manager
             .send_message(&session_id, "hi", &memory_role_config())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SessionError::RoleRejected(_)), "{err:?}");
-        assert!(err.to_string().contains("can't use memory: true"), "{err}");
-        assert!(!marker.exists(), "omp must not have been started");
+            .await;
         assert!(
-            !dir.join("state").exists(),
-            "no overlay or session dir was made"
+            !matches!(result, Err(SessionError::RoleRejected(_))),
+            "{result:?}"
         );
-        let row = sessions::get(&pool, &session_id).await.unwrap().unwrap();
-        assert_eq!(row.status, SessionStatus::Idle);
-
+        for _ in 0..200 {
+        if marker.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+        assert!(marker.exists(), "omp must have been started");
+        assert!(dir.join("state").join("memory").join("P").is_dir());
         // The same role on claude is fine.
         let claude_session = idle_chat_session_on(&pool, "claude").await;
         manager
@@ -4957,6 +4966,8 @@ mod tests {
             Arc::new(Notify::new()),
         );
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             cwd: std::env::temp_dir(),
             ..role_config()
         };
@@ -5817,6 +5828,8 @@ mod tests {
         );
         let dir = TempDir::new();
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             model: Some("haiku".to_string()),
             cwd: dir.0.clone(),
             // A disposable directory, and Bash calls need no approval there.

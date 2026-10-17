@@ -2001,6 +2001,7 @@ impl WorkflowEngine {
             cwd,
             definition.worktree,
             role_config::StageReport::default(),
+            &task.project_id,
         )
         .map_err(SendMessageError::RoleConfig)?;
 

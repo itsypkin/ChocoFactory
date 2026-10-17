@@ -13,8 +13,8 @@
 //! tool name, so the engine has no omp-specific path.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -58,6 +58,14 @@ const THINKING_LEVELS: [&str; 9] = [
 
 const BASE_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "glob", "grep", "todo"];
 
+/// The only omp memory tools a `memory: true` role gets (#222): not
+/// `reflect`, `memory_edit` or `learn`.
+const MEMORY_TOOLS: [&str; 2] = ["recall", "retain"];
+
+/// The mnemopi bank every memory role uses. One bank per store file, so the
+/// folder is the unit of ownership; `/memory stats` must name exactly this.
+const MEMORY_BANK: &str = "choco";
+
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const STATS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,6 +106,52 @@ impl OmpAdapter {
         self.state_dir.join("sessions")
     }
 
+    /// `<state_dir>/memory/<project-id>`: the memory store of one choco
+    /// project, or `None` for an id that isn't one plain path component.
+    fn memory_store_dir(&self, project_id: &str) -> Option<PathBuf> {
+        valid_project_id(project_id).then(|| self.state_dir.join("memory").join(project_id))
+    }
+
+    /// Creates (owner-only) and canonicalizes the memory store folder of
+    /// `cfg`'s project; returns the `mnemopi.db` path inside it. Runs on
+    /// every spawn, so a folder that already exists is tightened too.
+    fn prepare_memory_store(&self, cfg: &RoleConfig) -> Result<PathBuf, AdapterError> {
+        let role = &cfg.role;
+        let Some(project_id) = cfg.project_id.as_deref() else {
+            return Err(AdapterError::Spawn(std::io::Error::other(format!(
+                "role '{role}' uses memory: true on omp, but the turn has no valid project id \
+                 to keep its memory under"
+            ))));
+        };
+        let Some(store) = self.memory_store_dir(project_id) else {
+            return Err(AdapterError::Spawn(std::io::Error::other(format!(
+                "role '{role}' uses memory: true on omp, but the turn has no valid project id \
+                 to keep its memory under ('{project_id}' is not one plain path component)"
+            ))));
+        };
+        let fail = |err: std::io::Error| {
+            AdapterError::Spawn(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "role '{role}': couldn't create the omp memory store {}: {err}",
+                    store.display()
+                ),
+            ))
+        };
+        let parent = self.state_dir.join("memory");
+        for dir in [&parent, &store] {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(fail)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(fail)?;
+        }
+        let canonical = std::fs::canonicalize(&store).map_err(fail)?;
+        Ok(canonical.join("mnemopi.db"))
+    }
+
     fn spawn(
         &self,
         cfg: &RoleConfig,
@@ -115,13 +169,18 @@ impl OmpAdapter {
                 .then(|| with_trailing_newline(&report_instruction(&cfg.report_outcomes))),
         };
 
+        let memory_db = match &cfg.isolation {
+            Isolation::Isolated { memory: true, .. } => Some(self.prepare_memory_store(cfg)?),
+            _ => None,
+        };
+
         let session_dir = self.session_dir();
         let overlay_dir = self.state_dir.join("overlays");
         for dir in [&session_dir, &overlay_dir] {
             std::fs::create_dir_all(dir).map_err(AdapterError::Spawn)?;
         }
         let overlay_path = overlay_dir.join(format!("{}.yml", uuid::Uuid::new_v4()));
-        let yaml = serde_yaml::to_string(&overlay(cfg))
+        let yaml = serde_yaml::to_string(&overlay(cfg, memory_db.as_deref()))
             .map_err(|err| AdapterError::Spawn(std::io::Error::other(err)))?;
         write_private_file(&overlay_path, &yaml).map_err(AdapterError::Spawn)?;
         // From here the overlay is removed whenever this guard drops: on a
@@ -178,6 +237,8 @@ impl OmpAdapter {
                     required_sections: cfg.report_sections.clone(),
                 },
                 isolation: cfg.isolation.describe(),
+                role: cfg.role.clone(),
+                memory_db,
             },
         );
         tokio::spawn(driver.run(stdin_rx));
@@ -198,15 +259,9 @@ impl AgentAdapter for OmpAdapter {
     }
 
     fn validate_role(&self, role: &str, isolation: &Isolation) -> Result<(), String> {
-        let Isolation::Isolated { skills, memory } = isolation else {
+        let Isolation::Isolated { skills, .. } = isolation else {
             return Ok(());
         };
-        if *memory {
-            return Err(format!(
-                "role '{role}' runs on cli 'omp', which can't use memory: true; remove \
-                 memory: true or run the role on cli: claude"
-            ));
-        }
         // `--skills` takes a comma-separated list of glob patterns.
         if let Some(name) = skills
             .iter()
@@ -218,6 +273,20 @@ impl AgentAdapter for OmpAdapter {
             ));
         }
         Ok(())
+    }
+
+    fn remove_project_data(&self, project_id: &str) -> Result<(), String> {
+        let store = self.memory_store_dir(project_id).ok_or_else(|| {
+            format!("couldn't remove omp memory store: '{project_id}' is not a valid project id")
+        })?;
+        match std::fs::remove_dir_all(&store) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!(
+                "couldn't remove omp memory store {}: {err}",
+                store.display()
+            )),
+        }
     }
 
     fn start(&self, prompt: &str, cfg: &RoleConfig) -> Result<AgentHandle, AdapterError> {
@@ -237,6 +306,16 @@ impl AgentAdapter for OmpAdapter {
 // ---------------------------------------------------------------------------
 // Spawn pieces
 // ---------------------------------------------------------------------------
+
+/// A project id is safe to build a path from only when it is exactly one
+/// plain path component.
+fn valid_project_id(id: &str) -> bool {
+    let mut components = Path::new(id).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    )
+}
 
 /// Removes the overlay file when dropped. A failed removal is logged, not an
 /// error: the file holds no secrets.
@@ -304,8 +383,24 @@ fn approval_mode(cfg: &RoleConfig) -> &'static str {
 /// `always-ask` a user `allow` from the operator's or the repo's own
 /// settings would otherwise beat the mode, and a user `deny` can't be
 /// overridden.
-pub fn overlay(cfg: &RoleConfig) -> Value {
+///
+/// `memory_db` is the canonical `mnemopi.db` path of a `memory: true` role's
+/// store (#222); the other roles ignore it.
+pub fn overlay(cfg: &RoleConfig, memory_db: Option<&Path>) -> Value {
     let mut approval = json!({ REPORT_OUTCOME_TOOL_NAME: "allow" });
+    let memory_db = match cfg.isolation {
+        Isolation::Isolated { memory: true, .. } => {
+            Some(memory_db.expect("a memory role is spawned with its store path"))
+        }
+        _ => None,
+    };
+    if memory_db.is_some() {
+        // choco's own per-project store: allowing these loosens no
+        // operator or repo boundary.
+        for tool in MEMORY_TOOLS {
+            approval[tool] = json!("allow");
+        }
+    }
     if !cfg.sandboxed {
         for tool in ["bash", "edit", "write"] {
             approval[tool] = json!("deny");
@@ -339,6 +434,18 @@ pub fn overlay(cfg: &RoleConfig) -> Value {
         "async": { "enabled": false },
         "bash": { "autoBackground": { "enabled": false } },
     });
+    if let Some(db) = memory_db {
+        overlay["memory"] = json!({ "backend": "mnemopi" });
+        overlay["mnemopi"] = json!({
+            "dbPath": db.to_string_lossy(),
+            "bank": MEMORY_BANK,
+            "scoping": "global",
+            "noEmbeddings": true,
+            "llmMode": "none",
+            "autoRecall": true,
+            "autoRetain": true,
+        });
+    }
     for (key, value) in common.as_object().expect("an object") {
         overlay[key] = value.clone();
     }
@@ -379,9 +486,11 @@ fn append_block(rendered_files: &str, cfg: &RoleConfig) -> String {
 /// The tools omp may use: never `report_outcome` (omp exits 2 on it; it is a
 /// host tool), and minus the role's disallowed tools. `task`, `wait`,
 /// `eval`, `web_search`, `lsp` and `python` are deliberately absent.
-fn allowed_tools(disallowed: &[RoleTool]) -> Vec<&'static str> {
+fn allowed_tools(disallowed: &[RoleTool], memory: bool) -> Vec<&'static str> {
+    let memory_tools: &[&str] = if memory { &MEMORY_TOOLS } else { &[] };
     BASE_TOOLS
         .iter()
+        .chain(memory_tools)
         .copied()
         .filter(|tool| {
             !disallowed.iter().any(|role_tool| match role_tool {
@@ -425,7 +534,11 @@ pub fn build_args(
     if isolated {
         push(&["--no-rules"]);
     }
-    push(&["--tools", &allowed_tools(&cfg.disallowed_tools).join(",")]);
+    let memory = matches!(cfg.isolation, Isolation::Isolated { memory: true, .. });
+    push(&[
+        "--tools",
+        &allowed_tools(&cfg.disallowed_tools, memory).join(","),
+    ]);
     if let Isolation::Isolated { skills, .. } = &cfg.isolation {
         if skills.is_empty() {
             push(&["--no-skills"]);
@@ -757,6 +870,11 @@ struct DriverConfig {
     pid: Option<u32>,
     stage: StageReport,
     isolation: Value,
+    /// The role's name, for the errors of the memory check.
+    role: String,
+    /// The canonical `mnemopi.db` path of a `memory: true` role; the
+    /// session must prove omp opened it before any prompt is sent.
+    memory_db: Option<PathBuf>,
 }
 
 /// A prompt omp has finished, waiting for its statistics.
@@ -1058,6 +1176,9 @@ impl Driver {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(db) = self.config.memory_db.clone() {
+            self.check_memory_store(&db).await?;
+        }
         let omp_version = match version.await {
             Ok(version) => version,
             Err(err) => {
@@ -1085,6 +1206,47 @@ impl Driver {
             }
         };
         Ok(())
+    }
+
+    /// Proves omp's memory opened the store at `db` (#222). omp starts and
+    /// claims memory even when the store is unwritable, so the only proof is
+    /// the `/memory stats` command: it makes no model call. Sent directly,
+    /// not as a prompt of ours, so the stage prompt is still the session's
+    /// first prompt.
+    async fn check_memory_store(&mut self, db: &Path) -> Result<(), String> {
+        let role = self.config.role.clone();
+        let id = self.request_id("memory");
+        let frame = json!({ "id": id, "type": "prompt", "message": "/memory stats" });
+        if !self.send_frame(&frame).await {
+            return Err(memory_failure(&role, db, "stdin is closed"));
+        }
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let mut seen: Vec<Value> = Vec::new();
+        loop {
+            let frame = match tokio::time::timeout_at(deadline, self.frames.recv()).await {
+                Err(_) => return Err(memory_failure(&role, db, "/memory stats timed out")),
+                Ok(None) => {
+                    return Err(memory_failure(
+                        &role,
+                        db,
+                        "omp exited before answering /memory stats",
+                    ));
+                }
+                Ok(Some(frame)) => frame,
+            };
+            let ty = frame.get("type").and_then(Value::as_str);
+            let ours = ty == Some("response")
+                && frame.get("id").and_then(Value::as_str) == Some(id.as_str());
+            let model_turn = matches!(ty, Some("prompt_result" | "message_end"));
+            if ty != Some("command_output") && !ours && !model_turn {
+                tracing::debug!("omp: frame during the memory check: {frame}");
+                continue;
+            }
+            seen.push(frame);
+            if ours || model_turn {
+                return memory_stats_verdict(&seen, &id, db, &role);
+            }
+        }
     }
 
     // -- events -------------------------------------------------------------
@@ -1391,6 +1553,92 @@ impl Driver {
             self.send_event(event);
         }
     }
+}
+
+fn memory_failure(role: &str, db: &Path, reason: &str) -> String {
+    format!(
+        "role '{role}': omp's memory store {} didn't open: {reason}",
+        db.display()
+    )
+}
+
+/// Whether one `/memory stats` table row names the bank and database file
+/// choco expects: first cell exactly the bank, last cell (one pair of
+/// backticks trimmed) exactly the path.
+fn stats_row(line: &str, expected_db: &Path) -> Result<(), (String, String)> {
+    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
+    let cells: Vec<&str> = inner.split('|').map(str::trim).collect();
+    let first = cells.first().copied().unwrap_or("").to_string();
+    let last = cells.last().copied().unwrap_or("");
+    let last = last
+        .strip_prefix('`')
+        .and_then(|rest| rest.strip_suffix('`'))
+        .unwrap_or(last)
+        .to_string();
+    if cells.len() > 1 && first == MEMORY_BANK && Path::new(&last) == expected_db {
+        Ok(())
+    } else {
+        Err((first, last))
+    }
+}
+
+/// The verdict on a `/memory stats` check, from the frames seen between
+/// sending it (request `id`) and its response. The store counts as open
+/// only when a `command_output` table row names bank `choco` and exactly
+/// `expected_db`, and then our response says `success: true` with
+/// `agentInvoked: false`. Anything else, including a model turn, is an
+/// error that names the role and the path. Shared by the driver and the
+/// real-omp tests.
+pub fn memory_stats_verdict(
+    frames: &[Value],
+    id: &str,
+    expected_db: &Path,
+    role: &str,
+) -> Result<(), String> {
+    let fail = |reason: &str| Err(memory_failure(role, expected_db, reason));
+    let mut matched = false;
+    let mut near_misses: Vec<String> = Vec::new();
+    for frame in frames {
+        match frame.get("type").and_then(Value::as_str) {
+            Some("prompt_result" | "message_end") => {
+                return fail("omp started a model turn for /memory stats");
+            }
+            Some("command_output") => {
+                let text = frame.get("text").and_then(Value::as_str).unwrap_or("");
+                for line in text.lines().filter(|line| line.trim_start().starts_with('|')) {
+                    match stats_row(line, expected_db) {
+                        Ok(()) => matched = true,
+                        Err((bank, path)) => near_misses.push(format!("bank '{bank}' at '{path}'")),
+                    }
+                }
+            }
+            Some("response") if frame.get("id").and_then(Value::as_str) == Some(id) => {
+                if frame.get("success").and_then(Value::as_bool) != Some(true) {
+                    let error = frame
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("no error text");
+                    return fail(error);
+                }
+                if !matched {
+                    let saw = if near_misses.is_empty() {
+                        "no memory table".to_string()
+                    } else {
+                        near_misses.join(", ")
+                    };
+                    return fail(&format!(
+                        "/memory stats didn't show bank '{MEMORY_BANK}' at that path (saw {saw})"
+                    ));
+                }
+                if frame.pointer("/data/agentInvoked").and_then(Value::as_bool) != Some(false) {
+                    return fail("omp invoked the model for /memory stats");
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    fail("omp never answered /memory stats")
 }
 
 /// `data` of a successful response, or its error text.
