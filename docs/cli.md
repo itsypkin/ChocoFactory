@@ -731,15 +731,20 @@ Actions apply to the selected task (the open one, in the detail view):
   fallback, and with neither set `s` says so on the bottom line and points to
   `choco task send <id>`. The value runs through `/bin/sh -c`, so arguments
   work (`VISUAL="code -w"`). Saving text sends it (trailing whitespace
-  trimmed) and reports `sent to <id>`; an empty or whitespace-only file sends
+  trimmed) and reports `sent to <short id>` (the first 8 characters); an empty or whitespace-only file sends
   nothing and says so. The daemon decides which tasks take a message: its
   refusal is shown verbatim as `send failed: …` (also for a daemon that is
   down), and `send timed out: …` means the daemon may still have taken it. If
   the editor exits non-zero or is ended by a signal, nothing is sent. Whenever
-  the text is not sent the file is kept and its path is shown after the
-  message (`; your text is in <path>`); it is removed once the daemon accepts
-  the text or when it holds nothing. Quitting prints one stderr line for each
-  kept file, and for a send that had no answer yet.
+  the text is not sent the file is kept. The bottom line shows the cause
+  first and, when the line is too narrow, shortens the path to
+  `; kept: …/<file name>`; at about 100 columns or more it shows
+  `; your text is in <path>`. A cause that is cut on screen (a long daemon
+  refusal, the editor's exit status) is never lost: quitting prints, on stderr,
+  one line per kept file with its full path and a second line with the full
+  cause (`why it was not sent: …`), and one line for each send that had no
+  answer yet. The file is removed once the daemon accepts the text or when it
+  holds nothing.
 - `o` opens the PR with `open` (macOS) or `xdg-open`. Over SSH (`SSH_CONNECTION`
   or `SSH_TTY` set) it launches nothing and prints `PR #N: <url>` instead.
 
