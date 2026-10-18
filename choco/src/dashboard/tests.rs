@@ -5106,6 +5106,50 @@ case "$mode" in
 esac
 "#;
 
+/// A backend that never answers a cursor-position query, like a terminal
+/// that ignores `ESC[6n`.
+struct NoCursor(TestBackend);
+
+impl ratatui::backend::Backend for NoCursor {
+    type Error = std::io::Error;
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.0.draw(content).map_err(|e| match e {})
+    }
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.0.hide_cursor().map_err(|e| match e {})
+    }
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.0.show_cursor().map_err(|e| match e {})
+    }
+    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        Err(std::io::Error::other("the terminal did not answer"))
+    }
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> std::io::Result<()> {
+        self.0.set_cursor_position(position).map_err(|e| match e {})
+    }
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.0.clear().map_err(|e| match e {})
+    }
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        self.0.clear_region(clear_type).map_err(|e| match e {})
+    }
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        self.0.size().map_err(|e| match e {})
+    }
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        self.0.window_size().map_err(|e| match e {})
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush().map_err(|e| match e {})
+    }
+}
+
 struct Scenario {
     mode: &'static str,
     extra: String,
@@ -5256,7 +5300,7 @@ async fn scenario(name: &str, sc: Scenario) -> Outcome {
     let latest = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&latest);
     let shot = Arc::new(Mutex::new(String::new()));
-    let mut terminal = Terminal::new(TestBackend::new(320, 30)).unwrap();
+    let mut terminal = Terminal::new(NoCursor(TestBackend::new(320, 30))).unwrap();
     let driver = async {
         wait_for(&latest, "Fix the login").await;
         ktx.send(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
@@ -5696,4 +5740,95 @@ async fn quitting_with_a_send_in_flight_keeps_its_file_and_lists_it() {
         o.app.unanswered_sends,
         vec![("aaaa1111-0".to_string(), path)]
     );
+}
+
+#[tokio::test]
+async fn a_terminal_that_ignores_the_cursor_query_is_still_taken_back() {
+    // `scenario` draws to a backend whose cursor query always fails.
+    let o = scenario("nocursor", Scenario::new("text", Wait::Screen("sent to"))).await;
+    o.result.clone().unwrap();
+    assert_eq!(o.posts().len(), 1);
+}
+
+#[tokio::test]
+async fn the_message_file_is_created_new_and_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = EDITOR_LOCK.lock().await;
+    let planted = Scratch::new("planted");
+    let next = super::MESSAGE_FILES.load(Ordering::Relaxed);
+    let mut stale = Vec::new();
+    for n in next..next + 5 {
+        let p = planted.0.join(format!(
+            "choco-message-aaaa1111-{}-{n}.md",
+            std::process::id()
+        ));
+        std::fs::write(&p, "stale").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        stale.push(p);
+    }
+    drop(_serial);
+    let mut sc = Scenario::new("fail", Wait::Screen("exit status: 1"));
+    sc.message_dir = Some(planted.0.clone());
+    let o = scenario("fresh", sc).await;
+    let path = o.path();
+    assert!(!stale.contains(&path), "reused {path:?}");
+    for p in &stale {
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "stale");
+    }
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+fn not_sent_texts(app: &mut App, msg: Msg, w: u16) -> String {
+    update(app, msg);
+    let mut hay = render(app, w, 20);
+    for l in super::app::exit_report(app) {
+        hay.push('\n');
+        hay.push_str(&l);
+    }
+    hay
+}
+
+#[test]
+fn the_full_cause_and_path_stay_readable_when_nothing_is_sent() {
+    let refusal = "stage 'awaiting_human_review' needs exactly one /approve or /request-changes \
+        marker line: put /request-changes or /approve alone on its own line and send again";
+    assert!(refusal.chars().count() > 130);
+    let path = "/var/folders/zz/abcdefghijklmnopqrstuvwxyz0123456789abcdefghijkl/T/\
+        choco-message-aaaa1111-12345-7.md";
+    assert!(path.chars().count() > 95);
+    for w in [80u16, 120] {
+        let mut app = two_tasks();
+        let hay = not_sent_texts(
+            &mut app,
+            Msg::Sent {
+                id: "aaaa1111-0".into(),
+                path: path.into(),
+                result: Err(SendFailure::Failed(refusal.into())),
+            },
+            w,
+        );
+        assert!(hay.contains(refusal), "{w}: refusal\n{hay}");
+        assert!(hay.contains(path), "{w}: path\n{hay}");
+
+        let mut app = two_tasks();
+        let hay = not_sent_texts(
+            &mut app,
+            Msg::Edited {
+                id: "aaaa1111-0".into(),
+                path: path.into(),
+                outcome: EditOutcome::Exited {
+                    status: status(1 << 8),
+                    content: Ok("hello\n".into()),
+                    exists: true,
+                },
+            },
+            w,
+        );
+        assert!(
+            hay.contains("nothing sent: the editor exited with exit status: 1"),
+            "{w}: status\n{hay}"
+        );
+        assert!(hay.contains(path), "{w}: path\n{hay}");
+    }
 }

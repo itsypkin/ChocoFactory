@@ -144,11 +144,17 @@ pub(crate) fn resolve_editor(visual: Option<&str>, editor: Option<&str>) -> Opti
 /// kept, then sends that got no answer.
 pub(crate) fn exit_report(app: &App) -> Vec<String> {
     let short = |id: &str| id.chars().take(8).collect::<String>();
-    let mut lines: Vec<String> = app
-        .kept_messages
-        .iter()
-        .map(|(id, path)| format!("unsent message for task {}: {}", short(id), path.display()))
-        .collect();
+    let mut lines: Vec<String> = Vec::new();
+    for (id, path) in &app.kept_messages {
+        lines.push(format!(
+            "unsent message for task {}: {}",
+            short(id),
+            path.display()
+        ));
+        for (_, cause) in app.kept_causes.iter().filter(|(p, _)| p == path) {
+            lines.push(format!("  why it was not sent: {cause}"));
+        }
+    }
     lines.extend(app.unanswered_sends.iter().map(|(id, path)| {
         format!(
             "message for task {} got no answer before exit (it may have been delivered): {}",
@@ -370,6 +376,9 @@ pub struct App {
     pub editor: Option<String>,
     /// Message files kept on disk: (full task id, path).
     pub kept_messages: Vec<(String, PathBuf)>,
+    /// Why each kept file was not sent, in full (the status line may cut it):
+    /// (path, cause). Printed by `exit_report`.
+    pub kept_causes: Vec<(PathBuf, String)>,
     /// Sends with no answer yet: (full task id, path).
     pub unanswered_sends: Vec<(String, PathBuf)>,
 
@@ -422,6 +431,7 @@ impl App {
                 std::env::var("EDITOR").ok().as_deref(),
             ),
             kept_messages: Vec::new(),
+            kept_causes: Vec::new(),
             unanswered_sends: Vec::new(),
             active: Vec::new(),
             closed: Vec::new(),
@@ -927,7 +937,8 @@ fn compose(app: &mut App) -> Vec<Effect> {
 /// Records a kept message file and shows its path after `text`.
 fn keep(app: &mut App, id: String, path: PathBuf, text: String) {
     let tail = format!("; your text is in {}", path.display());
-    app.set_status_with_tail(text, tail, Level::Error);
+    app.set_status_with_tail(text.clone(), tail, Level::Error);
+    app.kept_causes.push((path.clone(), text));
     app.kept_messages.push((id, path));
 }
 

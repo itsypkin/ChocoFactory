@@ -621,22 +621,33 @@ async fn compose<B: Backend>(
     use std::os::unix::fs::OpenOptionsExt;
 
     let short: String = id.chars().take(8).collect();
-    let n = MESSAGE_FILES.fetch_add(1, Ordering::Relaxed);
-    let path = config.message_dir.join(format!(
-        "choco-message-{short}-{}-{n}.md",
-        std::process::id()
-    ));
-    let created = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path);
-    if let Err(e) = created {
-        return Ok(Msg::Edited {
-            id,
-            path,
-            outcome: EditOutcome::CreateFailed(e.to_string()),
-        });
+    // A name already taken (a stale kept file, a planted file) is skipped,
+    // never reused: `create_new` fails on it and the next number is tried.
+    let mut path;
+    let mut attempts = 0;
+    loop {
+        let n = MESSAGE_FILES.fetch_add(1, Ordering::Relaxed);
+        path = config.message_dir.join(format!(
+            "choco-message-{short}-{}-{n}.md",
+            std::process::id()
+        ));
+        attempts += 1;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 100 => {}
+            Err(e) => {
+                return Ok(Msg::Edited {
+                    id,
+                    path,
+                    outcome: EditOutcome::CreateFailed(e.to_string()),
+                });
+            }
+        }
     }
     let mut back_err: Option<String> = None;
 
@@ -658,7 +669,12 @@ async fn compose<B: Backend>(
     if let Err(e) = handover.resume() {
         back_err.get_or_insert(e.to_string());
     }
-    if let Err(e) = terminal.clear() {
+    // Clear and redraw everything without `Terminal::clear`, which asks the
+    // terminal for the cursor position and fails when it does not answer.
+    let cleared = terminal
+        .size()
+        .and_then(|size| terminal.resize(ratatui::layout::Rect::from(size)));
+    if let Err(e) = cleared {
         back_err.get_or_insert(e.to_string());
     }
     if let Some(e) = back_err {
