@@ -1889,6 +1889,23 @@ fn a_home_relative_path_is_expanded_against_the_home_omp_ran_with() {
     assert!(verdict("~/.config/choco/omp/memory/P/mnemopi.db", None).is_err());
 }
 
+#[test]
+fn a_home_that_is_a_symlink_is_matched_through_its_canonical_path() {
+    let tmp = tempdir("symlink");
+    let real = std::fs::canonicalize(&tmp).unwrap();
+    let link = real.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let db = real.join("x/mnemopi.db");
+    let frames = vec![
+        json!({"type": "command_output", "text": "| choco | `~/x/mnemopi.db` |\n"}),
+        json!({"type": "response", "id": "m-1", "success": true,
+               "data": {"agentInvoked": false}}),
+    ];
+    assert!(memory_stats_verdict(&frames, "m-1", &db, "coder", Some(&link)).is_ok());
+    let other = real.join("y/mnemopi.db");
+    assert!(memory_stats_verdict(&frames, "m-1", &other, "coder", Some(&link)).is_err());
+}
+
 #[tokio::test]
 async fn a_memory_store_that_did_not_open_fails_the_turn_before_the_stage_prompt() {
     for resume in [false, true] {
