@@ -89,9 +89,18 @@ pub struct OmpAdapter {
     state_dir: PathBuf,
     /// How long a memory role's `/memory stats` check may take.
     memory_check_timeout: Duration,
+    /// The `HOME` the omp child sees: omp prints a path under it as `~/…`.
+    home: Option<PathBuf>,
 }
 
 impl OmpAdapter {
+    /// Overrides the `HOME` the memory check expands `~/` against (tests
+    /// whose fake omp runs under another `HOME`).
+    pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.home = Some(home.into());
+        self
+    }
+
     /// Overrides the memory check's deadline (tests use a short one).
     pub fn with_memory_check_timeout(mut self, timeout: Duration) -> Self {
         self.memory_check_timeout = timeout;
@@ -108,6 +117,7 @@ impl OmpAdapter {
             binary: binary.into(),
             state_dir: state_dir.into(),
             memory_check_timeout: REQUEST_TIMEOUT,
+            home: std::env::var_os("HOME").map(PathBuf::from),
         }
     }
 
@@ -256,6 +266,7 @@ impl OmpAdapter {
                 role: cfg.role.clone(),
                 memory_db,
                 memory_check_timeout: self.memory_check_timeout,
+                home: self.home.clone(),
                 startup_guard,
             },
         );
@@ -889,6 +900,8 @@ struct DriverConfig {
     /// session must prove omp opened it before any prompt is sent.
     memory_db: Option<PathBuf>,
     memory_check_timeout: Duration,
+    /// The `HOME` omp runs with, to read a `~/` path in `/memory stats`.
+    home: Option<PathBuf>,
     /// The per-store startup lock; released once the check has ended.
     startup_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -1311,7 +1324,7 @@ impl Driver {
             }
             seen.push(frame);
             if ours || model_turn {
-                return memory_stats_verdict(&seen, &id, db, &role);
+                return memory_stats_verdict(&seen, &id, db, &role, self.config.home.as_deref());
             }
         }
     }
@@ -1632,7 +1645,7 @@ fn memory_failure(role: &str, db: &Path, reason: &str) -> String {
 /// Whether one `/memory stats` table row names the bank and database file
 /// choco expects: first cell exactly the bank, last cell (one pair of
 /// backticks trimmed) exactly the path.
-fn stats_row(line: &str, expected_db: &Path) -> Result<(), (String, String)> {
+fn stats_row(line: &str, expected_db: &Path, home: Option<&Path>) -> Result<(), (String, String)> {
     let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
     let cells: Vec<&str> = inner.split('|').map(str::trim).collect();
     let first = cells.first().copied().unwrap_or("").to_string();
@@ -1642,11 +1655,25 @@ fn stats_row(line: &str, expected_db: &Path) -> Result<(), (String, String)> {
         .and_then(|rest| rest.strip_suffix('`'))
         .unwrap_or(last)
         .to_string();
-    if cells.len() > 1 && first == MEMORY_BANK && Path::new(&last) == expected_db {
+    if cells.len() > 1 && first == MEMORY_BANK && same_db_path(&last, expected_db, home) {
         Ok(())
     } else {
         Err((first, last))
     }
+}
+
+/// Whether the printed Database cell names `expected_db`. omp prints a path
+/// under its `HOME` as `~/…`, so that form is expanded against `home` (and
+/// its canonical form, for a symlinked `HOME`); a `~/` path that expands
+/// anywhere else does not match.
+fn same_db_path(printed: &str, expected_db: &Path, home: Option<&Path>) -> bool {
+    if let Some(rest) = printed.strip_prefix("~/") {
+        let Some(home) = home else { return false };
+        let canonical = std::fs::canonicalize(home).ok();
+        return home.join(rest) == expected_db
+            || canonical.is_some_and(|home| home.join(rest) == expected_db);
+    }
+    Path::new(printed) == expected_db
 }
 
 /// The verdict on a `/memory stats` check, from the frames seen between
@@ -1661,6 +1688,7 @@ pub fn memory_stats_verdict(
     id: &str,
     expected_db: &Path,
     role: &str,
+    home: Option<&Path>,
 ) -> Result<(), String> {
     let fail = |reason: &str| Err(memory_failure(role, expected_db, reason));
     let mut matched = false;
@@ -1676,7 +1704,7 @@ pub fn memory_stats_verdict(
                     .lines()
                     .filter(|line| line.trim_start().starts_with('|'))
                 {
-                    match stats_row(line, expected_db) {
+                    match stats_row(line, expected_db, home) {
                         Ok(()) => matched = true,
                         // The header and separator rows are not banks.
                         Err((bank, _))

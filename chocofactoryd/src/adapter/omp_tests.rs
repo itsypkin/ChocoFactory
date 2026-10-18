@@ -1772,11 +1772,23 @@ async fn the_store_is_keyed_by_project_not_by_cwd() {
 /// Events after a start (or resume) that fails: everything until the stream
 /// ends, which only happens once the process has been killed.
 async fn failed_session(env: &Env, stats: &str, resume: bool) -> (Vec<AgentEvent>, String) {
+    failed_session_with(env, stats, resume, true).await
+}
+
+/// As `failed_session`; `drain_all` false stops at the first turn's end.
+async fn failed_session_with(
+    env: &Env,
+    stats: &str,
+    resume: bool,
+    drain_all: bool,
+) -> (Vec<AgentEvent>, String) {
     let log = env
         .dir
         .join(format!("prompts-{}.log", uuid::Uuid::new_v4()));
+    let home = std::fs::canonicalize(&env.dir).unwrap();
     let adapter = env
         .adapter(&[
+            ("HOME", &home.to_string_lossy()),
             ("FAKE_OMP_MODES", "noreport"),
             ("FAKE_OMP_MEMORY_STATS", stats),
             ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
@@ -1785,6 +1797,7 @@ async fn failed_session(env: &Env, stats: &str, resume: bool) -> (Vec<AgentEvent
                 &env.dir.join("launch.log").to_string_lossy(),
             ),
         ])
+        .with_home(&home)
         .with_memory_check_timeout(Duration::from_secs(if stats == "hang" { 2 } else { 60 }));
     let cfg = env.memory_cfg("P");
     let mut handle = if resume {
@@ -1792,7 +1805,13 @@ async fn failed_session(env: &Env, stats: &str, resume: bool) -> (Vec<AgentEvent
     } else {
         adapter.start("do the work", &cfg).unwrap()
     };
-    let events = drain(&mut handle).await;
+    let events = if drain_all {
+        drain(&mut handle).await
+    } else {
+        let events = until_turn_completed(&mut handle).await;
+        drain(&mut handle).await;
+        events
+    };
     (events, std::fs::read_to_string(&log).unwrap_or_default())
 }
 
@@ -1834,12 +1853,51 @@ async fn a_healthy_memory_check_runs_before_the_stage_prompt_without_follow_up()
 }
 
 #[tokio::test]
+async fn a_store_omp_prints_as_home_relative_passes_the_check() {
+    // Production keeps the store under $HOME, where real omp prints `~/…`.
+    for resume in [false, true] {
+        let env = Env::new();
+        let (events, log) = failed_session_with(&env, "home_relative", resume, false).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. })),
+            "resume={resume}: {events:?}"
+        );
+        assert!(log.contains("do the work"), "resume={resume}: {log}");
+    }
+}
+
+#[test]
+fn a_home_relative_path_is_expanded_against_the_home_omp_ran_with() {
+    let db = Path::new("/h/.config/choco/omp/memory/P/mnemopi.db");
+    let frames = |path: &str| {
+        vec![
+            json!({"type": "command_output", "text": format!("| choco | `{path}` |\n")}),
+            json!({"type": "response", "id": "m-1", "success": true,
+                   "data": {"agentInvoked": false}}),
+        ]
+    };
+    let verdict = |path: &str, home: Option<&str>| {
+        memory_stats_verdict(&frames(path), "m-1", db, "coder", home.map(Path::new))
+    };
+    assert!(verdict("~/.config/choco/omp/memory/P/mnemopi.db", Some("/h")).is_ok());
+    assert!(verdict("~/.config/choco/omp/memory/Q/mnemopi.db", Some("/h")).is_err());
+    assert!(verdict("~/.omp/agent/memories/mnemopi/mnemopi.db", Some("/h")).is_err());
+    // A `~/` path that expands somewhere else, or with no known HOME.
+    assert!(verdict("~/.config/choco/omp/memory/P/mnemopi.db", Some("/other")).is_err());
+    assert!(verdict("~/.config/choco/omp/memory/P/mnemopi.db", None).is_err());
+}
+
+#[tokio::test]
 async fn a_memory_store_that_did_not_open_fails_the_turn_before_the_stage_prompt() {
     for resume in [false, true] {
         for stats in [
             "error",
             "other_path",
             "other_bank",
+            "home_relative_other",
+            "home_relative_default",
             "no_output",
             "agent",
             "exit",
@@ -1924,7 +1982,7 @@ fn the_memory_verdict_needs_the_row_then_the_response_and_no_model_turn() {
         json!({"type": "response", "id": "m-1", "command": "prompt",
                "success": true, "data": {"agentInvoked": agent}})
     };
-    let verdict = |frames: &[Value]| memory_stats_verdict(frames, "m-1", db, "coder");
+    let verdict = |frames: &[Value]| memory_stats_verdict(frames, "m-1", db, "coder", None);
     assert!(
         verdict(&[
             output("choco", "/state/memory/P/mnemopi.db"),
@@ -2323,8 +2381,16 @@ async fn next_frame(lines: &mut BufReader<ChildStdout>) -> Value {
 /// role of project `P`, runs the same protocol-v2 negotiation the driver
 /// runs, then `/memory stats` (no model call), and returns the verdict and
 /// the stats table text.
-async fn real_memory_stats(env: &Env, cfg: &RoleConfig, db: &Path) -> (Result<(), String>, String) {
+async fn real_memory_stats(
+    env: &Env,
+    cfg: &RoleConfig,
+    db: &Path,
+    home: Option<&Path>,
+) -> (Result<(), String>, String) {
     let (mut command, overlay_path) = real_command("omp", &env.state, cfg, Some(db));
+    if let Some(home) = home {
+        command.env("HOME", home);
+    }
     let mut child = command.spawn().expect("omp must be on PATH");
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap());
@@ -2390,7 +2456,10 @@ async fn real_memory_stats(env: &Env, cfg: &RoleConfig, db: &Path) -> (Result<()
         .filter_map(|f| f["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    (memory_stats_verdict(&seen, "memory-1", db, &cfg.role), text)
+    (
+        memory_stats_verdict(&seen, "memory-1", db, &cfg.role, home),
+        text,
+    )
 }
 
 /// No model call. The real omp, under the adapter's own flags and overlay
@@ -2406,7 +2475,7 @@ async fn omp_opens_the_memory_store_without_touching_the_operators_state() {
     let before = omp_home_state().await;
     let adapter = OmpAdapter::with_binary("omp", &env.state);
     let db = adapter.prepare_memory_store(&cfg).unwrap();
-    let (verdict, text) = real_memory_stats(&env, &cfg, &db).await;
+    let (verdict, text) = real_memory_stats(&env, &cfg, &db, None).await;
     println!("{text}");
     verdict.unwrap();
     assert!(
@@ -2415,6 +2484,36 @@ async fn omp_opens_the_memory_store_without_touching_the_operators_state() {
         db.display()
     );
     assert_eq!(omp_home_state().await, before);
+}
+
+/// No model call. The store sits under the `HOME` omp runs with (a temp
+/// one, so the operator's `~/.omp` is untouched), as production keeps it;
+/// real omp prints that path as `~/…` and the check must still pass.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_opens_a_memory_store_under_its_home -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn omp_opens_a_memory_store_under_its_home() {
+    let env = Env::new();
+    let home = std::fs::canonicalize(&env.dir).unwrap();
+    let state = home.join(".config/chocofactory/omp");
+    let cfg = env.memory_cfg("P");
+    let adapter = OmpAdapter::with_binary("omp", &state);
+    let db = adapter.prepare_memory_store(&cfg).unwrap();
+    assert!(db.starts_with(&home));
+    let env = Env {
+        dir: env.dir.clone(),
+        state,
+        repo: env.repo.clone(),
+    };
+    let (verdict, text) = real_memory_stats(&env, &cfg, &db, Some(&home)).await;
+    println!("{text}");
+    verdict.unwrap();
+    assert!(
+        db.exists(),
+        "mnemopi.db was not created at {}",
+        db.display()
+    );
 }
 
 /// No model call. With the store folder unwritable, omp still starts and
@@ -2430,7 +2529,7 @@ async fn omp_with_an_unwritable_memory_store_fails_the_check() {
     let db = adapter.prepare_memory_store(&cfg).unwrap();
     let store = db.parent().unwrap().to_path_buf();
     std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let (verdict, _) = real_memory_stats(&env, &cfg, &db).await;
+    let (verdict, _) = real_memory_stats(&env, &cfg, &db, None).await;
     std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
     let err = verdict.unwrap_err();
     println!("{err}");
@@ -2471,7 +2570,7 @@ async fn omp_retains_a_fact_in_the_project_store() {
     drain(&mut handle).await;
 
     let db = adapter.prepare_memory_store(&cfg).unwrap();
-    let (verdict, text) = real_memory_stats(&env, &cfg, &db).await;
+    let (verdict, text) = real_memory_stats(&env, &cfg, &db, None).await;
     println!("{text}");
     verdict.unwrap();
     let working: u64 = text

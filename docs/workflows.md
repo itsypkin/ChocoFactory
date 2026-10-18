@@ -293,19 +293,21 @@ runs on either, but the two never share:
   and facts stored with `retain`, found by word matching at session start or
   with `recall`.
 - **Where and how long.** omp: `~/.config/chocofactory/omp/memory/<project-id>/`
-  (the id is shown by `choco project list`), kept until the project is
-  deleted. To clear it by hand, delete that folder while no omp turn of the
-  project runs.
+  (the id is shown by `choco project list`), kept until you delete
+  the folder by hand. Choco removes it when its project is deleted, but
+  `DELETE /projects/{id}` refuses a project that has any task and tasks are
+  never deleted, so in practice it stays. Delete the folder while no omp turn
+  of the project runs.
 - **Scope.** Claude: per repo. omp: per choco project, so two projects on one
   repo don't share.
 - **Failure.** If omp can't open the store at startup, the turn fails naming
   the role and the store path. The check can't see every way memory can
   fail: a memory tool reporting "not initialised" means memory is off for
-  that turn, so retry it.
+  that turn, so run `choco task retry`.
 - **Parallel turns.** Memory roles of one project start one at a time, so
   two started together don't open the store together. Two omp sessions that
   did open it together were seen to leave one with a memory tool reporting
-  "not initialised"; if you see that, retry the turn.
+  "not initialised"; if you see that, run `choco task retry`.
 
 None of `skills`, `memory` or `inherit_operator_config` can be set from task config (`--config`, `--role-*`) or the global
 config file: only a workflow definition can loosen what its agents see. The

@@ -77,6 +77,9 @@ wrapper script, never through the test process's own environment):
   file's `dbPath:` and `bank:` lines.
   healthy (default)  a `command_output` table row, then `agentInvoked: false`
   error       the response is `success: false`, `EACCES: permission denied`
+  home_relative        the row shows the path as `~/…` against this HOME
+  home_relative_other  the same for another project's store
+  home_relative_default  the same for omp's default `~/.omp/…` store
   other_path  the row names `/elsewhere/mnemopi.db`
   other_bank  the row names bank `choco-1a2b`
   no_output   the response only
@@ -353,6 +356,14 @@ def memory_stats(request):
     if mode != "no_output":
         if mode == "other_path":
             db = "/elsewhere/mnemopi.db"
+        if mode in ("home_relative", "home_relative_other", "home_relative_default"):
+            home = os.environ.get("HOME", "")
+            if mode == "home_relative_other":
+                db = db.replace("/memory/", "/memory/other-", 1)
+            if mode == "home_relative_default":
+                db = os.path.join(home, ".omp/agent/memories/mnemopi/mnemopi.db")
+            if home and db.startswith(home.rstrip("/") + "/"):
+                db = "~/" + db[len(home.rstrip("/")) + 1:]
         if mode == "other_bank":
             bank = "choco-1a2b"
         emit({"type": "command_output",
