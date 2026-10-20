@@ -302,12 +302,14 @@ runs on either, but the two never share:
   repo don't share.
 - **Failure.** If omp can't open the store at startup, the turn fails naming
   the role and the store path. The check can't see every way memory can
-  fail: a memory tool reporting "not initialised" means memory is off for
-  that turn, so run `choco task retry`.
+  fail: a memory tool reporting "not initialised" means the turn ran without
+  memory. If that matters,
+  `choco task retry` re-runs the stage once the task is stuck.
 - **Parallel turns.** Memory roles of one project start one at a time, so
   two started together don't open the store together. Two omp sessions that
   did open it together were seen to leave one with a memory tool reporting
-  "not initialised"; if you see that, run `choco task retry`.
+  "not initialised"; if you see that, the turn ran without memory. If that matters,
+  `choco task retry` re-runs the stage once the task is stuck.
 
 None of `skills`, `memory` or `inherit_operator_config` can be set from task config (`--config`, `--role-*`) or the global
 config file: only a workflow definition can loosen what its agents see. The

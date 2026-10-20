@@ -132,7 +132,8 @@ roles:
   the memory makes no model calls of its own. If omp can't open the
   store at startup, the turn fails naming the role and the store path. That
   check can't see every way memory can fail: a memory tool reporting "not
-  initialised" means memory is off for that turn, so run `choco task retry`.
+  initialised" means the turn ran without memory; if that matters,
+  `choco task retry` re-runs the stage once the task is stuck.
   Memory roles of one project start one at a time so two starts don't open
   the store together. [What differs from claude](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#what-an-agent-inherits-from-your-claude-setup).
   A skill name containing `,` `*` `?` `[` `]` `{` or `}` is rejected, with the

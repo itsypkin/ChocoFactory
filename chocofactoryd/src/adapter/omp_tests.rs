@@ -1852,6 +1852,43 @@ async fn a_healthy_memory_check_runs_before_the_stage_prompt_without_follow_up()
     }
 }
 
+/// The production adapter (no `with_home`) expands `~/` against the `HOME`
+/// its omp children inherit. The store sits under the real `HOME`, which the
+/// fake inherits too.
+#[tokio::test]
+async fn the_default_adapter_expands_home_relative_paths_against_its_own_home() {
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    assert_eq!(
+        std::fs::canonicalize(&home).unwrap(),
+        home,
+        "this test needs a HOME without symlinks"
+    );
+    let mut env = Env::new();
+    let under_home = home.join(format!(".choco-home-test-{}", uuid::Uuid::new_v4()));
+    env.state = under_home.join("state");
+    let log = env.dir.join("prompts.log");
+    let adapter = env.adapter(&[
+        ("FAKE_OMP_MODES", "noreport"),
+        ("FAKE_OMP_MEMORY_STATS", "home_relative"),
+        ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
+    ]);
+    let mut handle = adapter.start("do the work", &env.memory_cfg("P")).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    let _ = std::fs::remove_dir_all(&under_home);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("do the work")
+    );
+}
+
 #[tokio::test]
 async fn a_store_omp_prints_as_home_relative_passes_the_check() {
     // Production keeps the store under $HOME, where real omp prints `~/…`.
