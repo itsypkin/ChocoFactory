@@ -684,6 +684,7 @@ Below 40×10 it only says the terminal is too small. `NO_COLOR` turns colour off
 | `o` | open the task's pull request |
 | `r` | retry a `stuck` task (on a pausing or paused one it says to press `p`) |
 | `p` | pause an `open` task (graceful only; there is no `--now` here), or resume a `pausing` or `paused` one |
+| `s` | reply to the task: write a message in `$VISUAL` / `$EDITOR` and send it (see below) |
 | `c` | cancel an `open`, `pausing`, `paused` or `stuck` task |
 | `/` | search every task by PR number, title or id (from the list or the detail view) |
 | `?` | list the keys |
@@ -723,6 +724,27 @@ Actions apply to the selected task (the open one, in the detail view):
   keeps the work (`--keep` is `choco task cancel` only).
 - Any key but `y` closes the question and sends nothing. A daemon error is shown
   verbatim on the bottom line, and a success refreshes the list at once.
+- `s` writes a reply in your editor and sends it, like `choco task send`.
+  The dashboard hands the terminal to the editor (the screen is redrawn when it
+  exits) on a new empty file named `choco-message-<first 8 characters of the id>-<pid>-<n>.md` in the
+  temp directory. The editor is `$VISUAL`, else `$EDITOR`; there is no `vi`
+  fallback, and with neither set `s` says so on the bottom line and points to
+  `choco task send <id>`. The value runs through `/bin/sh -c`, so arguments
+  work (`VISUAL="code -w"`). Saving text sends it (trailing whitespace
+  trimmed) and reports `sent to <short id>` (the first 8 characters); an empty or whitespace-only file sends
+  nothing and says so. The daemon decides which tasks take a message: its
+  refusal is shown verbatim as `send failed: …` (also for a daemon that is
+  down), and `send timed out: …` means the daemon may still have taken it. If
+  the editor exits non-zero or is ended by a signal, nothing is sent. Whenever
+  the text is not sent the file is kept. The bottom line shows the cause
+  first and, when the line is too narrow, shortens the path to
+  `; kept: …/<file name>`; at about 100 columns or more it shows
+  `; your text is in <path>`. A cause that is cut on screen (a long daemon
+  refusal, the editor's exit status) is never lost: quitting prints, on stderr,
+  one line per kept file with its full path and a second line with the full
+  cause (`why it was not sent: …`), and one line for each send that had no
+  answer yet. The file is removed once the daemon accepts the text or when it
+  holds nothing.
 - `o` opens the PR with `open` (macOS) or `xdg-open`. Over SSH (`SSH_CONNECTION`
   or `SSH_TTY` set) it launches nothing and prints `PR #N: <url>` instead.
 

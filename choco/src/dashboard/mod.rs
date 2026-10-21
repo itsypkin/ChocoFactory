@@ -8,9 +8,12 @@ pub mod app;
 pub mod search;
 pub mod view;
 
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use chocofactory_core::models::RetryMode;
@@ -30,7 +33,10 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::cli::DashboardArgs;
 use crate::client::Client;
-use app::{ActionKind, ActionOk, App, Effect, ListResult, Msg, Scope, SocketMsg, update};
+use app::{
+    ActionKind, ActionOk, App, EditOutcome, Effect, ListResult, Msg, Scope, SendFailure, SocketMsg,
+    exit_report, update, worth_keeping,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -53,6 +59,10 @@ pub struct LoopConfig {
     /// Tripped by the panic hook when any thread or task panics, so the loop
     /// stops instead of drawing on a terminal the hook already restored.
     pub panicked: Arc<PanicSignal>,
+    /// The shell that runs the editor: `<shell> -c '<editor> "$@"' …`.
+    pub shell: PathBuf,
+    /// Where message files for `s` are made.
+    pub message_dir: PathBuf,
 }
 
 /// Set once from the panic hook; the loop watches it.
@@ -114,6 +124,8 @@ pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
         timeout: REQUEST_TIMEOUT,
         poll_timeout: poll_timeout_for(args.interval.duration),
         panicked: Arc::new(PanicSignal::default()),
+        shell: PathBuf::from("/bin/sh"),
+        message_dir: std::env::temp_dir(),
     };
 
     let mut terminal = match enter_terminal() {
@@ -124,18 +136,24 @@ pub async fn run(base_url: String, args: DashboardArgs) -> ExitCode {
         }
     };
     let hook = install_panic_hook(Arc::clone(&config.panicked));
-    let mut keys = spawn_key_reader();
+    let (mut keys, reader) = spawn_key_reader(CrosstermSource);
+    let mut handover = TerminalHandover { reader };
     let result = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut keys,
+        &mut handover,
         &mut |_| {},
     )
     .await;
     restore_terminal();
     restore_panic_hook(hook);
+    // Message files that were kept or may be in flight, on the normal screen.
+    for line in exit_report(&app) {
+        eprintln!("{line}");
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -218,18 +236,227 @@ fn restore_panic_hook(prev: PanicHook) {
     std::panic::set_hook(Box::new(move |info| prev(info)));
 }
 
-fn spawn_key_reader() -> mpsc::UnboundedReceiver<KeyEvent> {
+/// Where terminal events come from; a test can inject a fake.
+pub trait KeySource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<TermEvent>;
+}
+
+/// The real terminal.
+pub struct CrosstermSource;
+
+impl KeySource for CrosstermSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+    fn read(&mut self) -> io::Result<TermEvent> {
+        event::read()
+    }
+}
+
+#[derive(Default)]
+struct ReaderState {
+    pause_requested: bool,
+    parked: bool,
+    exited: bool,
+}
+
+/// Pauses and resumes the key-reading thread. Even `poll` reads bytes from
+/// the tty, so a paused reader makes neither call.
+#[derive(Clone, Default)]
+pub struct ReaderControl(Arc<(Mutex<ReaderState>, Condvar)>);
+
+fn lock_reader(m: &Mutex<ReaderState>) -> std::sync::MutexGuard<'_, ReaderState> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl ReaderControl {
+    /// Returns once the reader has stopped touching the terminal, or has
+    /// exited (a dead reader reads nothing, so this never waits on it).
+    pub fn pause(&self) {
+        let (m, cv) = &*self.0;
+        let mut st = lock_reader(m);
+        st.pause_requested = true;
+        cv.notify_all();
+        while !st.parked && !st.exited {
+            st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Lets a paused reader go on. Does nothing when no pause is in effect.
+    pub fn resume(&self) {
+        let (m, cv) = &*self.0;
+        let mut st = lock_reader(m);
+        st.pause_requested = false;
+        st.parked = false;
+        cv.notify_all();
+    }
+
+    /// Parks while a pause is requested. `false` once the reader has exited.
+    fn gate(&self) -> bool {
+        let (m, cv) = &*self.0;
+        let mut st = lock_reader(m);
+        while st.pause_requested && !st.exited {
+            st.parked = true;
+            cv.notify_all();
+            st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        !st.exited
+    }
+
+    fn mark_exited(&self) {
+        let (m, cv) = &*self.0;
+        lock_reader(m).exited = true;
+        cv.notify_all();
+    }
+}
+
+pub fn spawn_key_reader(
+    mut source: impl KeySource + Send + 'static,
+) -> (mpsc::UnboundedReceiver<KeyEvent>, ReaderControl) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let control = ReaderControl::default();
+    let thread_control = control.clone();
     std::thread::spawn(move || {
-        while let Ok(ev) = event::read() {
-            if let TermEvent::Key(key) = ev
-                && tx.send(key).is_err()
-            {
+        let c = thread_control;
+        loop {
+            if !c.gate() {
                 break;
             }
+            match source.poll(Duration::from_millis(50)) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(_) => break,
+            }
+            if !c.gate() {
+                break;
+            }
+            match source.read() {
+                Ok(TermEvent::Key(key)) => {
+                    if tx.send(key).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
         }
+        c.mark_exited();
     });
-    rx
+    (rx, control)
+}
+
+/// Gives the terminal to the editor and takes it back.
+pub trait Handover {
+    fn suspend(&mut self) -> io::Result<()>;
+    fn resume(&mut self) -> io::Result<()>;
+}
+
+struct TerminalHandover {
+    reader: ReaderControl,
+}
+
+impl Handover for TerminalHandover {
+    fn suspend(&mut self) -> io::Result<()> {
+        self.reader.pause();
+        disable_raw_mode()?;
+        execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            ratatui::crossterm::cursor::Show
+        )
+    }
+
+    fn resume(&mut self) -> io::Result<()> {
+        let screen = execute!(io::stdout(), EnterAlternateScreen);
+        let raw = enable_raw_mode();
+        self.reader.resume();
+        screen.and(raw)
+    }
+}
+
+// ---- ignoring Ctrl-C while the editor runs -------------------------------
+
+struct SigState {
+    count: usize,
+    saved: Option<[libc::sigaction; 2]>,
+}
+
+static SIGNALS: Mutex<SigState> = Mutex::new(SigState {
+    count: 0,
+    saved: None,
+});
+
+const GUARDED: [libc::c_int; 2] = [libc::SIGINT, libc::SIGQUIT];
+
+/// While held, this process ignores SIGINT and SIGQUIT (the editor, in the
+/// same foreground group, gets them). Process-wide and counted: the last
+/// release restores what the first acquire saw.
+struct SigintIgnore {
+    released: bool,
+}
+
+impl SigintIgnore {
+    fn acquire() -> io::Result<Self> {
+        let mut st = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        if st.count == 0 {
+            // SAFETY: plain sigaction calls on zeroed, fully set structs.
+            unsafe {
+                let mut saved: [libc::sigaction; 2] = std::mem::zeroed();
+                let mut ignore: libc::sigaction = std::mem::zeroed();
+                ignore.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&mut ignore.sa_mask);
+                for (i, sig) in GUARDED.iter().enumerate() {
+                    if libc::sigaction(*sig, &ignore, &mut saved[i]) != 0 {
+                        let err = io::Error::last_os_error();
+                        for j in 0..i {
+                            libc::sigaction(GUARDED[j], &saved[j], std::ptr::null_mut());
+                        }
+                        return Err(err);
+                    }
+                }
+                st.saved = Some(saved);
+            }
+        }
+        st.count += 1;
+        Ok(SigintIgnore { released: false })
+    }
+
+    fn release(mut self) -> io::Result<()> {
+        self.release_inner()
+    }
+
+    fn release_inner(&mut self) -> io::Result<()> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        let mut st = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+        st.count -= 1;
+        if st.count > 0 {
+            return Ok(());
+        }
+        let Some(saved) = st.saved.take() else {
+            return Ok(());
+        };
+        let mut first = None;
+        for (i, sig) in GUARDED.iter().enumerate() {
+            // SAFETY: restores the structs `acquire` read back.
+            if unsafe { libc::sigaction(*sig, &saved[i], std::ptr::null_mut()) } != 0
+                && first.is_none()
+            {
+                first = Some(io::Error::last_os_error());
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for SigintIgnore {
+    fn drop(&mut self) {
+        // Only reached unreleased when unwinding; nothing can report it then.
+        let _ = self.release_inner();
+    }
 }
 
 // ---- the loop -----------------------------------------------------------
@@ -242,11 +469,18 @@ pub async fn run_loop<B: Backend>(
     client: Arc<Client>,
     config: &LoopConfig,
     keys: &mut mpsc::UnboundedReceiver<KeyEvent>,
+    handover: &mut dyn Handover,
     on_frame: &mut dyn FnMut(&Buffer),
 ) -> Result<(), String> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-    let mut socket: Option<JoinHandle<()>> = None;
-    let mut search_load: Option<JoinHandle<()>> = None;
+    let mut rt = Runtime {
+        client,
+        config,
+        tx,
+        socket: None,
+        search_load: None,
+    };
+    let client = Arc::clone(&rt.client);
 
     // First data before the first draw: daemon version, project names (all
     // projects) and both lists.
@@ -278,11 +512,11 @@ pub async fn run_loop<B: Backend>(
             }
         }
     };
-    for effect in update(app, Msg::List(Box::new(first))) {
-        if run_effect(effect, &client, config, &tx, &mut socket, &mut search_load) {
-            abort(&mut socket);
-            return Ok(());
-        }
+    let effects = update(app, Msg::List(Box::new(first)));
+    let quit = apply_effects(effects, terminal, app, handover, &mut rt).await;
+    if quit.is_err() || matches!(quit, Ok(true)) {
+        abort(&mut rt.socket);
+        return quit.map(|_| ());
     }
 
     let mut tick = tokio::time::interval(config.tick);
@@ -297,20 +531,221 @@ pub async fn run_loop<B: Backend>(
             Some(msg) = rx.recv() => msg,
             _ = tick.tick() => Msg::Tick(Utc::now()),
             () = config.panicked.tripped() => {
-                abort(&mut socket);
+                abort(&mut rt.socket);
                 return Err(PANICKED.to_string());
             }
         };
-        for effect in update(app, msg) {
-            if run_effect(effect, &client, config, &tx, &mut socket, &mut search_load) {
-                abort(&mut socket);
-                return Ok(());
-            }
+        let effects = update(app, msg);
+        let quit = apply_effects(effects, terminal, app, handover, &mut rt).await;
+        if quit.is_err() || matches!(quit, Ok(true)) {
+            abort(&mut rt.socket);
+            return quit.map(|_| ());
         }
         draw(terminal, app, on_frame)?;
     }
-    abort(&mut socket);
+    abort(&mut rt.socket);
     Ok(())
+}
+
+/// What carrying out effects needs.
+struct Runtime<'a> {
+    client: Arc<Client>,
+    config: &'a LoopConfig,
+    tx: mpsc::UnboundedSender<Msg>,
+    socket: Option<JoinHandle<()>>,
+    search_load: Option<JoinHandle<()>>,
+}
+
+/// Carries out effects in order. `Compose` is awaited here, in place: no
+/// frame is drawn and no key is read while the editor runs, and its result
+/// goes straight to `update`, whose effects join the queue. Returns `true`
+/// for `Quit`.
+async fn apply_effects<B: Backend>(
+    effects: Vec<Effect>,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    handover: &mut dyn Handover,
+    rt: &mut Runtime<'_>,
+) -> Result<bool, String> {
+    let mut queue: VecDeque<Effect> = effects.into();
+    while let Some(effect) = queue.pop_front() {
+        match effect {
+            Effect::Compose { id } => {
+                let msg = match app.editor.clone() {
+                    Some(editor) => compose(terminal, handover, rt.config, id, editor).await?,
+                    None => Msg::Edited {
+                        id,
+                        path: PathBuf::new(),
+                        outcome: EditOutcome::CreateFailed("no editor is set".into()),
+                    },
+                };
+                queue.extend(update(app, msg));
+            }
+            other => {
+                if run_effect(
+                    other,
+                    &rt.client,
+                    rt.config,
+                    &rt.tx,
+                    &mut rt.socket,
+                    &mut rt.search_load,
+                ) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+static MESSAGE_FILES: AtomicU64 = AtomicU64::new(0);
+
+/// How the editor child ended.
+enum Ran {
+    Handover(String),
+    Spawn(String),
+    WaitFailed(String),
+    Exited(std::process::ExitStatus),
+}
+
+/// The editor round trip for `s`: make the file, hand the terminal over, run
+/// the editor, take the terminal back (always), read the file. `Err` only
+/// when the terminal could not be taken back.
+async fn compose<B: Backend>(
+    terminal: &mut Terminal<B>,
+    handover: &mut dyn Handover,
+    config: &LoopConfig,
+    id: String,
+    editor: String,
+) -> Result<Msg, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let short: String = id.chars().take(8).collect();
+    // A name already taken (a stale kept file, a planted file) is skipped,
+    // never reused: `create_new` fails on it and the next number is tried.
+    let mut path;
+    let mut attempts = 0;
+    loop {
+        let n = MESSAGE_FILES.fetch_add(1, Ordering::Relaxed);
+        path = config.message_dir.join(format!(
+            "choco-message-{short}-{}-{n}.md",
+            std::process::id()
+        ));
+        attempts += 1;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 100 => {}
+            Err(e) => {
+                return Ok(Msg::Edited {
+                    id,
+                    path,
+                    outcome: EditOutcome::CreateFailed(e.to_string()),
+                });
+            }
+        }
+    }
+    let mut back_err: Option<String> = None;
+
+    let ran = match handover.suspend() {
+        Err(e) => Ran::Handover(e.to_string()),
+        Ok(()) => match SigintIgnore::acquire() {
+            Err(e) => Ran::Handover(e.to_string()),
+            Ok(guard) => {
+                let ran = run_editor(config, &editor, &path).await;
+                if let Err(e) = guard.release() {
+                    back_err.get_or_insert(e.to_string());
+                }
+                ran
+            }
+        },
+    };
+
+    // Every way back passes here, with no early return above.
+    if let Err(e) = handover.resume() {
+        back_err.get_or_insert(e.to_string());
+    }
+    // Clear and redraw everything without `Terminal::clear`, which asks the
+    // terminal for the cursor position and fails when it does not answer.
+    let cleared = terminal
+        .size()
+        .and_then(|size| terminal.resize(ratatui::layout::Rect::from(size)));
+    if let Err(e) = cleared {
+        back_err.get_or_insert(e.to_string());
+    }
+    if let Some(e) = back_err {
+        return Err(take_back_failed(&e, &path));
+    }
+
+    let outcome = match ran {
+        Ran::Handover(e) => EditOutcome::HandoverFailed(e),
+        Ran::Spawn(error) => EditOutcome::SpawnFailed { editor, error },
+        Ran::WaitFailed(error) => {
+            let content = std::fs::read_to_string(&path).map_err(|e| e.to_string());
+            let exists = content.is_ok() || path.exists();
+            EditOutcome::WaitFailed {
+                error,
+                content,
+                exists,
+            }
+        }
+        Ran::Exited(status) => {
+            let content = std::fs::read_to_string(&path).map_err(|e| e.to_string());
+            let exists = content.is_ok() || path.exists();
+            EditOutcome::Exited {
+                status,
+                content,
+                exists,
+            }
+        }
+    };
+    Ok(Msg::Edited { id, path, outcome })
+}
+
+async fn run_editor(config: &LoopConfig, editor: &str, path: &Path) -> Ran {
+    let mut cmd = tokio::process::Command::new(&config.shell);
+    cmd.arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(editor)
+        .arg(path);
+    // SAFETY: only async-signal-safe `signal` calls run between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
+        Err(e) => Ran::Spawn(e.to_string()),
+        Ok(mut child) => match child.wait().await {
+            Ok(status) => Ran::Exited(status),
+            Err(e) => Ran::WaitFailed(e.to_string()),
+        },
+    }
+}
+
+/// The error for a terminal that could not be taken back; it names the
+/// message file when it holds text (the same rule `update` uses).
+fn take_back_failed(error: &str, path: &Path) -> String {
+    let head = format!("could not take the terminal back: {error}");
+    match std::fs::read_to_string(path) {
+        Ok(text) if worth_keeping(&text) => {
+            format!("{head}; your unsent message is in {}", path.display())
+        }
+        Ok(_) => match std::fs::remove_file(path) {
+            Ok(()) => head,
+            Err(e) => format!("{head}; could not remove {}: {e}", path.display()),
+        },
+        Err(_) if path.exists() => {
+            format!("{head}; your unsent message is in {}", path.display())
+        }
+        Err(_) => head,
+    }
 }
 
 const PANICKED: &str = "stopped because a background task panicked (see the panic message above)";
@@ -377,6 +812,7 @@ fn run_effect(
             let (closed, project_id, timeout) =
                 (config.closed, config.project_id.clone(), config.timeout);
             let poll_timeout = config.poll_timeout;
+            let (shell, message_dir) = (config.shell.clone(), config.message_dir.clone());
             tokio::spawn(async move {
                 let cfg = LoopConfig {
                     tick: Duration::ZERO,
@@ -385,6 +821,8 @@ fn run_effect(
                     timeout,
                     poll_timeout,
                     panicked: Arc::default(),
+                    shell,
+                    message_dir,
                 };
                 let result =
                     fetch_bounded(&client, poll_timeout.min(timeout), &cfg, projects).await;
@@ -464,6 +902,29 @@ fn run_effect(
                 });
             });
         }
+        Effect::Send { id, path, text } => {
+            let (client, tx) = (Arc::clone(client), tx.clone());
+            let timeout = config.timeout;
+            tokio::spawn(async move {
+                let result =
+                    match tokio::time::timeout(timeout, client.send_message(&id, &text)).await {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(e)) => Err(SendFailure::Failed(e.to_string())),
+                        Err(_) => Err(SendFailure::TimedOut),
+                    };
+                let _ = tx.send(Msg::Sent { id, path, result });
+            });
+        }
+        Effect::RemoveFile { path } => {
+            if let Err(e) = std::fs::remove_file(&path) {
+                let _ = tx.send(Msg::RemoveFailed {
+                    path,
+                    error: e.to_string(),
+                });
+            }
+        }
+        // Handled by `apply_effects`, which awaits the editor in place.
+        Effect::Compose { .. } => unreachable!("Compose is carried out by apply_effects"),
         Effect::OpenUrl(url) => open_url(url, tx),
         Effect::OpenSocket(id) => {
             abort(socket);

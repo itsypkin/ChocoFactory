@@ -4,6 +4,8 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::time::Duration;
 
 use chocofactory_core::models::{
@@ -79,6 +81,88 @@ pub enum Level {
 pub struct StatusLine {
     pub text: String,
     pub level: Level,
+    /// Shown after `text` and never cut (a kept message's path).
+    pub tail: String,
+}
+
+impl StatusLine {
+    /// The whole line, `text` then `tail`.
+    #[cfg(test)]
+    pub fn full(&self) -> String {
+        format!("{}{}", self.text, self.tail)
+    }
+}
+
+/// Why a message did not reach the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendFailure {
+    Failed(String),
+    TimedOut,
+}
+
+/// How the editor round trip ended (see `Effect::Compose`).
+#[derive(Debug)]
+pub enum EditOutcome {
+    CreateFailed(String),
+    HandoverFailed(String),
+    SpawnFailed {
+        editor: String,
+        error: String,
+    },
+    /// The editor started but waiting for it failed; its file is judged by
+    /// content like any other, so text the operator wrote is never dropped.
+    WaitFailed {
+        error: String,
+        content: Result<String, String>,
+        exists: bool,
+    },
+    Exited {
+        status: ExitStatus,
+        content: Result<String, String>,
+        /// Whether the file still exists (only read when `content` is an error).
+        exists: bool,
+    },
+}
+
+/// Whether a message's text is worth keeping or sending: not empty and not
+/// only whitespace. The one keep-or-remove rule.
+pub(crate) fn worth_keeping(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
+/// `$VISUAL`, else `$EDITOR`, each trimmed; none when neither has text.
+pub(crate) fn resolve_editor(visual: Option<&str>, editor: Option<&str>) -> Option<String> {
+    [visual, editor]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Lines for stderr after the terminal is restored: message files that were
+/// kept, then sends that got no answer.
+pub(crate) fn exit_report(app: &App) -> Vec<String> {
+    let short = |id: &str| id.chars().take(8).collect::<String>();
+    let mut lines: Vec<String> = Vec::new();
+    for (id, path) in &app.kept_messages {
+        lines.push(format!(
+            "unsent message for task {}: {}",
+            short(id),
+            path.display()
+        ));
+        for (_, cause) in app.kept_causes.iter().filter(|(p, _)| p == path) {
+            lines.push(format!("  why it was not sent: {cause}"));
+        }
+    }
+    lines.extend(app.unanswered_sends.iter().map(|(id, path)| {
+        format!(
+            "message for task {} got no answer before exit (it may have been delivered): {}",
+            short(id),
+            path.display()
+        )
+    }));
+    lines
 }
 
 /// State of the full-screen detail view.
@@ -225,6 +309,23 @@ pub enum Msg {
         url: String,
         error: String,
     },
+    /// The editor round trip for a reply ended.
+    Edited {
+        id: String,
+        path: PathBuf,
+        outcome: EditOutcome,
+    },
+    /// The daemon's answer (or silence) to a reply.
+    Sent {
+        id: String,
+        path: PathBuf,
+        result: Result<(), SendFailure>,
+    },
+    /// A message file could not be removed.
+    RemoveFailed {
+        path: PathBuf,
+        error: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -245,6 +346,19 @@ pub enum Effect {
     Pause(String),
     Resume(String),
     OpenUrl(String),
+    /// Hand the terminal to the editor on a new message file for this task.
+    Compose {
+        id: String,
+    },
+    /// Send `text` to the task; `path` is the file it came from.
+    Send {
+        id: String,
+        path: PathBuf,
+        text: String,
+    },
+    RemoveFile {
+        path: PathBuf,
+    },
     Quit,
 }
 
@@ -258,6 +372,15 @@ pub struct App {
     pub interval_label: String,
     pub color: bool,
     pub ssh: bool,
+    /// The editor `s` runs (`$VISUAL`, else `$EDITOR`); none when neither is set.
+    pub editor: Option<String>,
+    /// Message files kept on disk: (full task id, path).
+    pub kept_messages: Vec<(String, PathBuf)>,
+    /// Why each kept file was not sent, in full (the status line may cut it):
+    /// (path, cause). Printed by `exit_report`.
+    pub kept_causes: Vec<(PathBuf, String)>,
+    /// Sends with no answer yet: (full task id, path).
+    pub unanswered_sends: Vec<(String, PathBuf)>,
 
     pub active: Vec<TaskSummary>,
     pub closed: Vec<TaskSummary>,
@@ -303,6 +426,13 @@ impl App {
             color: std::env::var_os("NO_COLOR").is_none(),
             ssh: std::env::var_os("SSH_CONNECTION").is_some()
                 || std::env::var_os("SSH_TTY").is_some(),
+            editor: resolve_editor(
+                std::env::var("VISUAL").ok().as_deref(),
+                std::env::var("EDITOR").ok().as_deref(),
+            ),
+            kept_messages: Vec::new(),
+            kept_causes: Vec::new(),
+            unanswered_sends: Vec::new(),
             active: Vec::new(),
             closed: Vec::new(),
             projects: HashMap::new(),
@@ -412,9 +542,14 @@ impl App {
     }
 
     fn set_status(&mut self, text: impl Into<String>, level: Level) {
+        self.set_status_with_tail(text, String::new(), level);
+    }
+
+    fn set_status_with_tail(&mut self, text: impl Into<String>, tail: String, level: Level) {
         self.status = Some(StatusLine {
             text: text.into(),
             level,
+            tail,
         });
     }
 
@@ -669,6 +804,44 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.set_status(format!("could not open {url}: {error}"), Level::Error);
             Vec::new()
         }
+        Msg::Edited { id, path, outcome } => edited(app, id, path, outcome),
+        Msg::Sent { id, path, result } => {
+            app.unanswered_sends.retain(|(_, p)| *p != path);
+            match result {
+                Ok(()) => {
+                    let short: String = id.chars().take(8).collect();
+                    app.set_status(format!("sent to {short}"), Level::Info);
+                    app.fetching = true;
+                    vec![
+                        Effect::RemoveFile { path },
+                        Effect::Fetch {
+                            projects: app.needs_projects(),
+                        },
+                    ]
+                }
+                Err(failure) => {
+                    let text = match failure {
+                        SendFailure::Failed(e) => format!("send failed: {e}"),
+                        SendFailure::TimedOut => "send timed out: the daemon may still have \
+                             taken it (check the task's events)"
+                            .to_string(),
+                    };
+                    keep(app, id, path, text);
+                    Vec::new()
+                }
+            }
+        }
+        Msg::RemoveFailed { path, error } => {
+            let note = format!("could not remove {}: {error}", path.display());
+            match &mut app.status {
+                Some(s) => {
+                    s.text.push_str("; ");
+                    s.text.push_str(&note);
+                }
+                None => app.set_status(note, Level::Error),
+            }
+            Vec::new()
+        }
     }
 }
 
@@ -733,6 +906,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
             return Vec::new();
         }
         KeyCode::Char('p') => return pause_toggle(app),
+        KeyCode::Char('s') => return compose(app),
         _ => {}
     }
 
@@ -740,6 +914,123 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {
         return detail_key(app, key);
     }
     list_key(app, key)
+}
+
+/// `s`: reply to the task in view through the operator's editor. The id is
+/// captured here and travels with the message from now on.
+fn compose(app: &mut App) -> Vec<Effect> {
+    let Some(id) = app.action_target() else {
+        return Vec::new();
+    };
+    if app.editor.is_none() {
+        app.set_status(
+            format!(
+                "s: set $VISUAL or $EDITOR to write a message here, or use choco task send {id}"
+            ),
+            Level::Info,
+        );
+        return Vec::new();
+    }
+    vec![Effect::Compose { id }]
+}
+
+/// Records a kept message file and shows its path after `text`.
+fn keep(app: &mut App, id: String, path: PathBuf, text: String) {
+    let tail = format!("; your text is in {}", path.display());
+    app.set_status_with_tail(text.clone(), tail, Level::Error);
+    app.kept_causes.push((path.clone(), text));
+    app.kept_messages.push((id, path));
+}
+
+/// Decides what an editor round trip means: send, keep the file, or remove it.
+fn edited(app: &mut App, id: String, path: PathBuf, outcome: EditOutcome) -> Vec<Effect> {
+    match outcome {
+        EditOutcome::CreateFailed(e) => {
+            app.set_status(
+                format!("could not create a message file: {e}"),
+                Level::Error,
+            );
+            Vec::new()
+        }
+        EditOutcome::HandoverFailed(e) => {
+            app.set_status(
+                format!("could not hand the terminal to the editor: {e}; nothing sent"),
+                Level::Error,
+            );
+            vec![Effect::RemoveFile { path }]
+        }
+        EditOutcome::SpawnFailed { editor, error } => {
+            app.set_status(
+                format!("could not start the editor ({editor}): {error}; nothing sent"),
+                Level::Error,
+            );
+            vec![Effect::RemoveFile { path }]
+        }
+        EditOutcome::WaitFailed {
+            error,
+            content,
+            exists,
+        } => match content {
+            Err(e) => {
+                let text = format!(
+                    "could not wait for the editor: {error}; could not read the message: {e}; nothing sent"
+                );
+                if exists {
+                    keep(app, id, path, text);
+                } else {
+                    app.set_status(text, Level::Error);
+                }
+                Vec::new()
+            }
+            Ok(text) => {
+                let msg = format!("nothing sent: could not wait for the editor: {error}");
+                if worth_keeping(&text) {
+                    keep(app, id, path, msg);
+                    Vec::new()
+                } else {
+                    app.set_status(msg, Level::Error);
+                    vec![Effect::RemoveFile { path }]
+                }
+            }
+        },
+        EditOutcome::Exited {
+            status,
+            content,
+            exists,
+        } => match content {
+            Err(e) => {
+                let text = format!("could not read the message: {e}; nothing sent");
+                if exists {
+                    keep(app, id, path, text);
+                } else {
+                    app.set_status(text, Level::Error);
+                }
+                Vec::new()
+            }
+            Ok(text) if !status.success() => {
+                let msg = format!("nothing sent: the editor exited with {status}");
+                if worth_keeping(&text) {
+                    keep(app, id, path, msg);
+                    Vec::new()
+                } else {
+                    app.set_status(msg, Level::Error);
+                    vec![Effect::RemoveFile { path }]
+                }
+            }
+            Ok(text) if !worth_keeping(&text) => {
+                app.set_status("nothing sent: the message was empty", Level::Info);
+                vec![Effect::RemoveFile { path }]
+            }
+            Ok(text) => {
+                app.unanswered_sends.push((id.clone(), path.clone()));
+                vec![Effect::Send {
+                    id,
+                    path,
+                    text: text.trim_end().to_string(),
+                }]
+            }
+        },
+    }
 }
 
 fn search_key(app: &mut App, key: KeyEvent) -> Vec<Effect> {

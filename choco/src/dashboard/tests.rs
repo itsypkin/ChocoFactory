@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 
 use super::app::*;
 use super::view::draw;
-use super::{LoopConfig, PanicSignal, run_loop};
+use super::{Handover, LoopConfig, PanicSignal, run_loop};
 use crate::client::Client;
 
 fn now() -> DateTime<Utc> {
@@ -104,6 +104,7 @@ fn new_app(scope: Scope) -> App {
     );
     app.color = false;
     app.ssh = false;
+    app.editor = None;
     app.daemon_version = Some(chocofactory_core::version::VERSION.to_string());
     app
 }
@@ -893,7 +894,19 @@ fn detail_events_follow_until_scrolled() {
 
 // ---- end to end against a fake daemon -----------------------------------
 
-#[derive(Clone)]
+/// A handover that does nothing (the tests have no real terminal).
+struct NoHandover;
+
+impl Handover for NoHandover {
+    fn suspend(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn resume(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
 struct Fake {
     tasks: Arc<Vec<TaskSummary>>,
     cancels: Arc<Mutex<Vec<String>>>,
@@ -903,6 +916,20 @@ struct Fake {
     hang: bool,
     /// The query string of each `GET /tasks`, in order.
     queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    /// Each `POST /tasks/{id}/messages` as `(id, text)`.
+    messages: Arc<Mutex<Vec<(String, String)>>>,
+    /// How that route answers.
+    reply: Reply,
+    /// `"list"` for each `GET /tasks`, `"post"` for each message, in order.
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[derive(Clone, Default)]
+enum Reply {
+    #[default]
+    Accept,
+    Refuse(String),
+    Hang,
 }
 
 async fn fake_server(state: Fake) -> String {
@@ -925,6 +952,7 @@ async fn fake_server(state: Fake) -> String {
         Query(q): Query<HashMap<String, String>>,
     ) -> axum::Json<Value> {
         s.queries.lock().unwrap().push(q.clone());
+        s.events.lock().unwrap().push("list");
         let statuses: Vec<&str> = q
             .get("status")
             .map(|s| s.split(',').collect())
@@ -974,6 +1002,25 @@ async fn fake_server(state: Fake) -> String {
         s.cancels.lock().unwrap().push(id);
         StatusCode::ACCEPTED
     }
+    async fn message(
+        State(s): State<Fake>,
+        Path(id): Path<String>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        s.messages
+            .lock()
+            .unwrap()
+            .push((id, body["text"].as_str().unwrap_or_default().to_string()));
+        s.events.lock().unwrap().push("post");
+        match &s.reply {
+            Reply::Accept => StatusCode::ACCEPTED.into_response(),
+            Reply::Refuse(text) => {
+                (StatusCode::CONFLICT, axum::Json(json!({ "error": text }))).into_response()
+            }
+            Reply::Hang => std::future::pending().await,
+        }
+    }
     async fn live(Path(id): Path<String>, ws: WebSocketUpgrade) -> axum::response::Response {
         ws.on_upgrade(move |mut socket| async move {
             for (n, text) in ["hello streamed", "second streamed"].iter().enumerate() {
@@ -1000,6 +1047,7 @@ async fn fake_server(state: Fake) -> String {
         .route("/tasks/{id}", get(task))
         .route("/tasks/{id}/cancel", post(cancel))
         .route("/tasks/{id}/retry", post(retry))
+        .route("/tasks/{id}/messages", post(message))
         .route("/tasks/{id}/events/live", get(live))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1073,6 +1121,7 @@ async fn the_real_loop_against_a_fake_daemon() {
         keeps: Arc::new(Mutex::new(Vec::new())),
         hang: false,
         queries: Arc::default(),
+        ..Default::default()
     };
     let base_url = fake_server(fake.clone()).await;
     let client = Arc::new(Client::new(base_url.clone()).without_version_check());
@@ -1093,6 +1142,8 @@ async fn the_real_loop_against_a_fake_daemon() {
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_secs(30),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1146,12 +1197,14 @@ async fn the_real_loop_against_a_fake_daemon() {
         k('q');
     };
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let mut handover = NoHandover;
     let run = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut krx,
+        &mut handover,
         &mut on_frame,
     );
     let (result, ()) =
@@ -1180,6 +1233,8 @@ async fn an_unreachable_daemon_shows_the_error_and_the_loop_still_quits() {
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_secs(30),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1192,12 +1247,14 @@ async fn an_unreachable_daemon_shows_the_error_and_the_loop_still_quits() {
             .unwrap();
     };
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let mut handover = NoHandover;
     let run = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut krx,
+        &mut handover,
         &mut on_frame,
     );
     let (result, ()) = tokio::join!(run, driver);
@@ -1336,12 +1393,15 @@ async fn a_hung_daemon_does_not_stop_the_first_load_from_quitting() {
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_secs(30),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
         .unwrap();
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
     let mut on_frame = |_: &Buffer| {};
+    let mut handover = NoHandover;
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         run_loop(
@@ -1350,6 +1410,7 @@ async fn a_hung_daemon_does_not_stop_the_first_load_from_quitting() {
             client,
             &config,
             &mut krx,
+            &mut handover,
             &mut on_frame,
         ),
     )
@@ -1369,6 +1430,8 @@ async fn a_request_that_times_out_is_shown_as_unreachable() {
         timeout: Duration::from_millis(300),
         poll_timeout: Duration::from_millis(300),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1380,12 +1443,14 @@ async fn a_request_that_times_out_is_shown_as_unreachable() {
             .unwrap();
     };
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let mut handover = NoHandover;
     let run = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut krx,
+        &mut handover,
         &mut on_frame,
     );
     let (result, ()) =
@@ -1420,6 +1485,7 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
         keeps: Arc::new(Mutex::new(Vec::new())),
         hang: true,
         queries: Arc::default(),
+        ..Default::default()
     };
     let base_url = fake_server(fake).await;
     let client = Arc::new(Client::new(base_url).without_version_check());
@@ -1433,6 +1499,8 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
         timeout: Duration::from_millis(300),
         poll_timeout: Duration::from_millis(300),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1462,12 +1530,14 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
         k('q');
     };
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let mut handover = NoHandover;
     let run = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut krx,
+        &mut handover,
         &mut on_frame,
     );
     let (result, ()) =
@@ -1488,6 +1558,8 @@ async fn a_panic_signal_stops_the_loop_with_an_error() {
         timeout: Duration::from_millis(300),
         poll_timeout: Duration::from_millis(300),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     let (_ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -1500,12 +1572,14 @@ async fn a_panic_signal_stops_the_loop_with_an_error() {
         signal.trip();
     };
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let mut handover = NoHandover;
     let run = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut krx,
+        &mut handover,
         &mut on_frame,
     );
     let (result, ()) =
@@ -1576,12 +1650,14 @@ where
     let sink = Arc::clone(&latest);
     let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let mut handover = NoHandover;
     let run = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut krx,
+        &mut handover,
         &mut on_frame,
     );
     let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
@@ -1655,6 +1731,8 @@ fn search_config(timeout: Duration) -> LoopConfig {
         timeout,
         poll_timeout: Duration::from_secs(30),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     }
 }
 
@@ -1737,6 +1815,8 @@ async fn list_polls_time_out_at_the_poll_timeout_not_the_request_timeout() {
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_millis(200),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     run_against(url, config, |latest, ktx| async move {
         wait_for(&latest, "Slow but there").await;
@@ -1761,6 +1841,8 @@ async fn the_first_load_waits_for_a_slow_daemon_past_the_poll_timeout() {
         timeout: Duration::from_secs(5),
         poll_timeout: Duration::from_millis(100),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     run_against(url, config, |latest, ktx| async move {
         wait_for(&latest, "Slow but there").await;
@@ -1944,7 +2026,7 @@ fn the_status_view_shows_fields_progress_counters_and_the_event_tail() {
         String::new(),
         String::new(),
         String::new(),
-        "e events  o PR  r retry  p pause  c cancel  Esc back".into(),
+        "e events  o PR  r retry  p pause  s send  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 100, 30), &expected);
@@ -2156,7 +2238,8 @@ fn the_expanded_view_has_the_full_stream_and_its_own_footer() {
     }
     expected.extend(std::iter::repeat_n(String::new(), 20));
     expected.push(
-        "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  c cancel".into(),
+        "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  s send  c cancel"
+            .into(),
     );
     assert_screen(&render(&app, 100, 30), &expected.join("\n"));
     // Scrolling still works there.
@@ -2230,21 +2313,23 @@ fn the_status_view_does_not_scroll_and_expanding_starts_following() {
 }
 
 #[test]
-fn s_does_nothing_in_either_view_or_the_help() {
+fn s_without_an_editor_says_so_in_both_views_and_help_lists_it() {
     let mut app = board();
     open_detail(&mut app, BUSY);
-    let before = render(&app, 100, 30);
-    assert!(ch(&mut app, 's').is_empty());
-    assert_eq!(render(&app, 100, 30), before);
-    ch(&mut app, 'e');
-    let before = render(&app, 100, 30);
-    assert!(ch(&mut app, 's').is_empty());
-    assert_eq!(render(&app, 100, 30), before);
-    assert_eq!(detail_state(&app), (true, true, 0));
+    for expanded in [false, true] {
+        if expanded {
+            ch(&mut app, 'e');
+        }
+        assert!(ch(&mut app, 's').is_empty());
+        let shown = render(&app, 100, 30);
+        assert!(shown.contains("s: set $VISUAL or $EDITOR"), "{shown}");
+    }
     ch(&mut app, '?');
     let help = render(&app, 100, 30);
-    assert!(help.contains("e           events / status"), "{help}");
-    assert!(!help.contains(" s "), "{help}");
+    assert!(
+        help.contains("e           events / status s     send a message"),
+        "{help}"
+    );
 }
 
 #[test]
@@ -2284,7 +2369,7 @@ fn a_short_screen_shrinks_the_events_tail_then_cuts_the_status_block() {
         "  … 3 earlier steps".into(),
         "  4  revising         done               internal_review  11:48:00  ◀ current".into(),
         "Loop counters  internal_review=2".into(),
-        "e events  o PR  r retry  p pause  c cancel  Esc back".into(),
+        "e events  o PR  r retry  p pause  s send  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 100, 12), &expected);
@@ -3027,7 +3112,7 @@ fn the_80x24_status_view_shows_the_aligned_table() {
         format!("  {}  human_message message 4", at(4)),
         format!("  {}  human_message message 5", at(5)),
         format!("  {}  human_message message 6", at(6)),
-        "e events  o PR  r retry  p pause  c cancel  Esc back".into(),
+        "e events  o PR  r retry  p pause  s send  c cancel  Esc back".into(),
     ]
     .join("\n");
     assert_screen(&render(&app, 80, 24), &expected);
@@ -3431,7 +3516,7 @@ fn the_120x40_status_view_shows_the_aligned_table() {
         assert_eq!(&lines[i], e, "line {i}\n{s}");
     }
     assert_eq!(
-        lines[39], "e events  o PR  r retry  p pause  c cancel  Esc back",
+        lines[39], "e events  o PR  r retry  p pause  s send  c cancel  Esc back",
         "{s}"
     );
 }
@@ -4194,6 +4279,7 @@ async fn search_finds_a_task_beyond_the_closed_window_through_the_real_loop() {
         keeps: Arc::new(Mutex::new(Vec::new())),
         hang: false,
         queries: Arc::default(),
+        ..Default::default()
     };
     let base_url = fake_server(fake.clone()).await;
     let client = Arc::new(Client::new(base_url.clone()).without_version_check());
@@ -4213,6 +4299,8 @@ async fn search_finds_a_task_beyond_the_closed_window_through_the_real_loop() {
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_secs(30),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -4249,12 +4337,14 @@ async fn search_finds_a_task_beyond_the_closed_window_through_the_real_loop() {
         k('q');
     };
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let mut handover = NoHandover;
     let run = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut krx,
+        &mut handover,
         &mut on_frame,
     );
     let (result, ()) =
@@ -4289,6 +4379,7 @@ async fn search_in_one_project_mode_asks_for_that_project_only() {
         keeps: Arc::new(Mutex::new(Vec::new())),
         hang: false,
         queries: Arc::default(),
+        ..Default::default()
     };
     let base_url = fake_server(fake.clone()).await;
     let client = Arc::new(Client::new(base_url.clone()).without_version_check());
@@ -4310,6 +4401,8 @@ async fn search_in_one_project_mode_asks_for_that_project_only() {
         timeout: Duration::from_secs(30),
         poll_timeout: Duration::from_secs(30),
         panicked: Arc::default(),
+        shell: "/bin/sh".into(),
+        message_dir: std::env::temp_dir(),
     };
     let (ktx, mut krx) = mpsc::unbounded_channel();
     let latest = Arc::new(Mutex::new(String::new()));
@@ -4336,12 +4429,14 @@ async fn search_in_one_project_mode_asks_for_that_project_only() {
             .unwrap();
     };
     let mut on_frame = |buf: &Buffer| *sink.lock().unwrap() = screen(buf);
+    let mut handover = NoHandover;
     let run = run_loop(
         &mut terminal,
         &mut app,
         client,
         &config,
         &mut krx,
+        &mut handover,
         &mut on_frame,
     );
     let (result, ()) =
@@ -4658,4 +4753,1082 @@ fn the_detail_view_shows_the_paused_row_and_how_long_ago() {
     assert!(screen.contains("Paused"), "{screen}");
     assert!(screen.contains("choco task resume held0000-0"), "{screen}");
     assert!(screen.contains("(paused 3m ago)"), "{screen}");
+}
+
+// ---- `s`: reply through the editor (#167) -----------------------------------
+
+use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
+use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use super::{KeySource, spawn_key_reader};
+
+fn status(raw: i32) -> ExitStatus {
+    ExitStatus::from_raw(raw)
+}
+
+fn two_tasks() -> App {
+    let mut app = new_app(Scope::AllProjects);
+    app.editor = Some("ed".into());
+    load(
+        &mut app,
+        vec![
+            summary("aaaa1111-0", "Task A", "open", Some("coding"), Some(3), "p"),
+            summary("bbbb2222-0", "Task B", "open", Some("coding"), Some(3), "p"),
+        ],
+        vec![],
+    );
+    app
+}
+
+fn edited(id: &str, outcome: EditOutcome) -> Msg {
+    Msg::Edited {
+        id: id.into(),
+        path: PathBuf::from("/tmp/m.md"),
+        outcome,
+    }
+}
+
+fn exited(raw: i32, text: &str) -> EditOutcome {
+    EditOutcome::Exited {
+        status: status(raw),
+        content: Ok(text.into()),
+        exists: true,
+    }
+}
+
+#[test]
+fn send_goes_to_the_task_captured_when_s_was_pressed() {
+    // The cursor moves on after `s`.
+    let mut app = two_tasks();
+    assert_eq!(
+        ch(&mut app, 's'),
+        vec![Effect::Compose {
+            id: "aaaa1111-0".into()
+        }]
+    );
+    ch(&mut app, 'j');
+    assert_eq!(app.selected.as_deref(), Some("bbbb2222-0"));
+    let fx = update(&mut app, edited("aaaa1111-0", exited(0, "hi\n")));
+    assert_eq!(
+        fx,
+        vec![Effect::Send {
+            id: "aaaa1111-0".into(),
+            path: "/tmp/m.md".into(),
+            text: "hi".into()
+        }]
+    );
+    // The detail view's task differs from the selection.
+    let mut app = two_tasks();
+    press(&mut app, KeyCode::Enter);
+    let fx = ch(&mut app, 's');
+    assert_eq!(
+        fx,
+        vec![Effect::Compose {
+            id: "aaaa1111-0".into()
+        }]
+    );
+    app.selected = Some("bbbb2222-0".into());
+    let fx = update(&mut app, edited("aaaa1111-0", exited(0, "hi\n")));
+    assert!(matches!(&fx[0], Effect::Send { id, .. } if id == "aaaa1111-0"));
+}
+
+#[test]
+fn whitespace_only_sends_nothing() {
+    for text in ["", "  \n\t\n"] {
+        let mut app = two_tasks();
+        let fx = update(&mut app, edited("aaaa1111-0", exited(0, text)));
+        assert_eq!(
+            fx,
+            vec![Effect::RemoveFile {
+                path: "/tmp/m.md".into()
+            }]
+        );
+        assert_eq!(
+            app.status.as_ref().unwrap().full(),
+            "nothing sent: the message was empty"
+        );
+    }
+    let mut app = two_tasks();
+    let fx = update(&mut app, edited("aaaa1111-0", exited(0, " x \n")));
+    assert!(matches!(&fx[0], Effect::Send { text, .. } if text == " x"));
+}
+
+#[test]
+fn editor_resolution() {
+    use super::app::resolve_editor;
+    assert_eq!(resolve_editor(Some("v"), Some("e")).as_deref(), Some("v"));
+    assert_eq!(resolve_editor(Some("  "), Some("e")).as_deref(), Some("e"));
+    assert_eq!(resolve_editor(Some(""), Some("e")).as_deref(), Some("e"));
+    assert_eq!(
+        resolve_editor(None, Some(" e -w ")).as_deref(),
+        Some("e -w")
+    );
+    assert_eq!(resolve_editor(Some(" v "), None).as_deref(), Some("v"));
+    assert_eq!(resolve_editor(None, None), None);
+    assert_eq!(resolve_editor(Some(" "), Some("\t")), None);
+
+    let mut app = two_tasks();
+    app.editor = None;
+    assert!(ch(&mut app, 's').is_empty());
+    assert_eq!(
+        app.status.as_ref().unwrap().full(),
+        "s: set $VISUAL or $EDITOR to write a message here, or use choco task send aaaa1111-0"
+    );
+    assert_eq!(app.status.as_ref().unwrap().level, Level::Info);
+}
+
+#[test]
+fn s_key_routing() {
+    // Typed into the search query.
+    let mut app = two_tasks();
+    ch(&mut app, '/');
+    assert!(ch(&mut app, 's').is_empty());
+    assert_eq!(app.search.as_ref().unwrap().query, "s");
+    // Swallowed by a prompt.
+    let mut app = two_tasks();
+    ch(&mut app, 'c');
+    assert!(app.prompt.is_some());
+    assert!(ch(&mut app, 's').is_empty());
+    assert!(app.status.is_none());
+    // Swallowed by help.
+    let mut app = two_tasks();
+    ch(&mut app, '?');
+    assert!(ch(&mut app, 's').is_empty());
+    assert!(app.help);
+    // Detail views use the detail's task, not the selection.
+    let mut app = two_tasks();
+    press(&mut app, KeyCode::Enter);
+    app.selected = Some("bbbb2222-0".into());
+    let want = vec![Effect::Compose {
+        id: "aaaa1111-0".into(),
+    }];
+    assert_eq!(ch(&mut app, 's'), want);
+    ch(&mut app, 'e');
+    assert_eq!(ch(&mut app, 's'), want);
+    // An empty list.
+    let mut app = new_app(Scope::AllProjects);
+    app.editor = Some("ed".into());
+    assert!(ch(&mut app, 's').is_empty());
+}
+
+#[test]
+fn exit_report_lists_kept_and_unanswered_files() {
+    let mut app = two_tasks();
+    app.unanswered_sends
+        .push(("bbbb2222-0".into(), "/tmp/two.md".into()));
+    app.kept_messages
+        .push(("aaaa1111-0".into(), "/tmp/one.md".into()));
+    assert_eq!(
+        super::app::exit_report(&app),
+        vec![
+            "unsent message for task aaaa1111: /tmp/one.md".to_string(),
+            "message for task bbbb2222 got no answer before exit (it may have been delivered): /tmp/two.md"
+                .to_string(),
+        ]
+    );
+}
+
+#[test]
+fn the_kept_path_is_never_cut() {
+    let path = "/tmp/choco-message-aaaa1111-1-1.md";
+    for w in [60u16, 80, 100] {
+        let mut app = two_tasks();
+        update(
+            &mut app,
+            Msg::Sent {
+                id: "aaaa1111-0".into(),
+                path: path.into(),
+                result: Err(SendFailure::Failed("x".repeat(300))),
+            },
+        );
+        let out = render(&app, w, 20);
+        let last = out.lines().last().unwrap().to_string();
+        // The reason has priority, so the directory may go; the file name stays.
+        assert!(
+            last.contains("choco-message-aaaa1111-1-1.md"),
+            "{w}: {last:?}"
+        );
+        if w >= 100 {
+            assert!(
+                last.contains(&format!("; your text is in {path}")),
+                "{last:?}"
+            );
+        }
+        assert!(last.starts_with("send f"), "{last:?}");
+    }
+}
+
+// -- the key reader --
+
+struct TimedSource {
+    calls: Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl KeySource for TimedSource {
+    fn poll(&mut self, _: Duration) -> std::io::Result<bool> {
+        let start = std::time::Instant::now();
+        std::thread::sleep(Duration::from_millis(30));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((start, std::time::Instant::now()));
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("stop"));
+        }
+        Ok(false)
+    }
+    fn read(&mut self) -> std::io::Result<ratatui::crossterm::event::Event> {
+        Err(std::io::Error::other("no events"))
+    }
+}
+
+#[test]
+fn key_reader_makes_no_terminal_calls_while_paused() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (_rx, control) = spawn_key_reader(TimedSource {
+        calls: Arc::clone(&calls),
+        stop: Arc::clone(&stop),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    control.pause();
+    let paused = std::time::Instant::now();
+    std::thread::sleep(Duration::from_millis(200));
+    let resumed = std::time::Instant::now();
+    control.resume();
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::SeqCst);
+    let calls = calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|(s, _)| *s < paused), "none before");
+    assert!(calls.iter().any(|(s, _)| *s >= resumed), "none after");
+    let inside: Vec<_> = calls
+        .iter()
+        .filter(|(s, e)| *e > paused && *s < resumed)
+        .collect();
+    assert!(inside.is_empty(), "calls while paused: {inside:?}");
+}
+
+struct DyingSource;
+
+impl KeySource for DyingSource {
+    fn poll(&mut self, _: Duration) -> std::io::Result<bool> {
+        Ok(true)
+    }
+    fn read(&mut self) -> std::io::Result<ratatui::crossterm::event::Event> {
+        Err(std::io::Error::other("gone"))
+    }
+}
+
+#[test]
+fn pause_returns_when_the_reader_has_exited() {
+    let (_rx, control) = spawn_key_reader(DyingSource);
+    std::thread::sleep(Duration::from_millis(200));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        control.pause();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("pause hung on an exited reader");
+}
+
+// -- the signal guard --
+
+/// Editor tests and the signal guard test share process-wide signal
+/// dispositions, so they run one at a time.
+static EDITOR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn sigint_is_ignored() -> (bool, usize) {
+    // SAFETY: reads the current disposition only.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        assert_eq!(libc::sigaction(libc::SIGINT, std::ptr::null(), &mut old), 0);
+        (old.sa_sigaction == libc::SIG_IGN, old.sa_sigaction)
+    }
+}
+
+#[test]
+fn sigint_ignore_nests() {
+    let _serial = EDITOR_LOCK.blocking_lock();
+    let (was_ignored, before) = sigint_is_ignored();
+    let a = super::SigintIgnore::acquire().unwrap();
+    let b = super::SigintIgnore::acquire().unwrap();
+    assert!(sigint_is_ignored().0);
+    a.release().unwrap();
+    assert!(sigint_is_ignored().0, "released too early");
+    b.release().unwrap();
+    let (now_ignored, now) = sigint_is_ignored();
+    assert_eq!((now_ignored, now), (was_ignored, before));
+}
+
+// -- run_loop with a stub editor --
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("choco-dash-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        Scratch(p)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(rd) = std::fs::read_dir(&self.0) {
+            for e in rd.flatten() {
+                let _ = std::fs::set_permissions(e.path(), std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `$1` log, `$2` mode, `$3` extra, `$4` the message file.
+const STUB: &str = r#"
+log="$1"; mode="$2"; extra="$3"; f="$4"
+echo editor >> "$log"
+echo "$f" > "$log.path"
+case "$mode" in
+  text) printf ' x \n' > "$f" ;;
+  empty) : ;;
+  fail) printf 'hello\n' > "$f"; exit 1 ;;
+  bin) printf '\377\376' > "$f" ;;
+  ctrlc) kill -INT "$extra"; printf 'hello\n' > "$f" ;;
+  selfint) printf 'hello\n' > "$f"; kill -INT $$ ;;
+  chmod) chmod 500 "$(dirname "$f")" ;;
+esac
+"#;
+
+/// A backend that never answers a cursor-position query, like a terminal
+/// that ignores `ESC[6n`.
+struct NoCursor(TestBackend);
+
+impl ratatui::backend::Backend for NoCursor {
+    type Error = std::io::Error;
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.0.draw(content).map_err(|e| match e {})
+    }
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.0.hide_cursor().map_err(|e| match e {})
+    }
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.0.show_cursor().map_err(|e| match e {})
+    }
+    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        Err(std::io::Error::other("the terminal did not answer"))
+    }
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> std::io::Result<()> {
+        self.0.set_cursor_position(position).map_err(|e| match e {})
+    }
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.0.clear().map_err(|e| match e {})
+    }
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        self.0.clear_region(clear_type).map_err(|e| match e {})
+    }
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        self.0.size().map_err(|e| match e {})
+    }
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        self.0.window_size().map_err(|e| match e {})
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush().map_err(|e| match e {})
+    }
+}
+
+struct Scenario {
+    mode: &'static str,
+    extra: String,
+    shell: &'static str,
+    reply: Reply,
+    timeout: Duration,
+    suspend_err: Option<&'static str>,
+    resume_err: Option<&'static str>,
+    message_dir: Option<PathBuf>,
+    wait: Wait,
+}
+
+#[derive(Clone, Copy)]
+enum Wait {
+    Screen(&'static str),
+    Posted,
+    Nothing,
+}
+
+impl Scenario {
+    fn new(mode: &'static str, wait: Wait) -> Self {
+        Scenario {
+            mode,
+            extra: "-".into(),
+            shell: "/bin/sh",
+            reply: Reply::Accept,
+            timeout: Duration::from_secs(30),
+            suspend_err: None,
+            resume_err: None,
+            message_dir: None,
+            wait,
+        }
+    }
+}
+
+struct RecHandover {
+    log: PathBuf,
+    frames: Arc<AtomicUsize>,
+    counts: Arc<Mutex<Vec<(&'static str, usize)>>>,
+    suspend_err: Option<&'static str>,
+    resume_err: Option<&'static str>,
+}
+
+impl RecHandover {
+    fn note(&self, what: &'static str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .unwrap();
+        writeln!(f, "{what}").unwrap();
+        self.counts
+            .lock()
+            .unwrap()
+            .push((what, self.frames.load(Ordering::SeqCst)));
+    }
+}
+
+impl Handover for RecHandover {
+    fn suspend(&mut self) -> std::io::Result<()> {
+        self.note("suspend");
+        self.suspend_err
+            .map_or(Ok(()), |e| Err(std::io::Error::other(e)))
+    }
+    fn resume(&mut self) -> std::io::Result<()> {
+        self.note("resume");
+        self.resume_err
+            .map_or(Ok(()), |e| Err(std::io::Error::other(e)))
+    }
+}
+
+struct Outcome {
+    result: Result<(), String>,
+    screen: String,
+    fake: Fake,
+    log: Vec<String>,
+    counts: Vec<(&'static str, usize)>,
+    dir: Scratch,
+    msgs: PathBuf,
+    app: App,
+}
+
+impl Outcome {
+    fn posts(&self) -> Vec<(String, String)> {
+        self.fake.messages.lock().unwrap().clone()
+    }
+    /// The path the stub was given.
+    fn path(&self) -> PathBuf {
+        let p = std::fs::read_to_string(self.dir.0.join("log.path")).unwrap();
+        PathBuf::from(p.trim_end())
+    }
+}
+
+async fn scenario(name: &str, sc: Scenario) -> Outcome {
+    let _serial = EDITOR_LOCK.lock().await;
+    let dir = Scratch::new(name);
+    let stub = dir.0.join("stub.sh");
+    std::fs::write(&stub, STUB).unwrap();
+    let log = dir.0.join("log");
+    let msgs = sc.message_dir.clone().unwrap_or_else(|| dir.0.join("msgs"));
+    if sc.message_dir.is_none() {
+        std::fs::create_dir_all(&msgs).unwrap();
+    }
+    let fake = Fake {
+        tasks: Arc::new(vec![summary(
+            "aaaa1111-0",
+            "Fix the login",
+            "open",
+            Some("coding"),
+            Some(3),
+            "p-alpha",
+        )]),
+        reply: sc.reply.clone(),
+        ..Default::default()
+    };
+    let base_url = fake_server(fake.clone()).await;
+    let client = Arc::new(Client::new(base_url.clone()).without_version_check());
+    let mut app = new_app(Scope::AllProjects);
+    app.now = Utc::now();
+    app.editor = Some(format!(
+        "sh {} {} {} {}",
+        stub.display(),
+        log.display(),
+        sc.mode,
+        sc.extra
+    ));
+    let config = LoopConfig {
+        tick: Duration::from_millis(50),
+        closed: 10,
+        project_id: None,
+        timeout: sc.timeout,
+        poll_timeout: sc.timeout,
+        panicked: Arc::default(),
+        shell: sc.shell.into(),
+        message_dir: msgs.clone(),
+    };
+    let frames = Arc::new(AtomicUsize::new(0));
+    let counts = Arc::new(Mutex::new(Vec::new()));
+    let mut handover = RecHandover {
+        log: log.clone(),
+        frames: Arc::clone(&frames),
+        counts: Arc::clone(&counts),
+        suspend_err: sc.suspend_err,
+        resume_err: sc.resume_err,
+    };
+    let (ktx, mut krx) = mpsc::unbounded_channel();
+    let latest = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&latest);
+    let shot = Arc::new(Mutex::new(String::new()));
+    let mut terminal = Terminal::new(NoCursor(TestBackend::new(320, 30))).unwrap();
+    let driver = async {
+        wait_for(&latest, "Fix the login").await;
+        ktx.send(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+            .unwrap();
+        match sc.wait {
+            Wait::Screen(t) => wait_for(&latest, t).await,
+            Wait::Posted => {
+                for _ in 0..300 {
+                    if !fake.messages.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                // Let the loop process what followed the post.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Wait::Nothing => {}
+        }
+        *shot.lock().unwrap() = latest.lock().unwrap().clone();
+        let _ = ktx.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    };
+    let mut on_frame = |buf: &Buffer| {
+        frames.fetch_add(1, Ordering::SeqCst);
+        *sink.lock().unwrap() = screen(buf);
+    };
+    let run = run_loop(
+        &mut terminal,
+        &mut app,
+        client,
+        &config,
+        &mut krx,
+        &mut handover,
+        &mut on_frame,
+    );
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(run, driver) })
+            .await
+            .expect("the loop should end");
+    let screen_text = shot.lock().unwrap().clone();
+    let log_lines = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let counts = counts.lock().unwrap().clone();
+    Outcome {
+        result,
+        screen: screen_text,
+        fake,
+        log: log_lines,
+        counts,
+        dir,
+        msgs,
+        app,
+    }
+}
+
+fn files_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn the_terminal_is_handed_over_and_restored_on_every_way_back() {
+    let cases = [
+        ("ok", Scenario::new("text", Wait::Screen("sent to"))),
+        (
+            "ws",
+            Scenario::new("empty", Wait::Screen("the message was empty")),
+        ),
+        (
+            "fail",
+            Scenario::new("fail", Wait::Screen("exit status: 1")),
+        ),
+        ("spawn", {
+            let mut s = Scenario::new("text", Wait::Screen("could not start the editor"));
+            s.shell = "/nonexistent/sh";
+            s
+        }),
+        ("refused", {
+            let mut s = Scenario::new("text", Wait::Screen("send failed"));
+            s.reply = Reply::Refuse("nope".into());
+            s
+        }),
+    ];
+    for (name, sc) in cases {
+        let spawn_fail = name == "spawn";
+        let o = scenario(&format!("every-{name}"), sc).await;
+        o.result.clone().unwrap();
+        let want: Vec<&str> = if spawn_fail {
+            vec!["suspend", "resume"]
+        } else {
+            vec!["suspend", "editor", "resume"]
+        };
+        assert_eq!(o.log, want, "{name}");
+        let (a, b) = (o.counts[0].1, o.counts[1].1);
+        assert_eq!(a, b, "{name}: drew while the editor ran");
+    }
+}
+
+#[tokio::test]
+async fn a_non_zero_editor_exit_sends_nothing_and_keeps_the_text() {
+    let o = scenario(
+        "nonzero",
+        Scenario::new("fail", Wait::Screen("exit status: 1")),
+    )
+    .await;
+    let path = o.path();
+    assert!(o.posts().is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+    assert!(
+        o.screen
+            .contains("nothing sent: the editor exited with exit status: 1")
+    );
+    assert!(
+        o.screen
+            .contains(&format!("; your text is in {}", path.display()))
+    );
+    assert_eq!(o.app.kept_messages.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_send_keeps_the_text_and_says_where() {
+    let mut sc = Scenario::new("text", Wait::Screen("send failed"));
+    sc.reply = Reply::Refuse("marker text zzz".into());
+    let o = scenario("refused", sc).await;
+    let path = o.path();
+    assert!(
+        o.screen.contains("send failed: marker text zzz"),
+        "{}",
+        o.screen
+    );
+    assert!(
+        o.screen
+            .contains(&format!("; your text is in {}", path.display()))
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), " x \n");
+    assert_eq!(o.app.kept_messages.len(), 1);
+
+    let mut sc = Scenario::new("text", Wait::Screen("send timed out"));
+    sc.reply = Reply::Hang;
+    sc.timeout = Duration::from_millis(300);
+    let o = scenario("timeout", sc).await;
+    let path = o.path();
+    assert!(
+        o.screen.contains(
+            "send timed out: the daemon may still have taken it (check the task's events)"
+        ),
+        "{}",
+        o.screen
+    );
+    assert!(
+        o.screen
+            .contains(&format!("; your text is in {}", path.display()))
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), " x \n");
+}
+
+#[tokio::test]
+async fn a_sent_message_removes_its_file_and_refreshes() {
+    let o = scenario(
+        "sent",
+        Scenario::new("text", Wait::Screen("sent to aaaa1111")),
+    )
+    .await;
+    assert_eq!(
+        o.posts(),
+        vec![("aaaa1111-0".to_string(), " x".to_string())]
+    );
+    assert!(files_in(&o.msgs).is_empty());
+    let events = o.fake.events.lock().unwrap().clone();
+    let post = events.iter().position(|e| *e == "post").unwrap();
+    assert!(events[post..].contains(&"list"), "{events:?}");
+}
+
+#[tokio::test]
+async fn ctrl_c_while_the_editor_runs_does_not_stop_the_dashboard() {
+    let mut sc = Scenario::new("ctrlc", Wait::Screen("sent to aaaa1111"));
+    sc.extra = std::process::id().to_string();
+    let o = scenario("ctrlc", sc).await;
+    o.result.clone().unwrap();
+    assert_eq!(o.posts().len(), 1);
+}
+
+#[tokio::test]
+async fn the_editor_gets_default_signal_handling() {
+    let o = scenario(
+        "selfint",
+        Scenario::new("selfint", Wait::Screen("nothing sent")),
+    )
+    .await;
+    assert!(o.posts().is_empty());
+    // macOS /bin/sh reports the signal; dash (Linux CI) exits 128+2.
+    assert!(
+        o.screen.contains("signal: 2") || o.screen.contains("exit status: 130"),
+        "{}",
+        o.screen
+    );
+    eprintln!(
+        "ExitStatus text for a SIGINT-ended editor: {}",
+        o.screen
+            .lines()
+            .find(|l| l.contains("signal: 2") || l.contains("exit status: 130"))
+            .unwrap_or_default()
+            .trim()
+    );
+}
+
+#[tokio::test]
+async fn the_file_path_is_passed_as_an_argument() {
+    let root = Scratch::new("quote-root");
+    let weird = root.0.join("a b'c");
+    std::fs::create_dir_all(&weird).unwrap();
+    let mut sc = Scenario::new("fail", Wait::Screen("exit status: 1"));
+    sc.message_dir = Some(weird.clone());
+    let o = scenario("quote", sc).await;
+    let files = files_in(&weird);
+    assert_eq!(files.len(), 1);
+    assert_eq!(o.path(), files[0]);
+}
+
+#[tokio::test]
+async fn a_message_file_that_cannot_be_created_leaves_the_terminal_alone() {
+    let mut sc = Scenario::new("text", Wait::Screen("could not create a message file:"));
+    sc.message_dir = Some(PathBuf::from("/nonexistent/choco-dir"));
+    let o = scenario("nocreate", sc).await;
+    assert!(o.log.is_empty());
+    assert!(o.posts().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_handover_starts_no_editor_and_still_restores() {
+    let mut sc = Scenario::new(
+        "text",
+        Wait::Screen("could not hand the terminal to the editor: boom; nothing sent"),
+    );
+    sc.suspend_err = Some("boom");
+    let o = scenario("handover", sc).await;
+    assert_eq!(o.log, vec!["suspend", "resume"]);
+    assert!(files_in(&o.msgs).is_empty());
+    assert!(o.posts().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_take_back_ends_the_loop_and_names_the_text() {
+    let mut sc = Scenario::new("text", Wait::Nothing);
+    sc.resume_err = Some("tty gone");
+    let o = scenario("takeback", sc).await;
+    let path = o.path();
+    let err = o.result.unwrap_err();
+    assert!(
+        err.contains("could not take the terminal back: tty gone"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("your unsent message is in {}", path.display())),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), " x \n");
+    assert!(o.fake.messages.lock().unwrap().is_empty());
+
+    let mut sc = Scenario::new("empty", Wait::Nothing);
+    sc.resume_err = Some("tty gone");
+    let o = scenario("takeback-empty", sc).await;
+    let err = o.result.unwrap_err();
+    assert!(err.contains("could not take the terminal back: tty gone"));
+    assert!(!err.contains("unsent message"), "{err}");
+    assert!(files_in(&o.msgs).is_empty());
+
+    // The file cannot be read but exists: kept and named, not deleted.
+    let mut sc = Scenario::new("bin", Wait::Nothing);
+    sc.resume_err = Some("tty gone");
+    let o = scenario("takeback-bin", sc).await;
+    let path = o.path();
+    let err = o.result.unwrap_err();
+    assert!(
+        err.contains(&format!("your unsent message is in {}", path.display())),
+        "{err}"
+    );
+    assert!(path.exists());
+
+    // An empty file that cannot be removed: the error says so.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        let mut sc = Scenario::new("chmod", Wait::Nothing);
+        sc.resume_err = Some("tty gone");
+        let o = scenario("takeback-rmfail", sc).await;
+        let path = o.path();
+        let err = o.result.unwrap_err();
+        assert!(
+            err.contains(&format!("; could not remove {}:", path.display())),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn a_wait_failure_keeps_text_and_removes_nothing_worth_keeping() {
+    let wait = |text: &str| EditOutcome::WaitFailed {
+        error: "boom".into(),
+        content: Ok(text.into()),
+        exists: true,
+    };
+    let mut app = two_tasks();
+    let fx = update(&mut app, edited("aaaa1111-0", wait("x\n")));
+    assert!(fx.is_empty());
+    assert_eq!(app.kept_messages.len(), 1);
+    assert!(
+        app.status
+            .as_ref()
+            .unwrap()
+            .full()
+            .starts_with("nothing sent: could not wait for the editor: boom")
+    );
+    let mut app = two_tasks();
+    let fx = update(&mut app, edited("aaaa1111-0", wait(" \n")));
+    assert!(matches!(&fx[..], [Effect::RemoveFile { .. }]));
+}
+
+#[test]
+fn a_wait_failure_with_an_unreadable_file_keeps_it_and_names_the_cause() {
+    let mut app = two_tasks();
+    let fx = update(
+        &mut app,
+        edited(
+            "aaaa1111-0",
+            EditOutcome::WaitFailed {
+                error: "boom".into(),
+                content: Err("bad utf8".into()),
+                exists: true,
+            },
+        ),
+    );
+    assert!(fx.is_empty());
+    assert_eq!(app.kept_messages.len(), 1);
+    let full = app.status.as_ref().unwrap().full();
+    assert!(full.contains("boom") && full.contains("bad utf8"), "{full}");
+}
+
+#[test]
+fn a_failed_editor_with_an_empty_file_removes_it() {
+    let mut app = two_tasks();
+    let fx = update(&mut app, edited("aaaa1111-0", exited(256, "\n")));
+    assert!(matches!(&fx[..], [Effect::RemoveFile { .. }]));
+    assert!(app.kept_messages.is_empty());
+}
+
+#[test]
+fn a_long_kept_path_shows_its_file_name() {
+    let path = "/var/folders/nb/abcdefghijklmnopqrstuvwxyz0123/T/choco-message-aaaa1111-12345-7.md";
+    let mut app = two_tasks();
+    update(
+        &mut app,
+        Msg::Sent {
+            id: "aaaa1111-0".into(),
+            path: path.into(),
+            result: Err(SendFailure::Failed("refused".into())),
+        },
+    );
+    let out = render(&app, 60, 20);
+    let last = out.lines().last().unwrap().to_string();
+    assert!(
+        last.contains("choco-message-aaaa1111-12345-7.md"),
+        "{last:?}"
+    );
+    assert!(last.starts_with("send failed:"), "{last:?}");
+    // A realistic refusal stays whole beside the file name at 80 columns.
+    let mut app = two_tasks();
+    update(
+        &mut app,
+        Msg::Sent {
+            id: "aaaa1111-0".into(),
+            path: path.into(),
+            result: Err(SendFailure::Failed("task is not at a gate".into())),
+        },
+    );
+    let out = render(&app, 80, 20);
+    let last = out.lines().last().unwrap().to_string();
+    assert!(
+        last.contains("send failed: task is not at a gate"),
+        "{last:?}"
+    );
+    assert!(
+        last.contains("choco-message-aaaa1111-12345-7.md"),
+        "{last:?}"
+    );
+    assert!(!last.contains("……"), "{last:?}");
+}
+
+#[tokio::test]
+async fn an_unreadable_message_is_kept() {
+    let o = scenario(
+        "unreadable",
+        Scenario::new("bin", Wait::Screen("could not read the message:")),
+    )
+    .await;
+    let path = o.path();
+    assert!(o.screen.contains("; nothing sent"), "{}", o.screen);
+    assert!(o.screen.contains(&path.display().to_string()));
+    assert!(path.exists());
+    assert!(o.posts().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_removal_is_reported() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can remove files from a read-only directory");
+        return;
+    }
+    let o = scenario(
+        "rmfail",
+        Scenario::new("chmod", Wait::Screen("could not remove")),
+    )
+    .await;
+    let path = o.path();
+    assert!(
+        o.screen.contains(&format!(
+            "nothing sent: the message was empty; could not remove {}:",
+            path.display()
+        )),
+        "{}",
+        o.screen
+    );
+}
+
+#[tokio::test]
+async fn quitting_with_a_send_in_flight_keeps_its_file_and_lists_it() {
+    let mut sc = Scenario::new("text", Wait::Posted);
+    sc.reply = Reply::Hang;
+    let o = scenario("inflight", sc).await;
+    o.result.clone().unwrap();
+    let path = o.path();
+    assert!(path.exists());
+    assert_eq!(
+        o.app.unanswered_sends,
+        vec![("aaaa1111-0".to_string(), path)]
+    );
+}
+
+#[tokio::test]
+async fn a_terminal_that_ignores_the_cursor_query_is_still_taken_back() {
+    // `scenario` draws to a backend whose cursor query always fails.
+    let o = scenario("nocursor", Scenario::new("text", Wait::Screen("sent to"))).await;
+    o.result.clone().unwrap();
+    assert_eq!(o.posts().len(), 1);
+}
+
+#[tokio::test]
+async fn the_message_file_is_created_new_and_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = EDITOR_LOCK.lock().await;
+    let planted = Scratch::new("planted");
+    let next = super::MESSAGE_FILES.load(Ordering::Relaxed);
+    let mut stale = Vec::new();
+    for n in next..next + 5 {
+        let p = planted.0.join(format!(
+            "choco-message-aaaa1111-{}-{n}.md",
+            std::process::id()
+        ));
+        std::fs::write(&p, "stale").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        stale.push(p);
+    }
+    drop(_serial);
+    let mut sc = Scenario::new("fail", Wait::Screen("exit status: 1"));
+    sc.message_dir = Some(planted.0.clone());
+    let o = scenario("fresh", sc).await;
+    let path = o.path();
+    assert!(!stale.contains(&path), "reused {path:?}");
+    for p in &stale {
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "stale");
+    }
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+fn not_sent_texts(app: &mut App, msg: Msg, w: u16) -> String {
+    update(app, msg);
+    let mut hay = render(app, w, 20);
+    for l in super::app::exit_report(app) {
+        hay.push('\n');
+        hay.push_str(&l);
+    }
+    hay
+}
+
+#[test]
+fn the_full_cause_and_path_stay_readable_when_nothing_is_sent() {
+    let refusal = "stage 'awaiting_human_review' needs exactly one /approve or /request-changes \
+        marker line: put /request-changes or /approve alone on its own line and send again";
+    assert!(refusal.chars().count() > 130);
+    let path = "/var/folders/zz/abcdefghijklmnopqrstuvwxyz0123456789abcdefghijkl/T/\
+        choco-message-aaaa1111-12345-7.md";
+    assert!(path.chars().count() > 95);
+    for w in [80u16, 120] {
+        let mut app = two_tasks();
+        let hay = not_sent_texts(
+            &mut app,
+            Msg::Sent {
+                id: "aaaa1111-0".into(),
+                path: path.into(),
+                result: Err(SendFailure::Failed(refusal.into())),
+            },
+            w,
+        );
+        assert!(hay.contains(refusal), "{w}: refusal\n{hay}");
+        assert!(hay.contains(path), "{w}: path\n{hay}");
+
+        let mut app = two_tasks();
+        let hay = not_sent_texts(
+            &mut app,
+            Msg::Edited {
+                id: "aaaa1111-0".into(),
+                path: path.into(),
+                outcome: EditOutcome::Exited {
+                    status: status(1 << 8),
+                    content: Ok("hello\n".into()),
+                    exists: true,
+                },
+            },
+            w,
+        );
+        assert!(
+            hay.contains("nothing sent: the editor exited with exit status: 1"),
+            "{w}: status\n{hay}"
+        );
+        assert!(hay.contains(path), "{w}: path\n{hay}");
+    }
 }

@@ -558,7 +558,7 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         frame,
         app,
         Rect::new(area.x, area.y + area.height - 1, area.width, 1),
-        "↑↓ move  ⏎ open  / search  o PR  r retry  p pause  c cancel  ? help  q quit",
+        "↑↓ move  ⏎ open  / search  o PR  r retry  p pause  s send  c cancel  ? help  q quit",
     );
 }
 
@@ -633,6 +633,45 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, name: &str) {
     );
 }
 
+/// Splits a status line into its shown text and shown tail for `width`.
+/// The reason (text) has priority: the full tail is shown while the text keeps
+/// up to `WANT` characters beside it; otherwise the tail shrinks to
+/// `; kept: …/<file name>` and the text takes the rest. Only when even that
+/// leaves the text under `FLOOR` characters is the tail cut from its left.
+fn status_parts(text: &str, tail: &str, width: usize) -> (String, String) {
+    const WANT: usize = 40;
+    const FLOOR: usize = 16;
+    let text_len = text.chars().count();
+    let tail_len = tail.chars().count();
+    if text_len.min(WANT) + tail_len <= width {
+        return (fit(text, width.saturating_sub(tail_len)), tail.to_string());
+    }
+    let compact = tail
+        .strip_prefix("; your text is in ")
+        .and_then(|p| p.rsplit('/').next())
+        .map(|file| format!("; kept: …/{file}"))
+        .filter(|c| c.chars().count() < tail_len)
+        .unwrap_or_else(|| tail.to_string());
+    let compact_len = compact.chars().count();
+    let room = width.saturating_sub(compact_len);
+    if room >= text_len.min(FLOOR) {
+        return (fit(text, room), compact);
+    }
+    // Very narrow: keep FLOOR characters of text, cut the tail from its left.
+    let text_room = text_len.min(FLOOR).min(width);
+    let tail_room = width - text_room;
+    let shown_tail = if tail_room == 0 {
+        String::new()
+    } else {
+        let keep: String = compact
+            .chars()
+            .skip(compact_len.saturating_sub(tail_room - 1))
+            .collect();
+        format!("…{keep}")
+    };
+    (fit(text, text_room), shown_tail)
+}
+
 fn draw_bottom(frame: &mut Frame, app: &App, area: Rect, hints: &str) {
     let width = area.width as usize;
     // A failed poll outranks an informational status (e.g. "cancelled x"),
@@ -646,7 +685,9 @@ fn draw_bottom(frame: &mut Frame, app: &App, area: Rect, hints: &str) {
             Level::Error => error_style(app),
             Level::Info => Style::default(),
         };
-        Line::styled(fit(&status.text, width), style)
+        let (shown_text, shown_tail) = status_parts(&status.text, &status.tail, width);
+        let whole = format!("{shown_text}{shown_tail}");
+        Line::styled(fit(&whole, width), style)
     } else if let Some(err) = &app.poll_error {
         let data = match app.last_refresh {
             Some(t) => format!("data {} old", fmt_duration(app.now - t)),
@@ -1245,9 +1286,9 @@ fn draw_detail(frame: &mut Frame, app: &App, d: &Detail, area: Rect) {
     draw_detail_body(frame, app, lines, area, STATUS_HINTS);
 }
 
-const STATUS_HINTS: &str = "e events  o PR  r retry  p pause  c cancel  Esc back";
+const STATUS_HINTS: &str = "e events  o PR  r retry  p pause  s send  c cancel  Esc back";
 const EXPANDED_HINTS: &str =
-    "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  c cancel";
+    "PgUp/PgDn scroll  End follow  e/Esc status  o PR  r retry  p pause  s send  c cancel";
 
 fn draw_detail_body(frame: &mut Frame, app: &App, lines: Vec<Line>, area: Rect, hints: &str) {
     let body_h = area.height.saturating_sub(1);
@@ -1469,7 +1510,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("⇥ / ⇧⇥      next section    r     retry stuck"),
         Line::from("?           this help       c     cancel"),
         Line::from("q  Ctrl-C   quit            p     pause / resume"),
-        Line::from("e           events / status"),
+        Line::from("e           events / status s     send a message"),
         Line::from("/           search"),
     ];
     let r = centered(area, 52, lines.len() as u16 + 2);
