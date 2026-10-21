@@ -89,6 +89,8 @@ impl Env {
 
     fn cfg(&self) -> RoleConfig {
         RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             cwd: self.repo.clone(),
             model: Some("openai-codex/gpt-5.6-terra".to_string()),
             system_prompt: None,
@@ -97,6 +99,18 @@ impl Env {
             report_sections: Vec::new(),
             isolation: Isolation::default(),
             disallowed_tools: Vec::new(),
+        }
+    }
+
+    /// A `memory: true` role of project `project`.
+    fn memory_cfg(&self, project: &str) -> RoleConfig {
+        RoleConfig {
+            isolation: Isolation::Isolated {
+                skills: Vec::new(),
+                memory: true,
+            },
+            project_id: Some(project.to_string()),
+            ..self.cfg()
         }
     }
 }
@@ -1050,7 +1064,7 @@ async fn system_prompt_flags_skills_thinking_tools_and_the_profile_rule() {
 
 #[test]
 fn the_tool_allowlist_drops_what_the_role_disallows_and_never_lists_report_outcome() {
-    let tools = |disallowed: &[RoleTool]| allowed_tools(disallowed).join(",");
+    let tools = |disallowed: &[RoleTool]| allowed_tools(disallowed, false).join(",");
     assert_eq!(tools(&[]), "read,bash,edit,write,glob,grep,todo");
     assert_eq!(tools(&[RoleTool::Edit]), "read,bash,write,glob,grep,todo");
     assert_eq!(tools(&[RoleTool::Write]), "read,bash,edit,glob,grep,todo");
@@ -1596,7 +1610,7 @@ fn billing_follows_the_provider_and_the_environment() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn validate_role_rejects_memory_and_pattern_skill_names() {
+fn validate_role_accepts_memory_and_rejects_pattern_skill_names() {
     let adapter = OmpAdapter::new("/nonexistent");
     let isolated = |skills: &[&str], memory: bool| Isolation::Isolated {
         skills: skills.iter().map(|s| s.to_string()).collect(),
@@ -1612,13 +1626,7 @@ fn validate_role_rejects_memory_and_pattern_skill_names() {
             .validate_role("chat", &Isolation::InheritOperatorConfig)
             .is_ok()
     );
-    assert_eq!(
-        adapter
-            .validate_role("coder", &isolated(&[], true))
-            .unwrap_err(),
-        "role 'coder' runs on cli 'omp', which can't use memory: true; remove memory: true or \
-         run the role on cli: claude"
-    );
+    assert!(adapter.validate_role("coder", &isolated(&[], true)).is_ok());
     for bad in ["a,b", "a*", "a?", "[a]", "a{b}", "a}"] {
         assert_eq!(
             adapter
@@ -1650,13 +1658,505 @@ fn the_default_validate_role_accepts_everything() {
 }
 
 // ---------------------------------------------------------------------------
+// memory: true (#222)
+// ---------------------------------------------------------------------------
+
+fn memory_db_of(env: &Env, project: &str) -> PathBuf {
+    env.state.join("memory").join(project).join("mnemopi.db")
+}
+
+fn mode_of(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn a_memory_overlay_differs_from_the_plain_one_by_exactly_the_memory_block() {
+    let env = Env::new();
+    let db = memory_db_of(&env, "P");
+    let plain = overlay(&env.cfg(), None);
+    let memory = overlay(&env.memory_cfg("P"), Some(&db));
+
+    let mut expected = plain.clone();
+    expected["memory"] = json!({"backend": "mnemopi"});
+    expected["mnemopi"] = json!({
+        "dbPath": db.to_string_lossy(),
+        "bank": "choco",
+        "scoping": "global",
+        "noEmbeddings": true,
+        "llmMode": "none",
+        "autoRecall": true,
+        "autoRetain": true,
+    });
+    // No approval pin: omp runs both memory tools under `always-ask`.
+    assert!(memory["tools"]["approval"].get("recall").is_none());
+    assert_eq!(memory, expected);
+    assert_eq!(memory["memories"]["enabled"], false);
+    // The plain overlay is untouched.
+    assert_eq!(plain["memory"], json!({"backend": "off"}));
+    assert!(plain.get("mnemopi").is_none());
+}
+
+#[test]
+fn only_memory_roles_get_recall_and_retain() {
+    let mut cfg = Env::new().memory_cfg("P");
+    let tools = |cfg: &RoleConfig| {
+        let args = build_args(cfg, Path::new("/o.yml"), Path::new("/s"), None, None);
+        let at = args.iter().position(|arg| arg == "--tools").unwrap();
+        args[at + 1].clone()
+    };
+    assert_eq!(
+        tools(&cfg),
+        "read,bash,edit,write,glob,grep,todo,recall,retain"
+    );
+    let plain = Env::new().cfg();
+    assert_eq!(tools(&plain), "read,bash,edit,write,glob,grep,todo");
+    cfg.disallowed_tools = vec![RoleTool::Edit, RoleTool::Write];
+    assert_eq!(tools(&cfg), "read,bash,glob,grep,todo,recall,retain");
+}
+
+#[tokio::test]
+async fn a_memory_start_and_resume_create_an_owner_only_store_and_others_create_nothing() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport")]);
+    let mut handle = adapter.start("hi", &env.memory_cfg("P")).unwrap();
+    until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    let memory = env.state.join("memory");
+    assert_eq!(mode_of(&memory), 0o700);
+    assert_eq!(mode_of(&memory.join("P")), 0o700);
+
+    // A resume tightens a folder that was made too open.
+    for dir in [&memory, &memory.join("P")] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut handle = adapter.resume("s1", "hi", &env.memory_cfg("P")).unwrap();
+    until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    assert_eq!(mode_of(&memory), 0o700);
+    assert_eq!(mode_of(&memory.join("P")), 0o700);
+
+    // memory: false and an inheriting (chat) role make no store.
+    let other = Env::new();
+    let adapter = other.adapter(&[("FAKE_OMP_MODES", "noreport")]);
+    let mut inherit = other.cfg();
+    inherit.isolation = Isolation::InheritOperatorConfig;
+    for cfg in [other.cfg(), inherit] {
+        let mut handle = adapter.start("hi", &cfg).unwrap();
+        until_turn_completed(&mut handle).await;
+        drain(&mut handle).await;
+    }
+    assert!(!other.state.join("memory").exists());
+}
+
+#[tokio::test]
+async fn the_store_is_keyed_by_project_not_by_cwd() {
+    let env = Env::new();
+    let other_cwd = env.dir.join("worktree-2");
+    std::fs::create_dir_all(&other_cwd).unwrap();
+    let db_of = |report: &Value| {
+        overlay_of(report)["mnemopi"]["dbPath"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mut cfg = env.memory_cfg("P");
+    let first = db_of(&echo_run(&env, &cfg).await);
+    cfg.cwd = other_cwd;
+    let second = db_of(&echo_run(&env, &cfg).await);
+    let third = db_of(&echo_run(&env, &env.memory_cfg("Q")).await);
+    assert_eq!(first, memory_db_of(&env, "P").to_string_lossy());
+    assert_eq!(first, second);
+    assert_ne!(first, third);
+}
+
+/// Events after a start (or resume) that fails: everything until the stream
+/// ends, which only happens once the process has been killed.
+async fn failed_session(env: &Env, stats: &str, resume: bool) -> (Vec<AgentEvent>, String) {
+    failed_session_with(env, stats, resume, true).await
+}
+
+/// As `failed_session`; `drain_all` false stops at the first turn's end.
+async fn failed_session_with(
+    env: &Env,
+    stats: &str,
+    resume: bool,
+    drain_all: bool,
+) -> (Vec<AgentEvent>, String) {
+    let log = env
+        .dir
+        .join(format!("prompts-{}.log", uuid::Uuid::new_v4()));
+    let home = std::fs::canonicalize(&env.dir).unwrap();
+    let adapter = env
+        .adapter(&[
+            ("HOME", &home.to_string_lossy()),
+            ("FAKE_OMP_MODES", "noreport"),
+            ("FAKE_OMP_MEMORY_STATS", stats),
+            ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
+            (
+                "FAKE_OMP_LAUNCH_LOG",
+                &env.dir.join("launch.log").to_string_lossy(),
+            ),
+        ])
+        .with_home(&home)
+        .with_memory_check_timeout(Duration::from_secs(if stats == "hang" { 2 } else { 60 }));
+    let cfg = env.memory_cfg("P");
+    let mut handle = if resume {
+        adapter.resume("s1", "do the work", &cfg).unwrap()
+    } else {
+        adapter.start("do the work", &cfg).unwrap()
+    };
+    let events = if drain_all {
+        drain(&mut handle).await
+    } else {
+        let events = until_turn_completed(&mut handle).await;
+        drain(&mut handle).await;
+        events
+    };
+    (events, std::fs::read_to_string(&log).unwrap_or_default())
+}
+
+#[tokio::test]
+async fn a_healthy_memory_check_runs_before_the_stage_prompt_without_follow_up() {
+    for resume in [false, true] {
+        let env = Env::new();
+        let log = env.dir.join("prompts.log");
+        let adapter = env.adapter(&[
+            ("FAKE_OMP_MODES", "noreport"),
+            ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
+        ]);
+        let cfg = env.memory_cfg("P");
+        let mut handle = if resume {
+            adapter.resume("s1", "do the work", &cfg).unwrap()
+        } else {
+            adapter.start("do the work", &cfg).unwrap()
+        };
+        let events = until_turn_completed(&mut handle).await;
+        drain(&mut handle).await;
+        assert!(
+            matches!(events[0], AgentEvent::SessionMeta { .. }),
+            "{events:?}"
+        );
+        let lines: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                json!({"message": "/memory stats", "streamingBehavior": null}),
+                json!({"message": "do the work", "streamingBehavior": null}),
+            ],
+            "resume={resume}"
+        );
+    }
+}
+
+/// The production adapter (no `with_home`) expands `~/` against the `HOME`
+/// its omp children inherit. The store sits under the real `HOME`, which the
+/// fake inherits too.
+#[tokio::test]
+async fn the_default_adapter_expands_home_relative_paths_against_its_own_home() {
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    assert_eq!(
+        std::fs::canonicalize(&home).unwrap(),
+        home,
+        "this test needs a HOME without symlinks"
+    );
+    let mut env = Env::new();
+    let under_home = home.join(format!(".choco-home-test-{}", uuid::Uuid::new_v4()));
+    env.state = under_home.join("state");
+    let log = env.dir.join("prompts.log");
+    let adapter = env.adapter(&[
+        ("FAKE_OMP_MODES", "noreport"),
+        ("FAKE_OMP_MEMORY_STATS", "home_relative"),
+        ("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy()),
+    ]);
+    let mut handle = adapter.start("do the work", &env.memory_cfg("P")).unwrap();
+    let events = until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    let _ = std::fs::remove_dir_all(&under_home);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("do the work")
+    );
+}
+
+#[tokio::test]
+async fn a_store_omp_prints_as_home_relative_passes_the_check() {
+    // Production keeps the store under $HOME, where real omp prints `~/…`.
+    for resume in [false, true] {
+        let env = Env::new();
+        let (events, log) = failed_session_with(&env, "home_relative", resume, false).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. })),
+            "resume={resume}: {events:?}"
+        );
+        assert!(log.contains("do the work"), "resume={resume}: {log}");
+    }
+}
+
+#[test]
+fn a_home_relative_path_is_expanded_against_the_home_omp_ran_with() {
+    let db = Path::new("/h/.config/choco/omp/memory/P/mnemopi.db");
+    let frames = |path: &str| {
+        vec![
+            json!({"type": "command_output", "text": format!("| choco | `{path}` |\n")}),
+            json!({"type": "response", "id": "m-1", "success": true,
+                   "data": {"agentInvoked": false}}),
+        ]
+    };
+    let verdict = |path: &str, home: Option<&str>| {
+        memory_stats_verdict(&frames(path), "m-1", db, "coder", home.map(Path::new))
+    };
+    assert!(verdict("~/.config/choco/omp/memory/P/mnemopi.db", Some("/h")).is_ok());
+    assert!(verdict("~/.config/choco/omp/memory/Q/mnemopi.db", Some("/h")).is_err());
+    assert!(verdict("~/.omp/agent/memories/mnemopi/mnemopi.db", Some("/h")).is_err());
+    // A `~/` path that expands somewhere else, or with no known HOME.
+    assert!(verdict("~/.config/choco/omp/memory/P/mnemopi.db", Some("/other")).is_err());
+    assert!(verdict("~/.config/choco/omp/memory/P/mnemopi.db", None).is_err());
+}
+
+#[test]
+fn a_home_that_is_a_symlink_is_matched_through_its_canonical_path() {
+    let tmp = tempdir("symlink");
+    let real = std::fs::canonicalize(&tmp).unwrap();
+    let link = real.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let db = real.join("x/mnemopi.db");
+    let frames = vec![
+        json!({"type": "command_output", "text": "| choco | `~/x/mnemopi.db` |\n"}),
+        json!({"type": "response", "id": "m-1", "success": true,
+               "data": {"agentInvoked": false}}),
+    ];
+    assert!(memory_stats_verdict(&frames, "m-1", &db, "coder", Some(&link)).is_ok());
+    let other = real.join("y/mnemopi.db");
+    assert!(memory_stats_verdict(&frames, "m-1", &other, "coder", Some(&link)).is_err());
+}
+
+#[tokio::test]
+async fn a_memory_store_that_did_not_open_fails_the_turn_before_the_stage_prompt() {
+    for resume in [false, true] {
+        for stats in [
+            "error",
+            "other_path",
+            "other_bank",
+            "home_relative_other",
+            "home_relative_default",
+            "no_output",
+            "agent",
+            "exit",
+            "hang",
+        ] {
+            let env = Env::new();
+            let (events, log) = failed_session(&env, stats, resume).await;
+            let db = std::fs::canonicalize(env.state.join("memory/P"))
+                .unwrap()
+                .join("mnemopi.db");
+            let message = events
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::Error { message } => Some(message.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{stats}: no Error in {events:?}"));
+            assert!(message.contains("role 'coder'"), "{stats}: {message}");
+            assert!(
+                message.contains(&db.to_string_lossy().into_owned()),
+                "{stats}: {message}"
+            );
+            if stats == "error" {
+                assert!(message.contains("EACCES"), "{message}");
+            }
+            assert!(
+                !log.contains("do the work"),
+                "{stats} resume={resume}: the stage prompt was sent: {log}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::SessionMeta { .. })),
+                "{stats}: SessionMeta was emitted"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_roles_of_one_store_start_one_at_a_time() {
+    // Each session hangs on /memory stats until its 2 s check deadline. Run
+    // together on one store they must queue: the second's check starts only
+    // after the first's ended.
+    let env = Env::new();
+    let started = std::time::Instant::now();
+    let (a, b) = tokio::join!(
+        failed_session(&env, "hang", false),
+        failed_session(&env, "hang", false)
+    );
+    assert!(a.1.contains("/memory stats") && b.1.contains("/memory stats"));
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "the two checks overlapped: {:?}",
+        started.elapsed()
+    );
+    // The second omp process must not even launch until the first's check
+    // ended (about 2 s after its own launch), since omp opens the store as it
+    // starts.
+    let mut launches: Vec<f64> = std::fs::read_to_string(env.dir.join("launch.log"))
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    launches.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    assert_eq!(launches.len(), 2);
+    assert!(
+        launches[1] - launches[0] >= 1.9,
+        "the second omp launched {:.2}s after the first",
+        launches[1] - launches[0]
+    );
+}
+
+#[test]
+fn the_memory_verdict_needs_the_row_then_the_response_and_no_model_turn() {
+    let db = Path::new("/state/memory/P/mnemopi.db");
+    let output = |bank: &str, path: &str| {
+        json!({"type": "command_output", "text": format!(
+            "# Stats\n\n| Bank | Database |\n| --- | --- |\n| {bank} | `{path}` |\n")})
+    };
+    let response = |agent: bool| {
+        json!({"type": "response", "id": "m-1", "command": "prompt",
+               "success": true, "data": {"agentInvoked": agent}})
+    };
+    let verdict = |frames: &[Value]| memory_stats_verdict(frames, "m-1", db, "coder", None);
+    assert!(
+        verdict(&[
+            output("choco", "/state/memory/P/mnemopi.db"),
+            response(false)
+        ])
+        .is_ok()
+    );
+    // A mixed case: a wrong row before the right one still passes.
+    assert!(
+        verdict(&[
+            output("choco-1a2b", "/state/memory/P/mnemopi.db"),
+            output("choco", "/state/memory/P/mnemopi.db"),
+            response(false)
+        ])
+        .is_ok()
+    );
+    for frames in [
+        vec![response(false)],
+        vec![
+            response(false),
+            output("choco", "/state/memory/P/mnemopi.db"),
+        ],
+        vec![output("choco", "/elsewhere/mnemopi.db"), response(false)],
+        vec![
+            output("choco-1a2b", "/state/memory/P/mnemopi.db"),
+            response(false),
+        ],
+        vec![
+            output("choco", "/state/memory/P/mnemopi.db"),
+            response(true),
+        ],
+        vec![
+            output("choco", "/state/memory/P/mnemopi.db"),
+            json!({"type": "prompt_result", "id": "m-1"}),
+        ],
+        vec![output("choco", "/state/memory/P/mnemopi.db")],
+    ] {
+        let err = verdict(&frames).unwrap_err();
+        assert!(
+            err.contains("role 'coder'") && err.contains("mnemopi.db"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn a_store_path_that_is_a_file_fails_the_spawn_naming_the_role_and_path() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.state.join("memory")).unwrap();
+    std::fs::write(env.state.join("memory/P"), "not a folder").unwrap();
+    let log = env.dir.join("prompts.log");
+    let adapter = env.adapter(&[("FAKE_OMP_PROMPT_LOG", &log.to_string_lossy())]);
+    let Err(AdapterError::Spawn(err)) = adapter.start("hi", &env.memory_cfg("P")) else {
+        panic!("expected a spawn error");
+    };
+    let text = err.to_string();
+    assert!(text.contains("role 'coder'"), "{text}");
+    assert!(
+        text.contains(&env.state.join("memory/P").to_string_lossy().into_owned()),
+        "{text}"
+    );
+    assert!(!log.exists(), "omp must not have been started");
+}
+
+#[test]
+fn a_memory_role_without_a_usable_project_id_fails_and_makes_no_store() {
+    for project in [
+        None,
+        Some("../x"),
+        Some("a/b"),
+        Some(""),
+        Some(".."),
+        Some("/abs"),
+    ] {
+        let env = Env::new();
+        let adapter = env.adapter(&[]);
+        let mut cfg = env.memory_cfg("P");
+        cfg.project_id = project.map(str::to_string);
+        let Err(AdapterError::Spawn(err)) = adapter.start("hi", &cfg) else {
+            panic!("{project:?}: expected a spawn error");
+        };
+        assert!(err.to_string().contains("role 'coder'"), "{err}");
+        assert!(!env.state.join("memory").exists(), "{project:?}");
+        assert!(!env.dir.join("x").exists());
+    }
+}
+
+#[test]
+fn removing_project_data_removes_only_that_projects_store() {
+    let env = Env::new();
+    let adapter = env.adapter(&[]);
+    for project in ["P", "Q"] {
+        let store = env.state.join("memory").join(project);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("mnemopi.db"), "x").unwrap();
+    }
+    adapter.remove_project_data("P").unwrap();
+    assert!(!env.state.join("memory/P").exists());
+    assert!(env.state.join("memory/Q/mnemopi.db").exists());
+    // Nothing to remove, and a bad id.
+    adapter.remove_project_data("P").unwrap();
+    adapter.remove_project_data("never-had-one").unwrap();
+    assert!(adapter.remove_project_data("../Q").is_err());
+    assert!(adapter.remove_project_data("").is_err());
+    assert!(env.state.join("memory/Q/mnemopi.db").exists());
+}
+
+// ---------------------------------------------------------------------------
 // Opt-in tests against the real `omp` (ignored by default)
 // ---------------------------------------------------------------------------
 
 /// Everything `spawn` does before starting the process, for tests that talk
 /// to the real omp themselves: the overlay on disk, the arguments, and the
 /// scrubbed command.
-fn real_command(binary: &str, state: &Path, cfg: &RoleConfig) -> (Command, PathBuf) {
+fn real_command(
+    binary: &str,
+    state: &Path,
+    cfg: &RoleConfig,
+    memory_db: Option<&Path>,
+) -> (Command, PathBuf) {
     let (files, _warnings) = read_repo_instructions(&cfg.cwd, &INSTRUCTION_FILES);
     let append = match &cfg.isolation {
         Isolation::Isolated { .. } => Some(append_block(&render_instruction_files(&files), cfg)),
@@ -1669,7 +2169,7 @@ fn real_command(binary: &str, state: &Path, cfg: &RoleConfig) -> (Command, PathB
     let overlay_path = overlay_dir.join(format!("{}.yml", uuid::Uuid::new_v4()));
     write_private_file(
         &overlay_path,
-        &serde_yaml::to_string(&overlay(cfg)).unwrap(),
+        &serde_yaml::to_string(&overlay(cfg, memory_db)).unwrap(),
     )
     .unwrap();
     let args = build_args(cfg, &overlay_path, &session_dir, append.as_deref(), None);
@@ -1739,7 +2239,7 @@ async fn omp_loads_only_the_repos_own_instructions() {
 
     let mut cfg = env.cfg();
     cfg.cwd = repo;
-    let (mut command, overlay_path) = real_command("omp", &env.state, &cfg);
+    let (mut command, overlay_path) = real_command("omp", &env.state, &cfg, None);
     let mut child = command.spawn().expect("omp must be on PATH");
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap());
@@ -1836,6 +2336,8 @@ fn dump_probe_spawn() {
     let out = std::env::var("CHOCO_PROBE_OUT").unwrap();
     let state = PathBuf::from(&out).with_extension("state");
     let mut cfg = RoleConfig {
+        role: "coder".to_string(),
+        project_id: None,
         cwd,
         model: Some("openai-codex/gpt-5.6-terra".to_string()),
         system_prompt: None,
@@ -1846,7 +2348,7 @@ fn dump_probe_spawn() {
         disallowed_tools: Vec::new(),
     };
     cfg.report_outcomes = vec!["done".to_string()];
-    let (command, overlay_path) = real_command("omp", &state, &cfg);
+    let (command, overlay_path) = real_command("omp", &state, &cfg, None);
     let std_command = command.as_std();
     let args: Vec<String> = std_command
         .get_args()
@@ -1861,6 +2363,301 @@ fn dump_probe_spawn() {
         json!({"args": args, "overlay": overlay_path, "env": env_changes}).to_string(),
     )
     .unwrap();
+}
+
+// -- memory: true against the real omp (#222) --
+
+/// What the operator's own omp state looks like, for the "untouched" checks:
+/// the legacy memories tree (path, size, mtime), whether the fastembed cache
+/// and the mnemopi run folder exist, and `agent.db`'s table list (opened
+/// read-only and immutable, never written).
+#[derive(Debug, PartialEq)]
+struct OmpHomeState {
+    memories: Option<Vec<(PathBuf, u64, std::time::SystemTime)>>,
+    fastembed: bool,
+    run_mnemopi: bool,
+    agent_db_tables: Vec<String>,
+}
+
+async fn omp_home_state() -> OmpHomeState {
+    let home = PathBuf::from(std::env::var("HOME").unwrap()).join(".omp");
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let meta = entry.metadata().unwrap();
+            out.push((entry.path(), meta.len(), meta.modified().unwrap()));
+            if meta.is_dir() {
+                walk(&entry.path(), out);
+            }
+        }
+    }
+    let memories_dir = home.join("agent/memories");
+    let memories = memories_dir.exists().then(|| {
+        let mut files = Vec::new();
+        walk(&memories_dir, &mut files);
+        files.sort();
+        files
+    });
+    let db = home.join("agent/agent.db");
+    let mut agent_db_tables = Vec::new();
+    if db.exists() {
+        use sqlx::ConnectOptions;
+        let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .read_only(true)
+            .immutable(true)
+            .connect()
+            .await
+            .expect("agent.db opens read-only");
+        agent_db_tables =
+            sqlx::query_scalar::<_, String>("SELECT name FROM sqlite_master ORDER BY name")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+    }
+    OmpHomeState {
+        memories,
+        fastembed: home.join("cache/fastembed").exists(),
+        run_mnemopi: home.join("run/mnemopi").exists(),
+        agent_db_tables,
+    }
+}
+
+async fn next_frame(lines: &mut BufReader<ChildStdout>) -> Value {
+    let line = tokio::time::timeout(Duration::from_secs(60), read_lf_line(lines))
+        .await
+        .expect("omp didn't answer in 60 s")
+        .unwrap()
+        .expect("omp exited");
+    serde_json::from_str::<Value>(&line).unwrap()
+}
+
+/// Spawns the real omp with the adapter's own flags and overlay for a memory
+/// role of project `P`, runs the same protocol-v2 negotiation the driver
+/// runs, then `/memory stats` (no model call), and returns the verdict and
+/// the stats table text.
+async fn real_memory_stats(
+    env: &Env,
+    cfg: &RoleConfig,
+    db: &Path,
+    home: Option<&Path>,
+) -> (Result<(), String>, String) {
+    let (mut command, overlay_path) = real_command("omp", &env.state, cfg, Some(db));
+    if let Some(home) = home {
+        command.env("HOME", home);
+    }
+    let mut child = command.spawn().expect("omp must be on PATH");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let ready = loop {
+        let frame = next_frame(&mut lines).await;
+        if frame["type"] == "ready" {
+            break frame;
+        }
+    };
+    let mut assembler = None;
+    if ready["supportedProtocolVersions"]
+        .as_array()
+        .is_some_and(|v| v.iter().any(|v| v == 2))
+    {
+        let frame = json!({"id": "neg", "type": "negotiate_protocol", "protocolVersion": 2});
+        stdin
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+        loop {
+            let frame = next_frame(&mut lines).await;
+            if frame["type"] == "response" && frame["id"] == "neg" {
+                if frame["success"] == true {
+                    assembler = Some(ChunkAssembler::new(DEFAULT_MAX_REASSEMBLED));
+                }
+                break;
+            }
+        }
+    }
+    let frame = json!({"id": "memory-1", "type": "prompt", "message": "/memory stats"});
+    stdin
+        .write_all(format!("{frame}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let mut frame = next_frame(&mut lines).await;
+        if let Some(assembler) = assembler.as_mut() {
+            match assembler.feed(frame) {
+                Reassembled::Frame(whole) => frame = whole,
+                _ => continue,
+            }
+        }
+        let ty = frame["type"].as_str().unwrap_or("").to_string();
+        if matches!(
+            ty.as_str(),
+            "command_output" | "prompt_result" | "message_end"
+        ) || (ty == "response" && frame["id"] == "memory-1")
+        {
+            let done = ty != "command_output";
+            seen.push(frame);
+            if done {
+                break;
+            }
+        }
+    }
+    drop(stdin);
+    let _ = child.wait().await;
+    let _ = std::fs::remove_file(overlay_path);
+    let text = seen
+        .iter()
+        .filter(|f| f["type"] == "command_output")
+        .filter_map(|f| f["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (
+        memory_stats_verdict(&seen, "memory-1", db, &cfg.role, home),
+        text,
+    )
+}
+
+/// No model call. The real omp, under the adapter's own flags and overlay
+/// for a `memory: true` role, opens its store under the temp state folder
+/// and nothing of the operator's omp state changes.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_opens_the_memory_store -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn omp_opens_the_memory_store_without_touching_the_operators_state() {
+    let env = Env::new();
+    let cfg = env.memory_cfg("P");
+    let before = omp_home_state().await;
+    let adapter = OmpAdapter::with_binary("omp", &env.state);
+    let db = adapter.prepare_memory_store(&cfg).unwrap();
+    let (verdict, text) = real_memory_stats(&env, &cfg, &db, None).await;
+    println!("{text}");
+    verdict.unwrap();
+    assert!(
+        db.exists(),
+        "mnemopi.db was not created at {}",
+        db.display()
+    );
+    assert_eq!(omp_home_state().await, before);
+}
+
+/// No model call. The store sits under the `HOME` omp runs with (a temp
+/// one, so the operator's `~/.omp` is untouched), as production keeps it;
+/// real omp prints that path as `~/…` and the check must still pass.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_opens_a_memory_store_under_its_home -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn omp_opens_a_memory_store_under_its_home() {
+    let env = Env::new();
+    let home = std::fs::canonicalize(&env.dir).unwrap();
+    let state = home.join(".config/chocofactory/omp");
+    let cfg = env.memory_cfg("P");
+    let adapter = OmpAdapter::with_binary("omp", &state);
+    let db = adapter.prepare_memory_store(&cfg).unwrap();
+    assert!(db.starts_with(&home));
+    let env = Env {
+        dir: env.dir.clone(),
+        state,
+        repo: env.repo.clone(),
+    };
+    let (verdict, text) = real_memory_stats(&env, &cfg, &db, Some(&home)).await;
+    println!("{text}");
+    verdict.unwrap();
+    assert!(
+        db.exists(),
+        "mnemopi.db was not created at {}",
+        db.display()
+    );
+}
+
+/// No model call. With the store folder unwritable, omp still starts and
+/// claims memory; only the check notices.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_with_an_unwritable_memory_store -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn omp_with_an_unwritable_memory_store_fails_the_check() {
+    let env = Env::new();
+    let cfg = env.memory_cfg("P");
+    let adapter = OmpAdapter::with_binary("omp", &env.state);
+    let db = adapter.prepare_memory_store(&cfg).unwrap();
+    let store = db.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (verdict, _) = real_memory_stats(&env, &cfg, &db, None).await;
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = verdict.unwrap_err();
+    println!("{err}");
+    assert!(err.contains("role 'coder'") && err.contains(&db.to_string_lossy().into_owned()));
+}
+
+/// One model call, through the real driver and its check: the agent
+/// `retain`s a fact; a new session's `/memory stats` then shows rows.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_retains_a_fact -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp, its login, and makes one model call"]
+async fn omp_retains_a_fact_in_the_project_store() {
+    let env = Env::new();
+    let mut cfg = env.memory_cfg("P");
+    cfg.report_outcomes = vec!["done".to_string()];
+    // Outside a disposable worktree omp asks before it acts; the memory tools
+    // must still run (they are not pinned in the overlay).
+    cfg.sandboxed = false;
+    let before = omp_home_state().await;
+    let adapter = OmpAdapter::new(&env.state);
+    let mut handle = adapter
+        .start(
+            "Use your retain tool to store exactly this fact: 'the choco test passphrase is \
+             mauve-walrus'. Then report your outcome as done.",
+            &cfg,
+        )
+        .expect("omp must be on PATH");
+    let events = until_turn_completed(&mut handle).await;
+    println!("{events:#?}");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnCompleted {
+            is_error: false,
+            ..
+        })
+    ));
+    drain(&mut handle).await;
+
+    let db = adapter.prepare_memory_store(&cfg).unwrap();
+    let (verdict, text) = real_memory_stats(&env, &cfg, &db, None).await;
+    println!("{text}");
+    verdict.unwrap();
+    let working: u64 = text
+        .lines()
+        .find(|line| line.contains("| choco |"))
+        .and_then(|line| line.split('|').nth(2))
+        .and_then(|cell| cell.trim().parse().ok())
+        .expect("a Working count in the stats table");
+    assert!(working > 0, "{text}");
+
+    // A second task of the same project, in another working folder, finds
+    // the fact with `recall`.
+    let other_cwd = env.dir.join("worktree-2");
+    std::fs::create_dir_all(&other_cwd).unwrap();
+    cfg.cwd = other_cwd;
+    let mut handle = adapter
+        .start(
+            "Use your recall tool to look up the choco test passphrase. Then report your \
+             outcome as done, with the passphrase as the summary.",
+            &cfg,
+        )
+        .expect("omp must be on PATH");
+    let events = until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult { tool, output, is_error: false, .. }
+                if tool == "recall" && output.contains("mauve-walrus")
+        )),
+        "{events:#?}"
+    );
+    assert_eq!(omp_home_state().await, before);
 }
 
 // -- rpc_chunk reassembly --

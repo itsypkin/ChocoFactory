@@ -310,7 +310,7 @@ pub enum EngineError {
     /// no adapter in the registry. Nothing was created or spawned.
     UnknownCli(UnknownCliError),
     /// The role's adapter can't run the role as configured (for example omp
-    /// with `memory: true`). Nothing was created or spawned.
+    /// with a skill name it would read as a pattern). Nothing was created or spawned.
     RoleRejected(String),
     Session(SessionError),
     Db(sqlx::Error),
@@ -2001,6 +2001,7 @@ impl WorkflowEngine {
             cwd,
             definition.worktree,
             role_config::StageReport::default(),
+            &task.project_id,
         )
         .map_err(SendMessageError::RoleConfig)?;
 

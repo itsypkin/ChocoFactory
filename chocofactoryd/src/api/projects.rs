@@ -145,6 +145,14 @@ pub async fn delete(
         )));
     }
     projects::delete(&state.pool, &id).await?;
+    // Whatever the delete returned: removal is idempotent, and the data
+    // belongs to a project that is now gone. A failure is reported, not
+    // swallowed; the project row stays deleted.
+    if let Err(err) = state.engine.registry().remove_project_data(&id) {
+        let message = format!("project '{id}' was deleted, but {err}");
+        tracing::error!("{message}");
+        return Err(ApiError::Internal(message));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -196,6 +204,109 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::tests::TestServer;
+
+    async fn new_project(server: &TestServer, name: &str) -> String {
+        let created: Value = server
+            .post("/projects", json!({ "name": name }))
+            .await
+            .json();
+        created["id"].as_str().unwrap().to_string()
+    }
+
+    fn make_store(server: &TestServer, id: &str) -> std::path::PathBuf {
+        let store = server.omp_state_dir().join("memory").join(id);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("mnemopi.db"), "rows").unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn deleting_a_project_removes_only_its_own_omp_memory_store() {
+        let server = TestServer::start_with_omp().await;
+        let gone = new_project(&server, "gone").await;
+        let kept = new_project(&server, "kept").await;
+        let no_store = new_project(&server, "bare").await;
+        let gone_store = make_store(&server, &gone);
+        let kept_store = make_store(&server, &kept);
+
+        assert_eq!(
+            server.delete(&format!("/projects/{gone}")).await.status(),
+            204
+        );
+        assert!(!gone_store.exists());
+        assert!(kept_store.join("mnemopi.db").exists());
+        assert!(server.omp_state_dir().join("memory").is_dir());
+
+        // A project that never had a store deletes cleanly too.
+        assert_eq!(
+            server
+                .delete(&format!("/projects/{no_store}"))
+                .await
+                .status(),
+            204
+        );
+    }
+
+    /// Restores permissions so the temp folder can be cleaned up.
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_store_removal_is_a_500_that_names_the_path_and_is_logged() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = TestServer::start_with_omp().await;
+        let id = new_project(&server, "stuck").await;
+        let store = make_store(&server, &id);
+        let memory = server.omp_state_dir().join("memory");
+        let _restore = Restore(memory.clone());
+        std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let log = LogBuf::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let response = server.delete(&format!("/projects/{id}")).await;
+        assert_eq!(response.status(), 500, "{}", response.json());
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            error.contains(&format!("project '{id}' was deleted")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&store.to_string_lossy().into_owned()),
+            "{error}"
+        );
+        let logged = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        assert!(logged.contains("was deleted, but"), "{logged}");
+        // The project row is gone even though the folder could not be.
+        assert_eq!(server.get(&format!("/projects/{id}")).await.status(), 404);
+    }
 
     #[tokio::test]
     async fn crud_round_trip_over_http() {

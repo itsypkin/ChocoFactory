@@ -86,6 +86,7 @@ pub fn resolve_cli(
 /// Resolves `role_name`'s final `cli`/`model`/system prompt against the
 /// three layers, plus `cwd`/`sandboxed`/`report` (stage- or task-wide, not
 /// per-role — passed straight through, not resolved here).
+#[allow(clippy::too_many_arguments)]
 pub fn resolve(
     role_name: &str,
     role_def: &RoleDef,
@@ -94,6 +95,7 @@ pub fn resolve(
     cwd: std::path::PathBuf,
     sandboxed: bool,
     report: StageReport,
+    project_id: &str,
 ) -> Result<ResolvedRoleConfig, RoleConfigError> {
     let task_role = task_config.get("roles").and_then(|r| r.get(role_name));
     let global_role = global.roles.get(role_name);
@@ -139,6 +141,9 @@ pub fn resolve(
             isolation: role_def.isolation.clone(),
             // Same rule (#172): a task creator must not loosen enforcement.
             disallowed_tools: role_def.disallowed_tools.clone(),
+            // Stage- and task-derived, passed straight through (#222).
+            role: role_name.to_string(),
+            project_id: Some(project_id.to_string()),
         },
     })
 }
@@ -198,6 +203,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         assert_eq!(resolved.cli, "def-cli"); // no task-level override, workflow-def wins
@@ -232,6 +238,7 @@ mod tests {
             "/cwd".into(),
             true,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         assert_eq!(resolved.role_config.isolation, def.isolation);
@@ -254,6 +261,7 @@ mod tests {
             "/cwd".into(),
             true,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         assert_eq!(
@@ -283,6 +291,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         assert!(!not_sandboxed.role_config.sandboxed);
@@ -295,6 +304,7 @@ mod tests {
             "/cwd".into(),
             true,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         assert!(sandboxed.role_config.sandboxed);
@@ -322,6 +332,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         assert_eq!(resolved.cli, "def-cli");
@@ -350,6 +361,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         assert_eq!(resolved.cli, "global-cli");
@@ -369,6 +381,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap_err();
         assert!(matches!(
@@ -390,6 +403,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         assert_eq!(
@@ -422,6 +436,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
 
@@ -454,6 +469,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
 
@@ -502,6 +518,7 @@ mod tests {
                 "/cwd".into(),
                 false,
                 StageReport::default(),
+                "p",
             )
             .unwrap_or_else(|err| panic!("config {task_config} should not error, got {err}"));
 
@@ -549,6 +566,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         let reviewer = resolve(
@@ -559,6 +577,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
 
@@ -616,6 +635,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
 
@@ -640,6 +660,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
 
@@ -673,6 +694,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
 
@@ -713,6 +735,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
         let reviewer = resolve(
@@ -723,6 +746,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap();
 
@@ -760,6 +784,7 @@ mod tests {
             "/cwd".into(),
             false,
             StageReport::default(),
+            "p",
         )
         .unwrap_err();
 

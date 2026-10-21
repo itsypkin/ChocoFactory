@@ -1433,6 +1433,8 @@ mod tests {
     async fn start_spawns_process_and_streams_events() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -1483,6 +1485,8 @@ mod tests {
     async fn resume_passes_session_id_through_to_the_cli() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -1514,6 +1518,8 @@ mod tests {
     async fn a_sandboxed_spawn_bypasses_claudes_own_permission_prompts() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -1547,6 +1553,8 @@ mod tests {
     async fn an_unsandboxed_spawn_leaves_claudes_permission_prompts_enabled() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -1578,6 +1586,8 @@ mod tests {
     async fn a_turn_with_no_outcomes_still_gets_the_tool_but_no_routing_instruction() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -1614,6 +1624,8 @@ mod tests {
     async fn a_turn_with_outcomes_gets_a_routing_instruction_naming_them() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -1678,6 +1690,8 @@ mod tests {
     async fn a_turn_with_report_sections_passes_them_to_the_tool() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -1747,6 +1761,8 @@ mod tests {
     ) -> HashMap<String, String> {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools,
             cwd,
             model: None,
@@ -1979,6 +1995,8 @@ mod tests {
     async fn an_isolated_spawn_whose_init_has_no_plugins_key_produces_no_warning() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -2015,6 +2033,8 @@ mod tests {
         ] {
             let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
             let cfg = RoleConfig {
+                role: "coder".to_string(),
+                project_id: None,
                 disallowed_tools: Vec::new(),
                 cwd: std::env::temp_dir(),
                 model: None,
@@ -2080,6 +2100,8 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: dir.clone(),
             model: None,
@@ -2110,6 +2132,8 @@ mod tests {
         );
         let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             disallowed_tools: Vec::new(),
             cwd: std::env::temp_dir(),
             model: None,
@@ -2375,6 +2399,8 @@ mod tests {
 
         let adapter = ClaudeAdapter::new();
         let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
             cwd: repo.clone(),
             model: Some("haiku".to_string()),
             isolation: Isolation::default(),

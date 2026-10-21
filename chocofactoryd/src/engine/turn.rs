@@ -343,6 +343,7 @@ impl WorkflowEngine {
                 // `finish_turn`, the capture — changes shape.
                 sections: report_sections.to_vec(),
             },
+            &task.project_id,
         )
         .map_err(EngineError::RoleConfig)?;
 

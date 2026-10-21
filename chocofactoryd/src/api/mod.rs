@@ -305,6 +305,12 @@ stages:
             self.workflows_dir.0.join(format!("{name}.yaml"))
         }
 
+        /// The state folder of the omp adapter [`Self::start_with_omp`]
+        /// registers.
+        pub fn omp_state_dir(&self) -> PathBuf {
+            self.workflows_dir.0.join("omp-state")
+        }
+
         pub fn write_workflow(&self, name: &str, yaml: &str) {
             std::fs::write(self.workflows_dir.0.join(format!("{name}.yaml")), yaml).unwrap();
         }

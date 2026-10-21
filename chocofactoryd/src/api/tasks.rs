@@ -2846,7 +2846,7 @@ stages:
     }
 
     #[tokio::test]
-    async fn patch_task_config_pointing_a_memory_role_at_omp_is_400_and_leaves_the_config_alone() {
+    async fn patch_task_config_moves_a_memory_role_to_omp_and_back_to_claude() {
         let server = TestServer::start_with_omp().await;
         server.write_workflow(
             "memflow",
@@ -2870,22 +2870,16 @@ stages:
             .as_str()
             .unwrap_or_else(|| panic!("{task}"))
             .to_string();
-        let before = server.get(&format!("/tasks/{task_id}")).await.json()["config"].clone();
 
+        // One workflow file with a memory role runs on either CLI (#222).
         let response = server
             .patch(
                 &format!("/tasks/{task_id}"),
                 json!({ "config": { "roles": { "coder": { "cli": "omp" } } } }),
             )
             .await;
-        assert_eq!(response.status(), 400, "{}", response.json());
-        assert_eq!(
-            response.json()["error"],
-            "role 'coder' runs on cli 'omp', which can't use memory: true; remove memory: true \
-             or run the role on cli: claude"
-        );
-        let after = server.get(&format!("/tasks/{task_id}")).await.json()["config"].clone();
-        assert_eq!(before, after);
+        assert_eq!(response.status(), 200, "{}", response.json());
+        assert_eq!(response.json()["config"]["roles"]["coder"]["cli"], "omp");
 
         // Claude with memory, a role the workflow doesn't define, and a
         // body that sets no cli at all are all fine.

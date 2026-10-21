@@ -54,6 +54,14 @@ pub struct RoleConfig {
     /// only — never task or global config. Adapter-neutral names; each
     /// adapter maps them onto its own CLI's tool names.
     pub disallowed_tools: Vec<RoleTool>,
+    /// The role's name in the workflow. Stage-derived like `sandboxed`:
+    /// passed straight through by `role_config::resolve`, never layered. An
+    /// adapter names it in the errors it gives for this role.
+    pub role: String,
+    /// The task's choco project (#222). Passed straight through by
+    /// `role_config::resolve`. `None` only in hand-built configs; an adapter
+    /// that keeps per-project data refuses to run without one.
+    pub project_id: Option<String>,
 }
 
 /// The adapter-neutral tool vocabulary a workflow's `disallowed_tools` may
@@ -103,23 +111,27 @@ pub enum Isolation {
     /// operator is the one talking to the agent.
     InheritOperatorConfig,
     /// Only the task repo's own settings and `CLAUDE.md`, only the daemon's
-    /// MCP server, no `ReportFindings`, and no auto-memory unless `memory`.
+    /// MCP server, no `ReportFindings`, and no memory unless `memory`.
     Isolated {
         /// The skills this turn may invoke. Empty means none: the `Skill`
         /// tool itself is removed.
         skills: Vec<String>,
-        /// Whether the turn may read and write the operator's auto-memory.
+        /// Whether the turn has a memory. On claude that is the operator's
+        /// own auto-memory for the repo; on omp it is a store choco keeps
+        /// per choco project.
         memory: bool,
     },
 }
 
-// Auto-memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) follows only the variant
-// above, never the daemon's own environment (#105): `Isolated { memory:
+// On claude, auto-memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) follows only the
+// variant above, never the daemon's own environment (#105): `Isolated { memory:
 // false }` sets it, `Isolated { memory: true }` and `InheritOperatorConfig`
 // both explicitly remove it. See `claude::apply_auto_memory_env` for why
 // removal — not "leave it alone" — is required for the latter two: a value
 // already in the daemon's environment is almost always an artifact of where
-// the daemon was launched, not a choice made for this role.
+// the daemon was launched, not a choice made for this role. That is the
+// claude meaning of `memory`; omp keeps a per-project store that choco owns
+// (#222, see `omp.rs`).
 
 impl Default for Isolation {
     /// Isolated, with no skills and no memory: the setting a role gets when
@@ -479,6 +491,11 @@ pub trait AgentAdapter: Send + Sync {
     fn validate_role(&self, _role: &str, _isolation: &Isolation) -> Result<(), String> {
         Ok(())
     }
+    /// Removes whatever this adapter keeps for a deleted project. Idempotent:
+    /// nothing to remove is `Ok`. The default keeps nothing.
+    fn remove_project_data(&self, _project_id: &str) -> Result<(), String> {
+        Ok(())
+    }
     fn start(&self, prompt: &str, cfg: &RoleConfig) -> Result<AgentHandle, AdapterError>;
     fn resume(
         &self,
@@ -550,6 +567,21 @@ impl Registry {
             cli: cli.to_string(),
             known: self.names(),
         })
+    }
+
+    /// Asks every adapter to remove its data for a deleted project, in name
+    /// order. A failure doesn't stop the others; the errors are joined.
+    pub fn remove_project_data(&self, project_id: &str) -> Result<(), String> {
+        let errors: Vec<String> = self
+            .adapters
+            .values()
+            .filter_map(|adapter| adapter.remove_project_data(project_id).err())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     /// Sorted adapter names.

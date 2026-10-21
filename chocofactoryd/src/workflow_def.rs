@@ -805,7 +805,9 @@ struct RawRole {
     /// Skills an isolated role may invoke (#90). Absent means none.
     #[serde(default)]
     skills: Option<Vec<String>>,
-    /// Whether an isolated role may use auto-memory (#90). Absent means no.
+    /// Whether an isolated role has a memory (#90). On claude that is the
+    /// operator's auto-memory; on omp a store choco keeps per project (#222).
+    /// Absent means no.
     #[serde(default)]
     memory: Option<bool>,
     /// Neutral tool names this role may not use (#172).
@@ -1962,7 +1964,7 @@ pub enum WorkflowDefError {
     /// engine's `load_workflow_file`, not by `parse` (which has no registry).
     UnknownCli(crate::adapter::UnknownCliError),
     /// The role's adapter can't run the role as defined (for example omp
-    /// with `memory: true`). Raised by the engine's `load_workflow_file`.
+    /// with a skill name it would read as a pattern). Raised by the engine's `load_workflow_file`.
     RoleRejected(String),
 }
 

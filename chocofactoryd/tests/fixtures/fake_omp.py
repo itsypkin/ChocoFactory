@@ -68,10 +68,29 @@ wrapper script, never through the test process's own environment):
 - FAKE_OMP_PROVIDER / FAKE_OMP_MODEL: what `get_state` reports.
 - FAKE_OMP_NO_PROVIDER=1: omit the provider from `get_state` and from messages.
 - FAKE_OMP_VERSION_FAIL: `--version` exits 1.
+- FAKE_OMP_PROMPT_LOG: a file; every received prompt appends one JSON line
+  `{"message": ..., "streamingBehavior": ...}` to it.
+- FAKE_OMP_LAUNCH_LOG: a file; the process appends its start time (seconds)
+  to it as its first act.
+- FAKE_OMP_MEMORY_STATS: how the prompt `/memory stats` is answered (it makes
+  no model call). The database path and bank are read from the `--config`
+  file's `dbPath:` and `bank:` lines.
+  healthy (default)  a `command_output` table row, then `agentInvoked: false`
+  error       the response is `success: false`, `EACCES: permission denied`
+  home_relative        the row shows the path as `~/…` against this HOME
+  home_relative_other  the same for another project's store
+  home_relative_default  the same for omp's default `~/.omp/…` store
+  other_path  the row names `/elsewhere/mnemopi.db`
+  other_bank  the row names bank `choco-1a2b`
+  no_output   the response only
+  agent       `agentInvoked: true`, then a `prompt_result`
+  exit        the process exits on the prompt
+  hang        the prompt is never answered
 """
 import base64
 import json
 import os
+import re
 import sys
 import time
 
@@ -79,6 +98,11 @@ ARGS = sys.argv[1:]
 MODES = set(filter(None, os.environ.get("FAKE_OMP_MODES", "").split(",")))
 USAGE = {"input": 100, "output": 20, "cacheRead": 30, "cacheWrite": 5}
 COST = 0.0123
+
+
+if os.environ.get("FAKE_OMP_LAUNCH_LOG"):
+    with open(os.environ["FAKE_OMP_LAUNCH_LOG"], "a") as launch_log:
+        launch_log.write("%f\n" % time.time())
 
 
 def emit(obj):
@@ -303,7 +327,62 @@ def run_reports():
             return
 
 
+def config_value(key):
+    config = flag("--config")
+    if not config or not os.path.exists(config):
+        return None
+    with open(config) as handle:
+        match = re.search(r"^\s*%s:\s*(.+?)\s*$" % key, handle.read(), re.M)
+    return match.group(1).strip("'\"") if match else None
+
+
+def memory_stats(request):
+    mode = os.environ.get("FAKE_OMP_MEMORY_STATS", "healthy")
+    db = config_value("dbPath") or ""
+    bank = config_value("bank") or ""
+    if mode == "exit":
+        sys.exit(0)
+    if mode == "hang":
+        return
+    if mode == "error":
+        respond(request, success=False,
+                error="EACCES: permission denied, mkdir '{}'".format(os.path.dirname(db)))
+        return
+    if mode == "agent":
+        respond(request, data={"agentInvoked": True})
+        emit({"type": "prompt_result", "id": request.get("id"), "agentInvoked": True,
+              "status": "completed", "sessionSettled": True})
+        return
+    if mode != "no_output":
+        if mode == "other_path":
+            db = "/elsewhere/mnemopi.db"
+        if mode in ("home_relative", "home_relative_other", "home_relative_default"):
+            home = os.environ.get("HOME", "")
+            if mode == "home_relative_other":
+                db = db.replace("/memory/", "/memory/other-", 1)
+            if mode == "home_relative_default":
+                db = os.path.join(home, ".omp/agent/memories/mnemopi/mnemopi.db")
+            if home and db.startswith(home.rstrip("/") + "/"):
+                db = "~/" + db[len(home.rstrip("/")) + 1:]
+        if mode == "other_bank":
+            bank = "choco-1a2b"
+        emit({"type": "command_output",
+              "text": "# Mnemopi Memory Stats\n\n"
+                      "| Bank | Working | Episodic | Triples | Last memory | Database |\n"
+                      "| --- | --- | --- | --- | --- | --- |\n"
+                      "| {} | 0 | 0 | 0 | - | {} |\n".format(bank, db)})
+    respond(request, data={"agentInvoked": False})
+
+
 def run_prompt(request):
+    log = os.environ.get("FAKE_OMP_PROMPT_LOG")
+    if log:
+        with open(log, "a") as handle:
+            handle.write(json.dumps({"message": request.get("message"),
+                                     "streamingBehavior": request.get("streamingBehavior")}) + "\n")
+    if request.get("message") == "/memory stats":
+        memory_stats(request)
+        return
     if "reject_noerror" in MODES:
         respond(request, success=False)
         return

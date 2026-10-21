@@ -179,8 +179,9 @@ omp login and needs no extra step. An omp role sees the repo's root
 the repo's `.claude/CLAUDE.md` (loaded by omp itself), and
 nothing from nested folders, folders above the repo, or your personal setup,
 so put what it needs in those files or in the spec. Outside a `worktree:
-true` workflow it can read but its edits and commands are refused. It can't
-use `memory: true`. A role on an Anthropic model needs an
+true` workflow it can read but its edits and commands are refused. `memory: true` works, but it is a separate memory per choco
+project, kept under `~/.config/chocofactory/omp/memory/<project-id>/`, not
+your Claude auto-memory. A role on an Anthropic model needs an
 `ANTHROPIC_API_KEY`, not a Claude subscription login.
 For an existing task, `choco task reconfigure` takes effect on the next
 turn.
