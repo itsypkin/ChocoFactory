@@ -1570,11 +1570,9 @@ async fn omp_turn_leaves_nothing_in_the_operators_omp_folder() {
     // Still alive: its client file is in choco's folder; check the pid
     // against ps once.
     let prefix = format!("{pid}-");
-    assert!(
-        client_files(&env).iter().any(|n| n.starts_with(&prefix)),
-        "{:?}",
-        client_files(&env)
-    );
+    // Recorded now, asserted after the leak check, so a leak into `~/.omp`
+    // is reported with its paths first.
+    let client_files_alive = client_files(&env);
     let ps = std::process::Command::new("ps")
         .args(["-o", "pid=,comm=", "-p", &pid.to_string()])
         .output()
@@ -1641,6 +1639,10 @@ async fn omp_turn_leaves_nothing_in_the_operators_omp_folder() {
         "files in ~/.omp naming this turn: {leaks:?}"
     );
     // Positive control: omp did write its state, into choco's folder.
+    assert!(
+        client_files_alive.iter().any(|n| n.starts_with(&prefix)),
+        "{client_files_alive:?}"
+    );
     assert!(
         xdg.join(format!("run/session-owners/{session_id}.lock"))
             .exists()

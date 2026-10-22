@@ -144,11 +144,12 @@ roles:
   `~/.config/chocofactory/omp/xdg-state/omp/`, not in your `~/.omp`: the
   session registry, session locks, logs (`logs/`; look there for omp's log of
   a choco turn), the terminal "last session" pointer and the per-process
-  client files. choco removes only a process's own client file when the turn
-  ends (the empty `run/daemons/<hash>/clients/` folders stay, one per worktree
+  client files. choco removes only a process's own client file when the omp
+  process exits (the empty `run/daemons/<hash>/clients/` folders stay, one per worktree
   path; a daemon crash leaves that turn's file). It never removes the
-  registry, locks, logs or pointer, which stay as long as the transcripts in
-  `~/.config/chocofactory/omp/sessions/`. A choco turn still writes
+  registry, locks, logs or pointer. The registry entries and locks stay as
+  long as the transcripts in `~/.config/chocofactory/omp/sessions/`; omp
+  prunes its own old logs; the pointer stays until omp overwrites it. A choco turn still writes
   `~/.omp/agent/agent.db` and `~/.omp/agent/models.db`: they hold your shared
   login and model list, and omp can't move them without moving the login.
   Side effects: commands the agent runs inherit `XDG_STATE_HOME`, so

@@ -470,7 +470,15 @@ impl Drop for SpawnCleanup {
         };
         let list = |dir: &Path| -> Vec<std::fs::DirEntry> {
             match std::fs::read_dir(dir) {
-                Ok(entries) => entries.filter_map(Result::ok).collect(),
+                Ok(entries) => entries
+                    .filter_map(|entry| match entry {
+                        Ok(entry) => Some(entry),
+                        Err(err) => {
+                            warn(dir, err);
+                            None
+                        }
+                    })
+                    .collect(),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                 Err(err) => {
                     warn(dir, err);
