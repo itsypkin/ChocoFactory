@@ -17673,7 +17673,8 @@ async fn run_an_attempt_that_crosses_the_deadline(
 /// (the old 11s) and with a wall-clock attempt end.
 #[tokio::test]
 async fn an_attempt_that_crosses_the_deadline_is_not_a_missed_deadline() {
-    let (pool, task_id, _dir, _engine) = run_an_attempt_that_crosses_the_deadline("cross-a", 5).await;
+    let (pool, task_id, _dir, _engine) =
+        run_an_attempt_that_crosses_the_deadline("cross-a", 5).await;
     wait_until_stage(&pool, &task_id, "stalled").await;
     let events = poll_events(&pool, &task_id).await;
     assert!(catch_up_entries(&events).is_empty(), "{events:?}");
@@ -17691,7 +17692,8 @@ async fn an_attempt_that_crosses_the_deadline_is_not_a_missed_deadline() {
 /// and catches up.
 #[tokio::test]
 async fn a_sleep_inside_an_attempt_that_crosses_the_deadline_still_catches_up() {
-    let (pool, task_id, _dir, _engine) = run_an_attempt_that_crosses_the_deadline("cross-b", 12).await;
+    let (pool, task_id, _dir, _engine) =
+        run_an_attempt_that_crosses_the_deadline("cross-b", 12).await;
     let entry = wait_until_catch_up_entry(&pool, &task_id).await;
     assert!(entry.get("catch_up_until").is_some());
 }

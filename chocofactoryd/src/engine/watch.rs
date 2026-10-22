@@ -351,8 +351,9 @@ impl WorkflowEngine {
     /// one more attempt — the *final attempt*, capped at
     /// `final_attempt_limit` — and only then reports `timeout`. If the
     /// stored deadline was *missed* (this runner had already watched, and
-    /// the deadline passed by more than one interval: the machine slept or
-    /// the runner stalled), it instead watches a bounded *catch-up* of
+    /// the stage could not watch for more than one interval, counted from the
+    /// deadline or from the end of an attempt that ran past it: the machine
+    /// slept or the runner stalled), it instead watches a bounded *catch-up* of
     /// `catch_up_len`, at most once, which ends with a final attempt too.
     /// The catch-up lives in memory only: a restart or pause during it
     /// falls back to one final attempt. An attempt killed because the

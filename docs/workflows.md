@@ -409,8 +409,9 @@ awaiting_review:
   outcome that matches then is taken as usual. Only if that does not match
   does it advance on the `timeout` edge, which `on:` must have. If the stage
   could not watch when the deadline passed (the machine slept, or the daemon
-  stalled: this run had already made an attempt and the deadline was passed
-  by more than one `interval`), it first watches a catch-up of `timeout` or
+  stalled: this run had already made an attempt, and the stage could not
+  watch for more than one `interval`, counted from the deadline or from the
+  end of an attempt that ran past it), it first watches a catch-up of `timeout` or
   30 minutes, whichever is shorter, at the normal `interval`, and takes the
   last look at its end. There is at most one catch-up per run, and it is kept
   in memory only: a daemon restart or a pause and resume during it falls back
