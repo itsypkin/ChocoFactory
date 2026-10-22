@@ -44,7 +44,7 @@ fn wrapper_for(dir: &Path, fixture: &str, env: &[(&str, &str)], marker: Option<&
     // starting the Python fixture just to print a constant is what blew that
     // budget under load. Mirrors `fake_omp.py`'s own `--version` branch.
     script.push_str(
-        "case \"$1\" in\n--version)\n    if [ -n \"${FAKE_OMP_VERSION_FAIL:-}\" ]; then exit 1; fi\n    echo 'omp/fake-1.0'\n    exit 0\n    ;;\nesac\n",
+        "case \"$1\" in\n--version)\n    if [ -n \"${FAKE_OMP_VERSION_FAIL:-}\" ]; then exit 1; fi\n    if [ -n \"${FAKE_OMP_VERSION_LOG:-}\" ]; then printf '%s\\n' \"${XDG_STATE_HOME:-}\" >> \"$FAKE_OMP_VERSION_LOG\"; if [ -d \"${XDG_STATE_HOME:-/nonexistent}/omp\" ]; then echo yes; else echo no; fi >> \"$FAKE_OMP_VERSION_LOG\"; fi\n    echo 'omp/fake-1.0'\n    exit 0\n    ;;\nesac\n",
     );
     script.push_str(&format!("exec '{}' \"$@\"\n", fixture_binary(fixture)));
     let path = dir.join(format!("wrapper-{}", uuid::Uuid::new_v4()));
@@ -831,6 +831,7 @@ async fn the_isolated_overlay_has_every_key_and_pins_denials_outside_a_worktree(
             json!({"enableClaudeUser": false, "enableCodexUser": false,
                    "enablePiUser": false, "enableAgentsUser": false})
         );
+        assert_eq!(overlay["enabledProviders"], json!([]));
         assert_eq!(overlay["mcp"], json!({"enableProjectConfig": false}));
         assert_eq!(overlay["memory"], json!({"backend": "off"}));
         assert_eq!(overlay["memories"], json!({"enabled": false}));
@@ -1208,6 +1209,450 @@ async fn a_failed_process_spawn_removes_the_overlay_it_wrote() {
             .count(),
         0
     );
+}
+
+// ---------------------------------------------------------------------------
+// omp's state folder, the Claude MCP pins and the home-test guard (#308)
+// ---------------------------------------------------------------------------
+
+/// Removes a folder when dropped, even while unwinding from a panic.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        // A test guard: the folder may never have been created.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn chat_cfg(env: &Env) -> RoleConfig {
+    RoleConfig {
+        isolation: Isolation::InheritOperatorConfig,
+        ..env.cfg()
+    }
+}
+
+async fn echo_with(env: &Env, adapter: &OmpAdapter, cfg: &RoleConfig, resume: bool) -> Value {
+    let mut handle = if resume {
+        adapter.resume("s-1", "hi", cfg).unwrap()
+    } else {
+        adapter.start("hi", cfg).unwrap()
+    };
+    let events = until_turn_completed(&mut handle).await;
+    let _ = env;
+    echo_report(&events)
+}
+
+#[tokio::test]
+async fn every_omp_process_gets_a_prepared_state_folder_as_xdg_state_home() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "echo,noreport")]);
+    let expected = env.state.join("xdg-state").to_string_lossy().into_owned();
+    for (cfg, resume) in [
+        (env.cfg(), false),
+        (env.cfg(), true),
+        (chat_cfg(&env), false),
+    ] {
+        let report = echo_with(&env, &adapter, &cfg, resume).await;
+        assert_eq!(report["env"]["XDG_STATE_HOME"], expected.as_str());
+        assert_eq!(report["state_omp_dir_at_start"], true);
+    }
+    use std::os::unix::fs::MetadataExt;
+    for dir in [env.state.join("xdg-state"), env.state.join("xdg-state/omp")] {
+        assert_eq!(std::fs::metadata(dir).unwrap().mode() & 0o777, 0o700);
+    }
+}
+
+#[tokio::test]
+async fn a_value_in_the_daemons_environment_does_not_win_over_the_redirect() {
+    let env = Env::new();
+    let adapter = env
+        .adapter(&[("FAKE_OMP_MODES", "echo,noreport")])
+        .with_parent_env(&[("XDG_STATE_HOME", "/elsewhere/xdg")]);
+    let report = echo_with(&env, &adapter, &env.cfg(), false).await;
+    assert_eq!(
+        report["env"]["XDG_STATE_HOME"],
+        env.state.join("xdg-state").to_string_lossy().as_ref()
+    );
+}
+
+#[tokio::test]
+async fn omp_version_runs_in_the_turns_environment_and_not_at_all_without_the_folder() {
+    let env = Env::new();
+    let log = env.dir.join("version.log");
+    let binary = wrapper(
+        &env.dir,
+        &[("FAKE_OMP_VERSION_LOG", &log.to_string_lossy())],
+    );
+    let launch = OmpAdapter::with_binary(&binary, &env.state).launch(&env.cfg());
+    assert_eq!(
+        omp_version(&binary, &launch).await.as_deref(),
+        Some("omp/fake-1.0")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        format!("{}\nyes\n", env.state.join("xdg-state").display())
+    );
+
+    std::fs::remove_file(&log).unwrap();
+    std::fs::remove_dir_all(env.state.join("xdg-state")).unwrap();
+    std::fs::write(env.state.join("xdg-state"), "a file").unwrap();
+    assert_eq!(omp_version(&binary, &launch).await, None);
+    assert!(!log.exists(), "omp --version must not have run");
+}
+
+#[tokio::test]
+async fn a_state_folder_that_cannot_be_prepared_refuses_the_spawn_before_the_overlay() {
+    let env = Env::new();
+    std::fs::create_dir_all(&env.state).unwrap();
+    std::fs::write(env.state.join("xdg-state"), "a file").unwrap();
+    let launch_log = env.dir.join("launch.log");
+    let adapter = env.adapter(&[("FAKE_OMP_LAUNCH_LOG", &launch_log.to_string_lossy())]);
+    let err = adapter.start("go", &env.cfg()).err().expect("must fail");
+    let AdapterError::Spawn(err) = err else {
+        panic!("{err:?}")
+    };
+    let text = err.to_string();
+    assert!(text.contains("role 'coder'"), "{text}");
+    assert!(
+        text.contains(&env.state.join("xdg-state").to_string_lossy().to_string()),
+        "{text}"
+    );
+    assert!(
+        std::fs::read_to_string(&launch_log)
+            .unwrap_or_default()
+            .is_empty()
+    );
+    let overlays = env.state.join("overlays");
+    assert!(!overlays.exists() || std::fs::read_dir(overlays).unwrap().count() == 0);
+}
+
+#[test]
+fn a_client_file_belongs_to_exactly_one_pid() {
+    assert!(is_client_file_of("1234-ab.json", 1234));
+    assert!(!is_client_file_of("12345-ab.json", 1234));
+    assert!(!is_client_file_of("1234.json", 1234));
+    assert!(!is_client_file_of("1234-ab.json.tmp", 1234));
+}
+
+/// The `clients/` files in `<state>/xdg-state/omp/run/daemons/*/clients/`.
+fn client_files(env: &Env) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(daemons) = std::fs::read_dir(env.state.join("xdg-state/omp/run/daemons")) else {
+        return found;
+    };
+    for daemon in daemons.flatten() {
+        if let Ok(files) = std::fs::read_dir(daemon.path().join("clients")) {
+            found.extend(
+                files
+                    .flatten()
+                    .map(|f| f.file_name().to_string_lossy().into_owned()),
+            );
+        }
+    }
+    found.sort();
+    found
+}
+
+async fn wait_for_client_file(env: &Env, pid: u32) {
+    let prefix = format!("{pid}-");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !client_files(env)
+        .iter()
+        .any(|name| name.starts_with(&prefix))
+    {
+        assert!(Instant::now() < deadline, "the fake wrote no client file");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_finished_turn_removes_its_own_client_file_and_no_other() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "client_file,noreport")]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let pid = handle.pid().expect("pid");
+    wait_for_client_file(&env, pid).await;
+    let daemons = env.state.join("xdg-state/omp/run/daemons");
+    let longer = daemons
+        .join("e2f034ac33e93976/clients")
+        .join(format!("{pid}5-aaaa.json"));
+    let other_dir = daemons.join("0123456789abcdef/clients");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let other = other_dir.join(format!("{}-bbbb.json", pid + 1));
+    std::fs::write(&longer, "{}").unwrap();
+    std::fs::write(&other, "{}").unwrap();
+    until_turn_completed(&mut handle).await;
+    drain(&mut handle).await;
+    handle.wait().await.unwrap();
+    drop(handle);
+    let prefix = format!("{pid}-");
+    assert!(
+        !client_files(&env).iter().any(|n| n.starts_with(&prefix)),
+        "{:?}",
+        client_files(&env)
+    );
+    assert!(longer.exists() && other.exists());
+    assert!(daemons.join("e2f034ac33e93976/clients").is_dir());
+    assert!(other_dir.is_dir());
+}
+
+#[tokio::test]
+async fn an_abandoned_turn_removes_its_client_file() {
+    let env = Env::new();
+    let adapter = env.adapter(&[("FAKE_OMP_MODES", "client_file,no_ready")]);
+    let handle = adapter.start("go", &env.cfg()).unwrap();
+    let pid = handle.pid().expect("pid");
+    wait_for_client_file(&env, pid).await;
+    drop(handle);
+    assert_eq!(client_files(&env), Vec::<String>::new());
+}
+
+#[test]
+fn the_isolated_overlay_pins_enabled_providers_and_the_chat_overlay_does_not() {
+    let env = Env::new();
+    assert_eq!(overlay(&env.cfg(), None)["enabledProviders"], json!([]));
+    let db = env.dir.join("mnemopi.db");
+    assert_eq!(
+        overlay(&env.memory_cfg("P"), Some(&db))["enabledProviders"],
+        json!([])
+    );
+    assert!(
+        overlay(&chat_cfg(&env), None)
+            .get("enabledProviders")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn claude_config_dir_is_removed_for_isolated_roles_and_kept_for_chat() {
+    let env = Env::new();
+    let dir = env.dir.join("claude").to_string_lossy().into_owned();
+    let adapter = env
+        .adapter(&[("FAKE_OMP_MODES", "echo,noreport")])
+        .with_parent_env(&[("CLAUDE_CONFIG_DIR", &dir)]);
+    let isolated = echo_with(&env, &adapter, &env.cfg(), false).await;
+    assert!(isolated["env"].get("CLAUDE_CONFIG_DIR").is_none());
+    let chat = echo_with(&env, &adapter, &chat_cfg(&env), false).await;
+    assert_eq!(chat["env"]["CLAUDE_CONFIG_DIR"], dir.as_str());
+}
+
+#[test]
+fn the_home_test_guard_removes_its_folder_when_the_test_panics() {
+    let dir = tempdir("guard");
+    std::fs::write(dir.join("file"), "x").unwrap();
+    let guarded = dir.clone();
+    let result = std::panic::catch_unwind(move || {
+        let _guard = RemoveOnDrop(guarded);
+        panic!("a failing test");
+    });
+    assert!(result.is_err());
+    assert!(!dir.exists());
+}
+
+/// Starts the real omp as an isolated role under a fake `HOME` whose
+/// `~/.claude.json` (or `claude_dir/.claude.json`) names an MCP server that
+/// only touches a marker file; returns whether the marker appeared. No model
+/// call: a dummy key lets omp reach `ready`.
+async fn personal_mcp_server_started(
+    enabled_all: bool,
+    claude_config_dir: bool,
+    parent_binary: &str,
+) -> bool {
+    let env = Env::new();
+    let home = env.dir.join("home");
+    let marker = env.dir.join("mcp-started");
+    std::fs::create_dir_all(home.join(".omp/agent")).unwrap();
+    let mut config = String::from("mcp:\n  startupTimeoutMs: 0\n");
+    if enabled_all {
+        config.push_str("enabledProviders: [\"*\"]\n");
+    }
+    std::fs::write(home.join(".omp/agent/config.yml"), config).unwrap();
+    let servers = json!({"mcpServers": {"touch_marker": {
+        "command": "sh",
+        "args": ["-c", format!("touch '{}'; sleep 30", marker.display())]}}});
+    let claude_dir = env.dir.join("claude-dir");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(home.join(".claude.json"), servers.to_string()).unwrap();
+    std::fs::write(claude_dir.join(".claude.json"), servers.to_string()).unwrap();
+    let home_s = home.to_string_lossy().into_owned();
+    let claude_s = claude_dir.to_string_lossy().into_owned();
+    let mut parent = vec![("HOME", home_s.as_str()), ("OPENAI_API_KEY", "sk-dummy")];
+    if claude_config_dir {
+        parent.push(("CLAUDE_CONFIG_DIR", claude_s.as_str()));
+    }
+    let mut cfg = env.cfg();
+    cfg.report_outcomes = vec!["done".to_string()];
+    let (mut command, overlay_path) =
+        real_command_with_env(parent_binary, &env.state, &cfg, None, &parent);
+    let mut child = command.spawn().expect("omp must be on PATH");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let ready = tokio::time::timeout(Duration::from_secs(60), read_lf_line(&mut lines))
+        .await
+        .expect("no ready in 60 s")
+        .unwrap()
+        .expect("omp exited");
+    assert!(ready.contains("\"ready\""), "{ready}");
+    rpc_request(&mut stdin, &mut lines, "s", json!({"type": "get_state"})).await;
+    drop(stdin);
+    let _ = child.kill().await;
+    let _ = std::fs::remove_file(overlay_path);
+    marker.exists()
+}
+
+/// Run with: `cargo test -p chocofactoryd --lib no_personal_mcp_server_starts -- --ignored`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn no_personal_mcp_server_starts_when_the_operator_enables_every_provider() {
+    assert!(!personal_mcp_server_started(true, false, "omp").await);
+}
+
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn no_personal_mcp_server_starts_when_claude_config_dir_is_set() {
+    assert!(!personal_mcp_server_started(false, true, "omp").await);
+}
+
+/// Every file under `root`: path -> (size, mtime).
+fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_dir() {
+                todo.push(entry.path());
+            } else {
+                found.insert(entry.path(), (meta.len(), meta.modified().unwrap()));
+            }
+        }
+    }
+    found
+}
+
+/// The before/after check of `~/.omp` (#308): one real turn through the
+/// adapter must leave nothing naming it in the operator's omp folder, except
+/// inside `agent/agent.db` and `agent/models.db`.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_turn_leaves_nothing_in_the_operators_omp_folder -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a real omp, its login, and makes one model call"]
+async fn omp_turn_leaves_nothing_in_the_operators_omp_folder() {
+    let omp_home = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".omp");
+    let env = Env::new();
+    let adapter = OmpAdapter::new(&env.state);
+    let mut cfg = env.cfg();
+    cfg.report_outcomes = vec!["done".to_string()];
+    let before = snapshot(&omp_home);
+    let mut handle = adapter
+        .start(
+            "Reply with the single word ok, then report your outcome as done.",
+            &cfg,
+        )
+        .expect("omp must be on PATH");
+    let pid = handle.pid().expect("pid");
+    let events = until_turn_completed(&mut handle).await;
+    let session_id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SessionMeta {
+                adapter_session_id, ..
+            } => Some(adapter_session_id.clone()),
+            _ => None,
+        })
+        .expect("a SessionMeta");
+    // Still alive: its client file is in choco's folder; check the pid
+    // against ps once.
+    let prefix = format!("{pid}-");
+    // Recorded now, asserted after the leak check, so a leak into `~/.omp`
+    // is reported with its paths first.
+    let client_files_alive = client_files(&env);
+    let ps = std::process::Command::new("ps")
+        .args(["-o", "pid=,comm=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    println!("ps for pid {pid}: {}", String::from_utf8_lossy(&ps.stdout));
+    drain(&mut handle).await;
+    handle.wait().await.unwrap();
+    drop(handle);
+    let after = snapshot(&omp_home);
+
+    let mut changed: Vec<_> = after
+        .iter()
+        .filter(|(path, stat)| before.get(*path) != Some(stat))
+        .collect();
+    changed.sort();
+    println!("added or changed under {}:", omp_home.display());
+    for (path, (size, mtime)) in &changed {
+        println!("  {} ({size} bytes, {mtime:?})", path.display());
+    }
+    let needles = [
+        session_id.clone(),
+        env.state.join("sessions").to_string_lossy().into_owned(),
+        env.repo.to_string_lossy().into_owned(),
+        pid.to_string(),
+    ];
+    let mut leaks = Vec::new();
+    for (path, (size, _)) in &changed {
+        let name = path.to_string_lossy();
+        if ["agent/agent.db", "agent/models.db"]
+            .iter()
+            .any(|db| name.contains(db))
+        {
+            continue;
+        }
+        let content = if *size <= 64 * 1024 {
+            String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
+        } else {
+            String::new()
+        };
+        if needles
+            .iter()
+            .any(|n| name.contains(n.as_str()) || content.contains(n.as_str()))
+        {
+            leaks.push(path.display().to_string());
+        }
+    }
+    let xdg = env.state.join("xdg-state/omp");
+    println!("under {}:", xdg.display());
+    for (path, (size, mtime)) in snapshot(&xdg) {
+        println!("  {} ({size} bytes, {mtime:?})", path.display());
+    }
+    for var in [
+        "WEZTERM_PANE",
+        "TMUX_PANE",
+        "KITTY_WINDOW_ID",
+        "TERM_SESSION_ID",
+        "ZELLIJ_PANE_ID",
+        "CMUX_SURFACE_ID",
+    ] {
+        println!("{var} set: {}", std::env::var_os(var).is_some());
+    }
+    assert!(
+        leaks.is_empty(),
+        "files in ~/.omp naming this turn: {leaks:?}"
+    );
+    // Positive control: omp did write its state, into choco's folder.
+    assert!(
+        client_files_alive.iter().any(|n| n.starts_with(&prefix)),
+        "{client_files_alive:?}"
+    );
+    assert!(
+        xdg.join(format!("run/session-owners/{session_id}.lock"))
+            .exists()
+    );
+    assert!(!client_files(&env).iter().any(|n| n.starts_with(&prefix)));
+    // `omp --version` through the adapter's builder writes no file.
+    let sizes_before = snapshot(&xdg).len();
+    let launch = adapter.launch(&cfg);
+    assert!(omp_version("omp", &launch).await.is_some());
+    assert_eq!(snapshot(&xdg).len(), sizes_before);
 }
 
 // ---------------------------------------------------------------------------
@@ -1865,6 +2310,9 @@ async fn the_default_adapter_expands_home_relative_paths_against_its_own_home() 
     );
     let mut env = Env::new();
     let under_home = home.join(format!(".choco-home-test-{}", uuid::Uuid::new_v4()));
+    // Removed on every exit, including a failed assertion or the 30 s event
+    // timeout (both panic). A run killed with SIGKILL can't clean up: accepted.
+    let _cleanup = RemoveOnDrop(under_home.clone());
     env.state = under_home.join("state");
     let log = env.dir.join("prompts.log");
     let adapter = env.adapter(&[
@@ -1875,7 +2323,6 @@ async fn the_default_adapter_expands_home_relative_paths_against_its_own_home() 
     let mut handle = adapter.start("do the work", &env.memory_cfg("P")).unwrap();
     let events = until_turn_completed(&mut handle).await;
     drain(&mut handle).await;
-    let _ = std::fs::remove_dir_all(&under_home);
     assert!(
         !events
             .iter()
@@ -2157,6 +2604,20 @@ fn real_command(
     cfg: &RoleConfig,
     memory_db: Option<&Path>,
 ) -> (Command, PathBuf) {
+    real_command_with_env(binary, state, cfg, memory_db, &[])
+}
+
+/// `real_command` with `parent_env` standing in for the daemon's environment.
+fn real_command_with_env(
+    binary: &str,
+    state: &Path,
+    cfg: &RoleConfig,
+    memory_db: Option<&Path>,
+    parent_env: &[(&str, &str)],
+) -> (Command, PathBuf) {
+    let launch = OmpAdapter::with_binary(binary, state)
+        .with_parent_env(parent_env)
+        .launch(cfg);
     let (files, _warnings) = read_repo_instructions(&cfg.cwd, &INSTRUCTION_FILES);
     let append = match &cfg.isolation {
         Isolation::Isolated { .. } => Some(append_block(&render_instruction_files(&files), cfg)),
@@ -2166,6 +2627,7 @@ fn real_command(
     let session_dir = state.join("sessions");
     std::fs::create_dir_all(&overlay_dir).unwrap();
     std::fs::create_dir_all(&session_dir).unwrap();
+    let mut command = omp_command(binary, &launch).unwrap();
     let overlay_path = overlay_dir.join(format!("{}.yml", uuid::Uuid::new_v4()));
     write_private_file(
         &overlay_path,
@@ -2173,7 +2635,6 @@ fn real_command(
     )
     .unwrap();
     let args = build_args(cfg, &overlay_path, &session_dir, append.as_deref(), None);
-    let mut command = Command::new(binary);
     command
         .current_dir(&cfg.cwd)
         .args(&args)
@@ -2181,7 +2642,6 @@ fn real_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    scrub_env(&mut command);
     (command, overlay_path)
 }
 

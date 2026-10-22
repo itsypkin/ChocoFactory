@@ -139,6 +139,28 @@ roles:
   A skill name containing `,` `*` `?` `[` `]` `{` or `}` is rejected, with the
   role's name, when the workflow loads, when a task is created or
   reconfigured, and when a turn starts: omp would read it as a pattern.
+- **omp's own files.** For every omp process choco starts (isolated roles,
+  the chat role, and `omp --version`), omp's bookkeeping files live in
+  `~/.config/chocofactory/omp/xdg-state/omp/`, not in your `~/.omp`: the
+  session registry, session locks, logs (`logs/`; look there for omp's log of
+  a choco turn), the terminal "last session" pointer and the per-process
+  client files. choco removes only a process's own client file when the omp
+  process exits (the empty `run/daemons/<hash>/clients/` folders stay, one per worktree
+  path; a daemon crash leaves that turn's file). It never removes the
+  registry, locks, logs or pointer. The registry entries and locks stay as
+  long as the transcripts in `~/.config/chocofactory/omp/sessions/`; omp
+  prunes its own old logs; the pointer stays until omp overwrites it. A choco turn still writes
+  `~/.omp/agent/agent.db` and `~/.omp/agent/models.db`: they hold your shared
+  login and model list, and omp can't move them without moving the login.
+  Side effects: commands the agent runs inherit `XDG_STATE_HOME`, so
+  XDG-aware tools such as `gh` keep their state in choco's folder; and an
+  operator cap `providers.maxInFlightRequests` no longer counts choco's turns
+  against your own omp. A session started by choco 0.3.3 or earlier and
+  resumed later gets a fresh lock in the new folder.
+- **Your Claude MCP servers.** An isolated omp role pins `enabledProviders`
+  to none and drops `CLAUDE_CONFIG_DIR` from its environment, so the MCP
+  servers in your `~/.claude.json` don't start in its sessions. The chat role
+  keeps both, as it keeps the rest of your setup.
 - **Thinking level.** `medium`, unless the model string ends in a level, such
   as `:high` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
   `auto` or `inherit`).
