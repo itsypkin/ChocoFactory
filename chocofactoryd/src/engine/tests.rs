@@ -17926,3 +17926,28 @@ async fn a_sliver_of_window_still_gets_a_complete_last_look() {
     wait_until_stage(&pool, &task_id, "finished").await;
     assert_eq!(count_lines(&dir.join("count")), 2);
 }
+
+/// The window ends at its deadline, not up to one interval before it: a
+/// `timeout: 3s` stage with a 1s interval must not report `timeout` before
+/// 3s have passed, and its last look starts at or after the deadline.
+#[tokio::test]
+async fn the_last_look_comes_at_the_deadline_not_before_it() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let command = format!(
+        "echo x >> {c}; cat {f} 2>/dev/null || echo PENDING",
+        c = dir.join("count").display(),
+        f = dir.join("flag").display()
+    );
+    let def = write_last_look_flow(&dir, "early", LastLookWatcher::Poll, &command, "1s", "3s");
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let (engine, _offset) = engine_with_offset_clock(pool.clone(), &dir);
+    let began = std::time::Instant::now();
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_stage(&pool, &task_id, "stalled").await;
+    assert!(
+        began.elapsed() >= Duration::from_secs(3),
+        "timed out {:?} after entry, before the 3s deadline",
+        began.elapsed()
+    );
+}

@@ -423,17 +423,6 @@ impl WorkflowEngine {
             // the stored deadline.
             let window_end = catch_up.map(|c| c.end).or(deadline);
             let mut remaining = window_end.map(|at| remaining_budget(at, self.now()));
-            // A sliver of window — less than the final attempt's cap — is
-            // too little for a regular attempt (it would be killed before
-            // it could print), and the sleep that ended it may have run
-            // the whole window with the wall clock a hair early. Treat it
-            // as over, so the stage still gets its last look.
-            if let Some(left) = remaining {
-                let sliver = final_attempt_limit(self.interval_now(&run, entered_at));
-                if left < sliver {
-                    remaining = Some(Duration::ZERO);
-                }
-            }
             let mut kind = AttemptKind::Regular;
             if let (Some(end), Some(Duration::ZERO)) = (window_end, remaining) {
                 // The one place a finished window is handled.
@@ -481,6 +470,13 @@ impl WorkflowEngine {
             // carries without one.
             let limit = if kind == AttemptKind::Final {
                 Some(final_attempt_limit(self.interval_now(&run, entered_at)))
+            } else if attempt > 1 {
+                // A sliver of window left (less than the final attempt's
+                // cap) is too little for a regular attempt: it would be
+                // killed before it could print. Give it the cap instead;
+                // the window ends after it and the final attempt follows.
+                let cap = final_attempt_limit(self.interval_now(&run, entered_at));
+                remaining.map(|r| r.max(cap))
             } else {
                 remaining
             };
