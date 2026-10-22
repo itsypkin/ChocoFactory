@@ -382,6 +382,9 @@ impl WorkflowEngine {
         let mut previous: Option<String> = None;
         // Set once, in memory only, when the deadline was missed.
         let mut catch_up: Option<CatchUp> = None;
+        // When the last attempt returned: time spent inside an attempt was
+        // spent watching, so it does not count towards how late the loop is.
+        let mut last_attempt_end: Option<DateTime<Utc>> = None;
 
         loop {
             // A poll is the one stage kind that holds its window open for
@@ -428,7 +431,8 @@ impl WorkflowEngine {
                 // The one place a finished window is handled.
                 let now = self.now();
                 let interval = self.interval_now(&run, entered_at);
-                let late = (now - end).to_std().unwrap_or(Duration::ZERO);
+                let since = last_attempt_end.map_or(end, |at| at.max(end));
+                let late = (now - since).to_std().unwrap_or(Duration::ZERO);
                 let started_catch_up = match run.watch.timeout {
                     Some(timeout) if catch_up.is_none() && missed(attempt, late, interval) => {
                         let len = catch_up_len(timeout);
@@ -470,11 +474,17 @@ impl WorkflowEngine {
             // carries without one.
             let limit = if kind == AttemptKind::Final {
                 Some(final_attempt_limit(self.interval_now(&run, entered_at)))
-            } else if attempt > 1 {
+            } else if attempt > 1
+                || (self.now() - entered_at).to_std().unwrap_or_default()
+                    > final_attempt_limit(self.interval_now(&run, entered_at))
+            {
                 // A sliver of window left (less than the final attempt's
                 // cap) is too little for a regular attempt: it would be
                 // killed before it could print. Give it the cap instead;
                 // the window ends after it and the final attempt follows.
+                // A fresh stage's first attempt (entered just now) is
+                // excluded, so a `timeout:` shorter than the cap still
+                // bounds it; a resumed runner's first attempt is not.
                 let cap = final_attempt_limit(self.interval_now(&run, entered_at));
                 remaining.map(|r| r.max(cap))
             } else {
@@ -531,6 +541,7 @@ impl WorkflowEngine {
                         "poll stage command ran but its output could not be read"
                     );
                     let note = err.to_string();
+                    last_attempt_end = Some(self.now());
                     if kind == AttemptKind::Final {
                         self.finish_poll_timed_out(
                             task_id,
@@ -578,6 +589,7 @@ impl WorkflowEngine {
                     continue;
                 }
             };
+            last_attempt_end = Some(self.now());
 
             if let Some(matched) = run.outcomes.matching(&outcome.stdout) {
                 let (captured, capture_note) =

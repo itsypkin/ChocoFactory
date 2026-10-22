@@ -17951,3 +17951,56 @@ async fn the_last_look_comes_at_the_deadline_not_before_it() {
         began.elapsed()
     );
 }
+
+/// A runner resumed with only a sliver of window left (less than the
+/// command runs) still gets a complete last look, not an attempt killed at
+/// the sliver.
+#[tokio::test]
+async fn a_resumed_runner_with_a_sliver_left_gets_a_complete_look() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let command = format!(
+        "echo x >> {c}; sleep 1; echo READY",
+        c = dir.join("count").display()
+    );
+    let def = write_last_look_flow(
+        &dir,
+        "resumed-sliver",
+        LastLookWatcher::Poll,
+        &command,
+        "3s",
+        "6h",
+    );
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let now = Utc::now();
+    seed_row(
+        &pool,
+        &task_id,
+        "watch",
+        json!({ "poll_window": window_json("watch", now - chrono::Duration::hours(6), Some(now + chrono::Duration::milliseconds(400))) }),
+    )
+    .await;
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
+    engine.resume_interrupted_polls().await.unwrap();
+    wait_until_stage(&pool, &task_id, "finished").await;
+}
+
+/// A fresh stage whose `timeout` is shorter than the command and than the
+/// interval still kills its first attempt at the timeout.
+#[tokio::test]
+async fn a_fresh_first_attempt_is_bounded_by_a_short_timeout() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = write_last_look_flow(
+        &dir,
+        "short",
+        LastLookWatcher::Poll,
+        "sleep 5; echo READY",
+        "60s",
+        "2s",
+    );
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let (engine, _offset) = engine_with_offset_clock(pool.clone(), &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_stage(&pool, &task_id, "stalled").await;
+}
