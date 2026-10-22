@@ -166,8 +166,8 @@ enum AttemptKind {
 #[derive(Clone, Copy)]
 struct CatchUp {
     end: DateTime<Utc>,
-    /// How long past the deadline the loop found it.
-    late: Duration,
+    /// How long ago the deadline itself passed, for the notes.
+    since_deadline: Duration,
     len: Duration,
 }
 
@@ -175,7 +175,7 @@ impl CatchUp {
     fn first_note(&self) -> String {
         format!(
             "the deadline passed {} ago while the stage could not watch; watching until {} UTC",
-            format_duration(round_for_note(self.late)),
+            format_duration(round_for_note(self.since_deadline)),
             self.end.format("%H:%M:%S")
         )
     }
@@ -437,10 +437,15 @@ impl WorkflowEngine {
                 let started_catch_up = match run.watch.timeout {
                     Some(timeout) if catch_up.is_none() && missed(attempt, late, interval) => {
                         let len = catch_up_len(timeout);
+                        let since_deadline = (now - end).to_std().unwrap_or(Duration::ZERO);
                         let end = now
                             + chrono::Duration::from_std(len)
                                 .unwrap_or_else(|_| chrono::Duration::zero());
-                        Some(CatchUp { end, late, len })
+                        Some(CatchUp {
+                            end,
+                            since_deadline,
+                            len,
+                        })
                     }
                     _ => None,
                 };
@@ -602,7 +607,7 @@ impl WorkflowEngine {
                     if kind == AttemptKind::CatchUpFirst {
                         note.push_str(&format!(
                             " (the deadline passed {} ago while the stage could not watch)",
-                            format_duration(round_for_note(c.late))
+                            format_duration(round_for_note(c.since_deadline))
                         ));
                     }
                 }
@@ -849,9 +854,9 @@ impl WorkflowEngine {
                 format_duration(elapsed)
             ),
             Some(c) => format!(
-                "no outcome matched in {attempts} attempts over {}; the deadline was missed by {}, so the stage watched {} more",
+                "no outcome matched in {attempts} attempts over {}; the deadline was missed by {}, so the stage watched up to {} more",
                 format_duration(elapsed),
-                format_duration(round_for_note(c.late)),
+                format_duration(round_for_note(c.since_deadline)),
                 format_duration(round_for_note(c.len)),
             ),
         };
