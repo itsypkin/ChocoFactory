@@ -17755,7 +17755,8 @@ async fn t2_the_shipped_review_script_sees_a_merge_on_the_final_attempt() {
         gh.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    // `interval` is shortened to 1s; backoff, outcomes and timeout are as
+    // `interval` is shortened to 5s (long enough that attempt 2 cannot start
+    // before the offset is stored); backoff, outcomes and timeout are as
     // shipped.
     let yaml = format!(
         r#"
@@ -17776,7 +17777,7 @@ stages:
         GH_FAKE_DIR: "{gh}"
         PR_NUMBER: "7"
         HANDED_OVER_AT: ""
-      interval: 1s
+      interval: 5s
       backoff:
         - {{ after: 6h, interval: 5m }}
         - {{ after: 30h, interval: 30m }}
@@ -17812,4 +17813,116 @@ stages:
     wait_until_stage(&pool, &task_id, "done").await;
     let events = poll_events(&pool, &task_id).await;
     assert!(find_timeout_entry(&events).is_none(), "{events:?}");
+}
+
+/// The commonest real case: CI finished while the machine slept, so the
+/// first catch-up attempt itself matches.
+#[tokio::test]
+async fn the_first_catch_up_attempt_can_match_and_says_so() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let command = counting_command(&dir, 2, true);
+    let def = write_last_look_flow(
+        &dir,
+        "catch-up-first-match",
+        LastLookWatcher::Poll,
+        &command,
+        "1s",
+        "6h",
+    );
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let (engine, offset) = engine_with_offset_clock(pool.clone(), &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&dir.join("count"), 1).await;
+    offset.store(6 * 3600 + 50 * 60, std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(dir.join("go"), "").unwrap();
+    wait_until_stage(&pool, &task_id, "finished").await;
+    let matched = wait_until_event_matching(&pool, &task_id).await;
+    assert_eq!(matched["attempt"], json!(2));
+    assert!(matched.get("catch_up_until").is_some(), "{matched:?}");
+    let note = matched["note"].as_str().unwrap();
+    assert!(
+        note.contains("; in the catch-up after a missed deadline")
+            && note.ends_with("(the deadline passed 50m ago while the stage could not watch)"),
+        "{note}"
+    );
+    let events = poll_events(&pool, &task_id).await;
+    assert!(find_timeout_entry(&events).is_none(), "{events:?}");
+}
+
+/// A catch-up attempt that cannot start takes the `error` edge, and the
+/// entry still says a catch-up was under way.
+#[tokio::test]
+async fn a_catch_up_attempt_that_cannot_start_takes_the_error_edge() {
+    use std::os::unix::fs::PermissionsExt;
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let script = dir.join("watch.sh");
+    crate::test_support::write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\necho x >> {c}\nwhile [ ! -f {g} ]; do sleep 0.05; done\necho PENDING\n",
+            c = dir.join("count").display(),
+            g = dir.join("go").display()
+        ),
+    );
+    let yaml = r#"
+name: catch-up-spawn
+stages:
+  watch:
+    kind: poll
+    script_file: watch.sh
+    interval: 1s
+    timeout: 6h
+    outcomes:
+      - match: 'READY'
+        then: green
+    on: { green: finished, timeout: stalled, error: errored }
+  finished:
+    kind: terminal
+  stalled:
+    kind: terminal
+  errored:
+    kind: terminal
+"#;
+    let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let (engine, offset) = engine_with_offset_clock(pool.clone(), &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&dir.join("count"), 1).await;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+    offset.store(7 * 3600, std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(dir.join("go"), "").unwrap();
+    wait_until_stage(&pool, &task_id, "errored").await;
+    let events = poll_events(&pool, &task_id).await;
+    assert!(find_timeout_entry(&events).is_none(), "{events:?}");
+    let last = events.last().unwrap();
+    assert_eq!(last["attempt"], json!(2));
+    assert!(last.get("catch_up_until").is_some(), "{last:?}");
+}
+
+/// A window with only a sliver left (shorter than the command runs) still
+/// gets a complete last look instead of a regular attempt killed at the
+/// sliver. Interval 2s, so the sliver is under the 2s final-attempt cap.
+#[tokio::test]
+async fn a_sliver_of_window_still_gets_a_complete_last_look() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let command = format!(
+        "echo x >> {c}; sleep 1.5; cat {f} 2>/dev/null || echo PENDING",
+        c = dir.join("count").display(),
+        f = dir.join("flag").display()
+    );
+    let def = write_last_look_flow(&dir, "sliver", LastLookWatcher::Poll, &command, "2s", "30m");
+    let task_id = seed_task_in(&pool, &def.name, &dir).await;
+    let (engine, offset) = engine_with_offset_clock(pool.clone(), &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_until_count(&dir.join("count"), 1).await;
+    // 4s of window left when attempt 1 started; attempt 2 would start with
+    // well under the command's 1.5s.
+    offset.store(30 * 60 - 4, std::sync::atomic::Ordering::SeqCst);
+    wait_for_poll_attempt(&pool, &task_id).await;
+    std::fs::write(dir.join("flag"), "READY").unwrap();
+    wait_until_stage(&pool, &task_id, "finished").await;
+    assert_eq!(count_lines(&dir.join("count")), 2);
 }

@@ -382,9 +382,6 @@ impl WorkflowEngine {
         let mut previous: Option<String> = None;
         // Set once, in memory only, when the deadline was missed.
         let mut catch_up: Option<CatchUp> = None;
-        // The last sleep ran out the whole window: treat it as over even if
-        // the wall clock reads a hair early.
-        let mut window_over = false;
 
         loop {
             // A poll is the one stage kind that holds its window open for
@@ -426,8 +423,16 @@ impl WorkflowEngine {
             // the stored deadline.
             let window_end = catch_up.map(|c| c.end).or(deadline);
             let mut remaining = window_end.map(|at| remaining_budget(at, self.now()));
-            if std::mem::take(&mut window_over) && remaining.is_some() {
-                remaining = Some(Duration::ZERO);
+            // A sliver of window — less than the final attempt's cap — is
+            // too little for a regular attempt (it would be killed before
+            // it could print), and the sleep that ended it may have run
+            // the whole window with the wall clock a hair early. Treat it
+            // as over, so the stage still gets its last look.
+            if let Some(left) = remaining {
+                let sliver = final_attempt_limit(self.interval_now(&run, entered_at));
+                if left < sliver {
+                    remaining = Some(Duration::ZERO);
+                }
             }
             let mut kind = AttemptKind::Regular;
             if let (Some(end), Some(Duration::ZERO)) = (window_end, remaining) {
@@ -569,12 +574,11 @@ impl WorkflowEngine {
                         self.record_poll_attempt(task_id, &mut previous, key, payload)
                             .await;
                     }
-                    window_over = self
-                        .sleep_before_next_attempt(
-                            self.interval_now(&run, entered_at),
-                            catch_up.map(|c| c.end).or(deadline),
-                        )
-                        .await;
+                    self.sleep_before_next_attempt(
+                        self.interval_now(&run, entered_at),
+                        catch_up.map(|c| c.end).or(deadline),
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -707,12 +711,11 @@ impl WorkflowEngine {
                     .await;
             }
 
-            window_over = self
-                .sleep_before_next_attempt(
-                    self.interval_now(&run, entered_at),
-                    catch_up.map(|c| c.end).or(deadline),
-                )
-                .await;
+            self.sleep_before_next_attempt(
+                self.interval_now(&run, entered_at),
+                catch_up.map(|c| c.end).or(deadline),
+            )
+            .await;
         }
     }
 
@@ -777,8 +780,7 @@ impl WorkflowEngine {
         }
     }
 
-    /// Waits out the interval and says whether that used up the window
-    /// (`true`), so the loop treats it as over and gives it its last look.
+    /// Waits out the interval, or what is left of the window if shorter.
     ///
     /// Measured from the end of one attempt to the start of the next
     /// rather than on a fixed cadence, so a command slower than its own
@@ -789,23 +791,18 @@ impl WorkflowEngine {
     /// `self.now()`; the sleep itself is `interval.min(remaining)` on
     /// tokio's monotonic clock, so after the machine wakes an expired
     /// window is noticed within one interval.
-    async fn sleep_before_next_attempt(
-        &self,
-        interval: Duration,
-        deadline: Option<DateTime<Utc>>,
-    ) -> bool {
+    async fn sleep_before_next_attempt(&self, interval: Duration, deadline: Option<DateTime<Utc>>) {
         let Some(deadline) = deadline else {
             tokio::time::sleep(interval).await;
-            return false;
+            return;
         };
         let remaining = remaining_budget(deadline, self.now());
         if remaining.is_zero() {
-            return true;
+            return;
         }
         // Never sleep past the deadline: a 60s interval under a 70s budget
         // should give up at 70s, not at 120s.
         tokio::time::sleep(interval.min(remaining)).await;
-        interval >= remaining
     }
 
     /// Ends a poll whose window is over with no matching outcome (§5.2's
