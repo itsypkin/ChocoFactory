@@ -181,7 +181,7 @@ nothing from nested folders, folders above the repo, or your personal setup,
 so put what it needs in those files or in the spec. Outside a `worktree:
 true` workflow it can read but its edits and commands are refused. `memory: true` works, but it is a separate memory per choco
 project, kept under `~/.config/chocofactory/omp/memory/<project-id>/`, not
-your Claude auto-memory. A role on an Anthropic model needs an
+your Claude auto-memory. omp's own files for a choco turn (session registry, locks, logs, client files) go to `~/.config/chocofactory/omp/xdg-state/omp/`; only `~/.omp/agent/agent.db` and `models.db` are still written ([details](../../../../docs/models.md)). A role on an Anthropic model needs an
 `ANTHROPIC_API_KEY`, not a Claude subscription login.
 For an existing task, `choco task reconfigure` takes effect on the next
 turn.
