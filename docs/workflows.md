@@ -403,10 +403,22 @@ awaiting_review:
 - `watch:` takes the same fields as a `poll` stage (`command` or
   `script_file`, `env`, `interval`, `backoff`, `timeout`, `outcomes`), and
   `interval` is required. When an outcome matches, the gate advances on it, keeping the
-  command's output if the gate says `capture: text`. When `timeout` runs out it
-  advances on the `timeout` edge, which `on:` must have. The watcher is the
-  same loop a `poll` runs: it survives a daemon restart with its stored
-  deadline.
+  command's output if the gate says `capture: text`. When `timeout` runs out
+  the watcher takes one last look before giving up: it runs the command once
+  more, capped at the `interval` or 60 seconds, whichever is shorter, and an
+  outcome that matches then is taken as usual. Only if that does not match
+  does it advance on the `timeout` edge, which `on:` must have. If the stage
+  could not watch when the deadline passed (the machine slept, or the daemon
+  stalled: this run had already made an attempt, and the stage could not
+  watch for more than one `interval`, counted from the deadline or from the
+  end of an attempt that ran past it), it first watches a catch-up of `timeout` or
+  30 minutes, whichever is shorter, at the normal `interval`, and takes the
+  last look at its end. There is at most one catch-up per run, and it is kept
+  in memory only: a daemon restart or a pause and resume during it falls back
+  to one last look. An attempt that is killed because the budget ran out was
+  already the last look and ends in `timeout` at once. All of this applies to
+  `poll` stages too. The watcher is the same loop a `poll` runs: it survives a
+  daemon restart with its stored deadline.
 - `backoff:` (optional, on a `poll` stage and on `watch:`) slows the polling
   down the longer the stage waits. Each step is `{ after: 6h, interval: 5m }`:
   from `after` on, the step's `interval` replaces the base one. `after` is

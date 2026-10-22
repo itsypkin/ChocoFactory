@@ -60,13 +60,16 @@ Read this while watching a task, when its behaviour surprises you.
   4th red in a row parks the task at `escalate_to_human`). It escalates to
   `escalate_to_human` on a cancelled, startup-failure or action-required
   check (the outcome name in `choco task status` says which), and when CI
-  has not finished in 30 minutes. A real failure wins over those three. A PR
+  has not finished in 30 minutes (it takes one last look at the deadline, and
+  watches up to 30 more minutes if the machine slept through it, unless the
+  daemon restarts meanwhile). A real failure wins over those three. A PR
   with no checks at all goes to `awaiting_human_review` as `no_checks` after
   3 minutes, so on a repo without CI, or on a conflicting PR, you review
   without CI. The timeline lists each check with its state.
 - **awaiting_human_review.** A human gate that watches the PR's comments and reviews
   every minute for 6 hours, every 5 minutes for the next 24 hours and every
-  30 minutes for the next 3 days, then parks at `escalate_to_human`. It also takes
+  30 minutes for the next 3 days, takes one last look, then parks at
+  `escalate_to_human`. It also takes
   `choco task send <id> --text "..."` carrying `/approve` or
   `/request-changes` on a line of its own; a reply with neither or both is
   refused. A merged PR counts as approval and moves the task to `done`; a PR

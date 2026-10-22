@@ -2,6 +2,7 @@ use super::runners::DetachedKind;
 use super::shell_stage::{describe_command, duration_ms, elapsed_ms, tail, warn_if_escaped};
 use super::stage_capture::derive_capture;
 use super::*;
+use chocofactory_core::duration::format_duration;
 
 /// Everything a detached poll runner needs, resolved once on stage entry.
 ///
@@ -149,6 +150,64 @@ pub(crate) fn timed_out_watch(
     })
 }
 
+/// Which kind of attempt `run_watch` is about to run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttemptKind {
+    /// An ordinary attempt inside the window being watched.
+    Regular,
+    /// The first attempt of a catch-up, run the moment the missed deadline
+    /// is found.
+    CatchUpFirst,
+    /// The last look, after the window (deadline or catch-up) is over.
+    Final,
+}
+
+/// A bounded extra watch after a missed deadline (#313). In memory only.
+#[derive(Clone, Copy)]
+struct CatchUp {
+    end: DateTime<Utc>,
+    /// How long ago the deadline itself passed, for the notes.
+    since_deadline: Duration,
+    len: Duration,
+}
+
+impl CatchUp {
+    fn first_note(&self) -> String {
+        format!(
+            "the deadline passed {} ago while the stage could not watch; watching until {} UTC",
+            format_duration(round_for_note(self.since_deadline)),
+            self.end.format("%H:%M:%S")
+        )
+    }
+}
+
+/// The longest a final attempt may run: its window is gone, so it gets
+/// the interval, never more than a minute.
+pub(super) fn final_attempt_limit(interval: Duration) -> Duration {
+    interval.min(Duration::from_secs(60))
+}
+
+/// How long a catch-up watches: the stage's own `timeout`, never more
+/// than half an hour.
+pub(super) fn catch_up_len(timeout: Duration) -> Duration {
+    timeout.min(Duration::from_secs(30 * 60))
+}
+
+/// Whether a deadline was missed: this runner had already watched, and the
+/// loop found the deadline passed by *more than* one interval.
+pub(super) fn missed(attempts: u64, late: Duration, interval: Duration) -> bool {
+    attempts > 0 && late > interval
+}
+
+/// Whole minutes once a duration is a minute or more, for timeline notes.
+fn round_for_note(d: Duration) -> Duration {
+    if d >= Duration::from_secs(60) {
+        Duration::from_secs(d.as_secs() / 60 * 60)
+    } else {
+        d
+    }
+}
+
 /// What is left of a wall-clock budget; `ZERO` once the deadline passed.
 pub(super) fn remaining_budget(deadline: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
     (deadline - now).to_std().unwrap_or(Duration::ZERO)
@@ -277,13 +336,29 @@ impl WorkflowEngine {
     }
 
     /// Runs the command on `interval` until an outcome matches or the
-    /// `timeout` budget runs out (§5.2).
+    /// `timeout` budget runs out (§5.2). Serves `poll` stages and the
+    /// `watch:` of a `human_gate` alike.
     ///
     /// The budget is a wall-clock deadline (#52): `run.deadline` was fixed
     /// when the stage was entered and survives a daemon restart, and every
     /// check against it reads `self.now()`, so it keeps counting while the
     /// machine sleeps. Only the `interval` sleep and each attempt's kill
-    /// timer run on the monotonic clock.
+    /// timer run on the monotonic clock, which stops during a sleep.
+    ///
+    /// **A window that is over is never reported without a last look
+    /// (#313).** When the loop finds the window over (one place: the top of
+    /// the loop, which the sleep and a resumed runner both reach), it runs
+    /// one more attempt — the *final attempt*, capped at
+    /// `final_attempt_limit` — and only then reports `timeout`. If the
+    /// stored deadline was *missed* (this runner had already watched, and
+    /// the stage could not watch for more than one interval, counted from the
+    /// deadline or from the end of an attempt that ran past it: the machine
+    /// slept or the runner stalled), it instead watches a bounded *catch-up* of
+    /// `catch_up_len`, at most once, which ends with a final attempt too.
+    /// The catch-up lives in memory only: a restart or pause during it
+    /// falls back to one final attempt. An attempt killed because the
+    /// budget ran out was already the stage's last look, so it reports
+    /// `timeout` at once.
     ///
     /// Unlike `shell`, the command's *exit code decides nothing*: a polled
     /// command failing is ordinary — `gh` on a rate limit or a dropped
@@ -306,9 +381,12 @@ impl WorkflowEngine {
         // What the previous attempt produced, for the "only record what
         // changed" rule below. `None` until the first attempt reports.
         let mut previous: Option<String> = None;
-        // The most recent attempt that actually ran, so every timeout path
-        // can report what the command last said rather than an empty entry.
-        let mut last_outcome: Option<shell::ShellOutcome> = None;
+        // Set once, in memory only, when the deadline was missed.
+        let mut catch_up: Option<CatchUp> = None;
+        // When the last attempt returned, by its own monotonic run time: time
+        // spent inside an attempt was spent watching, so it does not count
+        // towards how late the loop is, while a sleep during it still does.
+        let mut last_attempt_end: Option<DateTime<Utc>> = None;
 
         loop {
             // A poll is the one stage kind that holds its window open for
@@ -346,56 +424,107 @@ impl WorkflowEngine {
                 return;
             }
 
-            let remaining = deadline.map(|at| remaining_budget(at, self.now()));
-            if remaining == Some(Duration::ZERO) {
-                self.finish_poll_timed_out(
-                    task_id,
-                    definition,
-                    stage_name,
-                    &described,
-                    attempt,
-                    last_outcome.as_ref(),
-                    entered_at,
-                )
-                .await;
-                return;
+            // The window being watched: the catch-up's end during one, else
+            // the stored deadline.
+            let window_end = catch_up.map(|c| c.end).or(deadline);
+            let mut remaining = window_end.map(|at| remaining_budget(at, self.now()));
+            let mut kind = AttemptKind::Regular;
+            if let (Some(end), Some(Duration::ZERO)) = (window_end, remaining) {
+                // The one place a finished window is handled.
+                let now = self.now();
+                let interval = self.interval_now(&run, entered_at);
+                let since = last_attempt_end.map_or(end, |at| at.max(end));
+                let late = (now - since).to_std().unwrap_or(Duration::ZERO);
+                let started_catch_up = match run.watch.timeout {
+                    Some(timeout) if catch_up.is_none() && missed(attempt, late, interval) => {
+                        let len = catch_up_len(timeout);
+                        let since_deadline = (now - end).to_std().unwrap_or(Duration::ZERO);
+                        let end = now
+                            + chrono::Duration::from_std(len)
+                                .unwrap_or_else(|_| chrono::Duration::zero());
+                        Some(CatchUp {
+                            end,
+                            since_deadline,
+                            len,
+                        })
+                    }
+                    _ => None,
+                };
+                match started_catch_up {
+                    Some(started) => {
+                        tracing::info!(
+                            task_id,
+                            stage = stage_name,
+                            late_secs = late.as_secs(),
+                            catch_up_until = %started.end.to_rfc3339(),
+                            "poll deadline was missed; watching a catch-up before giving up"
+                        );
+                        catch_up = Some(started);
+                        remaining = Some(remaining_budget(started.end, self.now()));
+                        kind = AttemptKind::CatchUpFirst;
+                    }
+                    None => kind = AttemptKind::Final,
+                }
             }
 
             attempt += 1;
             let started = std::time::Instant::now();
-            // Each attempt is capped at whatever is left of the stage's
-            // budget rather than at `interval`: a command that legitimately
+            let started_wall = self.now();
+            // Each regular attempt is capped at whatever is left of the
+            // window rather than at `interval`: a command that legitimately
             // takes longer than its own interval — a slow `gh` call on a
             // 30s poll — would otherwise be killed on every single attempt
-            // and the stage could never resolve. With no `timeout:` at all
-            // there is no cap, and a hung command parks the task, the same
-            // gap `shell` carries without one.
-            let outcome = match shell::run(&run.command, &run.cwd, remaining, &run.env).await {
+            // and the stage could never resolve. The final attempt gets
+            // `final_attempt_limit` instead: its window is already gone, so
+            // there is no budget to cap it at, and a hung command must not
+            // hold the stage open. With no `timeout:` at all there is no
+            // cap, and a hung command parks the task, the same gap `shell`
+            // carries without one.
+            let limit = if kind == AttemptKind::Final {
+                Some(final_attempt_limit(self.interval_now(&run, entered_at)))
+            } else if attempt > 1
+                || (self.now() - entered_at).to_std().unwrap_or_default()
+                    > final_attempt_limit(self.interval_now(&run, entered_at))
+            {
+                // A sliver of window left (less than the final attempt's
+                // cap) is too little for a regular attempt: it would be
+                // killed before it could print. Give it the cap instead;
+                // the window ends after it and the final attempt follows.
+                // A fresh stage's first attempt (entered just now) is
+                // excluded, so a `timeout:` shorter than the cap still
+                // bounds it; a resumed runner's first attempt is not.
+                let cap = final_attempt_limit(self.interval_now(&run, entered_at));
+                remaining.map(|r| r.max(cap))
+            } else {
+                remaining
+            };
+            let outcome = match shell::run(&run.command, &run.cwd, limit, &run.env).await {
                 Ok(outcome) => outcome,
                 // Nothing ran and nothing will: no `sh` on PATH, or a
                 // `script_file` that isn't executable. Retrying on an
                 // interval would just burn the whole budget to reach the
-                // same place, so this ends the poll.
+                // same place, so this ends the poll — also on the final
+                // attempt, where it is never collapsed into `timeout`.
                 Err(err @ shell::ShellError::Spawn(_)) => {
                     tracing::error!(
                         task_id, stage = stage_name, %err,
                         "poll stage command could not be started"
                     );
-                    self.append_command_event(
-                        task_id,
-                        json!({
-                            "stage": stage_name,
-                            "command": described,
-                            "attempt": attempt,
-                            "exit_code": Value::Null,
-                            "timed_out": false,
-                            "duration_ms": elapsed_ms(started),
-                            "stdout_tail": "",
-                            "stderr_tail": "",
-                            "note": err.to_string(),
-                        }),
-                    )
-                    .await;
+                    let mut payload = json!({
+                        "stage": stage_name,
+                        "command": described,
+                        "attempt": attempt,
+                        "exit_code": Value::Null,
+                        "timed_out": false,
+                        "duration_ms": elapsed_ms(started),
+                        "stdout_tail": "",
+                        "stderr_tail": "",
+                        "note": err.to_string(),
+                    });
+                    if let (AttemptKind::CatchUpFirst, Some(c)) = (kind, catch_up) {
+                        payload["catch_up_until"] = json!(c.end.to_rfc3339());
+                    }
+                    self.append_command_event(task_id, payload).await;
                     self.finish_detached(
                         DetachedKind::Poll,
                         task_id,
@@ -410,67 +539,79 @@ impl WorkflowEngine {
                 // The command *did* run — possibly for a long time — and
                 // only reading its pipes failed. That says nothing about
                 // the state being polled, so keep polling; the attempt
-                // simply contributes no output to match against.
+                // simply contributes no output to match against. On the
+                // final attempt there is no next one: it ends in `timeout`
+                // with the error in the note. Either way no *older*
+                // attempt's output is reported under this attempt's number.
                 Err(err @ shell::ShellError::Io(_)) => {
                     tracing::warn!(
                         task_id, stage = stage_name, %err,
                         "poll stage command ran but its output could not be read"
                     );
                     let note = err.to_string();
-                    self.record_poll_attempt(
-                        task_id,
-                        &mut previous,
-                        // Prefixed with a NUL so an I/O failure can never
-                        // collide with a command that happens to print the
-                        // same text, which would suppress the event.
-                        format!("\0io:{note}"),
-                        json!({
-                            "stage": stage_name,
-                            "command": described,
-                            "attempt": attempt,
-                            "exit_code": Value::Null,
-                            "timed_out": false,
-                            "duration_ms": elapsed_ms(started),
-                            "stdout_tail": "",
-                            "stderr_tail": "",
-                            "note": note,
-                        }),
-                    )
-                    .await;
-                    // This attempt produced no outcome, and an *older* one
-                    // must not be reported under this attempt's number — a
-                    // timeout entry saying "attempt 7" while carrying
-                    // attempt 6's exit code and output would be a quietly
-                    // wrong record. Clearing it means both timeout paths
-                    // below report empty fields after an I/O failure, which
-                    // is honest about what the last attempt actually
-                    // yielded: nothing.
-                    last_outcome = None;
-                    if self
-                        .sleep_before_next_attempt(self.interval_now(&run, entered_at), deadline)
-                        .await
-                        .is_break()
-                    {
+                    last_attempt_end = Some(attempt_end(started_wall, started));
+                    if kind == AttemptKind::Final {
                         self.finish_poll_timed_out(
                             task_id,
                             definition,
                             stage_name,
                             &described,
                             attempt,
-                            last_outcome.as_ref(),
+                            None,
                             entered_at,
+                            catch_up.as_ref(),
+                            Some(&note),
                         )
                         .await;
                         return;
                     }
+                    let mut payload = json!({
+                        "stage": stage_name,
+                        "command": described,
+                        "attempt": attempt,
+                        "exit_code": Value::Null,
+                        "timed_out": false,
+                        "duration_ms": elapsed_ms(started),
+                        "stdout_tail": "",
+                        "stderr_tail": "",
+                        "note": note,
+                    });
+                    // Prefixed with a NUL so an I/O failure can never
+                    // collide with a command that happens to print the
+                    // same text, which would suppress the event.
+                    let key = format!("\0io:{note}");
+                    if let (AttemptKind::CatchUpFirst, Some(c)) = (kind, catch_up) {
+                        payload["note"] = json!(format!("{}; {note}", c.first_note()));
+                        payload["catch_up_until"] = json!(c.end.to_rfc3339());
+                        previous = Some(key);
+                        self.append_command_event(task_id, payload).await;
+                    } else {
+                        self.record_poll_attempt(task_id, &mut previous, key, payload)
+                            .await;
+                    }
+                    self.sleep_before_next_attempt(
+                        self.interval_now(&run, entered_at),
+                        catch_up.map(|c| c.end).or(deadline),
+                    )
+                    .await;
                     continue;
                 }
             };
+            last_attempt_end = Some(attempt_end(started_wall, started));
 
             if let Some(matched) = run.outcomes.matching(&outcome.stdout) {
                 let (captured, capture_note) =
                     derive_capture(run.capture, &outcome.stdout, task_id, stage_name, "stdout");
                 let mut note = format!("matched \"{}\" on attempt {attempt}", matched.pattern);
+                if let Some(c) = catch_up {
+                    note.push_str("; in the catch-up after a missed deadline");
+                    if kind == AttemptKind::CatchUpFirst {
+                        note.push_str(&format!(
+                            " (the deadline passed {} ago while the stage could not watch)",
+                            format_duration(round_for_note(c.since_deadline))
+                        ));
+                    }
+                }
                 if let Some(capture_note) = capture_note {
                     note.push_str("; ");
                     note.push_str(&capture_note);
@@ -489,27 +630,27 @@ impl WorkflowEngine {
                 warn_if_escaped(task_id, stage_name, &outcome);
                 // Always recorded, changed output or not: this is the
                 // attempt that decided the stage.
-                self.append_command_event(
-                    task_id,
-                    json!({
-                        "stage": stage_name,
-                        "command": described,
-                        "attempt": attempt,
-                        "exit_code": outcome.exit_code,
-                        "timed_out": outcome.timed_out,
-                        "escaped": outcome.escaped,
-                        "duration_ms": duration_ms(outcome.duration),
-                        // Queryable siblings of the note, so "which rule
-                        // fired?" is answerable from `choco --json`
-                        // without matching free text.
-                        "matched": matched.pattern,
-                        "outcome": matched.then,
-                        "stdout_tail": tail(&outcome.stdout),
-                        "stderr_tail": tail(&outcome.stderr),
-                        "note": note,
-                    }),
-                )
-                .await;
+                let mut payload = json!({
+                    "stage": stage_name,
+                    "command": described,
+                    "attempt": attempt,
+                    "exit_code": outcome.exit_code,
+                    "timed_out": outcome.timed_out,
+                    "escaped": outcome.escaped,
+                    "duration_ms": duration_ms(outcome.duration),
+                    // Queryable siblings of the note, so "which rule
+                    // fired?" is answerable from `choco --json`
+                    // without matching free text.
+                    "matched": matched.pattern,
+                    "outcome": matched.then,
+                    "stdout_tail": tail(&outcome.stdout),
+                    "stderr_tail": tail(&outcome.stderr),
+                    "note": note,
+                });
+                if let (AttemptKind::CatchUpFirst, Some(c)) = (kind, catch_up) {
+                    payload["catch_up_until"] = json!(c.end.to_rfc3339());
+                }
+                self.append_command_event(task_id, payload).await;
                 self.finish_detached(
                     DetachedKind::Poll,
                     task_id,
@@ -524,86 +665,73 @@ impl WorkflowEngine {
 
             // No match. A killed attempt means the budget it was capped at
             // is now spent, so the stage is out of time regardless of what
-            // the interval says.
+            // the interval says — it was the stage's last look. The final
+            // attempt is the last look by definition.
             let killed = outcome.timed_out;
             warn_if_escaped(task_id, stage_name, &outcome);
 
-            // A killed attempt is reported once, by `finish_poll_timed_out`
-            // below, which carries the same fields plus the reason. Passing
-            // it through here as well would put two entries on the timeline
-            // for one attempt.
-            if !killed {
-                self.record_poll_attempt(
-                    task_id,
-                    &mut previous,
-                    // Compared trimmed, matching what `tail` puts on the
-                    // timeline: two attempts differing only in trailing
-                    // whitespace would otherwise record two entries a reader
-                    // can't tell apart.
-                    //
-                    // Keyed on the exit code as well as the output. A poll
-                    // whose command prints nothing on success — #78's
-                    // verdict poll is exactly that, empty until someone
-                    // reviews — makes "no verdict yet" and "`gh` has been
-                    // failing for an hour" the same empty string, so on
-                    // output alone the failure records nothing after the
-                    // first attempt and the stage looks like patient
-                    // waiting right up to its timeout. The exit code is
-                    // what tells them apart.
-                    format!("{}\0exit:{:?}", outcome.stdout.trim(), outcome.exit_code),
-                    json!({
-                        "stage": stage_name,
-                        "command": described,
-                        "attempt": attempt,
-                        "exit_code": outcome.exit_code,
-                        "timed_out": outcome.timed_out,
-                        "escaped": outcome.escaped,
-                        "duration_ms": duration_ms(outcome.duration),
-                        "stdout_tail": tail(&outcome.stdout),
-                        "stderr_tail": tail(&outcome.stderr),
-                    }),
-                )
-                .await;
-            }
-
-            // Kept so whichever timeout path fires can report what the
-            // command last actually said. Without it, a poll that printed
-            // `PENDING` for an hour and then ran out of budget leaves a
-            // final timeline entry showing nothing at all — the repeated
-            // attempts having been deliberately suppressed above.
-            last_outcome = Some(outcome);
-
-            if killed {
+            // Reported once, by `finish_poll_timed_out`, which carries the
+            // same fields plus the reason. Passing it through the recorder
+            // as well would put two entries on the timeline for one attempt.
+            if killed || kind == AttemptKind::Final {
                 self.finish_poll_timed_out(
                     task_id,
                     definition,
                     stage_name,
                     &described,
                     attempt,
-                    last_outcome.as_ref(),
+                    Some(&outcome),
                     entered_at,
+                    catch_up.as_ref(),
+                    None,
                 )
                 .await;
                 return;
             }
 
-            if self
-                .sleep_before_next_attempt(self.interval_now(&run, entered_at), deadline)
-                .await
-                .is_break()
-            {
-                self.finish_poll_timed_out(
-                    task_id,
-                    definition,
-                    stage_name,
-                    &described,
-                    attempt,
-                    last_outcome.as_ref(),
-                    entered_at,
-                )
-                .await;
-                return;
+            // Compared trimmed, matching what `tail` puts on the
+            // timeline: two attempts differing only in trailing
+            // whitespace would otherwise record two entries a reader
+            // can't tell apart.
+            //
+            // Keyed on the exit code as well as the output. A poll
+            // whose command prints nothing on success — #78's
+            // verdict poll is exactly that, empty until someone
+            // reviews — makes "no verdict yet" and "`gh` has been
+            // failing for an hour" the same empty string, so on
+            // output alone the failure records nothing after the
+            // first attempt and the stage looks like patient
+            // waiting right up to its timeout. The exit code is
+            // what tells them apart.
+            let key = format!("{}\0exit:{:?}", outcome.stdout.trim(), outcome.exit_code);
+            let mut payload = json!({
+                "stage": stage_name,
+                "command": described,
+                "attempt": attempt,
+                "exit_code": outcome.exit_code,
+                "timed_out": outcome.timed_out,
+                "escaped": outcome.escaped,
+                "duration_ms": duration_ms(outcome.duration),
+                "stdout_tail": tail(&outcome.stdout),
+                "stderr_tail": tail(&outcome.stderr),
+            });
+            if let (AttemptKind::CatchUpFirst, Some(c)) = (kind, catch_up) {
+                // Always recorded, whatever the output: it is the one
+                // entry that tells a reader the stage is catching up.
+                payload["note"] = json!(c.first_note());
+                payload["catch_up_until"] = json!(c.end.to_rfc3339());
+                previous = Some(key);
+                self.append_command_event(task_id, payload).await;
+            } else {
+                self.record_poll_attempt(task_id, &mut previous, key, payload)
+                    .await;
             }
+
+            self.sleep_before_next_attempt(
+                self.interval_now(&run, entered_at),
+                catch_up.map(|c| c.end).or(deadline),
+            )
+            .await;
         }
     }
 
@@ -668,40 +796,38 @@ impl WorkflowEngine {
         }
     }
 
-    /// Waits out the interval, or reports that the budget is gone.
+    /// Waits out the interval, or what is left of the window if shorter.
     ///
     /// Measured from the end of one attempt to the start of the next
     /// rather than on a fixed cadence, so a command slower than its own
     /// interval can't have attempts overlap and stack up on top of each
     /// other in the task's working copy.
     ///
-    /// `deadline` is wall-clock (#52) and is compared against `self.now()`;
-    /// the sleep itself is `interval.min(remaining)` on tokio's monotonic
-    /// clock, so after the machine wakes an expired deadline is noticed
-    /// within one interval.
-    async fn sleep_before_next_attempt(
-        &self,
-        interval: Duration,
-        deadline: Option<DateTime<Utc>>,
-    ) -> std::ops::ControlFlow<()> {
+    /// `deadline` is the window's end, wall-clock (#52), compared against
+    /// `self.now()`; the sleep itself is `interval.min(remaining)` on
+    /// tokio's monotonic clock, so after the machine wakes an expired
+    /// window is noticed within one interval.
+    async fn sleep_before_next_attempt(&self, interval: Duration, deadline: Option<DateTime<Utc>>) {
         let Some(deadline) = deadline else {
             tokio::time::sleep(interval).await;
-            return std::ops::ControlFlow::Continue(());
+            return;
         };
         let remaining = remaining_budget(deadline, self.now());
         if remaining.is_zero() {
-            return std::ops::ControlFlow::Break(());
+            return;
         }
         // Never sleep past the deadline: a 60s interval under a 70s budget
         // should give up at 70s, not at 120s.
         tokio::time::sleep(interval.min(remaining)).await;
-        std::ops::ControlFlow::Continue(())
     }
 
-    /// Ends a poll that ran out of budget with no matching outcome (§5.2's
-    /// `on_timeout`). The loader guarantees a `timeout` edge exists
-    /// whenever the stage sets a `timeout:`, so this reaches
-    /// `finish_detached`'s park path only for a hand-built definition.
+    /// Ends a poll whose window is over with no matching outcome (§5.2's
+    /// `on_timeout`), after its last look. The loader guarantees a
+    /// `timeout` edge exists whenever the stage sets a `timeout:`, so this
+    /// reaches `finish_detached`'s park path only for a hand-built
+    /// definition. `attempts` includes the final attempt; `last` is that
+    /// attempt (or the killed one), `None` when its output could not be
+    /// read, in which case `io_note` carries the error.
     #[allow(clippy::too_many_arguments)]
     async fn finish_poll_timed_out(
         self: &Arc<Self>,
@@ -712,6 +838,8 @@ impl WorkflowEngine {
         attempts: u64,
         last: Option<&shell::ShellOutcome>,
         entered_at: DateTime<Utc>,
+        catch_up: Option<&CatchUp>,
+        io_note: Option<&str>,
     ) {
         tracing::info!(
             task_id,
@@ -720,19 +848,24 @@ impl WorkflowEngine {
             "poll stage gave up: its timeout elapsed with no matching outcome"
         );
 
-        let mut note = if attempts == 0 {
-            "timeout elapsed before the first attempt: the deadline passed while the daemon was down"
-                .to_string()
-        } else {
-            let mut elapsed = (self.now() - entered_at).to_std().unwrap_or(Duration::ZERO);
-            if elapsed >= Duration::from_secs(60) {
-                elapsed = Duration::from_secs(elapsed.as_secs() / 60 * 60);
-            }
-            format!(
+        let elapsed = round_for_note((self.now() - entered_at).to_std().unwrap_or(Duration::ZERO));
+        let mut note = match catch_up {
+            None => format!(
                 "no outcome matched in {attempts} attempts over {}; timeout elapsed",
-                chocofactory_core::duration::format_duration(elapsed)
-            )
+                format_duration(elapsed)
+            ),
+            Some(c) => format!(
+                "no outcome matched in {attempts} attempts over {}; the deadline was missed by {}, so the stage watched up to {} more",
+                format_duration(elapsed),
+                format_duration(round_for_note(c.since_deadline)),
+                format_duration(round_for_note(c.len)),
+            ),
         };
+        if let Some(io_note) = io_note {
+            note.push_str(&format!(
+                "; the final attempt's output could not be read: {io_note}"
+            ));
+        }
         // Outranks the plain timeout wording: the workflow is about to
         // follow its `timeout` edge while the last command may still be
         // running in the same working copy.
@@ -740,22 +873,22 @@ impl WorkflowEngine {
             note = "could not confirm the process group exited — something may still be running"
                 .to_string();
         }
-        self.append_command_event(
-            task_id,
-            json!({
-                "stage": stage_name,
-                "command": described,
-                "attempt": attempts,
-                "exit_code": last.and_then(|outcome| outcome.exit_code),
-                "timed_out": true,
-                "escaped": last.is_some_and(|outcome| outcome.escaped),
-                "duration_ms": last.map_or(0, |outcome| duration_ms(outcome.duration)),
-                "stdout_tail": last.map_or_else(String::new, |outcome| tail(&outcome.stdout)),
-                "stderr_tail": last.map_or_else(String::new, |outcome| tail(&outcome.stderr)),
-                "note": note,
-            }),
-        )
-        .await;
+        let mut payload = json!({
+            "stage": stage_name,
+            "command": described,
+            "attempt": attempts,
+            "exit_code": last.and_then(|outcome| outcome.exit_code),
+            "timed_out": true,
+            "escaped": last.is_some_and(|outcome| outcome.escaped),
+            "duration_ms": last.map_or(0, |outcome| duration_ms(outcome.duration)),
+            "stdout_tail": last.map_or_else(String::new, |outcome| tail(&outcome.stdout)),
+            "stderr_tail": last.map_or_else(String::new, |outcome| tail(&outcome.stderr)),
+            "note": note,
+        });
+        if let Some(c) = catch_up {
+            payload["catch_up_until"] = json!(c.end.to_rfc3339());
+        }
+        self.append_command_event(task_id, payload).await;
 
         self.finish_detached(
             DetachedKind::Poll,
@@ -767,4 +900,11 @@ impl WorkflowEngine {
         )
         .await;
     }
+}
+
+/// The wall-clock end of an attempt, reckoned from its start plus how long
+/// it ran on the monotonic clock, so a machine sleep inside it isn't counted.
+fn attempt_end(started_wall: DateTime<Utc>, started: std::time::Instant) -> DateTime<Utc> {
+    started_wall
+        + chrono::Duration::from_std(started.elapsed()).unwrap_or_else(|_| chrono::Duration::zero())
 }
