@@ -37,6 +37,8 @@ wrapper script, never through the test process's own environment):
              other-provider / other-model), counted in the statistics
   no_messages  the prompt sends no message_end at all; the statistics gain
              FAKE_OMP_SIDE_TOKENS input and FAKE_OMP_SIDE_COST cost
+  client_file  at start, before anything else, write omp's "project
+             presence" file `$XDG_STATE_HOME/omp/run/daemons/<hash>/clients/<pid>-<uuid>.json`
   no_ready   the process sleeps instead of speaking (never used for success)
   unknown_tool  the turn first calls a host tool the daemon never registered
                 and reports the daemon's reply as assistant text
@@ -72,6 +74,11 @@ wrapper script, never through the test process's own environment):
   `{"message": ..., "streamingBehavior": ...}` to it.
 - FAKE_OMP_LAUNCH_LOG: a file; the process appends its start time (seconds)
   to it as its first act.
+- FAKE_OMP_VERSION_LOG (read by the test wrapper, not by this script): see
+  `wrapper_for` in omp_tests.rs.
+- XDG_STATE_HOME: when set, the process records at start whether
+  `$XDG_STATE_HOME/omp` is a directory; `echo` reports it as
+  `state_omp_dir_at_start` (real omp ignores the variable if it isn't).
 - FAKE_OMP_MEMORY_STATS: how the prompt `/memory stats` is answered (it makes
   no model call). The database path and bank are read from the `--config`
   file's `dbPath:` and `bank:` lines.
@@ -103,6 +110,22 @@ COST = 0.0123
 if os.environ.get("FAKE_OMP_LAUNCH_LOG"):
     with open(os.environ["FAKE_OMP_LAUNCH_LOG"], "a") as launch_log:
         launch_log.write("%f\n" % time.time())
+
+
+STATE_OMP_DIR_AT_START = None
+if os.environ.get("XDG_STATE_HOME"):
+    STATE_OMP_DIR_AT_START = os.path.isdir(os.path.join(os.environ["XDG_STATE_HOME"], "omp"))
+
+if "client_file" in MODES and os.environ.get("XDG_STATE_HOME"):
+    import uuid
+
+    _client_id = str(uuid.uuid4())
+    _clients = os.path.join(
+        os.environ["XDG_STATE_HOME"], "omp", "run", "daemons", "e2f034ac33e93976", "clients"
+    )
+    os.makedirs(_clients, exist_ok=True)
+    with open(os.path.join(_clients, "%d-%s.json" % (os.getpid(), _client_id)), "w") as _f:
+        json.dump({"pid": os.getpid(), "id": _client_id, "projectDir": os.getcwd()}, _f)
 
 
 def emit(obj):
@@ -257,12 +280,13 @@ def final_text(prompt_frame):
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith(("OTEL_", "OMP_", "PI_", "ANTHROPIC_"))
+            if key.startswith(("OTEL_", "OMP_", "PI_", "ANTHROPIC_", "XDG_", "CLAUDE_"))
         }
         return json.dumps(
             {
                 "argv": ARGS,
                 "env": env,
+                "state_omp_dir_at_start": STATE_OMP_DIR_AT_START,
                 "overlay": overlay,
                 "overlay_mode": oct(os.stat(config).st_mode & 0o777) if config else None,
                 "message": prompt_frame.get("message"),

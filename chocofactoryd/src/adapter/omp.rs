@@ -91,9 +91,30 @@ pub struct OmpAdapter {
     memory_check_timeout: Duration,
     /// The `HOME` the omp child sees: omp prints a path under it as `~/…`.
     home: Option<PathBuf>,
+    /// Test stand-in for the daemon's inherited environment (see
+    /// [`OmpLaunch`]).
+    #[cfg(test)]
+    parent_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
 impl OmpAdapter {
+    /// Variables the builder treats as inherited from the daemon (tests).
+    #[cfg(test)]
+    pub fn with_parent_env(mut self, pairs: &[(&str, &str)]) -> Self {
+        self.parent_env = pairs.iter().map(|(k, v)| (k.into(), v.into())).collect();
+        self
+    }
+
+    /// How an omp process of `cfg`'s role is launched.
+    fn launch(&self, cfg: &RoleConfig) -> OmpLaunch {
+        OmpLaunch {
+            xdg_state: self.state_dir.join("xdg-state"),
+            isolated: matches!(cfg.isolation, Isolation::Isolated { .. }),
+            #[cfg(test)]
+            parent_env: self.parent_env.clone(),
+        }
+    }
+
     /// Overrides the `HOME` the memory check expands `~/` against (tests
     /// whose fake omp runs under another `HOME`).
     pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
@@ -118,6 +139,8 @@ impl OmpAdapter {
             state_dir: state_dir.into(),
             memory_check_timeout: REQUEST_TIMEOUT,
             home: std::env::var_os("HOME").map(PathBuf::from),
+            #[cfg(test)]
+            parent_env: Vec::new(),
         }
     }
 
@@ -202,6 +225,19 @@ impl OmpAdapter {
 
         let session_dir = self.session_dir();
         let overlay_dir = self.state_dir.join("overlays");
+        let launch = self.launch(cfg);
+        // Built (and omp's state folder prepared) before the overlay is
+        // written: a refusal here leaves no overlay behind.
+        let mut command = omp_command(&self.binary, &launch).map_err(|err| {
+            AdapterError::Spawn(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "role '{}': couldn't prepare omp's state folder {}: {err}",
+                    cfg.role,
+                    launch.xdg_state.display()
+                ),
+            ))
+        })?;
         for dir in [&session_dir, &overlay_dir] {
             std::fs::create_dir_all(dir).map_err(AdapterError::Spawn)?;
         }
@@ -212,11 +248,14 @@ impl OmpAdapter {
         // From here the overlay is removed whenever this guard drops: on a
         // failed spawn right below, or with the handle once the child is
         // done.
-        let guard = OverlayGuard(overlay_path.clone());
+        let mut guard = SpawnCleanup {
+            overlay: overlay_path.clone(),
+            clients_root: launch.xdg_state.join("omp/run/daemons"),
+            pid: None,
+        };
 
         let args = build_args(cfg, &overlay_path, &session_dir, append.as_deref(), resume);
         let marker = super::new_turn_marker()?;
-        let mut command = Command::new(&self.binary);
         command
             .current_dir(&cfg.cwd)
             .args(&args)
@@ -227,10 +266,10 @@ impl OmpAdapter {
             // (same as `claude`).
             .process_group(0)
             .kill_on_drop(true);
-        scrub_env(&mut command);
-        // After the scrub, so nothing can remove it.
+        // After the builder's scrub, so nothing can remove it.
         command.env(&marker, "1");
         let mut child: Child = command.spawn().map_err(AdapterError::Spawn)?;
+        guard.pid = child.id();
 
         let pid = child.id();
         let stdin = child.stdin.take().expect("stdin was piped");
@@ -256,7 +295,7 @@ impl OmpAdapter {
             spawn_frame_reader(stdout),
             events_tx,
             DriverConfig {
-                binary: self.binary.clone(),
+                launch: (self.binary.clone(), launch),
                 pid,
                 stage: StageReport {
                     outcomes: cfg.report_outcomes.clone(),
@@ -346,14 +385,109 @@ fn valid_project_id(id: &str) -> bool {
     )
 }
 
-/// Removes the overlay file when dropped. A failed removal is logged, not an
-/// error: the file holds no secrets.
-struct OverlayGuard(PathBuf);
+/// How an omp process is launched: what [`omp_command`] needs besides the
+/// binary.
+#[derive(Clone)]
+pub(crate) struct OmpLaunch {
+    /// `<state_dir>/xdg-state`; omp writes its state under `<this>/omp/`.
+    xdg_state: PathBuf,
+    /// An isolated role: the operator's Claude config dir is not inherited.
+    isolated: bool,
+    /// Stands in for the daemon's inherited environment (tests).
+    #[cfg(test)]
+    parent_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
 
-impl Drop for OverlayGuard {
+/// The one place a `Command` for omp is built: `spawn`, `omp --version` and
+/// the real-omp tests all go through it. Steps, in order: the (test-only)
+/// parent environment, the scrub, `CLAUDE_CONFIG_DIR` removal for isolated
+/// roles, preparing omp's state folder, and `XDG_STATE_HOME` last so no
+/// inherited value can win.
+///
+/// omp moves its state category (session registry and locks, logs, terminal
+/// pointer, client files) to `$XDG_STATE_HOME/omp` only if that folder
+/// already exists, and otherwise silently falls back to `~/.omp`; so both
+/// levels are created (owner-only) before every process.
+pub(crate) fn omp_command(binary: &str, launch: &OmpLaunch) -> std::io::Result<Command> {
+    let mut command = Command::new(binary);
+    #[cfg(test)]
+    for (key, value) in &launch.parent_env {
+        command.env(key, value);
+    }
+    scrub_env(&mut command);
+    if launch.isolated {
+        // omp turns its `claude` source on when this is set and would read
+        // the operator's personal MCP servers.
+        command.env_remove("CLAUDE_CONFIG_DIR");
+    }
+    let xdg_state = std::path::absolute(&launch.xdg_state)?;
+    for dir in [xdg_state.clone(), xdg_state.join("omp")] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    command.env("XDG_STATE_HOME", &xdg_state);
+    Ok(command)
+}
+
+/// Whether `name` is a client file (`<pid>-<uuid>.json`) of process `pid`.
+/// The `-` keeps `12345-…` from matching pid `1234`.
+fn is_client_file_of(name: &str, pid: u32) -> bool {
+    name.starts_with(&format!("{pid}-")) && name.ends_with(".json")
+}
+
+/// Cleans up after one omp process when dropped: removes the overlay file
+/// and the process's own "project presence" client file, which omp leaves in
+/// its state folder after exit. Folders are left in place.
+///
+/// The one accepted log-and-continue: `Drop` can't return an error, and the
+/// files are harmless ones in choco's own folder. Accepted residual: a pid
+/// reused between the child's reaping and this drop could cost another choco
+/// omp process its presence file.
+struct SpawnCleanup {
+    overlay: PathBuf,
+    /// `<xdg_state>/omp/run/daemons`
+    clients_root: PathBuf,
+    pid: Option<u32>,
+}
+
+impl Drop for SpawnCleanup {
     fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_file(&self.0) {
-            tracing::warn!("couldn't remove omp overlay {}: {err}", self.0.display());
+        if let Err(err) = std::fs::remove_file(&self.overlay) {
+            tracing::warn!(
+                "couldn't remove omp overlay {}: {err}",
+                self.overlay.display()
+            );
+        }
+        let Some(pid) = self.pid else { return };
+        let warn = |path: &Path, err: std::io::Error| {
+            tracing::warn!(
+                "couldn't clean up omp client file {}: {err}",
+                path.display()
+            );
+        };
+        let list = |dir: &Path| -> Vec<std::fs::DirEntry> {
+            match std::fs::read_dir(dir) {
+                Ok(entries) => entries.filter_map(Result::ok).collect(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(err) => {
+                    warn(dir, err);
+                    Vec::new()
+                }
+            }
+        };
+        for daemon in list(&self.clients_root) {
+            let clients = daemon.path().join("clients");
+            for file in list(&clients) {
+                if is_client_file_of(&file.file_name().to_string_lossy(), pid)
+                    && let Err(err) = std::fs::remove_file(file.path())
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn(&file.path(), err);
+                }
+            }
         }
     }
 }
@@ -439,6 +573,9 @@ pub fn overlay(cfg: &RoleConfig, memory_db: Option<&Path>) -> Value {
         return common;
     };
     let mut overlay = json!({
+        // Replaces the operator's `enabledProviders` (arrays in the overlay
+        // replace theirs): `["*"]` there would start their Claude MCP servers.
+        "enabledProviders": [],
         "disabledProviders": [
             "native", "claude-md", "agents-md", "agents", "codex", "gemini", "opencode",
             "github", "cursor", "windsurf", "cline", "vscode", "mcp-json", "claude-plugins",
@@ -585,14 +722,15 @@ pub fn build_args(
 
 /// `omp --version`, trimmed. `None` on any failure: the version is a nicety
 /// for the timeline, never a reason to fail a turn.
-async fn omp_version(binary: &str) -> Option<String> {
-    let mut command = Command::new(binary);
+async fn omp_version(binary: &str, launch: &OmpLaunch) -> Option<String> {
+    // A folder that can't be prepared: no `--version`; the turn's own spawn
+    // fails closed on the same folder.
+    let mut command = omp_command(binary, launch).ok()?;
     command
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    scrub_env(&mut command);
     let output = tokio::time::timeout(VERSION_TIMEOUT, command.output())
         .await
         .ok()?
@@ -887,7 +1025,8 @@ fn spawn_frame_reader(stdout: ChildStdout) -> mpsc::UnboundedReceiver<Value> {
 // ---------------------------------------------------------------------------
 
 struct DriverConfig {
-    binary: String,
+    /// The binary and how to launch it, for `omp --version`.
+    launch: (String, OmpLaunch),
     /// The child's pid (it leads its own process group), for killing it when
     /// the session can't start. The handle owns the child and reaps it only
     /// after the event stream ends, so the pid can't be reused before then.
@@ -1028,8 +1167,8 @@ impl Driver {
     }
 
     async fn run(mut self, mut stdin_rx: mpsc::UnboundedReceiver<String>) {
-        let binary = self.config.binary.clone();
-        let version = tokio::spawn(async move { omp_version(&binary).await });
+        let (binary, launch) = self.config.launch.clone();
+        let version = tokio::spawn(async move { omp_version(&binary, &launch).await });
         if let Err(message) = self.startup(version).await {
             tracing::warn!("omp session didn't start: {message}");
             self.emit(AgentEvent::Error { message });
