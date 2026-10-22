@@ -397,7 +397,8 @@ pub async fn update_config(
     Ok(Json(task))
 }
 
-/// Whether `config` sets any string `roles.<name>.cli` or `roles.<name>.model`.
+/// Whether `config` sets (or, with `null`, deletes) any `roles.<name>.cli` or
+/// `roles.<name>.model`.
 fn sets_a_role_cli_or_model(config: &serde_json::Value) -> bool {
     config
         .get("roles")
@@ -406,7 +407,7 @@ fn sets_a_role_cli_or_model(config: &serde_json::Value) -> bool {
             roles.values().any(|role| {
                 ["cli", "model"]
                     .iter()
-                    .any(|key| role.get(key).is_some_and(serde_json::Value::is_string))
+                    .any(|key| role.get(key).is_some_and(|v| v.is_string() || v.is_null()))
             })
         })
 }
@@ -3081,6 +3082,37 @@ stages:
             )
             .await;
         assert_eq!(response.status(), 200, "{}", response.json());
+    }
+
+    /// Deleting a task-layer model can re-expose a bad pair from the workflow.
+    #[tokio::test]
+    async fn patch_task_config_checks_a_null_delete_of_a_role_model() {
+        let server = TestServer::start_with_omp().await;
+        server.write_workflow("lvlflow", LEVEL_FLOW);
+        let project_id = create_project(&server).await;
+        let task_id = create_level_task(&server, &project_id).await;
+        sqlx::query("UPDATE tasks SET config = ? WHERE id = ?")
+            .bind(
+                json!({"cwd": ".", "roles": {"coder": {"cli": "claude", "model": "claude-opus-5-5"}}})
+                    .to_string(),
+            )
+            .bind(&task_id)
+            .execute(server.pool())
+            .await
+            .unwrap();
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "model": null } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        assert!(
+            response.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("`coder`")
+        );
     }
 
     #[tokio::test]

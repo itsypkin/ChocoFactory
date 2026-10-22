@@ -297,8 +297,7 @@ fn spawn(
     // - Auto-memory (`CLAUDE_CODE_DISABLE_AUTO_MEMORY`) is decided by
     //   `apply_auto_memory_env` below, not read from the daemon's own
     //   environment (#105).
-    apply_auto_memory_env(&mut command, &cfg.isolation);
-    apply_effort_env(&mut command);
+    apply_spawn_env(&mut command, &cfg.isolation);
     command.env(&marker, "1");
     //
     // #115: workflow (isolated) roles lose all of `TIMER_TOOLS`; chat loses
@@ -443,6 +442,13 @@ fn apply_auto_memory_env(command: &mut Command, isolation: &Isolation) {
 ///   scrubbed from here: an isolated role applies the repo's committed
 ///   settings, and the chat role the operator's own, so such an `env` value
 ///   still wins (documented in `docs/models.md`).
+/// The environment decisions `spawn` makes for every role shape, in one place
+/// so a test can run them per isolation.
+fn apply_spawn_env(command: &mut Command, isolation: &Isolation) {
+    apply_auto_memory_env(command, isolation);
+    apply_effort_env(command);
+}
+
 fn apply_effort_env(command: &mut Command) {
     command.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
 }
@@ -1855,8 +1861,7 @@ mod tests {
 
     fn effort_env_entry(isolation: &Isolation) -> Option<Option<String>> {
         let mut command = Command::new("unused");
-        apply_effort_env(&mut command);
-        let _ = isolation;
+        apply_spawn_env(&mut command, isolation);
         command
             .as_std()
             .get_envs()

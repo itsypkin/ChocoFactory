@@ -74,8 +74,8 @@ For a Claude role, choco strips the suffix and runs
 `--effort`), written exactly like that: `HIGH` is refused. A level only omp
 knows (`off`, `minimal`, `auto`, `inherit`) or one that doesn't exist (a typo
 such as `hihg`, or an empty `claude-opus-5-5:`) is refused, naming the role:
-when the workflow loads, when the daemon starts (a bad model in `config.yaml`
-stops it), and when a task is created or reconfigured (`--role-model`, or a
+when the workflow loads, when the daemon starts (a role in `config.yaml` with
+`cli: claude` and a bad level stops it), and when a task is created or reconfigured (`--role-model`, or a
 `--role-cli` that pairs a role with a model from another layer). A value that
 slips in later, such as `config.yaml` edited while the daemon runs, parks the
 task `stuck` naming the role when the turn starts. Model ids that contain a

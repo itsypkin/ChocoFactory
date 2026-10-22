@@ -618,11 +618,12 @@ pub fn check_task_config_clis(config: &Value, registry: &Registry) -> Result<(),
 
 /// Asks each role's adapter whether it can run the role: `validate_role`
 /// and `validate_model`, for every role the workflow defines (or only those
-/// in `only`) whose `cli` and `model` both resolve across the three layers,
-/// task config first, then the workflow, then the global config. A role
-/// missing either field is not checked here (the turn-start check is the one
-/// nothing can skip), and neither is a `cli` the registry doesn't know (that
-/// is `check_task_config_clis`'s error to give). Returns the first
+/// in `only`), across the three layers, task config first, then the workflow,
+/// then the global config. `validate_role` runs whenever the `cli` resolves;
+/// `validate_model` only when the model resolves too. A role with no `cli` is
+/// not checked here (the turn-start check is the one nothing can skip), and
+/// neither is a `cli` the registry doesn't know (that is
+/// `check_task_config_clis`'s error to give). Returns the first
 /// rejection, in sorted role-name order.
 pub fn check_task_config_roles(
     task_config: &Value,
@@ -639,17 +640,16 @@ pub fn check_task_config_roles(
     names.sort();
     for name in names {
         let role = &definition.roles[name.as_str()];
-        let (Ok(cli), Ok(model)) = (
-            crate::role_config::resolve_cli(name, role, global, task_config),
-            crate::role_config::resolve_model(name, role, global, task_config),
-        ) else {
+        let Ok(cli) = crate::role_config::resolve_cli(name, role, global, task_config) else {
             continue;
         };
         let Ok(adapter) = registry.lookup(Some(name), &cli) else {
             continue;
         };
         adapter.validate_role(name, &role.isolation)?;
-        adapter.validate_model(name, &model)?;
+        if let Ok(model) = crate::role_config::resolve_model(name, role, global, task_config) {
+            adapter.validate_model(name, &model)?;
+        }
     }
     Ok(())
 }

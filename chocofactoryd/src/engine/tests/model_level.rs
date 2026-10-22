@@ -255,18 +255,19 @@ async fn check_config_patch_checks_the_merged_config_for_the_roles_it_touches() 
         .await
         .unwrap_err();
     assert!(matches!(err, ConfigPatchError::Rejected(_)), "{err:?}");
-    // A role the patch doesn't touch is not checked: the reviewer's level is
-    // fine here, and the coder still holds its omp-only one.
+    // A role the patch doesn't touch is not checked: the coder holds a bad
+    // level, the reviewer's patch is fine.
+    sqlx::query("UPDATE tasks SET config = ? WHERE id = ?")
+        .bind(json!({"roles": {"coder": {"cli": "claude", "model": "x:auto"}}}).to_string())
+        .bind(&task_id)
+        .execute(&env.pool)
+        .await
+        .unwrap();
     env.engine
         .check_config_patch(
             &task_id,
             &json!({"roles": {"reviewer": {"model": "claude-opus-5-5:low"}}}),
         )
-        .await
-        .unwrap();
-    // A null-delete drops the override.
-    env.engine
-        .check_config_patch(&task_id, &json!({"roles": {"coder": {"model": null}}}))
         .await
         .unwrap();
     // A global config that won't load fails closed.
@@ -277,4 +278,19 @@ async fn check_config_patch_checks_the_merged_config_for_the_roles_it_touches() 
         .await
         .unwrap_err();
     assert!(matches!(err, ConfigPatchError::GlobalConfig(_)), "{err:?}");
+}
+
+/// A role whose `cli` resolves but whose model doesn't is still asked
+/// `validate_role` (omp refuses pattern skills), at create.
+#[tokio::test]
+async fn create_validates_the_role_even_when_no_model_resolves() {
+    let env = env().await;
+    let yaml = "name: lvl\nworktree: false\nroles:\n  coder:\n    cli: claude\n    skills: [\"deploy*\"]\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    prompt_file: p.md\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
+    let err = env
+        .create(yaml, json!({"roles": {"coder": {"cli": "omp"}}}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CreateTaskError::RoleRejected(_)), "{err:?}");
+    assert!(err.to_string().contains("deploy*"), "{err}");
+    assert_eq!(env.task_count().await, 0);
 }

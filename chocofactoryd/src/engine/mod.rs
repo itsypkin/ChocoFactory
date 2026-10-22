@@ -1617,7 +1617,8 @@ impl WorkflowEngine {
                     .fetch_one(&self.pool)
                     .await
                     .map_err(ConfigPatchError::Db)?;
-                let merged: Value = serde_json::from_str(&merged).unwrap_or(Value::Null);
+                let merged: Value = serde_json::from_str(&merged)
+                    .map_err(|err| ConfigPatchError::Db(sqlx::Error::Decode(Box::new(err))))?;
                 let touched: Vec<String> = patch
                     .get("roles")
                     .and_then(Value::as_object)
