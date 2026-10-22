@@ -373,10 +373,9 @@ pub async fn update_config(
     }
     adapter::check_task_config_clis(&body.config, state.engine.registry())
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
-    // A patch that sets a role's CLI or model is checked against the task's
-    // workflow and the merged config before anything is merged. Only a body
-    // that sets a string `roles.<name>.cli` or `roles.<name>.model` can
-    // change which adapter or model a role runs on.
+    // A patch that can change a role's CLI or model (including by dropping
+    // an override) is checked against the task's workflow and the merged
+    // config before anything is merged.
     if sets_a_role_cli_or_model(&body.config) {
         match state.engine.check_config_patch(&id, &body.config).await {
             Ok(()) => {}
@@ -397,19 +396,18 @@ pub async fn update_config(
     Ok(Json(task))
 }
 
-/// Whether `config` sets (or, with `null`, deletes) any `roles.<name>.cli` or
-/// `roles.<name>.model`.
+/// Whether `config` can change any role's effective `cli` or `model`: a
+/// `roles` that isn't an object, a role value that isn't an object (`null`
+/// drops the whole override), or a role that mentions `cli` or `model` with
+/// any value (a string sets it; `null` or any other value drops it).
 fn sets_a_role_cli_or_model(config: &serde_json::Value) -> bool {
-    config
-        .get("roles")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|roles| {
-            roles.values().any(|role| {
-                ["cli", "model"]
-                    .iter()
-                    .any(|key| role.get(key).is_some_and(|v| v.is_string() || v.is_null()))
-            })
-        })
+    match config.get("roles") {
+        None => false,
+        Some(serde_json::Value::Object(roles)) => roles.values().any(|role| {
+            !role.is_object() || role.get("cli").is_some() || role.get("model").is_some()
+        }),
+        Some(_) => true,
+    }
 }
 
 #[derive(Deserialize)]
@@ -3113,6 +3111,80 @@ stages:
                 .unwrap()
                 .contains("`coder`")
         );
+    }
+
+    #[tokio::test]
+    async fn patch_task_config_checks_every_patch_that_drops_a_role_override() {
+        let dir = std::env::temp_dir().join(format!("choco-gc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.yaml");
+        let server = TestServer::start_with_global_config(config_path.clone()).await;
+        server.write_workflow(
+            "dropflow",
+            "name: dropflow\nroles:\n  coder:\n    cli: claude\n  reviewer:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: human_gate\n    on: { resumed: done }\n  done:\n    kind: terminal\n",
+        );
+        let project_id = create_project(&server).await;
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "dropflow",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": { "cwd": ".", "roles": { "coder": { "model": "claude-opus-5-5" } } },
+                }),
+            )
+            .await
+            .json();
+        let task_id = task["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{task}"))
+            .to_string();
+        // Edited after create: the fallback the override was hiding is bad.
+        std::fs::write(
+            &config_path,
+            "roles:\n  coder:\n    model: claude-sonnet-5-5:auto\n",
+        )
+        .unwrap();
+        let stored = crate::db::tasks::get(server.pool(), &task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .config;
+        for patch in [
+            json!({"roles": {"coder": null}}),
+            json!({"roles": null}),
+            json!({"roles": {"coder": {"model": 7}}}),
+            json!({"roles": {"coder": "gone"}}),
+        ] {
+            let response = server
+                .patch(&format!("/tasks/{task_id}"), json!({ "config": patch }))
+                .await;
+            assert_eq!(response.status(), 400, "{patch}: {}", response.json());
+            assert!(
+                response.json()["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("`coder`"),
+                "{patch}: {}",
+                response.json()
+            );
+            let after = crate::db::tasks::get(server.pool(), &task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .config;
+            assert_eq!(after, stored, "{patch}");
+        }
+        // A patch that leaves the override in place is still accepted.
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "model": "claude-opus-5-5:low" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{}", response.json());
     }
 
     #[tokio::test]

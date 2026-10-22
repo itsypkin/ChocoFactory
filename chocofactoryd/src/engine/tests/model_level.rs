@@ -229,6 +229,53 @@ async fn a_bad_level_edited_in_after_create_parks_the_task_at_turn_start() {
 }
 
 #[tokio::test]
+async fn a_global_config_broken_after_create_parks_the_task_stuck_naming_the_file() {
+    let env = env().await;
+    let task = env.create(GATED, json!({})).await.unwrap();
+    fs::write(&env.global, "max_agents: two\n").unwrap();
+    let _ = env.engine.send_message_or_resume(&task.id, "go").await;
+    let task = tasks::get(&env.pool, &task.id).await.unwrap().unwrap();
+    assert_eq!(task.status, "stuck");
+    let reason = task.stuck_reason.unwrap();
+    assert!(
+        reason.contains(&env.global.display().to_string()),
+        "the stuck reason names the config file: {reason}"
+    );
+    assert!(
+        sessions::list_for_task(&env.pool, &task.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn check_config_patch_checks_every_role_when_roles_is_null() {
+    let env = env().await;
+    let task = env
+        .create(
+            GATED,
+            json!({"roles": {"coder": {"model": "claude-opus-5-5"}}}),
+        )
+        .await
+        .unwrap();
+    fs::write(
+        &env.global,
+        "roles:\n  coder:\n    model: claude-sonnet-5-5:auto\n",
+    )
+    .unwrap();
+    let err = env
+        .engine
+        .check_config_patch(&task.id, &json!({"roles": null}))
+        .await
+        .unwrap_err();
+    let ConfigPatchError::Rejected(message) = err else {
+        panic!("{err:?}");
+    };
+    assert!(message.contains("`coder`"), "{message}");
+}
+
+#[tokio::test]
 async fn check_config_patch_checks_the_merged_config_for_the_roles_it_touches() {
     let env = env().await;
     let yaml = flow_yaml("omp", Some("p/m:minimal"));

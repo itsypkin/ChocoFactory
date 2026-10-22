@@ -1619,17 +1619,19 @@ impl WorkflowEngine {
                     .map_err(ConfigPatchError::Db)?;
                 let merged: Value = serde_json::from_str(&merged)
                     .map_err(|err| ConfigPatchError::Db(sqlx::Error::Decode(Box::new(err))))?;
-                let touched: Vec<String> = patch
-                    .get("roles")
-                    .and_then(Value::as_object)
-                    .map(|roles| roles.keys().cloned().collect())
-                    .unwrap_or_default();
+                // A `roles` that is not an object (`null` drops every role
+                // override) can change any workflow role, so all are checked.
+                let touched: Option<Vec<String>> = match patch.get("roles") {
+                    Some(Value::Object(roles)) => Some(roles.keys().cloned().collect()),
+                    Some(_) => None,
+                    None => Some(Vec::new()),
+                };
                 crate::adapter::check_task_config_roles(
                     &merged,
                     &definition,
                     &global,
                     self.registry(),
-                    Some(&touched),
+                    touched.as_deref(),
                 )
                 .map_err(ConfigPatchError::Rejected)?;
             }
