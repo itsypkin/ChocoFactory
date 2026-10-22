@@ -425,6 +425,13 @@ fn apply_auto_memory_env(command: &mut Command, isolation: &Isolation) {
     }
 }
 
+/// The environment decisions `spawn` makes for every role shape, in one place
+/// so a test can run them per isolation.
+fn apply_spawn_env(command: &mut Command, isolation: &Isolation) {
+    apply_auto_memory_env(command, isolation);
+    apply_effort_env(command);
+}
+
 /// Removes `CLAUDE_CODE_EFFORT_LEVEL` from the spawned process's
 /// environment for every role (#336). The level reaches claude only as
 /// `--effort`; the daemon's launch environment is not the operator's choice
@@ -442,13 +449,6 @@ fn apply_auto_memory_env(command: &mut Command, isolation: &Isolation) {
 ///   scrubbed from here: an isolated role applies the repo's committed
 ///   settings, and the chat role the operator's own, so such an `env` value
 ///   still wins (documented in `docs/models.md`).
-/// The environment decisions `spawn` makes for every role shape, in one place
-/// so a test can run them per isolation.
-fn apply_spawn_env(command: &mut Command, isolation: &Isolation) {
-    apply_auto_memory_env(command, isolation);
-    apply_effort_env(command);
-}
-
 fn apply_effort_env(command: &mut Command) {
     command.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
 }
