@@ -31,7 +31,8 @@ A task parks at `escalate_to_human` after a 4th rejection in a row by
 `internal_review`, a 4th red CI result in a row from `checks_polling`, a 4th
 `/request-changes` from you since the last escalation (each counted
 separately), after about 4 days with no verdict from you, when CI has not
-finished in 30 minutes, when a check is cancelled, failed to start or needs
+finished in 30 minutes (after a last look, and up to 30 more minutes if the
+machine slept through the deadline), when a check is cancelled, failed to start or needs
 an action (approval) before it can run, or when `open_pr` fails.
 
 Copy this checklist and tick it off:
@@ -153,7 +154,9 @@ command in step 3 and the pre-merge check in step 4.
   `stuck` marks and nudges show up there first.
 - **Keep the machine awake for the whole run.** On a sleeping laptop agent
   turns stall, and the review window (about 4 days) keeps running and can park the
-  task overnight. On macOS, run `caffeinate -dims` in a spare terminal. Don't
+  task overnight. A stage that wakes after its deadline takes a last look, and
+  watches up to 30 more minutes if it slept through the deadline, but that does
+  not give the lost time back, and a restart drops it. On macOS, run `caffeinate -dims` in a spare terminal. Don't
   tie it to the daemon with `-w <pid>`: the pid changes on restart.
 
 ## 2. Write the spec

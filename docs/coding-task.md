@@ -180,8 +180,8 @@ within 102 hours (about four days) the task stops waiting and parks at
 there: the gate doesn't read markers, so it would be a note that starts a coder
 lap. To watch again, run `choco task retry <id>`; the schedule starts over and
 no coder lap is spent. Comments and reviews posted before the timeout are not
-counted after that (including a verdict posted in the last polling interval
-before it); post them again. If the PR was merged meanwhile, `retry` is also the
+counted after that, except what the gate's last look at the deadline reads
+(it runs the check once more before it gives up); post them again. If the PR was merged meanwhile, `retry` is also the
 way on: the watcher sees the merge and the task moves to `done`. `retry` after
 a `checks_polling` timeout re-watches CI the same way. A fourth `/request-changes`, after three revise rounds, parks
 it the same way instead of looping, and resuming from there starts the
@@ -191,7 +191,11 @@ on the 4th red CI result in a row (any other outcome starts it over). A red
 result is one that is still red after the failed Actions jobs were re-run once
 for that head; while the re-run is pending the stage keeps polling and counts
 nothing.
-`checks_polling` polls every 30 seconds for up to 30 minutes: a timeout, and
+`checks_polling` polls every 30 seconds for up to 30 minutes and takes one last
+look at CI when the time is up. If the machine slept through the deadline, it
+watches up to 30 more minutes first, so a CI result that landed while it slept
+is still seen (keep the machine awake all the same: a daemon restart drops that
+extra time). A timeout, and
 a cancelled, startup-failure or action-required check (`ci_cancelled`,
 `ci_startup_failure`, `ci_action_required`), park the task at
 `escalate_to_human`. Green (every check passed or was skipped) and
