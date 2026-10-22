@@ -888,7 +888,7 @@ async fn the_inherit_overlay_has_exactly_three_keys_and_inherits_the_rest_of_the
             Some(if sandboxed { "yolo" } else { "always-ask" })
         );
         assert!(arg_after(&argv, "--tools").is_some());
-        assert_eq!(arg_after(&argv, "--thinking").as_deref(), Some("medium"));
+        assert_eq!(arg_after(&argv, "--thinking").as_deref(), Some("high"));
     }
 }
 
@@ -1025,7 +1025,7 @@ async fn system_prompt_flags_skills_thinking_tools_and_the_profile_rule() {
         assert!(argv.contains(&flag.to_string()), "{flag}");
     }
     assert_eq!(arg_after(&argv, "--mode").as_deref(), Some("rpc"));
-    assert_eq!(arg_after(&argv, "--thinking").as_deref(), Some("medium"));
+    assert_eq!(arg_after(&argv, "--thinking").as_deref(), Some("high"));
     assert_eq!(
         arg_after(&argv, "--model").as_deref(),
         Some("openai-codex/gpt-5.6-terra")
@@ -1049,7 +1049,7 @@ async fn system_prompt_flags_skills_thinking_tools_and_the_profile_rule() {
     assert_eq!(arg_after(&argv, "--skills").as_deref(), Some("a,b"));
     assert!(!argv.contains(&"--no-skills".to_string()));
 
-    // A level suffix wins over --thinking; no model still gets medium.
+    // A level suffix wins over --thinking; no model still gets high.
     cfg.model = Some("openai-codex/gpt-5.6-terra:high".to_string());
     let argv = argv_of(&echo_run(&env, &cfg).await);
     assert!(!argv.contains(&"--thinking".to_string()));
@@ -1057,9 +1057,14 @@ async fn system_prompt_flags_skills_thinking_tools_and_the_profile_rule() {
         arg_after(&argv, "--model").as_deref(),
         Some("openai-codex/gpt-5.6-terra:high")
     );
+    // A suffix that is not an omp level is part of the model id.
+    cfg.model = Some("p/m:latest".to_string());
+    let argv = argv_of(&echo_run(&env, &cfg).await);
+    assert_eq!(arg_after(&argv, "--model").as_deref(), Some("p/m:latest"));
+    assert_eq!(arg_after(&argv, "--thinking").as_deref(), Some("high"));
     cfg.model = None;
     let argv = argv_of(&echo_run(&env, &cfg).await);
-    assert_eq!(arg_after(&argv, "--thinking").as_deref(), Some("medium"));
+    assert_eq!(arg_after(&argv, "--thinking").as_deref(), Some("high"));
     assert!(!argv.contains(&"--model".to_string()));
 }
 
@@ -1071,11 +1076,6 @@ fn the_tool_allowlist_drops_what_the_role_disallows_and_never_lists_report_outco
     assert_eq!(tools(&[RoleTool::Write]), "read,bash,edit,glob,grep,todo");
     assert_eq!(tools(&[RoleTool::NotebookEdit]), tools(&[]));
     assert!(!tools(&RoleTool::ALL).contains("report_outcome"));
-    for suffix in ["off", "high", "auto"] {
-        assert!(model_has_thinking_suffix(&format!("p/m:{suffix}")));
-    }
-    assert!(!model_has_thinking_suffix("p/m"));
-    assert!(!model_has_thinking_suffix("p/m:latest"));
 }
 
 #[tokio::test]
@@ -2748,6 +2748,37 @@ async fn omp_loads_only_the_repos_own_instructions() {
     expected.push("report_outcome".to_string());
     expected.sort();
     assert_eq!(tools, expected);
+}
+
+/// No model call (#336). The real omp accepts the adapter's default
+/// `--thinking high` and reaches its `ready` frame.
+///
+/// Run with: `cargo test -p chocofactoryd --lib omp_accepts_the_default_thinking_level -- --ignored`
+#[tokio::test]
+#[ignore = "needs a real omp on PATH (no model call is made)"]
+async fn omp_accepts_the_default_thinking_level() {
+    let env = Env::new();
+    let mut cfg = env.cfg();
+    cfg.model = Some("openai-codex/gpt-5.6-terra".to_string());
+    let (mut command, overlay_path) = real_command("omp", &env.state, &cfg, None);
+    let std_args: Vec<String> = command
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(arg_after(&std_args, "--thinking").as_deref(), Some("high"));
+    let mut child = command.spawn().expect("omp must be on PATH");
+    let stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let ready = tokio::time::timeout(Duration::from_secs(60), read_lf_line(&mut lines))
+        .await
+        .expect("no ready in 60 s")
+        .unwrap()
+        .expect("omp exited");
+    assert!(ready.contains("\"ready\""), "{ready}");
+    drop(stdin);
+    let _ = child.kill().await;
+    let _ = std::fs::remove_file(overlay_path);
 }
 
 /// One real turn on `openai-codex/gpt-5.6-terra` with a one-line prompt,

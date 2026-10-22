@@ -402,6 +402,11 @@ impl SessionManager {
         adapter
             .validate_role(&session_row.role, &cfg.isolation)
             .map_err(SessionError::RoleRejected)?;
+        if let Some(model) = &cfg.model {
+            adapter
+                .validate_model(&session_row.role, model)
+                .map_err(SessionError::RoleRejected)?;
+        }
 
         // Re-checked atomically here (rather than trusting the read
         // above): two concurrent calls for the same not-yet-live
@@ -4838,6 +4843,44 @@ mod tests {
             },
             ..role_config()
         }
+    }
+
+    #[tokio::test]
+    async fn chat_resume_refuses_a_bad_claude_level_before_reserving_anything() {
+        let pool = connect_in_memory().await.unwrap();
+        let manager = SessionManager::new(
+            pool.clone(),
+            Registry::new(vec![Arc::new(crate::adapter::ClaudeAdapter::with_binary(
+                "/nonexistent/claude",
+            ))]),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+        );
+        let session_id = idle_chat_session_on(&pool, "claude").await;
+        let bad = RoleConfig {
+            model: Some("claude-sonnet-5-5:auto".to_string()),
+            ..role_config()
+        };
+        let result = manager.send_message(&session_id, "hi", &bad).await;
+        match result {
+            Err(SessionError::RoleRejected(message)) => {
+                assert!(message.contains(":auto"), "{message}");
+                assert!(message.contains("`chat`"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let row = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(row.status, SessionStatus::Idle);
+        // A valid level gets past the check (the missing binary fails later).
+        let good = RoleConfig {
+            model: Some("claude-sonnet-5-5:high".to_string()),
+            ..role_config()
+        };
+        let result = manager.send_message(&session_id, "hi", &good).await;
+        assert!(
+            !matches!(result, Err(SessionError::RoleRejected(_))),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

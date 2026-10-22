@@ -2404,3 +2404,164 @@ async fn daemon_refuses_to_start_on_an_unknown_cli_in_the_global_config() {
     entries.sort();
     assert_eq!(entries, vec!["config.yaml".to_string()], "{entries:?}");
 }
+
+/// #336 through the real binary: a daemon launched with
+/// `CLAUDE_CODE_EFFORT_LEVEL=max` in its environment must not leak it to the
+/// agent (claude would let it beat `--effort`), and a role with no level runs
+/// at `high`. The echo fixture reports the argv and the env it saw.
+#[tokio::test]
+async fn real_binary_scrubs_the_daemons_effort_env_and_defaults_to_high() {
+    let home = TempHome::new();
+    let workflow = home.write_workflow(
+        "effort-e2e",
+        r#"
+name: effort-e2e
+worktree: false
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    prompt_file: prompt.md
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+    );
+    std::fs::write(workflow.parent().unwrap().join("prompt.md"), "go").unwrap();
+    let echo = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fake_claude_echo_args.py"
+    );
+    let daemon = Daemon::spawn_with_home_and_env(
+        home,
+        &[
+            ("CLAUDE_CODE_EFFORT_LEVEL", "max"),
+            ("CHOCOFACTORY_CLAUDE_BINARY", echo),
+        ],
+    )
+    .await;
+    let task_id = create_task(&daemon, &workflow).await;
+    let reply = wait_until("the echo fixture's reply", || async {
+        let history = daemon.get(&format!("/tasks/{task_id}/events")).await;
+        history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["event_type"] == "assistant_message")
+            .map(|e| e["payload"]["text"].as_str().unwrap().to_string())
+            .ok_or_else(|| format!("no reply yet: {history}"))
+    })
+    .await;
+    assert!(reply.contains("|effort=high|"), "{reply}");
+    assert!(reply.contains("|effort_count=1|"), "{reply}");
+    assert!(reply.ends_with("|effort_env=<unset>"), "{reply}");
+}
+
+/// A localhost stand-in for the Anthropic API that records only each
+/// request's `model` and `output_config` (never headers) and answers 400.
+async fn spawn_api_stub() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = std::sync::Arc::clone(&recorded);
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let Ok(n) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..split]).to_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= split + 4 + length {
+                        let body: Value =
+                            serde_json::from_slice(&buf[split + 4..split + 4 + length])
+                                .unwrap_or(Value::Null);
+                        recorded.lock().unwrap().push(json!({
+                            "model": body["model"],
+                            "output_config": body["output_config"],
+                        }));
+                        break;
+                    }
+                }
+                let reply =
+                    r#"{"type":"error","error":{"type":"invalid_request_error","message":"stub"}}"#;
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// #336, real `claude`, no model call: a daemon started with
+/// `CLAUDE_CODE_EFFORT_LEVEL=max` still sends the role's level. The request
+/// goes to a localhost stub; a temp HOME and a throwaway key keep every
+/// operator credential out of it.
+#[tokio::test]
+#[ignore = "runs the real claude binary against a localhost stub (no model call); needs claude installed"]
+async fn real_claude_sends_the_roles_effort_not_the_daemons_env() {
+    let (port, seen) = spawn_api_stub().await;
+    let home = TempHome::new();
+    let workflow = home.write_workflow(
+        "effort-real",
+        "name: effort-real\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: \"claude-sonnet-5-5:low\"\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    prompt_file: prompt.md\n    on: { done: finished }\n  finished:\n    kind: terminal\n",
+    );
+    std::fs::write(workflow.parent().unwrap().join("prompt.md"), "go").unwrap();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let daemon = Daemon::spawn_with_home_and_env(
+        home,
+        &[
+            ("CLAUDE_CODE_EFFORT_LEVEL", "max"),
+            // The harness defaults this to mock-claude; `claude` on PATH is
+            // what an unset variable means.
+            ("CHOCOFACTORY_CLAUDE_BINARY", "claude"),
+            ("ANTHROPIC_API_KEY", "stub-only"),
+            ("ANTHROPIC_BASE_URL", base_url.as_str()),
+        ],
+    )
+    .await;
+    let _task_id = create_task(&daemon, &workflow).await;
+    let request = wait_until("a request carrying output_config", || async {
+        let seen = seen.lock().unwrap();
+        seen.iter()
+            .find(|r| {
+                r["model"].as_str().is_some_and(|m| m.contains("sonnet"))
+                    && !r["output_config"].is_null()
+            })
+            .cloned()
+            .ok_or_else(|| format!("seen so far: {seen:?}"))
+    })
+    .await;
+    assert_eq!(request["output_config"]["effort"], "low", "{request}");
+    assert_eq!(request["model"], "claude-sonnet-5-5", "{request}");
+}

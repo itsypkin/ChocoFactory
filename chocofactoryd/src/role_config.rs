@@ -83,6 +83,27 @@ pub fn resolve_cli(
     })
 }
 
+/// The `model` half of [`resolve`], layered like [`resolve_cli`].
+pub fn resolve_model(
+    role_name: &str,
+    role_def: &RoleDef,
+    global: &GlobalConfig,
+    task_config: &Value,
+) -> Result<String, RoleConfigError> {
+    let task_role = task_config.get("roles").and_then(|r| r.get(role_name));
+    let global_role = global.roles.get(role_name);
+    resolve_string_field(
+        task_role,
+        "model",
+        role_def.model.as_deref(),
+        global_role.and_then(|g| g.model.as_deref()),
+    )
+    .ok_or_else(|| RoleConfigError::MissingField {
+        role: role_name.to_string(),
+        field: "model",
+    })
+}
+
 /// Resolves `role_name`'s final `cli`/`model`/system prompt against the
 /// three layers, plus `cwd`/`sandboxed`/`report` (stage- or task-wide, not
 /// per-role — passed straight through, not resolved here).
@@ -102,16 +123,7 @@ pub fn resolve(
 
     let cli = resolve_cli(role_name, role_def, global, task_config)?;
 
-    let model = resolve_string_field(
-        task_role,
-        "model",
-        role_def.model.as_deref(),
-        global_role.and_then(|g| g.model.as_deref()),
-    )
-    .ok_or_else(|| RoleConfigError::MissingField {
-        role: role_name.to_string(),
-        field: "model",
-    })?;
+    let model = resolve_model(role_name, role_def, global, task_config)?;
 
     let system_prompt = if let Some(text) = task_role
         .and_then(|r| r.get("system_prompt"))

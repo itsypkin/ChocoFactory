@@ -39,7 +39,7 @@ role's `cli:` has changed starts fresh instead.
 | Flag | Sets |
 |---|---|
 | `--role-cli ROLE=CLI` | which agent adapter runs that role (`claude` or `omp`) |
-| `--role-model ROLE=MODEL` | that role's model |
+| `--role-model ROLE=MODEL` | that role's model, optionally ending in `:<level>` (see [Effort level](#effort-level)) |
 | `--role-system-prompt ROLE=TEXT` | that role's system prompt, inline |
 | `--role-system-prompt-file ROLE=PATH` | the same, read from a file |
 
@@ -58,6 +58,43 @@ cover:
 $ choco task create ... --config '{"roles":{"coder":{"model":"opus"}}}'
 ```
 
+
+## Effort level
+
+Every role runs at effort `high` unless its model string says otherwise. A
+model string may end in `:<level>`, on both CLIs:
+
+```
+--role-model coder=claude-sonnet-5-5:xhigh
+```
+
+For a Claude role, choco strips the suffix and runs
+`claude --model claude-sonnet-5-5 --effort xhigh`. The levels are `low`,
+`medium`, `high`, `xhigh` and `max` (the ones `claude --help` lists for
+`--effort`), written exactly like that: `HIGH` is refused. A level only omp
+knows (`off`, `minimal`, `auto`, `inherit`) or one that doesn't exist (a typo
+such as `hihg`, or an empty `claude-opus-5-5:`) is refused, naming the role:
+when the workflow loads, when the daemon starts (a role in `config.yaml` with
+`cli: claude` and a bad level stops it), and when a task is created or reconfigured (`--role-model`, or a
+`--role-cli` that pairs a role with a model from another layer). A value that
+slips in later, such as `config.yaml` edited while the daemon runs, parks the
+task `stuck` naming the role when the turn starts. Model ids that contain a
+colon themselves, such as Bedrock's `...-v1:0` or an ARN, are kept whole.
+For an omp role see [Thinking level](#cli-omp).
+
+**Cost.** `high` is now the default for every role, so turns are slower and
+cost more than at the `medium` that Opus, Sonnet and Haiku 5.5 roles and omp
+roles ran at before. Put `:medium` on a role to keep the old behaviour.
+
+**What can override it.** The level reaches claude only as `--effort`.
+choco removes `CLAUDE_CODE_EFFORT_LEVEL` from the daemon's environment before
+starting an agent, because claude lets that variable beat the flag. An
+`effortLevel` setting has no effect on claude 2.1.308 and can't beat the
+flag either. Two things still can: an `env` block that sets
+`CLAUDE_CODE_EFFORT_LEVEL` in the task repo's own committed
+`.claude/settings.json` (isolated roles apply the repo's committed settings)
+or in managed policy settings; and, for the chat role, the same `env` value
+in your own user, project or local settings, since chat inherits your setup.
 
 ## Using choco with omp
 
@@ -161,9 +198,10 @@ roles:
   to none and drops `CLAUDE_CONFIG_DIR` from its environment, so the MCP
   servers in your `~/.claude.json` don't start in its sessions. The chat role
   keeps both, as it keeps the rest of your setup.
-- **Thinking level.** `medium`, unless the model string ends in a level, such
-  as `:high` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
-  `auto` or `inherit`).
+- **Thinking level.** `high`, unless the model string ends in a level, such
+  as `:medium` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
+  `auto` or `inherit`). omp judges its own model strings: a suffix that isn't
+  one of these levels, such as `p/m:latest`, is part of the model id.
 - **Cost.** omp's list price is recorded as the turn's cost. On a subscription
   login it is shown as the API-equivalent price, like a claude subscription's;
   for a model omp has no price for, the cost is unknown rather than zero.

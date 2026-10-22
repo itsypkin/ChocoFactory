@@ -762,7 +762,7 @@ Each is `ROLE=VALUE` and each is repeatable:
 | Flag | Sets |
 |---|---|
 | `--role-cli ROLE=CLI` | which agent adapter runs that role (`claude` or `omp`) |
-| `--role-model ROLE=MODEL` | that role's model |
+| `--role-model ROLE=MODEL` | that role's model; a Claude or omp model may end in `:<level>` ([effort level](models.md#effort-level)), default `high` |
 | `--role-system-prompt ROLE=TEXT` | that role's system prompt, inline |
 | `--role-system-prompt-file ROLE=PATH` | the same, read from a file |
 

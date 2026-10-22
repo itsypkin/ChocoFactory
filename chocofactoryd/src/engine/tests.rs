@@ -6,6 +6,7 @@ use serde_json::json;
 use super::watch::{catch_up_len, final_attempt_limit, missed};
 use super::*;
 
+mod model_level;
 mod parallel;
 mod pause;
 mod queue;
@@ -15255,7 +15256,14 @@ async fn create_task_pointing_a_memory_role_at_omp_in_its_config_creates_the_tas
         json!({"roles": {"coder": {"cli": 1}}}),
     ] {
         assert!(
-            crate::adapter::check_task_config_roles(&config, &def, engine.registry()).is_ok(),
+            crate::adapter::check_task_config_roles(
+                &config,
+                &def,
+                &crate::global_config::GlobalConfig::default(),
+                engine.registry(),
+                None
+            )
+            .is_ok(),
             "{config}"
         );
     }

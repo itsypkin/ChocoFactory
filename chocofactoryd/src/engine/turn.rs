@@ -368,6 +368,9 @@ impl WorkflowEngine {
         adapter
             .validate_role(role, &resolved.role_config.isolation)
             .map_err(EngineError::RoleRejected)?;
+        adapter
+            .validate_model(role, &resolved.model)
+            .map_err(EngineError::RoleRejected)?;
         let adapter_name = adapter.name();
         // A stage with an empty `on:` map (chat, §5.4) never concludes — it
         // just keeps accepting further live messages into the same session

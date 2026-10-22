@@ -52,10 +52,6 @@ const NO_INSTRUCTIONS: &str = "No repository instruction files were found.\n";
 /// The repo-relative instruction files an omp role gets, in this order.
 const INSTRUCTION_FILES: [&str; 4] = ["CLAUDE.md", "AGENTS.md", ".omp/AGENTS.md", ".omp/RULES.md"];
 
-const THINKING_LEVELS: [&str; 9] = [
-    "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto", "inherit",
-];
-
 const BASE_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "glob", "grep", "todo"];
 
 /// The only omp memory tools a `memory: true` role gets (#222): not
@@ -621,13 +617,6 @@ pub fn overlay(cfg: &RoleConfig, memory_db: Option<&Path>) -> Value {
     overlay
 }
 
-/// A model string ending in `:<level>` carries its own thinking level.
-fn model_has_thinking_suffix(model: &str) -> bool {
-    model
-        .rsplit_once(':')
-        .is_some_and(|(_, suffix)| THINKING_LEVELS.contains(&suffix))
-}
-
 /// Value of `--system-prompt` / `--append-system-prompt`: ends with a
 /// newline, because omp reads a single-line value as a file path when that
 /// file exists.
@@ -716,8 +705,12 @@ pub fn build_args(
         }
     }
     push(&["--approval-mode", approval_mode(cfg)]);
-    if !cfg.model.as_deref().is_some_and(model_has_thinking_suffix) {
-        push(&["--thinking", "medium"]);
+    if !cfg
+        .model
+        .as_deref()
+        .is_some_and(super::level::omp_has_level)
+    {
+        push(&["--thinking", super::level::DEFAULT_LEVEL]);
     }
     if let Some(model) = &cfg.model {
         push(&["--model", model]);
