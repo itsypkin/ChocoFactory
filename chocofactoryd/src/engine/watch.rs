@@ -382,8 +382,9 @@ impl WorkflowEngine {
         let mut previous: Option<String> = None;
         // Set once, in memory only, when the deadline was missed.
         let mut catch_up: Option<CatchUp> = None;
-        // When the last attempt returned: time spent inside an attempt was
-        // spent watching, so it does not count towards how late the loop is.
+        // When the last attempt returned, by its own monotonic run time: time
+        // spent inside an attempt was spent watching, so it does not count
+        // towards how late the loop is, while a sleep during it still does.
         let mut last_attempt_end: Option<DateTime<Utc>> = None;
 
         loop {
@@ -462,6 +463,7 @@ impl WorkflowEngine {
 
             attempt += 1;
             let started = std::time::Instant::now();
+            let started_wall = self.now();
             // Each regular attempt is capped at whatever is left of the
             // window rather than at `interval`: a command that legitimately
             // takes longer than its own interval — a slow `gh` call on a
@@ -541,7 +543,7 @@ impl WorkflowEngine {
                         "poll stage command ran but its output could not be read"
                     );
                     let note = err.to_string();
-                    last_attempt_end = Some(self.now());
+                    last_attempt_end = Some(attempt_end(started_wall, started));
                     if kind == AttemptKind::Final {
                         self.finish_poll_timed_out(
                             task_id,
@@ -589,7 +591,7 @@ impl WorkflowEngine {
                     continue;
                 }
             };
-            last_attempt_end = Some(self.now());
+            last_attempt_end = Some(attempt_end(started_wall, started));
 
             if let Some(matched) = run.outcomes.matching(&outcome.stdout) {
                 let (captured, capture_note) =
@@ -892,4 +894,11 @@ impl WorkflowEngine {
         )
         .await;
     }
+}
+
+/// The wall-clock end of an attempt, reckoned from its start plus how long
+/// it ran on the monotonic clock, so a machine sleep inside it isn't counted.
+fn attempt_end(started_wall: DateTime<Utc>, started: std::time::Instant) -> DateTime<Utc> {
+    started_wall
+        + chrono::Duration::from_std(started.elapsed()).unwrap_or_else(|_| chrono::Duration::zero())
 }
