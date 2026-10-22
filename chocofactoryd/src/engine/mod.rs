@@ -2397,17 +2397,16 @@ impl WorkflowEngine {
         Ok(())
     }
 
-    /// Marks `task_id` `stuck` with `reason` (X-4, issue #61) — best-effort,
-    /// like every other timeline write in this file: there is nothing left
-    /// to return a failure to by the time any of this module's call sites
-    /// reach here.
+    /// Marks `task_id` `stuck` with `reason` (X-4, issue #61). The status and
+    /// its `error` event commit together in one transaction (#314); a failure
+    /// of either is [`StuckMark::WriteFailed`] and the task is not marked.
     ///
     /// `reason` should name the stage and say what happened, since it's the
     /// only thing a human sees in `choco task status` explaining why the
     /// task stopped moving. Uses `db::tasks::mark_stuck`'s compare-and-set —
-    /// only an `open` task actually changes — so a late failure racing a
-    /// concurrent `cancel_task`/`retry_task` can never clobber whatever
-    /// status that other caller already settled on.
+    /// only an `open`, `pausing` or `paused` task actually changes — so a
+    /// late failure racing a concurrent `cancel_task`/`retry_task` can never
+    /// clobber whatever status that other caller already settled on.
     ///
     /// `event_already_recorded` is `true` only when the caller is forwarding
     /// an `EngineError::Template` it got back from `enter_stage`: that path
@@ -2424,42 +2423,48 @@ impl WorkflowEngine {
         reason: &str,
         event_already_recorded: bool,
     ) -> StuckMark {
-        match tasks::mark_stuck(&self.pool, task_id, reason).await {
-            Ok(true) => {
-                tracing::error!(task_id, reason, "task stuck: {reason}");
-                if event_already_recorded {
-                    return StuckMark::Marked;
+        let stage = if event_already_recorded {
+            Value::Null
+        } else {
+            match workflow_state::get(&self.pool, task_id).await {
+                Ok(Some(state)) => json!(state.current_stage),
+                Ok(None) => Value::Null,
+                Err(err) => {
+                    tracing::error!(
+                        task_id, %err,
+                        "failed to read workflow_state while recording a stuck task's event"
+                    );
+                    Value::Null
                 }
-                let stage = match workflow_state::get(&self.pool, task_id).await {
-                    Ok(Some(state)) => json!(state.current_stage),
-                    Ok(None) => Value::Null,
-                    Err(err) => {
-                        tracing::error!(
-                            task_id, %err,
-                            "failed to read workflow_state while recording a stuck task's event"
-                        );
-                        Value::Null
-                    }
-                };
-                match events::append_for_task(
-                    &self.pool,
+            }
+        };
+        let written: Result<bool, sqlx::Error> = async {
+            let mut tx = self.pool.begin().await?;
+            if !tasks::mark_stuck_in(&mut tx, task_id, reason).await? {
+                return Ok(false);
+            }
+            if !event_already_recorded {
+                events::append_for_task_on(
+                    &mut tx,
                     task_id,
                     EventType::Error,
                     json!({ "stage": stage, "message": reason, "stuck": true }),
                 )
-                .await
-                {
-                    Ok(_) => self.events_notify.notify_waiters(),
-                    Err(err) => tracing::error!(
-                        task_id, %err,
-                        "failed to record a stuck-task event"
-                    ),
-                }
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(true)
+        }
+        .await;
+        match written {
+            Ok(true) => {
+                tracing::error!(task_id, reason, "task stuck: {reason}");
+                self.events_notify.notify_waiters();
                 StuckMark::Marked
             }
-            // The task was no longer `open` — already cancelled, closed, or
-            // already stuck — so there is nothing to mark. Not an error:
-            // this is the compare-and-set doing exactly its job.
+            // The task was no longer `open`, `pausing` or `paused` — already
+            // cancelled, closed, or already stuck — so there is nothing to
+            // mark. Not an error: the compare-and-set doing its job.
             Ok(false) => {
                 tracing::info!(
                     task_id,

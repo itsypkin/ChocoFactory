@@ -451,15 +451,26 @@ pub async fn mark_pausing(
 }
 
 /// `pausing → paused`; `paused_at` is left as the pause request set it.
-/// `false` means the task was not `pausing`.
+/// `false` means the task was not `pausing`. See [`mark_paused_in`]; this is
+/// the pool wrapper.
 pub async fn mark_paused(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    mark_paused_in(&mut conn, id).await
+}
+
+/// [`mark_paused`] on the given connection, so it can join a caller's
+/// transaction (pass `&mut *tx`) and commit with the `task_paused` event.
+pub async fn mark_paused_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE tasks SET status = 'paused', updated_at = ? \
          WHERE id = ? AND status = 'pausing'",
     )
     .bind(Utc::now())
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -1095,6 +1106,27 @@ mod tests {
         let task = get(&pool, &task_id).await.unwrap().unwrap();
         assert_eq!(task.status, "cancelled");
         assert_eq!(task.stuck_reason, None);
+    }
+
+    #[tokio::test]
+    async fn mark_paused_in_only_changes_a_pausing_task() {
+        let pool = connect_in_memory().await.unwrap();
+        for status in ["open", "pausing", "paused", "stuck", "cancelled", "closed"] {
+            let id = seed_open_task(&pool).await;
+            update_status(&pool, &id, status).await.unwrap();
+            let changed = {
+                let mut conn = pool.acquire().await.unwrap();
+                mark_paused_in(&mut conn, &id).await.unwrap()
+            };
+            assert_eq!(changed, status == "pausing", "from {status}");
+            let now = get(&pool, &id).await.unwrap().unwrap().status;
+            let want = if status == "pausing" {
+                "paused"
+            } else {
+                status
+            };
+            assert_eq!(now, want, "from {status}");
+        }
     }
 
     #[tokio::test]
