@@ -373,14 +373,20 @@ pub async fn update_config(
     }
     adapter::check_task_config_clis(&body.config, state.engine.registry())
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
-    // A patch that points a role at a CLI is checked against the task's
-    // workflow before anything is merged. Only a body that sets a string
-    // `roles.<name>.cli` can change which adapter a role runs on.
-    if sets_a_role_cli(&body.config) {
+    // A patch that sets a role's CLI or model is checked against the task's
+    // workflow and the merged config before anything is merged. Only a body
+    // that sets a string `roles.<name>.cli` or `roles.<name>.model` can
+    // change which adapter or model a role runs on.
+    if sets_a_role_cli_or_model(&body.config) {
         match state.engine.check_config_patch(&id, &body.config).await {
             Ok(()) => {}
             Err(ConfigPatchError::Rejected(message)) => {
                 return Err(ApiError::BadRequest(message));
+            }
+            Err(ConfigPatchError::GlobalConfig(err)) => {
+                return Err(ApiError::Internal(format!(
+                    "cannot check the roles: the global config failed to load: {err}"
+                )));
             }
             Err(ConfigPatchError::Db(err)) => return Err(err.into()),
         }
@@ -391,15 +397,17 @@ pub async fn update_config(
     Ok(Json(task))
 }
 
-/// Whether `config` sets any string `roles.<name>.cli`.
-fn sets_a_role_cli(config: &serde_json::Value) -> bool {
+/// Whether `config` sets any string `roles.<name>.cli` or `roles.<name>.model`.
+fn sets_a_role_cli_or_model(config: &serde_json::Value) -> bool {
     config
         .get("roles")
         .and_then(serde_json::Value::as_object)
         .is_some_and(|roles| {
-            roles
-                .values()
-                .any(|role| role.get("cli").is_some_and(serde_json::Value::is_string))
+            roles.values().any(|role| {
+                ["cli", "model"]
+                    .iter()
+                    .any(|key| role.get(key).is_some_and(serde_json::Value::is_string))
+            })
         })
 }
 
@@ -2911,6 +2919,130 @@ stages:
             .patch(
                 &format!("/tasks/{task_id}"),
                 json!({ "config": { "roles": { "coder": { "cli": "omp" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "{}", response.json());
+    }
+
+    // ---- #336: a Claude role's level suffix is checked ----
+
+    const LEVEL_FLOW: &str = "name: lvlflow\nroles:\n  coder:\n    cli: omp\n    model: \"p/m:minimal\"\n  reviewer:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: human_gate\n    on: { resumed: done }\n  done:\n    kind: terminal\n";
+
+    async fn create_level_task(server: &TestServer, project_id: &str) -> String {
+        let task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "lvlflow",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": { "cwd": "." },
+                }),
+            )
+            .await
+            .json();
+        task["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{task}"))
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn create_with_an_omp_only_level_on_a_claude_role_is_400_and_creates_nothing() {
+        let server = TestServer::start_with_omp().await;
+        server.write_workflow("lvlflow", LEVEL_FLOW);
+        let project_id = create_project(&server).await;
+        let response = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "lvlflow",
+                    "title": "t",
+                    "prompt": "hello",
+                    "config": { "cwd": ".", "roles": { "reviewer": { "model": "claude-opus-5-5:minimal" } } },
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            error.contains("`reviewer`") && error.contains(":minimal"),
+            "{error}"
+        );
+        assert!(error.contains("low, medium, high, xhigh, max"), "{error}");
+        assert!(!error.contains("coder"), "{error}");
+        let listed = server.get(&format!("/tasks?project_id={project_id}")).await;
+        assert_eq!(listed.json().as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn patch_task_config_checks_a_model_only_patch_and_the_merged_config() {
+        let server = TestServer::start_with_omp().await;
+        server.write_workflow("lvlflow", LEVEL_FLOW);
+        let project_id = create_project(&server).await;
+        let task_id = create_level_task(&server, &project_id).await;
+        let config_of =
+            || async { server.get(&format!("/tasks/{task_id}")).await.json()["config"].clone() };
+        let before = config_of().await;
+
+        // A model-only patch with a bad level.
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "reviewer": { "model": "claude-opus-5-5:hihg" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        let error = response.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            error.contains("`reviewer`") && error.contains(":hihg"),
+            "{error}"
+        );
+        assert_eq!(config_of().await, before);
+
+        // Only `cli: claude` over the workflow's omp-only `p/m:minimal`.
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "coder": { "cli": "claude" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        assert!(
+            response.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("`coder`")
+        );
+        assert_eq!(config_of().await, before);
+
+        // A valid level, and a null-delete, are accepted.
+        for config in [
+            json!({ "roles": { "reviewer": { "model": "claude-opus-5-5:xhigh" } } }),
+            json!({ "roles": { "reviewer": { "model": null } } }),
+        ] {
+            let response = server
+                .patch(&format!("/tasks/{task_id}"), json!({ "config": config }))
+                .await;
+            assert_eq!(response.status(), 200, "{config}: {}", response.json());
+        }
+
+        // A role the patch doesn't touch is not checked, even holding a bad level.
+        sqlx::query("UPDATE tasks SET config = ? WHERE id = ?")
+            .bind(
+                json!({"cwd": ".", "roles": {"coder": {"cli": "claude", "model": "x:auto"}}})
+                    .to_string(),
+            )
+            .bind(&task_id)
+            .execute(server.pool())
+            .await
+            .unwrap();
+        let response = server
+            .patch(
+                &format!("/tasks/{task_id}"),
+                json!({ "config": { "roles": { "reviewer": { "model": "claude-opus-5-5:low" } } } }),
             )
             .await;
         assert_eq!(response.status(), 200, "{}", response.json());

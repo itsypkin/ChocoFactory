@@ -173,7 +173,8 @@ criteria:
 
 `--role-cli reviewer=omp` (or `cli: omp` on the
 role in the workflow) runs that role on the `omp` CLI, for example with
-`--role-model reviewer=openai-codex/gpt-5.6-terra`. It uses your existing
+`--role-model reviewer=openai-codex/gpt-5.6-terra`. It runs at thinking level
+`high` unless the model ends in a level such as `:medium`. It uses your existing
 omp login and needs no extra step. An omp role sees the repo's root
 `CLAUDE.md` and `AGENTS.md` and `.omp/AGENTS.md` and `.omp/RULES.md`, plus
 the repo's `.claude/CLAUDE.md` (loaded by omp itself), and

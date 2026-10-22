@@ -402,6 +402,11 @@ impl SessionManager {
         adapter
             .validate_role(&session_row.role, &cfg.isolation)
             .map_err(SessionError::RoleRejected)?;
+        if let Some(model) = &cfg.model {
+            adapter
+                .validate_model(&session_row.role, model)
+                .map_err(SessionError::RoleRejected)?;
+        }
 
         // Re-checked atomically here (rather than trusting the read
         // above): two concurrent calls for the same not-yet-live

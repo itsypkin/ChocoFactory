@@ -249,6 +249,10 @@ the tool rejected.
 
 ## What an agent inherits from your Claude setup
 
+One thing is never inherited: the daemon's own `CLAUDE_CODE_EFFORT_LEVEL`.
+The role's effort comes from its model string
+([Effort level](models.md#effort-level)).
+
 By default an agent role runs isolated from the operator's own Claude Code
 setup: no `~/.claude/CLAUDE.md`, no user plugins, hooks or output style, no
 MCP servers other than the daemon's, no skills, no memory, no

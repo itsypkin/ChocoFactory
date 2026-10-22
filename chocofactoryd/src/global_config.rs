@@ -111,10 +111,14 @@ impl GlobalConfig {
 }
 
 /// Daemon-start check: every `cli:` in the global config at `path` must
-/// name an adapter in `registry`. A missing file or `None` path is fine; a
+/// name an adapter in `registry`, and a role with a `cli` and a `model` must
+/// have a model its adapter accepts. A missing file or `None` path is fine; a
 /// file that can't be loaded logs a warning and passes, as it always has
 /// (the error still surfaces when a turn needs the config).
-pub fn check_known_clis(path: Option<&Path>, registry: &Registry) -> Result<(), UnknownCliError> {
+pub fn check_global_roles(
+    path: Option<&Path>,
+    registry: &Registry,
+) -> Result<(), StartupRoleError> {
     let Some(path) = path else {
         return Ok(());
     };
@@ -129,10 +133,34 @@ pub fn check_known_clis(path: Option<&Path>, registry: &Registry) -> Result<(), 
     roles.sort_by_key(|(name, _)| *name);
     for (name, role) in roles {
         if let Some(cli) = &role.cli {
-            registry.lookup(Some(name), cli)?;
+            let adapter = registry
+                .lookup(Some(name), cli)
+                .map_err(StartupRoleError::UnknownCli)?;
+            if let Some(model) = &role.model {
+                adapter
+                    .validate_model(name, model)
+                    .map_err(StartupRoleError::RoleRejected)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Why `check_global_roles` refused the daemon's start.
+#[derive(Debug)]
+pub enum StartupRoleError {
+    UnknownCli(UnknownCliError),
+    /// A role's adapter can't run its model string (a bad level suffix).
+    RoleRejected(String),
+}
+
+impl std::fmt::Display for StartupRoleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupRoleError::UnknownCli(err) => write!(f, "{err}"),
+            StartupRoleError::RoleRejected(message) => write!(f, "{message}"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,10 +362,10 @@ mod tests {
     }
 
     #[test]
-    fn check_known_clis_rejects_an_unknown_cli_naming_the_role() {
+    fn check_global_roles_rejects_an_unknown_cli_naming_the_role() {
         let dir = TempDir::new();
         let path = dir.write("config.yaml", "roles:\n  coder:\n    cli: cluade\n");
-        let err = check_known_clis(Some(&path), &claude_registry()).unwrap_err();
+        let err = check_global_roles(Some(&path), &claude_registry()).unwrap_err();
         assert_eq!(
             err.to_string(),
             "role 'coder' uses cli 'cluade', which this daemon doesn't know; known CLIs: claude"
@@ -345,28 +373,53 @@ mod tests {
     }
 
     #[test]
-    fn check_known_clis_reports_the_first_bad_role_in_sorted_order() {
+    fn check_global_roles_rejects_a_bad_claude_level_naming_only_that_role() {
+        let dir = TempDir::new();
+        let path = dir.write(
+            "config.yaml",
+            "roles:\n  a_ok:\n    cli: claude\n    model: claude-opus-5-5:max\n  coder:\n    cli: claude\n    model: x:auto\n",
+        );
+        let err = check_global_roles(Some(&path), &claude_registry()).unwrap_err();
+        assert!(matches!(err, StartupRoleError::RoleRejected(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("`coder`") && message.contains("x:auto"),
+            "{message}"
+        );
+        assert!(!message.contains("a_ok"), "{message}");
+        let ok = dir.write(
+            "ok.yaml",
+            "roles:\n  a_ok:\n    cli: claude\n    model: claude-opus-5-5:max\n",
+        );
+        assert!(check_global_roles(Some(&ok), &claude_registry()).is_ok());
+    }
+
+    #[test]
+    fn check_global_roles_reports_the_first_bad_role_in_sorted_order() {
         let dir = TempDir::new();
         let path = dir.write(
             "config.yaml",
             "roles:\n  zed:\n    cli: nope\n  alpha:\n    cli: nada\n",
         );
-        let err = check_known_clis(Some(&path), &claude_registry()).unwrap_err();
+        let err = check_global_roles(Some(&path), &claude_registry()).unwrap_err();
+        let StartupRoleError::UnknownCli(err) = err else {
+            panic!("expected an unknown cli");
+        };
         assert_eq!(err.role.as_deref(), Some("alpha"));
     }
 
     #[test]
-    fn check_known_clis_accepts_what_startup_has_always_accepted() {
+    fn check_global_roles_accepts_what_startup_has_always_accepted() {
         let dir = TempDir::new();
         let registry = claude_registry();
-        assert!(check_known_clis(None, &registry).is_ok());
-        assert!(check_known_clis(Some(&dir.path.join("missing.yaml")), &registry).is_ok());
+        assert!(check_global_roles(None, &registry).is_ok());
+        assert!(check_global_roles(Some(&dir.path.join("missing.yaml")), &registry).is_ok());
         let ok = dir.write("ok.yaml", "roles:\n  coder:\n    cli: claude\n");
-        assert!(check_known_clis(Some(&ok), &registry).is_ok());
+        assert!(check_global_roles(Some(&ok), &registry).is_ok());
         let model_only = dir.write("m.yaml", "roles:\n  coder:\n    model: opus\n");
-        assert!(check_known_clis(Some(&model_only), &registry).is_ok());
+        assert!(check_global_roles(Some(&model_only), &registry).is_ok());
         let malformed = dir.write("bad.yaml", "roles: [not, a, map");
-        assert!(check_known_clis(Some(&malformed), &registry).is_ok());
+        assert!(check_global_roles(Some(&malformed), &registry).is_ok());
     }
 
     #[test]

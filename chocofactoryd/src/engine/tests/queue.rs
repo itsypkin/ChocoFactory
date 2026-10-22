@@ -1335,7 +1335,10 @@ async fn claim_fails_when_the_config_is_malformed_and_names_the_file() {
     assert_eq!(q.engine.running_total(), 0);
 }
 
-async fn a_broken_config_parks_the_new_turn_stuck(break_config: impl FnOnce(&Path)) {
+/// Since #336 the create reads the global config to check each role, so a
+/// config that won't load refuses the create outright (fail closed) instead
+/// of parking the first turn. Nothing is written: no task, no session.
+async fn a_broken_config_refuses_the_create(break_config: impl FnOnce(&Path)) {
     let q = Q::new(Some(1)).await;
     q.script(&[("job-a", Ending::Report)]);
     fs::remove_file(&q.config).unwrap();
@@ -1353,32 +1356,30 @@ async fn a_broken_config_parks_the_new_turn_stuck(break_config: impl FnOnce(&Pat
         )
         .await
         .unwrap_err();
-    let CreateTaskError::Start { task_id, .. } = err else {
-        panic!("expected a start failure: {err}");
-    };
-    let task = tasks::get(&q.pool, &task_id).await.unwrap().unwrap();
-    assert_eq!(task.status, "stuck");
-    let reason = task.stuck_reason.unwrap();
+    assert!(matches!(err, CreateTaskError::GlobalConfig(_)), "{err}");
     assert!(
-        reason.contains(&q.config.display().to_string()),
-        "the stuck reason names the config file: {reason}"
+        err.to_string().contains(&q.config.display().to_string()),
+        "the error names the config file: {err}"
     );
+    let listed = tasks::list(&q.pool, Some(&q.project.id), None)
+        .await
+        .unwrap();
+    assert!(listed.is_empty(), "{listed:?}");
     assert!(q.rows().await.is_empty());
-    assert!(q.sessions(&task_id).await.is_empty());
 }
 
 #[tokio::test]
-async fn a_malformed_config_parks_the_new_turn_stuck_naming_the_file() {
-    a_broken_config_parks_the_new_turn_stuck(|path| {
+async fn a_malformed_config_refuses_the_create_naming_the_file() {
+    a_broken_config_refuses_the_create(|path| {
         fs::write(path, "max_agents: two\n").unwrap();
     })
     .await;
 }
 
 #[tokio::test]
-async fn an_unreadable_config_parks_the_new_turn_stuck_naming_the_file() {
+async fn an_unreadable_config_refuses_the_create_naming_the_file() {
     // A directory where the file should be makes the read fail without chmod.
-    a_broken_config_parks_the_new_turn_stuck(|path| fs::create_dir(path).unwrap()).await;
+    a_broken_config_refuses_the_create(|path| fs::create_dir(path).unwrap()).await;
 }
 
 #[tokio::test]

@@ -91,6 +91,8 @@ impl From<CreateTaskError> for ApiError {
             CreateTaskError::Base(_)
             | CreateTaskError::BaseWithoutWorktree
             | CreateTaskError::NoRepo { .. } => ApiError::BadRequest(err.to_string()),
+            // A daemon-side file fault, not a bad request.
+            CreateTaskError::GlobalConfig(_) => ApiError::Internal(err.to_string()),
             _ => ApiError::Internal(err.to_string()),
         }
     }

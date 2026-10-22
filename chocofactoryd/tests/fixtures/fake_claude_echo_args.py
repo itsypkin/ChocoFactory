@@ -4,7 +4,7 @@
 Like fake_claude_oneshot.py it runs a single turn and exits, so an
 `agent_turn` stage using it completes and auto-advances. Unlike the other
 fixtures, its reply is not an echo of the input but a summary of its own
-argv: `model=<--model>|system_prompt=<--system-prompt>|permission_mode=<--permission-mode>|mcp_config=<--mcp-config>|strict_mcp_config=<present?>|setting_sources=<--setting-sources>|disallowed_tools=<--disallowedTools>|disable_auto_memory=<env>|initialize=<control request>|append_system_prompt=<--append-system-prompt>|settings=<--settings value, or <unset>>|settings_count=<how many times --settings appears in argv>`.
+argv: `model=<--model>|system_prompt=<--system-prompt>|permission_mode=<--permission-mode>|mcp_config=<--mcp-config>|strict_mcp_config=<present?>|setting_sources=<--setting-sources>|disallowed_tools=<--disallowedTools>|disable_auto_memory=<env>|initialize=<control request>|append_system_prompt=<--append-system-prompt>|settings=<--settings value, or <unset>>|settings_count=<how many times --settings appears in argv>|effort=<--effort value, or <unset>>|effort_count=<how many times --effort appears in argv>|effort_env=<CLAUDE_CODE_EFFORT_LEVEL, or <unset>>`.
 
 That makes the *resolved role config* observable from the events table.
 `sessions` persists a session's `cli_adapter`/`model` columns, but nothing
@@ -38,7 +38,7 @@ def main():
         initialize = json.dumps(json.loads(line)["request"], separators=(",", ":"))
         sys.stdin.readline()
 
-    reply = "model={}|system_prompt={}|permission_mode={}|mcp_config={}|strict_mcp_config={}|setting_sources={}|disallowed_tools={}|disable_auto_memory={}|initialize={}|append_system_prompt={}|settings={}|settings_count={}".format(
+    reply = "model={}|system_prompt={}|permission_mode={}|mcp_config={}|strict_mcp_config={}|setting_sources={}|disallowed_tools={}|disable_auto_memory={}|initialize={}|append_system_prompt={}|settings={}|settings_count={}|effort={}|effort_count={}|effort_env={}".format(
         flag(args, "--model"),
         flag(args, "--system-prompt"),
         flag(args, "--permission-mode"),
@@ -51,6 +51,9 @@ def main():
         flag(args, "--append-system-prompt"),
         flag(args, "--settings"),
         args.count("--settings"),
+        flag(args, "--effort"),
+        args.count("--effort"),
+        os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "<unset>"),
     )
 
     auto_report(args, session_id)

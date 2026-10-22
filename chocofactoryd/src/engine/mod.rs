@@ -602,6 +602,13 @@ pub(crate) fn load_workflow_file(
                 .map_err(WorkflowDefError::UnknownCli)?
                 .validate_role(name, &role.isolation)
                 .map_err(WorkflowDefError::RoleRejected)?;
+            if let Some(model) = &role.model {
+                registry
+                    .lookup(Some(name), cli)
+                    .map_err(WorkflowDefError::UnknownCli)?
+                    .validate_model(name, model)
+                    .map_err(WorkflowDefError::RoleRejected)?;
+            }
         }
     }
     Ok((definition, sha256))
@@ -626,6 +633,8 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 pub enum ConfigPatchError {
     /// A role's adapter can't run the role as the workflow defines it.
     Rejected(String),
+    /// The global config couldn't be loaded, so the roles can't be resolved.
+    GlobalConfig(GlobalConfigError),
     Db(sqlx::Error),
 }
 
@@ -658,6 +667,9 @@ pub enum CreateTaskError {
     /// A role's adapter can't run the role as the workflow and the task
     /// config define it. Nothing was written.
     RoleRejected(String),
+    /// The global config couldn't be loaded, so the roles can't be checked.
+    /// Nothing was written.
+    GlobalConfig(GlobalConfigError),
     Resolve(ResolveError),
     WorkflowDef(WorkflowDefError),
     /// `WorkflowRef::File` was given a relative path; the daemon's working
@@ -707,6 +719,12 @@ impl fmt::Display for CreateTaskError {
             CreateTaskError::InvalidCloses(message) => write!(f, "{message}"),
             CreateTaskError::UnknownCli(err) => write!(f, "{err}"),
             CreateTaskError::RoleRejected(message) => write!(f, "{message}"),
+            CreateTaskError::GlobalConfig(err) => {
+                write!(
+                    f,
+                    "cannot check the roles: the global config failed to load: {err}"
+                )
+            }
             CreateTaskError::Resolve(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowDef(err) => write!(f, "{err}"),
             CreateTaskError::WorkflowFileNotAbsolute(path) => write!(
@@ -1587,8 +1605,32 @@ impl WorkflowEngine {
         };
         match self.load_task_workflow(&task).await {
             Ok(definition) => {
-                crate::adapter::check_task_config_roles(patch, &definition, self.registry())
-                    .map_err(ConfigPatchError::Rejected)?;
+                let global = self
+                    .load_global_config()
+                    .map_err(ConfigPatchError::GlobalConfig)?;
+                // The config as it will be after the merge, computed by
+                // SQLite's own `json_patch` so null-deletes match
+                // `tasks::merge_config` exactly.
+                let (merged,): (String,) = sqlx::query_as("SELECT json_patch(?, ?)")
+                    .bind(task.config.to_string())
+                    .bind(patch.to_string())
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(ConfigPatchError::Db)?;
+                let merged: Value = serde_json::from_str(&merged).unwrap_or(Value::Null);
+                let touched: Vec<String> = patch
+                    .get("roles")
+                    .and_then(Value::as_object)
+                    .map(|roles| roles.keys().cloned().collect())
+                    .unwrap_or_default();
+                crate::adapter::check_task_config_roles(
+                    &merged,
+                    &definition,
+                    &global,
+                    self.registry(),
+                    Some(&touched),
+                )
+                .map_err(ConfigPatchError::Rejected)?;
             }
             Err(err) => {
                 tracing::warn!(
@@ -1735,8 +1777,17 @@ impl WorkflowEngine {
         // The roles the task's own config points at a different CLI: each
         // adapter has its say on the role as the workflow defines it, still
         // before anything is written.
-        crate::adapter::check_task_config_roles(&config, &definition, self.registry())
-            .map_err(CreateTaskError::RoleRejected)?;
+        let global = self
+            .load_global_config()
+            .map_err(CreateTaskError::GlobalConfig)?;
+        crate::adapter::check_task_config_roles(
+            &config,
+            &definition,
+            &global,
+            self.registry(),
+            None,
+        )
+        .map_err(CreateTaskError::RoleRejected)?;
         let definition = Arc::new(definition);
 
         // An explicit `--repo`/`config.cwd` always wins; this only fills in

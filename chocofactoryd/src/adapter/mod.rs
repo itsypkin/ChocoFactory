@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod level;
 pub mod omp;
 pub mod pi_family;
 
@@ -491,6 +492,13 @@ pub trait AgentAdapter: Send + Sync {
     fn validate_role(&self, _role: &str, _isolation: &Isolation) -> Result<(), String> {
         Ok(())
     }
+    /// Whether this adapter can run a role on this model string (#336: a
+    /// Claude role's `:<level>` suffix must be a claude effort level).
+    /// Called beside `validate_role` everywhere it is. The default accepts
+    /// everything.
+    fn validate_model(&self, _role: &str, _model: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// Removes whatever this adapter keeps for a deleted project. Idempotent:
     /// nothing to remove is `Ok`. The default keeps nothing.
     fn remove_project_data(&self, _project_id: &str) -> Result<(), String> {
@@ -608,32 +616,40 @@ pub fn check_task_config_clis(config: &Value, registry: &Registry) -> Result<(),
     Ok(())
 }
 
-/// Asks each role's adapter whether it can run the role, for every string
-/// `roles.<name>.cli` in a task config whose role the workflow defines. A
-/// role the workflow doesn't define is skipped, and so is a `cli` the
-/// registry doesn't know (that is `check_task_config_clis`'s error to give).
-/// Returns the first rejection, in sorted role-name order.
+/// Asks each role's adapter whether it can run the role: `validate_role`
+/// and `validate_model`, for every role the workflow defines (or only those
+/// in `only`) whose `cli` and `model` both resolve across the three layers,
+/// task config first, then the workflow, then the global config. A role
+/// missing either field is not checked here (the turn-start check is the one
+/// nothing can skip), and neither is a `cli` the registry doesn't know (that
+/// is `check_task_config_clis`'s error to give). Returns the first
+/// rejection, in sorted role-name order.
 pub fn check_task_config_roles(
-    config: &Value,
+    task_config: &Value,
     definition: &crate::workflow_def::WorkflowDefinition,
+    global: &crate::global_config::GlobalConfig,
     registry: &Registry,
+    only: Option<&[String]>,
 ) -> Result<(), String> {
-    let Some(roles) = config.get("roles").and_then(Value::as_object) else {
-        return Ok(());
-    };
-    let mut names: Vec<&String> = roles.keys().collect();
+    let mut names: Vec<&String> = definition
+        .roles
+        .keys()
+        .filter(|name| only.is_none_or(|only| only.contains(name)))
+        .collect();
     names.sort();
     for name in names {
-        let Some(cli) = roles[name].get("cli").and_then(Value::as_str) else {
-            continue;
-        };
-        let (Some(role), Ok(adapter)) = (
-            definition.roles.get(name.as_str()),
-            registry.lookup(Some(name), cli),
+        let role = &definition.roles[name.as_str()];
+        let (Ok(cli), Ok(model)) = (
+            crate::role_config::resolve_cli(name, role, global, task_config),
+            crate::role_config::resolve_model(name, role, global, task_config),
         ) else {
             continue;
         };
+        let Ok(adapter) = registry.lookup(Some(name), &cli) else {
+            continue;
+        };
         adapter.validate_role(name, &role.isolation)?;
+        adapter.validate_model(name, &model)?;
     }
     Ok(())
 }

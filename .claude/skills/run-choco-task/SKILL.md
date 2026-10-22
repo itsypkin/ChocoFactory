@@ -236,7 +236,10 @@ choco task create --project <p> --workflow coding-task-planned \
   The task reads only the text `--prompt` passes, not files in your checkout.
 - Per-task overrides beat editing shared config:
   `--role-model <role>=<model>`, `--role-system-prompt-file <role>=<path>`,
-  `--role-cli <role>=<cli>`.
+  `--role-cli <role>=<cli>`. A model may end in an effort level, for example
+  `--role-model coder=claude-sonnet-5-5:xhigh` (`low`, `medium`, `high`,
+  `xhigh`, `max`); set effort only this way. See
+  [docs/models.md](../../../docs/models.md#effort-level).
 - After creating, compare the `Base` line in `choco task status` with the
   commit you wrote the spec against. If they differ and the commits between
   them touch files the spec names, check the spec still holds.
@@ -395,6 +398,9 @@ cancelling. In short:
 
 ## Cost and safety
 
+- **Every role runs at effort `high` by default** on both CLIs, which is
+  slower and costs more than `medium`; add `:medium` to a role's model to
+  lower it.
 - **Every stage runs a real agent CLI** (`claude`, or `omp` for a role with
   `cli: omp`). Don't create a task to try something out, except the budgeted acceptance tasks a spec assigns to the operator or another named person (see [reference/spec.md](reference/spec.md#docs-only-tasks)). For a first run, pick a small, real change.
 - **A repo's `.chocofactory/workflows/` and any `--workflow` file can run

@@ -125,7 +125,7 @@ async fn main() {
     let registry = Registry::new(vec![Arc::new(claude_adapter), Arc::new(omp_adapter)]);
 
     // Before the lock: a refused start leaves no lock, port or DB state.
-    if let Err(err) = chocofactoryd::global_config::check_known_clis(
+    if let Err(err) = chocofactoryd::global_config::check_global_roles(
         GlobalConfig::default_path().as_deref(),
         &registry,
     ) {

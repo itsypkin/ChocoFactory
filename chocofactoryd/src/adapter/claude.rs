@@ -87,6 +87,10 @@ impl AgentAdapter for ClaudeAdapter {
         "claude"
     }
 
+    fn validate_model(&self, role: &str, model: &str) -> Result<(), String> {
+        super::level::claude_model_and_level(role, model).map(|_| ())
+    }
+
     fn start(&self, prompt: &str, cfg: &RoleConfig) -> Result<AgentHandle, AdapterError> {
         spawn(&self.binary, &self.choco_binary, cfg, None, prompt)
     }
@@ -162,6 +166,14 @@ fn spawn(
     resume_session_id: Option<&str>,
     initial_prompt: &str,
 ) -> Result<AgentHandle, AdapterError> {
+    // Parse the level before anything is created, so a bad one spawns nothing.
+    let model_and_level = match &cfg.model {
+        Some(model) => Some(
+            super::level::claude_model_and_level(&cfg.role, model)
+                .map_err(|message| AdapterError::Spawn(std::io::Error::other(message)))?,
+        ),
+        None => None,
+    };
     let marker = super::new_turn_marker()?;
     let mut command = Command::new(binary);
     command
@@ -286,6 +298,7 @@ fn spawn(
     //   `apply_auto_memory_env` below, not read from the daemon's own
     //   environment (#105).
     apply_auto_memory_env(&mut command, &cfg.isolation);
+    apply_effort_env(&mut command);
     command.env(&marker, "1");
     //
     // #115: workflow (isolated) roles lose all of `TIMER_TOOLS`; chat loses
@@ -331,8 +344,13 @@ fn spawn(
             .arg(report_instruction(&cfg.report_outcomes));
     }
 
-    if let Some(model) = &cfg.model {
-        command.arg("--model").arg(model);
+    match model_and_level {
+        Some((id, level)) => {
+            command.arg("--model").arg(id).arg("--effort").arg(level);
+        }
+        None => {
+            command.arg("--effort").arg(super::level::DEFAULT_LEVEL);
+        }
     }
     if let Some(system_prompt) = &cfg.system_prompt {
         command.arg("--system-prompt").arg(system_prompt);
@@ -406,6 +424,27 @@ fn apply_auto_memory_env(command: &mut Command, isolation: &Isolation) {
             command.env_remove("CLAUDE_CODE_DISABLE_AUTO_MEMORY");
         }
     }
+}
+
+/// Removes `CLAUDE_CODE_EFFORT_LEVEL` from the spawned process's
+/// environment for every role (#336). The level reaches claude only as
+/// `--effort`; the daemon's launch environment is not the operator's choice
+/// for this role (same reasoning as `apply_auto_memory_env`, #105).
+///
+/// Probed on Claude Code 2.1.308 against a localhost stub, reading the
+/// request's `output_config.effort`:
+///
+/// - process env `CLAUDE_CODE_EFFORT_LEVEL=max` + `--effort low` sent `max`:
+///   the env beats the flag, hence the removal.
+/// - an invalid or empty env value is ignored.
+/// - `effortLevel` in settings has no effect, and `--effort` beats it.
+/// - `{"env":{"CLAUDE_CODE_EFFORT_LEVEL":"max"}}` in a project
+///   `.claude/settings.json` + `--effort low` sent `max`. This can't be
+///   scrubbed from here: an isolated role applies the repo's committed
+///   settings, and the chat role the operator's own, so such an `env` value
+///   still wins (documented in `docs/models.md`).
+fn apply_effort_env(command: &mut Command) {
+    command.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
 }
 
 /// The stream-json `initialize` control request carrying the turn's skills
@@ -1759,20 +1798,35 @@ mod tests {
         disallowed_tools: Vec<RoleTool>,
         cwd: std::path::PathBuf,
     ) -> HashMap<String, String> {
+        echo_args_model(isolation, disallowed_tools, cwd, None, false).await
+    }
+
+    /// Runs the echo fixture through `start` (or `resume`) with this model.
+    async fn echo_args_model(
+        isolation: Isolation,
+        disallowed_tools: Vec<RoleTool>,
+        cwd: std::path::PathBuf,
+        model: Option<&str>,
+        resume: bool,
+    ) -> HashMap<String, String> {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools,
             cwd,
-            model: None,
+            model: model.map(str::to_string),
             system_prompt: None,
             sandboxed: true,
             report_outcomes: vec!["done".to_string()],
             report_sections: Vec::new(),
             isolation,
         };
-        let mut handle = adapter.start("go", &cfg).unwrap();
+        let mut handle = if resume {
+            adapter.resume("sess-1", "go", &cfg).unwrap()
+        } else {
+            adapter.start("go", &cfg).unwrap()
+        };
         let AgentEvent::AssistantMessage { text } = next_assistant_message(&mut handle).await
         else {
             unreachable!()
@@ -1797,6 +1851,159 @@ mod tests {
             .get_envs()
             .find(|(key, _)| *key == "CLAUDE_CODE_DISABLE_AUTO_MEMORY")
             .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    fn effort_env_entry(isolation: &Isolation) -> Option<Option<String>> {
+        let mut command = Command::new("unused");
+        apply_effort_env(&mut command);
+        let _ = isolation;
+        command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "CLAUDE_CODE_EFFORT_LEVEL")
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    /// #336: the daemon's own `CLAUDE_CODE_EFFORT_LEVEL` beats `--effort`, so
+    /// it is explicitly removed (not left to inherit) for every role shape.
+    #[test]
+    fn every_role_shape_removes_the_effort_env() {
+        for isolation in [
+            Isolation::Isolated {
+                skills: Vec::new(),
+                memory: false,
+            },
+            Isolation::Isolated {
+                skills: Vec::new(),
+                memory: true,
+            },
+            Isolation::InheritOperatorConfig,
+        ] {
+            assert_eq!(effort_env_entry(&isolation), Some(None), "{isolation:?}");
+        }
+    }
+
+    /// The args every role gets: id and level split apart, each flag once.
+    #[tokio::test]
+    async fn a_models_level_suffix_becomes_the_effort_flag() {
+        let isolations = || [Isolation::default(), Isolation::InheritOperatorConfig];
+        for resume in [false, true] {
+            for isolation in isolations() {
+                for (model, id, effort) in [
+                    ("claude-sonnet-5-5:xhigh", "claude-sonnet-5-5", "xhigh"),
+                    ("claude-sonnet-5-5", "claude-sonnet-5-5", "high"),
+                    ("sonnet[1m]:low", "sonnet[1m]", "low"),
+                    (
+                        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                        "high",
+                    ),
+                    (
+                        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123",
+                        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123",
+                        "high",
+                    ),
+                ] {
+                    let fields = echo_args_model(
+                        isolation.clone(),
+                        Vec::new(),
+                        std::env::temp_dir(),
+                        Some(model),
+                        resume,
+                    )
+                    .await;
+                    assert_eq!(fields["model"], id, "{model}");
+                    assert_eq!(fields["effort"], effort, "{model}");
+                    assert_eq!(fields["effort_count"], "1", "{model}");
+                }
+                for level in super::super::level::CLAUDE_EFFORT_LEVELS {
+                    let fields = echo_args_model(
+                        isolation.clone(),
+                        Vec::new(),
+                        std::env::temp_dir(),
+                        Some(&format!("opus:{level}")),
+                        resume,
+                    )
+                    .await;
+                    assert_eq!(fields["effort"], level);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_role_without_a_model_still_gets_the_default_effort() {
+        let fields = echo_args_for(Isolation::default()).await;
+        assert_eq!(fields["model"], "<unset>");
+        assert_eq!(fields["effort"], "high");
+        assert_eq!(fields["effort_count"], "1");
+    }
+
+    #[test]
+    fn an_omp_only_level_fails_the_spawn_naming_role_and_suffix() {
+        let adapter = ClaudeAdapter::with_binary("/nonexistent/never-spawned");
+        let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
+            disallowed_tools: Vec::new(),
+            cwd: std::env::temp_dir(),
+            model: Some("claude-sonnet-5-5:minimal".to_string()),
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
+            isolation: Isolation::default(),
+        };
+        // A spawn error about the binary would be `NotFound`; this one is
+        // the level, and it comes before any process is attempted.
+        for result in [adapter.start("go", &cfg), adapter.resume("s", "go", &cfg)] {
+            let Err(AdapterError::Spawn(err)) = result else {
+                panic!("expected a spawn error");
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::Other);
+            let message = err.to_string();
+            assert!(
+                message.contains("`coder`") && message.contains(":minimal"),
+                "{message}"
+            );
+        }
+    }
+
+    /// One real model call (#336): a role on `claude-sonnet-5-5:high` runs a
+    /// turn through the real `claude` without error. Uses the operator's
+    /// login.
+    ///
+    /// Run with: `cargo test -p chocofactoryd --lib a_real_claude_turn_runs_with_an_effort_suffix -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a real claude and its login, and makes one model call"]
+    async fn a_real_claude_turn_runs_with_an_effort_suffix() {
+        let adapter = ClaudeAdapter::new();
+        let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
+            disallowed_tools: Vec::new(),
+            cwd: std::env::temp_dir(),
+            model: Some("claude-sonnet-5-5:high".to_string()),
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: Vec::new(),
+            report_sections: Vec::new(),
+            isolation: Isolation::default(),
+        };
+        let mut handle = adapter
+            .start("Reply with the single word: ok", &cfg)
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(120), handle.recv())
+                .await
+                .expect("no event in 120 s")
+                .expect("the stream ended before the turn completed");
+            match event {
+                AgentEvent::Error { message, .. } => panic!("the turn failed: {message}"),
+                AgentEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
     }
 
     #[test]
