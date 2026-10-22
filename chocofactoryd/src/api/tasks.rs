@@ -3018,6 +3018,41 @@ stages:
         );
         assert_eq!(config_of().await, before);
 
+        // The model comes from the task's own stored config, the cli from the
+        // patch: only the merged config shows the pair.
+        let merged_task: Value = server
+            .post(
+                "/tasks",
+                json!({
+                    "project_id": project_id,
+                    "workflow_def": "lvlflow",
+                    "title": "t2",
+                    "prompt": "hello",
+                    "config": { "cwd": ".", "roles": { "reviewer": { "cli": "omp", "model": "p/m:minimal" } } },
+                }),
+            )
+            .await
+            .json();
+        let merged_id = merged_task["id"].as_str().unwrap().to_string();
+        let stored = server.get(&format!("/tasks/{merged_id}")).await.json()["config"].clone();
+        let response = server
+            .patch(
+                &format!("/tasks/{merged_id}"),
+                json!({ "config": { "roles": { "reviewer": { "cli": "claude" } } } }),
+            )
+            .await;
+        assert_eq!(response.status(), 400, "{}", response.json());
+        assert!(
+            response.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("`reviewer`")
+        );
+        assert_eq!(
+            server.get(&format!("/tasks/{merged_id}")).await.json()["config"],
+            stored
+        );
+
         // A valid level, and a null-delete, are accepted.
         for config in [
             json!({ "roles": { "reviewer": { "model": "claude-opus-5-5:xhigh" } } }),
