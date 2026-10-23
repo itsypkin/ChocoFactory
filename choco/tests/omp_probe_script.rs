@@ -295,3 +295,67 @@ fn signal_during_the_watch_cancels_and_cleans_up() {
     assert!(log.contains("cancel-saw-folder=yes"), "{log}");
     c.assert_tmp_empty();
 }
+
+#[test]
+fn closed_task_without_a_report_exits_1_with_nothing_on_stdout() {
+    let mut ev = real_events();
+    ev["events"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| e["event_type"] != "tool_call");
+    let c = Case::new(6, &ev);
+    let o = c.run();
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "");
+    assert!(stderr(&o).contains("without a report"));
+    assert!(!c.log().contains("task cancel"));
+    c.assert_tmp_empty();
+}
+
+#[test]
+fn task_cancelled_from_outside_is_not_cancelled_again() {
+    let c = Case::new(4, &real_events());
+    let o = c.run();
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(stdout(&o), "");
+    assert!(!c.log().contains("task cancel"), "{}", c.log());
+    c.assert_tmp_empty();
+}
+
+#[test]
+fn bad_commit_fails_before_a_task_is_created() {
+    let c = Case::new(6, &real_events());
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../.claude/skills/run-choco-task/scripts/omp-probe.sh");
+    let o = Command::new("sh")
+        .arg(script)
+        .args([
+            "proj",
+            c.repo.to_str().unwrap(),
+            "0000000000000000000000000000000000000000",
+            "m",
+            "q?",
+        ])
+        .env("CHOCO", c.dir.join("choco"))
+        .env("TMPDIR", &c.tmp)
+        .output()
+        .unwrap();
+    assert_ne!(o.status.code(), Some(0));
+    assert!(!c.log().contains("task create"), "{}", c.log());
+    c.assert_tmp_empty();
+}
+
+#[test]
+fn export_holds_exactly_the_commits_tree() {
+    let c = Case::new(6, &real_events());
+    let o = c.run();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let root = fs::read_to_string(c.dir.join("repo_arg")).unwrap();
+    let root = root.trim();
+    let listing = fs::read_to_string(c.dir.join("listing")).unwrap();
+    let rel: Vec<String> = listing
+        .lines()
+        .map(|l| l.strip_prefix(root).unwrap().to_string())
+        .collect();
+    assert_eq!(rel, ["", "/.omp", "/.omp/AGENTS.md", "/README.md"]);
+}
