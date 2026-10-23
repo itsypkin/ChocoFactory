@@ -141,6 +141,18 @@ fn review_panel_has_the_decided_shape() {
         ("changes_requested", 3, "escalate_to_human")
     );
 
+    // A PR that starts conflicting is rebased, bounded by its own guard (#342).
+    assert_eq!(
+        def.stages["awaiting_human_review"].on["conflicting"],
+        "base_conflict"
+    );
+    let bc = &def.stages["base_conflict"];
+    let g = bc.loop_guard.as_ref().expect("base_conflict loop guard");
+    assert_eq!(
+        (g.on.as_str(), g.max, g.then.as_str()),
+        ("done", 3, "escalate_to_human")
+    );
+
     let (_, pf, sections) = agent_turn_parts(&branches["internal_review"].def.kind);
     let pf = pf.expect("internal_review prompt_file");
     assert_eq!(pf.file_name().unwrap(), "reviewer-turn-planned.md");

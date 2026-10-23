@@ -71,13 +71,14 @@ follow that entry:
   `awaiting_human_review` entry, plus top-level comments:
   `gh api --paginate "repos/{owner}/{repo}/issues/$N/comments"`. When the escalation came from the PR
   review's loop guard, the section "The human's review" below is that
-  review; when it came from the conflict-round guard (`base_conflict`), that
-  section holds the last conflict note, and the rule in "When you're done"
-  rebases the branch; on any other escalation it may be left over from an earlier
+  review; on any other escalation it may be left over from an earlier
   review, so check its comments against your last commit. When the
   escalation came from the PR review, that's where the rejection is, and a
   short note like "same issues, keep going" refers to it. Where the note and a comment disagree, follow
   the note.
+  When the escalation came from the conflict-round guard (`base_conflict`),
+  "The human's review" holds the last conflict note, and the rule in
+  "When you're done" rebases the branch.
 
 If your transition isn't in this list, check `gh pr checks`,
 `gh pr view --json comments,reviews` and `git log` to work out why you're here before

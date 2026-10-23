@@ -830,7 +830,9 @@ fn the_marker_case_table_is_consistent() {
 const CONFLICT_BLOCK: &str = "CONFLICTING\n\nThe PR has merge conflicts with its base branch (GitHub reports mergeable: CONFLICTING).\n";
 
 fn set_aside(at: &str) -> String {
-    format!("An approval posted at {at} was not acted on because the PR can't merge; approve again when the rebased PR is back for review.\n")
+    format!(
+        "An approval posted at {at} was not acted on because the PR can't merge; approve again when the rebased PR is back for review.\n"
+    )
 }
 
 fn run_ok(fx: &Fixture) -> String {
@@ -873,7 +875,10 @@ fn request_changes_beats_a_conflict_and_renders_as_without_one() {
     let votes = [owner_comment(FRESH, "/request-changes")];
     let conflicting = run_ok(&comment_fixture("CONFLICTING", &votes));
     let clean = run_ok(&comment_fixture("MERGEABLE", &votes));
-    assert!(conflicting.starts_with("REQUEST_CHANGES\n\n"), "{conflicting}");
+    assert!(
+        conflicting.starts_with("REQUEST_CHANGES\n\n"),
+        "{conflicting}"
+    );
     assert_eq!(conflicting, clean);
 }
 
