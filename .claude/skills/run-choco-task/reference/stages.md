@@ -54,9 +54,12 @@ Read this while watching a task, when its behaviour surprises you.
   skill catch both.
 - **checks_polling.** Polls every 30 seconds for up to 30 minutes.
   It goes green when every check passed or was skipped. It goes red on a
-  failed, errored or timed-out check that is still red after one automatic
-  re-run of the failed Actions jobs for this head (a failing check that is not
-  an Actions job is red at once). Red starts a paid `revising` lap (the
+  failed, errored or timed-out check, as soon as one has finished. Only if the
+  workflow sets `CI_RERUN_FAILED: "on"` in `checks_polling`'s `env:` is the
+  failed Actions job re-run once for this head first, and then red means still
+  red after that re-run (a failing check that is not an Actions job is red at
+  once). A `CI_RERUN_FAILED` value other than `on`, `off` or empty fails every
+  poll and ends as a timeout (see recover.md). Red starts a paid `revising` lap (the
   4th red in a row parks the task at `escalate_to_human`). It escalates to
   `escalate_to_human` on a cancelled, startup-failure or action-required
   check (the outcome name in `choco task status` says which), and when CI

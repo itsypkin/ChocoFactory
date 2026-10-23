@@ -114,6 +114,8 @@ stages:
     script_file: scripts/ci-checks.sh
     env:
       PR_NUMBER: "{{ stages.open_pr.number }}"
+      # Opt-in re-run of the failed CI jobs once per head ("on"/"off"); see the header of scripts/ci-checks.sh.
+      CI_RERUN_FAILED: "off"
     interval: 30s
     timeout: 30m
     outcomes:

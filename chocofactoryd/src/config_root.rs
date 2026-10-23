@@ -1684,7 +1684,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            assert_eq!(env, [("PR_NUMBER", "{{ stages.open_pr.number }}")]);
+            assert_eq!(
+                env,
+                [
+                    ("PR_NUMBER", "{{ stages.open_pr.number }}"),
+                    ("CI_RERUN_FAILED", "off")
+                ]
+            );
             assert_eq!(watch.interval, std::time::Duration::from_secs(30));
             assert_eq!(watch.timeout, Some(std::time::Duration::from_secs(30 * 60)));
             let outcomes: Vec<(&str, &str)> = watch
@@ -1766,6 +1772,30 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         // A token must be the whole first line: a check name cannot select one.
         assert!(compiled.matching("PENDING\n\nFAILURE_x RED\n").is_none());
         assert!(compiled.matching("REDDISH\n").is_none());
+    }
+
+    /// The documented way to turn the CI re-run on: edit the key in an
+    /// ejected copy. The edited file must still load.
+    #[test]
+    fn the_documented_edit_that_turns_the_ci_rerun_on_loads() {
+        use crate::workflow_def::StageKind;
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let path = dir.path.join("coding-task.yaml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("CI_RERUN_FAILED: \"off\"").count(), 1);
+        std::fs::write(
+            &path,
+            text.replace("CI_RERUN_FAILED: \"off\"", "CI_RERUN_FAILED: \"on\""),
+        )
+        .unwrap();
+        let def = load_seeded(&dir, "coding-task.yaml");
+        let StageKind::Poll { watch, .. } = &def.stages["checks_polling"].kind else {
+            panic!("checks_polling must be a poll");
+        };
+        assert_eq!(watch.env["CI_RERUN_FAILED"], "on");
+        assert_eq!(watch.env["PR_NUMBER"], "{{ stages.open_pr.number }}");
+        assert_eq!(watch.env.len(), 2);
     }
 
     #[test]

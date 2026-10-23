@@ -100,7 +100,11 @@ the merge and move the task to `done`. `choco task send <id> --text "<note>"` mo
 - After 4 red CI results in a row, name the failing check and what it says
   in the note, or fix CI by hand first.
 - After a CI timeout, or a cancelled, startup-failure or action-required
-  check, fix or re-run CI on GitHub. Once it is green, after a CI timeout run
+  check, fix or re-run CI on GitHub. A CI timeout can also be a bad
+  `CI_RERUN_FAILED` value in the workflow file (not slow CI): look in
+  `choco task events <id> --json` for a `stderr_tail` saying
+  `CI_RERUN_FAILED is '...'`, fix the value in the workflow file (the task
+  reloads it), then retry. Re-running CI on GitHub does not help there. Once it is green, after a CI timeout run
   `choco task retry <id>`: it polls CI again and costs no lap. After a
   cancelled, startup-failure or action-required check, either merge the PR
   and cancel the task, or send a note saying CI is green and no code change

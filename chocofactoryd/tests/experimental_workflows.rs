@@ -126,6 +126,11 @@ fn review_panel_has_the_decided_shape() {
     let on: Vec<_> = group.on.iter().collect();
     assert_eq!(on, [(&"done".to_string(), &"lead_review".to_string())]);
 
+    let StageKind::Poll { watch, .. } = &def.stages["checks_polling"].kind else {
+        panic!("checks_polling must be a poll");
+    };
+    assert_eq!(watch.env["CI_RERUN_FAILED"], "off");
+
     let lead = &def.stages["lead_review"];
     assert_eq!(lead.on["approved"], "open_pr");
     assert_eq!(lead.on["changes_requested"], "revising");

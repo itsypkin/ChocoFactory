@@ -108,6 +108,10 @@ existed shows no `Workflow file` line at all.
   that file as is, without putting it in a repo. To try an unmerged change to
   a built-in, point it at the checkout:
   `--workflow <checkout>/workflows/coding-task.yaml`.
+- **A workflow-level setting.** A poll stage's `env:` passes settings to its
+  script. For example, `checks_polling` has `CI_RERUN_FAILED`, which turns on
+  the re-run of failed CI jobs; see
+  [CI re-run](coding-task.md#ci-re-run-of-failed-jobs-opt-in).
 
 ## Migrating from the old global folder
 

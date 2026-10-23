@@ -6,6 +6,8 @@
 //! `jq` to canned JSON, standing in for the filter engine inside `gh`.
 //! The same case table (`ci-checks-cases.json`) is read by a unit test in
 //! `config_root.rs` that runs the first lines through the seeded workflow.
+//! That table describes the default (`CI_RERUN_FAILED` off) behaviour; the
+//! tests of the re-run itself set `CI_RERUN_FAILED=on` with `with_rerun`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,8 @@ const HEAD: &str = "0123456789abcdef";
 struct Fixture {
     dir: PathBuf,
     repo: PathBuf,
+    /// The value of `CI_RERUN_FAILED`; `None` leaves it unset.
+    rerun: Option<&'static str>,
 }
 
 impl Fixture {
@@ -43,7 +47,11 @@ impl Fixture {
         let gh = dir.join("gh");
         fs::write(&gh, FAKE_GH).unwrap();
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
-        let fx = Fixture { dir, repo };
+        let fx = Fixture {
+            dir,
+            repo,
+            rerun: None,
+        };
         fx.set_states(states);
         let init = Command::new("git")
             .args(["init", "-q"])
@@ -52,6 +60,16 @@ impl Fixture {
             .unwrap();
         assert!(init.success());
         fx
+    }
+
+    fn with_rerun(mut self, v: &'static str) -> Self {
+        self.rerun = Some(v);
+        self
+    }
+
+    /// The fake's call log, or "" when it made no call.
+    fn calls(&self) -> String {
+        fs::read_to_string(self.dir.join("calls")).unwrap_or_default()
     }
 
     fn set_states(&self, states: &[&str]) {
@@ -116,16 +134,19 @@ impl Fixture {
             self.dir.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        Command::new("sh")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/scripts/ci-checks.sh"))
+        let mut cmd = Command::new("sh");
+        cmd.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/scripts/ci-checks.sh"))
             .current_dir(cwd)
+            .env_remove("CI_RERUN_FAILED")
             .env("PATH", path)
             .env("GH_FAKE_DIR", &self.dir)
             .env("GIT_CEILING_DIRECTORIES", &self.dir)
             .env("PR_NUMBER", "7")
-            .env("FAKE_NOW", now.map(|n| n.to_string()).unwrap_or_default())
-            .output()
-            .expect("failed to run ci-checks.sh")
+            .env("FAKE_NOW", now.map(|n| n.to_string()).unwrap_or_default());
+        if let Some(v) = self.rerun {
+            cmd.env("CI_RERUN_FAILED", v);
+        }
+        cmd.output().expect("failed to run ci-checks.sh")
     }
 
     fn run(&self) -> Output {
@@ -185,6 +206,8 @@ struct Case {
     first_line: String,
 }
 
+/// The table is the default (off) behaviour: the first finished red is RED,
+/// with no re-run, no record and no note.
 #[test]
 fn every_shared_case_prints_its_token_and_the_sorted_check_lines() {
     let cases: Vec<Case> =
@@ -208,16 +231,13 @@ fn every_shared_case_prints_its_token_and_the_sorted_check_lines() {
             .collect();
         lines.sort();
         let expected = format!("{}\n\n{}\n", case.first_line, lines.join("\n"));
-        let has_failure = case
-            .states
-            .iter()
-            .any(|s| matches!(s.as_str(), "FAILURE" | "ERROR" | "TIMED_OUT"));
-        if has_failure {
-            // A failure may add a note after the check lines.
-            assert!(out.starts_with(&expected), "case '{}': {out}", case.name);
-        } else {
-            assert_eq!(out, expected, "case '{}'", case.name);
-        }
+        assert_eq!(out, expected, "case '{}'", case.name);
+        assert!(
+            !fx.calls().lines().any(|l| l.starts_with("run rerun")),
+            "case '{}'",
+            case.name
+        );
+        assert!(fx.record().is_none(), "case '{}'", case.name);
         assert!(!fx.first_seen().exists(), "case '{}'", case.name);
     }
 }
@@ -394,7 +414,7 @@ fn a_failing_awk_never_turns_a_red_pr_into_green() {
 #[test]
 fn a_failing_run_id_extraction_fails_closed_without_rerunning() {
     use std::os::unix::fs::PermissionsExt;
-    let fx = Fixture::new(&["FAILURE", "SUCCESS"]);
+    let fx = Fixture::new(&["FAILURE", "SUCCESS"]).with_rerun("on");
     // Passes every sed call except the `-n` run-id extraction.
     let p = fx.dir.join("sed");
     fs::write(
@@ -448,6 +468,7 @@ fn a_missing_pr_number_fails_closed() {
     let out = Command::new("sh")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/scripts/ci-checks.sh"))
         .current_dir(&fx.repo)
+        .env_remove("CI_RERUN_FAILED")
         .env_remove("PR_NUMBER")
         .output()
         .unwrap();
@@ -480,7 +501,7 @@ fn out_and_err(fx: &Fixture) -> (String, String) {
 
 #[test]
 fn the_first_red_reruns_each_failed_run_once_and_records_the_links() {
-    let fx = Fixture::new(&["FAILURE", "FAILURE", "SUCCESS", "ERROR"]);
+    let fx = Fixture::new(&["FAILURE", "FAILURE", "SUCCESS", "ERROR"]).with_rerun("on");
     let (a, b, c) = (link(L100, 1), link(L100, 2), link(L200, 3));
     fx.set_links(&[&a, &b, "https://github.com/o/r/actions/runs/100/job/9", &c]);
     let out = fx.ok();
@@ -500,7 +521,7 @@ fn the_first_red_reruns_each_failed_run_once_and_records_the_links() {
 
 #[test]
 fn a_recorded_failure_waits_for_the_rerun_without_rerunning_again() {
-    let fx = Fixture::new(&["FAILURE", "SUCCESS"]);
+    let fx = Fixture::new(&["FAILURE", "SUCCESS"]).with_rerun("on");
     let a = link(L100, 0);
     fs::write(fx.record_path(), format!("{HEAD}\n{a}\n")).unwrap();
     let out = fx.ok();
@@ -516,7 +537,7 @@ fn a_recorded_failure_waits_for_the_rerun_without_rerunning_again() {
 
 #[test]
 fn a_failure_not_in_the_record_is_red_without_another_rerun() {
-    let fx = Fixture::new(&["FAILURE", "FAILURE"]);
+    let fx = Fixture::new(&["FAILURE", "FAILURE"]).with_rerun("on");
     fs::write(fx.record_path(), format!("{HEAD}\n{}\n", link(L100, 0))).unwrap();
     let out = fx.ok();
     assert_eq!(out, "RED\n\nFAILURE job-0\nFAILURE job-1\n");
@@ -525,7 +546,7 @@ fn a_failure_not_in_the_record_is_red_without_another_rerun() {
 
 #[test]
 fn a_green_rerun_is_green() {
-    let fx = Fixture::new(&["SUCCESS", "SUCCESS"]);
+    let fx = Fixture::new(&["SUCCESS", "SUCCESS"]).with_rerun("on");
     fs::write(fx.record_path(), format!("{HEAD}\n{}\n", link(L100, 0))).unwrap();
     assert_eq!(first_line(&fx.ok()), "GREEN");
     assert!(fx.reruns().is_empty());
@@ -533,7 +554,7 @@ fn a_green_rerun_is_green() {
 
 #[test]
 fn a_record_for_another_head_is_replaced_by_a_new_rerun() {
-    let fx = Fixture::new(&["FAILURE"]);
+    let fx = Fixture::new(&["FAILURE"]).with_rerun("on");
     fs::write(
         fx.record_path(),
         format!("fedcba9876543210\n{}\n", link(L100, 0)),
@@ -548,7 +569,7 @@ fn a_record_for_another_head_is_replaced_by_a_new_rerun() {
 
 #[test]
 fn a_red_with_a_check_still_running_waits_without_rerunning() {
-    let fx = Fixture::new(&["FAILURE", "IN_PROGRESS"]);
+    let fx = Fixture::new(&["FAILURE", "IN_PROGRESS"]).with_rerun("on");
     let out = fx.ok();
     assert_eq!(first_line(&out), "PENDING");
     assert!(
@@ -569,13 +590,13 @@ fn a_failure_that_cannot_be_rerun_is_red_at_once() {
         ("missing", &["<none>"]),
     ];
     for (what, links) in cases {
-        let fx = Fixture::new(&["FAILURE"]);
+        let fx = Fixture::new(&["FAILURE"]).with_rerun("on");
         fx.set_links(links);
         assert_eq!(fx.ok(), "RED\n\nFAILURE job-0\n", "{what}");
         assert!(fx.reruns().is_empty(), "{what}");
         assert!(fx.record().is_none(), "{what}");
     }
-    let fx = Fixture::new(&["FAILURE", "FAILURE"]);
+    let fx = Fixture::new(&["FAILURE", "FAILURE"]).with_rerun("on");
     fx.set_links(&[&link(L100, 0), "https://example.com/ci/1"]);
     assert_eq!(first_line(&fx.ok()), "RED");
     assert!(fx.reruns().is_empty());
@@ -584,7 +605,7 @@ fn a_failure_that_cannot_be_rerun_is_red_at_once() {
 
 #[test]
 fn a_failing_rerun_is_red_with_a_note_and_no_record() {
-    let fx = Fixture::new(&["FAILURE", "FAILURE"]);
+    let fx = Fixture::new(&["FAILURE", "FAILURE"]).with_rerun("on");
     fx.set_links(&[&link(L100, 0), &link(L200, 1)]);
     fx.switch("fail-rerun");
     let (out, err) = out_and_err(&fx);
@@ -601,7 +622,7 @@ fn a_failing_rerun_is_red_with_a_note_and_no_record() {
 
 #[test]
 fn a_failed_record_write_is_red_with_a_note_after_the_rerun() {
-    let fx = Fixture::new(&["FAILURE"]);
+    let fx = Fixture::new(&["FAILURE"]).with_rerun("on");
     fx.broken_tool("mv", 1);
     let (out, err) = out_and_err(&fx);
     assert_eq!(out, "RED\n\nFAILURE job-0\n");
@@ -632,7 +653,7 @@ fn an_unparsable_record_is_ignored_with_a_note_and_rewritten() {
         format!("{HEAD}\nhttps://example.com/ci/1\n"),
     ];
     for text in junk {
-        let fx = Fixture::new(&["FAILURE"]);
+        let fx = Fixture::new(&["FAILURE"]).with_rerun("on");
         fs::write(fx.record_path(), &text).unwrap();
         let (out, err) = out_and_err(&fx);
         assert_eq!(first_line(&out), "PENDING", "record {text:?}");
@@ -651,7 +672,7 @@ fn an_unparsable_record_is_ignored_with_a_note_and_rewritten() {
 
 #[test]
 fn a_red_outside_a_repo_needs_git_only_when_it_can_be_rerun() {
-    let fx = Fixture::new(&["FAILURE"]);
+    let fx = Fixture::new(&["FAILURE"]).with_rerun("on");
     let bare = fx.dir.join("not-a-repo");
     fs::create_dir_all(&bare).unwrap();
     let out = fx.run_in(&bare);
@@ -668,18 +689,117 @@ fn a_red_outside_a_repo_needs_git_only_when_it_can_be_rerun() {
 
 #[test]
 fn a_red_never_prints_startup_failure() {
-    let fx = Fixture::new(&["FAILURE", "STARTUP_FAILURE"]);
+    let fx = Fixture::new(&["FAILURE", "STARTUP_FAILURE"]).with_rerun("on");
     assert_eq!(first_line(&fx.ok()), "PENDING");
     assert_eq!(fx.reruns().len(), 1);
-    let fx = Fixture::new(&["FAILURE", "STARTUP_FAILURE"]);
+    let fx = Fixture::new(&["FAILURE", "STARTUP_FAILURE"]).with_rerun("on");
     fx.set_links(&["https://example.com/ci/1", &link(L100, 1)]);
     assert_eq!(first_line(&fx.ok()), "RED");
 }
 
 #[test]
 fn a_link_with_a_space_is_never_rerunnable() {
-    let fx = Fixture::new(&["FAILURE"]);
+    let fx = Fixture::new(&["FAILURE"]).with_rerun("on");
     fx.set_links(&["https://github.com/o/r/actions/runs/100/job/1 x"]);
     assert_eq!(first_line(&fx.ok()), "RED");
     assert!(fx.reruns().is_empty());
+}
+
+// ---- the re-run is opt-in ----
+
+const ACTIONS_LINK: &str = "https://github.com/o/r/actions/runs/100/job/0";
+
+#[test]
+fn off_is_the_default_and_the_first_red_is_final() {
+    for mode in [None, Some(""), Some("off")] {
+        let mut fx = Fixture::new(&["FAILURE"]);
+        fx.rerun = mode;
+        fx.set_links(&[ACTIONS_LINK]);
+        let out = fx.run();
+        assert!(out.status.success(), "{mode:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "RED\n\nFAILURE job-0\n",
+            "{mode:?}"
+        );
+        assert!(out.stderr.is_empty(), "{mode:?}");
+        assert!(
+            !fx.calls().lines().any(|l| l.starts_with("run rerun")),
+            "{mode:?}"
+        );
+        assert!(fx.record().is_none(), "{mode:?}");
+    }
+}
+
+#[test]
+fn off_does_not_wait_for_running_checks() {
+    let fx = Fixture::new(&["FAILURE", "IN_PROGRESS"]);
+    assert_eq!(fx.ok(), "RED\n\nFAILURE job-0\nIN_PROGRESS job-1\n");
+    assert!(fx.reruns().is_empty());
+    assert!(fx.record().is_none());
+}
+
+#[test]
+fn off_ignores_a_record() {
+    let fx = Fixture::new(&["FAILURE", "SUCCESS"]);
+    let rec = format!("{HEAD}\n{}\n", link(L100, 0));
+    fs::write(fx.record_path(), &rec).unwrap();
+    assert_eq!(fx.ok(), "RED\n\nFAILURE job-0\nSUCCESS job-1\n");
+    assert_eq!(fx.record().unwrap(), rec);
+    assert!(fx.reruns().is_empty());
+}
+
+#[test]
+fn off_needs_no_git_for_a_red() {
+    let fx = Fixture::new(&["FAILURE"]);
+    let bare = fx.dir.join("not-a-repo");
+    fs::create_dir_all(&bare).unwrap();
+    let out = fx.run_in(&bare);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "RED\n\nFAILURE job-0\n"
+    );
+    assert!(fx.reruns().is_empty());
+}
+
+#[test]
+fn an_unknown_value_fails_closed_before_any_call() {
+    for value in ["On", "ON", "yes", "true", "1", " on", "on ", "of"] {
+        for state in ["SUCCESS", "FAILURE"] {
+            let fx = Fixture::new(&[state]).with_rerun(value);
+            fx.set_links(&[ACTIONS_LINK]);
+            let out = fx.run();
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            assert!(!out.status.success(), "{value:?} {state}");
+            assert!(out.stdout.is_empty(), "{value:?} {state}");
+            assert!(
+                err.contains(&format!("choco ci-checks: CI_RERUN_FAILED is '{value}'")),
+                "{value:?} {state}: {err}"
+            );
+            assert_eq!(fx.calls(), "", "{value:?} {state}");
+            assert!(fx.record().is_none(), "{value:?} {state}");
+            assert!(!fx.first_seen().exists(), "{value:?} {state}");
+        }
+    }
+}
+
+#[test]
+fn on_never_reruns_a_cancelled_check() {
+    let fx = Fixture::new(&["CANCELLED"]).with_rerun("on");
+    assert_eq!(fx.ok(), "CANCELLED\n\nCANCELLED job-0\n");
+    assert!(fx.reruns().is_empty());
+    assert!(fx.record().is_none());
+
+    let fx = Fixture::new(&["CANCELLED", "SUCCESS"]).with_rerun("on");
+    assert_eq!(fx.ok(), "CANCELLED\n\nCANCELLED job-0\nSUCCESS job-1\n");
+    assert!(fx.reruns().is_empty());
+    assert!(fx.record().is_none());
+
+    let fx = Fixture::new(&["FAILURE", "CANCELLED"]).with_rerun("on");
+    let (a, b) = (link(L100, 1), link(L200, 2));
+    fx.set_links(&[&a, &b]);
+    assert_eq!(first_line(&fx.ok()), "PENDING");
+    assert_eq!(fx.reruns(), vec!["run rerun 100 --failed"]);
+    assert_eq!(fx.record().unwrap(), format!("{HEAD}\n{a}\n"));
 }

@@ -17841,6 +17841,7 @@ stages:
       PATH: "{path}"
       GH_FAKE_DIR: "{gh}"
       PR_NUMBER: "7"
+      CI_RERUN_FAILED: "on"
     interval: 1s
     timeout: 30m
     outcomes:
