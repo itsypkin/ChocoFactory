@@ -244,4 +244,6 @@ It exits 3, after printing the answer, when the turn called a tool other than
 `report_outcome`: the answer may then come from a file it read rather than
 from what it loaded. Each probe is one agent turn on your omp login and leaves
 a closed task in the project. It needs your own daemon: a throwaway daemon's
-omp has no login.
+omp has no login. If the script is killed outright, or `choco task create` is
+killed after the daemon made the task but before it printed the id, the task
+isn't cancelled: it finishes its one turn and closes itself.

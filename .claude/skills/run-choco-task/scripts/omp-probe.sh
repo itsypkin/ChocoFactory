@@ -73,7 +73,7 @@ $question"
 "$CHOCO" --json task create --project "$project" --workflow "$workflow" \
     --title "omp probe of $commit" --repo "$tmp/tree" \
     --role-model "probe=$model" --prompt "$prompt" >"$tmp/create.json"
-task=$(jq -r '.id // empty' "$tmp/create.json")
+task=$(jq -r '.id // empty' "$tmp/create.json" 2>/dev/null) || task=''
 [ -n "$task" ] || {
     echo "omp-probe.sh: task create returned no id" >&2
     exit 1
