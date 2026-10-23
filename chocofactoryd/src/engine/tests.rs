@@ -7347,7 +7347,22 @@ case "$1" in
                     if [ "${{CHOCO_STAGE-}}" = awaiting_human_review ]; then
                         echo "[${{HANDED_OVER_AT-unset}}]" >> "{dir}/handed-over-at"
                     fi
-                    printf '{{"headRefOid":"0000000000000000000000000000000000000000","state":"%s","mergedAt":%s,"statusCheckRollup":[{{"state":"SUCCESS"}}]}}' "$state" "$merged" | jq -r "$q"
+                    # `mergeable` (#342): `pr-mergeable` holds a value (default
+                    # MERGEABLE; a merged PR reads UNKNOWN, as on GitHub).
+                    # `mergeable-seq` holds one value per line, consumed one per
+                    # read made by the gate only. Every gate read is logged.
+                    mergeable=MERGEABLE
+                    [ -e "{dir}/pr-merged" ] && mergeable=UNKNOWN
+                    [ -s "{dir}/pr-mergeable" ] && mergeable=$(cat "{dir}/pr-mergeable")
+                    if [ "${{CHOCO_STAGE-}}" = awaiting_human_review ]; then
+                        if [ -s "{dir}/mergeable-seq" ]; then
+                            mergeable=$(head -n 1 "{dir}/mergeable-seq")
+                            tail -n +2 "{dir}/mergeable-seq" > "{dir}/mergeable-seq.tmp"
+                            mv "{dir}/mergeable-seq.tmp" "{dir}/mergeable-seq"
+                        fi
+                        echo "$mergeable" >> "{dir}/mergeable-reads"
+                    fi
+                    printf '{{"headRefOid":"0000000000000000000000000000000000000000","state":"%s","mergedAt":%s,"mergeable":"%s","statusCheckRollup":[{{"state":"SUCCESS"}}]}}' "$state" "$merged" "$mergeable" | jq -r "$q"
                 fi
                 ;;
             checks)
@@ -7712,6 +7727,239 @@ async fn the_real_coding_task_review_gate_takes_a_choco_reply() {
         .unwrap();
     wait_until_stage(&pool, &task_id, "done").await;
     wait_until_task_status(&pool, &task_id, "closed").await;
+}
+
+// ---- a PR that starts conflicting while it waits for review (#342) ----
+
+/// The real `coding-task` with the gate's poll interval cut from 60s to 1s
+/// (the loader's floor), so a second read of the gate costs a second and not
+/// a minute. Every other stage, prompt and script is the shipped one.
+struct ConflictRig {
+    pool: SqlitePool,
+    task_id: String,
+    engine: Arc<WorkflowEngine>,
+    scripts_dir: TempDir,
+    _repo: TempDir,
+    _origin: TempDir,
+    _workflows_dir: TempDir,
+    _path_guard: PathPrefixGuard,
+}
+
+/// `pr_mergeable` is what the stub `gh` reports for the PR; `verdict` is the
+/// PR's issue-comment list; `seq` is the stub's per-gate-read `mergeable`
+/// values, one per line.
+async fn conflict_rig(pr_mergeable: &str, verdict: &str, seq: &str) -> ConflictRig {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(scripts_dir.join("verdict"), verdict).unwrap();
+    fs::write(scripts_dir.join("pr-mergeable"), pr_mergeable).unwrap();
+    // One value per gate read, consumed in order; empty means none.
+    fs::write(scripts_dir.join("mergeable-seq"), seq).unwrap();
+
+    let (task_id, _shipped, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let yaml_path = workflows_dir.join("coding-task.yaml");
+    let yaml = fs::read_to_string(&yaml_path).unwrap();
+    assert_eq!(yaml.matches("interval: 60s").count(), 1);
+    fs::write(&yaml_path, yaml.replace("interval: 60s", "interval: 1s")).unwrap();
+    let def = Arc::new(WorkflowDefinition::load(&yaml_path).unwrap());
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    ConflictRig {
+        pool,
+        task_id,
+        engine,
+        scripts_dir,
+        _repo: repo,
+        _origin: origin,
+        _workflows_dir: workflows_dir,
+        _path_guard: path_guard,
+    }
+}
+
+impl ConflictRig {
+    async fn trail(&self) -> Vec<(String, Value)> {
+        stage_trail(&self.pool, &self.task_id).await
+    }
+
+    /// The names of the stages entered, oldest first.
+    async fn stages(&self) -> Vec<String> {
+        self.trail().await.into_iter().map(|(s, _)| s).collect()
+    }
+
+    async fn wait_for_trail(&self, what: &str, ok: impl Fn(&[String]) -> bool) -> Vec<String> {
+        crate::test_support::wait_until(what, || async {
+            let stages = self.stages().await;
+            if ok(&stages) {
+                Ok(stages)
+            } else {
+                Err(format!("trail {stages:?}"))
+            }
+        })
+        .await
+    }
+}
+
+fn count_of(stages: &[String], name: &str) -> usize {
+    stages.iter().filter(|s| s.as_str() == name).count()
+}
+
+/// The gate's `changes_requested` count is absent or zero.
+async fn gate_counter_is_clear(pool: &SqlitePool, task_id: &str) {
+    let state = state_of(pool, task_id).await;
+    let n = state.loop_counters["awaiting_human_review"]
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(n, 0, "{}", state.loop_counters);
+}
+
+/// A conflicting PR goes gate -> `base_conflict` -> `revising`, and the
+/// coder's prompt on that lap carries the conflict note.
+#[tokio::test]
+async fn the_real_coding_task_sends_a_conflicting_pr_to_revising() {
+    let rig = conflict_rig("CONFLICTING", "[]", "").await;
+    let stages = rig
+        .wait_for_trail("a revising lap after base_conflict", |s| {
+            s.iter()
+                .position(|n| n == "base_conflict")
+                .is_some_and(|i| s.get(i + 1).is_some_and(|n| n == "revising"))
+        })
+        .await;
+    let trail = rig.trail().await;
+    let i = stages.iter().position(|n| n == "base_conflict").unwrap();
+    assert_eq!(stages[i - 1], "awaiting_human_review");
+    assert_eq!(trail[i].1, json!("conflicting"), "{trail:?}");
+    assert_eq!(trail[i + 1].1, json!("done"), "{trail:?}");
+
+    let mut payload = payload_of(&rig.pool, &rig.task_id).await;
+    let note = payload["stages"]["awaiting_human_review"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(note.starts_with("CONFLICTING\n\n"), "{note:?}");
+    payload["arrival"] = json!({ "from": "base_conflict", "outcome": "done" });
+    let prompt = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows/prompts/coder-revise.md"),
+    )
+    .unwrap();
+    let (rendered, _) = crate::template::render(&prompt, &payload).unwrap();
+    let from = rendered.find("## The human's review").unwrap();
+    let to = rendered.find("## Internal reviewer's summary").unwrap();
+    assert!(
+        rendered[from..to].contains("merge conflicts with its base branch"),
+        "{}",
+        &rendered[from..to]
+    );
+}
+
+/// A PR that conflicts on every return parks the task on the 4th conflict
+/// round, by `base_conflict`'s own guard; the gate's guard is never touched.
+/// After a resume the count has started over.
+#[tokio::test]
+async fn the_real_coding_task_parks_a_pr_that_conflicts_every_time_on_the_fourth_round() {
+    let rig = conflict_rig("CONFLICTING", "[]", "").await;
+    rig.wait_for_trail("the escalation", |s| {
+        s.last().is_some_and(|n| n == "escalate_to_human")
+    })
+    .await;
+    wait_until_stage(&rig.pool, &rig.task_id, "escalate_to_human").await;
+    let stages = rig.stages().await;
+    assert_eq!(count_of(&stages, "base_conflict"), 4, "{stages:?}");
+    assert_eq!(stages[stages.len() - 2], "base_conflict", "{stages:?}");
+    let state = state_of(&rig.pool, &rig.task_id).await;
+    assert_eq!(
+        state.payload["arrival"],
+        json!({ "from": "base_conflict", "outcome": "done" })
+    );
+    gate_counter_is_clear(&rig.pool, &rig.task_id).await;
+    // The gate's own guard never ran: it is not where the task was parked.
+    assert_eq!(count_of(&stages, "revising"), 3, "{stages:?}");
+
+    rig.engine
+        .send_message_or_resume(&rig.task_id, "keep going")
+        .await
+        .unwrap();
+    let stages = rig
+        .wait_for_trail("a fifth conflict round and its revising lap", |s| {
+            s.iter()
+                .enumerate()
+                .filter(|(_, n)| n.as_str() == "base_conflict")
+                .nth(4)
+                .is_some_and(|(i, _)| s.get(i + 1).is_some_and(|n| n == "revising"))
+        })
+        .await;
+    assert!(count_of(&stages, "base_conflict") >= 5);
+    gate_counter_is_clear(&rig.pool, &rig.task_id).await;
+}
+
+/// A fresh `/approve` on a conflicting PR does not finish the task: it goes
+/// round a rebase, and the gate's capture says the approval was set aside.
+#[tokio::test]
+async fn the_real_coding_task_sets_an_approval_of_a_conflicting_pr_aside() {
+    let rig = conflict_rig("CONFLICTING", &owner_comment_page("/approve"), "").await;
+    rig.wait_for_trail("the escalation", |s| {
+        s.last().is_some_and(|n| n == "escalate_to_human")
+    })
+    .await;
+    let stages = rig.stages().await;
+    assert_eq!(count_of(&stages, "done"), 0, "{stages:?}");
+    assert!(count_of(&stages, "base_conflict") >= 1, "{stages:?}");
+    let payload = payload_of(&rig.pool, &rig.task_id).await;
+    let note = payload["stages"]["awaiting_human_review"].as_str().unwrap();
+    assert!(
+        note.contains("An approval posted at 2030-01-01T00:00:00Z was not acted on"),
+        "{note:?}"
+    );
+}
+
+/// `UNKNOWN` holds an approval and never starts a round: the gate reads
+/// CONFLICTING (one round), then UNKNOWN (held), then MERGEABLE (approved).
+/// The reads come from the stub's per-read sequence, written before the task
+/// starts so the order is exact; the stub logs a read only when the poll runs
+/// in the gate stage (`CHOCO_STAGE=awaiting_human_review`).
+#[tokio::test]
+async fn the_real_coding_task_holds_an_approval_while_mergeable_is_unknown() {
+    let rig = conflict_rig(
+        "MERGEABLE",
+        &owner_comment_page("/approve"),
+        "CONFLICTING\nUNKNOWN\nMERGEABLE\n",
+    )
+    .await;
+    wait_until_stage(&rig.pool, &rig.task_id, "done").await;
+    wait_until_task_status(&rig.pool, &rig.task_id, "closed").await;
+    let reads = fs::read_to_string(rig.scripts_dir.join("mergeable-reads")).unwrap();
+    assert_eq!(
+        reads.lines().collect::<Vec<_>>(),
+        ["CONFLICTING", "UNKNOWN", "MERGEABLE"]
+    );
+    let trail = rig.trail().await;
+    let stages: Vec<String> = trail.iter().map(|(s, _)| s.clone()).collect();
+    // The UNKNOWN read started no round; it was the second visit to the gate.
+    assert_eq!(count_of(&stages, "base_conflict"), 1, "{stages:?}");
+    assert_eq!(count_of(&stages, "awaiting_human_review"), 2, "{stages:?}");
+    assert_eq!(
+        trail.last(),
+        Some(&("done".to_string(), json!("approved"))),
+        "{trail:?}"
+    );
 }
 
 /// #260: the real `coding-task` hands the review script an empty
