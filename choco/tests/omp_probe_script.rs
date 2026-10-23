@@ -189,6 +189,19 @@ impl Case {
                 .unwrap();
             unsafe { libc::kill(fake_pid, libc::SIGTERM) };
         }
+        let mut child = child;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                // Failure guard: the script did not end on TERM.
+                if let Ok(p) = fs::read_to_string(self.dir.join("pid")) {
+                    unsafe { libc::kill(p.trim().parse().unwrap(), libc::SIGKILL) };
+                }
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("script did not exit after SIGTERM");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         child.wait_with_output().unwrap()
     }
 }
