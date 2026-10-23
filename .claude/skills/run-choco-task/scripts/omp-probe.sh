@@ -44,6 +44,11 @@ watch=''
 # remove the folder its turn reads. The signal traps make the signals end
 # the script.
 cleanup() {
+    # A signal during `task create` runs this trap after create has finished,
+    # when its output is in the file but `task` isn't set yet.
+    if [ -z "$task" ] && [ -f "$tmp/create.json" ]; then
+        task=$(jq -r '.id // empty' "$tmp/create.json" 2>/dev/null) || task=''
+    fi
     if [ -n "$watch" ]; then
         kill "$watch" 2>/dev/null || :
     fi
@@ -65,9 +70,10 @@ tar -x -f "$tmp/tree.tar" -C "$tmp/tree"
 prompt="Answer from your system prompt and context only. Call no tool except report_outcome, and put your whole answer in its summary.
 
 $question"
-task=$("$CHOCO" --json task create --project "$project" --workflow "$workflow" \
+"$CHOCO" --json task create --project "$project" --workflow "$workflow" \
     --title "omp probe of $commit" --repo "$tmp/tree" \
-    --role-model "probe=$model" --prompt "$prompt" | jq -r '.id // empty')
+    --role-model "probe=$model" --prompt "$prompt" >"$tmp/create.json"
+task=$(jq -r '.id // empty' "$tmp/create.json")
 [ -n "$task" ] || {
     echo "omp-probe.sh: task create returned no id" >&2
     exit 1

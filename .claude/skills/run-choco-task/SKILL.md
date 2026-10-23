@@ -216,8 +216,8 @@ explicit out-of-scope list.
   word for word, and you check the report before coding starts (see
   [reference/spec.md](reference/spec.md#text-that-must-arrive-word-for-word)).
   A claim it couldn't run read-only is marked **unverified**: treat it as open
-  until the coder reports the probe's result. Read the report, answer questions and
-  see the rest in [reference/spec.md](reference/spec.md#having-choco-check-the-spec-first-coding-task-planned).
+  until the coder reports the probe's result. Read the report, answer
+  questions and see the rest in [reference/spec.md](reference/spec.md#having-choco-check-the-spec-first-coding-task-planned).
 - **Docs-only task:** every link and anchor resolves (from a copy outside the
   repo, for a skill or doc meant to be copied), every command matches `--help`,
   no fact is lost, and for a skill or doc meant to be copied every snippet
