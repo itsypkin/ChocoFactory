@@ -2330,6 +2330,79 @@ async fn a_restart_sweep_whose_task_paused_event_is_refused_leaves_the_task_paus
     );
 }
 
+const REFUSE_PAUSED_STATUS: &str = "CREATE TRIGGER refuse_paused_status BEFORE UPDATE ON tasks \
+     WHEN NEW.status = 'paused' BEGIN SELECT RAISE(ABORT,'refused'); END";
+
+#[tokio::test]
+async fn a_settle_whose_paused_status_write_is_refused_writes_no_task_paused_event() {
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = create_flow(&q, PFLOW, "pflow.yaml", "job-a").await;
+    q.wait_started("job-a").await;
+    q.engine.pause_task(&a.id, false).await.unwrap();
+    sqlx::query(REFUSE_PAUSED_STATUS)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    q.release("job-a");
+    crate::test_support::wait_until("the turn to be gone", || async {
+        if q.engine.turn_gate().busy_for_task(&a.id) == 0 {
+            Ok(())
+        } else {
+            Err("busy".to_string())
+        }
+    })
+    .await;
+    let outcome = q.engine.pause_task(&a.id, true).await.unwrap();
+    assert_eq!(outcome.status, "pausing");
+    assert_eq!(q.status(&a.id).await, "pausing");
+    assert!(
+        q.queue_events(&a.id, EventType::TaskPaused)
+            .await
+            .is_empty()
+    );
+
+    sqlx::query("DROP TRIGGER refuse_paused_status")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    let outcome = q.engine.pause_task(&a.id, true).await.unwrap();
+    assert_eq!(outcome.status, "paused");
+    assert_eq!(q.queue_events(&a.id, EventType::TaskPaused).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_restart_sweep_whose_paused_status_write_is_refused_writes_no_task_paused_event() {
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = q.create("job-a").await;
+    q.wait_started("job-a").await;
+    q.engine.pause_task(&a.id, false).await.unwrap();
+    sqlx::query(REFUSE_PAUSED_STATUS)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    let next = q.restarted_engine();
+    q.crash_and_sweep(&next).await;
+    assert_eq!(q.status(&a.id).await, "pausing");
+    assert!(
+        q.queue_events(&a.id, EventType::TaskPaused)
+            .await
+            .is_empty()
+    );
+
+    sqlx::query("DROP TRIGGER refuse_paused_status")
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    next.park_interrupted_turns().await.unwrap();
+    assert_eq!(q.status(&a.id).await, "paused");
+    assert_eq!(
+        q.queue_events(&a.id, EventType::TaskPaused).await,
+        vec![json!({"restart": true})]
+    );
+}
+
 #[tokio::test]
 async fn a_stuck_mark_whose_error_event_is_refused_does_not_mark_the_task_stuck() {
     let q = Q::new(None).await;
@@ -2385,7 +2458,7 @@ async fn a_settle_on_a_task_that_is_no_longer_pausing_writes_nothing() {
 
     q.engine.resume_task(&a.id).await.unwrap();
     q.engine.settle_pause(&a.id).await;
-    assert_ne!(q.status(&a.id).await, "paused");
+    assert_eq!(q.status(&a.id).await, "open");
     assert_eq!(q.queue_events(&a.id, EventType::TaskPaused).await.len(), 1);
 }
 
