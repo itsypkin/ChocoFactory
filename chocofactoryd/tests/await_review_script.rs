@@ -982,7 +982,11 @@ fn a_failing_pr_view_stays_a_failure_even_when_conflicting() {
     let out = fx.run();
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("choco await-review:"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("choco await-review: gh pr view failed"),
+        "{stderr}"
+    );
 }
 
 // ---- GitHub reviews and inline review comments (#230) ----
