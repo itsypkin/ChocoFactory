@@ -43,6 +43,22 @@
 #
 #              <body>
 #            with a blank line after each block.
+# Output, when the OPEN PR has merge conflicts with its base (#342):
+#   line 1   CONFLICTING
+#   line 2   blank
+#   line 3   The PR has merge conflicts with its base branch (GitHub reports
+#            mergeable: CONFLICTING).
+#   line 4   only when the newest vote is an approval: "An approval posted at
+#            <time> was not acted on because the PR can't merge; approve
+#            again when the rebased PR is back for review." The approval is
+#            set aside on purpose.
+# Order: MERGED, then REQUEST_CHANGES, then CONFLICTING, then APPROVE. With
+# mergeable UNKNOWN (GitHub computes it lazily; the read starts the
+# computation) an approval is held: nothing is printed and the next poll
+# reads again. `mergeable` comes from the same `gh pr view` as the state.
+# Only exactly CONFLICTING counts; an empty or missing value means "no
+# conflict" by design (the direction that spends nothing). A failed
+# `gh pr view` stays a failure. A CLOSED PR is never CONFLICTING here.
 # Output, when there is none: nothing, so the stage keeps polling.
 # Any `gh` failure: a note on stderr (it reaches the timeline), exit 1 and
 # nothing on stdout. A failure must never look like "nobody has reviewed
@@ -164,13 +180,14 @@ RENDER="$SELECT"'
 # One read for the head commit, the state and the merge time, so a merge
 # between two calls cannot pair a stale head with a fresh state. One value
 # per line, to a file: no `jq` binary, and `read` below needs no splitting.
-gh pr view "$PR_NUMBER" --json headRefOid,state,mergedAt \
-    -q '.headRefOid, .state, (.mergedAt // "")' > "$TMP/pr" ||
+gh pr view "$PR_NUMBER" --json headRefOid,state,mergedAt,mergeable \
+    -q '.headRefOid, .state, (.mergedAt // ""), (.mergeable // "")' > "$TMP/pr" ||
     fail "gh pr view failed"
 {
     IFS= read -r HEAD_SHA || true
     IFS= read -r PR_STATE || true
     IFS= read -r MERGED_AT || true
+    IFS= read -r MERGEABLE || true
 } < "$TMP/pr"
 [ -n "$HEAD_SHA" ] || fail "gh pr view returned no head commit"
 [ -n "$PR_STATE" ] || fail "gh pr view returned no state"
@@ -207,8 +224,27 @@ gh api --paginate "$REVIEWS" -q "$REVIEW_VERDICT" >> "$TMP/verdicts" ||
 # REQUEST_CHANGES sorts after APPROVE.
 sort "$TMP/verdicts" > "$TMP/verdicts-sorted"
 LINE=$(tail -n 1 "$TMP/verdicts-sorted")
+V=
+[ -z "$LINE" ] || V=${LINE#* }
+# Conflicts (#342), on an OPEN PR only (a CLOSED one can read CONFLICTING and
+# keeps polling as before). After MERGED and REQUEST_CHANGES, before APPROVE.
+if [ "$PR_STATE" = "OPEN" ] && [ "$V" != "REQUEST_CHANGES" ]; then
+    case "$MERGEABLE" in
+        CONFLICTING)
+            printf 'CONFLICTING\n\n'
+            printf 'The PR has merge conflicts with its base branch (GitHub reports mergeable: CONFLICTING).\n'
+            if [ "$V" = "APPROVE" ]; then
+                printf 'An approval posted at %s was not acted on because the PR can'"'"'t merge; approve again when the rebased PR is back for review.\n' "${LINE%% *}"
+            fi
+            exit 0
+            ;;
+        UNKNOWN)
+            # GitHub computes this lazily; hold an approval until it answers.
+            [ "$V" != "APPROVE" ] || exit 0
+            ;;
+    esac
+fi
 [ -n "$LINE" ] || exit 0
-V=${LINE#* }
 
 gh api --paginate "$URL" -q "$RENDER" > "$TMP/rendered" ||
     fail "gh api issues/$PR_NUMBER/comments failed (rendering)"

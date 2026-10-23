@@ -72,6 +72,11 @@ impl Fixture {
         fs::write(self.dir.join("pr-state"), state).unwrap();
     }
 
+    /// What `gh pr view` reports as `mergeable` (see the fixture).
+    fn mergeable(&self, value: &str) {
+        fs::write(self.dir.join("pr-mergeable"), value).unwrap();
+    }
+
     /// Every argument line the fake `gh` was called with.
     fn calls(&self) -> String {
         fs::read_to_string(self.dir.join("calls")).unwrap_or_default()
@@ -818,6 +823,161 @@ fn the_marker_case_table_is_consistent() {
             "missing case '{name}'"
         );
     }
+}
+
+// ---- a PR that conflicts with its base (#342) ----
+
+const CONFLICT_BLOCK: &str = "CONFLICTING\n\nThe PR has merge conflicts with its base branch (GitHub reports mergeable: CONFLICTING).\n";
+
+fn set_aside(at: &str) -> String {
+    format!("An approval posted at {at} was not acted on because the PR can't merge; approve again when the rebased PR is back for review.\n")
+}
+
+fn run_ok(fx: &Fixture) -> String {
+    let out = fx.run();
+    assert!(
+        out.status.success(),
+        "script failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn comment_fixture(mergeable: &str, comments: &[String]) -> Fixture {
+    let fx = Fixture::new(SINCE, &[list(comments)]);
+    fx.mergeable(mergeable);
+    fx
+}
+
+#[test]
+fn a_conflicting_open_pr_with_no_vote_prints_the_conflict_block() {
+    let fx = comment_fixture("CONFLICTING", &[]);
+    assert_eq!(run_ok(&fx), CONFLICT_BLOCK);
+    let calls = fx.calls();
+    let n = |needle: &str| calls.lines().filter(|l| l.contains(needle)).count();
+    assert_eq!(n("issues/7/comments"), 1, "{calls}");
+    assert_eq!(n("pulls/7/reviews"), 1, "{calls}");
+    assert_eq!(n("pulls/7/comments"), 0, "{calls}");
+}
+
+#[test]
+fn a_non_conflicting_value_with_no_vote_prints_nothing() {
+    for value in ["UNKNOWN", "MERGEABLE", "null", "absent"] {
+        let fx = comment_fixture(value, &[]);
+        assert_eq!(run_ok(&fx), "", "{value}");
+    }
+}
+
+#[test]
+fn request_changes_beats_a_conflict_and_renders_as_without_one() {
+    let votes = [owner_comment(FRESH, "/request-changes")];
+    let conflicting = run_ok(&comment_fixture("CONFLICTING", &votes));
+    let clean = run_ok(&comment_fixture("MERGEABLE", &votes));
+    assert!(conflicting.starts_with("REQUEST_CHANGES\n\n"), "{conflicting}");
+    assert_eq!(conflicting, clean);
+}
+
+#[test]
+fn an_approval_of_a_conflicting_pr_is_set_aside_by_comment_and_by_review() {
+    let fx = comment_fixture("CONFLICTING", &[owner_comment(FRESH, "/approve")]);
+    assert_eq!(run_ok(&fx), format!("{CONFLICT_BLOCK}{}", set_aside(FRESH)));
+
+    let fx = comment_fixture("CONFLICTING", &[]);
+    fx.reviews(&[list(&[review(
+        "11",
+        "APPROVED",
+        Some(LATER),
+        "OWNER",
+        "me",
+        "",
+    )])]);
+    assert_eq!(run_ok(&fx), format!("{CONFLICT_BLOCK}{}", set_aside(LATER)));
+}
+
+#[test]
+fn unknown_holds_an_approval_until_the_value_settles() {
+    let fx = comment_fixture("UNKNOWN", &[owner_comment(FRESH, "/approve")]);
+    assert_eq!(run_ok(&fx), "");
+    fx.mergeable("MERGEABLE");
+    assert_eq!(first_line(&run_ok(&fx)), "APPROVE");
+}
+
+#[test]
+fn an_approval_goes_through_when_mergeable_is_clean_null_or_absent() {
+    for value in ["MERGEABLE", "null", "absent"] {
+        let fx = comment_fixture(value, &[owner_comment(FRESH, "/approve")]);
+        assert_eq!(first_line(&run_ok(&fx)), "APPROVE", "{value}");
+    }
+}
+
+#[test]
+fn the_newest_vote_decides_between_a_conflict_block_and_request_changes() {
+    let fx = comment_fixture(
+        "CONFLICTING",
+        &[
+            owner_comment(FRESH, "/request-changes"),
+            owner_comment(LATER, "/approve"),
+        ],
+    );
+    assert_eq!(run_ok(&fx), format!("{CONFLICT_BLOCK}{}", set_aside(LATER)));
+
+    let fx = comment_fixture(
+        "CONFLICTING",
+        &[
+            owner_comment(FRESH, "/approve"),
+            owner_comment(LATER, "/request-changes"),
+        ],
+    );
+    assert_eq!(first_line(&run_ok(&fx)), "REQUEST_CHANGES");
+}
+
+#[test]
+fn a_conflict_with_only_an_old_vote_has_no_set_aside_line() {
+    let fx = comment_fixture("CONFLICTING", &[owner_comment(STALE, "/approve")]);
+    assert_eq!(run_ok(&fx), CONFLICT_BLOCK);
+}
+
+#[test]
+fn a_closed_pr_is_never_conflicting() {
+    let fx = comment_fixture("CONFLICTING", &[]);
+    fx.pr_state("CLOSED");
+    assert_eq!(run_ok(&fx), "");
+
+    let fx = comment_fixture("CONFLICTING", &[owner_comment(FRESH, "/approve")]);
+    fx.pr_state("CLOSED");
+    assert_eq!(first_line(&run_ok(&fx)), "APPROVE");
+}
+
+#[test]
+fn a_merged_pr_reading_unknown_is_still_merged() {
+    let fx = merged_fixture(&list(&[]));
+    assert_eq!(
+        run_ok(&fx),
+        "MERGED\n\nThe PR was merged at 2030-01-02T03:04:05Z.\n"
+    );
+}
+
+#[test]
+fn mergeable_is_read_in_the_one_existing_pr_view_call() {
+    let fx = comment_fixture("CONFLICTING", &[]);
+    run_ok(&fx);
+    let calls = fx.calls();
+    let views: Vec<&str> = calls.lines().filter(|l| l.starts_with("pr ")).collect();
+    assert_eq!(views.len(), 1, "{calls}");
+    assert!(views[0].contains("mergeable"), "{calls}");
+    // The other calls are the commit date and the two verdict reads: nothing new.
+    let apis = calls.lines().filter(|l| l.starts_with("api ")).count();
+    assert_eq!(apis, 3, "{calls}");
+}
+
+#[test]
+fn a_failing_pr_view_stays_a_failure_even_when_conflicting() {
+    let fx = comment_fixture("CONFLICTING", &[]);
+    fx.fail("pr-view");
+    let out = fx.run();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("choco await-review:"));
 }
 
 // ---- GitHub reviews and inline review comments (#230) ----

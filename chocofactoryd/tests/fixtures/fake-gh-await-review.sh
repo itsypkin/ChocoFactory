@@ -24,7 +24,18 @@ pr)
     state=$(cat "$DIR/pr-state" 2>/dev/null || echo OPEN)
     merged=null
     [ "$state" = MERGED ] && [ ! -e "$DIR/no-merged-at" ] && merged='"2030-01-02T03:04:05Z"'
-    printf '{"headRefOid":"0123456789abcdef","state":"%s","mergedAt":%s}' "$state" "$merged" | jq -r "$q"
+    # $DIR/pr-mergeable is MERGEABLE (default; UNKNOWN for a merged PR, as
+    # GitHub reports it), CONFLICTING or UNKNOWN; the fail-safe cases use
+    # `null` (JSON null) and `absent` (no field).
+    default=MERGEABLE
+    [ "$state" = MERGED ] && default=UNKNOWN
+    mergeable=$(cat "$DIR/pr-mergeable" 2>/dev/null || echo "$default")
+    case "$mergeable" in
+    null) field=',"mergeable":null' ;;
+    absent) field='' ;;
+    *) field=$(printf ',"mergeable":"%s"' "$mergeable") ;;
+    esac
+    printf '{"headRefOid":"0123456789abcdef","state":"%s","mergedAt":%s%s}' "$state" "$merged" "$field" | jq -r "$q"
     ;;
 api)
     # pages <file prefix> <counter file> <fail switch prefix>: the nth call to
