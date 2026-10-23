@@ -1,0 +1,17 @@
+# One omp turn that answers the task's prompt and changes nothing; run by
+# ../omp-probe.sh. No worktree: the turn can read files, and omp refuses its
+# edits and commands.
+name: omp-probe
+roles:
+  probe:
+    cli: omp
+    model: openai-codex/gpt-5.6-terra
+    disallowed_tools: [edit, write, notebook_edit]
+stages:
+  ask:
+    kind: agent_turn
+    role: probe
+    prompt_file: prompts/ask.md
+    on: { done: done }
+  done:
+    kind: terminal
