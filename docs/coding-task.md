@@ -12,11 +12,12 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 | `open_pr` | A script pushes the branch `task/<id>` and opens the pull request. |
 | `checks_polling` | Polls the PR's CI checks. Green goes on; red goes to `revising` as soon as a check has failed. Optionally (off by default) the failed GitHub Actions jobs are re-run once for the PR's current head first; see [CI re-run](#ci-re-run-of-failed-jobs-opt-in). |
 | `awaiting_human_review` | Waits for your verdict on the PR (see below). |
+| `base_conflict` | Reached when the PR stops merging cleanly into its base branch while it waits. It does nothing but count these rounds, then sends the task to `revising` to rebase. |
 | `done` | The task is finished. |
 | `escalate_to_human` | A parking stage: the task waits here for a human when a limit is hit (see [Escalation limits](#escalation-limits-and-ci-polling)). |
 
 Every way back (a rejected internal review, red CI, a `/request-changes` from
-you, a resumed escalation) goes through `revising`. The `coder` runs on
+you, a resumed escalation, a PR that started conflicting with its base) goes through `revising`. The `coder` runs on
 `claude-sonnet-5-5` and the `reviewer` on `claude-opus-5-5` by default; see
 [models.md](models.md) to change that.
 
@@ -69,7 +70,7 @@ line**:
 
 | Marker             | Effect                          |
 | ------------------ | ------------------------------- |
-| `/approve`         | the task moves to `done`        |
+| `/approve`         | the task moves to `done`, unless the PR has merge conflicts (see below) |
 | `/request-changes` | the task goes back to `revising` |
 
 Merging the PR counts as approval too: while the task waits here, a merged
@@ -78,6 +79,22 @@ comment, and even if a `/request-changes` comment is also there, since
 there is nothing left to revise once the work has landed. A PR closed
 without merging is not a verdict; the task keeps reading markers until its
 timeout.
+
+**A PR that conflicts.** If the open PR can no longer merge into its base
+branch (GitHub reports `mergeable: CONFLICTING`), the task does not wait for
+you: it goes to `base_conflict`, then `revising`, where the coder rebases the
+branch; it then runs through `internal_review`, `open_pr` (which pushes the
+rebased branch) and `checks_polling` and comes back here. The order of
+findings is: merged, then `/request-changes` (that round's coder lap rebases
+too), then a conflict, then `/approve`. **An `/approve` on a conflicting PR is
+set aside**: the task does not finish, the watcher event says so, and you
+approve again once the rebased PR is back. While GitHub still reports
+`UNKNOWN` (it computes this lazily, for a poll or two after a push) an
+approval is held until the next poll. Two exceptions: an approval read in the
+few seconds after the base branch moved can still see a stale `MERGEABLE`,
+and an approval sent with `choco task send <id> --text /approve` is not
+checked for conflicts at all (run `gh pr view <n> --json mergeable` first).
+Rewriting history also marks your earlier comments as outdated on GitHub.
 
 The rest of the comment is yours to write however you like — put the marker
 on the last line and your review above it. A comment that reads "Two
@@ -184,7 +201,9 @@ counted after that, except what the gate's last look at the deadline reads
 (it runs the check once more before it gives up); post them again. If the PR was merged meanwhile, `retry` is also the
 way on: the watcher sees the merge and the task moves to `done`. `retry` after
 a `checks_polling` timeout re-watches CI the same way. A fourth `/request-changes`, after three revise rounds, parks
-it the same way instead of looping, and resuming from there starts the
+it the same way instead of looping; so does the 4th conflict round
+(`base_conflict`) since the last escalation, which is counted separately from
+your `/request-changes` rounds and in total, not in a row, and resuming from there starts the
 count over. `internal_review` parks the task there on its 4th rejection in a
 row (an approval starts its count over), and `checks_polling` does the same
 on the 4th red CI result in a row (any other outcome starts it over). A red

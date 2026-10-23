@@ -30,7 +30,7 @@ Handing a coding task to an AI agent and walking away goes wrong in familiar way
 
 ## How ChocoFactory solves it
 
-- **A workflow is a state machine.** Every task moves through explicit stages, and every transition is a named outcome. The built-in `coding-task` goes: code → internal review → open a PR → wait for CI → human review → done. Every way back (a rejected review, red CI, your `/request-changes`, a resumed escalation) goes through a revise stage, so there is one path for fixing things.
+- **A workflow is a state machine.** Every task moves through explicit stages, and every transition is a named outcome. The built-in `coding-task` goes: code → internal review → open a PR → wait for CI → human review → done. Every way back (a rejected review, red CI, your `/request-changes`, a resumed escalation, a PR that started conflicting) goes through a revise stage, so there is one path for fixing things.
 - **Several workflows come built in.** `coding-task` is the full pipeline above. `coding-task-planned` puts a planning agent in front: it checks the spec against the code and asks you only when it must. `chat` is a deliberately simple example, a single standing conversation with an agent.
 - **A workflow is just a YAML file.** You, or your agents, can write your own workflows from scratch, or copy a built-in and change its stages, roles, models and prompts. Put them in your repo's `.chocofactory/workflows/` and the whole team shares them. See [Customising workflows](#customising-workflows).
 - **Harnesses and models are per role.** Roles run on Claude Code by default. A role can run on [omp (oh-my-pi)](https://github.com/can1357/oh-my-pi) instead, which reaches other providers' models, so the coder and the reviewer can run different models. For example, a Claude coder with an OpenAI GPT reviewer, using your existing omp login:
@@ -41,7 +41,7 @@ Handing a coding task to an AI agent and walking away goes wrong in familiar way
 
   See [Using choco with omp](docs/models.md#using-choco-with-omp).
 - **A separate reviewer.** A different agent, in its own session and read-only, reviews the change against the spec before any PR exists. Read-only is enforced: the daemon checks that the worktree didn't change.
-- **Loop guards and escalation.** Repeated rejections, repeated red CI, or no verdict from you for about four days (checked every minute at first, then less often) park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck (a turn still waiting on its own background job on Claude Code is not nudged, but is marked stuck once its waits on that job add up to 60 minutes in total for the turn).
+- **Loop guards and escalation.** Repeated rejections, repeated red CI, a PR that keeps conflicting with its base (it is rebased, up to three times), or no verdict from you for about four days (checked every minute at first, then less often) park the task for a human instead of looping forever. A turn that stops reporting is nudged, then marked stuck (a turn still waiting on its own background job on Claude Code is not nudged, but is marked stuck once its waits on that job add up to 60 minutes in total for the turn).
 - **Tasks survive restarts.** Everything lives in the daemon's database. Waits survive a restart. Interrupted agent turns are parked and can be retried, resuming the agent's session when possible.
 - **Your verdict lives on the PR.** Comment `/approve` or `/request-changes` on the pull request.
 - **One dashboard** (`choco dashboard`) for every task: what needs you, what's running, what's stuck.
@@ -136,7 +136,7 @@ Leave a PR comment (or the body of a review) containing one of these markers, **
 
 | Marker | Effect |
 |---|---|
-| `/approve` | the task moves to `done` |
+| `/approve` | the task moves to `done`, unless the PR has merge conflicts (then the approval is set aside, the branch is rebased and you approve again) |
 | `/request-changes` | the task goes back to `revising`, and the coder gets your comment |
 
 - Only comments and reviews newer than the last hand-off to the coder count (before the first hand-off, newer than the head commit), so there is nothing to clear between rounds. A review submitted while the coder revises is carried into the next round; editing a review after the hand-off does not count, so post a new one. A vote cast during a revision, approval included, is read when the task next reaches the gate.
@@ -144,6 +144,7 @@ Leave a PR comment (or the body of a review) containing one of these markers, **
 - A collaborator's **Approve** or **Request changes** review votes by itself. On your own PR GitHub only allows a **Comment** review, so put the marker alone on a line of its body.
 - The inline comments on a review go to the coder with it. A pending (unsubmitted) review doesn't count.
 - Merging the PR counts as approval too.
+- If the open PR starts conflicting with its base, the task rebases it and comes back; `UNKNOWN` from GitHub never starts a round. An approval sent with `choco task send` is not checked for conflicts: run `gh pr view <n> --json mergeable` first.
 - `choco task send <id> --text ...` is the other channel: it answers without touching the PR, with the same markers.
 
 The full rules (editing a comment, code blocks, the six-hour window, escalation counts, CI polling, how the PR body is written) are in [docs/coding-task.md](docs/coding-task.md#reviewing-a-coding-task-pr).
