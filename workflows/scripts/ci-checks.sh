@@ -2,16 +2,20 @@
 # Decides what a coding-task PR's CI checks mean. Run by the `checks_polling`
 # poll stage every interval; the stage's `outcomes:` match against this stdout.
 #
-# Input: PR_NUMBER (the stage's `env:`). Needs only `gh` and `git` plus POSIX
+# Input: PR_NUMBER and CI_RERUN_FAILED (the stage's `env:`). CI_RERUN_FAILED
+# turns on the one-time re-run of failed jobs: unset, empty or `off` -> off;
+# `on` -> on; anything else -> fail closed with a note (see FAIL CLOSED).
+# Needs only `gh` and `git` plus POSIX
 # sh: no `jq` binary, because the operator's machine may not have one. The
 # filters below run inside gh's embedded jq through `-q`.
 #
 # Output: a token on line 1, a blank line, then one line per check,
 # `<STATE> <name>`, sorted, so the timeline shows which check is in which
 # state. The workflow's patterns anchor to the token.
-#   RED               a check is FAILURE, ERROR or TIMED_OUT, and the failed
-#                     GitHub Actions jobs were already re-run once for this
-#                     head or cannot be re-run (see RE-RUN below)
+#   RED               a check is FAILURE, ERROR or TIMED_OUT. With the re-run
+#                     off (default) this is final at once. With it on, the
+#                     failed GitHub Actions jobs were already re-run once for
+#                     this head or cannot be re-run (see RE-RUN below)
 #   STARTUP_FAILURE   a check is STARTUP_FAILURE (and none is red)
 #   ACTION_REQUIRED   a check is ACTION_REQUIRED (and none is above)
 #   CANCELLED         a check is CANCELLED (and none is above)
@@ -37,7 +41,11 @@
 # elapsed prints NO_CHECKS. Checks that register late still win: the count is
 # read every attempt, and once it is above 0 NO_CHECKS is never printed.
 #
-# RE-RUN. A red result would send the coder on a paid lap, and a flaky test
+# RE-RUN. Only when CI_RERUN_FAILED is `on`; when it is off (the default) none
+# of this applies: the script never calls `gh run rerun`, never reads or writes
+# `<git dir>/choco-ci-rerun` and needs no git directory for a red, and the first
+# finished red is RED at once, even while other checks still run. When it is
+# on, a red result would send the coder on a paid lap, and a flaky test
 # is not the coder's to fix. So for each head, the first time CI is red the
 # failed Actions jobs are re-run once (`gh run rerun <run id> --failed`) and
 # polling goes on. A failing check is FAILURE, ERROR or TIMED_OUT; it is
@@ -70,9 +78,11 @@
 # FAIL CLOSED. Any `gh` or `git` failure, an empty head, a count that is not
 # a number, or a failed write of the first-seen file: a note on stderr
 # (`choco ci-checks: ...`), exit 1 and nothing on stdout. A failure must
-# never print a token, and never look like NO_CHECKS or GREEN. The one
-# exception is a failed `gh run rerun` or a failed write of the re-run
-# record: those end in RED (today's behaviour) with a note on stderr.
+# never print a token, and never look like NO_CHECKS or GREEN. A
+# CI_RERUN_FAILED value other than unset, empty, `off` or `on` fails closed
+# the same way, before any gh or git call. The one exception is a failed
+# `gh run rerun` or a failed write of the re-run record (only when the re-run
+# is on): those end in RED with a note on stderr.
 set -eu
 LC_ALL=C
 export LC_ALL
@@ -102,8 +112,9 @@ emit() {
 
 ACTIONS_JOB_URL='^https://github[.]com/[^/]+/[^/]+/actions/runs/[0-9]+/job/[0-9]+$'
 
-# Runs only when the classification is RED: decides between RED and the
-# one-time re-run of the failed Actions jobs (see RE-RUN above).
+# Runs only when the classification is RED and CI_RERUN_FAILED is on: decides
+# between RED and the one-time re-run of the failed Actions jobs (see RE-RUN
+# above).
 rerun_gate() {
     awk '$1 == "FAILURE" || $1 == "ERROR" || $1 == "TIMED_OUT" { print $2 }' \
         "$TMP/checks.raw" > "$TMP/fail.unsorted" || fail "awk failed"
@@ -187,6 +198,13 @@ rerun_gate() {
     emit PENDING "Re-ran the failed jobs of run${RUN_IDS} for $HEAD_SHA."
 }
 
+# The re-run mode, checked first on every run, before any gh or git call.
+case "${CI_RERUN_FAILED:-}" in
+'' | off) RERUN=off ;;
+on) RERUN=on ;;
+*) fail "CI_RERUN_FAILED is '${CI_RERUN_FAILED}'; set it to on or off (unset or empty means off)" ;;
+esac
+
 [ -n "${PR_NUMBER:-}" ] || fail "PR_NUMBER is not set"
 
 gh pr view "$PR_NUMBER" --json headRefOid,statusCheckRollup \
@@ -230,7 +248,7 @@ if [ "$COUNT" -gt 0 ]; then
     RED | STARTUP_FAILURE | ACTION_REQUIRED | CANCELLED | GREEN | PENDING) ;;
     *) fail "unexpected classification '$TOKEN'" ;;
     esac
-    if [ "$TOKEN" = RED ]; then
+    if [ "$TOKEN" = RED ] && [ "$RERUN" = on ]; then
         rerun_gate
     fi
     emit "$TOKEN" ""

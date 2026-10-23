@@ -10,7 +10,7 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 | `internal_review` | A separate, read-only `reviewer` agent reviews the work against the spec. It approves, or sends the task to `revising`. |
 | `revising` | The coder fixes what a review, CI or you asked for, then goes back to `internal_review`. |
 | `open_pr` | A script pushes the branch `task/<id>` and opens the pull request. |
-| `checks_polling` | Polls the PR's CI checks. Green goes on; red goes to `revising`, after the failed GitHub Actions jobs were re-run once for the PR's current head (a failing check that is not an Actions job is red at once). |
+| `checks_polling` | Polls the PR's CI checks. Green goes on; red goes to `revising` as soon as a check has failed. Optionally (off by default) the failed GitHub Actions jobs are re-run once for the PR's current head first; see [CI re-run](#ci-re-run-of-failed-jobs-opt-in). |
 | `awaiting_human_review` | Waits for your verdict on the PR (see below). |
 | `done` | The task is finished. |
 | `escalate_to_human` | A parking stage: the task waits here for a human when a limit is hit (see [Escalation limits](#escalation-limits-and-ci-polling)). |
@@ -188,8 +188,9 @@ it the same way instead of looping, and resuming from there starts the
 count over. `internal_review` parks the task there on its 4th rejection in a
 row (an approval starts its count over), and `checks_polling` does the same
 on the 4th red CI result in a row (any other outcome starts it over). A red
-result is one that is still red after the failed Actions jobs were re-run once
-for that head; while the re-run is pending the stage keeps polling and counts
+result is the first finished red by default; with the opt-in re-run on, it is
+one that is still red after the failed Actions jobs were re-run once for that
+head, and while the re-run is pending the stage keeps polling and counts
 nothing.
 `checks_polling` polls every 30 seconds for up to 30 minutes and takes one last
 look at CI when the time is up. If the machine slept through the deadline, it
@@ -217,3 +218,29 @@ a trailing `(#N)`, only gets a `Refs #N` line, which links but doesn't close
 (an issue that is also closed gets just its `Closes` line). With neither, the
 PR body says so. The internal reviewer is told the closes list, and treats a
 description that says the PR closes or fixes any other issue as a false claim.
+
+## CI re-run of failed jobs (opt-in)
+
+By default the first finished red CI result is final: `checks_polling` goes to
+`revising` at once, even while other checks still run, and nothing is re-run.
+
+A project can turn on a one-time re-run: before reporting red, the failed
+GitHub Actions jobs are re-run once for the PR's current head (a failing check
+that is not an Actions job is red at once, and a cancelled check is never
+re-run). While the re-run is pending the stage keeps polling. With it on,
+behaviour is exactly the earlier one.
+
+The setting is `CI_RERUN_FAILED` in `checks_polling`'s `env:`:
+
+- unset, empty or `"off"`: off (the default);
+- `"on"`: on;
+- anything else (`On`, `yes`, `true`, `1`, ...): each poll attempt fails with a
+  note naming the variable, the stage makes no progress and times out to
+  `escalate_to_human`. It never re-runs a job.
+
+To turn it on, eject the workflow with `choco project init-workflows <project>`
+(or open an existing copy) and set `CI_RERUN_FAILED: "on"`, quoted, in
+`checks_polling`'s `env:`. An ejected copy keeps the script it was ejected
+with: copies made before this setting existed still re-run, and get the new
+default only by ejecting again. A misspelled key name is not noticed: it reads
+as off.

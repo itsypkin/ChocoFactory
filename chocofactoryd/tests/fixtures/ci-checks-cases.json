@@ -87,24 +87,24 @@
     "states": [
       "FAILURE"
     ],
-    "first_line": "PENDING",
-    "outcome": null
+    "first_line": "RED",
+    "outcome": "red"
   },
   {
     "name": "error",
     "states": [
       "ERROR"
     ],
-    "first_line": "PENDING",
-    "outcome": null
+    "first_line": "RED",
+    "outcome": "red"
   },
   {
     "name": "timed out",
     "states": [
       "TIMED_OUT"
     ],
-    "first_line": "PENDING",
-    "outcome": null
+    "first_line": "RED",
+    "outcome": "red"
   },
   {
     "name": "startup failure is not red",
@@ -146,8 +146,8 @@
       "FAILURE",
       "CANCELLED"
     ],
-    "first_line": "PENDING",
-    "outcome": null
+    "first_line": "RED",
+    "outcome": "red"
   },
   {
     "name": "failure beats pending",
@@ -156,8 +156,8 @@
       "FAILURE",
       "PENDING"
     ],
-    "first_line": "PENDING",
-    "outcome": null
+    "first_line": "RED",
+    "outcome": "red"
   },
   {
     "name": "skipped and pending",
@@ -287,12 +287,12 @@
     "outcome": "red"
   },
   {
-    "name": "Actions failure with startup failure, not re-run yet",
+    "name": "Actions failure beats startup failure",
     "states": [
       "FAILURE",
       "STARTUP_FAILURE"
     ],
-    "first_line": "PENDING",
-    "outcome": null
+    "first_line": "RED",
+    "outcome": "red"
   }
 ]
