@@ -51,7 +51,10 @@ case "$*" in
     done
     echo "$repo" >"$d/repo_arg"
     find "$repo" | sort >"$d/listing"
-    echo '{"id": "T1", "status": "queued"}'
+    n=$(cat "$d/count" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" >"$d/count"
+    echo "{\"id\": \"T$n\", \"status\": \"queued\"}"
     if [ -f "$d/block_create" ]; then
         echo $$ >"$d/pid"
         : >"$d/blocked"
@@ -75,6 +78,11 @@ case "$*" in
     ;;
 esac
 "#;
+
+fn script_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../.claude/skills/run-choco-task/scripts/omp-probe.sh")
+}
 
 struct Case {
     dir: PathBuf,
@@ -141,7 +149,7 @@ impl Case {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../.claude/skills/run-choco-task/scripts/omp-probe.sh");
         assert!(script.is_file(), "script missing: {}", script.display());
-        let mut c = Command::new("sh");
+        let mut c = Command::new("/bin/sh");
         c.arg(script)
             .args(["proj", self.repo.to_str().unwrap(), &self.commit, "m", "q?"])
             .env("CHOCO", self.dir.join("choco"))
@@ -165,11 +173,15 @@ impl Case {
     }
 
     /// Start the script with the fake blocking in `which`, wait for the fake's
-    /// marker file, send TERM to the script and then to the blocked fake (a
+    /// marker file, send the signal to the script and then to the blocked fake (a
     /// group signal would reach both). A watchdog kills the script after 20 s.
-    fn run_terminated(&self, which: &str) -> Output {
+    fn run_terminated(&self, which: &str, sig: i32) -> Output {
         fs::write(self.dir.join(which), "").unwrap();
         let child = self.command().spawn().unwrap();
+        self.signal_when_blocked(child, which, sig)
+    }
+
+    fn signal_when_blocked(&self, child: std::process::Child, which: &str, sig: i32) -> Output {
         let pid = child.id() as i32;
         let marker = self.dir.join("blocked");
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -180,25 +192,25 @@ impl Case {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        unsafe { libc::kill(pid, sig) };
         if which == "block_create" {
             let fake_pid: i32 = fs::read_to_string(self.dir.join("pid"))
                 .unwrap()
                 .trim()
                 .parse()
                 .unwrap();
-            unsafe { libc::kill(fake_pid, libc::SIGTERM) };
+            unsafe { libc::kill(fake_pid, sig) };
         }
         let mut child = child;
         let deadline = Instant::now() + Duration::from_secs(20);
         while child.try_wait().unwrap().is_none() {
             if Instant::now() > deadline {
-                // Failure guard: the script did not end on TERM.
+                // Failure guard: the script did not end on the signal.
                 if let Ok(p) = fs::read_to_string(self.dir.join("pid")) {
                     unsafe { libc::kill(p.trim().parse().unwrap(), libc::SIGKILL) };
                 }
                 unsafe { libc::kill(pid, libc::SIGKILL) };
-                panic!("script did not exit after SIGTERM");
+                panic!("script did not exit after the signal");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -274,25 +286,82 @@ fn unfinished_task_is_cancelled_before_the_folder_is_removed() {
     }
 }
 
+const SIGNALS: [(i32, i32, &str); 3] = [
+    (libc::SIGTERM, 143, "TERM"),
+    (libc::SIGINT, 130, "INT"),
+    (libc::SIGHUP, 129, "HUP"),
+];
+
 #[test]
 fn signal_during_task_create_cancels_the_created_task() {
-    let c = Case::new(6, &real_events());
-    let o = c.run_terminated("block_create");
-    assert_eq!(o.status.code(), Some(143), "{}", stderr(&o));
-    let log = c.log();
-    assert!(log.contains("task cancel T1"), "{log}");
-    assert!(log.contains("cancel-saw-folder=yes"), "{log}");
-    c.assert_tmp_empty();
+    for (sig, code, name) in SIGNALS {
+        let c = Case::new(6, &real_events());
+        let o = c.run_terminated("block_create", sig);
+        assert_eq!(o.status.code(), Some(code), "{name}: {}", stderr(&o));
+        let log = c.log();
+        assert!(log.contains("task cancel T1"), "{name}: {log}");
+        assert!(log.contains("cancel-saw-folder=yes"), "{name}: {log}");
+        c.assert_tmp_empty();
+    }
 }
 
 #[test]
 fn signal_during_the_watch_cancels_and_cleans_up() {
+    for (sig, code, name) in SIGNALS {
+        let c = Case::new(6, &real_events());
+        let o = c.run_terminated("block_watch", sig);
+        assert_eq!(o.status.code(), Some(code), "{name}: {}", stderr(&o));
+        let log = c.log();
+        assert!(log.contains("task cancel T1"), "{name}: {log}");
+        assert!(log.contains("cancel-saw-folder=yes"), "{name}: {log}");
+        c.assert_tmp_empty();
+    }
+}
+
+#[test]
+fn a_run_that_fails_before_create_leaves_another_runs_task_and_folder_alone() {
     let c = Case::new(6, &real_events());
-    let o = c.run_terminated("block_watch");
-    assert_eq!(o.status.code(), Some(143), "{}", stderr(&o));
+    fs::write(c.dir.join("block_watch"), "").unwrap();
+    let first = c.command().spawn().unwrap();
+    let marker = c.dir.join("blocked");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.exists() {
+        if Instant::now() > deadline {
+            unsafe { libc::kill(first.id() as i32, libc::SIGKILL) };
+            panic!("fake never reached the watch");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Second run, same TMPDIR: a bad commit fails it before `task create`.
+    let o = Command::new("/bin/sh")
+        .arg(script_path())
+        .args([
+            "proj",
+            c.repo.to_str().unwrap(),
+            "0000000000000000000000000000000000000000",
+            "m",
+            "q?",
+        ])
+        .env("CHOCO", c.dir.join("choco"))
+        .env("TMPDIR", &c.tmp)
+        .output()
+        .unwrap();
+    assert_ne!(o.status.code(), Some(0));
     let log = c.log();
-    assert!(log.contains("task cancel T1"), "{log}");
-    assert!(log.contains("cancel-saw-folder=yes"), "{log}");
+    assert!(!log.contains("task cancel"), "second run cancelled: {log}");
+    assert_eq!(log.matches("task create").count(), 1, "{log}");
+    let left: Vec<_> = fs::read_dir(&c.tmp).unwrap().collect();
+    assert_eq!(left.len(), 1, "first run's folder must remain: {left:?}");
+    let o = c.signal_when_blocked(first, "block_watch", libc::SIGTERM);
+    assert_eq!(o.status.code(), Some(143));
+    // Every cancel names the first run's own task.
+    let cancels: Vec<_> = c
+        .log()
+        .lines()
+        .filter(|l| l.contains("task cancel"))
+        .map(String::from)
+        .collect();
+    assert_eq!(cancels, ["task cancel T1"]);
     c.assert_tmp_empty();
 }
 
@@ -325,9 +394,8 @@ fn task_cancelled_from_outside_is_not_cancelled_again() {
 #[test]
 fn bad_commit_fails_before_a_task_is_created() {
     let c = Case::new(6, &real_events());
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../.claude/skills/run-choco-task/scripts/omp-probe.sh");
-    let o = Command::new("sh")
+    let script = script_path();
+    let o = Command::new("/bin/sh")
         .arg(script)
         .args([
             "proj",

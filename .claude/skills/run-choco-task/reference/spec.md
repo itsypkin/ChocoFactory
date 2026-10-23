@@ -237,8 +237,11 @@ the turn runs through choco, it loads what your daemon gives any omp role. It
 differs from a coder or reviewer turn in two ways: it has choco's default role
 system prompt, not the built-in role's, and your question is its whole prompt.
 Pass the role's own model string, `:level` suffix included. To see which
-instruction files load, put a distinct marker line in each and ask which
-markers it can see.
+instruction files load, put a random marker line in each (not derived from
+the file's name), put one more in a file that must not load as a decoy, and
+ask a question that doesn't list the markers. A file counts as loaded only if
+its marker comes back and the decoy's doesn't. An acceptance question must
+also fail on a control commit without the text.
 
 It exits 3, after printing the answer, when the turn called a tool other than
 `report_outcome`: the answer may then come from a file it read rather than
