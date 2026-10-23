@@ -393,7 +393,9 @@ cancelling. In short:
   retry, or cancel).
 - `escalate_to_human` → after a review timeout, `choco task retry <id>`
   watches again at no cost; after a CI timeout, re-run CI on GitHub, then
-  `choco task retry <id>`; after any other escalation (a cancelled or
+  `choco task retry <id>` (if `choco task events <id> --json` shows a
+  `CI_RERUN_FAILED is '...'` note instead, fix that value in the workflow file,
+  then retry); after any other escalation (a cancelled or
   failed-to-start check, a loop guard), `choco task send <id> --text "<note>"`
   moves on through a coder lap. `/approve` alone is refused there.
 - `choco task cancel <id>` is final and deletes the task's worktree and

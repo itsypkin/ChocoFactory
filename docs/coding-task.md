@@ -240,7 +240,24 @@ The setting is `CI_RERUN_FAILED` in `checks_polling`'s `env:`:
 
 To turn it on, eject the workflow with `choco project init-workflows <project>`
 (or open an existing copy) and set `CI_RERUN_FAILED: "on"`, quoted, in
-`checks_polling`'s `env:`. An ejected copy keeps the script it was ejected
-with: copies made before this setting existed still re-run, and get the new
-default only by ejecting again. A misspelled key name is not noticed: it reads
-as off.
+`checks_polling`'s `env:`.
+
+A key in the workflow always wins over the daemon's environment. A workflow
+whose `checks_polling` has no `CI_RERUN_FAILED` key (a hand-written file, or a
+copy ejected before this setting existed) inherits the variable from the
+environment the daemon was started in, so "unset means off" holds only if the
+operator did not export it at `choco server start`.
+
+An ejected copy keeps the script it was ejected with. Copies made before this
+setting existed still re-run. `init-workflows` never overwrites an existing
+file: running it again over an old copy prints `existing` and keeps the old
+YAML and script. To get the new default, delete the copied workflow files and
+`scripts/ci-checks.sh` first, then eject again. Deleting only the script leaves
+a keyless YAML running the new script, which takes the daemon's environment
+as above.
+
+A misspelled key name is not noticed: it reads as off.
+
+A bad value shows in `choco task status` only as a `checks_polling` timeout
+and `escalate_to_human`, the same as slow CI. The note is in `choco task
+events <id> --json` (`stderr_tail`).
