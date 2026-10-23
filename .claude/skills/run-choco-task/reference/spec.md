@@ -9,6 +9,7 @@
 - Docs-only tasks
 - Text an agent or a reader acts on
 - Running a role on omp
+- Probing what an omp role sees
 
 ## Check that the design holds
 
@@ -66,6 +67,29 @@ with the command it ran and the output. A claim it couldn't run read-only
 is marked **unverified**, with a probe for the coder to run. Don't read
 every Decision as checked: treat an unverified one as open until the coder
 reports the probe's result.
+
+### Text that must arrive word for word
+
+The planner may reword, reflow or shorten what it carries over, for a Claude
+coder and an omp coder alike, so on this workflow "in the spec" means "in what
+the planner carries over". Put text whose exact wording matters (versions and
+features, a full argument list, rules a file must contain word for word) in a
+fenced block, and write above it: "Carry this block word for word into the
+Spec." Then check the report before coding starts:
+
+```bash
+choco task pause <id>      # while spec_check runs, not while it shows Queued
+choco task status <id> --until paused --timeout 20m
+choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary' > report.md
+diff spec.md report.md     # each marked block must come through unchanged
+choco task resume <id>
+```
+
+The pause lets the planner's turn finish and holds the task before `coding`
+starts. If it stopped at `spec_questions`, answer, resume, and pause again the
+same way. If a marked block came through changed, cancel the task and create
+it again with the block restated: once coding starts, the coder has only the
+report.
 
 ## Which `--help` to trust
 
@@ -168,6 +192,9 @@ criteria:
 - When the text is a skill or doc meant to be copied, the criteria
   include the copy-outside-the-repo check in
   [Docs-only tasks](#docs-only-tasks).
+- For text an omp role reads, such as the repo's instruction files, a run can
+  be one omp turn through your own daemon; see
+  [Probing what an omp role sees](#probing-what-an-omp-role-sees).
 
 ## Running a role on omp
 
@@ -179,10 +206,42 @@ omp login and needs no extra step. An omp role sees the repo's root
 `CLAUDE.md` and `AGENTS.md` and `.omp/AGENTS.md` and `.omp/RULES.md`, plus
 the repo's `.claude/CLAUDE.md` (loaded by omp itself), and
 nothing from nested folders, folders above the repo, or your personal setup,
-so put what it needs in those files or in the spec. Outside a `worktree:
+so put what it needs in those files or in the spec (on `coding-task-planned`,
+in what the planner carries over; see
+[Text that must arrive word for word](#text-that-must-arrive-word-for-word)). Outside a `worktree:
 true` workflow it can read but its edits and commands are refused. `memory: true` works, but it is a separate memory per choco
 project, kept under `~/.config/chocofactory/omp/memory/<project-id>/`, not
 your Claude auto-memory. omp's own files for a choco turn (session registry, locks, logs, terminal pointer, client files) go to `~/.config/chocofactory/omp/xdg-state/omp/`; only `~/.omp/agent/agent.db` and `models.db` are still written ([details](../../../../docs/models.md)). A role on an Anthropic model needs an
 `ANTHROPIC_API_KEY`, not a Claude subscription login.
 For an existing task, `choco task reconfigure` takes effect on the next
 turn.
+To check what an omp role reads, see
+[Probing what an omp role sees](#probing-what-an-omp-role-sees).
+
+## Probing what an omp role sees
+
+To check what an omp role reads from a commit's files, for an acceptance run
+or to see which instruction files load, ask one omp turn on your own daemon:
+
+```bash
+${CLAUDE_SKILL_DIR}/scripts/omp-probe.sh <project> <repo> <commit> <model> "<question>"
+```
+
+`<commit>` must be in `<repo>`; for a PR, run `git fetch origin pull/<n>/head`
+and pass `gh pr view <n> --json headRefOid -q .headRefOid`. The script exports
+the commit with `git archive` into a temp folder outside any checkout and runs
+one turn of the `omp-probe` workflow there, with no worktree, so the turn's
+edits and commands are refused. It waits up to 10 minutes, prints the answer
+and removes the folder, cancelling the task first if it hasn't closed. Because
+the turn runs through choco, it loads what your daemon gives any omp role. It
+differs from a coder or reviewer turn in two ways: it has choco's default role
+system prompt, not the built-in role's, and your question is its whole prompt.
+Pass the role's own model string, `:level` suffix included. To see which
+instruction files load, put a distinct marker line in each and ask which
+markers it can see.
+
+It exits 3, after printing the answer, when the turn called a tool other than
+`report_outcome`: the answer may then come from a file it read rather than
+from what it loaded. Each probe is one agent turn on your omp login and leaves
+a closed task in the project. It needs your own daemon: a throwaway daemon's
+omp has no login.

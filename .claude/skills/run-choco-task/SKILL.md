@@ -211,9 +211,12 @@ explicit out-of-scope list.
   `--workflow coding-task-planned`. A planning agent checks the spec against
   the code, fixes stale references, decides the design choices your intent
   implies, and asks you only when it can't go on without guessing. The coder
-  and reviewer then work from its report, not your `--prompt`. A claim it
-  couldn't run read-only is marked **unverified**: treat it as open until the
-  coder reports the probe's result. Read the report, answer questions and
+  and reviewer then work from its report, not your `--prompt`, on either CLI:
+  text that must reach them exactly goes in a block you mark to be carried
+  word for word, and you check the report before coding starts (see
+  [reference/spec.md](reference/spec.md#text-that-must-arrive-word-for-word)).
+  A claim it couldn't run read-only is marked **unverified**: treat it as open
+  until the coder reports the probe's result. Read the report, answer questions and
   see the rest in [reference/spec.md](reference/spec.md#having-choco-check-the-spec-first-coding-task-planned).
 - **Docs-only task:** every link and anchor resolves (from a copy outside the
   repo, for a skill or doc meant to be copied), every command matches `--help`,
@@ -226,6 +229,9 @@ explicit out-of-scope list.
   each with a budget and a way out that tells the internal reviewer to carry a
   "not made: <reason>" item to the human gate; see
   [reference/spec.md](reference/spec.md#text-an-agent-or-a-reader-acts-on).
+  To see what an omp role reads from a commit's files, ask one omp turn with
+  `${CLAUDE_SKILL_DIR}/scripts/omp-probe.sh`; see
+  [reference/spec.md](reference/spec.md#probing-what-an-omp-role-sees).
 
 ## 3. Create and watch
 
