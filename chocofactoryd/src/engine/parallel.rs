@@ -432,7 +432,8 @@ impl WorkflowEngine {
         Ok(Some(reason))
     }
 
-    /// Appends the settle's `Error` event, best-effort, as `mark_stuck` does.
+    /// Appends the settle's `Error` event, best-effort, after the commit; unlike `mark_stuck`, which commits its
+    /// event with the status (#314).
     async fn append_settle_error(&self, task_id: &str, group: &str, reason: String) {
         tracing::error!(task_id, reason, "task stuck: {reason}");
         match events::append_for_task(

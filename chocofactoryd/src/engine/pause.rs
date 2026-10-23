@@ -405,10 +405,11 @@ impl WorkflowEngine {
         self.evict_task_lock_if_unshared(task_id, &lock).await;
     }
 
-    /// [`Self::settle_pause`] under the task lock the caller holds. One
-    /// conditional write. A failed write is logged at `error` and the task
-    /// stays `pausing`, the safe side: the next pause, resume or restart
-    /// sweep corrects it.
+    /// [`Self::settle_pause`] under the task lock the caller holds. The
+    /// `paused` status and its `task_paused` event commit in one
+    /// transaction (#314); any failure leaves the task `pausing`, logged at
+    /// `error`, the safe side: the next pause, resume or restart sweep
+    /// corrects it.
     pub(super) async fn settle_pause_locked(&self, task_id: &str) {
         let task = match tasks::get(&self.pool, task_id).await {
             Ok(Some(task)) => task,
@@ -424,21 +425,35 @@ impl WorkflowEngine {
         if self.has_running_work(task_id) {
             return;
         }
-        match tasks::mark_paused(&self.pool, task_id).await {
-            Ok(true) => {
-                let stage = match workflow_state::get(&self.pool, task_id).await {
-                    Ok(Some(state)) => json!(state.current_stage),
-                    _ => Value::Null,
-                };
-                self.append_task_event(task_id, EventType::TaskPaused, json!({ "stage": stage }))
-                    .await;
-            }
-            Ok(false) => {}
-            Err(err) => tracing::error!(
+        let stage = match workflow_state::get(&self.pool, task_id).await {
+            Ok(Some(state)) => json!(state.current_stage),
+            _ => Value::Null,
+        };
+        if let Err(err) = self.commit_paused(task_id, json!({ "stage": stage })).await {
+            tracing::error!(
                 task_id, %err,
                 "could not mark a pausing task paused; it stays pausing"
-            ),
+            );
         }
+    }
+
+    /// Writes `paused` and its `task_paused` event in one transaction and
+    /// wakes event waiters after the commit. Nothing is written when the task
+    /// was no longer `pausing`. An error drops the transaction (rolling it
+    /// back), so the task stays `pausing`.
+    pub(super) async fn commit_paused(
+        &self,
+        task_id: &str,
+        payload: Value,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        if !tasks::mark_paused_in(&mut tx, task_id).await? {
+            return Ok(());
+        }
+        db_events::append_for_task_on(&mut tx, task_id, EventType::TaskPaused, payload).await?;
+        tx.commit().await?;
+        self.events_notify.notify_waiters();
+        Ok(())
     }
 
     // -----------------------------------------------------------------

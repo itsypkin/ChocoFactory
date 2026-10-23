@@ -296,7 +296,8 @@ impl WorkflowEngine {
     /// The startup sweep for one `pausing` task, under its lock. Records
     /// every cut-off session of the current stage (each running branch's, for
     /// a group) as `daemon_stopped`, checks read-only roles, and then makes
-    /// the task `paused` — or `stuck` with the finding when a session could
+    /// the task `paused` (status and `task_paused {restart: true}` in one
+    /// transaction; it stays `pausing` if that fails) — or `stuck` with the finding when a session could
     /// not be recorded or a read-only role changed the worktree. Branch slots
     /// are failed only for a branch whose turn had failed; `resume` continues
     /// the others.
@@ -304,20 +305,14 @@ impl WorkflowEngine {
         let task_id = task.id.as_str();
         match self.pausing_findings(task, false).await {
             Ok(findings) if findings.is_empty() => {
-                match tasks::mark_paused(&self.pool, task_id).await {
-                    Ok(true) => {
-                        self.append_task_event(
-                            task_id,
-                            EventType::TaskPaused,
-                            json!({ "restart": true }),
-                        )
-                        .await
-                    }
-                    Ok(false) => {}
-                    Err(err) => tracing::error!(
+                if let Err(err) = self
+                    .commit_paused(task_id, json!({ "restart": true }))
+                    .await
+                {
+                    tracing::error!(
                         task_id, %err,
                         "restart sweep could not mark a pausing task paused; it stays pausing"
-                    ),
+                    );
                 }
             }
             Ok(findings) => {
