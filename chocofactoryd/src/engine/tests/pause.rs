@@ -2476,7 +2476,13 @@ async fn a_settle_on_a_task_that_is_no_longer_pausing_writes_nothing() {
 
     q.engine.resume_task(&a.id).await.unwrap();
     q.engine.settle_pause(&a.id).await;
-    assert_eq!(q.status(&a.id).await, "open");
+    // The resumed stage runs on its own and may already have closed the task,
+    // so assert only what the settle controls: it is no longer paused/pausing.
+    let status = q.status(&a.id).await;
+    assert!(
+        status != "paused" && status != "pausing",
+        "settle must not touch a resumed task, got {status}"
+    );
     assert_eq!(q.queue_events(&a.id, EventType::TaskPaused).await.len(), 1);
 }
 
