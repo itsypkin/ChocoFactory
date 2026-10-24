@@ -277,7 +277,16 @@ Code's built-in agents-md plugin; if a session's plugins don't include it, an
 repo enables: they belong to the code being worked on. The repo's
 `.claude/settings.local.json` is *not* read: it is the operator's personal
 file, and in a task's linked worktree Claude Code would resolve it to the
-main checkout's. A role can loosen the
+main checkout's. Your user settings (`~/.claude/settings.json`) are not
+read either, so a preference set there doesn't reach the agent: with
+`includeCoAuthoredBy: false` only in your user file, the agent's commits still
+carry the `Co-Authored-By` trailer. To turn it off, commit
+`"attribution": {"commit": "", "pr": ""}` to the repo's `.claude/settings.json`
+(`attribution` is the current key; `includeCoAuthoredBy: false` is older,
+deprecated, and still honoured). The other way is
+`inherit_operator_config: true` on the role, which brings in your whole setup:
+settings, plugins, hooks, MCP servers and `~/.claude/CLAUDE.md`. A role can
+loosen the
 rest in the workflow file:
 
 ```yaml
