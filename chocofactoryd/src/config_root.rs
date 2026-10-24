@@ -805,6 +805,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         for (stage, on, max) in [
             ("internal_review", "changes_requested", 3),
             ("checks_polling", "red", 3),
+            ("base_conflict", "done", 3),
         ] {
             let guard = def.stages[stage].loop_guard.as_ref().expect("loop guard");
             assert_eq!(
@@ -868,6 +869,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 (r"\AREQUEST_CHANGES(\n|$)", "changes_requested"),
                 (r"\AAPPROVE(\n|$)", "approved"),
                 (r"\AMERGED(\n|$)", "approved"),
+                (r"\ACONFLICTING(\n|$)", "conflicting"),
             ]
         );
         let on: Vec<(&str, &str)> = stage
@@ -880,6 +882,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             [
                 ("approved", "done"),
                 ("changes_requested", "revising"),
+                ("conflicting", "base_conflict"),
                 ("timeout", "escalate_to_human")
             ]
         );
@@ -888,6 +891,22 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             (guard.on.as_str(), guard.max, guard.then.as_str()),
             ("changes_requested", 3, "escalate_to_human")
         );
+
+        // `base_conflict` only counts conflict rounds (#342).
+        let conflict = &def.stages["base_conflict"];
+        let StageKind::Shell { command, .. } = &conflict.kind else {
+            panic!("base_conflict must be a shell stage: {:?}", conflict.kind);
+        };
+        assert!(
+            matches!(command, ShellCommand::Inline(c) if c == "true"),
+            "{command:?}"
+        );
+        let conflict_on: Vec<(&str, &str)> = conflict
+            .on
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(conflict_on, [("done", "revising")]);
     }
 
     /// The workflow's `markers:` and the shared case table agree: a marker
@@ -1104,6 +1123,52 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "the awaiting_human_review entry",
         );
         assert!(!entry.contains("Run `gh pr view --comments`"));
+    }
+
+    #[test]
+    fn coder_revise_for_the_base_conflict_path_tells_the_coder_to_rebase() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "base_conflict",
+            "done",
+            serde_json::json!({
+                "internal_review": { "summary": "STALE REVIEWER APPROVAL" },
+                "awaiting_human_review": "CONFLICTING\n\nCONFLICT NOTE"
+            }),
+        );
+        assert_eq!(rendered.matches("CONFLICT NOTE").count(), 1);
+        let entry = squash(route_entry(&rendered, "base_conflict"));
+        assert_says(
+            &entry,
+            &[
+                r#"gh pr view "$N" --json baseRefName -q .baseRefName"#,
+                "`git fetch origin <base>`",
+                "rebase the branch onto `origin/<base>`",
+                "`git rebase --abort`",
+                "Don't push: `open_pr` does.",
+                "address the comments handed over below, as in a review round",
+                "set aside, not withdrawn; treat comments that came with it as optional",
+                "report `done` without a commit",
+            ],
+            "the base_conflict entry",
+        );
+        let done = squash(&rendered[rendered.find("## When you're done").unwrap()..]);
+        assert_says(
+            &done,
+            &[
+                r#"`gh pr view "$N" --json mergeable -q .mergeable` prints `CONFLICTING`"#,
+                "rebase as the `base_conflict` entry says before you finish",
+                "If it prints `UNKNOWN`, read it again up to 3 times, about 10 seconds apart, and act only on `CONFLICTING`.",
+            ],
+            "the rule in When you're done",
+        );
+        let resumed = squash(route_entry(&rendered, "escalate_to_human"));
+        assert_says(
+            &resumed,
+            &[
+                "When the escalation came from the conflict-round guard (`base_conflict`), \"The human's review\" holds the last conflict note",
+            ],
+            "the resumed entry",
+        );
     }
 
     /// A review sent through choco has no verdict line; the prompt tells the

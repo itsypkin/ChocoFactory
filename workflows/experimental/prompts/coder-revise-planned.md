@@ -47,6 +47,23 @@ follow that entry:
   If "The human's review" below has content, it is from an earlier lap and
   already handled on this branch (each item done or declined with a
   reason): fix the failure without undoing the human's change. If the only fix would undo it, say so in your summary.
+- **`base_conflict` → `done`**: the open PR no longer merges cleanly into
+  its base branch. "The human's review" below holds the conflict note
+  (and, when there was one, a line saying an approval was set aside),
+  followed by any comments or reviews the human posted since the last
+  hand-off, marker or not. Set `N` as the
+  `awaiting_human_review` entry does, then read the base with
+  `gh pr view "$N" --json baseRefName -q .baseRefName`. Run
+  `git status` first: if a rebase is already in progress (an earlier lap
+  was cut off), run `git rebase --abort` and start again. Then
+  `git fetch origin <base>` and rebase the branch onto `origin/<base>`.
+  Resolve each conflict keeping both sides' intent and run the tests. Then address the comments handed over below, as in a
+  review round. An `/approve` or APPROVED review among them was set aside,
+  not withdrawn; treat comments that came with it as optional unless they
+  ask for a change. Don't push: `open_pr` does. In your summary, list the
+  files you resolved and how, and what you did about each comment. If
+  the rebase finds nothing to do, the PR now reads `MERGEABLE` and no
+  comment asks for a change, report `done` without a commit and say so.
 - **`escalate_to_human` → `resumed`**: a human stepped in after the task was
   escalated. Their note is quoted below under "A human's note", and it is
   current. Follow it. If this branch has an open PR, also read everything on
@@ -60,6 +77,10 @@ follow that entry:
   escalation came from the PR review, that's where the rejection is, and a
   short note like "same issues, keep going" refers to it. Where the note and a comment disagree, follow
   the note.
+  When the escalation came from the conflict-round guard (`base_conflict`),
+  "The human's review" holds the last conflict note and the comments that
+  came with it, and the rule in
+  "When you're done" rebases the branch.
 
 If your transition isn't in this list, check `gh pr checks`,
 `gh pr view --json comments,reviews` and `git log` to work out why you're here before
@@ -71,7 +92,8 @@ Current on the `awaiting_human_review` path. When the review came from the
 PR, it holds the PR comments from accounts with write access, newer than
 the previous hand-off, or than your last commit on the first review, oldest first, and its first line is the verdict token. A
 review sent through choco is the person's reply as written, with no verdict
-line. On the `escalate_to_human` path it is
+line. On the `base_conflict` path it holds the
+conflict note, then any comments posted since the last hand-off. On the `escalate_to_human` path it is
 context: when the escalation came from the review loop guard, it is the
 review that tripped it. On any other path it is from an earlier lap and
 already handled on this branch (each item done or declined with a reason):
@@ -103,6 +125,13 @@ left over from an earlier escalation, so ignore it.
 {{ stages.escalate_to_human }}
 
 ## When you're done
+
+If the branch has an open PR (`N` non-empty, set as the
+`awaiting_human_review` entry does) and
+`gh pr view "$N" --json mergeable -q .mergeable` prints `CONFLICTING`,
+rebase as the `base_conflict` entry says before you finish, whatever path
+brought you here. If it prints `UNKNOWN`, read it again up to 3 times,
+about 10 seconds apart, and act only on `CONFLICTING`.
 
 Commit your revisions, and rewrite the PR description file whole (step 4 of your
 instructions) so it describes the branch as it now stands.

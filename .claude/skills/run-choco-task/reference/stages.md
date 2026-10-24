@@ -68,7 +68,7 @@ Read this while watching a task, when its behaviour surprises you.
   daemon restarts meanwhile). A real failure wins over those three. A PR
   with no checks at all goes to `awaiting_human_review` as `no_checks` after
   3 minutes, so on a repo without CI, or on a conflicting PR, you review
-  without CI. The timeline lists each check with its state.
+  without CI (the gate then sends a conflicting PR to rebase). The timeline lists each check with its state.
 - **awaiting_human_review.** A human gate that watches the PR's comments and reviews
   every minute for 6 hours, every 5 minutes for the next 24 hours and every
   30 minutes for the next 3 days, takes one last look, then parks at
@@ -76,9 +76,14 @@ Read this while watching a task, when its behaviour surprises you.
   `choco task send <id> --text "..."` carrying `/approve` or
   `/request-changes` on a line of its own; a reply with neither or both is
   refused. A merged PR counts as approval and moves the task to `done`; a PR
-  closed without merging does not.
-- **escalate_to_human.** Arriving here starts all three loop counts over (internal rejections, red CI
-  results, your votes).
+  closed without merging does not. A third finding is `conflicting`: an open
+  PR whose `mergeable` is `CONFLICTING` goes to `base_conflict` (a stage that
+  only counts these rounds; the 4th since the last escalation parks the task)
+  and then `revising` to rebase. Order: merged, `/request-changes`, conflict,
+  `/approve`. An approval of a conflicting PR is set aside; an `UNKNOWN`
+  `mergeable` holds an approval for one more poll.
+- **escalate_to_human.** Arriving here starts all four loop counts over (internal rejections, red CI
+  results, your votes, conflict rounds).
   It waits for you. After a review or CI timeout, `choco task retry <id>`
   watches again at no cost. Otherwise `choco task send <id> --text "<note>"`
   moves the task into `revising`.

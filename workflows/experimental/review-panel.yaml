@@ -206,11 +206,21 @@ stages:
           then: approved
         - match: '\AMERGED(\n|$)'
           then: approved
+        - match: '\ACONFLICTING(\n|$)'
+          then: conflicting
     on:
       approved: done
       changes_requested: revising
+      conflicting: base_conflict
       timeout: escalate_to_human
     loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Same as `coding-task.yaml`'s `base_conflict`.
+  base_conflict:
+    kind: shell
+    command: "true"
+    on: { done: revising }
+    loop_guard: { on: done, max: 3, then: escalate_to_human }
 
   # Same as `coding-task-planned.yaml`'s `done`.
   done:
