@@ -285,8 +285,13 @@ carry the `Co-Authored-By` trailer. To turn it off, commit
 (`attribution` is the current key; `includeCoAuthoredBy: false` is older,
 deprecated, and still honoured). The other way is
 `inherit_operator_config: true` on the role, which brings in your whole setup:
-settings, plugins, hooks, MCP servers and `~/.claude/CLAUDE.md`. A role can
-loosen the
+settings, plugins, hooks, MCP servers and `~/.claude/CLAUDE.md`. Login and
+routing values in your user settings, such as `apiKeyHelper` or an `env` block
+setting `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or
+`CLAUDE_CODE_USE_VERTEX`, don't reach an isolated role either, so set them in
+the daemon's own environment, which agents inherit: if you are also logged in
+with OAuth, the agent's traffic otherwise goes straight to Anthropic, past your
+gateway, with no warning. A role can loosen the
 rest in the workflow file:
 
 ```yaml
