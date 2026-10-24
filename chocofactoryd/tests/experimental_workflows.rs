@@ -153,9 +153,9 @@ fn review_panel_has_the_decided_shape() {
         ("done", 3, "escalate_to_human")
     );
 
-    let StageKind::Poll { watch, .. } = &def.stages["awaiting_human_review"].kind else {
-        panic!("awaiting_human_review must be a poll");
-    };
+    let watch = def.stages["awaiting_human_review"]
+        .watch()
+        .expect("awaiting_human_review has a watcher");
     let outcomes: Vec<(&str, &str)> = watch
         .outcomes
         .iter()
