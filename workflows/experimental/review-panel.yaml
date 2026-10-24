@@ -60,13 +60,15 @@ stages:
     kind: agent_turn
     role: coder
     prompt_file: prompts/coder-turn-planned.md
-    on: { done: review_panel }
+    capture: json
+    on: { done: review_panel, blocked: blocker }
 
   revising:
     kind: agent_turn
     role: coder
     prompt_file: prompts/coder-revise-planned.md
-    on: { done: review_panel }
+    capture: json
+    on: { done: review_panel, blocked: blocker }
 
   # All three branches start together and the group always leaves through
   # `done`; `lead_review` decides. Only `internal_review` builds and runs the
@@ -125,6 +127,12 @@ stages:
 
   # Same as `coding-task-planned.yaml`'s `escalate_to_human`.
   escalate_to_human:
+    kind: human_gate
+    capture: text
+    on: { resumed: revising }
+
+  # Same as `coding-task-planned.yaml`'s `blocker`.
+  blocker:
     kind: human_gate
     capture: text
     on: { resumed: revising }

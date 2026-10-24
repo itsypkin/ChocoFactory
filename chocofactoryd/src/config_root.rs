@@ -909,6 +909,48 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_eq!(conflict_on, [("done", "revising")]);
     }
 
+    /// (#333) `coding` and `revising` can stop on a hard blocker: a second
+    /// exit, `blocked`, to a human gate of its own that resumes into
+    /// `revising`. The gate has no loop guard (every round waits on a human)
+    /// and no markers, so a marker-only reply is refused. `capture: json` is
+    /// what makes the exit routable and keeps the coder's own report for the
+    /// next lap.
+    #[test]
+    fn the_seeded_coding_task_can_stop_on_a_blocker() {
+        use crate::workflow_def::{Capture, StageKind};
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let def = load_seeded(&dir, "coding-task.yaml");
+
+        for name in ["coding", "revising"] {
+            let stage = &def.stages[name];
+            let StageKind::AgentTurn { capture, .. } = &stage.kind else {
+                panic!("{name} must be an agent_turn: {:?}", stage.kind);
+            };
+            assert_eq!(*capture, Some(Capture::Json), "{name} capture");
+            assert_eq!(
+                on_map(stage),
+                [("done", "internal_review"), ("blocked", "blocker")],
+                "{name} on"
+            );
+        }
+
+        let gate = &def.stages["blocker"];
+        let StageKind::HumanGate {
+            capture,
+            markers,
+            watch,
+        } = &gate.kind
+        else {
+            panic!("blocker must be a human_gate: {:?}", gate.kind);
+        };
+        assert_eq!(*capture, Some(Capture::Text));
+        assert!(markers.is_empty(), "{markers:?}");
+        assert!(watch.is_none());
+        assert_eq!(on_map(gate), [("resumed", "revising")]);
+        assert!(gate.loop_guard.is_none(), "blocker must have no loop guard");
+    }
+
     /// The workflow's `markers:` and the shared case table agree: a marker
     /// renamed in the YAML alone fails here.
     #[test]
@@ -1480,6 +1522,256 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 });
             searched_from += found + section.len();
         }
+    }
+
+    /// A blocked report as the coder writes it: realistic length, backticks,
+    /// a real resolver error and a `{{ task.input }}` literal.
+    const BLOCKED_CODING_REPORT: &str = "BLOCKED-CODING: `cargo update -p serde` printed \
+        `error: failed to select a version for the requirement `serde = \"=9.9.9\"``. \
+        The task says {{ task.input }} must not be substituted.";
+    const BLOCKED_REVISING_REPORT: &str = "BLOCKED-REVISING: still `serde = \"=9.9.9\"`; \
+        sent back for the missing test, which is still to do.";
+    const BLOCKER_ANSWER: &str =
+        "BLOCKER-ANSWER line one: use serde 1.x.\nline two: keep {{ task.input }} as is.";
+
+    #[test]
+    fn coder_revise_for_the_blocker_path_hands_over_the_report_and_the_answer() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "blocker",
+            "resumed",
+            serde_json::json!({
+                "coding": { "outcome": "blocked", "summary": BLOCKED_CODING_REPORT },
+                "revising": { "outcome": "blocked", "summary": BLOCKED_REVISING_REPORT },
+                "blocker": BLOCKER_ANSWER,
+            }),
+        );
+        assert!(rendered.contains("the `blocker` stage ended with the outcome `resumed`"));
+
+        let report = rendered.find("## Your blocker report").unwrap();
+        let from_coding = rendered.find("From `coding`:").unwrap();
+        let from_revising = rendered.find("From `revising`:").unwrap();
+        let answer = rendered
+            .find("## A human's answer to your blocker")
+            .unwrap();
+        let done = rendered.find("## When you're done").unwrap();
+        assert!(report < from_coding && from_coding < from_revising);
+        assert!(from_revising < answer && answer < done);
+
+        // Each seeded text renders exactly once, under its own heading.
+        for (text, from, to) in [
+            ("BLOCKED-CODING:", from_coding, from_revising),
+            ("BLOCKED-REVISING:", from_revising, answer),
+            ("BLOCKER-ANSWER line one", answer, done),
+        ] {
+            assert_eq!(rendered.matches(text).count(), 1, "{text}:\n{rendered}");
+            let at = rendered.find(text).unwrap();
+            assert!(from < at && at < to, "{text} is under the wrong heading");
+        }
+        // The answer is data: its second line and its `{{ task.input }}`
+        // render literally, and the report's too.
+        assert!(rendered.contains("line two: keep {{ task.input }} as is."));
+        assert!(rendered.contains("The task says {{ task.input }} must not be substituted."));
+
+        let entry = squash(route_entry(&rendered, "blocker"));
+        assert_says(
+            &entry,
+            &[
+                "you stopped on a blocker by reporting `blocked`, and a human has answered.",
+                "Your report is under \"Your blocker report\" and their answer under \"A human's answer to your blocker\"; both are current.",
+                "Follow the answer. Where it conflicts with the task's rules, the answer wins.",
+                "If your report lists work you were sent back for that is still to do, finish it too: for those items, the section of this prompt it came from is current.",
+                "If the answer doesn't settle the blocker, report `blocked` again and say what is still open.",
+            ],
+            "the blocker entry",
+        );
+        let base = rendered.find("- **`base_conflict`").unwrap();
+        let blocker = rendered.find("- **`blocker`").unwrap();
+        let escalate = rendered.find("- **`escalate_to_human`").unwrap();
+        assert!(base < blocker && blocker < escalate);
+
+        assert_says(
+            &squash(&rendered[report..from_coding]),
+            &["Current only on the `blocker` path, and ignore it on every other path."],
+            "the report label",
+        );
+    }
+
+    /// On every other path the answer is an earlier one, labelled so, and it
+    /// renders once, under its own heading.
+    #[test]
+    fn coder_revise_for_the_internal_review_path_labels_an_old_blocker_answer() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "internal_review",
+            "changes_requested",
+            serde_json::json!({
+                "internal_review": { "summary": "CURRENT REVIEWER SUMMARY" },
+                "blocker": BLOCKER_ANSWER,
+            }),
+        );
+        let answer = rendered
+            .find("## A human's answer to your blocker")
+            .unwrap();
+        let done = rendered.find("## When you're done").unwrap();
+        assert_eq!(rendered.matches("BLOCKER-ANSWER line one").count(), 1);
+        let at = rendered.find("BLOCKER-ANSWER line one").unwrap();
+        assert!(answer < at && at < done);
+        assert_says(
+            &squash(&rendered[answer..at]),
+            &[
+                "On any other path, it is an earlier answer that this branch already acts on: keep to the decision it made, and don't undo it.",
+            ],
+            "the answer label",
+        );
+    }
+
+    #[test]
+    fn coder_revise_says_when_it_may_report_blocked() {
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "internal_review",
+            "changes_requested",
+            serde_json::json!({}),
+        );
+        let done = rendered.find("## When you're done").unwrap();
+        assert_says(
+            &squash(&rendered[done..]),
+            &[
+                "Then call `report_outcome` with the outcome `done`, or `blocked` only as \"When you can't go on\" in your instructions allows.",
+            ],
+            "the closing section's outcome",
+        );
+    }
+
+    /// A task already past `coding` when the daemon is updated has no
+    /// `coding` capture. Each shape of that gap renders, with every heading,
+    /// and reports the one placeholder as `Missing`.
+    #[test]
+    fn coder_revise_renders_when_the_coding_report_is_missing_in_every_shape() {
+        use crate::template::UnresolvedKind;
+        let base = |coding: Option<serde_json::Value>| {
+            let mut stages = serde_json::json!({
+                "internal_review": { "outcome": "changes_requested", "summary": "OLD REVIEW" },
+                "revising": { "outcome": "blocked", "summary": BLOCKED_REVISING_REPORT },
+                "blocker": BLOCKER_ANSWER,
+            });
+            if let Some(coding) = coding {
+                stages["coding"] = coding;
+            }
+            serde_json::json!({
+                "task": { "title": "Fix the thing", "input": "do the thing", "closes": "" },
+                "arrival": { "from": "blocker", "outcome": "resumed" },
+                "finished_stages": ["coding", "internal_review", "revising", "blocker"],
+                "stages": stages,
+            })
+        };
+        for (shape, coding) in [
+            ("absent", None),
+            (
+                "a reply captured as text",
+                Some(serde_json::json!("a reply")),
+            ),
+            (
+                "a null summary",
+                Some(serde_json::json!({ "outcome": "blocked", "summary": null })),
+            ),
+        ] {
+            let (rendered, unresolved) =
+                crate::template::render(coder_revise_content(), &base(coding))
+                    .unwrap_or_else(|err| panic!("{shape}: {err}"));
+            for heading in [
+                "## Your blocker report",
+                "## A human's answer to your blocker",
+                "## When you're done",
+            ] {
+                assert!(rendered.contains(heading), "{shape}: {heading}");
+            }
+            let missing: Vec<&str> = unresolved
+                .iter()
+                .filter(|u| u.kind == UnresolvedKind::Missing)
+                .map(|u| u.placeholder.as_str())
+                .collect();
+            assert_eq!(missing, ["{{ stages.coding.summary }}"], "{shape}");
+        }
+    }
+
+    /// The reviewers read a human's answer to a blocker, and where it
+    /// conflicts with the task, the answer wins. A first review has no
+    /// answer: the block is empty and that is not worth a timeline note.
+    #[test]
+    fn reviewer_turns_show_the_blockers_answer_between_markers() {
+        use crate::template::UnresolvedKind;
+        for name in ["reviewer-turn.md", "reviewer-turn-planned.md"] {
+            let between = |rendered: &str| {
+                let open =
+                    rendered.find("<blocker_answer>\n").unwrap() + "<blocker_answer>\n".len();
+                let close = rendered.find("</blocker_answer>").unwrap();
+                rendered[open..close].to_string()
+            };
+            let payload = |blocker: Option<&str>, finished: &[&str]| {
+                let mut stages = serde_json::json!({ "spec_check": { "summary": "THE SPEC" } });
+                if let Some(answer) = blocker {
+                    stages["blocker"] = serde_json::json!(answer);
+                }
+                serde_json::json!({
+                    "task": { "title": "T", "input": "THE TASK" },
+                    "finished_stages": finished,
+                    "stages": stages,
+                })
+            };
+
+            let (rendered, unresolved) = crate::template::render(
+                embedded_prompt(name),
+                &payload(Some(BLOCKER_ANSWER), &["coding", "blocker", "revising"]),
+            )
+            .unwrap();
+            assert_eq!(
+                rendered.matches("BLOCKER-ANSWER line one").count(),
+                1,
+                "{name}"
+            );
+            assert_eq!(between(&rendered).trim_end(), BLOCKER_ANSWER, "{name}");
+            assert_says(
+                &squash(&rendered),
+                &[
+                    "where it conflicts with the task text above, the answer wins, and work that follows it is not a defect. Check that the work does follow it.",
+                ],
+                name,
+            );
+            assert!(
+                !unresolved.iter().any(|u| u.placeholder.contains("blocker")),
+                "{name}: {unresolved:?}"
+            );
+
+            let (rendered, unresolved) =
+                crate::template::render(embedded_prompt(name), &payload(None, &["coding"]))
+                    .unwrap();
+            assert!(between(&rendered).trim().is_empty(), "{name}");
+            let blocker: Vec<_> = unresolved
+                .iter()
+                .filter(|u| u.placeholder == "{{ stages.blocker }}")
+                .collect();
+            assert_eq!(blocker.len(), 1, "{name}: {unresolved:?}");
+            assert_eq!(blocker[0].kind, UnresolvedKind::StageNotRunYet, "{name}");
+        }
+    }
+
+    /// (#333) The stop rule is whole clauses in the shared system prompt.
+    #[test]
+    fn coder_system_says_when_the_coder_may_stop() {
+        let text = squash(embedded_prompt("coder-system.md"));
+        assert_says(
+            &text,
+            &[
+                "An ambiguity is never a reason to stop; the one way to stop is described under \"When you can't go on\" below.",
+                "To stop on a blocker instead, follow \"When you can't go on\" below.",
+                "**When you can't go on.** If `blocked` is one of the outcomes this stage accepts (they are listed with the instruction to call `report_outcome`), you may stop and hand the task to a human.",
+                "Do that only when the task tells you to stop in the situation you are in, or when every way forward breaks a rule the task sets.",
+                "Work that is hard, slow or unfamiliar is not a reason, and neither is a check that can't run here (step 2 says how to report that). Never break such a rule to finish instead.",
+                "To stop, commit any finished work that keeps to the task's rules, check that `git status --short` is empty, and call `report_outcome` with outcome `blocked`.",
+                "In a lap that revises earlier work, also say what you were sent back for and which of it is still to do.",
+                "If `blocked` isn't among this stage's outcomes, finish with `done` and name what you couldn't do, as the next paragraph says.",
+            ],
+            "coder-system.md's stop rule",
+        );
     }
 
     fn embedded_prompt(name: &str) -> &'static str {

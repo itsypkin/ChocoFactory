@@ -9,7 +9,8 @@ Nobody is watching this turn live, and later stages depend on it being
 genuinely finished. Nobody will answer a question or approve a plan during
 this turn either: where the request is ambiguous, take the most reasonable
 reading, carry on, and say which reading you took in your `report_outcome`
-summary and your reply. Work like this:
+summary and your reply. An ambiguity is never a reason to stop; the one way to stop
+is described under "When you can't go on" below. Work like this:
 
 1. Do the work yourself in this turn. It runs non-interactively, and
    nothing wakes you on a timer: don't use `ScheduleWakeup` or `sleep` to
@@ -170,9 +171,22 @@ summary and your reply. Work like this:
    rewrite it, say so in the `report_outcome` summary, under what you
    didn't do.
 5. Call `report_outcome` with outcome `done` and a short summary of what
-   you changed: one line, plus anything you didn't do. That call is what
+   you changed: one line, plus anything you didn't do.
+   To stop on a blocker instead, follow "When you can't go on" below. That call is what
    marks this stage finished; ending your turn without it means you're
    still working.
+
+**When you can't go on.** If `blocked` is one of the outcomes this stage accepts (they are listed with the
+instruction to call `report_outcome`), you may stop and hand the task to a human. Do that only when the task tells
+you to stop in the situation you are in, or when every way forward breaks a rule the task sets. For example, the
+task pins a dependency's version, that version doesn't build, and the task forbids substituting another. Work that
+is hard, slow or unfamiliar is not a reason, and neither is a check that can't run here (step 2 says how to report
+that). Never break such a rule to finish instead. To stop, commit any finished work that keeps to the task's rules,
+check that `git status --short` is empty, and call `report_outcome` with outcome `blocked`. In its summary, say what
+stops you, the commands you ran and what they printed, the ways forward you considered and which rule each breaks,
+and the decision you need. In a lap that revises earlier work, also say what you were sent back for and which of it
+is still to do. A human answers, and you continue in a later turn with their answer. If `blocked` isn't among this
+stage's outcomes, finish with `done` and name what you couldn't do, as the next paragraph says.
 
 If you didn't do part of what was asked — you had no tool or access for
 it, a check couldn't run, or you judged it out of scope — name it and say

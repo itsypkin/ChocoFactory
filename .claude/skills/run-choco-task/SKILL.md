@@ -26,8 +26,14 @@ The bracketed part is `coding-task-planned` only.
 Every way back goes through `revising`, which returns to `internal_review`:
 `internal_review` requests changes, `checks_polling` sees a failed check, you
 post `/request-changes`, the PR starts conflicting with its base (`base_conflict`
-sends it to `revising` to rebase), or someone resumes the task from
-`escalate_to_human`.
+sends it to `revising` to rebase), you answer a blocker, or someone resumes
+the task from `escalate_to_human`.
+
+A coder that hits a rule the spec sets and that leaves no way forward (for
+example, a pinned dependency that doesn't build, where the spec forbids
+substituting another) reports `blocked` instead of finishing, from `coding` or
+`revising`, and the task waits at `blocker` for your answer. It costs no
+rejection count.
 
 A task parks at `escalate_to_human` after a 4th rejection in a row by
 `internal_review`, a 4th red CI result in a row from `checks_polling`, a 4th
@@ -186,6 +192,10 @@ explicit out-of-scope list.
   when it reads a file in that folder), but not your `~/.claude/CLAUDE.md` or
   instruction files in folders above the repo. Anything from your personal
   setup that the task needs goes in the spec.
+- **State a stop condition for any rule the coder must not work around.**
+  A coder that can't keep such a rule can report `blocked` and wait for you,
+  but only when the spec tells it to stop in that situation; see
+  [reference/spec.md](reference/spec.md#stop-conditions).
 - **Check that the design holds, not only that it builds.** List every way a
   protected event can end and say whether the protection runs on each, and
   carry in any spec checks your project's instruction files name; see
@@ -265,15 +275,21 @@ choco task create --project <p> --workflow coding-task-planned \
   `choco task status <id> --until attention --timeout <dur>`. It returns
   when the task is open at `spec_questions` (the planner needs your answer;
   reply with `choco task send <id> --text "<answers>"`), at
-  `awaiting_human_review` (vote, step 4) or at `escalate_to_human`
-  (`choco task retry` or `choco task send`, step 5), or when it is paused,
+  `awaiting_human_review` (vote, step 4), at `escalate_to_human`
+  (`choco task retry` or `choco task send`, step 5) or at `blocker` (the
+  coder reported `blocked`: read its report with
+  `choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'`,
+  then answer with `choco task send <id> --text "<answer>"` or cancel), or when it is paused,
   stuck, cancelled or closed. Its stderr line and exit code say which. The exit codes are in
   [reference/watch.md](reference/watch.md#waiting-with---until); typical
   stage times for choosing `--timeout` are in
   [reference/watch.md](reference/watch.md#stage-times).
 - **Read a stage's verdict text** (the latest lap) with
   `choco --json task status <id> | jq -r '.workflow_state.payload.stages.<stage>.summary'`
-  for `spec_check` or `internal_review`. Every lap's text, and watching
+  for `spec_check` or `internal_review`. For the coder's latest report, which
+  holds the reason when it stopped at `blocker`, use
+  `choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'`.
+  Every lap's text, and watching
   commits while a revise lap is still open, are in
   [reference/watch.md](reference/watch.md#reading-a-stages-verdict-text).
 - **Find the task's PR** with `gh pr list --head task/<task-id>` (add
@@ -421,6 +437,10 @@ cancelling. In short:
   then retry); after any other escalation (a cancelled or
   failed-to-start check, a loop guard), `choco task send <id> --text "<note>"`
   moves on through a coder lap. `/approve` alone is refused there.
+- `blocker` → the coder stopped on a rule the spec sets. Read its report,
+  then `choco task send <id> --text "<answer>"` (a reply that is only
+  `/approve` is refused) or `choco task cancel <id>`; see
+  [reference/recover.md](reference/recover.md#blocker-answer-or-cancel).
 - `choco task cancel <id>` is final and deletes the task's worktree and
   local branch; `--keep` keeps both for you to take over.
 

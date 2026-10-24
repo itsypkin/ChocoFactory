@@ -2,6 +2,7 @@
 
 ## Contents
 - Check that the design holds
+- Stop conditions
 - Having choco check the spec first (`coding-task-planned`)
 - Which `--help` to trust
 - Tasks that read an external API
@@ -36,14 +37,39 @@ of their own; carry those into the spec too.
 **Every run the spec requires has a budget and a way out.** The spec
 states how many runs, and what the coder does when it can't make one (no
 access to the model or provider, no login, budget spent): it reports the
-run as not made, with the reason, and still finishes: a coder's stages end
-only with done, so it can't stop and wait. Its summary and the PR
+run as not made, with the reason, and still finishes: a check that can't be
+made is not a blocker (see [Stop conditions](#stop-conditions)), so it
+doesn't stop and wait. Its summary and the PR
 description mark the item "not made: <reason>". The spec also tells the
 internal reviewer, which runs inside the task, not to request changes for
 that item but to name it in its report so it reaches the human gate; the
 reviewer still blocks on everything else, and on a not-made item with no
 reason or outside the spec's way out. The coder never skips a run
 silently and never retries in a loop.
+
+## Stop conditions
+
+A coder can stop and wait for you, but only when the spec says to. Its
+`coding` and `revising` stages have a second exit, `blocked`, which parks the
+task at `blocker`. The coder uses it only when the task tells it to stop in the
+situation it is in, or when every way forward breaks a rule the task sets.
+Ambiguity is not a reason: it takes the most reasonable reading. So for any
+rule the coder must not work around (pinned versions, no new dependencies, a
+file it must not touch), write the stop condition next to the rule, in the form
+"if X, don't do Y; stop and report `blocked`", and name what to report:
+
+> Pin `serde` to `=9.9.9`. If it doesn't resolve, don't substitute another
+> version or crate; stop and report `blocked`, with the exact error, the
+> command that printed it and the decision you need.
+
+The report is your whole briefing, and the coder is told to put in it what
+stops it, the commands it ran and what they printed, the ways forward it
+considered and which rule each breaks, and the decision it needs. Read it with
+`choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'`, and answer
+at `blocker` (see [recover.md](recover.md#blocker-answer-or-cancel)). Your
+answer wins over the spec where they conflict, for the coder and for the
+internal reviewer. A check the coder can't run (no network, no login) is not a
+blocker: the spec still says to report it as "not made: <reason>" and finish.
 
 ## Having choco check the spec first (`coding-task-planned`)
 

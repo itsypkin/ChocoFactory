@@ -14,14 +14,22 @@ roles:
 
 stages:
   # First attempt at the task. Every later return path (a failed review, a
-  # human's redirect, red CI, a PR review requesting changes, a PR that
-  # started conflicting with its base) lands on
+  # human's redirect, an answered blocker, red CI, a PR review requesting
+  # changes, a PR that started conflicting with its base) lands on
   # `revising`, not back here — see `revising`'s own comment.
+  #
+  # The coder may instead stop by reporting `blocked`, when the task tells it
+  # to stop in the situation it is in or every way forward breaks a rule the
+  # task sets (`coder-system.md`, "When you can't go on"). That lands on
+  # `blocker`. `capture: json` is what makes the exit routable, and it keeps
+  # the coder's report as `stages.coding.summary` so the next lap, which is a
+  # fresh session, can read it back.
   coding:
     kind: agent_turn
     role: coder
     prompt_file: prompts/coder-turn.md
-    on: { done: internal_review }
+    capture: json
+    on: { done: internal_review, blocked: blocker }
 
   # The single landing spot for every way work comes back. The coder is an
   # agent with tool access, so it can look up *why* it's back itself (CI
@@ -33,12 +41,17 @@ stages:
   # `stages.internal_review.summary` and `stages.escalate_to_human` persist
   # across laps once either stage has ever run, so the prompt labels each
   # one with the arrival path it's current for and tells the coder to
-  # ignore it on every other path.
+  # ignore it on every other path. The same goes for `stages.blocker` (a
+  # human's answer to a blocker) and for the coder's own reports,
+  # `stages.coding.summary` and `stages.revising.summary`: the prompt labels
+  # them as current only on the `blocker` path. `revising` can itself report
+  # `blocked`, which lands on `blocker` again.
   revising:
     kind: agent_turn
     role: coder
     prompt_file: prompts/coder-revise.md
-    on: { done: internal_review }
+    capture: json
+    on: { done: internal_review, blocked: blocker }
 
   # The reviewer states its verdict by calling `report_outcome(outcome,
   # summary)` (#73) rather than replying with structured JSON; `capture: json`
@@ -101,6 +114,20 @@ stages:
   # budget. `capture: text` keeps the human's reply so `revising` can see
   # what they said.
   escalate_to_human:
+    kind: human_gate
+    capture: text
+    on: { resumed: revising }
+
+  # Reached when the coder reports `blocked` from `coding` or `revising`: it
+  # hit a rule the task sets that leaves no way forward, and stopped instead of
+  # breaking it. The coder's report (`stages.coding.summary` or
+  # `stages.revising.summary`) is the briefing; read it with
+  # `choco --json task status <id>`. The human answers with
+  # `choco task send <id> --text "..."`. The answer goes to `revising` and is
+  # also shown to the internal reviewer (`reviewer-turn.md`), where it wins over
+  # the task text. `capture: text` keeps it. There is no loop guard, because
+  # every round here waits on a human, and arriving here resets no loop count.
+  blocker:
     kind: human_gate
     capture: text
     on: { resumed: revising }

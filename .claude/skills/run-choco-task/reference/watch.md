@@ -13,7 +13,7 @@
 
 `choco task status <id> --until attention --timeout <dur>` waits for every
 stop that needs you: the task is open at a `human_gate` stage
-(`spec_questions`, `awaiting_human_review`, `escalate_to_human`, or any gate
+(`spec_questions`, `awaiting_human_review`, `escalate_to_human`, `blocker`, or any gate
 a custom workflow defines), or it is paused, stuck, cancelled or closed. It looks at
 the current state only, so started while the task already sits at a gate it
 returns at once. The exit code says how it ended:
@@ -49,6 +49,14 @@ The latest lap's text of `spec_check` or `internal_review`:
 choco --json task status <id> | jq -r '.workflow_state.payload.stages.internal_review.summary'
 ```
 
+The coder's stages keep their report too. Its latest one is `revising`'s if that
+stage has run and `coding`'s otherwise; when the task is parked at `blocker`,
+it is the reason:
+
+```bash
+choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'
+```
+
 `scripts/tail-events.sh` cuts each event to one line, so it can't show
 reasons. Every lap's text is in the events. A report is a `tool_call` event
 whose `payload.tool` ends in `report_outcome`, with `payload.input.outcome`
@@ -72,7 +80,7 @@ id=<task-id>
 ```
 
 These are every role's reports, not only the reviewer's: `ready` or
-`needs_input` come from `spec_check`, `done` from `coding` or `revising`, and
+`needs_input` come from `spec_check`, `done` or `blocked` from `coding` or `revising`, and
 `approved` or `changes_requested` from `internal_review`. Match their times
 against the `Progress` table in `choco task status`. Use `printf '%s\n'`,
 not `echo`: zsh's `echo` corrupts the JSON.

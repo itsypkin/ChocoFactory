@@ -6,7 +6,7 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 
 | Stage | What happens |
 |---|---|
-| `coding` | The `coder` agent implements the spec in the task's own git worktree. |
+| `coding` | The `coder` agent implements the spec in the task's own git worktree. If the spec's rules leave it no way forward (for example, a pinned dependency that doesn't build and a spec that forbids substituting another), it can instead stop at `blocker`. |
 | `internal_review` | A separate, read-only `reviewer` agent reviews the work against the spec. It approves, or sends the task to `revising`. |
 | `revising` | The coder fixes what a review, CI or you asked for, then goes back to `internal_review`. |
 | `open_pr` | A script pushes the branch `task/<id>` and opens the pull request. |
@@ -15,9 +15,10 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 | `base_conflict` | Reached when the PR stops merging cleanly into its base branch while it waits. It does nothing but count these rounds, then sends the task to `revising` to rebase. |
 | `done` | The task is finished. |
 | `escalate_to_human` | A parking stage: the task waits here for a human when a limit is hit (see [Escalation limits](#escalation-limits-and-ci-polling)). |
+| `blocker` | A parking stage: the coder reported a blocker it must not work around, from `coding` or `revising`. The task waits, with no time limit, for your answer (`choco task send <id> --text "..."`). The answer goes to `revising`, and the internal reviewer sees it too and treats it as your decision. It resets no loop count. |
 
 Every way back (a rejected internal review, red CI, a `/request-changes` from
-you, a resumed escalation, a PR that started conflicting with its base) goes through `revising`. The `coder` runs on
+you, a resumed escalation, an answered blocker, a PR that started conflicting with its base) goes through `revising`. The `coder` runs on
 `claude-sonnet-5-5` and the `reviewer` on `claude-opus-5-5` by default; see
 [models.md](models.md) to change that.
 
