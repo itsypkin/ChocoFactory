@@ -86,7 +86,9 @@ you: it goes to `base_conflict`, then `revising`, where the coder rebases the
 branch; it then runs through `internal_review`, `open_pr` (which pushes the
 rebased branch) and `checks_polling` and comes back here. The order of
 findings is: merged, then `/request-changes` (that round's coder lap rebases
-too), then a conflict, then `/approve`. **An `/approve` on a conflicting PR is
+too), then a conflict, then `/approve`. Comments you posted since the last
+hand-off, marker or not, travel with the conflict note, and the coder
+addresses them in the same lap (an approval among them is optional to act on). **An `/approve` on a conflicting PR is
 set aside**: the task does not finish, the watcher event says so, and you
 approve again once the rebased PR is back. While GitHub still reports
 `UNKNOWN` (it computes this lazily, for a poll or two after a push) an

@@ -845,6 +845,11 @@ fn run_ok(fx: &Fixture) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// The comment render of a verdict output: everything after "<V>\n\n".
+fn render_of(out: &str) -> &str {
+    out.splitn(3, '\n').nth(2).unwrap()
+}
+
 fn comment_fixture(mergeable: &str, comments: &[String]) -> Fixture {
     let fx = Fixture::new(SINCE, &[list(comments)]);
     fx.mergeable(mergeable);
@@ -857,8 +862,9 @@ fn a_conflicting_open_pr_with_no_vote_prints_the_conflict_block() {
     assert_eq!(run_ok(&fx), CONFLICT_BLOCK);
     let calls = fx.calls();
     let n = |needle: &str| calls.lines().filter(|l| l.contains(needle)).count();
-    assert_eq!(n("issues/7/comments"), 1, "{calls}");
-    assert_eq!(n("pulls/7/reviews"), 1, "{calls}");
+    // The verdict read, then the comments render and the review id list.
+    assert_eq!(n("issues/7/comments"), 2, "{calls}");
+    assert_eq!(n("pulls/7/reviews"), 2, "{calls}");
     assert_eq!(n("pulls/7/comments"), 0, "{calls}");
 }
 
@@ -884,8 +890,17 @@ fn request_changes_beats_a_conflict_and_renders_as_without_one() {
 
 #[test]
 fn an_approval_of_a_conflicting_pr_is_set_aside_by_comment_and_by_review() {
-    let fx = comment_fixture("CONFLICTING", &[owner_comment(FRESH, "/approve")]);
-    assert_eq!(run_ok(&fx), format!("{CONFLICT_BLOCK}{}", set_aside(FRESH)));
+    let votes = [owner_comment(FRESH, "/approve")];
+    let clean = run_ok(&comment_fixture("MERGEABLE", &votes));
+    let fx = comment_fixture("CONFLICTING", &votes);
+    assert_eq!(
+        run_ok(&fx),
+        format!(
+            "{CONFLICT_BLOCK}{}\n{}",
+            set_aside(FRESH),
+            render_of(&clean)
+        )
+    );
 
     let fx = comment_fixture("CONFLICTING", &[]);
     fx.reviews(&[list(&[review(
@@ -896,7 +911,48 @@ fn an_approval_of_a_conflicting_pr_is_set_aside_by_comment_and_by_review() {
         "me",
         "",
     )])]);
-    assert_eq!(run_ok(&fx), format!("{CONFLICT_BLOCK}{}", set_aside(LATER)));
+    let out = run_ok(&fx);
+    let head = format!("{CONFLICT_BLOCK}{}", set_aside(LATER));
+    assert!(out.starts_with(&head), "{out}");
+    assert!(out[head.len()..].starts_with("\n### "), "{out}");
+    assert!(out.contains("review APPROVED"), "{out}");
+}
+
+#[test]
+fn a_conflict_carries_the_pending_comments_marker_or_not() {
+    // Without a vote: the bare block, then the marker-less comment.
+    let notes = [owner_comment(FRESH, "please rename the helper")];
+    let out = run_ok(&comment_fixture("CONFLICTING", &notes));
+    assert!(out.starts_with(CONFLICT_BLOCK), "{out}");
+    assert!(out[CONFLICT_BLOCK.len()..].starts_with("\n### "), "{out}");
+    assert!(out.contains("please rename the helper"), "{out}");
+    assert!(!out.contains("APPROVE"), "{out}");
+
+    // With a set-aside approval: header, set-aside line, then every comment.
+    let both = [
+        owner_comment(FRESH, "please rename the helper"),
+        owner_comment(LATER, "/approve"),
+    ];
+    let out = run_ok(&comment_fixture("CONFLICTING", &both));
+    let head = format!("{CONFLICT_BLOCK}{}", set_aside(LATER));
+    assert!(out.starts_with(&head), "{out}");
+    assert!(out[head.len()..].starts_with("\n### "), "{out}");
+    assert!(out.contains("/approve"), "{out}");
+    assert!(out.contains("please rename the helper"), "{out}");
+}
+
+#[test]
+fn a_gh_failure_while_rendering_a_conflict_prints_nothing() {
+    let fx = comment_fixture("CONFLICTING", &[owner_comment(FRESH, "note")]);
+    // The second comments call is the render.
+    fx.fail("comments-2");
+    let out = fx.run();
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]
@@ -924,7 +980,11 @@ fn the_newest_vote_decides_between_a_conflict_block_and_request_changes() {
             owner_comment(LATER, "/approve"),
         ],
     );
-    assert_eq!(run_ok(&fx), format!("{CONFLICT_BLOCK}{}", set_aside(LATER)));
+    let out = run_ok(&fx);
+    assert!(
+        out.starts_with(&format!("{CONFLICT_BLOCK}{}", set_aside(LATER))),
+        "{out}"
+    );
 
     let fx = comment_fixture(
         "CONFLICTING",
@@ -970,9 +1030,10 @@ fn mergeable_is_read_in_the_one_existing_pr_view_call() {
     let views: Vec<&str> = calls.lines().filter(|l| l.starts_with("pr ")).collect();
     assert_eq!(views.len(), 1, "{calls}");
     assert!(views[0].contains("mergeable"), "{calls}");
-    // The other calls are the commit date and the two verdict reads: nothing new.
-    let apis = calls.lines().filter(|l| l.starts_with("api ")).count();
-    assert_eq!(apis, 3, "{calls}");
+    // The same call sequence as a verdict read on a clean PR: nothing new.
+    let reference = comment_fixture("MERGEABLE", &[owner_comment(FRESH, "/request-changes")]);
+    run_ok(&reference);
+    assert_eq!(calls, reference.calls());
 }
 
 #[test]

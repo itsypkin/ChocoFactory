@@ -217,7 +217,9 @@ stages:
   # the rebased PR is back. `/request-changes` wins over a conflict, and
   # that round's coder lap rebases too. An UNKNOWN `mergeable` holds an
   # approval for one more poll (GitHub computes it lazily) and never starts
-  # a round. On this path the gate's capture holds the conflict note.
+  # a round. On this path the gate's capture holds the conflict note
+  # followed by the same comment render a verdict prints (marker or not), so
+  # the fence moving past them loses nothing.
   #
   # Both halves of the first-round bound are read the long way round on
   # purpose. `gh pr view --json commits,comments` caps each at the first 100

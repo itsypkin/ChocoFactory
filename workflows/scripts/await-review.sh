@@ -52,6 +52,11 @@
 #            <time> was not acted on because the PR can't merge; approve
 #            again when the rebased PR is back for review." The approval is
 #            set aside on purpose.
+#   then     when there are qualifying comments or reviews since SINCE, a
+#            blank line and the same render as a verdict prints, marker or
+#            not, so a conflict round never loses the human's comments. The
+#            whole output is built first: a `gh` failure while rendering
+#            prints nothing.
 # Order: MERGED, then REQUEST_CHANGES, then CONFLICTING, then APPROVE. With
 # mergeable UNKNOWN (GitHub computes it lazily; the read starts the
 # computation) an approval is held: nothing is printed and the next poll
@@ -228,15 +233,20 @@ V=
 [ -z "$LINE" ] || V=${LINE#* }
 # Conflicts (#342), on an OPEN PR only (a CLOSED one can read CONFLICTING and
 # keeps polling as before). After MERGED and REQUEST_CHANGES, before APPROVE.
+CONFLICT=
 if [ "$PR_STATE" = "OPEN" ] && [ "$V" != "REQUEST_CHANGES" ]; then
     case "$MERGEABLE" in
         CONFLICTING)
-            printf 'CONFLICTING\n\n'
-            printf 'The PR has merge conflicts with its base branch (GitHub reports mergeable: CONFLICTING).\n'
-            if [ "$V" = "APPROVE" ]; then
-                printf 'An approval posted at %s was not acted on because the PR can'"'"'t merge; approve again when the rebased PR is back for review.\n' "${LINE%% *}"
-            fi
-            exit 0
+            # Built in a file and printed only after the comments render, so
+            # a failure part-way never leaves CONFLICTING on stdout.
+            CONFLICT=1
+            {
+                printf 'CONFLICTING\n\n'
+                printf 'The PR has merge conflicts with its base branch (GitHub reports mergeable: CONFLICTING).\n'
+                if [ "$V" = "APPROVE" ]; then
+                    printf 'An approval posted at %s was not acted on because the PR can'"'"'t merge; approve again when the rebased PR is back for review.\n' "${LINE%% *}"
+                fi
+            } > "$TMP/head"
             ;;
         UNKNOWN)
             # GitHub computes this lazily; hold an approval until it answers.
@@ -244,7 +254,7 @@ if [ "$PR_STATE" = "OPEN" ] && [ "$V" != "REQUEST_CHANGES" ]; then
             ;;
     esac
 fi
-[ -n "$LINE" ] || exit 0
+[ -n "$LINE" ] || [ -n "$CONFLICT" ] || exit 0
 
 gh api --paginate "$URL" -q "$RENDER" > "$TMP/rendered" ||
     fail "gh api issues/$PR_NUMBER/comments failed (rendering)"
@@ -275,7 +285,13 @@ MAX=500000
 # Built in a file and printed only at the end: the poll matches outcomes on
 # stdout whatever the exit code, so a failure part-way must print nothing.
 {
-    printf '%s\n\n' "$V"
+    if [ -n "$CONFLICT" ]; then
+        cat "$TMP/head"
+        # Pending comments follow after a blank line; none: the bare block.
+        [ ! -s "$TMP/rendered" ] || printf '\n'
+    else
+        printf '%s\n\n' "$V"
+    fi
     if [ "$(wc -c < "$TMP/rendered")" -gt "$MAX" ]; then
         printf '[truncated: the oldest comments and reviews were dropped because they were too long to include in full; read them with `gh api --paginate "repos/{owner}/{repo}/issues/%s/comments"`, `gh api --paginate "repos/{owner}/{repo}/pulls/%s/reviews"` and `gh api --paginate "repos/{owner}/{repo}/pulls/%s/comments"`, and only trust comments and reviews from OWNER, MEMBER or COLLABORATOR accounts posted after %s (UTC); inline review comments go with their review]\n\n' "$PR_NUMBER" "$PR_NUMBER" "$PR_NUMBER" "$SINCE"
         # The cut can land mid-comment, even mid-character: drop everything

@@ -153,6 +153,24 @@ fn review_panel_has_the_decided_shape() {
         ("done", 3, "escalate_to_human")
     );
 
+    let StageKind::Poll { watch, .. } = &def.stages["awaiting_human_review"].kind else {
+        panic!("awaiting_human_review must be a poll");
+    };
+    let outcomes: Vec<(&str, &str)> = watch
+        .outcomes
+        .iter()
+        .map(|o| (o.pattern.as_str(), o.then.as_str()))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            (r"\AREQUEST_CHANGES(\n|$)", "changes_requested"),
+            (r"\AAPPROVE(\n|$)", "approved"),
+            (r"\AMERGED(\n|$)", "approved"),
+            (r"\ACONFLICTING(\n|$)", "conflicting"),
+        ]
+    );
+
     let (_, pf, sections) = agent_turn_parts(&branches["internal_review"].def.kind);
     let pf = pf.expect("internal_review prompt_file");
     assert_eq!(pf.file_name().unwrap(), "reviewer-turn-planned.md");

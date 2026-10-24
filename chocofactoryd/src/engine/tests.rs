@@ -7930,6 +7930,80 @@ async fn the_real_coding_task_sets_an_approval_of_a_conflicting_pr_aside() {
     );
 }
 
+/// An owner comment page with timestamps `offset_secs` from now (whole-second
+/// UTC), for tests where the hand-off fence must matter: unlike 2030, a time
+/// near now is older than the fence of every visit after the first.
+fn owner_comments_at(items: &[(i64, &str)]) -> String {
+    let rows: Vec<String> = items
+        .iter()
+        .map(|(offset, body)| {
+            let at = (chrono::Utc::now() + chrono::Duration::seconds(*offset))
+                .format("%Y-%m-%dT%H:%M:%SZ");
+            format!(
+                r#"{{"created_at": "{at}", "updated_at": "{at}", "author_association": "OWNER", "user": {{"login": "owner"}}, "html_url": "https://example.test/c/1", "body": "{body}"}}"#
+            )
+        })
+        .collect();
+    format!("[{}]", rows.join(","))
+}
+
+/// A conflict round hands over the human's comments that carry no marker:
+/// the gate's exit moves the fence past them, so the capture the coder gets
+/// on the `base_conflict` arrival must hold them.
+#[tokio::test]
+async fn the_real_coding_task_hands_a_marker_less_comment_over_on_a_conflict() {
+    let comments = owner_comments_at(&[(-3600, "please rename the helper UNIQUE-NOTE")]);
+    let rig = conflict_rig("MERGEABLE", &comments, "CONFLICTING\n").await;
+    rig.wait_for_trail("a second visit to the gate after a conflict", |s| {
+        count_of(s, "base_conflict") == 1 && count_of(s, "awaiting_human_review") == 2
+    })
+    .await;
+    let payload = payload_of(&rig.pool, &rig.task_id).await;
+    let capture = payload["stages"]["awaiting_human_review"].as_str().unwrap();
+    assert!(capture.starts_with("CONFLICTING\n\n"), "{capture:?}");
+    assert!(capture.contains("UNIQUE-NOTE"), "{capture:?}");
+}
+
+/// An approval set aside by a conflict is not withdrawn but is not read
+/// again either: after the round it is older than the fence, so it does not
+/// finish the task; a fresh approval does.
+#[tokio::test]
+async fn the_real_coding_task_does_not_act_on_a_set_aside_approval_after_the_round() {
+    let old = owner_comments_at(&[(-3600, "/approve")]);
+    let rig = conflict_rig("MERGEABLE", &old, "CONFLICTING\n").await;
+    let reads = || {
+        fs::read_to_string(rig.scripts_dir.join("mergeable-reads"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    // The conflict read, the round, then two polls of the returned gate.
+    crate::test_support::wait_until("two clean polls after the round", || async {
+        let stages = rig.stages().await;
+        if count_of(&stages, "base_conflict") == 1 && reads() >= 3 {
+            Ok(())
+        } else {
+            Err(format!("reads {} trail {stages:?}", reads()))
+        }
+    })
+    .await;
+    let payload = payload_of(&rig.pool, &rig.task_id).await;
+    let capture = payload["stages"]["awaiting_human_review"].as_str().unwrap();
+    assert!(capture.contains("An approval posted at"), "{capture:?}");
+    let stages = rig.stages().await;
+    assert_eq!(count_of(&stages, "done"), 0, "{stages:?}");
+    assert_eq!(
+        stages.last().map(String::as_str),
+        Some("awaiting_human_review")
+    );
+
+    // A fresh approval, newer than the fence, finishes the task.
+    let both = owner_comments_at(&[(-3600, "/approve"), (3600, "/approve")]);
+    fs::write(rig.scripts_dir.join("verdict"), both).unwrap();
+    wait_until_stage(&rig.pool, &rig.task_id, "done").await;
+    wait_until_task_status(&rig.pool, &rig.task_id, "closed").await;
+}
+
 /// `UNKNOWN` holds an approval and never starts a round: the gate reads
 /// CONFLICTING (one round), then UNKNOWN (held), then MERGEABLE (approved).
 /// The reads come from the stub's per-read sequence, written before the task
