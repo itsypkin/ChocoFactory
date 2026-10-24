@@ -255,6 +255,9 @@ stages:
   #  - `choco task send <id> --text /approve` is acted on without a
   #    conflict check (the markers path is the engine's, not the
   #    watcher's). Check `gh pr view <n> --json mergeable` first.
+  #  - UNKNOWN at timeout. An approval read while `mergeable` is UNKNOWN on
+  #    the final look before the 102h timeout is held, so the task parks
+  #    instead of finishing; approve again after `choco task retry`.
   #
   # `scripts/await-review.sh` resolves the verdict itself and prints it
   # as the first line, so the engine's regexes anchor to the start of the
