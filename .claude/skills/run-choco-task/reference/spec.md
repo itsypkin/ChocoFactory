@@ -49,7 +49,7 @@ silently and never retries in a loop.
 
 ## Stop conditions
 
-A coder can stop and wait for you, but only when the spec says to. Its
+A coder can stop and wait for you. Its
 `coding` and `revising` stages have a second exit, `blocked`, which parks the
 task at `blocker`. The coder uses it only when the task tells it to stop in the
 situation it is in, or when every way forward breaks a rule the task sets.

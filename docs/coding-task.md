@@ -8,7 +8,7 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 |---|---|
 | `coding` | The `coder` agent implements the spec in the task's own git worktree. If the spec's rules leave it no way forward (for example, a pinned dependency that doesn't build and a spec that forbids substituting another), it can instead stop at `blocker`. |
 | `internal_review` | A separate, read-only `reviewer` agent reviews the work against the spec. It approves, or sends the task to `revising`. |
-| `revising` | The coder fixes what a review, CI or you asked for, then goes back to `internal_review`. |
+| `revising` | The coder fixes what a review, CI or you asked for, then goes back to `internal_review`, or stops at `blocker`. |
 | `open_pr` | A script pushes the branch `task/<id>` and opens the pull request. |
 | `checks_polling` | Polls the PR's CI checks. Green goes on; red goes to `revising` as soon as a check has failed. Optionally (off by default) the failed GitHub Actions jobs are re-run once for the PR's current head first; see [CI re-run](#ci-re-run-of-failed-jobs-opt-in). |
 | `awaiting_human_review` | Waits for your verdict on the PR (see below). |

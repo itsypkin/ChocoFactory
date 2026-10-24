@@ -23,7 +23,7 @@ code yourself:
 
 The bracketed part is `coding-task-planned` only.
 
-Every way back goes through `revising`, which returns to `internal_review`:
+Every way back goes through `revising`, which returns to `internal_review` (or stops at `blocker`):
 `internal_review` requests changes, `checks_polling` sees a failed check, you
 post `/request-changes`, the PR starts conflicting with its base (`base_conflict`
 sends it to `revising` to rebase), you answer a blocker, or someone resumes
@@ -194,7 +194,8 @@ explicit out-of-scope list.
   setup that the task needs goes in the spec.
 - **State a stop condition for any rule the coder must not work around.**
   A coder that can't keep such a rule can report `blocked` and wait for you,
-  but only when the spec tells it to stop in that situation; see
+  when the spec tells it to stop in that situation or every way forward breaks
+  a rule the spec sets; see
   [reference/spec.md](reference/spec.md#stop-conditions).
 - **Check that the design holds, not only that it builds.** List every way a
   protected event can end and say whether the protection runs on each, and
