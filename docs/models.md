@@ -92,7 +92,9 @@ starting an agent, because claude lets that variable beat the flag. An
 `effortLevel` setting has no effect on claude 2.1.308 and can't beat the
 flag either. Two things still can: an `env` block that sets
 `CLAUDE_CODE_EFFORT_LEVEL` in the task repo's own committed
-`.claude/settings.json` (isolated roles apply the repo's committed settings)
+`.claude/settings.json` (isolated roles apply the repo's committed settings,
+not your user or local ones; see
+[What an agent inherits](workflows.md#what-an-agent-inherits-from-your-claude-setup))
 or in managed policy settings; and, for the chat role, the same `env` value
 in your own user, project or local settings, since chat inherits your setup.
 
