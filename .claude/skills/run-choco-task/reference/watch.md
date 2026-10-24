@@ -32,7 +32,8 @@ returns at once. The exit code says how it ended:
 `paused`; a `pausing` task never ends a watch, and `--live` alone keeps
 watching through a pause. `choco task resume <id>` continues a paused task.
 
-After a PR vote (a `/approve` or `/request-changes` comment) the task stays
+After a PR vote (a `/approve` or `/request-changes` comment, yours or someone
+else's) the task stays
 at `awaiting_human_review` until the daemon's poll reads the comment, up to
 a minute. A fresh `--until attention` would return at once, so wait for the
 stage to change first, for example

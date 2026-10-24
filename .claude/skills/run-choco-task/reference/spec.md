@@ -26,7 +26,10 @@ criteria.
 
 A spec also says what the change makes untrue elsewhere (docs, prompts,
 skills), what an operation that is interrupted leaves behind, and which
-test shows that each rule the change adds actually matters. Your
+test shows that each rule the change adds actually matters. Its
+out-of-scope list never forbids the tests review will ask for: a task
+that can't add them ends at `escalate_to_human`, so for a script, say
+where its tests live. Your
 project's instruction files (`CLAUDE.md`, `AGENTS.md`) may name checks
 of their own; carry those into the spec too.
 
@@ -161,8 +164,8 @@ rm -rf "${t:?}"    # also after a failed step: stop the daemon first if the lock
 ```
 
 The throwaway daemon's agents get the same `HOME`, so they have no
-`claude` or `gh` login. The coder creates no task and opens no PR to
-satisfy a criterion. A route that needs an agent turn or GitHub is taken
+`claude` or `gh` login. The coder opens no PR, and creates no task
+outside its own throwaway daemon, to satisfy a criterion. A route that needs an agent turn or GitHub is taken
 by the operator (or a named person who isn't the coder), on a small
 real task on their own daemon without stopping, updating or restarting
 it. The spec names that owner and a budget of runs; the coder reports the
