@@ -288,7 +288,7 @@ an independent reviewer do it, and look for what agents systematically miss:
 - **Does the branch still merge into your default branch?** GitHub runs no
   `pull_request` workflows on a conflicting PR, so its checks stay empty.
   Choco now rebases a PR that starts conflicting while it waits: the gate
-  sends it through `base_conflict` and `revising`. An `/approve` of a
+  sends it through `base_conflict` and `revising`. Comments you posted since the last hand-off, marker or not, go with it. An `/approve` of a
   conflicting PR is set aside, so approve again when the rebased PR is back.
   An approval sent with `choco task send` is not conflict-checked: run
   `gh pr view <n> --json mergeable` first.
