@@ -92,7 +92,9 @@ checkout too.
 
 Once the repo has `.chocofactory/workflows/<name>.yaml`, that file wins over
 the built-in of that name. Choco updates stop reaching it and its prompts
-and scripts.
+and scripts. When a release changes a built-in's default, your copy keeps
+the old one until you bring that change across or delete the copy and
+eject again.
 
 - **Eject only what you change.** `init-workflows` seeds all three
   built-ins (`chat`, `coding-task`, `coding-task-planned`) with their

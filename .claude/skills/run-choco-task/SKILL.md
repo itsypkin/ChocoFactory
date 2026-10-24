@@ -203,6 +203,8 @@ explicit out-of-scope list.
   numbered files such as database migrations above all, then file names and
   flags, including a file another PR's tests copy or pin. Two tasks that
   both take the next number conflict, and the second PR's CI may not run.
+  A running task's files show before its PR with
+  `git -C <project-repo> diff --stat <base> task/<task-id>`.
 - **`--closes` decides what the PR closes.** Each `--closes <n>` makes the
   PR say `Closes #n` (repeat the flag for several issues); a `#N` anywhere in
   the title, including a trailing `(#N)`, only gives `Refs #N`. For one part
@@ -246,6 +248,8 @@ choco task create --project <p> --workflow coding-task-planned \
 
 - Keep `spec.md` outside the repository, in a temp directory, for example.
   The task reads only the text `--prompt` passes, not files in your checkout.
+- To keep the new task's id in a script, use
+  `id=$(choco --json task create … | jq -r .id)`.
 - Per-task overrides beat editing shared config:
   `--role-model <role>=<model>`, `--role-system-prompt-file <role>=<path>`,
   `--role-cli <role>=<cli>`. A model may end in an effort level, for example
@@ -305,7 +309,9 @@ an independent reviewer do it, and look for what agents systematically miss:
 - **Tests for the new branches**, not only the ones the spec listed. Break
   the main fix in a scratch copy and confirm a test fails.
 - **Claims are not evidence.** Code comments ("deliberately untested"),
-  commit messages and "addressed in <sha>" replies are claims to verify. A coder's
+  commit messages and "addressed in <sha>" replies are claims to verify.
+  Check the readings the coder took and its `Not done` section against the
+  spec, and read the internal reviewer's report, not only the coder's summary. A coder's
   "not re-run" on a run the spec requires is an unmet requirement, unless it
   reported the run as "not made: <reason>" within the spec's budget and way
   out, and finished. Every
@@ -320,7 +326,7 @@ an independent reviewer do it, and look for what agents systematically miss:
   spec's acceptance runs were run and reported.
 
 **The verdict is a PR comment or a GitHub review**: `/approve` or
-`/request-changes` alone on its own line, with your review above it. A
+`/request-changes` on a line of its own, anywhere in the text. A
 collaborator's Approve or Request changes review votes by its state. On your
 own PR, GitHub only allows a Comment review, so put the marker on a line of
 its body. You can
@@ -343,9 +349,11 @@ current counts on its `Loop counters` line.
 **The coder often ignores your `/request-changes` comment** and works from
 the internal reviewer's earlier summary instead. After each lap, check that
 each of your items maps to a commit (while the task is still open, see
-[reference/watch.md](reference/watch.md#watching-commits-in-a-revise-lap)). Watch for an **empty commit**: the coder
+[reference/watch.md](reference/watch.md#watching-commits-in-a-revise-lap)),
+then read the rest of the lap's diff for changes nobody asked for. Watch for an **empty commit**: the coder
 makes one when it decides only the PR description needs changing, and it
-moves the head past your comment without changing anything. What to do next
+moves the head past your comment without changing anything. A short lap is
+not by itself an empty one: check its commits. What to do next
 is in [reference/recover.md](reference/recover.md).
 
 **`/approve` moves the task to `done`; merging the PR is still your job.**

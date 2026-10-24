@@ -52,7 +52,8 @@ broke it. That covers only tests already on main: a test your change adds that f
 change's defect, so find the race before approving it.
 
 Run one cargo command at a time in a worktree. A second build only waits on the first's lock on the
-target dir, and on this repo's 8 GB development machine it starves everything else.
+target dir, and on this repo's 8 GB development machine it starves everything else. To loop a test
+under load, build once with `--no-run` and run the test binary directly.
 
 ## Self-check before opening a PR
 
@@ -62,6 +63,8 @@ Reviews on this repo repeatedly flag the same two defects. Check your own diff f
   interleave with. One write per fact.
 - **Swallowed errors** — a `Result` dropped, logged-and-continued, or collapsed into a default where
   the caller can no longer tell the operation failed.
+
+Reviewers on this repo block on either defect.
 
 ## What a spec on this repo covers
 
@@ -83,7 +86,20 @@ reached a human reviewer.
     produce the same result in that test. Safety rules include who owns what, what is excluded and
     what is refused. They also include each lock, transaction, conditional write or filter that keeps
     two writers apart. The spec lists each one with the break that must fail its test, and the coder
-    makes each break and reports the result.
+    makes each break and reports the result. Each break fails at the assertion for its own rule.
+    Check by reading that a specified break can fail at all. A test that exists to show a leak or
+    regression asserts that first and names what it found.
+  - Tests and real runs use production-shaped inputs: paths where production puts them (under
+    `$HOME`, a macOS `$TMPDIR`), the real text of messages at full length, every signal production
+    sends (Ctrl-C is SIGINT; CI's `/bin/sh` is dash), and the value the production constructor
+    supplies. A fake never echoes back a value the code checks, and it returns distinct values
+    (ids, paths) wherever the code must tell them apart.
+  - A check on an input covers every shape that reaches it: missing, `null`, the wrong type, and a
+    deleted parent.
+  - A rule that two writes commit together is broken both ways, each write without the other, and
+    each break fails a test.
+  - A timing test waits on the write it asserts on, and asserts only values nothing else is still
+    changing when it reads them.
   - The coder checks a read from the OS or another external system once, on the real machine,
     against an independent source (for example a process list against `ps`), and reports the
     result. A claim about how long an operation takes is measured with that exact operation.

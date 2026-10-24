@@ -111,7 +111,9 @@ the merge and move the task to `done`. `choco task send <id> --text "<note>"` mo
   is needed. The note costs a coder lap and a review lap, because
   resuming always goes through `revising`.
 - The note is templated into the coder's prompt verbatim. Make it
-  self-contained: list every item in full.
+  self-contained: list every item in full. List them under MUST DO and
+  ACCEPTED COSTS, and ask the coder to copy the accepted costs into the PR
+  description.
 - On every lap where the branch has an open PR, `open_pr` force-pushes with
   a lease on the commit the task itself last pushed (recorded in the
   worktree's git dir), so a rebase goes through. If the PR's head is not
