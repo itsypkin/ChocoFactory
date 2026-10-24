@@ -22,7 +22,7 @@ updates:
     commit-message:
       prefix: deps
 
-  # The actions used by ci.yml, release.yml and claude-review.yml.
+  # The actions used by ci.yml and release.yml.
   - package-ecosystem: github-actions
     directory: /
     schedule:

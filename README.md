@@ -208,8 +208,9 @@ d=$(mktemp -d) &&
   describe that release only, so fetch it again after `choco update`.
   Without `--branch` you get `main`'s copy, which can describe behaviour
   newer than your choco.
-- A clone keeps `scripts/tail-events.sh` executable. If you fetch the files
-  another way, such as the GitHub contents API, `chmod +x` it.
+- A clone keeps `scripts/tail-events.sh` and `scripts/omp-probe.sh`
+  executable. If you fetch the files another way, such as the GitHub
+  contents API, `chmod +x` both.
 - A new Claude Code session finds the skills. In a running session, if the
   `skills/` folder you copied into didn't exist when it started, run
   `/reload-skills` or start a new session.
