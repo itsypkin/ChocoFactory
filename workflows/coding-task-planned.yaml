@@ -59,14 +59,16 @@ stages:
     kind: agent_turn
     role: coder
     prompt_file: prompts/coder-turn-planned.md
-    on: { done: internal_review }
+    capture: json
+    on: { done: internal_review, blocked: blocker }
 
   # Same as `coding-task.yaml`'s `revising`.
   revising:
     kind: agent_turn
     role: coder
     prompt_file: prompts/coder-revise-planned.md
-    on: { done: internal_review }
+    capture: json
+    on: { done: internal_review, blocked: blocker }
 
   # Same as `coding-task.yaml`'s `internal_review`.
   internal_review:
@@ -92,6 +94,12 @@ stages:
 
   # Same as `coding-task.yaml`'s `escalate_to_human`.
   escalate_to_human:
+    kind: human_gate
+    capture: text
+    on: { resumed: revising }
+
+  # Same as `coding-task.yaml`'s `blocker`.
+  blocker:
     kind: human_gate
     capture: text
     on: { resumed: revising }

@@ -8,6 +8,14 @@ The agreed spec:
 
 {{ stages.spec_check.summary }}
 
+A human's latest answer to a blocker the coder stopped on, between the markers below. It is empty if
+the coder never stopped. It is the human's decision on this task: where it conflicts with the agreed spec
+above, the answer wins, and work that follows it is not a defect. Check that the work does follow it.
+
+<blocker_answer>
+{{ stages.blocker }}
+</blocker_answer>
+
 ## The reviewers' reports
 
 A reviewer's verdict is input, not a veto. Check each finding against the code.

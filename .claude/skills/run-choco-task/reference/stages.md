@@ -18,7 +18,9 @@ Read this while watching a task, when its behaviour surprises you.
   limit, for `choco task send`. The answer goes back to `spec_check`,
   never straight to the coder.
 - **coding / revising.** The coder's turn ends when it calls
-  `report_outcome`, not when it stops printing. A turn that goes quiet
+  `report_outcome`, not when it stops printing. It reports `done`, or
+  `blocked` when the spec's rules leave it no way forward (see the `blocker`
+  entry). A turn that goes quiet
   without reporting is nudged, then closed, unless a background job it started
   is still running (Claude Code only): then it is not nudged, and is closed
   once its waits on jobs add up to 60 minutes in total for the turn (a later
@@ -26,6 +28,11 @@ Read this while watching a task, when its behaviour surprises you.
   which PR comments are new by comparing their times with its last commit,
   and it can get that wrong across time zones, so a comment of yours may be
   treated as already handled.
+- **blocker.** Reached when the coder reports `blocked` from `coding` or
+  `revising`. Waits, with no time limit, for `choco task send`. The answer goes
+  to `revising`, and the internal reviewer is shown it as your decision: where
+  it conflicts with the spec, the answer wins. Only your latest answer is kept.
+  It resets no loop count, and a reply that is only `/approve` is refused.
 - **internal_review.** The reviewer is told the task's closes list and treats
   a description that claims the PR closes any other issue as a false claim.
   The reviewer can't use the file-editing tools, and a

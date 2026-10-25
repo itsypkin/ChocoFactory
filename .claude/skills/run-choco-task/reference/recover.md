@@ -4,6 +4,7 @@
 - Queued is not stuck
 - `stuck`: retry
 - `escalate_to_human`: watch again or send a note
+- `blocker`: answer or cancel
 - Getting your review items done when the coder ignores them
 - Pausing a task
 - Cancelling a task
@@ -127,6 +128,28 @@ the merge and move the task to `done`. `choco task send <id> --text "<note>"` mo
   it the same way. Read the message from `stderr_tail` in
   `choco --json task events <id>`; the one-line `choco task events` view
   cuts it off.
+
+## `blocker`: answer or cancel
+
+The coder reported `blocked`: the spec's rules left it no way forward, and it
+stopped instead of breaking one. Read its report:
+
+```bash
+choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'
+```
+
+Then either answer with `choco task send <id> --text "<answer>"`, or run
+`choco task cancel <id>` (`--keep` keeps the work for you to take over). An
+answer can relax the rule, give a new way forward, or say the cause is fixed
+outside the task (the registry is back, the version is published). A reply that
+is only `/approve` is refused. The answer goes to `revising`, and the internal
+reviewer is shown it too and treats it as your decision, so where it conflicts
+with the spec the answer wins.
+
+- The answer is templated into the prompts verbatim, and only the latest one is
+  kept. Make it self-contained: say what to do and what to leave alone.
+- If the answer doesn't settle it, the coder reports `blocked` again and the
+  task waits here again. No loop count is used up by a block or an answer.
 
 ## Getting your review items done when the coder ignores them
 

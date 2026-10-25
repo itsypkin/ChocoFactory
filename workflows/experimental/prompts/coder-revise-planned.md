@@ -64,6 +64,12 @@ follow that entry:
   files you resolved and how, and what you did about each comment. If
   the rebase finds nothing to do, the PR now reads `MERGEABLE` and no
   comment asks for a change, report `done` without a commit and say so.
+- **`blocker` → `resumed`**: you stopped on a blocker by reporting `blocked`, and a human has answered.
+  Your report is under "Your blocker report" and their answer under "A human's answer to your blocker";
+  both are current. Follow the answer. Where it conflicts with the task's rules, the answer wins. If your
+  report lists work you were sent back for that is still to do, finish it too: for those items, the section
+  of this prompt it came from is current. If the answer doesn't settle the blocker, report `blocked` again
+  and say what is still open.
 - **`escalate_to_human` → `resumed`**: a human stepped in after the task was
   escalated. Their note is quoted below under "A human's note", and it is
   current. Follow it. If this branch has an open PR, also read everything on
@@ -124,6 +130,27 @@ left over from an earlier escalation, so ignore it.
 
 {{ stages.escalate_to_human }}
 
+## Your blocker report
+
+Current only on the `blocker` path, and ignore it on every other path. If "From `revising`" below has
+content, that is your latest report, and "From `coding`" is from your first turn. Otherwise your report
+is under "From `coding`".
+
+From `coding`:
+
+{{ stages.coding.summary }}
+
+From `revising`:
+
+{{ stages.revising.summary }}
+
+## A human's answer to your blocker
+
+Current on the `blocker` path. On any other path, it is an earlier answer that this branch already
+acts on: keep to the decision it made, and don't undo it.
+
+{{ stages.blocker }}
+
 ## When you're done
 
 If the branch has an open PR (`N` non-empty, set as the
@@ -156,7 +183,7 @@ allowed only when every requested change is to the PR's description: the
 PR's review is read against the latest commit, and without a new one the
 same request for changes would be read again. If any requested change is to
 the code, make a real commit for it; an empty commit is not a way to finish
-a lap. Then call `report_outcome` with the outcome `done`. In its summary,
+a lap. Then call `report_outcome` with the outcome `done`, or `blocked` only as "When you can't go on" in your instructions allows. In its summary,
 give one short line per item you were sent back for: what you changed, or
 that you didn't act on it and why. On the `awaiting_human_review` path,
 map each item in the human's review to the short SHA of the commit that

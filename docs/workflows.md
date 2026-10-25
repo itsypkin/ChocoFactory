@@ -142,7 +142,7 @@ sentence:
 > A stage routes on the agent's own verdict **if and only if** it declares
 > `capture: json`. Its `on:` keys are the allowed verdicts.
 
-That's it — nothing about the tool belongs in a prompt file. Given
+That's it — a prompt never needs to describe the tool or list the outcomes, though it may refer to them (see [A second exit to a human](#a-second-exit-to-a-human)). Given
 
 ```yaml
 internal_review:
@@ -193,6 +193,25 @@ This is how a verdict is kept from being cheaper than the work behind it: a
 reviewer that stops at its first blocking finding has no walk to write down. Because parking a turn costs a human, the rule bends
 before it breaks — after two rejections the report is recorded as it stands, with the
 missing sections named in the tool's reply on the task's timeline.
+
+### A second exit to a human
+
+A working stage can have an exit besides `done`. It declares `capture: json` and lists the extra outcome in `on:`, pointing at a `human_gate`:
+
+```yaml
+coding:
+  kind: agent_turn
+  role: coder
+  capture: json
+  on: { done: internal_review, blocked: blocker }
+
+blocker:
+  kind: human_gate
+  capture: text
+  on: { resumed: revising }
+```
+
+The agent sees the accepted outcomes in its instruction ("It must be one of: …"), and the tool refuses any other. So a prompt can make the exit conditional on the outcome being listed, as the shipped `coder-system.md` does for `blocked`: the same prompt stays correct on a stage that has no such exit. The agent's report is kept as `stages.coding.summary` (with `capture: json`), so a later stage, which is a fresh session, can template it back in. The built-in `coding-task` uses this shape so that a coder who meets a rule it must not break can stop at `blocker` instead of finishing (see [docs/coding-task.md](coding-task.md)).
 
 ### When a turn counts as complete
 

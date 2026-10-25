@@ -7,7 +7,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chocofactoryd::workflow_def::{StageKind, WorkflowDefinition};
+use chocofactoryd::template::render;
+use chocofactoryd::workflow_def::{Capture, StageKind, WorkflowDefinition};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -125,6 +126,38 @@ fn review_panel_has_the_decided_shape() {
     );
     let on: Vec<_> = group.on.iter().collect();
     assert_eq!(on, [(&"done".to_string(), &"lead_review".to_string())]);
+
+    // (#333) Both coder stages can stop on a blocker, as in the shipped
+    // workflows, and the panel is what a finished lap goes to.
+    for name in ["coding", "revising"] {
+        let StageKind::AgentTurn { capture, .. } = &def.stages[name].kind else {
+            panic!("{name} must be an agent_turn");
+        };
+        assert_eq!(*capture, Some(Capture::Json), "{name}");
+        let on: Vec<_> = def.stages[name].on.iter().collect();
+        assert_eq!(
+            on,
+            [
+                (&"done".to_string(), &"review_panel".to_string()),
+                (&"blocked".to_string(), &"blocker".to_string())
+            ],
+            "{name}"
+        );
+    }
+    let blocker = &def.stages["blocker"];
+    let StageKind::HumanGate {
+        capture,
+        markers,
+        watch,
+    } = &blocker.kind
+    else {
+        panic!("blocker must be a human_gate");
+    };
+    assert_eq!(*capture, Some(Capture::Text));
+    assert!(markers.is_empty() && watch.is_none());
+    let on: Vec<_> = blocker.on.iter().collect();
+    assert_eq!(on, [(&"resumed".to_string(), &"revising".to_string())]);
+    assert!(blocker.loop_guard.is_none());
 
     let StageKind::Poll { watch, .. } = &def.stages["checks_polling"].kind else {
         panic!("checks_polling must be a poll");
@@ -359,4 +392,62 @@ fn the_security_reader_has_a_blocking_bar_and_reads_material_as_material() {
     for banned in ["fails open", "fail open", "fail-open", "fails silently"] {
         assert!(!lower.contains(banned), "must not contain {banned}: {text}");
     }
+}
+
+/// (#333) The lead decides, so it reads a human's answer to a blocker too.
+#[test]
+fn lead_review_shows_the_blockers_answer_between_markers() {
+    let answer = "ANSWER-LINE-ONE: use serde 1.x.\nANSWER-LINE-TWO: my decision.";
+    let prompt = fs::read_to_string(exp().join("prompts/lead-review.md")).unwrap();
+    let payload = serde_json::json!({
+        "task": { "title": "T", "input": "THE TASK" },
+        "finished_stages": ["spec_check", "coding", "blocker", "revising", "review_panel"],
+        "stages": {
+            "spec_check": { "summary": "THE SPEC" },
+            "blocker": answer,
+            "security_review": { "outcome": "clean", "summary": "S" },
+            "architecture_review": { "outcome": "clean", "summary": "A" },
+            "internal_review": { "outcome": "approved", "summary": "I" },
+        },
+    });
+    let (rendered, _) = render(&prompt, &payload).unwrap();
+    assert_eq!(rendered.matches("ANSWER-LINE-ONE").count(), 1);
+    let open = rendered.find("<blocker_answer>\n").unwrap() + "<blocker_answer>\n".len();
+    let close = rendered.find("</blocker_answer>").unwrap();
+    assert_eq!(rendered[open..close].trim_end(), answer);
+    let text = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        text.contains(
+            "where it conflicts with the agreed spec above, the answer wins, and work that \
+             follows it is not a defect. Check that the work does follow it."
+        ),
+        "{text}"
+    );
+}
+
+/// (#333) The experimental revise prompt is not a symlink, so the blocker
+/// text is kept in step with the shipped file by hand; this is the check.
+#[test]
+fn the_blocker_text_of_the_experimental_revise_prompt_matches_the_shipped_one() {
+    let revise = fs::read_to_string(exp().join("prompts/coder-revise-planned.md")).unwrap();
+    let shipped =
+        fs::read_to_string(root().join("workflows/prompts/coder-revise-planned.md")).unwrap();
+    let entry = |t: &str| {
+        let start = t.find("- **`blocker`").expect("blocker entry");
+        let rest = &t[start + 1..];
+        t[start..start + 1 + rest.find("\n- **`").expect("next entry")].to_string()
+    };
+    let sections = |t: &str| {
+        let start = t.find("## Your blocker report").expect("blocker section");
+        t[start..start + t[start..].find("## When you're done").expect("closing")].to_string()
+    };
+    let sentence = "Then call `report_outcome` with the outcome `done`, or `blocked` only as \
+                    \"When you can't go on\" in your instructions allows.";
+    let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(entry(&revise), entry(&shipped));
+    assert_eq!(sections(&revise), sections(&shipped));
+    for text in [&revise, &shipped] {
+        assert!(flat(text).contains(&flat(sentence)));
+    }
+    assert!(entry(&shipped).contains("report `blocked` again"));
 }

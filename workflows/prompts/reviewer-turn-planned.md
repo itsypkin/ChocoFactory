@@ -15,6 +15,14 @@ on a first review:
 {{ stages.internal_review.summary }}
 </previous_review>
 
+A human's latest answer to a blocker the coder stopped on, between the markers below. It is empty if
+the coder never stopped. It is the human's decision on this task: where it conflicts with the task text
+above, the answer wins, and work that follows it is not a defect. Check that the work does follow it.
+
+<blocker_answer>
+{{ stages.blocker }}
+</blocker_answer>
+
 Before step 1, also read the branch's full commit messages and, if a pull
 request for this branch already exists, its comments
 (`gh pr view --json comments,reviews`) — a human's findings live there,

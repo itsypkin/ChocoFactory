@@ -7124,23 +7124,32 @@ for arg in "$@"; do
     esac
 done
 export MOCK_CLAUDE_ONESHOT=1
+# Call N of a role is the Nth time this wrapper started as that role.
+n=$(cat "{dir}/$role-calls" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "{dir}/$role-calls"
 if [ "$role" = "planner" ]; then
     # Call N reads `planner-reply-N.json` when present, else
     # `planner-reply.json`, so a test can script a different report per call.
-    n=$(cat "{dir}/planner-calls" 2>/dev/null || echo 0)
-    n=$((n + 1))
-    echo "$n" > "{dir}/planner-calls"
     f="{dir}/planner-reply-$n.json"
     [ -f "$f" ] || f="{dir}/planner-reply.json"
     export MOCK_CLAUDE_REPLY="planned"
     export MOCK_CLAUDE_REPORT="$(cat "$f")"
 elif [ "$role" = "reviewer" ]; then
-    export MOCK_CLAUDE_REPLY="$(cat "{reply_path}")"
-    export MOCK_CLAUDE_REPORT="$(cat "{reply_path}")"
+    # Call N reads `reviewer-reply-N.json` when present, else `{reply_path}`.
+    f="{dir}/reviewer-reply-$n.json"
+    [ -f "$f" ] || f="{reply_path}"
+    export MOCK_CLAUDE_REPLY="$(cat "$f")"
+    export MOCK_CLAUDE_REPORT="$(cat "$f")"
 else
+    # Call N reports `coder-reply-N.json` when present; otherwise the mock's
+    # own default report (`done`).
     export MOCK_CLAUDE_REPLY="did the thing"
+    f="{dir}/coder-reply-$n.json"
+    if [ -f "$f" ]; then export MOCK_CLAUDE_REPORT="$(cat "$f")"; fi
 fi
-exec "{mock_claude}" "$@"
+# Keep the prompt each call was sent, for tests that assert on it.
+tee "{dir}/$role-prompt-$n" | "{mock_claude}" "$@"
 "#,
             reply_path = reply_path.display(),
             mock_claude = mock_claude.display(),
@@ -8523,6 +8532,295 @@ async fn the_planned_workflow_parks_for_answers_then_resumes_through_spec_check(
     );
     let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
     assert_eq!(state.payload["stages"]["spec_questions"], "ANSWER");
+}
+
+/// The prompt a `role_dispatch_claude` call was sent: the first stream-json
+/// line of type `user`, text of its first content block. The file is
+/// JSON-escaped on disk, so it is decoded, never grepped raw. Read it only
+/// after the task has left that call's stage: the report follows the prompt.
+fn saved_prompt(dir: &Path, role: &str, n: u32) -> String {
+    let path = dir.join(format!("{role}-prompt-{n}"));
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v["type"] == "user")
+        .and_then(|v| {
+            v.pointer("/message/content/0/text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("no user line in {path:?}:\n{raw}"))
+}
+
+/// Realistic blocked report: a resolver error in backticks and a literal
+/// template reference, which must reach the next prompt unexpanded.
+const CODING_BLOCKED_SUMMARY: &str = "CODING-BLOCKED-SUMMARY: `cargo update -p serde` printed \
+    `error: failed to select a version for the requirement `serde = \"=9.9.9\"``. The task says \
+    `{{ task.input }}` must not be substituted, so I stopped. Decision needed: relax the pin?";
+const REVISING_BLOCKED_SUMMARY: &str = "REVISING-BLOCKED-SUMMARY: still `serde = \"=9.9.9\"`. \
+    Sent back for the missing test; that is still to do.";
+const BLOCKER_ANSWER_TEXT: &str =
+    "BLOCKER-ANSWER-LINE-ONE: use serde 1.x.\nBLOCKER-ANSWER-LINE-TWO: that is my decision.";
+
+/// The text of `prompt` strictly between `from` and `to`.
+fn between<'a>(prompt: &'a str, from: &str, to: &str) -> &'a str {
+    let start = prompt
+        .find(from)
+        .unwrap_or_else(|| panic!("no {from:?} in:\n{prompt}"))
+        + from.len();
+    let end = start
+        + prompt[start..]
+            .find(to)
+            .unwrap_or_else(|| panic!("no {to:?} after {from:?} in:\n{prompt}"));
+    &prompt[start..end]
+}
+
+/// A coder lap that resumes from `blocker` carries the answer once, under
+/// its heading, and its own reports under theirs.
+fn assert_blocker_resume_prompt(prompt: &str, from_coding: &str, from_revising: Option<&str>) {
+    assert!(
+        prompt.contains("the `blocker` stage ended with the outcome `resumed`"),
+        "{prompt}"
+    );
+    let report = between(
+        prompt,
+        "## Your blocker report",
+        "## A human's answer to your blocker",
+    );
+    let coding = between(report, "From `coding`:", "From `revising`:");
+    assert!(coding.contains(from_coding), "{report}");
+    let revising = &report[report.find("From `revising`:").unwrap()..];
+    match from_revising {
+        Some(text) => assert!(revising.contains(text), "{report}"),
+        None => assert!(!revising.contains("SUMMARY"), "{report}"),
+    }
+    let answer = between(
+        prompt,
+        "## A human's answer to your blocker",
+        "## When you're done",
+    );
+    for line in BLOCKER_ANSWER_TEXT.lines() {
+        assert!(answer.contains(line), "{answer}");
+        assert_eq!(prompt.matches(line).count(), 1, "{line}:\n{prompt}");
+    }
+    for text in [from_coding].into_iter().chain(from_revising) {
+        assert_eq!(prompt.matches(text).count(), 1, "{text}:\n{prompt}");
+    }
+}
+
+/// (#333) A coder that reports `blocked` from `coding` parks the task at
+/// `blocker` with no review turn; a marker-only reply is refused and
+/// changes nothing; the answer goes to `revising` and then to the reviewer.
+#[tokio::test]
+async fn a_coder_blocked_in_coding_parks_at_blocker_and_the_answer_reaches_coder_and_reviewer() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(
+        scripts_dir.join("verdict"),
+        owner_comment_page("looks good\\n/approve"),
+    )
+    .unwrap();
+    fs::write(
+        scripts_dir.join("coder-reply-1.json"),
+        json!({ "outcome": "blocked", "summary": CODING_BLOCKED_SUMMARY }).to_string(),
+    )
+    .unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "blocker").await;
+    crate::test_support::wait_until("the blocker stage_entered event", || async {
+        let trail = stage_trail(&pool, &task_id).await;
+        if trail.len() == 2 {
+            Ok(())
+        } else {
+            Err(format!("{trail:?}"))
+        }
+    })
+    .await;
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "open");
+    let parked = vec![
+        ("coding".to_string(), Value::Null),
+        ("blocker".to_string(), json!("blocked")),
+    ];
+    assert_eq!(stage_trail(&pool, &task_id).await, parked);
+    assert!(
+        !scripts_dir.join("reviewer-calls").exists()
+            && !scripts_dir.join("reviewer-prompt-1").exists(),
+        "no reviewer turn may run before the blocker is answered"
+    );
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(
+        state.payload["stages"]["coding"]["summary"],
+        json!(CODING_BLOCKED_SUMMARY)
+    );
+
+    // A reply of only a marker is refused and changes nothing.
+    let err = engine
+        .send_message_or_resume(&task_id, "/approve")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, SendMessageOrResumeError::ReplyIsOnlyMarkers { stage, .. } if stage == "blocker"),
+        "{err:?}"
+    );
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(state.current_stage, "blocker");
+    assert_eq!(stage_trail(&pool, &task_id).await, parked);
+    assert!(
+        state.payload["stages"].get("blocker").is_none(),
+        "{:?}",
+        state.payload["stages"]
+    );
+
+    engine
+        .send_message_or_resume(&task_id, BLOCKER_ANSWER_TEXT)
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "done").await;
+    wait_until_task_status(&pool, &task_id, "closed").await;
+
+    let trail = stage_trail(&pool, &task_id).await;
+    assert_eq!(
+        trail[..4],
+        [
+            ("coding".to_string(), Value::Null),
+            ("blocker".to_string(), json!("blocked")),
+            ("revising".to_string(), json!("resumed")),
+            ("internal_review".to_string(), json!("done")),
+        ],
+        "{trail:?}"
+    );
+    assert_blocker_resume_prompt(
+        &saved_prompt(&scripts_dir, "coder", 2),
+        CODING_BLOCKED_SUMMARY,
+        None,
+    );
+    let review = saved_prompt(&scripts_dir, "reviewer", 1);
+    let marked = between(&review, "<blocker_answer>\n", "</blocker_answer>");
+    assert_eq!(marked.trim_end(), BLOCKER_ANSWER_TEXT, "{review}");
+    assert_eq!(review.matches("BLOCKER-ANSWER-LINE-ONE").count(), 1);
+}
+
+/// (#333) `blocked` from `revising` parks at `blocker` too and leaves
+/// `internal_review`'s count alone; the resumed lap is handed both of the
+/// coder's reports.
+#[tokio::test]
+async fn a_coder_blocked_in_revising_keeps_the_review_count_and_gets_both_reports_back() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(
+        scripts_dir.join("verdict"),
+        owner_comment_page("looks good\\n/approve"),
+    )
+    .unwrap();
+    let coded = "CODING-DONE-SUMMARY: implemented the feature.";
+    fs::write(
+        scripts_dir.join("coder-reply-1.json"),
+        json!({ "outcome": "done", "summary": coded }).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        scripts_dir.join("reviewer-reply-1.json"),
+        json!({ "outcome": "changes_requested", "summary": "REVIEW-ONE: add a test" }).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        scripts_dir.join("coder-reply-2.json"),
+        json!({ "outcome": "blocked", "summary": REVISING_BLOCKED_SUMMARY }).to_string(),
+    )
+    .unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "blocker").await;
+
+    // Settled: the counter is written only in transitions, and nothing runs
+    // while the gate waits.
+    let state = state_of(&pool, &task_id).await;
+    assert_eq!(
+        state.loop_counters["internal_review"],
+        json!({ "count": 1 })
+    );
+    assert_eq!(
+        state.payload["stages"]["revising"]["summary"],
+        json!(REVISING_BLOCKED_SUMMARY)
+    );
+
+    engine
+        .send_message_or_resume(&task_id, BLOCKER_ANSWER_TEXT)
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "done").await;
+    wait_until_task_status(&pool, &task_id, "closed").await;
+
+    assert_blocker_resume_prompt(
+        &saved_prompt(&scripts_dir, "coder", 3),
+        coded,
+        Some(REVISING_BLOCKED_SUMMARY),
+    );
+    // Reviewer call 2 used the default approval and was shown the answer.
+    let review = saved_prompt(&scripts_dir, "reviewer", 2);
+    assert_eq!(
+        between(&review, "<blocker_answer>\n", "</blocker_answer>").trim_end(),
+        BLOCKER_ANSWER_TEXT
+    );
+    let trail = stage_trail(&pool, &task_id).await;
+    assert_eq!(
+        trail[..6],
+        [
+            ("coding".to_string(), Value::Null),
+            ("internal_review".to_string(), json!("done")),
+            ("revising".to_string(), json!("changes_requested")),
+            ("blocker".to_string(), json!("blocked")),
+            ("revising".to_string(), json!("resumed")),
+            ("internal_review".to_string(), json!("done")),
+        ],
+        "{trail:?}"
+    );
 }
 
 /// A merged PR counts as approval (#102): `MERGED` routes
