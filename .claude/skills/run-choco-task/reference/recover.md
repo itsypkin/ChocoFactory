@@ -41,7 +41,8 @@ and `choco task list --status stuck` finds every stuck task.
   off from outside (a usage limit, a daemon stop, the daemon closing an idle
   session) **resumes its session**, with the work already in the worktree. A
   turn that failed on its own (`no_report`, a crash) starts fresh, and
-  can't be resumed. `--fresh` forces a fresh start; `--resume` refuses,
+  can't be resumed; neither can a turn stopped before its prompt because its
+  `claude_settings` were not applied. `--fresh` forces a fresh start; `--resume` refuses,
   changing nothing, rather than start fresh when the turn can't resume.
 - On a task stuck in a parallel group, `choco task retry <id>` re-runs only
   the failed branches. Each one resumes or starts fresh by the same rules as
@@ -76,6 +77,22 @@ and `choco task list --status stuck` finds every stuck task.
   turn started was still alive, and it was killed. The `leftovers_killed`
   `session_note` says what. The turn may have been writing to the worktree
   until then, so check `git status` there before retrying.
+- `claude_settings_rejected`: the reason says Claude Code did not apply role
+  `<role>`'s `claude_settings` (it ignores the whole settings when one value is
+  invalid). The agent never got its prompt, so nothing ran. Fix the value in
+  `~/.config/chocofactory/config.yaml` or the workflow file, then
+  `choco task retry <id>`; it starts a fresh session.
+- `claude_settings_unconfirmed`: choco could not confirm Claude Code applied the
+  role's `claude_settings` (its tool server failed, or the CLI would not answer
+  the status request). The agent never got its prompt. Read the session's
+  `error` event for the status it saw, then `choco task retry <id>`; it starts
+  fresh.
+- A stuck reason naming a role's `claude_settings` key (`sets claude_settings
+  'hooks' in the global config, which only a workflow file may set`) or its
+  `env` (`'env' must be a mapping`) or `cli omp` (`can't take`): config.yaml
+  holds a value the role can't use. Nothing was spawned. Edit
+  `~/.config/chocofactory/config.yaml` (move a workflow-only key into the
+  workflow file), then `choco task retry <id>`.
 - A read-only role changed its worktree (the reason starts `read-only role
   '...' changed the worktree`): the change is still there, nothing was
   reverted. Inspect it, reset or clean it yourself, then retry. A retry that

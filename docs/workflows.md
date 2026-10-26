@@ -299,19 +299,18 @@ file, and in a task's linked worktree Claude Code would resolve it to the
 main checkout's. Your user settings (`~/.claude/settings.json`) are not
 read either, so a preference set there doesn't reach the agent: with
 `includeCoAuthoredBy: false` only in your user file, the agent's commits still
-carry the `Co-Authored-By` trailer. To turn it off, commit
-`"attribution": {"commit": "", "pr": ""}` to the repo's `.claude/settings.json`
-(`attribution` is the current key; `includeCoAuthoredBy: false` is older,
-deprecated, and still honoured). The other way is
-`inherit_operator_config: true` on the role, which brings in your whole setup:
-settings, plugins, hooks, MCP servers and `~/.claude/CLAUDE.md`. Login and
-routing values in your user settings, such as `apiKeyHelper` or an `env` block
-setting `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or
-`CLAUDE_CODE_USE_VERTEX`, don't reach an isolated role either, so set them in
-the daemon's own environment, which agents inherit: if you are also logged in
-with OAuth, the agent's traffic otherwise goes straight to Anthropic, past your
-gateway, with no warning. A role can loosen the
-rest in the workflow file:
+carry the `Co-Authored-By` trailer. Two ways to change that:
+
+- **`claude_settings`** on the role (below) passes Claude Code settings to
+  the role's agents without loosening anything else. It works in a repo you
+  don't own, which committing `.claude/settings.json` does not.
+- **`inherit_operator_config: true`** on the role brings in your whole setup:
+  settings, plugins, hooks, MCP servers and `~/.claude/CLAUDE.md`.
+
+Committing `"attribution": {"commit": "", "pr": ""}` to the repo's
+`.claude/settings.json` also turns the trailer off (`attribution` is the
+current key; `includeCoAuthoredBy: false` is older, deprecated, and still
+honoured). A role can loosen the rest in the workflow file:
 
 ```yaml
 roles:
@@ -321,6 +320,79 @@ roles:
   chat:
     inherit_operator_config: true   # your full setup, minus cron/remote-trigger tools
 ```
+
+`skills`/`memory` can't be combined with `inherit_operator_config`.
+
+### `claude_settings`: Claude Code settings for choco's agents
+
+`claude_settings` is a YAML mapping of Claude Code settings, written for choco's
+agents and merged into the `--settings` JSON the daemon passes to `claude`. It
+can be set in `~/.config/chocofactory/config.yaml` under `roles.<name>` and in a
+workflow file's `roles.<name>`. Choco never reads your own Claude settings files.
+
+```yaml
+# ~/.config/chocofactory/config.yaml: no Co-Authored-By trailer, for every
+# workflow whose role is called `coder`
+roles:
+  coder:
+    claude_settings:
+      attribution: {commit: "", pr: ""}
+      env:
+        ANTHROPIC_BASE_URL: https://gateway.example.com   # routing, not a secret
+```
+
+- **Layers.** The workflow file wins over config.yaml, top-level key by key,
+  with no deep merge: if config.yaml sets `env` and `attribution` and the
+  workflow sets `env`, the result is the workflow's `env` and config.yaml's
+  `attribution`. Task config (`--config`, `--role-*`, `choco task reconfigure`)
+  can't set it; a `claude_settings` key there is ignored.
+- **A top-level `null`** removes that key: it wins over the other layer, and
+  is then not sent, because Claude Code discards the whole settings object when
+  it meets one. Missing, `null` and `{}` all mean "nothing extra".
+- **Shape.** It must be a mapping with string keys at every depth, no YAML
+  tags, and no `.nan`/`.inf`; anything else is a load error naming the role.
+  Choco doesn't check values against Claude Code's schema.
+- **Isolated roles.** Choco writes its own scope last: `claudeMdExcludes` is
+  replaced by its scoped glob, and its entry in `pluginConfigs` is set (other
+  `pluginConfigs` entries a workflow wrote are kept). An isolated role's `env`
+  must be a mapping, because choco adds a variable to it (below).
+- **The chat role** (`inherit_operator_config: true`) gets a `--settings`
+  argument only when its `claude_settings` is non-empty, and then it beats your
+  own user settings.
+- **Workflow-only keys.** `hooks`, `disableAllHooks`, `enabledPlugins`,
+  `extraKnownMarketplaces`, `pluginConfigs`, `outputStyle`, `claudeMdExcludes`,
+  `enableAllProjectMcpServers`, `enabledMcpjsonServers` and
+  `disabledMcpjsonServers` run code or change what an agent loads, so only a
+  workflow file may set them. In config.yaml the daemon refuses to start,
+  naming the role and the key; if you add one while the daemon runs, that
+  role's next turn parks the task `stuck` naming the role and the key, and
+  `choco task retry` runs it once the file is fixed.
+- **omp.** A role on `cli: omp` can't take `claude_settings`. It is refused
+  where an unknown `cli` is: when the workflow loads, when the daemon starts,
+  when a task is created or reconfigured, and at turn start.
+- **Secrets.** The settings travel on the command line, so `ps` shows them. Put
+  secrets (API keys, tokens) in the daemon's own environment, which agents
+  inherit; use `claude_settings` for non-secret login and routing values such
+  as `apiKeyHelper` or an `env` block setting `ANTHROPIC_BASE_URL`,
+  `CLAUDE_CODE_USE_BEDROCK` or `CLAUDE_CODE_USE_VERTEX` (an `env` value there
+  does reach the request). If you are also logged in with OAuth and set none of
+  these, the agent's traffic goes straight to Anthropic, past your gateway,
+  with no warning.
+- **Typos.** A mistyped key in config.yaml is ignored by Claude Code. Check
+  `claude_settings_keys` in the session's `session_meta` event: it lists the
+  top-level key names the turn ran with (never a value).
+- **A value Claude Code rejects.** Claude Code discards the role's whole
+  settings when one value is invalid, and an isolated role would then run
+  unscoped. To catch this, an isolated role with non-empty `claude_settings`
+  gets one random variable added to the settings' `env`, and choco's tool
+  server checks that Claude Code passed it on. If not, the task parks `stuck`
+  naming the role, before the agent gets its prompt, with the session ended
+  `claude_settings_rejected`. If choco can't tell (the tool server failed, or
+  the CLI doesn't answer the status request cleanly), the session ends
+  `claude_settings_unconfirmed` and the `error` event says why. Fix the value
+  and run `choco task retry`; it starts a fresh session. The variable is
+  recorded nowhere. A rejected value in the chat role's settings is not
+  detected: chat has no choco scope to lose.
 
 `skills`/`memory` can't be combined with `inherit_operator_config`.
 
@@ -353,15 +425,18 @@ runs on either, but the two never share:
   `choco task retry` re-runs the stage once the task is stuck.
 
 None of `skills`, `memory` or `inherit_operator_config` can be set from task config (`--config`, `--role-*`) or the global
-config file: only a workflow definition can loosen what its agents see. The
+config file: only a workflow definition can loosen what its agents see.
+`claude_settings` may also come from the global config file, minus the
+workflow-only keys above, and never from task config. The
 built-in `chat` workflow inherits your setup; `coding-task` is isolated. A
 copy of `chat.yaml` you made yourself (in a repo, or run with
 `--workflow <path>`) needs `inherit_operator_config: true` added by hand to
 keep that behaviour.
 
 Each session's `session_meta` event records what it actually ran with: the
-CLI version, model, tools, MCP servers, plugins, skills, and the isolation
-it was launched under.
+CLI version, model, tools, MCP servers, plugins, skills, the isolation
+it was launched under, and the key names (never the values) of its
+`claude_settings`.
 
 ## Read-only roles
 

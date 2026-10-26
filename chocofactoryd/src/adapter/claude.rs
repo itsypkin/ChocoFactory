@@ -325,7 +325,11 @@ fn spawn(
     //   committed `.claude/settings.json` still applies.
     // - `--strict-mcp-config` drops the operator's MCP servers, leaving only
     //   ours.
-    // - `--settings` (`isolated_settings`) scopes the instruction files: its
+    // - `--settings` (`isolated_settings`) starts from the role's own
+    //   `claude_settings` (#346: the operator's way to pass non-secret login,
+    //   routing and attribution settings to choco's agents, since the user
+    //   settings file is not read), then choco writes its scope over it. It
+    //   scopes the instruction files: its
     //   `claudeMdExcludes` negated glob excludes every `CLAUDE.md` outside
     //   the canonical working directory, the personal one included. Its
     //   `pluginConfigs` switches on `AGENTS.md` loading in the built-in
@@ -529,7 +533,9 @@ fn apply_spawn_env(command: &mut Command, isolation: &Isolation) {
 ///   `.claude/settings.json` + `--effort low` sent `max`. This can't be
 ///   scrubbed from here: an isolated role applies the repo's committed
 ///   settings, and the chat role the operator's own, so such an `env` value
-///   still wins (documented in `docs/models.md`).
+///   still wins (documented in `docs/models.md`). The same holds for an `env`
+///   block in the role's own `claude_settings` (#346), which choco passes in
+///   `--settings`.
 fn apply_effort_env(command: &mut Command) {
     command.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
 }
@@ -3589,7 +3595,7 @@ mod tests {
                 .unwrap_or_default();
             crate::test_support::write_executable(
                 &wrapper,
-                &format!(
+                format!(
                     "#!/bin/sh\nexport FAKE_CLAUDE_SETTINGS={mode}\nexport FAKE_CLAUDE_PROMPT_MARKER={dir}/prompt\nexport FAKE_CLAUDE_ARGV_FILE={dir}/argv.json\n{init}exec {fixture} \"$@\"\n",
                     dir = dir.display(),
                     fixture = fixture_binary("fake_claude.py"),

@@ -177,6 +177,8 @@ A task's workflow comes from the first of these that matches:
 
 **Trust warning:** a repo's workflows, and any `--workflow` file, can run shell commands as you. Only point choco at repos and files you trust.
 
+To pass Claude Code settings to a role's agents (for example `attribution` to drop the `Co-Authored-By` trailer) without loosening the rest of their isolation, give the role `claude_settings` in `config.yaml` or the workflow: see [docs/workflows.md](docs/workflows.md#claude_settings-claude-code-settings-for-chocos-agents).
+
 More in [docs/workflows.md](docs/workflows.md). The `customize-choco-workflow` skill (see below) helps pick the lightest way to change a workflow and edit it safely.
 
 ## Using choco from Claude Code

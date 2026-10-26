@@ -51,7 +51,9 @@ pub struct RoleConfig {
     /// How much of the operator's own CLI setup this turn inherits (#90).
     /// Role-derived, from the workflow definition only — never task config
     /// or global config — because every setting here can only *loosen* what
-    /// a workflow agent is exposed to.
+    /// a workflow agent is exposed to. (`claude_settings` below is the one
+    /// role field with a global-config layer; its workflow-only keys are
+    /// the ones that load code or plugins.)
     pub isolation: Isolation,
     /// Tools this role must not use (#172), from the workflow definition
     /// only — never task or global config. Adapter-neutral names; each
