@@ -14,8 +14,8 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{
-    AdapterError, AgentEvent, AgentHandle, BackgroundJob, Registry, RoleConfig, UnknownCliError,
-    describe_jobs,
+    AdapterError, AgentEvent, AgentHandle, BackgroundJob, Registry, RoleConfig, SettingsVerdict,
+    UnknownCliError, describe_jobs,
 };
 use crate::db::{events, sessions, usage};
 
@@ -400,7 +400,7 @@ impl SessionManager {
             .map_err(SessionError::UnknownCli)?
             .clone();
         adapter
-            .validate_role(&session_row.role, &cfg.isolation)
+            .validate_role(&session_row.role, &cfg.isolation, &cfg.claude_settings)
             .map_err(SessionError::RoleRejected)?;
         if let Some(model) = &cfg.model {
             adapter
@@ -877,6 +877,21 @@ async fn drain_session(
                     }
                     Err(err) => tracing::error!(session_id, %err, "failed to append event"),
                 }
+                // The prompt was never written, so there is nothing to wait
+                // for: kill the process group now, the way `cancel` does, and
+                // record why for the end reason.
+                if let AgentEvent::SettingsNotApplied { verdict, .. } = &event {
+                    turn.settings_end = Some(match verdict {
+                        SettingsVerdict::Rejected => SessionEndReason::ClaudeSettingsRejected,
+                        SettingsVerdict::Unconfirmed { .. } => {
+                            SessionEndReason::ClaudeSettingsUnconfirmed
+                        }
+                    });
+                    tracing::warn!(session_id, "claude settings not applied; killing the session before its prompt");
+                    if let Some(pgid) = *pgid.lock().await {
+                        kill_and_sweep(&tracker, pgid, "settings not applied").await;
+                    }
+                }
                 if kind == SessionKind::SingleShot {
                     match turn.observe(&event) {
                         TurnStep::Continue => {}
@@ -1264,6 +1279,10 @@ struct SingleShotTurn {
     /// from outside, so the run is resumable rather than a failure of the
     /// agent's own.
     interrupted: bool,
+    /// The claude adapter found the role's `claude_settings` not applied (or
+    /// unconfirmed) before the prompt (#346); holds the end reason to record.
+    /// Set for a standing session too.
+    settings_end: Option<SessionEndReason>,
     /// The background jobs the CLI last reported as running (#271). Each
     /// `BackgroundJobs` event replaces it.
     background_jobs: Vec<BackgroundJob>,
@@ -1293,6 +1312,7 @@ impl Default for SingleShotTurn {
             lingered: false,
             errored: false,
             interrupted: false,
+            settings_end: None,
             background_jobs: Vec::new(),
             job_wait_deadline: None,
             job_wait_started_at: None,
@@ -1576,6 +1596,11 @@ async fn close_after_job_wait(
 /// completed or errored but whose process had to be killed is `Lingered`.
 /// Anything else that exits without having completed is `exited`: cleanly
 /// means it never reported (`NoReport`), otherwise it crashed (no reason).
+///
+/// A run the claude adapter ended because the role's `claude_settings` were
+/// not applied (`ClaudeSettingsRejected` / `ClaudeSettingsUnconfirmed`, #346)
+/// ranks after the requested ends (Cancelled, Paused, DaemonStopped) and ahead
+/// of every observed one: its prompt was never delivered.
 #[cfg(test)]
 fn final_run_state(
     kind: SessionKind,
@@ -1604,6 +1629,10 @@ fn final_run_state_ranked(
     use SessionEndReason::{
         Cancelled, DaemonStopped, Interrupted, Lingered, NoReport, Paused, Reaped,
     };
+    // Observed ends, ranked after the requested ones (Cancelled, Paused,
+    // DaemonStopped) and ahead of every other observed end: the prompt was
+    // never delivered, so nothing else can describe this run.
+    let settings_end = turn.settings_end;
     use SessionStatus::{Exited, Idle};
     match kind {
         // A clean exit (reaper-driven close, or a one-shot process finishing on
@@ -1619,6 +1648,9 @@ fn final_run_state_ranked(
                 // Idle whatever the exit looked like: the daemon killed it,
                 // and a chat stays resumable by message.
                 return (Idle, Some(DaemonStopped));
+            }
+            if let Some(reason) = settings_end {
+                return (Exited, Some(reason));
             }
             let reason = if clean_exit && reaped {
                 Some(Reaped)
@@ -1639,6 +1671,8 @@ fn final_run_state_ranked(
                 (Exited, Some(Paused))
             } else if stopping && !turn.completed {
                 (Exited, Some(DaemonStopped))
+            } else if let Some(reason) = settings_end {
+                (Exited, Some(reason))
             } else if turn.gave_up {
                 (Exited, Some(NoReport))
             } else if reaped && !turn.completed {
@@ -2057,6 +2091,7 @@ mod tests {
 
     fn role_config() -> RoleConfig {
         RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -4128,6 +4163,69 @@ mod tests {
             ranked(Standing, &silent, false, true, false).1,
             None,
             "a pause never stops a standing session"
+        );
+    }
+
+    /// #346: a run ended because Claude Code did not apply the role's
+    /// settings ranks after the requested ends (cancel, pause, daemon stop)
+    /// and ahead of every observed one, for a standing session too.
+    #[test]
+    fn a_settings_end_ranks_after_requested_ends_and_ahead_of_observed_ones() {
+        use SessionEndReason::{
+            Cancelled, ClaudeSettingsRejected, ClaudeSettingsUnconfirmed, DaemonStopped, Paused,
+        };
+        use SessionKind::{SingleShot, Standing};
+        use SessionStatus::Exited;
+        let rejected = turn_with(|t| t.settings_end = Some(ClaudeSettingsRejected));
+        let unconfirmed = turn_with(|t| t.settings_end = Some(ClaudeSettingsUnconfirmed));
+        // Observed ends that would otherwise win: a gave-up turn, a reaped one,
+        // a clean exit with no report.
+        let rejected_and_gave_up = turn_with(|t| {
+            t.settings_end = Some(ClaudeSettingsRejected);
+            t.gave_up = true;
+        });
+        let ranked = |kind, turn: &SingleShotTurn, clean, reaped, cancelled, paused, stopping| {
+            final_run_state_ranked(kind, turn, clean, reaped, cancelled, paused, stopping)
+        };
+        for kind in [SingleShot, Standing] {
+            assert_eq!(
+                ranked(kind, &rejected, false, false, false, false, false),
+                (Exited, Some(ClaudeSettingsRejected)),
+                "{kind:?}"
+            );
+            assert_eq!(
+                ranked(kind, &unconfirmed, false, false, false, false, false),
+                (Exited, Some(ClaudeSettingsUnconfirmed)),
+                "{kind:?}"
+            );
+            assert_eq!(
+                ranked(kind, &rejected, false, false, true, false, false).1,
+                Some(Cancelled),
+                "cancel beats it: {kind:?}"
+            );
+            assert_eq!(
+                ranked(kind, &rejected, false, false, false, false, true).1,
+                Some(DaemonStopped),
+                "daemon stop beats it: {kind:?}"
+            );
+        }
+        assert_eq!(
+            ranked(SingleShot, &rejected, false, false, false, true, false).1,
+            Some(Paused),
+            "pause beats it"
+        );
+        assert_eq!(
+            ranked(
+                SingleShot,
+                &rejected_and_gave_up,
+                true,
+                true,
+                false,
+                false,
+                false
+            ),
+            (Exited, Some(ClaudeSettingsRejected)),
+            "it beats gave_up and reaped"
         );
     }
 

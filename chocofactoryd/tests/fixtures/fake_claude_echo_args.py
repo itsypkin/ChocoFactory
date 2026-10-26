@@ -17,7 +17,15 @@ import os
 import sys
 import uuid
 
-from fake_common import auto_report, emit, flag, is_control_request
+from fake_common import (
+    answer_control_request,
+    auto_report,
+    emit,
+    flag,
+    is_control_request,
+    record_startup,
+    touch_prompt_marker,
+)
 
 
 def main():
@@ -32,11 +40,17 @@ def main():
     # Read (and discard) the turn, so the adapter's stdin write completes
     # exactly as it would against the real CLI. A control request ahead of
     # it (the skills allowlist, #90) is reported rather than discarded.
+    record_startup()
     initialize = "<unset>"
-    line = sys.stdin.readline().strip()
-    if is_control_request(line):
-        initialize = json.dumps(json.loads(line)["request"], separators=(",", ":"))
-        sys.stdin.readline()
+    while True:
+        line = sys.stdin.readline().strip()
+        if not is_control_request(line):
+            break
+        request = json.loads(line)["request"]
+        if request.get("subtype") == "initialize":
+            initialize = json.dumps(request, separators=(",", ":"))
+        answer_control_request(line)
+    touch_prompt_marker()
 
     reply = "model={}|system_prompt={}|permission_mode={}|mcp_config={}|strict_mcp_config={}|setting_sources={}|disallowed_tools={}|disable_auto_memory={}|initialize={}|append_system_prompt={}|settings={}|settings_count={}|effort={}|effort_count={}|effort_env={}".format(
         flag(args, "--model"),

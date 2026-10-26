@@ -130,7 +130,18 @@ async fn main() -> ExitCode {
             outcomes: args.outcomes.clone(),
             required_sections: args.required_sections.clone(),
         };
-        return match mcp::serve(&stage, stdin.lock(), stdout.lock()) {
+        let settings_applied = match &args.claude_settings_sentinel {
+            None => true,
+            Some(flag) => match mcp::sentinel_present(flag, |name| std::env::var_os(name)) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    // Names the problem, never the flag's value.
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+        return match mcp::serve_checked(&stage, settings_applied, stdin.lock(), stdout.lock()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");

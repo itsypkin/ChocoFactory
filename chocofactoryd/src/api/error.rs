@@ -62,7 +62,9 @@ impl From<CreateTaskError> for ApiError {
             | CreateTaskError::UnknownCli(_)
             | CreateTaskError::RoleRejected(_)
             | CreateTaskError::WorkflowDef(
-                WorkflowDefError::UnknownCli(_) | WorkflowDefError::RoleRejected(_),
+                WorkflowDefError::UnknownCli(_)
+                | WorkflowDefError::RoleRejected(_)
+                | WorkflowDefError::InvalidClaudeSettings { .. },
             )
             | CreateTaskError::Start {
                 source: EngineError::UnknownCli(_) | EngineError::RoleRejected(_),

@@ -1863,6 +1863,16 @@ async fn run_failure_answers_every_row_of_the_table() {
         (SessionStatus::Exited, Some(SessionEndReason::Reaped), true),
         (
             SessionStatus::Exited,
+            Some(SessionEndReason::ClaudeSettingsRejected),
+            true,
+        ),
+        (
+            SessionStatus::Idle,
+            Some(SessionEndReason::ClaudeSettingsUnconfirmed),
+            true,
+        ),
+        (
+            SessionStatus::Exited,
             Some(SessionEndReason::Cancelled),
             false,
         ),

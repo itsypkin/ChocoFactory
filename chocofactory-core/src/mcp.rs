@@ -12,6 +12,16 @@ pub const MCP_SERVER_NAME: &str = "chocofactory";
 /// The tool's own, unqualified name.
 pub const REPORT_OUTCOME_TOOL_NAME: &str = "report_outcome";
 
+/// The only tool `choco mcp-serve` offers when Claude Code did not apply the
+/// role's `claude_settings` (the sentinel check failed). `report_outcome`
+/// is not offered then, so the turn cannot complete.
+pub const CLAUDE_SETTINGS_REJECTED_TOOL_NAME: &str = "claude_settings_rejected";
+
+/// [`CLAUDE_SETTINGS_REJECTED_TOOL_NAME`] as `claude` namespaces it.
+pub fn qualified_claude_settings_rejected_tool_name() -> String {
+    format!("mcp__{MCP_SERVER_NAME}__{CLAUDE_SETTINGS_REJECTED_TOOL_NAME}")
+}
+
 /// The name a model-visible tool call actually carries: `claude` namespaces
 /// every MCP tool as `mcp__<server-key>__<tool-name>`, so this is what shows
 /// up as a `tool_call` event's `tool` field on the timeline.

@@ -366,7 +366,11 @@ impl WorkflowEngine {
         // this turn (the recorded one on a resume) must accept the role. It
         // comes before any baseline, session row or process.
         adapter
-            .validate_role(role, &resolved.role_config.isolation)
+            .validate_role(
+                role,
+                &resolved.role_config.isolation,
+                &resolved.role_config.claude_settings,
+            )
             .map_err(EngineError::RoleRejected)?;
         adapter
             .validate_model(role, &resolved.model)
@@ -1113,6 +1117,44 @@ impl WorkflowEngine {
                             "the turn was stopped by a pause; not auto-advancing"
                         );
                         break TurnEnd::Paused;
+                    }
+                    // #346: the claude adapter ended the turn before writing its
+                    // prompt, because Claude Code did not apply the role's
+                    // `claude_settings` (or choco could not confirm it did).
+                    // Any status. Neither reason names a value.
+                    Ok(Some(run))
+                        if run.end_reason == Some(SessionEndReason::ClaudeSettingsRejected) =>
+                    {
+                        let role = agent_role_of(&definition, &stage_name).unwrap_or("unknown");
+                        tracing::warn!(
+                            task_id,
+                            session_id,
+                            role,
+                            "Claude Code did not apply the role's claude_settings; the turn was stopped before its prompt"
+                        );
+                        break TurnEnd::Incomplete(format!(
+                            "stage '{stage_name}': Claude Code did not apply role '{role}''s \
+                             claude_settings (it ignores the whole settings when one value is \
+                             invalid), so choco stopped the turn before the agent started; fix \
+                             the value and run 'choco task retry'"
+                        ));
+                    }
+                    Ok(Some(run))
+                        if run.end_reason == Some(SessionEndReason::ClaudeSettingsUnconfirmed) =>
+                    {
+                        let role = agent_role_of(&definition, &stage_name).unwrap_or("unknown");
+                        tracing::warn!(
+                            task_id,
+                            session_id,
+                            role,
+                            "choco could not confirm Claude Code applied the role's claude_settings; the turn was stopped before its prompt"
+                        );
+                        break TurnEnd::Incomplete(format!(
+                            "stage '{stage_name}': choco could not confirm that Claude Code \
+                             applied role '{role}''s claude_settings, so it stopped the turn \
+                             before the agent started; the session's error event says why; \
+                             'choco task retry' tries again"
+                        ));
                     }
                     Ok(Some(run)) if run.status == SessionStatus::Idle => break TurnEnd::Completed,
                     // #90: the two ways `drain_session` ends a single-shot

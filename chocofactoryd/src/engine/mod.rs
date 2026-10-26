@@ -600,7 +600,7 @@ pub(crate) fn load_workflow_file(
             registry
                 .lookup(Some(name), cli)
                 .map_err(WorkflowDefError::UnknownCli)?
-                .validate_role(name, &role.isolation)
+                .validate_role(name, &role.isolation, &role.claude_settings)
                 .map_err(WorkflowDefError::RoleRejected)?;
             if let Some(model) = &role.model {
                 registry
@@ -3009,6 +3009,17 @@ impl WorkflowEngine {
                 | SessionEndReason::DaemonStopped
                 | SessionEndReason::Paused),
             ) => reason,
+            // #346: the prompt was never delivered, so there is no
+            // conversation to continue; a retry starts the turn fresh.
+            Some(
+                other @ (SessionEndReason::ClaudeSettingsRejected
+                | SessionEndReason::ClaudeSettingsUnconfirmed),
+            ) => {
+                return Ok(Err(format!(
+                    "its turn ended '{other}' before the agent started, so there is nothing to \
+                     resume"
+                )));
+            }
             Some(other) => {
                 return Ok(Err(format!(
                     "its turn ended '{other}', which is the agent's own failure rather than an \

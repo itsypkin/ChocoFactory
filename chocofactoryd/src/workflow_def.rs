@@ -16,6 +16,7 @@ use serde::Deserialize;
 use chocofactory_core::duration::parse_duration;
 
 use crate::adapter::{Isolation, RoleTool};
+use crate::claude_settings::{ClaudeSettings, ShapeError};
 
 /// A parsed, validated workflow definition. `stages` preserves the YAML
 /// file's declaration order because that order carries meaning: the first
@@ -130,9 +131,17 @@ impl WorkflowDefinition {
                         resolve_file(base_dir, &rel, RefOwner::Role(&name), "system_prompt_file")
                     })
                     .transpose()?;
+                let claude_settings =
+                    ClaudeSettings::from_yaml(role.claude_settings).map_err(|problem| {
+                        WorkflowDefError::InvalidClaudeSettings {
+                            role: name.clone(),
+                            problem,
+                        }
+                    })?;
                 Ok((
                     name,
                     RoleDef {
+                        claude_settings,
                         cli: role.cli,
                         model: role.model,
                         system_prompt_file,
@@ -595,6 +604,10 @@ pub struct RoleDef {
     /// requires all of `RoleTool::ALL` in `disallowed_tools` and a
     /// `worktree: true` workflow.
     pub read_only: bool,
+    /// Claude Code settings for this role's agents (#346): the workflow
+    /// layer of a field with two layers (the global config is the other;
+    /// task config cannot set it). Empty when missing, `null` or `{}`.
+    pub claude_settings: ClaudeSettings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -816,6 +829,10 @@ struct RawRole {
     /// The role must not change the task's worktree (#172).
     #[serde(default)]
     read_only: bool,
+    /// Claude Code settings for this role's agents (#346); validated and
+    /// converted when the role is built.
+    #[serde(default)]
+    claude_settings: Option<serde_yaml::Value>,
 }
 
 impl RawRole {
@@ -1966,6 +1983,11 @@ pub enum WorkflowDefError {
     /// The role's adapter can't run the role as defined (for example omp
     /// with a skill name it would read as a pattern). Raised by the engine's `load_workflow_file`.
     RoleRejected(String),
+    /// A role's `claude_settings` is not a JSON-representable mapping (#346).
+    InvalidClaudeSettings {
+        role: String,
+        problem: ShapeError,
+    },
 }
 
 impl fmt::Display for WorkflowDefError {
@@ -2308,6 +2330,9 @@ impl fmt::Display for WorkflowDefError {
             ),
             WorkflowDefError::UnknownCli(err) => write!(f, "{err}"),
             WorkflowDefError::RoleRejected(message) => write!(f, "{message}"),
+            WorkflowDefError::InvalidClaudeSettings { role, problem } => {
+                write!(f, "role '{role}': claude_settings {problem}")
+            }
             WorkflowDefError::ReadOnlyRoleWithoutWorktree { role } => write!(
                 f,
                 "role '{role}' is 'read_only: true', which needs 'worktree: true' on the \
@@ -2488,6 +2513,101 @@ stages:
                 "{message}"
             );
         }
+    }
+
+    // ---- claude_settings (#346) ----
+
+    #[test]
+    fn claude_settings_missing_null_and_empty_are_nothing_extra() {
+        let dir = TempDir::new();
+        for fields in [
+            "    cli: x",
+            "    claude_settings:",
+            "    claude_settings: {}",
+            "    claude_settings: ~",
+        ] {
+            let def = WorkflowDefinition::parse(&role_yaml(false, fields), &dir.path).unwrap();
+            assert!(def.roles["reviewer"].claude_settings.is_empty(), "{fields}");
+        }
+    }
+
+    #[test]
+    fn claude_settings_parse_as_a_json_object_and_may_sit_beside_inherit_operator_config() {
+        let dir = TempDir::new();
+        let def = WorkflowDefinition::parse(
+            &role_yaml(
+                false,
+                "    inherit_operator_config: true\n    claude_settings:\n      attribution: {commit: ''}\n      hooks: {SessionStart: []}",
+            ),
+            &dir.path,
+        )
+        .unwrap();
+        assert_eq!(
+            def.roles["reviewer"].claude_settings.keys_sorted(),
+            vec!["attribution", "hooks"]
+        );
+        assert_eq!(
+            def.roles["reviewer"].isolation,
+            Isolation::InheritOperatorConfig
+        );
+    }
+
+    #[test]
+    fn claude_settings_of_the_wrong_shape_are_a_load_error_naming_the_role_and_field() {
+        let dir = TempDir::new();
+        for (value, kind) in [
+            ("[str-secret-1]", "a list"),
+            ("str-secret-1", "a string"),
+            ("4242", "a number"),
+            ("false", "a boolean"),
+        ] {
+            let err = WorkflowDefinition::parse(
+                &role_yaml(false, &format!("    claude_settings: {value}")),
+                &dir.path,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                WorkflowDefError::InvalidClaudeSettings { .. }
+            ));
+            let text = err.to_string();
+            assert_eq!(
+                text,
+                format!(
+                    "role 'reviewer': claude_settings must be a mapping of Claude Code settings, not {kind}"
+                )
+            );
+            assert!(!text.contains("str-secret-1") && !text.contains("4242"));
+        }
+        for value in [
+            "{1: x}",
+            "{~: x}",
+            "{env: {true: x}}",
+            "{env: {A: !t x}}",
+            "{x: .nan}",
+            "{x: .inf}",
+        ] {
+            let err = WorkflowDefinition::parse(
+                &role_yaml(false, &format!("    claude_settings: {value}")),
+                &dir.path,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, WorkflowDefError::InvalidClaudeSettings { .. }),
+                "{value}"
+            );
+            assert!(
+                err.to_string()
+                    .starts_with("role 'reviewer': claude_settings "),
+                "{err}"
+            );
+        }
+        let err = WorkflowDefinition::parse(
+            &role_yaml(false, "    claude_settings: {env: {A: a}, env: {B: b}}"),
+            &dir.path,
+        )
+        .unwrap_err();
+        assert!(matches!(err, WorkflowDefError::Yaml(_)), "{err}");
     }
 
     #[test]
