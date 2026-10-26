@@ -3464,8 +3464,13 @@ mod tests {
             isolation,
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
-        let AgentEvent::AssistantMessage { text } = next_assistant_message(&mut handle).await
-        else {
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_assistant_message(&mut handle),
+        )
+        .await
+        .expect("the fixture never replied: its prompt was held back");
+        let AgentEvent::AssistantMessage { text } = reply else {
             unreachable!()
         };
         echo_fields(&text)

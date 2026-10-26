@@ -653,8 +653,21 @@ mod tests {
     #[test]
     fn every_workflow_only_key_is_refused_alone_naming_the_role_and_the_key() {
         let dir = TempDir::new();
-        assert_eq!(WORKFLOW_ONLY_CLAUDE_SETTINGS.len(), 10);
-        for key in WORKFLOW_ONLY_CLAUDE_SETTINGS {
+        // The list is pinned by value, so deleting or misspelling an entry of
+        // the constant fails here and not only in a loop that reads it.
+        let expected = [
+            "hooks",
+            "disableAllHooks",
+            "enabledPlugins",
+            "extraKnownMarketplaces",
+            "pluginConfigs",
+            "outputStyle",
+            "claudeMdExcludes",
+            "enableAllProjectMcpServers",
+            "enabledMcpjsonServers",
+            "disabledMcpjsonServers",
+        ];
+        for key in expected {
             let path = settings_config(&dir, &format!(" {{{key}: {{}}}}"));
             let err = check_global_roles(Some(&path), &claude_registry()).unwrap_err();
             assert!(matches!(
