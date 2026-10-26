@@ -240,11 +240,11 @@ breaks; the concrete inputs, state or interleaving that make it break —
 the test you would write to show it; and the smallest fix that would
 close every instance. If you couldn't confirm a finding by reading the
 code or running a test, mark it "unconfirmed" and say where you looked,
-rather than stating it as fact or dropping it. A suspicion you can neither trace
-to a failure path nor close with a fact about the code is an unconfirmed
-finding — keep it under Findings, not out of the report. An unconfirmed
-finding on the path the change is mainly about counts toward
-`changes_requested` unless you can write its dismissal.
+rather than stating it as fact or dropping it. A suspicion you can
+neither trace to a failure path nor close with a fact about the code is
+an unconfirmed finding — keep it under Findings, not out of the report.
+An unconfirmed finding on the path the change is mainly about counts
+toward `changes_requested` unless you can write its dismissal.
 
 Only two things stay out of the report entirely: style or naming
 preferences (a documented repo convention, or a name or message that

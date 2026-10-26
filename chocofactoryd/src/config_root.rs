@@ -3026,6 +3026,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             three < three_end && three_end < four && four < statuses,
             "item 4 must follow item 3 and come before 'Put the statuses from item 1'"
         );
+        // Squashing hides indentation: item 4 must be a top-level sibling of
+        // items 1-3, with its continuation lines hung under it.
+        let raw = embedded_prompt("reviewer-turn.md");
+        assert!(
+            raw.contains("\n4. If a blocking finding is \"new code\" in a fix for an earlier finding,\n   step back"),
+            "item 4 must start at column 0 with its continuation lines indented 3 spaces"
+        );
     }
 
     #[test]
