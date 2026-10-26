@@ -1104,6 +1104,71 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         })
     }
 
+    /// On a human's round the coder changes only what the human asks for.
+    /// The rule belongs to the `awaiting_human_review` entry alone.
+    #[test]
+    fn coder_revise_on_a_humans_round_changes_only_what_the_human_asks() {
+        let rule = [
+            r#"Make only the changes the human asks for, and what those changes need (their tests, the description)."#,
+            r#"A finding from an earlier review that the human doesn't repeat is not a request, whoever raised it and however it was rated: leave that code as it is."#,
+            r#"If you notice a defect nobody asked about, name it in your summary instead of changing it."#,
+        ];
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "awaiting_human_review",
+            "changes_requested",
+            stale_approval_and_human_review(),
+        );
+        let entry = squash(route_entry(&rendered, "awaiting_human_review"));
+        assert_says(&entry, &rule, "the awaiting_human_review entry");
+        let every = index_of(&entry, "Address every item in it, not just the first.");
+        let first = index_of(&entry, rule[0]);
+        let formal = index_of(
+            &entry,
+            "Formal review bodies and their inline review comments",
+        );
+        assert!(
+            every < first && first < formal,
+            "the rule belongs between 'Address every item' and 'Formal review bodies': {entry}"
+        );
+
+        let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
+            "internal_review",
+            "changes_requested",
+            serde_json::json!({ "internal_review": { "summary": "CURRENT REVIEWER SUMMARY" } }),
+        );
+        let list_start = index_of(&rendered, "Find your transition in this list");
+        let list_end = index_of(&rendered, "If your transition isn't in this list");
+        let mut names = Vec::new();
+        let mut rest = &rendered[list_start..list_end];
+        while let Some(at) = rest.find("\n- **`") {
+            rest = &rest[at + "\n- **`".len()..];
+            names.push(&rest[..rest.find('`').expect("closing backtick")]);
+        }
+        for expected in [
+            "internal_review",
+            "checks_polling",
+            "base_conflict",
+            "escalate_to_human",
+            "blocker",
+        ] {
+            assert!(names.contains(&expected), "route entries found: {names:?}");
+        }
+        for name in names.iter().filter(|n| **n != "awaiting_human_review") {
+            let other = squash(route_entry(&rendered, name));
+            for sentence in rule {
+                assert!(
+                    !other.contains(sentence),
+                    "the {name} entry must not carry \"{sentence}\""
+                );
+            }
+        }
+        assert_eq!(
+            squash(&rendered).matches(rule[0]).count(),
+            1,
+            "the human-round rule appears once in the whole prompt"
+        );
+    }
+
     #[test]
     fn coder_revise_for_the_awaiting_human_review_path_hands_over_the_humans_review() {
         let rendered = assert_coder_revise_names_arrival_and_isolates_captures(
@@ -1752,6 +1817,23 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             assert_eq!(blocker.len(), 1, "{name}: {unresolved:?}");
             assert_eq!(blocker[0].kind, UnresolvedKind::StageNotRunYet, "{name}");
         }
+    }
+
+    /// The coder never reports while its background work runs.
+    #[test]
+    fn coder_system_never_reports_while_its_work_runs() {
+        let text = squash(embedded_prompt("coder-system.md"));
+        let rule = r#"Don't call `report_outcome` while that work runs, not even to say it is still running: the call is final and can't be taken back."#;
+        assert_says(&text, &[rule], "coder-system.md step 1");
+        let one = index_of(&text, "1. Do the work yourself");
+        let result = index_of(&text, "Check its result before you report.");
+        let at = index_of(&text, rule);
+        let wait = index_of(&text, "Wait by ending the turn, not by polling.");
+        let two = index_of(&text, "2. When you change code");
+        assert!(
+            one < result && result < at && at < wait && wait < two,
+            "the rule belongs in step 1, between 'Check its result' and 'Wait by ending the turn'"
+        );
     }
 
     /// (#333) The stop rule is whole clauses in the shared system prompt.
@@ -2410,6 +2492,29 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         );
     }
 
+    /// The planner carries a marked block into the Spec unchanged, and asks
+    /// when a check finds a fault in it.
+    #[test]
+    fn planner_system_keeps_marked_blocks_word_for_word() {
+        let section = section_of(embedded_prompt("planner-system.md"), "## What you report");
+        let rule = [
+            r#"Where the task marks a block of text to be carried word for word, copy it into the Spec unchanged, character for character, line breaks and fences included: don't reword, rewrap, shorten or correct it."#,
+            r#"A marker is a sentence next to the block, usually just above it, that asks for the block to be kept word for word or exactly as written, such as "Carry this block word for word into the Spec.""#,
+            r#"If a check finds a fault inside a marked block, leave the block as it is and raise the fault as a question: the task wants the text unchanged and wants it to work, so it contradicts itself (stop condition 1)."#,
+            r#"Change a marked block only where a human's answer to your questions says to."#,
+        ];
+        assert_says(&section, &rule, "planner-system.md Spec bullet");
+        let spec = index_of(&section, "**Spec.**");
+        let never = index_of(&section, "never summarise one away.");
+        let first = index_of(&section, rule[0]);
+        let fold = index_of(&section, "Fold in your fixes and decisions.");
+        let needs_input = index_of(&section, "Report `needs_input` only");
+        assert!(
+            spec < never && never < first && first < fold && fold < needs_input,
+            "the rule belongs in the Spec bullet, between 'never summarise one away.' and 'Fold in your fixes'"
+        );
+    }
+
     #[test]
     fn planner_system_names_the_sections_the_stage_enforces_in_order() {
         use crate::workflow_def::StageKind;
@@ -2555,6 +2660,28 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 "'{p}' must sit in the waiting paragraph"
             );
         }
+    }
+
+    /// Check 5 has the planner fix a test a wrong version of the code could
+    /// still pass.
+    #[test]
+    fn planner_system_check_five_fixes_foolable_tests() {
+        let text = squash(embedded_prompt("planner-system.md"));
+        let rule = [
+            r#"For every test the spec asks for, ask whether it can be fooled: describe a wrong version of the code that would still pass it."#,
+            r#"If there is one, change the test so that version fails, and record it under Checks as "was → now"."#,
+            r#"The spec's way of testing (what a test sets up, which inputs or signals it sends, how it breaks the code, where the test lives) is a requirement you fix like any other, not a decision check 4 makes binding."#,
+            r#"If the task forbids the only test that would catch a wrong version, that is check 4's contradiction: raise it as a question."#,
+        ];
+        assert_says(&text, &rule, "planner-system.md check 5");
+        let five = index_of(&text, "5. **Testability.**");
+        let required = index_of(&text, "repository's own required checks.");
+        let first = index_of(&text, rule[0]);
+        let six = index_of(&text, "6. **Soundness.**");
+        assert!(
+            five < required && required < first && first < six,
+            "the rule belongs inside check 5, after its last sentence and before check 6"
+        );
     }
 
     #[test]
@@ -2835,6 +2962,70 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             assert!(index_of(&text, c) < predict, "'{c}' must sit before step 1");
         }
         assert!(!text.contains("Don't re-run formatting, lint, build or the full test suite"));
+    }
+
+    /// The reviewer names the class of a defect, weighs a broken promise as
+    /// blocking, and its fix line covers every instance.
+    #[test]
+    fn reviewer_system_finds_the_class_and_weighs_promises() {
+        let text = squash(embedded_prompt("reviewer-system.md"));
+        let class_rule = [
+            r#"Name the class of each defect: the rule the code breaks, said so that it covers more than the line you found."#,
+            r#""The check skips input shapes it wasn't written for" is a class; "`null` skips the check" is one instance of it."#,
+            r#"Then search the whole change for every other instance of that class: each input shape, caller, path and file where the same rule can break."#,
+            r#"List them all in the finding, or write "no other instances" and say where you looked."#,
+        ];
+        let promise_rule = [
+            r#"A defect that breaks a promise the task makes blocks, even where a rule above would let it stay minor."#,
+            r#"A promise is anything the task, or an issue it closes, says will always or never happen, such as "refused before the task starts" or "never deletes the user's files"."#,
+            r#"How unlikely the inputs that break it are doesn't lower its weight."#,
+        ];
+        let every_instance = "and the smallest fix that would close every instance.";
+        assert_says(&text, &class_rule, "reviewer-system.md class rule");
+        assert_says(&text, &promise_rule, "reviewer-system.md promise rule");
+        assert_says(&text, &[every_instance], "reviewer-system.md fix line");
+
+        let decide = index_of(&text, "## 5. Decide");
+        let rewrite_end = index_of(&text, "after a coder has already built on it.");
+        let class_at = index_of(&text, class_rule[0]);
+        let minors = index_of(
+            &text,
+            "Minor findings carried unchanged for two or more laps",
+        );
+        assert!(
+            decide < rewrite_end && rewrite_end < class_at && class_at < minors,
+            "the class rule belongs in step 5, after the 'not worth reporting' paragraph and before the carried minors"
+        );
+
+        let four_parts = index_of(&text, "Write every finding with the same four parts");
+        let fix_at = index_of(&text, every_instance);
+        let promise_at = index_of(&text, promise_rule[0]);
+        let needs = index_of(&text, "`changes_requested` needs a concrete defect");
+        assert!(
+            decide < four_parts && four_parts < fix_at && fix_at < promise_at && promise_at < needs,
+            "the promise rule belongs in step 5, after the four-parts paragraph and before the changes_requested paragraph"
+        );
+        assert!(
+            !text.contains("the smallest fix that would close it."),
+            "the fix line must cover every instance, not one"
+        );
+    }
+
+    /// A blocking "new code" finding in a fix makes the reviewer say whether
+    /// the approach is the problem.
+    #[test]
+    fn reviewer_turn_steps_back_on_new_code_in_a_fix() {
+        let text = squash(embedded_prompt("reviewer-turn.md"));
+        let item = r#"4. If a blocking finding is "new code" in a fix for an earlier finding, step back before you report and say whether the approach is the problem. When each fix opens a new edge case, a rule is usually missing. If one is, name that rule in one sentence, and the one test that would hold it for every case, in that finding. If the approach is sound, say so in one line."#;
+        assert_says(&text, &[item], "reviewer-turn.md item 4");
+        let three = index_of(&text, "3. For every finding first raised in this report");
+        let three_end = index_of(&text, "reviews are getting deeper or just later.");
+        let four = index_of(&text, item);
+        let statuses = index_of(&text, "Put the statuses from item 1");
+        assert!(
+            three < three_end && three_end < four && four < statuses,
+            "item 4 must follow item 3 and come before 'Put the statuses from item 1'"
+        );
     }
 
     #[test]

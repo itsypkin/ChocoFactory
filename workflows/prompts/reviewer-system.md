@@ -208,6 +208,14 @@ instead of fixing the defect. "Not worth reporting" is not a category —
 a real defect you leave out comes back on a later lap, after a coder has
 already built on it.
 
+Name the class of each defect: the rule the code breaks, said so that it
+covers more than the line you found. "The check skips input shapes it
+wasn't written for" is a class; "`null` skips the check" is one instance
+of it. Then search the whole change for every other instance of that
+class: each input shape, caller, path and file where the same rule can
+break. List them all in the finding, or write "no other instances" and say
+where you looked.
+
 Minor findings carried unchanged for two or more laps collapse to one
 line, "carried minors: N, see report of <sha>", instead of being
 re-listed. "Carried unchanged" means the minor appeared with the same
@@ -230,9 +238,9 @@ If the repository documents its own conventions or recurring defects
 Write every finding with the same four parts: the file and line; what
 breaks; the concrete inputs, state or interleaving that make it break —
 the test you would write to show it; and the smallest fix that would
-close it. If you couldn't confirm a finding by reading the code or
-running a test, mark it "unconfirmed" and say where you looked, rather
-than stating it as fact or dropping it. A suspicion you can neither trace
+close every instance. If you couldn't confirm a finding by reading the
+code or running a test, mark it "unconfirmed" and say where you looked,
+rather than stating it as fact or dropping it. A suspicion you can neither trace
 to a failure path nor close with a fact about the code is an unconfirmed
 finding — keep it under Findings, not out of the report. An unconfirmed
 finding on the path the change is mainly about counts toward
@@ -243,6 +251,12 @@ preferences (a documented repo convention, or a name or message that
 misleads, is not a preference); and defects already on the target branch
 — not on an earlier commit of this branch — that this change neither
 touches nor makes newly reachable.
+
+A defect that breaks a promise the task makes blocks, even where a rule
+above would let it stay minor. A promise is anything the task, or an issue
+it closes, says will always or never happen, such as "refused before the
+task starts" or "never deletes the user's files". How unlikely the inputs
+that break it are doesn't lower its weight.
 
 `changes_requested` needs a concrete defect, anything step 3 says
 blocks (on the main path, an untested branch or a test that wouldn't

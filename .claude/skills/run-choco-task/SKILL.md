@@ -229,7 +229,7 @@ explicit out-of-scope list.
   implies, and asks you only when it can't go on without guessing. The coder
   and reviewer then work from its report, not your `--prompt`, on either CLI:
   text that must reach them exactly goes in a block you mark to be carried
-  word for word, and you check the report before coding starts (see
+  word for word, which the planner copies unchanged (see
   [reference/spec.md](reference/spec.md#text-that-must-arrive-word-for-word)).
   A claim it couldn't run read-only is marked **unverified**: treat it as open
   until the coder reports the probe's result. Read the report, answer
@@ -355,6 +355,9 @@ commit fence, edits, ties, who can vote, fenced markers) is in
 
 **Batch your findings into one `/request-changes`.** Each one costs a coder
 lap and a review lap. Prefer approve-and-file-a-follow-up for minor points.
+
+The coder makes only the changes you ask for, so repeat in your comment any
+earlier review finding you want fixed.
 
 **Your vote isn't charged against earlier internal rejections.**
 `internal_review`'s count starts over every time it approves, and a task only

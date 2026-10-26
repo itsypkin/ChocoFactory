@@ -27,8 +27,9 @@ you, a resumed escalation, an answered blocker, a PR that started conflicting wi
 `coding-task-planned` is `coding-task` with a spec check in front. Its first
 stage, `spec_check`, has a planning agent read your `--prompt` against the
 code the task starts from. It makes the spec buildable (fixing stale
-references, commands that don't work here and loose test requirements) and
-decides the design choices your intent implies, listing each with its reason.
+references, commands that don't work here, loose test requirements and tests a
+wrong change could still pass) and decides the design choices your intent
+implies, listing each with its reason.
 It stops and asks you only when it would otherwise have to guess what you
 want: the spec contradicts itself, the goal is missing or unclear, or every
 way forward is irreversible, weakens security or costs far more than the
@@ -40,6 +41,11 @@ report, not from your `--prompt`. Read it with:
 ```
 choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'
 ```
+
+Text whose exact wording matters goes in a fenced block, with the line "Carry
+this block word for word into the Spec." above it. The planner copies a marked
+block into its report unchanged; if it finds a fault inside one, it asks you
+rather than fixing it.
 
 A task waiting at `spec_questions` is answered with
 `choco task send <id> --text "..."`. The answer goes back to the planner,
@@ -108,6 +114,9 @@ below), oldest first, in its prompt, and after them every qualifying review
 (oldest first) with that review's inline comments; the coder doesn't have to
 fetch them. Anything posted after the poll read the PR isn't in the prompt,
 so the coder is told to check for it.
+
+The coder makes only the changes you ask for, so repeat in your comment any
+earlier review finding you want fixed.
 
 Reviews follow these rules:
 
