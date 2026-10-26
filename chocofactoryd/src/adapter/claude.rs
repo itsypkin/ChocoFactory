@@ -3543,6 +3543,58 @@ mod tests {
         assert!(!fields["mcp_config"].contains("\"env\""));
     }
 
+    /// D2 through the spawn: config.yaml `env` + `attribution`, the workflow's
+    /// `env` replaces the whole `env` (no deep merge), and a workflow `null`
+    /// leaves `env` holding only the sentinel.
+    #[tokio::test]
+    async fn layered_settings_reach_the_spawn_key_by_key_and_a_null_leaves_only_the_sentinel() {
+        use crate::global_config::{GlobalConfig, GlobalRoleConfig};
+        let mut global = GlobalConfig::default();
+        global.roles.insert(
+            "coder".to_string(),
+            GlobalRoleConfig {
+                claude_settings: settings_of(
+                    "env: {A: from-global}\nattribution: {commit: global-c}",
+                ),
+                ..Default::default()
+            },
+        );
+        let def = |yaml: &str| crate::workflow_def::RoleDef {
+            claude_settings: settings_of(yaml),
+            cli: Some("claude".to_string()),
+            model: None,
+            system_prompt_file: None,
+            isolation: Isolation::default(),
+            disallowed_tools: Vec::new(),
+            read_only: false,
+        };
+        let (name_re, _) = sentinel_regexes();
+
+        let merged = crate::role_config::resolve_claude_settings(
+            "coder",
+            &def("env: {B: from-workflow}"),
+            &global,
+        )
+        .unwrap();
+        let fields = echo_args_settings(Isolation::default(), merged).await;
+        let sent: Value = serde_json::from_str(&fields["settings"]).unwrap();
+        assert_eq!(sent["attribution"], json!({"commit": "global-c"}));
+        let env = sent["env"].as_object().unwrap();
+        assert_eq!(env["B"], "from-workflow");
+        assert!(!env.contains_key("A"), "no deep merge: {env:?}");
+        assert_eq!(env.keys().filter(|k| name_re.is_match(k)).count(), 1);
+        assert_eq!(env.len(), 2);
+
+        let merged =
+            crate::role_config::resolve_claude_settings("coder", &def("env: ~"), &global).unwrap();
+        let fields = echo_args_settings(Isolation::default(), merged).await;
+        let sent: Value = serde_json::from_str(&fields["settings"]).unwrap();
+        assert_eq!(sent["attribution"], json!({"commit": "global-c"}));
+        let env = sent["env"].as_object().unwrap();
+        assert_eq!(env.len(), 1, "only the sentinel: {env:?}");
+        assert!(name_re.is_match(env.keys().next().unwrap()));
+    }
+
     #[tokio::test]
     async fn a_chat_spawn_passes_its_settings_once_alone_and_with_no_sentinel() {
         let settings = settings_of("attribution: {commit: ''}");
@@ -3616,7 +3668,7 @@ mod tests {
         async fn run(&self, choco: &str) -> Vec<AgentEvent> {
             let adapter = ClaudeAdapter::with_binary(self.wrapper.clone()).with_choco_binary(choco);
             let cfg = RoleConfig {
-                claude_settings: settings_of("attribution: {commit: c1}"),
+                claude_settings: settings_of("attribution: {commit: secret-commit-text}"),
                 role: "coder".to_string(),
                 project_id: None,
                 disallowed_tools: Vec::new(),
@@ -3687,6 +3739,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(meta["claude_settings_keys"], json!(["attribution"]));
+        // Key names only: no value reaches an event.
+        let serialized = format!("{events:?}");
+        assert!(!serialized.contains("secret-commit-text"), "{serialized}");
         // Nothing in any event carries the sentinel.
         let argv: Vec<String> =
             serde_json::from_str(&std::fs::read_to_string(gate.dir.join("argv.json")).unwrap())
