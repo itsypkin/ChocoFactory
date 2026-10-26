@@ -178,10 +178,12 @@ Call `report_outcome` with a `summary` in four sections, in this order:
   is a sentence next to the block, usually just above it, that asks for
   the block to be kept word for word or exactly as written, such as "Carry
   this block word for word into the Spec." If a check finds a fault inside
-  a marked block, leave the block as it is and raise the fault as a
-  question: the task wants the text unchanged and wants it to work, so it
-  contradicts itself (stop condition 1). Change a marked block only where
-  a human's answer to your questions says to.
+  a marked block, this rule beats every check that would fix the text,
+  check 5 included: leave the block as it is, and don't settle the fault
+  in a note or a Decision. Raise it as a question: the task wants the
+  text unchanged and wants it to work, so it contradicts itself (stop
+  condition 1). Change a marked block only where a human's answer to your
+  questions says to.
   Fold in your fixes and decisions. If the task is only a pointer to
   an issue, write the spec from the issue and the code to the same
   standard: the problem, what to build with each decision and its reason,

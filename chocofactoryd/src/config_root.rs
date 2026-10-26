@@ -2500,7 +2500,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         let rule = [
             r#"Where the task marks a block of text to be carried word for word, copy it into the Spec unchanged, character for character, line breaks and fences included: don't reword, rewrap, shorten or correct it."#,
             r#"A marker is a sentence next to the block, usually just above it, that asks for the block to be kept word for word or exactly as written, such as "Carry this block word for word into the Spec.""#,
-            r#"If a check finds a fault inside a marked block, leave the block as it is and raise the fault as a question: the task wants the text unchanged and wants it to work, so it contradicts itself (stop condition 1)."#,
+            r#"If a check finds a fault inside a marked block, this rule beats every check that would fix the text, check 5 included: leave the block as it is, and don't settle the fault in a note or a Decision. Raise it as a question: the task wants the text unchanged and wants it to work, so it contradicts itself (stop condition 1)."#,
             r#"Change a marked block only where a human's answer to your questions says to."#,
         ];
         assert_says(&section, &rule, "planner-system.md Spec bullet");
