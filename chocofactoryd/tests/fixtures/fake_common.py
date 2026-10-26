@@ -21,6 +21,42 @@ import sys
 
 REPORT_OUTCOME_TOOL = "mcp__chocofactory__report_outcome"
 
+# How long the real CLI takes to answer `initialize` when a tool server is
+# still connecting (probed on 2.1.310: it answers only after its MCP servers
+# have connected or failed). An `mcp_status` that reaches it inside this
+# window sees the server as `pending`.
+INIT_REPLY_DELAY_SECONDS = 0.3
+
+
+class _Stdin:
+    """An unbuffered line reader over fd 0.
+
+    `select` on the fd then says truthfully whether a line has arrived,
+    which a buffered `sys.stdin` can't (it may already hold the next line).
+    `pushback` holds lines read early that a later reader must still see.
+    """
+
+    def __init__(self):
+        self.pushback = []
+
+    def fileno(self):
+        return 0
+
+    def readline(self):
+        if self.pushback:
+            return self.pushback.pop(0)
+        data = b""
+        while True:
+            byte = os.read(0, 1)
+            if not byte:
+                return data.decode("utf-8", "replace")
+            data += byte
+            if byte == b"\n":
+                return data.decode("utf-8", "replace")
+
+
+sys.stdin = _Stdin()
+
 
 def emit(obj):
     print(json.dumps(obj), flush=True)
@@ -65,6 +101,8 @@ def answer_control_request(line):
     rid = request.get("request_id")
     subtype = (request.get("request") or {}).get("subtype")
     if subtype == "initialize":
+        if has_sentinel(sys.argv[1:]):
+            wait_for_servers()
         emit(
             {
                 "type": "control_response",
@@ -97,6 +135,43 @@ def answer_control_request(line):
                 },
             }
         )
+
+
+def has_sentinel(args):
+    """Whether the `--mcp-config` server was given a settings sentinel."""
+    return "--claude-settings-sentinel" in flag(args, "--mcp-config")
+
+
+def wait_for_servers():
+    """Models the real CLI answering `initialize` only once its servers are up.
+
+    An `mcp_status` request that arrives before that answer is replied to
+    with the tool server still `pending`, as the real CLI does (#346). Any
+    other line read early is pushed back for the turn reader.
+    """
+    ready, _, _ = select.select([0], [], [], INIT_REPLY_DELAY_SECONDS)
+    if not ready:
+        return
+    line = sys.stdin.readline()
+    try:
+        request = json.loads(line)
+    except ValueError:
+        request = {}
+    if (request.get("request") or {}).get("subtype") == "mcp_status":
+        emit(
+            {
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request.get("request_id"),
+                    "response": {
+                        "mcpServers": [{"name": "chocofactory", "status": "pending"}]
+                    },
+                },
+            }
+        )
+    else:
+        sys.stdin.pushback.append(line)
 
 
 def mcp_servers(args, apply_settings):

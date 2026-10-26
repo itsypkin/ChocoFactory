@@ -245,7 +245,7 @@ pub enum SessionEndReason {
     Paused,
     /// Claude Code did not apply the role's `claude_settings` (it discards
     /// the whole bundle when one value is invalid), so choco ended the turn
-    /// before the agent got its prompt. Observed by the claude adapter from
+    /// (normally) before the agent got its prompt. Observed by the claude adapter from
     /// the tool server's report. The session never received a prompt, so
     /// `retry` starts fresh.
     ClaudeSettingsRejected,

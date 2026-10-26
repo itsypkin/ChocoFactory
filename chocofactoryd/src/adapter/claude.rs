@@ -549,7 +549,7 @@ fn apply_effort_env(command: &mut Command) {
 fn initialize_line(skills: &[String]) -> String {
     let request = json!({
         "type": "control_request",
-        "request_id": "chocofactory-initialize",
+        "request_id": INITIALIZE_REQUEST_ID,
         "request": { "subtype": "initialize", "skills": skills },
     });
     format!("{request}\n")
@@ -3429,7 +3429,7 @@ mod tests {
         assert_eq!(event.event_type(), EventType::Error);
         assert_eq!(
             event.payload(),
-            json!({"message": "Claude Code did not apply role 'coder''s claude_settings: it ignores the whole settings when one value is invalid. choco stopped the turn before the agent started."})
+            json!({"message": "Claude Code did not apply role 'coder''s claude_settings: it ignores the whole settings when one value is invalid. choco stopped the turn."})
         );
         let event = AgentEvent::SettingsNotApplied {
             verdict: SettingsVerdict::Unconfirmed {
@@ -3439,7 +3439,7 @@ mod tests {
         };
         assert_eq!(
             event.payload(),
-            json!({"message": "choco could not confirm that Claude Code applied role 'coder''s claude_settings (its tool server reported: failed). choco stopped the turn before the agent started."})
+            json!({"message": "choco could not confirm that Claude Code applied role 'coder''s claude_settings (its tool server reported: failed). choco stopped the turn."})
         );
     }
 

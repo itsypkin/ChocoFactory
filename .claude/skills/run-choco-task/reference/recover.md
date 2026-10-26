@@ -79,14 +79,17 @@ and `choco task list --status stuck` finds every stuck task.
   until then, so check `git status` there before retrying.
 - `claude_settings_rejected`: the reason says Claude Code did not apply role
   `<role>`'s `claude_settings` (it ignores the whole settings when one value is
-  invalid). The agent never got its prompt, so nothing ran. Fix the value in
+  invalid). Choco normally sees this before the agent gets its prompt, so
+  nothing ran. Fix the value in
   `~/.config/chocofactory/config.yaml` or the workflow file, then
   `choco task retry <id>`; it starts a fresh session.
 - `claude_settings_unconfirmed`: choco could not confirm Claude Code applied the
-  role's `claude_settings` (its tool server failed, or the CLI would not answer
-  the status request). The agent never got its prompt. Read the session's
+  role's `claude_settings` (its tool server failed, or the CLI refused the status
+  request). Read the session's
   `error` event for the status it saw, then `choco task retry <id>`; it starts
   fresh.
+  A CLI that never answers the status request is not this: the turn waits
+  until the idle reaper closes it (`reaped`).
 - A stuck reason naming a role's `claude_settings` key (`sets claude_settings
   'hooks' in the global config, which only a workflow file may set`) or its
   `env` (`'env' must be a mapping`) or `cli omp` (`can't take`): config.yaml

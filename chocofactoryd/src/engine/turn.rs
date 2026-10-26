@@ -1135,8 +1135,8 @@ impl WorkflowEngine {
                         break TurnEnd::Incomplete(format!(
                             "stage '{stage_name}': Claude Code did not apply role '{role}''s \
                              claude_settings (it ignores the whole settings when one value is \
-                             invalid), so choco stopped the turn before the agent started; fix \
-                             the value and run 'choco task retry'"
+                             invalid), so choco stopped the turn; fix the value \
+                             and run 'choco task retry'"
                         ));
                     }
                     Ok(Some(run))
@@ -1151,8 +1151,8 @@ impl WorkflowEngine {
                         );
                         break TurnEnd::Incomplete(format!(
                             "stage '{stage_name}': choco could not confirm that Claude Code \
-                             applied role '{role}''s claude_settings, so it stopped the turn \
-                             before the agent started; the session's error event says why; \
+                             applied role '{role}''s claude_settings, so it stopped the turn; \
+                             the session's error event says why; \
                              'choco task retry' tries again"
                         ));
                     }

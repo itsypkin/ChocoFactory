@@ -280,10 +280,10 @@ impl SettingsVerdict {
     pub fn message(&self, role: &str) -> String {
         match self {
             SettingsVerdict::Rejected => format!(
-                "Claude Code did not apply role '{role}''s claude_settings: it ignores the whole settings when one value is invalid. choco stopped the turn before the agent started."
+                "Claude Code did not apply role '{role}''s claude_settings: it ignores the whole settings when one value is invalid. choco stopped the turn."
             ),
             SettingsVerdict::Unconfirmed { status } => format!(
-                "choco could not confirm that Claude Code applied role '{role}''s claude_settings (its tool server reported: {status}). choco stopped the turn before the agent started."
+                "choco could not confirm that Claude Code applied role '{role}''s claude_settings (its tool server reported: {status}). choco stopped the turn."
             ),
         }
     }

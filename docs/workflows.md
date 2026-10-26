@@ -386,15 +386,14 @@ roles:
   unscoped. To catch this, an isolated role with non-empty `claude_settings`
   gets one random variable added to the settings' `env`, and choco's tool
   server checks that Claude Code passed it on. If not, the task parks `stuck`
-  naming the role, before the agent gets its prompt, with the session ended
+  naming the role, normally before the agent gets its prompt, with the session ended
   `claude_settings_rejected`. If choco can't tell (the tool server failed, or
-  the CLI doesn't answer the status request cleanly), the session ends
+  the CLI refused the status request), the session ends
   `claude_settings_unconfirmed` and the `error` event says why. Fix the value
   and run `choco task retry`; it starts a fresh session. The variable is
   recorded nowhere. A rejected value in the chat role's settings is not
-  detected: chat has no choco scope to lose.
-
-`skills`/`memory` can't be combined with `inherit_operator_config`.
+  detected: chat has no choco scope to lose. A CLI that never answers the
+  status request is closed by the idle reaper (`reaped`), not by this check.
 
 `memory: true` means different things on the two CLIs, so one workflow file
 runs on either, but the two never share:

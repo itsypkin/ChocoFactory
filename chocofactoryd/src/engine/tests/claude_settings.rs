@@ -45,7 +45,7 @@ async fn env() -> Env {
     crate::test_support::write_executable(
         &wrapper,
         format!(
-            "#!/bin/sh\ntouch '{d}/spawned'\necho $$ > '{d}/pid'\nexport FAKE_CLAUDE_SETTINGS=\"$(cat '{d}/mode')\"\nexport FAKE_CLAUDE_PROMPT_MARKER='{d}/prompt'\nexport FAKE_CLAUDE_ARGV_FILE=\"{d}/argv-$(date +%s)-$$.json\"\nexec '{fixture}' \"$@\"\n",
+            "#!/bin/sh\ntouch '{d}/spawned'\necho $$ > '{d}/pid'\nexport FAKE_CLAUDE_SETTINGS=\"$(cat '{d}/mode')\"\nexport FAKE_CLAUDE_PROMPT_MARKER='{d}/prompt'\nexport FAKE_CLAUDE_ARGV_FILE=\"{d}/argv-$(date +%s)-$$.json\"\nif [ -e '{d}/lingers' ]; then\n  '{fixture}' \"$@\"\n  sleep 60\n  exit\nfi\nexec '{fixture}' \"$@\"\n",
             d = dir.display(),
             fixture = fixture_binary("fake_claude.py"),
         ),
@@ -373,7 +373,7 @@ async fn a_non_mapping_env_edited_in_after_create_parks_the_turn_at_start() {
     assert!(!env.spawned());
 }
 
-const R9_STUCK: &str = "stage 'coding': Claude Code did not apply role 'coder''s claude_settings (it ignores the whole settings when one value is invalid), so choco stopped the turn before the agent started; fix the value and run 'choco task retry'";
+const R9_STUCK: &str = "stage 'coding': Claude Code did not apply role 'coder''s claude_settings (it ignores the whole settings when one value is invalid), so choco stopped the turn; fix the value and run 'choco task retry'";
 
 /// R9: a bundle Claude Code rejects parks the task `stuck`, the agent never
 /// gets its prompt, and a retry (fresh, with a new sentinel) completes once
@@ -409,7 +409,7 @@ async fn rejected_settings_park_the_task_and_the_prompt_is_never_written() {
     );
     assert!(
         timeline.iter().any(|e| e.payload["message"]
-            == "Claude Code did not apply role 'coder''s claude_settings: it ignores the whole settings when one value is invalid. choco stopped the turn before the agent started."),
+            == "Claude Code did not apply role 'coder''s claude_settings: it ignores the whole settings when one value is invalid. choco stopped the turn."),
         "{timeline:?}"
     );
 
@@ -462,6 +462,45 @@ async fn rejected_settings_park_the_task_and_the_prompt_is_never_written() {
     let names = env.sentinel_names();
     assert_eq!(names.len(), 2);
     assert_ne!(names[0], names[1], "a new sentinel per spawn");
+}
+
+/// Decision 22: on a miss choco kills the whole process group at once, rather
+/// than relying on the CLI exiting when its stdin closes. The wrapper keeps
+/// the stdout pipe open for a minute after the fake exits (as a lingering hook
+/// or child would), so only the kill ends the session in time.
+#[tokio::test]
+async fn a_rejected_turn_kills_a_process_that_lingers_after_stdin_closes() {
+    let env = env().await;
+    fs::write(env.dir.join("mode"), "reject").unwrap();
+    fs::write(env.dir.join("lingers"), "").unwrap();
+    let yaml = gated("    claude_settings:\n      attribution: {commit: c}\n");
+    let task = env.create(&yaml, json!({})).await.unwrap();
+    let started = std::time::Instant::now();
+    let _ = env.engine.send_message_or_resume(&task.id, "go").await;
+    wait_until_task_status(&env.pool, &task.id, "stuck").await;
+    assert!(
+        started.elapsed() < StdDuration::from_secs(30),
+        "the session waited for the lingering process: {:?}",
+        started.elapsed()
+    );
+    let rows = sessions::list_for_task(&env.pool, &task.id).await.unwrap();
+    assert_eq!(
+        rows[0].end_reason,
+        Some(SessionEndReason::ClaudeSettingsRejected)
+    );
+    let pid: i32 = fs::read_to_string(env.dir.join("pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "the agent process {pid} is gone");
 }
 
 /// A CLI that never answers `mcp_status`: the turn waits at the gate and a
@@ -575,7 +614,7 @@ async fn an_unconfirmed_check_parks_the_task_with_its_own_message() {
     assert_eq!(
         after.stuck_reason.as_deref(),
         Some(
-            "stage 'coding': choco could not confirm that Claude Code applied role 'coder''s claude_settings, so it stopped the turn before the agent started; the session's error event says why; 'choco task retry' tries again"
+            "stage 'coding': choco could not confirm that Claude Code applied role 'coder''s claude_settings, so it stopped the turn; the session's error event says why; 'choco task retry' tries again"
         )
     );
     let rows = sessions::list_for_task(&env.pool, &task.id).await.unwrap();
