@@ -2689,6 +2689,7 @@ mod tests {
             report_outcomes: Vec::new(),
             report_sections: Vec::new(),
             isolation: Isolation::default(),
+            claude_settings: ClaudeSettings::default(),
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
         let first = handle.recv().await;

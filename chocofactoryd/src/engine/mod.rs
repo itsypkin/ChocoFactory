@@ -3016,8 +3016,7 @@ impl WorkflowEngine {
                 | SessionEndReason::ClaudeSettingsUnconfirmed),
             ) => {
                 return Ok(Err(format!(
-                    "its turn ended '{other}' before the agent started, so there is nothing to \
-                     resume"
+                    "its turn ended '{other}', so there is nothing to resume"
                 )));
             }
             Some(other) => {

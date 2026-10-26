@@ -11516,7 +11516,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
                 .await
                 .unwrap(),
             Err(format!(
-                "its turn ended '{reason}' before the agent started, so there is nothing to resume"
+                "its turn ended '{reason}', so there is nothing to resume"
             ))
         );
     }
