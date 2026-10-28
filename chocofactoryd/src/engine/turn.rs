@@ -1130,7 +1130,7 @@ impl WorkflowEngine {
                             task_id,
                             session_id,
                             role,
-                            "Claude Code did not apply the role's claude_settings; the turn was stopped before its prompt"
+                            "Claude Code did not apply the role's claude_settings; the turn was stopped"
                         );
                         break TurnEnd::Incomplete(format!(
                             "stage '{stage_name}': Claude Code did not apply role '{role}''s \
@@ -1147,7 +1147,7 @@ impl WorkflowEngine {
                             task_id,
                             session_id,
                             role,
-                            "choco could not confirm Claude Code applied the role's claude_settings; the turn was stopped before its prompt"
+                            "choco could not confirm Claude Code applied the role's claude_settings; the turn was stopped"
                         );
                         break TurnEnd::Incomplete(format!(
                             "stage '{stage_name}': choco could not confirm that Claude Code \

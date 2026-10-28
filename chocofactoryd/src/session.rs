@@ -877,8 +877,8 @@ async fn drain_session(
                     }
                     Err(err) => tracing::error!(session_id, %err, "failed to append event"),
                 }
-                // The prompt was never written, so there is nothing to wait
-                // for: kill the process group now, the way `cancel` does, and
+                // Whether or not the prompt was written, the turn is over:
+                // kill the process group now, the way `cancel` does, and
                 // record why for the end reason.
                 if let AgentEvent::SettingsNotApplied { verdict, .. } = &event {
                     turn.settings_end = Some(match verdict {
@@ -887,7 +887,7 @@ async fn drain_session(
                             SessionEndReason::ClaudeSettingsUnconfirmed
                         }
                     });
-                    tracing::warn!(session_id, "claude settings not applied; killing the session before its prompt");
+                    tracing::warn!(session_id, "claude settings not applied; killing the session");
                     if let Some(pgid) = *pgid.lock().await {
                         kill_and_sweep(&tracker, pgid, "settings not applied").await;
                     }
@@ -1280,7 +1280,7 @@ struct SingleShotTurn {
     /// agent's own.
     interrupted: bool,
     /// The claude adapter found the role's `claude_settings` not applied (or
-    /// unconfirmed) before the prompt (#346); holds the end reason to record.
+    /// unconfirmed) (#346); holds the end reason to record.
     /// Set for a standing session too.
     settings_end: Option<SessionEndReason>,
     /// The background jobs the CLI last reported as running (#271). Each
@@ -1600,7 +1600,8 @@ async fn close_after_job_wait(
 /// A run the claude adapter ended because the role's `claude_settings` were
 /// not applied (`ClaudeSettingsRejected` / `ClaudeSettingsUnconfirmed`, #346)
 /// ranks after the requested ends (Cancelled, Paused, DaemonStopped) and ahead
-/// of every observed one: its prompt was never delivered.
+/// of every observed one: the turn ended because its settings were not
+/// applied, so nothing else can describe this run.
 #[cfg(test)]
 fn final_run_state(
     kind: SessionKind,
@@ -1630,8 +1631,9 @@ fn final_run_state_ranked(
         Cancelled, DaemonStopped, Interrupted, Lingered, NoReport, Paused, Reaped,
     };
     // Observed ends, ranked after the requested ones (Cancelled, Paused,
-    // DaemonStopped) and ahead of every other observed end: the prompt was
-    // never delivered, so nothing else can describe this run.
+    // DaemonStopped) and ahead of every other observed end: the turn ended
+    // because its settings were not applied, so nothing else can describe
+    // this run.
     let settings_end = turn.settings_end;
     use SessionStatus::{Exited, Idle};
     match kind {

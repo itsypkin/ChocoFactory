@@ -255,7 +255,9 @@ pub enum AgentEvent {
     /// not confirm it did (#346). Recorded as an ordinary `error` event;
     /// carried as its own variant so `session::drain_session` can kill the
     /// process at once and end the session with the matching reason. Sent
-    /// before the turn's prompt is written. Only the claude adapter sends it.
+    /// normally before the turn's prompt is written (the `mcp_status` check),
+    /// but the `init`-line backstop can send it after the prompt. Only the
+    /// claude adapter sends it.
     SettingsNotApplied {
         verdict: SettingsVerdict,
         /// The role's name, for the message.

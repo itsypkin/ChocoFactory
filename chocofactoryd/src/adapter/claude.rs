@@ -568,7 +568,9 @@ const INITIALIZE_REQUEST_ID: &str = "chocofactory-initialize";
 /// `mcp_status` once the `initialize` reply is in, and writes no user
 /// message until the `mcp_status` reply passes. Claude Code has no user
 /// message before then, so it makes no model request and runs no tool:
-/// the agent cannot act on a turn whose settings were not applied.
+/// the agent cannot act on a turn whose settings the `mcp_status` check finds
+/// not applied. (The `init`-line backstop is the second detector, and it can
+/// fire after the prompt was written.)
 struct GateSenders {
     init_answered: Option<oneshot::Sender<()>>,
     /// Sent when the check passed. Dropped unsent on a miss, which makes the

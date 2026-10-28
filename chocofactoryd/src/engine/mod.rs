@@ -3009,7 +3009,7 @@ impl WorkflowEngine {
                 | SessionEndReason::DaemonStopped
                 | SessionEndReason::Paused),
             ) => reason,
-            // #346: the prompt was never delivered, so there is no
+            // #346: the turn was ended over its settings, so there is no
             // conversation to continue; a retry starts the turn fresh.
             Some(
                 other @ (SessionEndReason::ClaudeSettingsRejected
