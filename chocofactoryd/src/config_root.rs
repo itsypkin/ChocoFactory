@@ -2513,6 +2513,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             spec < never && never < first && first < fold && fold < needs_input,
             "the rule belongs in the Spec bullet, between 'never summarise one away.' and 'Fold in your fixes'"
         );
+        assert_all_between(
+            &section,
+            "never summarise one away.",
+            &rule,
+            "Fold in your fixes and decisions.",
+            "planner-system.md Spec bullet",
+        );
     }
 
     #[test]
@@ -2541,6 +2548,20 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     fn index_of(text: &str, needle: &str) -> usize {
         text.find(needle)
             .unwrap_or_else(|| panic!("expected \"{needle}\" in:\n{text}"))
+    }
+
+    /// Asserts that every one of `sentences` sits after `after` and before
+    /// `before` in `text` (already squashed), not only the first of them.
+    fn assert_all_between(text: &str, after: &str, sentences: &[&str], before: &str, what: &str) {
+        let lo = index_of(text, after);
+        let hi = index_of(text, before);
+        for sentence in sentences {
+            let at = index_of(text, sentence);
+            assert!(
+                lo < at && at < hi,
+                "{what}: \"{sentence}\" must sit after \"{after}\" and before \"{before}\""
+            );
+        }
     }
 
     #[test]
@@ -2681,6 +2702,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert!(
             five < required && required < first && first < six,
             "the rule belongs inside check 5, after its last sentence and before check 6"
+        );
+        assert_all_between(
+            &text,
+            "repository's own required checks.",
+            &rule,
+            "6. **Soundness.**",
+            "planner-system.md check 5",
         );
     }
 
@@ -2996,6 +3024,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             decide < rewrite_end && rewrite_end < class_at && class_at < minors,
             "the class rule belongs in step 5, after the 'not worth reporting' paragraph and before the carried minors"
         );
+        assert_all_between(
+            &text,
+            "after a coder has already built on it.",
+            &class_rule,
+            "Minor findings carried unchanged for two or more laps",
+            "reviewer-system.md class rule",
+        );
 
         let four_parts = index_of(&text, "Write every finding with the same four parts");
         let fix_at = index_of(&text, every_instance);
@@ -3004,6 +3039,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert!(
             decide < four_parts && four_parts < fix_at && fix_at < promise_at && promise_at < needs,
             "the promise rule belongs in step 5, after the four-parts paragraph and before the changes_requested paragraph"
+        );
+        assert_all_between(
+            &text,
+            every_instance,
+            &promise_rule,
+            "`changes_requested` needs a concrete defect",
+            "reviewer-system.md promise rule",
         );
         assert!(
             !text.contains("the smallest fix that would close it."),
