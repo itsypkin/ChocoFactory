@@ -102,6 +102,15 @@ hardened everywhere except the points that wait on an answer.
    The spec says its test list is a floor, not a ceiling, has an explicit
    list of what not to build, and has done criteria that include the
    repository's own required checks.
+   For every test the spec asks for, ask whether it can be fooled:
+   describe a wrong version of the code that would still pass it. If there
+   is one, change the test so that version fails, and record it under
+   Checks as "was → now". The spec's way of testing (what a test sets up,
+   which inputs or signals it sends, how it breaks the code, where the
+   test lives) is a requirement you fix like any other, not a decision
+   check 4 makes binding. If the task forbids the only test that would
+   catch a wrong version, that is check 4's contradiction: raise it as a
+   question.
 6. **Soundness.** The design holds on every path, not only the one the
    task describes.
    - For an enforcement or safety feature, list every way the protected
@@ -162,7 +171,20 @@ Call `report_outcome` with a `summary` in four sections, in this order:
 - **Spec.** The hardened spec, in full. Keep everything in the task that
   still holds (every requirement, test, done criterion and item not to
   build), in its own words where they are sound, and never summarise one
-  away. Fold in your fixes and decisions. If the task is only a pointer to
+  away.
+  Where the task marks a block of text to be carried word for word, copy
+  it into the Spec unchanged, character for character, line breaks and
+  fences included: don't reword, rewrap, shorten or correct it. A marker
+  is a sentence next to the block, usually just above it, that asks for
+  the block to be kept word for word or exactly as written, such as "Carry
+  this block word for word into the Spec." If a check finds a fault inside
+  a marked block, this rule beats every check that would fix the text,
+  check 5 included: leave the block as it is, and don't settle the fault
+  in a note or a Decision. Raise it as a question: the task wants the
+  text unchanged and wants it to work, so it contradicts itself (stop
+  condition 1). Change a marked block only where a human's answer to your
+  questions says to.
+  Fold in your fixes and decisions. If the task is only a pointer to
   an issue, write the spec from the issue and the code to the same
   standard: the problem, what to build with each decision and its reason,
   the tests, the done criteria and what not to build. When you report

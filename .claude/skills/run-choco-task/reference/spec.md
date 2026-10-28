@@ -75,14 +75,16 @@ blocker: the spec still says to report it as "not made: <reason>" and finish.
 
 Create the task with `--workflow coding-task-planned`. A planning agent
 checks the spec against the code the task starts from, fixes stale
-references and loose test requirements, checks that the design holds on
-every path, and decides the design choices your intent implies, listing
-each with its reason. It parks the task at `spec_questions` with questions
-for you only when it can't go on without guessing what you want: the spec
-contradicts itself, the goal is unclear, or the only way forward is
-irreversible, weakens security or costs far more than the spec suggests.
-From then on, the coder and the reviewer work from its report, not your
-`--prompt`. Read the report with
+references and loose test requirements, replaces any test a wrong change
+could still pass (it treats your way of testing as open, and asks you if
+your spec forbids the only test that would catch that change), checks that
+the design holds on every path, and decides the design choices your intent
+implies, listing each with its reason. It parks the task at `spec_questions`
+with questions for you only when it can't go on without guessing what you
+want: the spec contradicts itself, the goal is unclear, or the only way
+forward is irreversible, weakens security or costs far more than the spec
+suggests. From then on, the coder and the reviewer work from its report, not
+your `--prompt`. Read the report with
 `choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'`,
 and answer with `choco task send <id> --text "<answers>"`. The planner
 folds your answers in and checks again; an answer can tell it to decide a
@@ -104,21 +106,21 @@ coder and an omp coder alike, so on this workflow "in the spec" means "in what
 the planner carries over". Put text whose exact wording matters (versions and
 features, a full argument list, rules a file must contain word for word) in a
 fenced block, and write above it: "Carry this block word for word into the
-Spec." Then check the report before coding starts:
+Spec." The planner copies a marked block into its Spec unchanged. If one of
+its checks finds a fault inside the block, it leaves the block as it is and
+asks you about it before coding starts.
+
+Don't pause the task to check. To see the blocks arrived, read the report
+while coding runs:
 
 ```bash
-choco task pause <id>      # while spec_check runs, not while it shows Queued
-choco task status <id> --until paused --timeout 20m
-choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary' > report.md
-diff spec.md report.md     # each marked block must come through unchanged
-choco task resume <id>
+choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'
 ```
 
-The pause lets the planner's turn finish and holds the task before `coding`
-starts. If it stopped at `spec_questions`, answer, resume, and pause again the
-same way. If a marked block came through changed, cancel the task and create
-it again with the block restated: once coding starts, the coder has only the
-report.
+Check them at the latest when you review the PR: the internal reviewer reads
+the report, not your `--prompt`, so it can't see a change. If a marked block
+came through changed, quote the block as you wrote it in your
+`/request-changes`; the coder gets your review in full.
 
 ## Which `--help` to trust
 

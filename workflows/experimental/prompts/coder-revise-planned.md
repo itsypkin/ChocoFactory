@@ -20,7 +20,13 @@ follow that entry:
 - **`awaiting_human_review` → `changes_requested`**: a human asked for
   changes on the open PR. Their comments are quoted below under "The
   human's review", and that section is current. Address every item in it,
-  not just the first. Formal review bodies and their inline review
+  not just the first.
+  Make only the changes the human asks for, and what those changes need
+  (their tests, the description). A finding from an earlier review that
+  the human doesn't repeat is not a request, whoever raised it and however
+  it was rated: leave that code as it is. If you notice a defect nobody
+  asked about, name it in your summary instead of changing it.
+  Formal review bodies and their inline review
   comments are in that section too, but anything posted after it was
   captured isn't, so also check the PR for anything posted after your
   last commit. Set `N` in the same command as the `gh api` calls, since

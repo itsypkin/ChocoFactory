@@ -19,6 +19,8 @@ is described under "When you can't go on" below. Work like this:
    long build or test run), the one turn you may end without reporting is
    one spent waiting on it: say so in one line, and you will be woken when
    it finishes. Check its result before you report.
+   Don't call `report_outcome` while that work runs, not even to say it is
+   still running: the call is final and can't be taken back.
    Wait by ending the turn, not by polling. Never wait on `pgrep` for a
    program name, because other tasks and reviewers on this machine run the
    same tools, and never check a pid or loop until a line appears that the

@@ -451,3 +451,40 @@ fn the_blocker_text_of_the_experimental_revise_prompt_matches_the_shipped_one() 
     }
     assert!(entry(&shipped).contains("report `blocked` again"));
 }
+
+/// The experimental revise prompt is a real file, not a link, so the
+/// human-round rule is pinned in it too.
+#[test]
+fn the_experimental_revise_prompt_changes_only_what_the_human_asks() {
+    let revise = fs::read_to_string(exp().join("prompts/coder-revise-planned.md")).unwrap();
+    let flat = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let start = revise
+        .find("- **`awaiting_human_review`")
+        .expect("awaiting_human_review entry");
+    let rest = &revise[start + 1..];
+    let entry = flat(&revise[start..start + 1 + rest.find("\n- **`").expect("next entry")]);
+    let rule = [
+        r#"Make only the changes the human asks for, and what those changes need (their tests, the description)."#,
+        r#"A finding from an earlier review that the human doesn't repeat is not a request, whoever raised it and however it was rated: leave that code as it is."#,
+        r#"If you notice a defect nobody asked about, name it in your summary instead of changing it."#,
+    ];
+    let at = |needle: &str| {
+        entry
+            .find(needle)
+            .unwrap_or_else(|| panic!("expected \"{needle}\" in:\n{entry}"))
+    };
+    let lo = at("Address every item in it, not just the first.");
+    let hi = at("Formal review bodies and their inline review comments");
+    for sentence in rule {
+        let pos = at(sentence);
+        assert!(
+            lo < pos && pos < hi,
+            "\"{sentence}\" must sit after 'Address every item' and before 'Formal review bodies': {entry}"
+        );
+    }
+    assert_eq!(
+        flat(&revise).matches(rule[0]).count(),
+        1,
+        "the human-round rule appears once in the experimental revise prompt"
+    );
+}

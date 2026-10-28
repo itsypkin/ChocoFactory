@@ -10913,7 +10913,8 @@ async fn a_baseline_that_cannot_be_taken_stops_the_turn_before_it_starts() {
     let reason = stuck_reason(&run.pool, &run.task_id).await;
     assert!(
         reason.contains("could not record the worktree baseline")
-            && reason.contains("not a git repository"),
+            && (reason.contains("not a git repository")
+                || reason.contains("gitfile does not point to a valid repository")),
         "{reason}"
     );
     assert!(

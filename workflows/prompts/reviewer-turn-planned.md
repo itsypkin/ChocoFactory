@@ -61,6 +61,12 @@ not above. If earlier findings exist, from either source:
    new commits "new code", and leave the ones repeated from item 1
    untagged. Be honest about which is which: that tag is how this
    workflow measures whether reviews are getting deeper or just later.
+4. If a blocking finding is "new code" in a fix for an earlier finding,
+   step back before you report and say whether the approach is the
+   problem. When each fix opens a new edge case, a rule is usually
+   missing. If one is, name that rule in one sentence, and the one test
+   that would hold it for every case, in that finding. If the approach is
+   sound, say so in one line.
 
 Put the statuses from item 1 under "Prior findings", the section that
 comes before "Reviewed" in your summary.
