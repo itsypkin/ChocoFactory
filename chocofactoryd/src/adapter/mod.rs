@@ -265,8 +265,9 @@ pub enum AgentEvent {
     },
 }
 
-/// What the claude adapter found out about the role's `claude_settings`
-/// before writing the prompt.
+/// What the claude adapter found out about the role's `claude_settings`.
+/// Normally that is before the prompt is written; the `init`-line backstop
+/// can find a `Rejected` after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsVerdict {
     /// The tool server saw no matching sentinel: Claude Code discarded the

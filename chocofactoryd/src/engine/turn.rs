@@ -1118,8 +1118,8 @@ impl WorkflowEngine {
                         );
                         break TurnEnd::Paused;
                     }
-                    // #346: the claude adapter ended the turn before writing its
-                    // prompt, because Claude Code did not apply the role's
+                    // #346: the claude adapter ended the turn because Claude Code
+                    // did not apply the role's
                     // `claude_settings` (or choco could not confirm it did).
                     // Any status. Neither reason names a value.
                     Ok(Some(run))

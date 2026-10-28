@@ -3009,8 +3009,9 @@ impl WorkflowEngine {
                 | SessionEndReason::DaemonStopped
                 | SessionEndReason::Paused),
             ) => reason,
-            // #346: the turn was ended over its settings, so there is no
-            // conversation to continue; a retry starts the turn fresh.
+            // #346: the turn was ended over its settings. A retry starts it
+            // fresh rather than continue what the CLI began under the wrong
+            // settings.
             Some(
                 other @ (SessionEndReason::ClaudeSettingsRejected
                 | SessionEndReason::ClaudeSettingsUnconfirmed),

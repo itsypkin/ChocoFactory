@@ -41,7 +41,7 @@ and `choco task list --status stuck` finds every stuck task.
   off from outside (a usage limit, a daemon stop, the daemon closing an idle
   session) **resumes its session**, with the work already in the worktree. A
   turn that failed on its own (`no_report`, a crash) starts fresh, and
-  can't be resumed; neither can a turn stopped before its prompt because its
+  can't be resumed; neither can a turn choco stopped because its
   `claude_settings` were not applied. `--fresh` forces a fresh start; `--resume` refuses,
   changing nothing, rather than start fresh when the turn can't resume.
 - On a task stuck in a parallel group, `choco task retry <id>` re-runs only

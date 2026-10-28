@@ -11503,8 +11503,8 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
         );
     }
 
-    // #346: a turn stopped before its prompt was written has nothing to
-    // resume, even with an adapter session id recorded.
+    // #346: a turn choco stopped over its settings has nothing to
+    // resume, whenever it was stopped, even with an adapter session id recorded.
     for reason in [
         SessionEndReason::ClaudeSettingsRejected,
         SessionEndReason::ClaudeSettingsUnconfirmed,
