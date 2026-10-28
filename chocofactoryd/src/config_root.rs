@@ -1120,15 +1120,12 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         );
         let entry = squash(route_entry(&rendered, "awaiting_human_review"));
         assert_says(&entry, &rule, "the awaiting_human_review entry");
-        let every = index_of(&entry, "Address every item in it, not just the first.");
-        let first = index_of(&entry, rule[0]);
-        let formal = index_of(
+        assert_all_between(
             &entry,
+            "Address every item in it, not just the first.",
+            &rule,
             "Formal review bodies and their inline review comments",
-        );
-        assert!(
-            every < first && first < formal,
-            "the rule belongs between 'Address every item' and 'Formal review bodies': {entry}"
+            "coder-revise awaiting_human_review entry",
         );
 
         let rendered = assert_coder_revise_names_arrival_and_isolates_captures(

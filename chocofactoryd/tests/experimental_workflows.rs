@@ -468,10 +468,18 @@ fn the_experimental_revise_prompt_changes_only_what_the_human_asks() {
         r#"A finding from an earlier review that the human doesn't repeat is not a request, whoever raised it and however it was rated: leave that code as it is."#,
         r#"If you notice a defect nobody asked about, name it in your summary instead of changing it."#,
     ];
+    let at = |needle: &str| {
+        entry
+            .find(needle)
+            .unwrap_or_else(|| panic!("expected \"{needle}\" in:\n{entry}"))
+    };
+    let lo = at("Address every item in it, not just the first.");
+    let hi = at("Formal review bodies and their inline review comments");
     for sentence in rule {
+        let pos = at(sentence);
         assert!(
-            entry.contains(sentence),
-            "expected \"{sentence}\" in:\n{entry}"
+            lo < pos && pos < hi,
+            "\"{sentence}\" must sit after 'Address every item' and before 'Formal review bodies': {entry}"
         );
     }
     assert_eq!(
