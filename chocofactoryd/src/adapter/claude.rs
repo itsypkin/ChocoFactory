@@ -1,16 +1,21 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 
-use chocofactory_core::mcp::MCP_SERVER_NAME;
+use chocofactory_core::mcp::{
+    CLAUDE_SETTINGS_REJECTED_TOOL_NAME, MCP_SERVER_NAME, REPORT_OUTCOME_TOOL_NAME,
+    qualified_claude_settings_rejected_tool_name,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::claude_settings::ClaudeSettings;
 
 use super::{
     AdapterError, AgentAdapter, AgentEvent, AgentHandle, BackgroundJob, BillingMode,
-    InterruptionEvidence, Isolation, ModelUsage, RoleConfig, RoleTool, TokenCounts, TurnUsage,
-    UsageCounting, report_instruction, usage_limit_text,
+    InterruptionEvidence, Isolation, ModelUsage, RoleConfig, RoleTool, SettingsVerdict,
+    TokenCounts, TurnUsage, UsageCounting, report_instruction, usage_limit_text,
 };
 
 /// Wraps `claude --print --output-format=stream-json --input-format=stream-json
@@ -85,6 +90,27 @@ impl Default for ClaudeAdapter {
 impl AgentAdapter for ClaudeAdapter {
     fn name(&self) -> &'static str {
         "claude"
+    }
+
+    fn validate_role(
+        &self,
+        role: &str,
+        isolation: &Isolation,
+        claude_settings: &ClaudeSettings,
+    ) -> Result<(), String> {
+        // An isolated role's `env` gets choco's sentinel variable added (see
+        // `isolated_settings`), which needs a mapping to add it to. A `null`
+        // is dropped when the layers merge, so it is not refused here.
+        if matches!(isolation, Isolation::Isolated { .. })
+            && let Some(env) = claude_settings.map().get("env")
+            && !env.is_object()
+            && !env.is_null()
+        {
+            return Err(format!(
+                "role '{role}': claude_settings 'env' must be a mapping, because choco adds a variable to it to check that Claude Code applied the settings"
+            ));
+        }
+        Ok(())
     }
 
     fn validate_model(&self, role: &str, model: &str) -> Result<(), String> {
@@ -175,6 +201,15 @@ fn spawn(
         None => None,
     };
     let marker = super::new_turn_marker()?;
+    // D11 (#346): an isolated role with settings of its own gets a per-spawn
+    // sentinel variable in the settings' `env`, checked by choco's tool server.
+    // Chat has no choco scope to lose, so it gets none.
+    let sentinel = match &cfg.isolation {
+        Isolation::Isolated { .. } if !cfg.claude_settings.is_empty() => {
+            Some(new_settings_sentinel()?)
+        }
+        _ => None,
+    };
     let mut command = Command::new(binary);
     command
         .current_dir(&cfg.cwd)
@@ -249,6 +284,14 @@ fn spawn(
         mcp_args.push("--require-section".to_string());
         mcp_args.push(section.clone());
     }
+    // The expected sentinel reaches the tool server as an argument, never
+    // through the MCP config's `env` or the `claude` process's environment:
+    // either of those would set the variable whether or not Claude Code
+    // applied the settings, and the check could not tell.
+    if let Some((name, value)) = &sentinel {
+        mcp_args.push("--claude-settings-sentinel".to_string());
+        mcp_args.push(format!("{name}={value}"));
+    }
     // `alwaysLoad` (#90): without it the CLI lists `report_outcome` as a
     // *deferred* tool whose schema has to be fetched with `ToolSearch` before
     // it can be called. Probed against Claude Code 2.1.272: even with ours as
@@ -282,7 +325,11 @@ fn spawn(
     //   committed `.claude/settings.json` still applies.
     // - `--strict-mcp-config` drops the operator's MCP servers, leaving only
     //   ours.
-    // - `--settings` (`isolated_settings`) scopes the instruction files: its
+    // - `--settings` (`isolated_settings`) starts from the role's own
+    //   `claude_settings` (#346: the operator's way to pass non-secret login,
+    //   routing and attribution settings to choco's agents, since the user
+    //   settings file is not read), then choco writes its scope over it. It
+    //   scopes the instruction files: its
     //   `claudeMdExcludes` negated glob excludes every `CLAUDE.md` outside
     //   the canonical working directory, the personal one included. Its
     //   `pluginConfigs` switches on `AGENTS.md` loading in the built-in
@@ -310,10 +357,25 @@ fn spawn(
             let mut disallowed: Vec<&str> = CHAT_BLOCKED_TOOLS.to_vec();
             merge_role_tools(&mut disallowed, &cfg.disallowed_tools);
             command.arg("--disallowedTools").arg(disallowed.join(","));
+            // The role's own settings, alone and exactly once: no choco scope
+            // keys, and they beat the operator's user settings (#346).
+            if !cfg.claude_settings.is_empty() {
+                command
+                    .arg("--settings")
+                    .arg(Value::Object(cfg.claude_settings.map().clone()).to_string());
+            }
             None
         }
         Isolation::Isolated { skills, memory: _ } => {
-            let (settings, warnings) = isolated_settings(&cfg.cwd);
+            let (settings, warnings) = isolated_settings(
+                &cfg.role,
+                &cfg.cwd,
+                &cfg.claude_settings,
+                sentinel
+                    .as_ref()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
+            .map_err(|message| AdapterError::Spawn(std::io::Error::other(message)))?;
             spawn_warnings = warnings;
             command
                 .arg("--setting-sources")
@@ -384,13 +446,36 @@ fn spawn(
         .send(initial_prompt.to_string())
         .expect("stdin_rx not yet dropped");
 
-    tokio::spawn(run_stdin_writer(stdin, initialize, stdin_rx));
+    // With a sentinel, no user message is written until Claude Code's tool
+    // list shows the settings were applied (see `GateSenders`).
+    let (gate_tx, gate_rx) = match sentinel {
+        Some(_) => {
+            let (init_tx, init_rx) = oneshot::channel();
+            let (verdict_tx, verdict_rx) = oneshot::channel();
+            (
+                Some(GateSenders {
+                    init_answered: Some(init_tx),
+                    verdict: Some(verdict_tx),
+                    role: cfg.role.clone(),
+                }),
+                Some(GateReceivers {
+                    init_answered: init_rx,
+                    verdict: verdict_rx,
+                }),
+            )
+        }
+        None => (None, None),
+    };
+
+    tokio::spawn(run_stdin_writer(stdin, initialize, gate_rx, stdin_rx));
     tokio::spawn(run_stderr_reader(stderr, events_tx.clone()));
     tokio::spawn(run_stdout_reader(
         stdout,
         events_tx,
         cfg.isolation.describe(),
         cfg.isolation.clone(),
+        cfg.claude_settings.keys_sorted(),
+        gate_tx,
     ));
 
     Ok(AgentHandle::new(child, events_rx, stdin_tx, marker))
@@ -448,7 +533,9 @@ fn apply_spawn_env(command: &mut Command, isolation: &Isolation) {
 ///   `.claude/settings.json` + `--effort low` sent `max`. This can't be
 ///   scrubbed from here: an isolated role applies the repo's committed
 ///   settings, and the chat role the operator's own, so such an `env` value
-///   still wins (documented in `docs/models.md`).
+///   still wins (documented in `docs/models.md`). The same holds for an `env`
+///   block in the role's own `claude_settings` (#346), which choco passes in
+///   `--settings`.
 fn apply_effort_env(command: &mut Command) {
     command.env_remove("CLAUDE_CODE_EFFORT_LEVEL");
 }
@@ -462,8 +549,47 @@ fn apply_effort_env(command: &mut Command) {
 fn initialize_line(skills: &[String]) -> String {
     let request = json!({
         "type": "control_request",
-        "request_id": "chocofactory-initialize",
+        "request_id": INITIALIZE_REQUEST_ID,
         "request": { "subtype": "initialize", "skills": skills },
+    });
+    format!("{request}\n")
+}
+
+/// The `request_id` of choco's `mcp_status` control request.
+const MCP_STATUS_REQUEST_ID: &str = "chocofactory-mcp-status";
+/// The `request_id` of choco's `initialize` control request.
+const INITIALIZE_REQUEST_ID: &str = "chocofactory-initialize";
+
+/// The stdout reader's side of the settings gate (D11, #346).
+///
+/// Claude Code starts and connects its MCP servers before it has a prompt,
+/// and answers the `initialize` control request only after they have
+/// connected or failed (probed on 2.1.310). The writer therefore sends
+/// `mcp_status` once the `initialize` reply is in, and writes no user
+/// message until the `mcp_status` reply passes. Claude Code has no user
+/// message before then, so it makes no model request and runs no tool:
+/// the agent cannot act on a turn whose settings the `mcp_status` check finds
+/// not applied. (The `init`-line backstop is the second detector, and it can
+/// fire after the prompt was written.)
+struct GateSenders {
+    init_answered: Option<oneshot::Sender<()>>,
+    /// Sent when the check passed. Dropped unsent on a miss, which makes the
+    /// writer return without writing and so closes stdin.
+    verdict: Option<oneshot::Sender<()>>,
+    role: String,
+}
+
+struct GateReceivers {
+    init_answered: oneshot::Receiver<()>,
+    verdict: oneshot::Receiver<()>,
+}
+
+/// The `mcp_status` control request line.
+fn mcp_status_line() -> String {
+    let request = json!({
+        "type": "control_request",
+        "request_id": MCP_STATUS_REQUEST_ID,
+        "request": { "subtype": "mcp_status" },
     });
     format!("{request}\n")
 }
@@ -471,6 +597,7 @@ fn initialize_line(skills: &[String]) -> String {
 async fn run_stdin_writer(
     mut stdin: tokio::process::ChildStdin,
     initialize: Option<String>,
+    gate: Option<GateReceivers>,
     mut stdin_rx: mpsc::UnboundedReceiver<String>,
 ) {
     // Ahead of the first user turn, so the allowlist is in force before the
@@ -480,10 +607,57 @@ async fn run_stdin_writer(
     {
         return;
     }
+    if let Some(gate) = gate {
+        // Messages queued meanwhile (the prompt, a nudge, a send) are held,
+        // not written. If every sender goes away while waiting (the handle
+        // closed stdin), nothing is written and stdin closes.
+        let mut held: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let GateReceivers {
+            init_answered,
+            verdict,
+        } = gate;
+        if !wait_holding(init_answered, &mut stdin_rx, &mut held).await {
+            return;
+        }
+        if stdin.write_all(mcp_status_line().as_bytes()).await.is_err() {
+            return;
+        }
+        if !wait_holding(verdict, &mut stdin_rx, &mut held).await {
+            return;
+        }
+        for text in held {
+            if stdin
+                .write_all(user_turn_line(&text).as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
     while let Some(text) = stdin_rx.recv().await {
         let line = user_turn_line(&text);
         if stdin.write_all(line.as_bytes()).await.is_err() {
             break;
+        }
+    }
+}
+
+/// Waits for `signal`, holding whatever arrives on `stdin_rx` meanwhile.
+/// `false` when the signal's sender was dropped (a miss, or the reader
+/// ended) or every sender of `stdin_rx` went away first.
+async fn wait_holding(
+    mut signal: oneshot::Receiver<()>,
+    stdin_rx: &mut mpsc::UnboundedReceiver<String>,
+    held: &mut std::collections::VecDeque<String>,
+) -> bool {
+    loop {
+        tokio::select! {
+            result = &mut signal => return result.is_ok(),
+            message = stdin_rx.recv() => match message {
+                Some(text) => held.push_back(text),
+                None => return false,
+            },
         }
     }
 }
@@ -508,10 +682,14 @@ async fn run_stdout_reader(
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     isolation: Value,
     role_isolation: Isolation,
+    claude_settings_keys: Vec<String>,
+    mut gate: Option<GateSenders>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut billing = BillingMode::Unknown;
+    // At most one `SettingsNotApplied` per spawn.
+    let mut settings_event_sent = false;
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
             continue;
@@ -519,6 +697,47 @@ async fn run_stdout_reader(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if let Some(gate) = gate.as_mut()
+            && value.get("type").and_then(Value::as_str) == Some("control_response")
+        {
+            match value
+                .pointer("/response/request_id")
+                .and_then(Value::as_str)
+            {
+                Some(INITIALIZE_REQUEST_ID) => {
+                    if let Some(tx) = gate.init_answered.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                Some(MCP_STATUS_REQUEST_ID) => {
+                    // The reply holds the tool server's argv (`config.args`),
+                    // which holds the sentinel: it is read here and copied
+                    // nowhere.
+                    match settings_verdict(&value) {
+                        Ok(()) => {
+                            if let Some(tx) = gate.verdict.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        Err(verdict) => {
+                            gate.verdict = None;
+                            if !settings_event_sent {
+                                settings_event_sent = true;
+                                let event = AgentEvent::SettingsNotApplied {
+                                    verdict,
+                                    role: gate.role.clone(),
+                                };
+                                if events_tx.send(event).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
         for mut event in normalize(&value, &mut tool_names, &mut billing) {
             if let AgentEvent::SessionMeta {
                 details: Value::Object(details),
@@ -526,6 +745,10 @@ async fn run_stdout_reader(
             } = &mut event
             {
                 details.insert("isolation".to_string(), isolation.clone());
+                details.insert(
+                    "claude_settings_keys".to_string(),
+                    json!(claude_settings_keys),
+                );
             }
             if events_tx.send(event).is_err() {
                 return;
@@ -534,6 +757,24 @@ async fn run_stdout_reader(
         let top_level_init = value.get("type").and_then(Value::as_str) == Some("system")
             && value.get("subtype").and_then(Value::as_str) == Some("init")
             && value.get("parent_tool_use_id").is_none_or(Value::is_null);
+        // Backstop for the gate: an `init` line that lists the rejected-
+        // settings tool means the tool server found no sentinel, whatever
+        // the status reply said.
+        if top_level_init
+            && let Some(gate) = gate.as_mut()
+            && !settings_event_sent
+            && init_lists_rejected_tool(&value)
+        {
+            settings_event_sent = true;
+            gate.verdict = None;
+            let event = AgentEvent::SettingsNotApplied {
+                verdict: SettingsVerdict::Rejected,
+                role: gate.role.clone(),
+            };
+            if events_tx.send(event).is_err() {
+                return;
+            }
+        }
         if top_level_init && let Some(event) = agents_md_plugin_warning(&value, &role_isolation) {
             if let AgentEvent::Error { message } = &event {
                 let session_id = value.get("session_id").and_then(Value::as_str);
@@ -544,6 +785,82 @@ async fn run_stdout_reader(
             }
         }
     }
+}
+
+/// A per-spawn sentinel for the settings check: a variable name
+/// `CHOCOFACTORY_SETTINGS_<32 hex>` and a value of 32 hex digits, from two
+/// independent random reads. A failed read fails the spawn.
+fn new_settings_sentinel() -> Result<(String, String), AdapterError> {
+    let name = format!("CHOCOFACTORY_SETTINGS_{}", super::random_hex_128()?);
+    let value = super::random_hex_128()?;
+    Ok((name, value))
+}
+
+/// Reads Claude Code's reply to choco's `mcp_status` request. `Ok` means the
+/// tool server is connected and offers `report_outcome` (so it found the
+/// sentinel). Never copies anything out of the reply but a status word of
+/// plain lowercase letters: the reply's `config.args` holds the sentinel.
+fn settings_verdict(reply: &Value) -> Result<(), SettingsVerdict> {
+    let unconfirmed = |status: &str| SettingsVerdict::Unconfirmed {
+        status: status.to_string(),
+    };
+    if reply.pointer("/response/subtype").and_then(Value::as_str) != Some("success") {
+        return Err(unconfirmed("the CLI refused the mcp_status request"));
+    }
+    let Some(server) = reply
+        .pointer("/response/response/mcpServers")
+        .and_then(Value::as_array)
+        .and_then(|servers| {
+            servers
+                .iter()
+                .find(|server| server.get("name").and_then(Value::as_str) == Some(MCP_SERVER_NAME))
+        })
+    else {
+        return Err(unconfirmed("not listed"));
+    };
+    let tools: Vec<&str> = server
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    if tools.contains(&CLAUDE_SETTINGS_REJECTED_TOOL_NAME) {
+        return Err(SettingsVerdict::Rejected);
+    }
+    match server.get("status").and_then(Value::as_str) {
+        Some("connected") => {}
+        Some(status)
+            if !status.is_empty()
+                && status.len() <= 32
+                && status
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_') =>
+        {
+            return Err(unconfirmed(status));
+        }
+        _ => return Err(unconfirmed("unrecognised status")),
+    }
+    if tools.contains(&REPORT_OUTCOME_TOOL_NAME) {
+        Ok(())
+    } else {
+        Err(unconfirmed("connected without report_outcome"))
+    }
+}
+
+/// Whether an `init` line's tool list holds the rejected-settings tool.
+fn init_lists_rejected_tool(init: &Value) -> bool {
+    let rejected = qualified_claude_settings_rejected_tool_name();
+    init.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.as_str() == Some(rejected.as_str()))
+        })
 }
 
 /// Makes a path match itself literally inside a glob.
@@ -571,11 +888,25 @@ fn glob_escape(path: &str) -> String {
     out
 }
 
-/// The `--settings` JSON for an isolated role (#183) and any warnings about
-/// falling back while building it. Only instruction files under the role's
-/// canonical working directory load, and the built-in agents-md plugin is
-/// told to read `AGENTS.md` as well as `CLAUDE.md`.
-fn isolated_settings(cwd: &std::path::Path) -> (String, Vec<String>) {
+/// The `--settings` JSON for an isolated role (#183, #346) and any warnings
+/// about falling back while building it.
+///
+/// It starts from the role's `claude_settings`, then choco writes last what
+/// it must own: the sentinel inside `env` (D11), `claudeMdExcludes` (replaced
+/// whole: only instruction files under the role's canonical working directory
+/// load), and the built-in agents-md plugin's entry in `pluginConfigs` (other
+/// plugin entries the workflow wrote are kept; a `pluginConfigs` that is not
+/// a mapping is replaced). With no settings and no sentinel the bytes are
+/// what they were before `claude_settings` existed.
+///
+/// A role `env` that is not a mapping is an error, never replaced:
+/// `validate_role` refuses it earlier, so this is a backstop.
+fn isolated_settings(
+    role: &str,
+    cwd: &std::path::Path,
+    claude_settings: &ClaudeSettings,
+    sentinel: Option<(&str, &str)>,
+) -> Result<(String, Vec<String>), String> {
     let mut warnings = Vec::new();
     let resolved = match std::fs::canonicalize(cwd) {
         Ok(path) => path,
@@ -589,15 +920,39 @@ fn isolated_settings(cwd: &std::path::Path) -> (String, Vec<String>) {
     };
     let path = utf8_path(&resolved, cwd, &mut warnings);
     let escaped = glob_escape(&path);
-    let settings = json!({
-        "claudeMdExcludes": [format!("!{}/**", escaped.trim_end_matches('/'))],
-        "pluginConfigs": {
-            "cc-plugin-agents-md@builtin": {
-                "options": { "instructionFiles": "claude-md-and-agents-md" }
+    let mut settings = claude_settings.map().clone();
+    if let Some((name, value)) = sentinel {
+        match settings.get_mut("env") {
+            None => {
+                settings.insert("env".to_string(), json!({ name: value }));
+            }
+            Some(Value::Object(env)) => {
+                env.insert(name.to_string(), Value::String(value.to_string()));
+            }
+            Some(_) => {
+                return Err(format!(
+                    "role '{role}': claude_settings 'env' must be a mapping, because choco adds a variable to it to check that Claude Code applied the settings"
+                ));
             }
         }
-    });
-    (settings.to_string(), warnings)
+    }
+    settings.insert(
+        "claudeMdExcludes".to_string(),
+        json!([format!("!{}/**", escaped.trim_end_matches('/'))]),
+    );
+    let agents_md = json!({ "options": { "instructionFiles": "claude-md-and-agents-md" } });
+    match settings.get_mut("pluginConfigs") {
+        Some(Value::Object(plugins)) => {
+            plugins.insert("cc-plugin-agents-md@builtin".to_string(), agents_md);
+        }
+        _ => {
+            settings.insert(
+                "pluginConfigs".to_string(),
+                json!({ "cc-plugin-agents-md@builtin": agents_md }),
+            );
+        }
+    }
+    Ok((Value::Object(settings).to_string(), warnings))
 }
 
 /// `resolved` as a string, lossily (with a warning) when it isn't UTF-8.
@@ -1478,6 +1833,7 @@ mod tests {
     async fn start_spawns_process_and_streams_events() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -1530,6 +1886,7 @@ mod tests {
     async fn resume_passes_session_id_through_to_the_cli() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -1563,6 +1920,7 @@ mod tests {
     async fn a_sandboxed_spawn_bypasses_claudes_own_permission_prompts() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -1598,6 +1956,7 @@ mod tests {
     async fn an_unsandboxed_spawn_leaves_claudes_permission_prompts_enabled() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -1631,6 +1990,7 @@ mod tests {
     async fn a_turn_with_no_outcomes_still_gets_the_tool_but_no_routing_instruction() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -1669,6 +2029,7 @@ mod tests {
     async fn a_turn_with_outcomes_gets_a_routing_instruction_naming_them() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -1735,6 +2096,7 @@ mod tests {
     async fn a_turn_with_report_sections_passes_them_to_the_tool() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -1817,6 +2179,7 @@ mod tests {
     ) -> HashMap<String, String> {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools,
@@ -1948,6 +2311,7 @@ mod tests {
     fn an_omp_only_level_fails_the_spawn_naming_role_and_suffix() {
         let adapter = ClaudeAdapter::with_binary("/nonexistent/never-spawned");
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -1984,6 +2348,7 @@ mod tests {
     async fn a_real_claude_turn_runs_with_an_effort_suffix() {
         let adapter = ClaudeAdapter::new();
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -2178,7 +2543,8 @@ mod tests {
     #[test]
     fn isolated_settings_falls_back_with_a_warning_when_the_path_cannot_be_resolved() {
         let missing = std::env::temp_dir().join(format!("choco-missing-{}", uuid::Uuid::new_v4()));
-        let (json_str, warnings) = isolated_settings(&missing);
+        let (json_str, warnings) =
+            isolated_settings("coder", &missing, &ClaudeSettings::default(), None).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("could not resolve the real path"));
         let settings: Value = serde_json::from_str(&json_str).unwrap();
@@ -2207,6 +2573,7 @@ mod tests {
     async fn an_isolated_spawn_whose_init_has_no_plugins_key_produces_no_warning() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -2245,6 +2612,7 @@ mod tests {
         ] {
             let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
             let cfg = RoleConfig {
+                claude_settings: Default::default(),
                 role: "coder".to_string(),
                 project_id: None,
                 disallowed_tools: Vec::new(),
@@ -2295,7 +2663,8 @@ mod tests {
     #[test]
     fn the_scope_glob_has_no_doubled_slash_when_resolution_fails() {
         let missing = std::env::temp_dir().join(format!("choco-missing-{}/", uuid::Uuid::new_v4()));
-        let (json_str, _) = isolated_settings(&missing);
+        let (json_str, _) =
+            isolated_settings("coder", &missing, &ClaudeSettings::default(), None).unwrap();
         let settings: Value = serde_json::from_str(&json_str).unwrap();
         let glob = settings["claudeMdExcludes"][0].as_str().unwrap();
         assert!(glob.ends_with("/**") && !glob.ends_with("//**"), "{glob}");
@@ -2322,6 +2691,7 @@ mod tests {
             report_outcomes: Vec::new(),
             report_sections: Vec::new(),
             isolation: Isolation::default(),
+            claude_settings: ClaudeSettings::default(),
         };
         let mut handle = adapter.start("go", &cfg).unwrap();
         let first = handle.recv().await;
@@ -2344,6 +2714,7 @@ mod tests {
         );
         let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -2611,6 +2982,7 @@ mod tests {
 
         let adapter = ClaudeAdapter::new();
         let cfg = RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             cwd: repo.clone(),
@@ -2823,5 +3195,669 @@ mod tests {
         );
         let none = AgentEvent::BackgroundJobs { running: vec![] }.payload();
         assert_eq!(none["message"], "no background jobs running");
+    }
+
+    // ---- claude_settings and the settings check (#346) -------------------
+
+    fn settings_of(yaml: &str) -> ClaudeSettings {
+        ClaudeSettings::from_yaml(Some(serde_yaml::from_str(yaml).unwrap())).unwrap()
+    }
+
+    fn sentinel_regexes() -> (regex::Regex, regex::Regex) {
+        (
+            regex::Regex::new("^CHOCOFACTORY_SETTINGS_[0-9a-f]{32}$").unwrap(),
+            regex::Regex::new("^[0-9a-f]{32}$").unwrap(),
+        )
+    }
+
+    /// The path of the real `choco` next to this test binary (built by
+    /// `cargo build --workspace --all-targets`). A missing one fails the test.
+    fn real_choco() -> String {
+        let mut path = std::env::current_exe().unwrap();
+        path.pop();
+        if path.ends_with("deps") {
+            path.pop();
+        }
+        let path = path.join("choco");
+        assert!(
+            path.exists(),
+            "{} is missing: run `cargo build --workspace --all-targets` first",
+            path.display()
+        );
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn isolated_settings_with_no_settings_and_no_sentinel_is_todays_literal() {
+        let cwd = std::env::temp_dir();
+        let (json_str, _) =
+            isolated_settings("coder", &cwd, &ClaudeSettings::default(), None).unwrap();
+        let canon = std::fs::canonicalize(&cwd).unwrap();
+        let glob = serde_json::to_string(&format!(
+            "!{}/**",
+            glob_escape(canon.to_str().unwrap()).trim_end_matches('/')
+        ))
+        .unwrap();
+        assert_eq!(
+            json_str,
+            format!(
+                r#"{{"claudeMdExcludes":[{glob}],"pluginConfigs":{{"cc-plugin-agents-md@builtin":{{"options":{{"instructionFiles":"claude-md-and-agents-md"}}}}}}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn choco_scope_keys_are_written_last_and_other_plugin_entries_survive() {
+        let settings = settings_of(
+            "claudeMdExcludes: ['!/**']\npluginConfigs:\n  cc-plugin-agents-md@builtin: {options: {instructionFiles: claude-md-only}}\n  other@mkt: {options: {x: 1}}\nattribution: {commit: ''}",
+        );
+        let (json_str, _) =
+            isolated_settings("coder", &std::env::temp_dir(), &settings, None).unwrap();
+        let got: Value = serde_json::from_str(&json_str).unwrap();
+        let mut expected = expected_settings(&std::env::temp_dir());
+        expected["pluginConfigs"]["other@mkt"] = json!({"options": {"x": 1}});
+        expected["attribution"] = json!({"commit": ""});
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_plugin_configs_that_is_not_a_mapping_is_replaced_by_chocos() {
+        let settings = settings_of("pluginConfigs: [x]");
+        let (json_str, _) =
+            isolated_settings("coder", &std::env::temp_dir(), &settings, None).unwrap();
+        let got: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(got, expected_settings(&std::env::temp_dir()));
+    }
+
+    #[test]
+    fn the_sentinel_goes_into_the_roles_env_mapping_or_a_new_one() {
+        let cwd = std::env::temp_dir();
+        let with_env = settings_of("env: {VISIBLE: v-1}");
+        let (json_str, _) = isolated_settings(
+            "coder",
+            &cwd,
+            &with_env,
+            Some(("CHOCOFACTORY_SETTINGS_aa", "bb")),
+        )
+        .unwrap();
+        let got: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            got["env"],
+            json!({"VISIBLE": "v-1", "CHOCOFACTORY_SETTINGS_aa": "bb"})
+        );
+        let without = settings_of("attribution: {commit: ''}");
+        let (json_str, _) = isolated_settings(
+            "coder",
+            &cwd,
+            &without,
+            Some(("CHOCOFACTORY_SETTINGS_aa", "bb")),
+        )
+        .unwrap();
+        let got: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(got["env"], json!({"CHOCOFACTORY_SETTINGS_aa": "bb"}));
+    }
+
+    #[test]
+    fn a_role_env_that_is_not_a_mapping_is_an_error_never_replaced() {
+        for yaml in ["env: [a]", "env: env-secret-x", "env: 3", "env: true"] {
+            let err = isolated_settings(
+                "coder",
+                &std::env::temp_dir(),
+                &settings_of(yaml),
+                Some(("CHOCOFACTORY_SETTINGS_aa", "bb")),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                "role 'coder': claude_settings 'env' must be a mapping, because choco adds a variable to it to check that Claude Code applied the settings"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_role_refuses_a_non_mapping_env_only_for_an_isolated_role() {
+        let adapter = ClaudeAdapter::with_binary("claude");
+        let isolated = Isolation::default();
+        let message = "role 'coder': claude_settings 'env' must be a mapping, because choco adds a variable to it to check that Claude Code applied the settings";
+        for yaml in ["env: [a]", "env: x", "env: 1", "env: false"] {
+            assert_eq!(
+                adapter
+                    .validate_role("coder", &isolated, &settings_of(yaml))
+                    .unwrap_err(),
+                message,
+                "{yaml}"
+            );
+            assert!(
+                adapter
+                    .validate_role(
+                        "chat",
+                        &Isolation::InheritOperatorConfig,
+                        &settings_of(yaml)
+                    )
+                    .is_ok(),
+                "chat takes any env: {yaml}"
+            );
+        }
+        for yaml in ["env: {A: b}", "env: ~", "attribution: {commit: ''}", "{}"] {
+            assert!(
+                adapter
+                    .validate_role("coder", &isolated, &settings_of(yaml))
+                    .is_ok(),
+                "{yaml}"
+            );
+        }
+    }
+
+    fn status_reply(servers: Value) -> Value {
+        json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "chocofactory-mcp-status",
+            "response": {"mcpServers": servers}}})
+    }
+
+    fn server(status: &str, tools: &[&str]) -> Value {
+        json!({"name": "chocofactory", "status": status,
+               "config": {"args": ["--claude-settings-sentinel", "CHOCOFACTORY_SETTINGS_aa=secret-value"]},
+               "tools": tools.iter().map(|t| json!({"name": t})).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn the_mcp_status_verdict_passes_only_a_connected_server_offering_report_outcome() {
+        assert_eq!(
+            settings_verdict(&status_reply(json!([server(
+                "connected",
+                &["report_outcome"]
+            )]))),
+            Ok(())
+        );
+        let unconfirmed = |status: &str| {
+            Err(SettingsVerdict::Unconfirmed {
+                status: status.to_string(),
+            })
+        };
+        assert_eq!(
+            settings_verdict(&status_reply(json!([server(
+                "connected",
+                &["claude_settings_rejected"]
+            )]))),
+            Err(SettingsVerdict::Rejected)
+        );
+        assert_eq!(
+            settings_verdict(&status_reply(json!([server("failed", &[])]))),
+            unconfirmed("failed")
+        );
+        assert_eq!(
+            settings_verdict(&status_reply(json!([server("pending", &[])]))),
+            unconfirmed("pending")
+        );
+        assert_eq!(
+            settings_verdict(&status_reply(json!([server("connected", &["other"])]))),
+            unconfirmed("connected without report_outcome")
+        );
+        assert_eq!(
+            settings_verdict(&status_reply(
+                json!([{"name": "other", "status": "connected"}])
+            )),
+            unconfirmed("not listed")
+        );
+        assert_eq!(
+            settings_verdict(&status_reply(json!([]))),
+            unconfirmed("not listed")
+        );
+        assert_eq!(
+            settings_verdict(&json!({"type": "control_response", "response": {
+                "subtype": "error", "request_id": "chocofactory-mcp-status",
+                "error": "secret-error-text"}})),
+            unconfirmed("the CLI refused the mcp_status request")
+        );
+        assert_eq!(
+            settings_verdict(&json!({"type": "control_response"})),
+            unconfirmed("the CLI refused the mcp_status request")
+        );
+        // A status word that is not plain lowercase is never copied.
+        assert_eq!(
+            settings_verdict(&status_reply(json!([server(
+                "CHOCOFACTORY_SETTINGS_aa=secret-value",
+                &[]
+            )]))),
+            unconfirmed("unrecognised status")
+        );
+    }
+
+    #[test]
+    fn the_rejected_event_message_names_the_role_and_no_value() {
+        let event = AgentEvent::SettingsNotApplied {
+            verdict: SettingsVerdict::Rejected,
+            role: "coder".to_string(),
+        };
+        assert_eq!(event.event_type(), EventType::Error);
+        assert_eq!(
+            event.payload(),
+            json!({"message": "Claude Code did not apply role 'coder''s claude_settings: it ignores the whole settings when one value is invalid. choco stopped the turn."})
+        );
+        let event = AgentEvent::SettingsNotApplied {
+            verdict: SettingsVerdict::Unconfirmed {
+                status: "failed".to_string(),
+            },
+            role: "coder".to_string(),
+        };
+        assert_eq!(
+            event.payload(),
+            json!({"message": "choco could not confirm that Claude Code applied role 'coder''s claude_settings (its tool server reported: failed). choco stopped the turn."})
+        );
+    }
+
+    /// Runs the echo fixture with these settings through `start`.
+    async fn echo_args_settings(
+        isolation: Isolation,
+        claude_settings: ClaudeSettings,
+    ) -> HashMap<String, String> {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"))
+            .with_choco_binary(real_choco());
+        let cfg = RoleConfig {
+            claude_settings,
+            role: "coder".to_string(),
+            project_id: None,
+            disallowed_tools: Vec::new(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: vec!["done".to_string()],
+            report_sections: Vec::new(),
+            isolation,
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            next_assistant_message(&mut handle),
+        )
+        .await
+        .expect("the fixture never replied: its prompt was held back");
+        let AgentEvent::AssistantMessage { text } = reply else {
+            unreachable!()
+        };
+        echo_fields(&text)
+    }
+
+    fn mcp_args_of(fields: &HashMap<String, String>) -> Vec<String> {
+        let config: Value = serde_json::from_str(&fields["mcp_config"]).unwrap();
+        assert!(
+            config["mcpServers"]["chocofactory"].get("env").is_none(),
+            "the MCP config must not carry an env: {config}"
+        );
+        config["mcpServers"]["chocofactory"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn empty_settings_leave_an_isolated_spawn_byte_for_byte_as_before() {
+        let fields = echo_args_settings(Isolation::default(), ClaudeSettings::default()).await;
+        let canon = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let glob = serde_json::to_string(&format!(
+            "!{}/**",
+            glob_escape(canon.to_str().unwrap()).trim_end_matches('/')
+        ))
+        .unwrap();
+        assert_eq!(
+            fields["settings"],
+            format!(
+                r#"{{"claudeMdExcludes":[{glob}],"pluginConfigs":{{"cc-plugin-agents-md@builtin":{{"options":{{"instructionFiles":"claude-md-and-agents-md"}}}}}}}}"#
+            )
+        );
+        assert!(
+            !mcp_args_of(&fields)
+                .iter()
+                .any(|a| a.contains("claude-settings-sentinel")),
+            "no sentinel without settings"
+        );
+        // The writer sent only `initialize`: no `mcp_status` is asked.
+        let initialize: Value = serde_json::from_str(&fields["initialize"]).unwrap();
+        assert_eq!(initialize, json!({ "subtype": "initialize", "skills": [] }));
+    }
+
+    #[tokio::test]
+    async fn an_isolated_spawn_with_settings_adds_exactly_one_sentinel_to_env_and_to_the_tool_servers_args()
+     {
+        let settings = settings_of("attribution: {commit: c1}\nenv: {VISIBLE: v-1}");
+        let fields = echo_args_settings(Isolation::default(), settings).await;
+        assert_eq!(fields["settings_count"], "1");
+        let sent: Value = serde_json::from_str(&fields["settings"]).unwrap();
+        assert_eq!(sent["attribution"], json!({"commit": "c1"}));
+        let env = sent["env"].as_object().unwrap();
+        let (name_re, value_re) = sentinel_regexes();
+        let sentinels: Vec<_> = env.iter().filter(|(k, _)| name_re.is_match(k)).collect();
+        assert_eq!(sentinels.len(), 1, "{env:?}");
+        assert_eq!(
+            env.len(),
+            2,
+            "the role's key plus exactly one sentinel: {env:?}"
+        );
+        assert_eq!(env["VISIBLE"], "v-1");
+        let (name, value) = sentinels[0];
+        assert!(value_re.is_match(value.as_str().unwrap()));
+        // The expected pair reaches the tool server as an argument, from the
+        // same variables.
+        let args = mcp_args_of(&fields);
+        let at = args
+            .iter()
+            .position(|a| a == "--claude-settings-sentinel")
+            .expect("the sentinel flag");
+        assert_eq!(args[at + 1], format!("{name}={}", value.as_str().unwrap()));
+        // Claude's own environment never carries it.
+        assert!(!fields["mcp_config"].contains("\"env\""));
+    }
+
+    /// D2 through the spawn: config.yaml `env` + `attribution`, the workflow's
+    /// `env` replaces the whole `env` (no deep merge), and a workflow `null`
+    /// leaves `env` holding only the sentinel.
+    #[tokio::test]
+    async fn layered_settings_reach_the_spawn_key_by_key_and_a_null_leaves_only_the_sentinel() {
+        use crate::global_config::{GlobalConfig, GlobalRoleConfig};
+        let mut global = GlobalConfig::default();
+        global.roles.insert(
+            "coder".to_string(),
+            GlobalRoleConfig {
+                claude_settings: settings_of(
+                    "env: {A: from-global}\nattribution: {commit: global-c}",
+                ),
+                ..Default::default()
+            },
+        );
+        let def = |yaml: &str| crate::workflow_def::RoleDef {
+            claude_settings: settings_of(yaml),
+            cli: Some("claude".to_string()),
+            model: None,
+            system_prompt_file: None,
+            isolation: Isolation::default(),
+            disallowed_tools: Vec::new(),
+            read_only: false,
+        };
+        let (name_re, _) = sentinel_regexes();
+
+        let merged = crate::role_config::resolve_claude_settings(
+            "coder",
+            &def("env: {B: from-workflow}"),
+            &global,
+        )
+        .unwrap();
+        let fields = echo_args_settings(Isolation::default(), merged).await;
+        let sent: Value = serde_json::from_str(&fields["settings"]).unwrap();
+        assert_eq!(sent["attribution"], json!({"commit": "global-c"}));
+        let env = sent["env"].as_object().unwrap();
+        assert_eq!(env["B"], "from-workflow");
+        assert!(!env.contains_key("A"), "no deep merge: {env:?}");
+        assert_eq!(env.keys().filter(|k| name_re.is_match(k)).count(), 1);
+        assert_eq!(env.len(), 2);
+
+        let merged =
+            crate::role_config::resolve_claude_settings("coder", &def("env: ~"), &global).unwrap();
+        let fields = echo_args_settings(Isolation::default(), merged).await;
+        let sent: Value = serde_json::from_str(&fields["settings"]).unwrap();
+        assert_eq!(sent["attribution"], json!({"commit": "global-c"}));
+        let env = sent["env"].as_object().unwrap();
+        assert_eq!(env.len(), 1, "only the sentinel: {env:?}");
+        assert!(name_re.is_match(env.keys().next().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_chat_spawn_passes_its_settings_once_alone_and_with_no_sentinel() {
+        let settings = settings_of("attribution: {commit: ''}");
+        let fields = echo_args_settings(Isolation::InheritOperatorConfig, settings).await;
+        assert_eq!(fields["settings_count"], "1");
+        let sent: Value = serde_json::from_str(&fields["settings"]).unwrap();
+        assert_eq!(sent, json!({"attribution": {"commit": ""}}));
+        assert!(
+            !mcp_args_of(&fields)
+                .iter()
+                .any(|a| a.contains("claude-settings-sentinel"))
+        );
+        for empty in [ClaudeSettings::default(), settings_of("{}")] {
+            let fields = echo_args_settings(Isolation::InheritOperatorConfig, empty).await;
+            assert_eq!(fields["settings"], "<unset>");
+            assert_eq!(fields["settings_count"], "0");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_spawns_get_different_sentinels() {
+        let settings = settings_of("attribution: {commit: ''}");
+        let a = echo_args_settings(Isolation::default(), settings.clone()).await;
+        let b = echo_args_settings(Isolation::default(), settings).await;
+        let sentinel = |fields: &HashMap<String, String>| {
+            let args = mcp_args_of(fields);
+            let at = args
+                .iter()
+                .position(|a| a == "--claude-settings-sentinel")
+                .unwrap();
+            args[at + 1].clone()
+        };
+        assert_ne!(sentinel(&a), sentinel(&b));
+    }
+
+    /// A temp dir holding a `/bin/sh` wrapper around the fake claude, with the
+    /// fixture's mode set by the wrapper, never by the test process.
+    struct Gate {
+        dir: PathBuf,
+        wrapper: String,
+    }
+
+    impl Gate {
+        fn new(mode: &str, init_tools: Option<&str>) -> Self {
+            let dir = std::env::temp_dir().join(format!("choco-gate-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let wrapper = dir.join("claude");
+            let init = init_tools
+                .map(|tools| format!("export FAKE_CLAUDE_INIT_TOOLS='{tools}'\n"))
+                .unwrap_or_default();
+            crate::test_support::write_executable(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nexport FAKE_CLAUDE_SETTINGS={mode}\nexport FAKE_CLAUDE_PROMPT_MARKER={dir}/prompt\nexport FAKE_CLAUDE_ARGV_FILE={dir}/argv.json\n{init}exec {fixture} \"$@\"\n",
+                    dir = dir.display(),
+                    fixture = fixture_binary("fake_claude.py"),
+                ),
+            );
+            Gate {
+                dir,
+                wrapper: wrapper.to_string_lossy().into_owned(),
+            }
+        }
+
+        fn prompt_written(&self) -> bool {
+            self.dir.join("prompt").exists()
+        }
+
+        /// Starts the single-shot turn and returns every event until the
+        /// stream ends.
+        async fn run(&self, choco: &str) -> Vec<AgentEvent> {
+            let adapter = ClaudeAdapter::with_binary(self.wrapper.clone()).with_choco_binary(choco);
+            let cfg = RoleConfig {
+                claude_settings: settings_of("attribution: {commit: secret-commit-text}"),
+                role: "coder".to_string(),
+                project_id: None,
+                disallowed_tools: Vec::new(),
+                cwd: std::env::temp_dir(),
+                model: None,
+                system_prompt: None,
+                sandboxed: true,
+                report_outcomes: vec!["done".to_string()],
+                report_sections: Vec::new(),
+                isolation: Isolation::default(),
+            };
+            let mut handle = adapter.start("go", &cfg).unwrap();
+            let mut events = Vec::new();
+            let result = tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, async {
+                while let Some(event) = handle.recv().await {
+                    // As the session manager does once a turn has ended.
+                    if matches!(event, AgentEvent::TurnCompleted { .. }) {
+                        handle.close_stdin();
+                    }
+                    events.push(event);
+                }
+            })
+            .await;
+            assert!(result.is_ok(), "the stream did not end: {events:?}");
+            let status = handle.wait().await.unwrap();
+            assert!(status.success(), "the fake exits cleanly on stdin EOF");
+            events
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn not_applied(events: &[AgentEvent]) -> Vec<&SettingsVerdict> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::SettingsNotApplied { verdict, role } => {
+                    assert_eq!(role, "coder");
+                    Some(verdict)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn applied_settings_open_the_gate_and_the_turn_completes() {
+        let gate = Gate::new("apply", None);
+        let events = gate.run(&real_choco()).await;
+        assert!(not_applied(&events).is_empty(), "{events:?}");
+        assert!(gate.prompt_written());
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnCompleted {
+                is_error: false,
+                ..
+            }
+        )));
+        let meta = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::SessionMeta { details, .. } => Some(details),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(meta["claude_settings_keys"], json!(["attribution"]));
+        // Key names only: no value reaches an event.
+        let serialized = format!("{events:?}");
+        assert!(!serialized.contains("secret-commit-text"), "{serialized}");
+        // Nothing in any event carries the sentinel.
+        let argv: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(gate.dir.join("argv.json")).unwrap())
+                .unwrap();
+        let config: Value =
+            serde_json::from_str(&argv[argv.iter().position(|a| a == "--mcp-config").unwrap() + 1])
+                .unwrap();
+        let args = config["mcpServers"]["chocofactory"]["args"]
+            .as_array()
+            .unwrap();
+        let flag = args[args
+            .iter()
+            .position(|a| a == "--claude-settings-sentinel")
+            .unwrap()
+            + 1]
+        .as_str()
+        .unwrap();
+        let (name, value) = flag.split_once('=').unwrap();
+        let all = format!("{events:?}");
+        assert!(!all.contains(name) && !all.contains(value), "{all}");
+    }
+
+    #[tokio::test]
+    async fn rejected_settings_stop_the_turn_before_its_prompt() {
+        let gate = Gate::new("reject", None);
+        let events = gate.run(&real_choco()).await;
+        assert_eq!(not_applied(&events), vec![&SettingsVerdict::Rejected]);
+        assert!(!gate.prompt_written(), "the prompt must never be written");
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnCompleted { .. } | AgentEvent::AssistantMessage { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_refuses_mcp_status_is_unconfirmed_and_gets_no_prompt() {
+        let gate = Gate::new("refuse", None);
+        let events = gate.run(&real_choco()).await;
+        assert_eq!(
+            not_applied(&events),
+            vec![&SettingsVerdict::Unconfirmed {
+                status: "the CLI refused the mcp_status request".to_string()
+            }]
+        );
+        assert!(!gate.prompt_written());
+        // The refusal's own text is not turned into a second error event.
+        assert!(
+            !events.iter().any(
+                |e| matches!(e, AgentEvent::Error { message } if message.contains("Unsupported"))
+            ),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_tool_server_is_unconfirmed_and_gets_no_prompt() {
+        let gate = Gate::new("apply", None);
+        let events = gate.run("/usr/bin/false").await;
+        assert_eq!(
+            not_applied(&events),
+            vec![&SettingsVerdict::Unconfirmed {
+                status: "failed".to_string()
+            }]
+        );
+        assert!(!gate.prompt_written());
+    }
+
+    #[tokio::test]
+    async fn an_init_line_listing_the_rejected_tool_is_a_second_detector() {
+        let gate = Gate::new(
+            "apply",
+            Some(r#"["mcp__chocofactory__claude_settings_rejected"]"#),
+        );
+        let events = gate.run(&real_choco()).await;
+        assert_eq!(not_applied(&events), vec![&SettingsVerdict::Rejected]);
+        assert!(!gate.prompt_written());
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_never_answers_holds_the_prompt_back() {
+        let gate = Gate::new("silent", None);
+        let adapter =
+            ClaudeAdapter::with_binary(gate.wrapper.clone()).with_choco_binary(real_choco());
+        let cfg = RoleConfig {
+            claude_settings: settings_of("attribution: {commit: c1}"),
+            role: "coder".to_string(),
+            project_id: None,
+            disallowed_tools: Vec::new(),
+            cwd: std::env::temp_dir(),
+            model: None,
+            system_prompt: None,
+            sandboxed: true,
+            report_outcomes: vec!["done".to_string()],
+            report_sections: Vec::new(),
+            isolation: Isolation::default(),
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        handle.send("a later message").unwrap();
+        // The init line arrives; nothing else, and no prompt reaches the CLI.
+        let first = tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, handle.recv())
+            .await
+            .unwrap();
+        assert!(matches!(first, Some(AgentEvent::SessionMeta { .. })));
+        let more = tokio::time::timeout(std::time::Duration::from_millis(700), handle.recv()).await;
+        assert!(more.is_err(), "nothing more is expected: {more:?}");
+        assert!(!gate.prompt_written());
     }
 }

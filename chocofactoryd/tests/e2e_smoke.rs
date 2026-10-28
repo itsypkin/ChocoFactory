@@ -2405,6 +2405,93 @@ async fn daemon_refuses_to_start_on_an_unknown_cli_in_the_global_config() {
     assert_eq!(entries, vec!["config.yaml".to_string()], "{entries:?}");
 }
 
+/// Writes `config.yaml` into a fresh home and starts the real daemon on it,
+/// returning how it ended (stderr) if it exited, or `None` if it came up.
+async fn start_with_global_config(
+    config: &str,
+) -> (TempHome, Option<(std::process::ExitStatus, String)>) {
+    let home = TempHome::new();
+    let config_dir = home.0.join(".config/chocofactory");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.yaml"), config).unwrap();
+    let mut child = spawn_raw(&home.0, &[]);
+    let exited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let outcome = match exited {
+        Ok(status) => {
+            let status = status.unwrap();
+            let stderr = read_stderr_to_string(&mut child).await;
+            Some((status, stderr))
+        }
+        Err(_) => {
+            // Still running after 5 s: it started. Stop it.
+            sigterm_and_wait(&mut child).await;
+            None
+        }
+    };
+    (home, outcome)
+}
+
+fn only_config_left(home: &TempHome) {
+    let mut entries: Vec<String> = std::fs::read_dir(home.0.join(".config/chocofactory"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, vec!["config.yaml".to_string()], "{entries:?}");
+}
+
+/// A workflow-only `claude_settings` key in config.yaml stops the daemon at
+/// start, before it takes the lock or touches the database (#346).
+#[tokio::test]
+async fn daemon_refuses_to_start_on_a_workflow_only_claude_settings_key_in_the_global_config() {
+    let (home, outcome) =
+        start_with_global_config("roles:\n  coder:\n    claude_settings:\n      hooks: {}\n").await;
+    let (status, stderr) = outcome.expect("the daemon should have exited");
+    assert!(!status.success(), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains(
+            "role 'coder' sets claude_settings 'hooks' in the global config, which only a workflow file may set"
+        ),
+        "{stderr}"
+    );
+    only_config_left(&home);
+}
+
+/// An omp role in config.yaml may not carry `claude_settings` (#346).
+#[tokio::test]
+async fn daemon_refuses_to_start_on_claude_settings_for_an_omp_role_in_the_global_config() {
+    let (home, outcome) = start_with_global_config(
+        "roles:\n  coder:\n    cli: omp\n    claude_settings:\n      attribution: {commit: x}\n",
+    )
+    .await;
+    let (status, stderr) = outcome.expect("the daemon should have exited");
+    assert!(!status.success(), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains(
+            "role 'coder' sets claude_settings, which a role on cli omp can't take; claude_settings is only for claude roles"
+        ),
+        "{stderr}"
+    );
+    only_config_left(&home);
+}
+
+/// config.yaml carries no isolation, so a chat role's `env: x` (fine for a
+/// role that inherits the operator's setup) must not stop the daemon (#346).
+#[tokio::test]
+async fn daemon_starts_with_a_non_mapping_env_for_a_claude_role_in_the_global_config() {
+    let home = TempHome::new();
+    let config_dir = home.0.join(".config/chocofactory");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.yaml"),
+        "roles:\n  chat:\n    cli: claude\n    claude_settings:\n      env: x\n",
+    )
+    .unwrap();
+    // `spawn_with_home` waits until the daemon answers, and fails if it exits.
+    let daemon = Daemon::spawn_with_home(home).await;
+    drop(daemon);
+}
+
 /// #336 through the real binary: a daemon launched with
 /// `CLAUDE_CODE_EFFORT_LEVEL=max` in its environment must not leak it to the
 /// agent (claude would let it beat `--effort`), and a role with no level runs

@@ -7,6 +7,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use chocofactory_core::models::EventType;
+
+use crate::claude_settings::ClaudeSettings;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -49,7 +51,9 @@ pub struct RoleConfig {
     /// How much of the operator's own CLI setup this turn inherits (#90).
     /// Role-derived, from the workflow definition only — never task config
     /// or global config — because every setting here can only *loosen* what
-    /// a workflow agent is exposed to.
+    /// a workflow agent is exposed to. (`claude_settings` below is the one
+    /// role field with a global-config layer; its workflow-only keys are
+    /// the ones that load code or plugins.)
     pub isolation: Isolation,
     /// Tools this role must not use (#172), from the workflow definition
     /// only — never task or global config. Adapter-neutral names; each
@@ -63,6 +67,12 @@ pub struct RoleConfig {
     /// `role_config::resolve`. `None` only in hand-built configs; an adapter
     /// that keeps per-project data refuses to run without one.
     pub project_id: Option<String>,
+    /// The role's merged `claude_settings` (#346): Claude Code settings the
+    /// operator wrote for choco's agents, from the global config and the
+    /// workflow definition (never task config). Empty means nothing extra.
+    /// The claude adapter passes them in `--settings`; the omp adapter
+    /// refuses a non-empty one.
+    pub claude_settings: ClaudeSettings,
 }
 
 /// The adapter-neutral tool vocabulary a workflow's `disallowed_tools` may
@@ -241,6 +251,45 @@ pub enum AgentEvent {
     BackgroundJobs {
         running: Vec<BackgroundJob>,
     },
+    /// Claude Code did not apply the role's `claude_settings`, or choco could
+    /// not confirm it did (#346). Recorded as an ordinary `error` event;
+    /// carried as its own variant so `session::drain_session` can kill the
+    /// process at once and end the session with the matching reason. Sent
+    /// normally before the turn's prompt is written (the `mcp_status` check),
+    /// but the `init`-line backstop can send it after the prompt. Only the
+    /// claude adapter sends it.
+    SettingsNotApplied {
+        verdict: SettingsVerdict,
+        /// The role's name, for the message.
+        role: String,
+    },
+}
+
+/// What the claude adapter found out about the role's `claude_settings`.
+/// Normally that is before the prompt is written; the `init`-line backstop
+/// can find a `Rejected` after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsVerdict {
+    /// The tool server saw no matching sentinel: Claude Code discarded the
+    /// settings.
+    Rejected,
+    /// Choco could not tell. `status` is a fixed phrase or the tool
+    /// server's own status word, never anything from the settings.
+    Unconfirmed { status: String },
+}
+
+impl SettingsVerdict {
+    /// The timeline's message for this verdict.
+    pub fn message(&self, role: &str) -> String {
+        match self {
+            SettingsVerdict::Rejected => format!(
+                "Claude Code did not apply role '{role}''s claude_settings: it ignores the whole settings when one value is invalid. choco stopped the turn."
+            ),
+            SettingsVerdict::Unconfirmed { status } => format!(
+                "choco could not confirm that Claude Code applied role '{role}''s claude_settings (its tool server reported: {status}). choco stopped the turn."
+            ),
+        }
+    }
 }
 
 /// One background job (a background shell command or sub-agent) the CLI
@@ -364,7 +413,9 @@ impl AgentEvent {
             AgentEvent::ToolResult { .. } => EventType::ToolResult,
             AgentEvent::Thinking { .. } => EventType::Thinking,
             AgentEvent::SessionMeta { .. } => EventType::SessionMeta,
-            AgentEvent::Error { .. } | AgentEvent::Interrupted { .. } => EventType::Error,
+            AgentEvent::Error { .. }
+            | AgentEvent::Interrupted { .. }
+            | AgentEvent::SettingsNotApplied { .. } => EventType::Error,
             AgentEvent::TurnCompleted { .. } => EventType::TurnCompleted,
             AgentEvent::Subagent { event, .. } => event.event_type(),
             AgentEvent::BackgroundJobs { .. } => EventType::SessionNote,
@@ -416,6 +467,9 @@ impl AgentEvent {
                 "interrupted": "usage_limit",
                 "detected_by": detected_by.as_str(),
             }),
+            AgentEvent::SettingsNotApplied { verdict, role } => {
+                serde_json::json!({ "message": verdict.message(role) })
+            }
             AgentEvent::TurnCompleted { is_error, .. } => {
                 serde_json::json!({ "is_error": is_error })
             }
@@ -485,11 +539,19 @@ pub trait AgentAdapter: Send + Sync {
     /// The name a role's `cli:` uses to select this adapter, and the value
     /// stored in `sessions.cli_adapter`.
     fn name(&self) -> &'static str;
-    /// Whether this adapter can run a role with this isolation at all.
-    /// Checked wherever a role's CLI is chosen (workflow load, task create,
-    /// config PATCH) and again at turn start and chat resume, which is the
-    /// check nothing can skip. The default accepts everything.
-    fn validate_role(&self, _role: &str, _isolation: &Isolation) -> Result<(), String> {
+    /// Whether this adapter can run a role with this isolation and these
+    /// `claude_settings` at all. Checked wherever a role's CLI is chosen
+    /// (workflow load, daemon start, task create, config PATCH) and again at
+    /// turn start and chat resume, which is the check nothing can skip. The
+    /// settings passed are whichever layer the caller has: the workflow's
+    /// own at load, the global config's at daemon start, the merged ones
+    /// elsewhere. The default accepts everything.
+    fn validate_role(
+        &self,
+        _role: &str,
+        _isolation: &Isolation,
+        _claude_settings: &ClaudeSettings,
+    ) -> Result<(), String> {
         Ok(())
     }
     /// Whether this adapter can run a role on this model string (#336: a
@@ -640,13 +702,17 @@ pub fn check_task_config_roles(
     names.sort();
     for name in names {
         let role = &definition.roles[name.as_str()];
+        // Before the cli lookups: a workflow-only key in the global config is
+        // refused whatever the role's cli, and a merge error is never skipped.
+        let claude_settings = crate::role_config::resolve_claude_settings(name, role, global)
+            .map_err(|err| err.to_string())?;
         let Ok(cli) = crate::role_config::resolve_cli(name, role, global, task_config) else {
             continue;
         };
         let Ok(adapter) = registry.lookup(Some(name), &cli) else {
             continue;
         };
-        adapter.validate_role(name, &role.isolation)?;
+        adapter.validate_role(name, &role.isolation, &claude_settings)?;
         if let Ok(model) = crate::role_config::resolve_model(name, role, global, task_config) {
             adapter.validate_model(name, &model)?;
         }
@@ -681,16 +747,22 @@ pub(crate) const TURN_MARKER_PREFIX: &str = "CHOCOFACTORY_TURN_";
 /// token is in the *name*, so a nested daemon's own markers never overwrite
 /// this one. There is no fallback: a failed read fails the spawn.
 pub(crate) fn new_turn_marker() -> Result<String, AdapterError> {
+    Ok(format!("{TURN_MARKER_PREFIX}{}", random_hex_128()?))
+}
+
+/// 128 random bits from `/dev/urandom` as 32 lowercase hex digits. No
+/// fallback: a failed read is the caller's failed spawn.
+pub(crate) fn random_hex_128() -> Result<String, AdapterError> {
     use std::io::Read;
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))
         .map_err(AdapterError::Spawn)?;
-    let mut name = String::from(TURN_MARKER_PREFIX);
+    let mut hex = String::with_capacity(32);
     for byte in bytes {
-        name.push_str(&format!("{byte:02x}"));
+        hex.push_str(&format!("{byte:02x}"));
     }
-    Ok(name)
+    Ok(hex)
 }
 
 impl AgentHandle {

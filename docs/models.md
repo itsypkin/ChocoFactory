@@ -12,6 +12,10 @@ most specific wins, independently per field:
 task config (--role-* below)  >  the workflow's roles: block  >  ~/.config/chocofactory/config.yaml
 ```
 
+`claude_settings` is the exception: it has two layers, `config.yaml` and the
+workflow's `roles:` block, merged key by key, and no task layer (see
+[`claude_settings`](workflows.md#claude_settings-claude-code-settings-for-chocos-agents)).
+
 The `--role-*` flags set the task-level layer. Each is `ROLE=VALUE` and each
 is repeatable, so several roles can be configured in one command. The built-in
 `coding-task` has two roles, `coder` and `reviewer`:
@@ -31,7 +35,9 @@ A role's `cli:` picks the agent adapter that runs it. The adapters are
 `claude` (the default) and `omp`, described below. An unknown name is rejected rather than run as
 `claude`: when a workflow is loaded, when the daemon starts (a bad `cli:` in
 `config.yaml` stops it with the message), and when a task is created or
-reconfigured (`--role-cli`). A value that slips in later, such as `config.yaml`
+reconfigured (`--role-cli`). A role that resolves to `omp` and carries a
+non-empty `claude_settings` is refused at the same points (workflow load, daemon
+start, create, reconfigure, turn start), naming the role. A value that slips in later, such as `config.yaml`
 edited while the daemon runs, parks the task `stuck` when the turn starts. A
 session can only be resumed by the adapter that created it, so a retry whose
 role's `cli:` has changed starts fresh instead.
@@ -90,7 +96,9 @@ roles ran at before. Put `:medium` on a role to keep the old behaviour.
 choco removes `CLAUDE_CODE_EFFORT_LEVEL` from the daemon's environment before
 starting an agent, because claude lets that variable beat the flag. An
 `effortLevel` setting has no effect on claude 2.1.308 and can't beat the
-flag either. Two things still can: an `env` block that sets
+flag either. Three things still can: an `env` block in the role's
+[`claude_settings`](workflows.md#claude_settings-claude-code-settings-for-chocos-agents)
+that sets `CLAUDE_CODE_EFFORT_LEVEL`; an `env` block that sets
 `CLAUDE_CODE_EFFORT_LEVEL` in the task repo's own committed
 `.claude/settings.json` (isolated roles apply the repo's committed settings,
 not your user or local ones; see
@@ -157,6 +165,8 @@ roles:
   is not loaded. Instruction files in subfolders (`sub/CLAUDE.md`) are not
   loaded either: a known gap. A role with `inherit_operator_config: true` (the
   chat role) keeps your omp setup and the repo's files, as it does on claude.
+- **No `claude_settings`.** `claude_settings` are Claude Code settings; a role
+  on omp can't take them and is refused (see above).
 - **Outside a disposable worktree.** A role that doesn't run in a
   `worktree: true` checkout can read files but has its edits and commands
   refused, and the agent sees the refusal. A role in a worktree has full

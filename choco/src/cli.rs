@@ -229,6 +229,15 @@ pub struct McpServeArgs {
     /// otherwise fail the whole subcommand and take the tool down with it.
     #[arg(long = "require-section", allow_hyphen_values = true)]
     pub required_sections: Vec<String>,
+
+    /// `NAME=VALUE`: an environment variable the daemon put in the role's
+    /// `claude_settings` `env`. The server checks, once at startup, that it
+    /// holds exactly this value; if not, Claude Code did not apply the
+    /// settings and the server offers no `report_outcome`. Passed as an
+    /// argument, never through the server's own environment, so the check
+    /// can only pass when Claude Code applied the settings.
+    #[arg(long = "claude-settings-sentinel", allow_hyphen_values = true)]
+    pub claude_settings_sentinel: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -851,6 +860,28 @@ mod tests {
             args.required_sections,
             vec!["Branches → tests", "Findings, blocking and minor"]
         );
+    }
+
+    #[test]
+    fn mcp_serve_parses_the_settings_sentinel() {
+        let cli = Cli::parse_from([
+            "choco",
+            "mcp-serve",
+            "--claude-settings-sentinel",
+            "CHOCOFACTORY_SETTINGS_ab=cd",
+        ]);
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(
+            args.claude_settings_sentinel.as_deref(),
+            Some("CHOCOFACTORY_SETTINGS_ab=cd")
+        );
+        let cli = Cli::parse_from(["choco", "mcp-serve"]);
+        let Command::McpServe(args) = cli.command else {
+            panic!("expected McpServe");
+        };
+        assert_eq!(args.claude_settings_sentinel, None);
     }
 
     /// `#[command(hide = true)]` hides it from `--help` text; it must not

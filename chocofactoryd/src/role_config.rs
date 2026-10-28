@@ -6,13 +6,20 @@
 //! `role_name` (it never assumes a particular name), which is exactly
 //! what lets #17/P2-6 resolve several roles on one task by calling this
 //! once per role, without changing this module at all.
+//!
+//! `claude_settings` (#346) is the exception: it has two layers, global
+//! config then workflow definition, merged key by key (`resolve_claude_settings`).
+//! Task config cannot set it.
 
 use std::fmt;
 
 use serde_json::Value;
 
 use crate::adapter::RoleConfig;
-use crate::global_config::GlobalConfig;
+use crate::claude_settings::ClaudeSettings;
+use crate::global_config::{
+    GlobalConfig, WorkflowOnlyKeyError, check_workflow_only_claude_settings,
+};
 use crate::workflow_def::RoleDef;
 
 #[derive(Debug)]
@@ -31,6 +38,10 @@ pub enum RoleConfigError {
     /// own load time, so this is only reachable via a TOCTOU (the file
     /// removed in between) rather than an authoring mistake.
     SystemPromptIo(std::io::Error),
+    /// The global config's `claude_settings` for this role holds a key only
+    /// a workflow file may set (#346). Checked per role, when its turn
+    /// resolves, so editing one in while the daemon runs stops only that role.
+    WorkflowOnlyClaudeSettings(WorkflowOnlyKeyError),
 }
 
 impl fmt::Display for RoleConfigError {
@@ -43,6 +54,7 @@ impl fmt::Display for RoleConfigError {
             RoleConfigError::SystemPromptIo(err) => {
                 write!(f, "failed to read resolved system prompt file: {err}")
             }
+            RoleConfigError::WorkflowOnlyClaudeSettings(err) => write!(f, "{err}"),
         }
     }
 }
@@ -104,6 +116,29 @@ pub fn resolve_model(
     })
 }
 
+/// The role's merged `claude_settings` (#346): the global config's layer, then
+/// each top-level key of the workflow's layer replacing it whole (no deep
+/// merge, and a workflow `null` wins), then top-level `null`s removed because
+/// Claude Code discards the entire `--settings` on one. Never reads task
+/// config. Refuses a global-config layer holding a workflow-only key.
+pub fn resolve_claude_settings(
+    role_name: &str,
+    role_def: &RoleDef,
+    global: &GlobalConfig,
+) -> Result<ClaudeSettings, RoleConfigError> {
+    let mut merged = match global.roles.get(role_name) {
+        Some(role) => {
+            check_workflow_only_claude_settings(role_name, &role.claude_settings)
+                .map_err(RoleConfigError::WorkflowOnlyClaudeSettings)?;
+            role.claude_settings.clone()
+        }
+        None => ClaudeSettings::default(),
+    };
+    merged.overlay(&role_def.claude_settings);
+    merged.drop_null_keys();
+    Ok(merged)
+}
+
 /// Resolves `role_name`'s final `cli`/`model`/system prompt against the
 /// three layers, plus `cwd`/`sandboxed`/`report` (stage- or task-wide, not
 /// per-role — passed straight through, not resolved here).
@@ -124,6 +159,8 @@ pub fn resolve(
     let cli = resolve_cli(role_name, role_def, global, task_config)?;
 
     let model = resolve_model(role_name, role_def, global, task_config)?;
+
+    let claude_settings = resolve_claude_settings(role_name, role_def, global)?;
 
     let system_prompt = if let Some(text) = task_role
         .and_then(|r| r.get("system_prompt"))
@@ -156,6 +193,7 @@ pub fn resolve(
             // Stage- and task-derived, passed straight through (#222).
             role: role_name.to_string(),
             project_id: Some(project_id.to_string()),
+            claude_settings,
         },
     })
 }
@@ -184,6 +222,7 @@ mod tests {
 
     fn role_def(cli: Option<&str>, model: Option<&str>) -> RoleDef {
         RoleDef {
+            claude_settings: Default::default(),
             disallowed_tools: Vec::new(),
             read_only: false,
             cli: cli.map(str::to_string),
@@ -199,6 +238,7 @@ mod tests {
         global.roles.insert(
             "chat".to_string(),
             crate::global_config::GlobalRoleConfig {
+                claude_settings: Default::default(),
                 cli: Some("global-cli".to_string()),
                 model: Some("global-model".to_string()),
                 system_prompt_file: None,
@@ -328,6 +368,7 @@ mod tests {
         global.roles.insert(
             "chat".to_string(),
             crate::global_config::GlobalRoleConfig {
+                claude_settings: Default::default(),
                 cli: Some("global-cli".to_string()),
                 model: Some("global-model".to_string()),
                 system_prompt_file: None,
@@ -357,6 +398,7 @@ mod tests {
         global.roles.insert(
             "chat".to_string(),
             crate::global_config::GlobalRoleConfig {
+                claude_settings: Default::default(),
                 cli: Some("global-cli".to_string()),
                 model: Some("global-model".to_string()),
                 system_prompt_file: None,
@@ -462,6 +504,7 @@ mod tests {
     fn a_task_level_system_prompt_file_cannot_override_the_workflow_def_file() {
         let secret = temp_prompt("secret.md", "SHOULD NEVER BE READ");
         let def = RoleDef {
+            claude_settings: Default::default(),
             disallowed_tools: Vec::new(),
             read_only: false,
             cli: Some("cli".to_string()),
@@ -548,6 +591,7 @@ mod tests {
         global.roles.insert(
             "coder".to_string(),
             crate::global_config::GlobalRoleConfig {
+                claude_settings: Default::default(),
                 cli: Some("coder-global-cli".to_string()),
                 model: None,
                 system_prompt_file: None,
@@ -556,6 +600,7 @@ mod tests {
         global.roles.insert(
             "reviewer".to_string(),
             crate::global_config::GlobalRoleConfig {
+                claude_settings: Default::default(),
                 cli: Some("reviewer-global-cli".to_string()),
                 model: None,
                 system_prompt_file: None,
@@ -615,6 +660,7 @@ mod tests {
         global.roles.insert(
             role.to_string(),
             crate::global_config::GlobalRoleConfig {
+                claude_settings: Default::default(),
                 cli: Some("cli".to_string()),
                 model: Some("model".to_string()),
                 system_prompt_file: Some(path),
@@ -630,6 +676,7 @@ mod tests {
         let def_path = temp_prompt("def.md", "from the workflow definition");
         let global_path = temp_prompt("global.md", "from global config");
         let def = RoleDef {
+            claude_settings: Default::default(),
             disallowed_tools: Vec::new(),
             read_only: false,
             cli: Some("cli".to_string()),
@@ -689,6 +736,7 @@ mod tests {
     fn task_level_system_prompt_beats_a_workflow_def_file() {
         let def_path = temp_prompt("def.md", "from the workflow definition");
         let def = RoleDef {
+            claude_settings: Default::default(),
             disallowed_tools: Vec::new(),
             read_only: false,
             cli: Some("cli".to_string()),
@@ -722,6 +770,7 @@ mod tests {
     #[test]
     fn two_roles_resolve_their_own_separate_system_prompt_files() {
         let coder_def = RoleDef {
+            claude_settings: Default::default(),
             disallowed_tools: Vec::new(),
             read_only: false,
             cli: Some("cli".to_string()),
@@ -730,6 +779,7 @@ mod tests {
             isolation: crate::adapter::Isolation::default(),
         };
         let reviewer_def = RoleDef {
+            claude_settings: Default::default(),
             disallowed_tools: Vec::new(),
             read_only: false,
             cli: Some("cli".to_string()),
@@ -780,6 +830,7 @@ mod tests {
         let path = temp_prompt("gone.md", "text");
         std::fs::remove_file(&path).unwrap();
         let def = RoleDef {
+            claude_settings: Default::default(),
             disallowed_tools: Vec::new(),
             read_only: false,
             cli: Some("cli".to_string()),
@@ -801,5 +852,144 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, RoleConfigError::SystemPromptIo(_)), "{err:?}");
+    }
+
+    // ---- claude_settings (#346) ----
+
+    fn settings(yaml: &str) -> crate::claude_settings::ClaudeSettings {
+        crate::claude_settings::ClaudeSettings::from_yaml(Some(serde_yaml::from_str(yaml).unwrap()))
+            .unwrap()
+    }
+
+    fn global_with(yaml: &str) -> GlobalConfig {
+        let mut global = GlobalConfig::default();
+        global.roles.insert(
+            "coder".to_string(),
+            crate::global_config::GlobalRoleConfig {
+                claude_settings: settings(yaml),
+                ..Default::default()
+            },
+        );
+        global
+    }
+
+    fn def_with(yaml: &str) -> RoleDef {
+        RoleDef {
+            claude_settings: settings(yaml),
+            ..role_def(Some("claude"), Some("sonnet"))
+        }
+    }
+
+    /// D2: the workflow wins key by key, with no deep merge.
+    #[test]
+    fn the_workflow_layer_replaces_whole_top_level_keys_of_the_global_layer() {
+        let global = global_with("env: {A: from-global}\nattribution: {commit: global-c}");
+        let merged =
+            resolve_claude_settings("coder", &def_with("env: {B: from-workflow}"), &global)
+                .unwrap();
+        assert_eq!(merged.keys_sorted(), vec!["attribution", "env"]);
+        assert_eq!(
+            merged.map()["env"],
+            serde_json::json!({"B": "from-workflow"}),
+            "no A: the env mapping is not merged"
+        );
+        assert_eq!(
+            merged.map()["attribution"],
+            serde_json::json!({"commit": "global-c"})
+        );
+    }
+
+    /// R10: a workflow `null` wins over the global value, and is then removed
+    /// because Claude Code discards the whole `--settings` on a top-level null.
+    #[test]
+    fn a_top_level_null_removes_the_key_instead_of_reaching_claude() {
+        let global = global_with("env: {A: from-global}\nattribution: {commit: global-c}");
+        let merged = resolve_claude_settings("coder", &def_with("env: ~"), &global).unwrap();
+        assert_eq!(merged.keys_sorted(), vec!["attribution"]);
+        // A null alone leaves nothing extra.
+        let merged =
+            resolve_claude_settings("coder", &def_with("env: ~"), &GlobalConfig::default())
+                .unwrap();
+        assert!(merged.is_empty());
+    }
+
+    /// R4: task config cannot set it, whatever it holds.
+    #[test]
+    fn task_config_cannot_set_claude_settings() {
+        let resolved = resolve(
+            "coder",
+            &def_with("attribution: {commit: wf}"),
+            &GlobalConfig::default(),
+            &json!({"roles": {"coder": {"claude_settings": {"outputStyle": "task-style"}}}}),
+            "/cwd".into(),
+            false,
+            StageReport::default(),
+            "p",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.role_config.claude_settings.keys_sorted(),
+            vec!["attribution"]
+        );
+    }
+
+    /// R3: the workflow file may set the workflow-only keys; only the global
+    /// layer is checked, and only for its own role.
+    #[test]
+    fn a_workflow_may_set_workflow_only_keys_but_the_global_layer_may_not() {
+        let merged = resolve_claude_settings(
+            "coder",
+            &def_with("hooks: {SessionStart: []}"),
+            &GlobalConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(merged.keys_sorted(), vec!["hooks"]);
+
+        let global = global_with("hooks: {}\nattribution: {commit: ''}");
+        let err = resolve_claude_settings("coder", &def_with("env: {A: b}"), &global).unwrap_err();
+        assert!(matches!(
+            err,
+            RoleConfigError::WorkflowOnlyClaudeSettings(_)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "role 'coder' sets claude_settings 'hooks' in the global config, which only a workflow file may set"
+        );
+        // Another role of the same config is not stopped.
+        assert!(resolve_claude_settings("chat", &def_with("env: {A: b}"), &global).is_ok());
+    }
+
+    #[test]
+    fn resolve_fills_the_role_configs_settings_and_propagates_the_global_refusal() {
+        let resolved = resolve(
+            "coder",
+            &def_with("env: {B: b}"),
+            &global_with("attribution: {commit: c}"),
+            &json!({}),
+            "/cwd".into(),
+            false,
+            StageReport::default(),
+            "p",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.role_config.claude_settings.keys_sorted(),
+            vec!["attribution", "env"]
+        );
+        let err = resolve(
+            "coder",
+            &def_with(""),
+            &global_with("outputStyle: x"),
+            &json!({}),
+            "/cwd".into(),
+            false,
+            StageReport::default(),
+            "p",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RoleConfigError::WorkflowOnlyClaudeSettings(_)
+        ));
     }
 }

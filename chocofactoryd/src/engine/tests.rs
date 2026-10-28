@@ -6,6 +6,7 @@ use serde_json::json;
 use super::watch::{catch_up_len, final_attempt_limit, missed};
 use super::*;
 
+mod claude_settings;
 mod model_level;
 mod parallel;
 mod pause;
@@ -11503,6 +11504,24 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
         );
     }
 
+    // #346: a turn choco stopped over its settings has nothing to
+    // resume, whenever it was stopped, even with an adapter session id recorded.
+    for reason in [
+        SessionEndReason::ClaudeSettingsRejected,
+        SessionEndReason::ClaudeSettingsUnconfirmed,
+    ] {
+        let run = ended(Some("session-d"), Some(reason)).await;
+        assert_eq!(
+            engine
+                .resumable_session(&task, &def, coding, Some(&run), false)
+                .await
+                .unwrap(),
+            Err(format!(
+                "its turn ended '{reason}', so there is nothing to resume"
+            ))
+        );
+    }
+
     // Interrupted, but with no session recorded: nothing to resume.
     let sessionless = ended(None, Some(SessionEndReason::Interrupted)).await;
     assert!(
@@ -12331,6 +12350,7 @@ async fn cancel_kills_every_live_session_of_the_task_not_just_the_current_one() 
     let engine = engine_with_adapter(pool.clone(), &wrapper.display().to_string());
     let task_id = seed_task(&pool, "single").await;
     let cfg = crate::adapter::RoleConfig {
+        claude_settings: Default::default(),
         role: "coder".to_string(),
         project_id: None,
         disallowed_tools: Vec::new(),

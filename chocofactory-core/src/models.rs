@@ -243,6 +243,17 @@ pub enum SessionEndReason {
     /// killed this run. Requested like `DaemonStopped`; the transcript is
     /// intact, so `resume` continues it.
     Paused,
+    /// Claude Code did not apply the role's `claude_settings` (it discards
+    /// the whole bundle when one value is invalid), so choco ended the turn
+    /// (normally) before the agent got its prompt. Observed by the claude
+    /// adapter from the tool server's report. `retry` starts fresh, since
+    /// this end is not resumable.
+    ClaudeSettingsRejected,
+    /// Choco could not confirm that Claude Code applied the role's
+    /// `claude_settings` (the tool server failed, the CLI refused the
+    /// status request, or the tool list was not the expected one), so it
+    /// ended the turn before the agent got its prompt. `retry` starts fresh.
+    ClaudeSettingsUnconfirmed,
 }
 
 impl fmt::Display for SessionEndReason {
@@ -256,6 +267,8 @@ impl fmt::Display for SessionEndReason {
             SessionEndReason::Interrupted => "interrupted",
             SessionEndReason::DaemonStopped => "daemon_stopped",
             SessionEndReason::Paused => "paused",
+            SessionEndReason::ClaudeSettingsRejected => "claude_settings_rejected",
+            SessionEndReason::ClaudeSettingsUnconfirmed => "claude_settings_unconfirmed",
         })
     }
 }
@@ -284,6 +297,8 @@ impl FromStr for SessionEndReason {
             "interrupted" => Ok(SessionEndReason::Interrupted),
             "daemon_stopped" => Ok(SessionEndReason::DaemonStopped),
             "paused" => Ok(SessionEndReason::Paused),
+            "claude_settings_rejected" => Ok(SessionEndReason::ClaudeSettingsRejected),
+            "claude_settings_unconfirmed" => Ok(SessionEndReason::ClaudeSettingsUnconfirmed),
             other => Err(ParseSessionEndReasonError(other.to_string())),
         }
     }
@@ -941,6 +956,8 @@ mod tests {
             SessionEndReason::Interrupted,
             SessionEndReason::DaemonStopped,
             SessionEndReason::Paused,
+            SessionEndReason::ClaudeSettingsRejected,
+            SessionEndReason::ClaudeSettingsUnconfirmed,
         ] {
             assert_eq!(
                 reason.to_string().parse::<SessionEndReason>().unwrap(),
