@@ -130,6 +130,18 @@ A role has `cli`, `model` and `system_prompt_file`. Other fields:
   `skills` and `memory` can't go with `inherit_operator_config`. See
   [what an agent inherits](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#what-an-agent-inherits-from-your-claude-setup).
 
+- `claude_settings` is a mapping of Claude Code settings for the role's agents,
+  passed in `--settings`. It has two layers, `config.yaml` (`roles.<name>`) and
+  the workflow file, merged key by key (the workflow wins, no deep merge; a
+  top-level `null` removes a key); task config can't set it. Only a workflow
+  file may set `hooks`, `disableAllHooks`, `enabledPlugins`,
+  `extraKnownMarketplaces`, `pluginConfigs`, `outputStyle`, `claudeMdExcludes`,
+  `enableAllProjectMcpServers`, `enabledMcpjsonServers` and
+  `disabledMcpjsonServers`. An isolated role's `env` must be a mapping. Not for
+  `cli: omp` roles. Put secrets in the daemon's environment, not here: `ps`
+  shows the settings. See
+  [`claude_settings`](https://github.com/itsypkin/ChocoFactory/blob/main/docs/workflows.md#claude_settings-claude-code-settings-for-chocos-agents).
+
 More: [how a role is configured](https://github.com/itsypkin/ChocoFactory/blob/main/docs/models.md#how-a-role-is-configured),
 [running a role on omp](https://github.com/itsypkin/ChocoFactory/blob/main/docs/models.md#cli-omp).
 

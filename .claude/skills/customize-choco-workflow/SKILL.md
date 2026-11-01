@@ -46,11 +46,14 @@ choco task create --project myproj --workflow coding-task \
   built-in review rules. The turn prompts don't change.
 - They can't change stages, routing, prompts other than the system prompt,
   or the role fields only a workflow can set: `read_only`,
-  `disallowed_tools`, `skills`, `memory`, `inherit_operator_config`. Task
-  config ignores those keys.
+  `disallowed_tools`, `skills`, `memory`, `inherit_operator_config`,
+  `claude_settings`. Task config ignores those keys.
 - The machine-wide `~/.config/chocofactory/config.yaml` ranks below a
   workflow's `roles:`. The built-ins set the CLI, model and system prompt
-  of every role, so it doesn't change a built-in role.
+  of every role, so it doesn't change those fields of a built-in role. It
+  can still give a built-in role `claude_settings` (Claude Code settings for
+  the role's agents, such as `attribution` to drop the `Co-Authored-By`
+  trailer), because the built-ins set none.
 
 More: [per-role flags](https://github.com/itsypkin/ChocoFactory/blob/main/docs/cli.md#per-role-flags-and-changing-a-tasks-config),
 [how a role is configured](https://github.com/itsypkin/ChocoFactory/blob/main/docs/models.md#how-a-role-is-configured).

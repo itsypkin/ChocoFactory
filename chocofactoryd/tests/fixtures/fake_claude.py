@@ -7,6 +7,7 @@ process-spawning and stdin/stdout plumbing without shelling out to the
 real CLI (no network, no auth, deterministic).
 """
 import json
+import os
 import sys
 import uuid
 
@@ -20,7 +21,12 @@ def main():
     else:
         session_id = str(uuid.uuid4())
 
-    emit({"type": "system", "subtype": "init", "session_id": session_id})
+    init = {"type": "system", "subtype": "init", "session_id": session_id}
+    # `FAKE_CLAUDE_INIT_TOOLS` (a JSON list) stands in for the tool names real
+    # Claude Code lists on its `init` line (#346).
+    if os.environ.get("FAKE_CLAUDE_INIT_TOOLS"):
+        init["tools"] = json.loads(os.environ["FAKE_CLAUDE_INIT_TOOLS"])
+    emit(init)
 
     for line in iter_turns(sys.stdin):
         turn = json.loads(line)

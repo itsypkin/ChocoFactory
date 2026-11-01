@@ -22,6 +22,15 @@
 //!   same connection, a sub-agent included; the server can't tell callers
 //!   apart, and the direction it fails in is lenient (an allowance spent
 //!   early, never a turn parked), so it is left as is.
+//! - **One startup check (#346).** Given `--claude-settings-sentinel NAME=VALUE`
+//!   the server reads its environment once, before serving, and passes only
+//!   if `NAME` holds exactly `VALUE`. The daemon put that variable into the
+//!   role's `claude_settings` `env`, and gave the server the expected pair as
+//!   an argument, never through the server's environment, so the check can
+//!   pass only when Claude Code applied the settings. On a miss the server
+//!   offers one tool, `claude_settings_rejected`, and no `report_outcome`.
+//!   It still never contacts the daemon: the daemon reads the verdict off
+//!   Claude's tool list.
 //! - **Hand-rolled.** Four JSON-RPC methods over newline-delimited stdio, no
 //!   MCP SDK. `serde_json` is already a dependency; a crate for one tool
 //!   would not be.
@@ -38,7 +47,8 @@ pub use chocofactory_core::mcp::StageReport;
 #[cfg(test)]
 use chocofactory_core::mcp::missing_sections;
 use chocofactory_core::mcp::{
-    MCP_SERVER_NAME, REPORT_OUTCOME_TOOL_NAME, check_report_call, tool_definition,
+    CLAUDE_SETTINGS_REJECTED_TOOL_NAME, MCP_SERVER_NAME, REPORT_OUTCOME_TOOL_NAME,
+    check_report_call, tool_definition,
 };
 use serde_json::{Value, json};
 
@@ -55,13 +65,55 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 /// own lookup can never disagree about what the tool is called.
 pub const TOOL_NAME: &str = REPORT_OUTCOME_TOOL_NAME;
 
+/// The prefix every settings sentinel variable name carries.
+const SENTINEL_NAME_PREFIX: &str = "CHOCOFACTORY_SETTINGS_";
+
+/// Whether the sentinel in `flag` (`NAME=VALUE`) is present in the
+/// environment `lookup` reads, with exactly that value. A malformed flag is
+/// an error that names the problem and never repeats the value.
+pub fn sentinel_present(
+    flag: &str,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<bool, String> {
+    let Some((name, value)) = flag.split_once('=') else {
+        return Err("--claude-settings-sentinel must be NAME=VALUE".to_string());
+    };
+    if !name.starts_with(SENTINEL_NAME_PREFIX) || name.len() == SENTINEL_NAME_PREFIX.len() {
+        return Err(format!(
+            "--claude-settings-sentinel's name must start with {SENTINEL_NAME_PREFIX}"
+        ));
+    }
+    Ok(lookup(name).is_some_and(|found| found == std::ffi::OsStr::new(value)))
+}
+
+/// The description of the one tool offered when the settings were not applied.
+const SETTINGS_REJECTED_DESCRIPTION: &str =
+    "Claude Code did not apply this turn's settings; choco is ending this turn. Do nothing.";
+
+/// What every call returns when the settings were not applied.
+const SETTINGS_REJECTED_CALL_TEXT: &str =
+    "choco ended this turn: Claude Code did not apply the role's claude_settings";
+
+fn settings_rejected_tool() -> Value {
+    json!({
+        "name": CLAUDE_SETTINGS_REJECTED_TOOL_NAME,
+        "description": SETTINGS_REJECTED_DESCRIPTION,
+        "inputSchema": { "type": "object", "properties": {} },
+    })
+}
+
 /// Serves the tool over `input`/`output` until the client closes the stream.
 ///
 /// Split from the subcommand entry point so tests can drive a whole session
 /// over byte slices, the same reason `client`'s request builders are split
 /// from their sending halves.
-pub fn serve(
+///
+/// `settings_applied` is the settings check's verdict: `false` means Claude
+/// Code did not apply the role's `claude_settings`, and the only tool offered
+/// is `claude_settings_rejected`.
+pub fn serve_checked(
     stage: &StageReport,
+    settings_applied: bool,
     input: impl BufRead,
     mut output: impl Write,
 ) -> std::io::Result<()> {
@@ -72,7 +124,7 @@ pub fn serve(
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(stage, &mut thin_reports, &line) {
+        if let Some(response) = handle_line(stage, settings_applied, &mut thin_reports, &line) {
             writeln!(output, "{response}")?;
             output.flush()?;
         }
@@ -83,7 +135,12 @@ pub fn serve(
 /// Answers one request line. `None` means "say nothing", which is required
 /// rather than merely polite: a JSON-RPC *notification* has no `id`, and
 /// replying to one is a protocol violation.
-fn handle_line(stage: &StageReport, thin_reports: &mut u32, line: &str) -> Option<String> {
+fn handle_line(
+    stage: &StageReport,
+    settings_applied: bool,
+    thin_reports: &mut u32,
+    line: &str,
+) -> Option<String> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
         // No `id` is recoverable from an unparseable line, so this is the one
@@ -106,7 +163,9 @@ fn handle_line(stage: &StageReport, thin_reports: &mut u32, line: &str) -> Optio
 
     let result = match method {
         "initialize" => Ok(initialize_result(&request)),
+        "tools/list" if !settings_applied => Ok(json!({ "tools": [settings_rejected_tool()] })),
         "tools/list" => Ok(json!({ "tools": [tool_definition(stage)] })),
+        "tools/call" if !settings_applied => Ok(tool_error(SETTINGS_REJECTED_CALL_TEXT)),
         "tools/call" => match call_tool(stage, thin_reports, request.get("params")) {
             Ok(result) => Ok(result),
             Err(CallError::Protocol(message)) => Err((-32602, message)),
@@ -233,7 +292,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut output = Vec::new();
-        serve(stage, input.as_bytes(), &mut output).unwrap();
+        serve_checked(stage, true, input.as_bytes(), &mut output).unwrap();
         String::from_utf8(output)
             .unwrap()
             .lines()
@@ -252,6 +311,80 @@ mod tests {
             })],
         );
         responses[0]["result"].clone()
+    }
+
+    fn list_tools(settings_applied: bool) -> Vec<Value> {
+        let input = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string();
+        let mut output = Vec::new();
+        serve_checked(&outcomes(), settings_applied, input.as_bytes(), &mut output).unwrap();
+        let response: Value =
+            serde_json::from_str(String::from_utf8(output).unwrap().lines().next().unwrap())
+                .unwrap();
+        response["result"]["tools"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn an_applied_settings_check_offers_report_outcome_only() {
+        let tools = list_tools(true);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], REPORT_OUTCOME_TOOL_NAME);
+    }
+
+    #[test]
+    fn a_missed_settings_check_offers_only_the_rejected_tool_and_refuses_calls() {
+        let tools = list_tools(false);
+        assert_eq!(tools.len(), 1, "got {tools:?}");
+        assert_eq!(tools[0]["name"], CLAUDE_SETTINGS_REJECTED_TOOL_NAME);
+        assert_eq!(tools[0]["description"], SETTINGS_REJECTED_DESCRIPTION);
+        assert_eq!(
+            tools[0]["inputSchema"],
+            json!({"type": "object", "properties": {}})
+        );
+
+        let input = json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": TOOL_NAME, "arguments": { "outcome": "approved", "summary": "" } },
+        })
+        .to_string();
+        let mut output = Vec::new();
+        serve_checked(&outcomes(), false, input.as_bytes(), &mut output).unwrap();
+        let response: Value =
+            serde_json::from_str(String::from_utf8(output).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "choco ended this turn: Claude Code did not apply the role's claude_settings"
+        );
+    }
+
+    #[test]
+    fn the_sentinel_passes_only_on_an_exact_match() {
+        let name = "CHOCOFACTORY_SETTINGS_0123";
+        let env = |value: Option<&'static str>| {
+            move |asked: &str| {
+                assert_eq!(asked, name);
+                value.map(std::ffi::OsString::from)
+            }
+        };
+        let flag = format!("{name}=abc");
+        assert_eq!(sentinel_present(&flag, env(Some("abc"))), Ok(true));
+        assert_eq!(sentinel_present(&flag, env(Some("abd"))), Ok(false));
+        assert_eq!(sentinel_present(&flag, env(Some("abcd"))), Ok(false));
+        assert_eq!(sentinel_present(&flag, env(None)), Ok(false));
+    }
+
+    #[test]
+    fn a_malformed_sentinel_flag_is_an_error_that_never_repeats_the_value() {
+        for flag in [
+            "NOEQUALS-secret-value",
+            "OTHER_NAME=secret-value",
+            "CHOCOFACTORY_SETTINGS_=secret-value",
+        ] {
+            let err = sentinel_present(flag, |_| None).unwrap_err();
+            assert!(!err.contains("secret-value"), "{err}");
+            assert!(!err.contains("NOEQUALS"), "{err}");
+        }
     }
 
     #[test]
@@ -877,7 +1010,7 @@ mod tests {
     #[test]
     fn an_unparseable_line_is_a_jsonrpc_parse_error() {
         let mut output = Vec::new();
-        serve(&outcomes(), &b"not json\n"[..], &mut output).unwrap();
+        serve_checked(&outcomes(), true, &b"not json\n"[..], &mut output).unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(response["error"]["code"], -32700);
         assert!(response["id"].is_null());
@@ -886,7 +1019,7 @@ mod tests {
     #[test]
     fn blank_lines_are_ignored() {
         let mut output = Vec::new();
-        serve(&outcomes(), &b"\n   \n"[..], &mut output).unwrap();
+        serve_checked(&outcomes(), true, &b"\n   \n"[..], &mut output).unwrap();
         assert!(output.is_empty(), "got {output:?}");
     }
 }

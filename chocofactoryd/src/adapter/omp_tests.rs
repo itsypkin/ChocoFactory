@@ -89,6 +89,7 @@ impl Env {
 
     fn cfg(&self) -> RoleConfig {
         RoleConfig {
+            claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
             cwd: self.repo.clone(),
@@ -2057,25 +2058,30 @@ fn billing_follows_the_provider_and_the_environment() {
 #[test]
 fn validate_role_accepts_memory_and_rejects_pattern_skill_names() {
     let adapter = OmpAdapter::new("/nonexistent");
+    let none = crate::claude_settings::ClaudeSettings::default();
     let isolated = |skills: &[&str], memory: bool| Isolation::Isolated {
         skills: skills.iter().map(|s| s.to_string()).collect(),
         memory,
     };
     assert!(
         adapter
-            .validate_role("coder", &isolated(&["plain-skill"], false))
+            .validate_role("coder", &isolated(&["plain-skill"], false), &none)
             .is_ok()
     );
     assert!(
         adapter
-            .validate_role("chat", &Isolation::InheritOperatorConfig)
+            .validate_role("chat", &Isolation::InheritOperatorConfig, &none)
             .is_ok()
     );
-    assert!(adapter.validate_role("coder", &isolated(&[], true)).is_ok());
+    assert!(
+        adapter
+            .validate_role("coder", &isolated(&[], true), &none)
+            .is_ok()
+    );
     for bad in ["a,b", "a*", "a?", "[a]", "a{b}", "a}"] {
         assert_eq!(
             adapter
-                .validate_role("coder", &isolated(&[bad], false))
+                .validate_role("coder", &isolated(&[bad], false), &none)
                 .unwrap_err(),
             format!(
                 "role 'coder' lists skill '{bad}', which omp would read as a pattern; skill \
@@ -2096,10 +2102,37 @@ fn the_default_validate_role_accepts_everything() {
                 &Isolation::Isolated {
                     skills: vec![],
                     memory: true
-                }
+                },
+                &crate::claude_settings::ClaudeSettings::default()
             )
             .is_ok()
     );
+}
+
+// ---------------------------------------------------------------------------
+#[test]
+fn omp_refuses_a_role_with_claude_settings_whatever_its_isolation() {
+    let adapter = OmpAdapter::new("/nonexistent");
+    let settings = crate::claude_settings::ClaudeSettings::from_yaml(Some(
+        serde_yaml::from_str("attribution: {commit: secret-text}").unwrap(),
+    ))
+    .unwrap();
+    let expected = "role 'coder' sets claude_settings, which a role on cli omp can't take; claude_settings is only for claude roles";
+    for isolation in [
+        Isolation::InheritOperatorConfig,
+        Isolation::default(),
+        Isolation::Isolated {
+            skills: vec!["a,b".to_string()],
+            memory: false,
+        },
+    ] {
+        assert_eq!(
+            adapter
+                .validate_role("coder", &isolation, &settings)
+                .unwrap_err(),
+            expected
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2827,6 +2860,7 @@ fn dump_probe_spawn() {
     let out = std::env::var("CHOCO_PROBE_OUT").unwrap();
     let state = PathBuf::from(&out).with_extension("state");
     let mut cfg = RoleConfig {
+        claude_settings: Default::default(),
         role: "coder".to_string(),
         project_id: None,
         cwd,

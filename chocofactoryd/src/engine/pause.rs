@@ -117,7 +117,8 @@ fn reason_text(session: &Session) -> String {
 /// the row alone, with the text to show. Mirrors the order of checks in
 /// `spawn_turn_watcher`: `cancelled` exits quietly; `paused` and
 /// `daemon_stopped` are requested ends; `reaped` and `interrupted` are
-/// parked on any status; otherwise `idle` is a completed run and `exited` is
+/// parked on any status, as are the two `claude_settings_*` ends (#346);
+/// otherwise `idle` is a completed run and `exited` is
 /// a failure, with or without a reason.
 pub(super) fn run_failure(session: &Session) -> Option<String> {
     let failed = match (session.status, session.end_reason) {
@@ -130,7 +131,15 @@ pub(super) fn run_failure(session: &Session) -> Option<String> {
                 | SessionEndReason::DaemonStopped,
             ),
         ) => false,
-        (_, Some(SessionEndReason::Reaped | SessionEndReason::Interrupted)) => true,
+        (
+            _,
+            Some(
+                SessionEndReason::Reaped
+                | SessionEndReason::Interrupted
+                | SessionEndReason::ClaudeSettingsRejected
+                | SessionEndReason::ClaudeSettingsUnconfirmed,
+            ),
+        ) => true,
         (SessionStatus::Idle, _) => false,
         (SessionStatus::Exited, _) => true,
     };

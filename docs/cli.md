@@ -369,7 +369,10 @@ untouched. See `choco task status bb93ada3-...`.
 Anything the agent itself got wrong still starts fresh — `Retrying stage
 'coding' from scratch, in a fresh session: its turn ended 'no_report', which
 is the agent's own failure rather than an interruption.` — so a turn that
-crashes deterministically isn't resumed back into the same crash. Use
+crashes deterministically isn't resumed back into the same crash. A turn that
+`claude_settings_rejected` or `claude_settings_unconfirmed` stopped also starts
+fresh, whenever it was stopped: a retry doesn't continue what the CLI began
+under the wrong settings. Use
 `--resume` to insist (it fails, rather than quietly starting fresh, when
 there is nothing safe to resume) or `--fresh` to start over anyway.
 

@@ -322,7 +322,19 @@ impl AgentAdapter for OmpAdapter {
         "omp"
     }
 
-    fn validate_role(&self, role: &str, isolation: &Isolation) -> Result<(), String> {
+    fn validate_role(
+        &self,
+        role: &str,
+        isolation: &Isolation,
+        claude_settings: &crate::claude_settings::ClaudeSettings,
+    ) -> Result<(), String> {
+        // First, whatever the isolation: `claude_settings` are Claude Code
+        // settings, and omp would silently ignore them (#346).
+        if !claude_settings.is_empty() {
+            return Err(format!(
+                "role '{role}' sets claude_settings, which a role on cli omp can't take; claude_settings is only for claude roles"
+            ));
+        }
         let Isolation::Isolated { skills, .. } = isolation else {
             return Ok(());
         };
