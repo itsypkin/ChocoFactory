@@ -645,8 +645,11 @@ pub enum EventType {
     /// - `"background_jobs"`: the CLI's list of running background jobs
     ///   changed;
     /// - `"resume"`: a retry resumed the interrupted turn's conversation;
-    /// - `"leftovers_killed"`: processes the turn started were still running
-    ///   when it ended and were killed (survivors are listed separately);
+    /// - `"leftovers_killed"`: processes the turn started outside the agent's
+    ///   own process group were still running when it ended and were killed.
+    ///   The group's members are killed by the group kill and are not listed.
+    ///   Survivors, including a group member still present after the group
+    ///   kill, are listed separately;
     /// - `"leftovers_unchecked"`: the process table could not be read, so
     ///   what the turn left running could not be checked.
     ///

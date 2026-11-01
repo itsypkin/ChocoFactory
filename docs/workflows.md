@@ -247,7 +247,10 @@ when it ends *after* the agent called `report_outcome`:
   and process groups of their own (Claude Code runs every Bash call in a
   new session), such as a hung `cargo test` or a dev server. They are
   listed in a `leftovers_killed` `session_note`, which also lists any that
-  could not be killed. A `leftovers_unchecked` note means choco could not
+  could not be killed. The note names only processes outside the agent's own
+  process group: the group is killed as a whole, so a turn whose only live
+  processes were in that group has no `leftovers_killed` note, because killing
+  the group was enough. A `leftovers_unchecked` note means choco could not
   read the process table, so the check could not run (the agent's own
   process group was still killed). A process counts as the turn's if it
   descends from the agent, was seen descending from it earlier, carries
