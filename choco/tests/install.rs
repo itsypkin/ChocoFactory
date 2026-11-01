@@ -1314,7 +1314,7 @@ fn every_crate_inherits_the_dual_license() {
     assert!(out.status.success(), "{}", text(&out));
     let meta: Value = serde_json::from_slice(&out.stdout).unwrap();
     let packages = meta["packages"].as_array().unwrap();
-    assert_eq!(packages.len(), 4);
+    assert_eq!(packages.len(), 5);
     for p in packages {
         assert_eq!(p["license"], "MIT OR Apache-2.0", "{}", p["name"]);
     }
