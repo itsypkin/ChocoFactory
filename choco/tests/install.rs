@@ -80,14 +80,16 @@ fn stderr(out: &Output) -> String {
 /// Where `server status --json` stands on "a turn is in flight", as a wait
 /// predicate. A non-zero exit is "not yet": the daemon holds the lock but is
 /// not answering (slow, or a failed read), so `choco` prints nothing on stdout
-/// and the reason on stderr; that reason is carried as `Err`. Exit 0 with
+/// and the reason on stderr; for a dead daemon (exit 3) stdout says so. Both
+/// streams are carried as `Err`. Exit 0 with
 /// output that is not JSON is a broken `choco`: it panics with the parse error,
 /// stdout and stderr, rather than letting the wait run to its bound.
 fn in_flight_state(out: &Output) -> Result<(), String> {
     if !out.status.success() {
         return Err(format!(
-            "`server status --json` exited with {}: {}",
+            "`server status --json` exited with {}: stdout {:?}, stderr {:?}",
             out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ));
     }
@@ -1384,6 +1386,18 @@ fn a_status_call_that_exits_non_zero_is_not_yet_and_carries_its_stderr() {
     .unwrap_err();
     assert!(
         err.contains("exited with") && err.contains("isn't answering: failed to connect"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_status_call_for_a_dead_daemon_is_not_yet_and_carries_its_stdout() {
+    // `choco --json server status` on a daemon that is not running exits 3 and
+    // says so on stdout, with nothing on stderr.
+    let err =
+        in_flight_state(&status_output(3, r#"{"running":false,"daemon":null}"#, "")).unwrap_err();
+    assert!(
+        err.contains("exited with") && err.contains("running"),
         "{err}"
     );
 }

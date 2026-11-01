@@ -171,14 +171,16 @@ fn stderr(out: &Output) -> String {
 /// Where `server status --json` stands on "a turn is in flight", as a wait
 /// predicate. A non-zero exit is "not yet": the daemon holds the lock but is
 /// not answering (slow, or a failed read), so `choco` prints nothing on stdout
-/// and the reason on stderr; that reason is carried as `Err`. Exit 0 with
+/// and the reason on stderr; for a dead daemon (exit 3) stdout says so. Both
+/// streams are carried as `Err`. Exit 0 with
 /// output that is not JSON is a broken `choco`: it panics with the parse error,
 /// stdout and stderr, rather than letting the wait run to its bound.
 fn in_flight_state(out: &Output) -> Result<(), String> {
     if !out.status.success() {
         return Err(format!(
-            "`server status --json` exited with {}: {}",
+            "`server status --json` exited with {}: stdout {:?}, stderr {:?}",
             out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ));
     }
@@ -199,17 +201,7 @@ fn in_flight_state(out: &Output) -> Result<(), String> {
     }
 }
 
-fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    wait_for_state(what, || {
-        if f() {
-            Ok(())
-        } else {
-            Err("the condition does not hold yet".to_string())
-        }
-    });
-}
-
-/// Like `wait_for`, for a predicate that says what it saw while not ready.
+/// Waits up to `DEADLINE` for a predicate that says what it saw while not ready.
 fn wait_for_state(what: &str, f: impl FnMut() -> Result<(), String>) {
     wait_until_blocking_within(DEADLINE, what, f);
 }
@@ -414,8 +406,9 @@ fn stale_lock_makes_default_base_url_an_error_not_a_fallback() {
     let env = Env::new();
     let info = env.start();
     unsafe { libc::kill(info.pid as i32, libc::SIGKILL) };
-    wait_for("the lock to be released", || {
-        matches!(env.lock(), LockState::NotRunning { .. })
+    wait_for_state("the lock to be released", || match env.lock() {
+        LockState::NotRunning { .. } => Ok(()),
+        other => Err(format!("lock state {other:?}")),
     });
     let out = env.choco(&["project", "list"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
@@ -466,9 +459,13 @@ fn stop_refuses_while_an_agent_turn_runs_and_force_parks_it() {
     assert!(matches!(env.lock(), LockState::NotRunning { .. }));
 
     env.start();
-    wait_for("the task to be stuck", || {
+    wait_for_state("the task to be stuck", || {
         let detail = env.json(&["task", "status", &id]);
-        detail["status"] == "stuck" || detail["task"]["status"] == "stuck"
+        if detail["status"] == "stuck" || detail["task"]["status"] == "stuck" {
+            Ok(())
+        } else {
+            Err(format!("task status {detail}"))
+        }
     });
 }
 
@@ -547,16 +544,27 @@ fn queued_turns_do_not_block_stop_and_start_after_the_restart() {
     );
     env.start();
     // The running turn was parked; the queued one was not, and now runs.
-    wait_for("the first task to be stuck", || {
-        env.json(&["task", "status", &first])["status"] == "stuck"
+    wait_for_state("the first task to be stuck", || {
+        let detail = env.json(&["task", "status", &first]);
+        if detail["status"] == "stuck" {
+            Ok(())
+        } else {
+            Err(format!("task status {detail}"))
+        }
     });
-    wait_for("the queued turn to start", || {
+    wait_for_state("the queued turn to start", || {
         let detail = env.json(&["task", "status", &second]);
-        detail["status"] == "open"
+        let server = env.json(&["server", "status"]);
+        let started = detail["status"] == "open"
             && detail["queued"].as_array().is_some_and(|q| q.is_empty())
-            && env.json(&["server", "status"])["daemon"]["in_flight"]
+            && server["daemon"]["in_flight"]
                 .as_array()
-                .is_some_and(|a| a.iter().any(|f| f["task_id"] == second.as_str()))
+                .is_some_and(|a| a.iter().any(|f| f["task_id"] == second.as_str()));
+        if started {
+            Ok(())
+        } else {
+            Err(format!("task {detail}; server {server}"))
+        }
     });
 }
 
@@ -575,8 +583,9 @@ fn stale_lock_reads_as_not_running_and_start_recovers() {
     let env = Env::new();
     let info = env.start();
     unsafe { libc::kill(info.pid as i32, libc::SIGKILL) };
-    wait_for("the lock to be released", || {
-        matches!(env.lock(), LockState::NotRunning { .. })
+    wait_for_state("the lock to be released", || match env.lock() {
+        LockState::NotRunning { .. } => Ok(()),
+        other => Err(format!("lock state {other:?}")),
     });
     let out = env.choco(&["server", "status"]);
     assert_eq!(out.status.code(), Some(3), "{}", text(&out));
@@ -723,8 +732,9 @@ fn unanswering_daemon_is_reported_and_force_kills_it() {
     let out = env.choco(&["server", "stop", "--force"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(stdout(&out).contains("was killed"), "{}", text(&out));
-    wait_for("the lock to be released", || {
-        matches!(env.lock(), LockState::NotRunning { .. })
+    wait_for_state("the lock to be released", || match env.lock() {
+        LockState::NotRunning { .. } => Ok(()),
+        other => Err(format!("lock state {other:?}")),
     });
 }
 
@@ -1089,6 +1099,18 @@ fn a_status_call_that_exits_non_zero_is_not_yet_and_carries_its_stderr() {
     .unwrap_err();
     assert!(
         err.contains("exited with") && err.contains("isn't answering: failed to connect"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_status_call_for_a_dead_daemon_is_not_yet_and_carries_its_stdout() {
+    // `choco --json server status` on a daemon that is not running exits 3 and
+    // says so on stdout, with nothing on stderr.
+    let err =
+        in_flight_state(&status_output(3, r#"{"running":false,"daemon":null}"#, "")).unwrap_err();
+    assert!(
+        err.contains("exited with") && err.contains("running"),
         "{err}"
     );
 }
