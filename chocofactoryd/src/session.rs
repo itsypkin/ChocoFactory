@@ -1734,8 +1734,10 @@ struct TrackerState {
 /// What [`kill_and_sweep`] did at one site.
 struct KillReport {
     group: GroupKill,
-    /// Live processes the sweeps of this call killed outside the agent's
-    /// group. The group's own members are the group kill's, not counted here.
+    /// Live processes the sweeps of this call killed. When the group kill
+    /// succeeded, the agent's group members are not counted: they are the
+    /// group kill's. When it failed, the sweeps kill them by pid and they are
+    /// counted.
     sweep_killed: usize,
 }
 
