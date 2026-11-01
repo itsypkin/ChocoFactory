@@ -168,29 +168,50 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// Whether `server status --json` output lists a turn in flight. Output that
-/// is not JSON is a broken `choco`, not "not yet": it panics with the parse
-/// error and the text, rather than letting the wait run to its bound.
-fn has_in_flight(stdout: &[u8]) -> bool {
-    let v: Value = serde_json::from_slice(stdout).unwrap_or_else(|e| {
+/// Where `server status --json` stands on "a turn is in flight", as a wait
+/// predicate. A non-zero exit is "not yet": the daemon holds the lock but is
+/// not answering (slow, or a failed read), so `choco` prints nothing on stdout
+/// and the reason on stderr; that reason is carried as `Err`. Exit 0 with
+/// output that is not JSON is a broken `choco`: it panics with the parse error,
+/// stdout and stderr, rather than letting the wait run to its bound.
+fn in_flight_state(out: &Output) -> Result<(), String> {
+    if !out.status.success() {
+        return Err(format!(
+            "`server status --json` exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
-            "`server status --json` printed output that is not JSON ({e}): {:?}",
-            String::from_utf8_lossy(stdout)
+            "`server status --json` exited 0 but printed output that is not JSON ({e}): stdout {:?}, stderr {:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         )
     });
-    !v["daemon"]["in_flight"]
+    if v["daemon"]["in_flight"]
         .as_array()
         .is_none_or(|a| a.is_empty())
+    {
+        Err(format!("no turn in flight yet: {v}"))
+    } else {
+        Ok(())
+    }
 }
 
 fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    wait_until_blocking_within(DEADLINE, what, || {
+    wait_for_state(what, || {
         if f() {
             Ok(())
         } else {
             Err("the condition does not hold yet".to_string())
         }
     });
+}
+
+/// Like `wait_for`, for a predicate that says what it saw while not ready.
+fn wait_for_state(what: &str, f: impl FnMut() -> Result<(), String>) {
+    wait_until_blocking_within(DEADLINE, what, f);
 }
 
 /// A fixture "claude" that never finishes a turn.
@@ -262,9 +283,9 @@ fn create_task(env: &Env, workflow: &str) -> String {
 }
 
 fn wait_in_flight(env: &Env) {
-    wait_for("an in-flight turn", || {
+    wait_for_state("an in-flight turn", || {
         let out = env.choco(&["--json", "server", "status"]);
-        has_in_flight(&out.stdout)
+        in_flight_state(&out)
     });
 }
 
@@ -1047,16 +1068,52 @@ async fn status_warns_once_for_a_version_mismatch_in_json_and_human_modes() {
     );
 }
 
+fn status_output(code: i32, stdout: &str, stderr: &str) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[test]
+fn a_status_call_that_exits_non_zero_is_not_yet_and_carries_its_stderr() {
+    // What `choco --json server status` does when the daemon holds the lock
+    // but is not answering: empty stdout, the reason on stderr, exit 1.
+    let err = in_flight_state(&status_output(
+        1,
+        "",
+        "error: chocofactoryd (pid 1, port 1) holds the lock but isn't answering: failed to connect",
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("exited with") && err.contains("isn't answering: failed to connect"),
+        "{err}"
+    );
+}
+
 #[test]
 fn unparseable_server_status_output_fails_the_wait_at_once_naming_the_parse_error() {
-    assert!(has_in_flight(
-        br#"{"daemon":{"in_flight":[{"task_id":"t"}]}}"#
-    ));
-    assert!(!has_in_flight(br#"{"daemon":{"in_flight":[]}}"#));
-    let err = std::panic::catch_unwind(|| has_in_flight(b"starting up...")).unwrap_err();
+    assert!(
+        in_flight_state(&status_output(
+            0,
+            r#"{"daemon":{"in_flight":[{"task_id":"t"}]}}"#,
+            ""
+        ))
+        .is_ok()
+    );
+    assert!(in_flight_state(&status_output(0, r#"{"daemon":{"in_flight":[]}}"#, "")).is_err());
+    let err = std::panic::catch_unwind(|| {
+        let _ = in_flight_state(&status_output(0, "starting up...", "a warning"));
+    })
+    .unwrap_err();
     let msg = err.downcast_ref::<String>().cloned().unwrap();
     assert!(
-        msg.contains("not JSON") && msg.contains("expected") && msg.contains("starting up..."),
+        msg.contains("not JSON")
+            && msg.contains("expected")
+            && msg.contains("starting up...")
+            && msg.contains("a warning"),
         "{msg}"
     );
 }
