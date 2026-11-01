@@ -25,6 +25,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use chocofactory_core::daemon_lock::{LockInfo, LockState, read_lock};
 use chocofactory_core::version::VERSION;
+use chocofactory_test_support::wait_until_blocking;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -77,14 +78,13 @@ fn stderr(out: &Output) -> String {
 }
 
 fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + DEADLINE;
-    while Instant::now() < end {
+    wait_until_blocking(what, || {
         if f() {
-            return;
+            Ok(())
+        } else {
+            Err("the condition does not hold yet".to_string())
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {what}");
+    });
 }
 
 fn sha(bytes: &[u8]) -> String {

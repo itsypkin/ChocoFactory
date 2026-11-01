@@ -14,6 +14,7 @@ use axum::routing::{get, post};
 use chocofactory_core::models::{
     Project, PullRequestRef, RetryOutcome, Task, TaskSummary, UsageTotal,
 };
+use chocofactory_test_support::{LOAD_ALLOWANCE, wait_until, wait_until_blocking};
 use chrono::{DateTime, TimeZone, Utc};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1059,16 +1060,17 @@ async fn fake_server(state: Fake) -> String {
 }
 
 async fn wait_for(screen: &Arc<Mutex<String>>, what: &str) {
-    for _ in 0..300 {
-        if screen.lock().unwrap().contains(what) {
-            return;
+    wait_until(&format!("the screen to show {what:?}"), || {
+        let shown = screen.lock().unwrap().clone();
+        async move {
+            if shown.contains(what) {
+                Ok(())
+            } else {
+                Err(format!("screen:\n{shown}"))
+            }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "never saw {what:?}; last screen:\n{}",
-        screen.lock().unwrap()
-    );
+    })
+    .await
 }
 
 /// Whether some screen line's whitespace-split tokens contain `tokens`
@@ -1082,16 +1084,17 @@ fn row_has(screen: &str, tokens: &[&str]) -> bool {
 }
 
 async fn wait_for_row(screen: &Arc<Mutex<String>>, tokens: &[&str]) {
-    for _ in 0..300 {
-        if row_has(&screen.lock().unwrap(), tokens) {
-            return;
+    wait_until(&format!("the screen to show a row {tokens:?}"), || {
+        let shown = screen.lock().unwrap().clone();
+        async move {
+            if row_has(&shown, tokens) {
+                Ok(())
+            } else {
+                Err(format!("screen:\n{shown}"))
+            }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!(
-        "never saw a row {tokens:?}; last screen:\n{}",
-        screen.lock().unwrap()
-    );
+    })
+    .await
 }
 
 #[tokio::test]
@@ -1164,6 +1167,8 @@ async fn the_real_loop_against_a_fake_daemon() {
         k('c');
         wait_for(&latest, "Cancel \"Fix the login\"?").await;
         k('n');
+        // Negative: only a cancel that must NOT happen is asserted next, so
+        // a fixed pause can pass falsely but cannot fail.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(fake.cancels.lock().unwrap().is_empty());
         assert!(!latest.lock().unwrap().contains("Cancel \""));
@@ -1454,7 +1459,7 @@ async fn a_request_that_times_out_is_shown_as_unreachable() {
         &mut on_frame,
     );
     let (result, ()) =
-        tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(run, driver) })
+        tokio::time::timeout(LOAD_ALLOWANCE * 2, async { tokio::join!(run, driver) })
             .await
             .expect("the loop should report the timeout and quit");
     result.unwrap();
@@ -1541,7 +1546,7 @@ async fn detail_cancel_and_retry_requests_time_out_visibly() {
         &mut on_frame,
     );
     let (result, ()) =
-        tokio::time::timeout(Duration::from_secs(40), async { tokio::join!(run, driver) })
+        tokio::time::timeout(LOAD_ALLOWANCE * 2, async { tokio::join!(run, driver) })
             .await
             .expect("every hung request should time out and the loop should quit");
     result.unwrap();
@@ -1583,7 +1588,7 @@ async fn a_panic_signal_stops_the_loop_with_an_error() {
         &mut on_frame,
     );
     let (result, ()) =
-        tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(run, driver) })
+        tokio::time::timeout(LOAD_ALLOWANCE * 2, async { tokio::join!(run, driver) })
             .await
             .expect("the loop must stop on a panic");
     assert!(result.unwrap_err().contains("panicked"));
@@ -1660,7 +1665,7 @@ where
         &mut handover,
         &mut on_frame,
     );
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+    let (result, ()) = tokio::time::timeout(LOAD_ALLOWANCE * 2, async {
         tokio::join!(run, driver(latest, ktx))
     })
     .await
@@ -4348,7 +4353,7 @@ async fn search_finds_a_task_beyond_the_closed_window_through_the_real_loop() {
         &mut on_frame,
     );
     let (result, ()) =
-        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(run, driver) })
+        tokio::time::timeout(LOAD_ALLOWANCE * 2, async { tokio::join!(run, driver) })
             .await
             .expect("the loop should end on q");
     result.unwrap();
@@ -4440,7 +4445,7 @@ async fn search_in_one_project_mode_asks_for_that_project_only() {
         &mut on_frame,
     );
     let (result, ()) =
-        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(run, driver) })
+        tokio::time::timeout(LOAD_ALLOWANCE * 2, async { tokio::join!(run, driver) })
             .await
             .expect("Ctrl-C quits from the popup");
     result.unwrap();
@@ -4993,13 +4998,28 @@ fn key_reader_makes_no_terminal_calls_while_paused() {
         calls: Arc::clone(&calls),
         stop: Arc::clone(&stop),
     });
-    std::thread::sleep(Duration::from_millis(200));
+    wait_until_blocking("a reader poll before the pause", || {
+        if calls.lock().unwrap().is_empty() {
+            Err("no poll yet".to_string())
+        } else {
+            Ok(())
+        }
+    });
     control.pause();
     let paused = std::time::Instant::now();
+    // The window itself: calls must NOT happen while it lasts, so it is a
+    // real stretch of time, not a wait.
     std::thread::sleep(Duration::from_millis(200));
     let resumed = std::time::Instant::now();
     control.resume();
-    std::thread::sleep(Duration::from_millis(200));
+    wait_until_blocking("a reader poll after the resume", || {
+        let calls = calls.lock().unwrap();
+        if calls.iter().any(|(s, _)| *s >= resumed) {
+            Ok(())
+        } else {
+            Err(format!("{} poll(s), none after the resume", calls.len()))
+        }
+    });
     stop.store(true, Ordering::SeqCst);
     let calls = calls.lock().unwrap().clone();
     assert!(calls.iter().any(|(s, _)| *s < paused), "none before");
@@ -5025,7 +5045,14 @@ impl KeySource for DyingSource {
 #[test]
 fn pause_returns_when_the_reader_has_exited() {
     let (_rx, control) = spawn_key_reader(DyingSource);
-    std::thread::sleep(Duration::from_millis(200));
+    // The test is of `pause` on a reader that has already exited.
+    wait_until_blocking("the reader to exit", || {
+        if super::lock_reader(&control.0.0).exited {
+            Ok(())
+        } else {
+            Err("still running".to_string())
+        }
+    });
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         control.pause();
@@ -5159,13 +5186,32 @@ struct Scenario {
     suspend_err: Option<&'static str>,
     resume_err: Option<&'static str>,
     message_dir: Option<PathBuf>,
+    /// The dashboard's own poll interval. The default matches `new_app`; a
+    /// test that must see only the refresh `Msg::Sent` asks for, not a
+    /// periodic poll, sets it past the scenario's outer timeout.
+    interval: Duration,
     wait: Wait,
 }
+
+/// A snapshot of what a scenario has recorded so far, handed to a
+/// `Wait::Until` predicate on each poll.
+struct Seen {
+    screen: String,
+    /// The fake daemon's `events`: `"list"` and `"post"` in arrival order.
+    events: Vec<&'static str>,
+    /// The fake daemon's `messages`: each post as `(id, text)`.
+    messages: Vec<(String, String)>,
+}
+
+/// A condition on a `Seen`: `Ok` when it holds, otherwise `Err` describing
+/// what it saw, for `wait_until` to print.
+type SeenCheck = fn(&Seen) -> Result<(), String>;
 
 #[derive(Clone, Copy)]
 enum Wait {
     Screen(&'static str),
-    Posted,
+    /// Waits until the predicate holds; the string names the wait.
+    Until(&'static str, SeenCheck),
     Nothing,
 }
 
@@ -5180,6 +5226,7 @@ impl Scenario {
             suspend_err: None,
             resume_err: None,
             message_dir: None,
+            interval: Duration::from_secs(2),
             wait,
         }
     }
@@ -5269,6 +5316,7 @@ async fn scenario(name: &str, sc: Scenario) -> Outcome {
     let base_url = fake_server(fake.clone()).await;
     let client = Arc::new(Client::new(base_url.clone()).without_version_check());
     let mut app = new_app(Scope::AllProjects);
+    app.interval = sc.interval;
     app.now = Utc::now();
     app.editor = Some(format!(
         "sh {} {} {} {}",
@@ -5307,15 +5355,20 @@ async fn scenario(name: &str, sc: Scenario) -> Outcome {
             .unwrap();
         match sc.wait {
             Wait::Screen(t) => wait_for(&latest, t).await,
-            Wait::Posted => {
-                for _ in 0..300 {
-                    if !fake.messages.lock().unwrap().is_empty() {
-                        break;
+            Wait::Until(what, check) => {
+                wait_until(what, || {
+                    // Clone inside the synchronous part: no guard crosses
+                    // an await.
+                    let seen = Seen {
+                        screen: latest.lock().unwrap().clone(),
+                        events: fake.events.lock().unwrap().clone(),
+                        messages: fake.messages.lock().unwrap().clone(),
+                    };
+                    async move {
+                        check(&seen).map_err(|saw| format!("{saw}; screen:\n{}", seen.screen))
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                // Let the loop process what followed the post.
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                })
+                .await
             }
             Wait::Nothing => {}
         }
@@ -5462,11 +5515,21 @@ async fn a_failed_send_keeps_the_text_and_says_where() {
 
 #[tokio::test]
 async fn a_sent_message_removes_its_file_and_refreshes() {
-    let o = scenario(
-        "sent",
-        Scenario::new("text", Wait::Screen("sent to aaaa1111")),
-    )
-    .await;
+    // `Msg::Sent` draws "sent to <id>" and only then spawns the refresh, so
+    // wait for the refresh itself: a `list` after the first `post`. The
+    // poll interval is set past the scenario's timeout so that `list` can
+    // only be that refresh, not a periodic poll.
+    let mut sc = Scenario::new(
+        "text",
+        Wait::Until("a list after the first post", |s| {
+            match s.events.iter().position(|e| *e == "post") {
+                Some(post) if s.events[post..].contains(&"list") => Ok(()),
+                _ => Err(format!("events {:?}", s.events)),
+            }
+        }),
+    );
+    sc.interval = Duration::from_secs(3600);
+    let o = scenario("sent", sc).await;
     assert_eq!(
         o.posts(),
         vec![("aaaa1111-0".to_string(), " x".to_string())]
@@ -5730,7 +5793,19 @@ async fn a_failed_removal_is_reported() {
 
 #[tokio::test]
 async fn quitting_with_a_send_in_flight_keeps_its_file_and_lists_it() {
-    let mut sc = Scenario::new("text", Wait::Posted);
+    // `unanswered_sends` is pushed in `update` before `Effect::Send` goes
+    // out, so it is set by the time the fake records the post; the reply
+    // hangs, so no `Msg::Sent` follows and the file stays.
+    let mut sc = Scenario::new(
+        "text",
+        Wait::Until("a posted message", |s| {
+            if s.messages.is_empty() {
+                Err(format!("no post; events {:?}", s.events))
+            } else {
+                Ok(())
+            }
+        }),
+    );
     sc.reply = Reply::Hang;
     let o = scenario("inflight", sc).await;
     o.result.clone().unwrap();

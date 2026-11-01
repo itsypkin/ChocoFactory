@@ -889,6 +889,7 @@ mod tests {
         let entered = append_stage_transition(&pool, &task_id, "chatting", None, "agent_turn")
             .await
             .unwrap();
+        // Not a wait: makes the next row's timestamp distinguishable.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let session = seed_session_for_task(&pool, &task_id, "chatting").await;
         let said = append(
@@ -899,6 +900,7 @@ mod tests {
         )
         .await
         .unwrap();
+        // Not a wait: makes the next row's timestamp distinguishable.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let advanced =
             append_stage_transition(&pool, &task_id, "done", Some("finished"), "terminal")
@@ -1078,6 +1080,7 @@ mod tests {
         )
         .await
         .unwrap();
+        // Not a wait: makes the next row's timestamp distinguishable.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let session_b = seed_session_for_task(&pool, &task_id, "chatting").await;
         let e2 = append(
@@ -1088,6 +1091,7 @@ mod tests {
         )
         .await
         .unwrap();
+        // Not a wait: makes the next row's timestamp distinguishable.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let e3 = append(
             &pool,
@@ -1152,6 +1156,7 @@ mod tests {
                 .await
                 .unwrap(),
             );
+            // Not a wait: makes the next row's timestamp distinguishable.
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
 

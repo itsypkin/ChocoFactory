@@ -1179,13 +1179,25 @@ async fn a_settle_pause_write_that_fails_logs_at_error_leaves_the_task_pausing_a
     .unwrap();
     q.release("job-a");
     q.wait_running(0).await;
-    tokio::time::sleep(StdDuration::from_millis(500)).await;
+    // The settle runs after the slot is freed. Once it has logged its error
+    // it is over and nothing else touches the status, so the status read
+    // below is the settled one.
+    crate::test_support::wait_until(
+        "an ERROR line 'could not mark a pausing task paused'",
+        || async {
+            let text = logs.text();
+            if text
+                .lines()
+                .any(|l| l.contains("ERROR") && l.contains("could not mark a pausing task paused"))
+            {
+                Ok(())
+            } else {
+                Err(text)
+            }
+        },
+    )
+    .await;
     assert_eq!(q.status(&a.id).await, "pausing", "the safe side");
-    let text = logs.text();
-    assert!(
-        text.contains("ERROR") && text.contains("could not mark a pausing task paused"),
-        "{text}"
-    );
     // A later resume repairs it: the held stage starts.
     let outcome = q.engine.resume_task(&a.id).await.unwrap();
     assert_eq!(outcome.started, vec!["checks".to_string()]);

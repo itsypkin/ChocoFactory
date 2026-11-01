@@ -24,4 +24,5 @@ tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+chocofactory-test-support = { workspace = true }
 serde_yaml = { workspace = true }

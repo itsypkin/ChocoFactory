@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chocofactory_core::daemon_lock::{LockState, read_lock};
+use chocofactory_test_support::wait_until_blocking;
 use serde_json::Value;
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -168,14 +169,13 @@ fn stderr(out: &Output) -> String {
 }
 
 fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + DEADLINE;
-    while Instant::now() < end {
+    wait_until_blocking(what, || {
         if f() {
-            return;
+            Ok(())
+        } else {
+            Err("the condition does not hold yet".to_string())
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {what}");
+    });
 }
 
 /// A fixture "claude" that never finishes a turn.
@@ -868,14 +868,17 @@ fn start_that_loses_the_race_reports_the_other_daemon() {
 
     // Once start has written its separator it has passed the "already running" check.
     let log = env.root().join("logs").join("chocofactoryd.log");
-    let deadline = Instant::now() + DEADLINE;
-    while !std::fs::read_to_string(&log)
-        .map(|t| t.contains("=== choco server start"))
-        .unwrap_or(false)
-    {
-        assert!(Instant::now() < deadline, "start never wrote its log");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until_blocking("start to write its separator to the log", || {
+        match std::fs::read_to_string(&log) {
+            Ok(t) if t.contains("=== choco server start") => Ok(()),
+            Ok(t) => Err(format!("log so far: {t:?}")),
+            // Not created yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err("no log file yet".to_string())
+            }
+            Err(e) => panic!("reading {}: {e}", log.display()),
+        }
+    });
 
     // Play the winning daemon: hold the lock and publish our own info.
     let me = std::process::id();

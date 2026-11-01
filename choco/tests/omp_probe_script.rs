@@ -184,6 +184,8 @@ impl Case {
     fn signal_when_blocked(&self, child: std::process::Child, which: &str, sig: i32) -> Output {
         let pid = child.id() as i32;
         let marker = self.dir.join("blocked");
+        // Not converted to `wait_until_blocking`: on timeout it kills its child
+        // before panicking.
         let deadline = Instant::now() + Duration::from_secs(20);
         while !marker.exists() {
             if Instant::now() > deadline {
@@ -202,6 +204,8 @@ impl Case {
             unsafe { libc::kill(fake_pid, sig) };
         }
         let mut child = child;
+        // Not converted to `wait_until_blocking`: on timeout it kills its child
+        // before panicking.
         let deadline = Instant::now() + Duration::from_secs(20);
         while child.try_wait().unwrap().is_none() {
             if Instant::now() > deadline {
@@ -324,6 +328,8 @@ fn a_run_that_fails_before_create_leaves_another_runs_task_and_folder_alone() {
     fs::write(c.dir.join("block_watch"), "").unwrap();
     let first = c.command().spawn().unwrap();
     let marker = c.dir.join("blocked");
+    // Not converted to `wait_until_blocking`: on timeout it kills its child
+    // before panicking.
     let deadline = Instant::now() + Duration::from_secs(20);
     while !marker.exists() {
         if Instant::now() > deadline {

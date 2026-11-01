@@ -11,19 +11,13 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use chocofactory_test_support::{LOAD_ALLOWANCE, wait_until};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-// One source of truth for the load-tolerant wait budgets (#98, #152): the
-// same file the unit tests use. `RESPONSE_MARGIN` is unused here.
-#[path = "../src/test_support.rs"]
-#[allow(dead_code)]
-mod test_support;
-use test_support::{LOAD_ALLOWANCE, wait_until};
 
 struct TempHome(PathBuf);
 
@@ -310,6 +304,8 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut 
     // accepts the connection but never answers (e.g. blocked writing to a
     // full stderr pipe) still reaches the kill-and-report path below
     // instead of hanging the test.
+    // Not converted to `wait_until`: on timeout it must kill the child and
+    // report its stderr before panicking.
     let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
     while tokio::time::Instant::now() < deadline {
         if let Ok(resp) = client
@@ -530,22 +526,25 @@ async fn real_binary_records_per_turn_usage_not_the_running_totals() {
     }
 
     // The `result` line follows the reply, so wait for all three turns.
-    let mut turns = 0;
-    let mut detail = Value::Null;
-    for _ in 0..100 {
+    let (turns, detail) = wait_until("three turn_completed events and the usage", || async {
         let events = daemon.get(&format!("/tasks/{task_id}/events")).await;
-        turns = events["events"]
+        let turns = events["events"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|e| e["event_type"] == "turn_completed")
             .count();
-        detail = daemon.get(&format!("/tasks/{task_id}")).await;
+        let detail = daemon.get(&format!("/tasks/{task_id}")).await;
         if turns == 3 && !detail["usage"].is_null() {
-            break;
+            Ok((turns, detail))
+        } else {
+            Err(format!(
+                "{turns} turn_completed event(s); usage {}",
+                detail["usage"]
+            ))
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    })
+    .await;
     assert_eq!(turns, 3, "expected three turn_completed events");
     let usage = &detail["usage"];
     let cost = usage["cost_usd"].as_f64().unwrap();
@@ -1474,12 +1473,16 @@ async fn real_binary_resumes_a_poll_after_a_kill_on_its_original_deadline() {
     let entered = std::time::Instant::now();
     let task_id = create_poll_restart_task(&daemon, &poll_wf).await;
 
+    // Not a wait: the poll's deadline is wall-clock, so the kill has to land
+    // part-way through it.
     tokio::time::sleep(Duration::from_secs(8)).await;
     let (home, port) = daemon.kill().await;
     let daemon = Daemon::restart_on(home, port).await;
 
     // Original entry + 12s + 4s of slack for startup and the interval.
     let limit = entered + Duration::from_secs(16);
+    // Not converted: the bound (the original deadline plus slack) is the
+    // behaviour under test, not a load allowance.
     let mut stage = String::new();
     while std::time::Instant::now() < limit {
         let detail = daemon.get(&format!("/tasks/{task_id}")).await;
@@ -1591,38 +1594,35 @@ async fn sigterm_and_wait(child: &mut Child) -> std::process::ExitStatus {
 }
 
 async fn read_pid_file(path: &std::path::Path) -> u32 {
-    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    loop {
-        if let Ok(text) = std::fs::read_to_string(path)
-            && let Ok(pid) = text.trim().parse()
-        {
-            return pid;
+    wait_until(&format!("{} to hold a pid", path.display()), || async {
+        match std::fs::read_to_string(path) {
+            // Half-written content parses as "not yet".
+            Ok(text) => text
+                .trim()
+                .parse()
+                .map_err(|_| format!("{} holds {text:?}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(format!("{} does not exist yet", path.display()))
+            }
+            Err(e) => panic!("reading {}: {e}", path.display()),
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{} never appeared",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
 }
 
 async fn wait_for_session_meta(daemon: &Daemon, task_id: &str) {
-    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    loop {
+    wait_until("a session_meta event", || async {
         let page = daemon.get(&format!("/tasks/{task_id}/events")).await;
         if page["events"]
             .as_array()
             .is_some_and(|events| events.iter().any(|e| e["event_type"] == "session_meta"))
         {
-            return;
+            Ok(())
+        } else {
+            Err(format!("events: {page}"))
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no session_meta event: {page}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await;
 }
 
 fn lock_is_released(home: &TempHome) -> bool {
@@ -1843,14 +1843,17 @@ stages:
     assert!(status.success(), "{status:?}");
     // The command's group is SIGKILLed as the runtime drops; allow the
     // kernel a moment to reap the orphan.
-    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    while pid_alive(grandchild) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        !pid_alive(grandchild),
-        "the shell command's child outlived the daemon"
-    );
+    wait_until(
+        "the shell command's child to die with the daemon",
+        || async {
+            if pid_alive(grandchild) {
+                Err(format!("pid {grandchild} is still alive"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
 
     let daemon = Daemon::restart_on(home, port).await;
     let detail = daemon.get(&format!("/tasks/{task_id}")).await;
@@ -1910,38 +1913,37 @@ async fn sigkill_mid_agent_turn_is_parked_at_the_next_start() {
 async fn port_zero_binds_a_free_port_and_publishes_it_in_the_lock_file() {
     let home = TempHome::new();
     let mut child = spawn_raw(&home.0, &[("CHOCOFACTORY_PORT", "0")]);
-    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    let info = loop {
-        if let Ok(chocofactory_core::daemon_lock::LockState::Running(info)) =
-            chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
-            && info.port != 0
-        {
-            break info;
-        }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the daemon exited: {}",
-            read_stderr_to_string(&mut child).await
-        );
-        assert!(tokio::time::Instant::now() < deadline, "no lock info");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let info = {
+        let child = tokio::sync::Mutex::new(&mut child);
+        wait_until("the lock file to publish a port", || async {
+            let state = chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
+                .expect("reading the lock file");
+            if let chocofactory_core::daemon_lock::LockState::Running(info) = &state
+                && info.port != 0
+            {
+                return Ok(info.clone());
+            }
+            let mut child = child.lock().await;
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the daemon exited: {}",
+                read_stderr_to_string(&mut child).await
+            );
+            Err(format!("lock state: {state:?}"))
+        })
+        .await
     };
     assert_eq!(info.pid, child.id().unwrap());
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/server", info.port);
-    let answer_deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    let body = loop {
-        if let Ok(resp) = client.get(&url).send().await
-            && resp.status().is_success()
-        {
-            break resp.json::<Value>().await.unwrap();
+    let body = wait_until("GET /server to answer on the lock file's port", || async {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => Ok(resp.json::<Value>().await.unwrap()),
+            Ok(resp) => Err(format!("status {}", resp.status())),
+            Err(err) => Err(err.to_string()),
         }
-        assert!(
-            tokio::time::Instant::now() < answer_deadline,
-            "GET /server never answered on the lock file's port"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    })
+    .await;
     assert_eq!(body["port"], info.port);
     assert_eq!(body["pid"], info.pid);
     assert_eq!(body["version"], chocofactory_core::version::VERSION);
@@ -1977,20 +1979,17 @@ async fn a_stalled_connection_does_not_block_shutdown_past_the_drain_grace() {
 
     let home = TempHome::new();
     let mut child = spawn_raw(&home.0, &[("RUST_LOG", "warn")]);
-    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    let port = loop {
-        if let Ok(chocofactory_core::daemon_lock::LockState::Running(info)) =
-            chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
-            && info.port != 0
-        {
-            break info.port;
+    let port = wait_until("the daemon to publish its port", || async {
+        let state = chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
+            .expect("reading the lock file");
+        match state {
+            chocofactory_core::daemon_lock::LockState::Running(info) if info.port != 0 => {
+                Ok(info.port)
+            }
+            other => Err(format!("lock state: {other:?}")),
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "daemon never started"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    })
+    .await;
     let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap();
@@ -2038,21 +2037,37 @@ async fn a_stalled_connection_does_not_block_shutdown_past_the_drain_grace() {
 async fn piped_stderr_carries_no_ansi_escapes() {
     let home = TempHome::new();
     let mut child = spawn_raw(&home.0, &[("RUST_LOG", "info")]);
-    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    while !matches!(
-        chocofactory_core::daemon_lock::read_lock(&config_root_of(&home)),
-        Ok(chocofactory_core::daemon_lock::LockState::Running(ref i)) if i.port != 0
-    ) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "daemon never started"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    // Give startup logging time to land before stopping.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Collect stderr as it arrives, so the test can wait for the startup
+    // line it asserts on instead of sleeping and hoping it has landed.
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let collector = {
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let collected = std::sync::Arc::clone(&collected);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Some(line) = lines.next_line().await.expect("reading daemon stderr") {
+                let mut text = collected.lock().unwrap();
+                text.push_str(&line);
+                text.push('\n');
+            }
+        })
+    };
+    wait_until("the startup log to say 'listening'", || async {
+        let text = collected.lock().unwrap().clone();
+        if text.contains("listening") {
+            Ok(())
+        } else {
+            Err(format!("stderr so far: {text:?}"))
+        }
+    })
+    .await;
     sigterm_and_wait(&mut child).await;
-    let stderr = read_stderr_to_string(&mut child).await;
+    // EOF: the daemon has exited, so the rest of its stderr is in.
+    tokio::time::timeout(LOAD_ALLOWANCE, collector)
+        .await
+        .expect("stderr never reached EOF")
+        .unwrap();
+    let stderr = collected.lock().unwrap().clone();
     assert!(
         stderr.contains("listening"),
         "no log output at all: {stderr}"
@@ -2122,19 +2137,14 @@ async fn start_daemon_for_report(
         ],
     );
     let base = format!("http://127.0.0.1:{port}");
-    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    loop {
-        if let Ok(resp) = client.get(format!("{base}/projects")).send().await
-            && resp.status().is_success()
-        {
-            break;
+    wait_until("the daemon to answer GET /projects", || async {
+        match client.get(format!("{base}/projects")).send().await {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => Err(format!("status {}", resp.status())),
+            Err(err) => Err(err.to_string()),
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the daemon never became ready"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await;
     (child, base)
 }
 
@@ -2285,19 +2295,14 @@ async fn real_binary_reports_the_old_workflows_folder_and_leaves_it_alone() {
     );
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
-    let deadline = tokio::time::Instant::now() + LOAD_ALLOWANCE;
-    loop {
-        if let Ok(resp) = client.get(format!("{base}/projects")).send().await
-            && resp.status().is_success()
-        {
-            break;
+    wait_until("the daemon to answer GET /projects", || async {
+        match client.get(format!("{base}/projects")).send().await {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => Err(format!("status {}", resp.status())),
+            Err(err) => Err(err.to_string()),
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the daemon never became ready"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await;
     let project: Value = client
         .post(format!("{base}/projects"))
         .json(&json!({ "name": "demo" }))
