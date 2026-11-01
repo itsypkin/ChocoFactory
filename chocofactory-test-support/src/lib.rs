@@ -51,7 +51,10 @@ pub fn wait_until_blocking<T>(what: &str, check: impl FnMut() -> Result<T, Strin
     wait_until_blocking_within(LOAD_ALLOWANCE, what, check)
 }
 
-fn wait_until_blocking_within<T>(
+/// `wait_until_blocking` with a caller-chosen bound, for a wait whose
+/// worst case is known to need more than `LOAD_ALLOWANCE`. The panic text
+/// names `allowance`.
+pub fn wait_until_blocking_within<T>(
     allowance: Duration,
     what: &str,
     mut check: impl FnMut() -> Result<T, String>,

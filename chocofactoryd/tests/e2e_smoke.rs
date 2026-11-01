@@ -1565,6 +1565,25 @@ fn config_root_of(home: &TempHome) -> PathBuf {
     home.0.join(".config/chocofactory")
 }
 
+/// One poll of the daemon's lock file, for use inside a `wait_until`.
+///
+/// `read_lock` answers `InvalidData` while a daemon holds the lock but has
+/// not published its JSON yet (it gives up after about a second; under load
+/// the daemon can take longer than that between locking and publishing).
+/// That is "not yet", so the wait goes on until its own bound; the error is
+/// kept as the wait's `last saw`. Any other error panics.
+fn lock_state_or_not_yet(
+    root: &std::path::Path,
+) -> Result<chocofactory_core::daemon_lock::LockState, String> {
+    match chocofactory_core::daemon_lock::read_lock(root) {
+        Ok(state) => Ok(state),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            Err(format!("the lock is held but not yet published: {err}"))
+        }
+        Err(err) => panic!("reading the lock file: {err}"),
+    }
+}
+
 fn pid_alive(pid: u32) -> bool {
     // SAFETY: signal 0 delivers nothing; it only reports whether the pid exists.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
@@ -1916,8 +1935,7 @@ async fn port_zero_binds_a_free_port_and_publishes_it_in_the_lock_file() {
     let info = {
         let child = tokio::sync::Mutex::new(&mut child);
         wait_until("the lock file to publish a port", || async {
-            let state = chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
-                .expect("reading the lock file");
+            let state = lock_state_or_not_yet(&config_root_of(&home))?;
             if let chocofactory_core::daemon_lock::LockState::Running(info) = &state
                 && info.port != 0
             {
@@ -1980,8 +1998,7 @@ async fn a_stalled_connection_does_not_block_shutdown_past_the_drain_grace() {
     let home = TempHome::new();
     let mut child = spawn_raw(&home.0, &[("RUST_LOG", "warn")]);
     let port = wait_until("the daemon to publish its port", || async {
-        let state = chocofactory_core::daemon_lock::read_lock(&config_root_of(&home))
-            .expect("reading the lock file");
+        let state = lock_state_or_not_yet(&config_root_of(&home))?;
         match state {
             chocofactory_core::daemon_lock::LockState::Running(info) if info.port != 0 => {
                 Ok(info.port)
@@ -2656,4 +2673,49 @@ async fn real_claude_sends_the_roles_effort_not_the_daemons_env() {
     .await;
     assert_eq!(request["output_config"]["effort"], "low", "{request}");
     assert_eq!(request["model"], "claude-sonnet-5-5", "{request}");
+}
+
+/// A daemon can hold the lock for longer than `read_lock`'s one-second grace
+/// before it publishes. The wait must go through that window and return the
+/// published value; only its own bound ends it.
+#[tokio::test]
+async fn a_wait_on_the_lock_file_outlasts_a_held_but_unpublished_window() {
+    let home = TempHome::new();
+    let root = config_root_of(&home);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = chocofactory_core::daemon_lock::lock_path(&root);
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.lock().unwrap();
+    let publisher = std::thread::spawn(move || {
+        use std::io::Write;
+        // Unpublished for 2.5 s: at least two reads hit `InvalidData`.
+        std::thread::sleep(Duration::from_millis(2500));
+        let info = json!({
+            "pid": 4242, "port": 4321, "version": "test", "commit": null,
+            "started_at": "2026-01-01T00:00:00Z", "exe": "/x/chocofactoryd",
+        });
+        file.write_all(info.to_string().as_bytes()).unwrap();
+        file.flush().unwrap();
+        file // keep the lock held until the test has its answer
+    });
+    let mut unpublished_polls = 0;
+    let info = wait_until("the lock file to publish", || {
+        let state = lock_state_or_not_yet(&root);
+        if state.is_err() {
+            unpublished_polls += 1;
+        }
+        async move {
+            match state? {
+                chocofactory_core::daemon_lock::LockState::Running(info) => Ok(info),
+                other => Err(format!("lock state: {other:?}")),
+            }
+        }
+    })
+    .await;
+    assert_eq!((info.pid, info.port), (4242, 4321));
+    assert!(
+        unpublished_polls >= 1,
+        "the window never produced a not-yet poll, so this proved nothing"
+    );
+    drop(publisher.join().unwrap());
 }

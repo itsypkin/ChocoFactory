@@ -25,7 +25,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use chocofactory_core::daemon_lock::{LockInfo, LockState, read_lock};
 use chocofactory_core::version::VERSION;
-use chocofactory_test_support::wait_until_blocking;
+use chocofactory_test_support::wait_until_blocking_within;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -77,8 +77,23 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// Whether `server status --json` output lists a turn in flight. Output that
+/// is not JSON is a broken `choco`, not "not yet": it panics with the parse
+/// error and the text, rather than letting the wait run to its bound.
+fn has_in_flight(stdout: &[u8]) -> bool {
+    let v: Value = serde_json::from_slice(stdout).unwrap_or_else(|e| {
+        panic!(
+            "`server status --json` printed output that is not JSON ({e}): {:?}",
+            String::from_utf8_lossy(stdout)
+        )
+    });
+    !v["daemon"]["in_flight"]
+        .as_array()
+        .is_none_or(|a| a.is_empty())
+}
+
 fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    wait_until_blocking(what, || {
+    wait_until_blocking_within(DEADLINE, what, || {
         if f() {
             Ok(())
         } else {
@@ -914,13 +929,7 @@ fn start_turn_in_flight(env: &Env) {
     ]);
     wait_for("an in-flight turn", || {
         let out = env.choco(NO_SERVER, &["--json", "server", "status"]);
-        serde_json::from_slice::<Value>(&out.stdout)
-            .map(|v| {
-                !v["daemon"]["in_flight"]
-                    .as_array()
-                    .is_none_or(|a| a.is_empty())
-            })
-            .unwrap_or(false)
+        has_in_flight(&out.stdout)
     });
 }
 
@@ -1341,4 +1350,18 @@ fn install_rejects_an_unrepresentable_dir_before_creating_it() {
         assert!(text(&out).contains("cannot hold"), "{}", text(&out));
         assert!(!dir.exists(), "{name:?} was created");
     }
+}
+
+#[test]
+fn unparseable_server_status_output_fails_the_wait_at_once_naming_the_parse_error() {
+    assert!(has_in_flight(
+        br#"{"daemon":{"in_flight":[{"task_id":"t"}]}}"#
+    ));
+    assert!(!has_in_flight(br#"{"daemon":{"in_flight":[]}}"#));
+    let err = std::panic::catch_unwind(|| has_in_flight(b"starting up...")).unwrap_err();
+    let msg = err.downcast_ref::<String>().cloned().unwrap();
+    assert!(
+        msg.contains("not JSON") && msg.contains("expected") && msg.contains("starting up..."),
+        "{msg}"
+    );
 }
