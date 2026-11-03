@@ -792,10 +792,9 @@ stages:
         // insert; the hook keeps it there for 3 s, so the client is still
         // waiting when it is aborted.
         let id = crate::test_support::wait_until("the handler to insert the task", || async {
-            let tasks = server
-                .get(&format!("/tasks?project_id={project_id}"))
-                .await
-                .json();
+            let response = server.get(&format!("/tasks?project_id={project_id}")).await;
+            assert_eq!(response.status(), 200, "GET /tasks: {}", response.json());
+            let tasks = response.json();
             match tasks[0]["id"].as_str() {
                 Some(found) => Ok(found.to_string()),
                 None => Err(format!("tasks: {tasks}")),
@@ -806,7 +805,14 @@ stages:
         client.abort();
 
         crate::test_support::wait_until("the task to reach a stage", || async {
-            let detail = server.get(&format!("/tasks/{id}")).await.json();
+            let response = server.get(&format!("/tasks/{id}")).await;
+            assert_eq!(
+                response.status(),
+                200,
+                "GET /tasks/{id}: {}",
+                response.json()
+            );
+            let detail = response.json();
             if detail["workflow_state"].is_null() {
                 Err(format!("detail: {detail}"))
             } else {
