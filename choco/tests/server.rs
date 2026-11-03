@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chocofactory_core::daemon_lock::{LockState, read_lock};
-use chocofactory_test_support::{wait_until_blocking, wait_until_blocking_within};
+use chocofactory_test_support::wait_until_blocking_within;
 use serde_json::Value;
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -908,7 +908,7 @@ fn start_that_loses_the_race_reports_the_other_daemon() {
 
     // Once start has written its separator it has passed the "already running" check.
     let log = env.root().join("logs").join("chocofactoryd.log");
-    wait_until_blocking("start to write its separator to the log", || {
+    wait_until_blocking_within(DEADLINE, "start to write its separator to the log", || {
         match std::fs::read_to_string(&log) {
             Ok(t) if t.contains("=== choco server start") => Ok(()),
             Ok(t) => Err(format!("log so far: {t:?}")),
