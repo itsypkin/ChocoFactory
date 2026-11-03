@@ -62,8 +62,9 @@ and `choco task list --status stuck` finds every stuck task.
 - `no_report`: the turn never called `report_outcome`, was nudged (or, with
   a background job still running, waited 60 minutes in total across all its
   waits; its `session_note` names the jobs), and was closed. The processes the
-  turn started, such as that job, were killed when it closed; the
-  `leftovers_killed` `session_note` lists them by pid, and a
+  turn started outside the agent's own process group, such as that job, were
+  killed when it closed; the `leftovers_killed` `session_note` lists them by
+  pid, and a
   `leftovers_unchecked` note means the process table could not be read, so
   look for strays yourself. There is no outcome to route on, so read its last
   events before retrying. Blind spots, where a stray can survive: on macOS, a process the OS
@@ -75,7 +76,9 @@ and `choco task list --status stuck` finds every stuck task.
   has the details.
 - `lingered`: the agent process outlived its reported turn, or something the
   turn started was still alive, and it was killed. The `leftovers_killed`
-  `session_note` says what. The turn may have been writing to the worktree
+  `session_note`, when there is one, names what was still running outside the
+  agent's own process group. A `lingered` run with no such note means only the
+  agent's group was alive and killing it was enough; nothing was skipped. The turn may have been writing to the worktree
   until then, so check `git status` there before retrying.
 - `claude_settings_rejected`: the reason says Claude Code did not apply role
   `<role>`'s `claude_settings` (it ignores the whole settings when one value is

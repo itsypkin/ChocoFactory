@@ -155,7 +155,7 @@ pub(crate) fn kill_group(pid: u32) -> GroupKill {
     // runs this from `Drop`, which cannot await, and `block_in_place` panics
     // on a current-thread runtime, so it runs inline.
     let live = crate::proc_table::read(None).map(|table| live_members(&table, pgid));
-    kill_group_with(pid, live)
+    kill_group_with(pid, live).0
 }
 
 /// How many live (non-zombie) members the table shows in group `pgid`.
@@ -187,16 +187,22 @@ pub(crate) enum GroupKill {
 
 /// Sends SIGKILL to group `pid` and classifies the result from `live`, the
 /// count of live members a scan just before saw (or the scan's error).
-pub(crate) fn kill_group_with(pid: u32, live: std::io::Result<usize>) -> GroupKill {
+///
+/// The `bool` is `true` only when `killpg` was called and returned 0, that is
+/// when the kernel delivered SIGKILL to the group. It is `false` on the early
+/// returns where `killpg` is never called and on every `killpg` error. It
+/// cannot be derived from the [`GroupKill`]: `NothingAlive` covers both a
+/// delivered signal (Linux, a group of only zombies) and a failed one (`ESRCH`).
+pub(crate) fn kill_group_with(pid: u32, live: std::io::Result<usize>) -> (GroupKill, bool) {
     let Ok(pgid) = i32::try_from(pid) else {
-        return GroupKill::NothingAlive;
+        return (GroupKill::NothingAlive, false);
     };
     // `killpg(0, …)` means "my own process group" — the daemon would
     // SIGKILL itself and everything sharing its group. `child.id()` can't
     // return 0, so this is unreachable; it's here because the cost of the
     // check is two lines and the cost of being wrong is the whole daemon.
     if pgid <= 0 {
-        return GroupKill::NothingAlive;
+        return (GroupKill::NothingAlive, false);
     }
     // SAFETY: `killpg` only sends a signal; both failure modes ("no such
     // group", "not permitted") come back through the return value.
@@ -215,7 +221,8 @@ pub(crate) fn kill_group_with(pid: u32, live: std::io::Result<usize>) -> GroupKi
     } else {
         Err(std::io::Error::last_os_error())
     };
-    classify_group_kill(pgid, live, signal_result)
+    let delivered = signal_result.is_ok();
+    (classify_group_kill(pgid, live, signal_result), delivered)
 }
 
 /// Decides a group kill's outcome from the pre-kill scan and `killpg`'s
@@ -446,6 +453,75 @@ mod tests {
         assert!(matches!(kill_group(pgid), GroupKill::Killed(1)));
         wait_for_table("the member to die", |t| live_members(t, pgid as i32) == 0);
         child.wait().unwrap();
+    }
+
+    /// The signal of a reaped leader.
+    fn reaped_signal(mut child: std::process::Child) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        child.wait().unwrap().signal()
+    }
+
+    /// T4: the delivered flag is true exactly when `killpg` returned 0.
+    #[test]
+    fn the_delivered_flag_is_true_exactly_when_killpg_returned_zero() {
+        let sleeper = || in_own_group(std::process::Command::new("sleep").arg("300"));
+        let (leader, live) = (sleeper(), Ok(1));
+        let (kill, delivered) = kill_group_with(leader.id(), live);
+        assert!(matches!(kill, GroupKill::Killed(1)), "{kill:?}");
+        assert!(delivered, "(i) delivered is true");
+        assert_eq!(reaped_signal(leader), Some(libc::SIGKILL));
+
+        let leader = sleeper();
+        let (kill, delivered) = kill_group_with(leader.id(), Ok(0));
+        assert!(matches!(kill, GroupKill::NothingAlive), "{kill:?}");
+        assert!(delivered, "(ii) delivered is true");
+        assert_eq!(reaped_signal(leader), Some(libc::SIGKILL));
+
+        let leader = sleeper();
+        let (kill, delivered) = kill_group_with(leader.id(), Err(std::io::Error::other("scan")));
+        assert!(
+            matches!(
+                kill,
+                GroupKill::Unknown {
+                    signal_result: Ok(()),
+                    ..
+                }
+            ),
+            "{kill:?}"
+        );
+        assert!(delivered, "(iii) delivered is true");
+        assert_eq!(reaped_signal(leader), Some(libc::SIGKILL));
+
+        // (iv) No such group: ESRCH reads as nothing alive.
+        let (kill, delivered) = kill_group_with(99_999_999, Ok(1));
+        assert!(matches!(kill, GroupKill::NothingAlive), "{kill:?}");
+        assert!(!delivered, "(iv) delivered is false");
+
+        // (v) Not a pid: `killpg` is never called.
+        let (kill, delivered) = kill_group_with(u32::MAX, Ok(1));
+        assert!(matches!(kill, GroupKill::NothingAlive), "{kill:?}");
+        assert!(!delivered, "(v) delivered is false");
+    }
+
+    #[test]
+    fn the_delivered_flag_is_false_when_killpg_is_refused() {
+        // SAFETY: only reads the uid and probes pids with signal 0.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, every pid is signalable");
+            return;
+        }
+        let foreign = (2..5000).find(|&pid| {
+            // SAFETY: signal 0 only checks permission, and the kill is a killpg.
+            let rc = unsafe { libc::killpg(pid, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        });
+        let Some(foreign) = foreign else {
+            eprintln!("skipped: no foreign pid found");
+            return;
+        };
+        let (kill, delivered) = kill_group_with(foreign as u32, Ok(1));
+        assert!(matches!(kill, GroupKill::Failed(_)), "{kill:?}");
+        assert!(!delivered, "(vi) delivered is false");
     }
 
     #[test]

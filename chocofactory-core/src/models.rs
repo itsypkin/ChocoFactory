@@ -646,7 +646,13 @@ pub enum EventType {
     ///   changed;
     /// - `"resume"`: a retry resumed the interrupted turn's conversation;
     /// - `"leftovers_killed"`: processes the turn started were still running
-    ///   when it ended and were killed (survivors are listed separately);
+    ///   when it ended and were killed. When the group kill succeeded, only
+    ///   processes outside the agent's own process group are listed: the
+    ///   group's members were killed by the group kill. When the group kill
+    ///   failed, the group is listed as a survivor and its members are killed
+    ///   one by one and listed with the rest. Survivors, including a group
+    ///   member still present after a successful group kill, are listed
+    ///   separately;
     /// - `"leftovers_unchecked"`: the process table could not be read, so
     ///   what the turn left running could not be checked.
     ///

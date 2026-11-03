@@ -1734,7 +1734,10 @@ struct TrackerState {
 /// What [`kill_and_sweep`] did at one site.
 struct KillReport {
     group: GroupKill,
-    /// Live processes the sweeps of this call killed.
+    /// Live processes the sweeps of this call killed. When the group kill
+    /// succeeded, the agent's group members are not counted: they are the
+    /// group kill's. When it failed, the sweeps kill them by pid and they are
+    /// counted.
     sweep_killed: usize,
 }
 
@@ -1825,7 +1828,13 @@ impl LeftoverTracker {
     /// Scans with the marker, SIGKILLs everything owned by pid, and repeats
     /// (bounded) to catch children forked between a scan and its kill.
     /// Returns how many live processes it killed.
-    async fn sweep(&self, agent: i32, site: &str) -> usize {
+    ///
+    /// `spare_group` is the process group whose SIGKILL `killpg` already
+    /// delivered (see [`kill_and_sweep`]). An owned entry in that group is
+    /// watched, not killed and not recorded as killed: it still keeps the
+    /// loop going, and if it is still in the table at the last round it is
+    /// listed as a survivor. `None` kills every owned entry.
+    async fn sweep(&self, agent: i32, spare_group: Option<i32>, site: &str) -> usize {
         // SAFETY: both only read process state.
         let (daemon_sid, uid) = unsafe { (libc::getsid(0), libc::geteuid()) };
         let mut failed = std::collections::HashSet::new();
@@ -1852,6 +1861,12 @@ impl LeftoverTracker {
             .into_iter()
             .filter(|pid| !failed.contains(pid))
             .collect();
+            let in_spared_group = |pid: i32| {
+                spare_group
+                    .is_some_and(|group| table.iter().any(|e| e.pid == pid && e.pgid == group))
+            };
+            let (watched, to_kill): (Vec<i32>, Vec<i32>) =
+                owned.into_iter().partition(|pid| in_spared_group(*pid));
             let comm = |pid: i32| {
                 table
                     .iter()
@@ -1859,17 +1874,17 @@ impl LeftoverTracker {
                     .map(|e| e.comm.clone())
                     .unwrap_or_default()
             };
-            if owned.is_empty() {
+            if watched.is_empty() && to_kill.is_empty() {
                 break;
             }
             if round == SWEEP_ROUNDS {
                 tracing::warn!(
                     site,
-                    count = owned.len(),
+                    count = watched.len() + to_kill.len(),
                     "processes the turn started survived the sweep"
                 );
                 let mut state = self.state();
-                for pid in owned {
+                for pid in watched.into_iter().chain(to_kill) {
                     state.add_survivor(pid, comm(pid));
                 }
                 break;
@@ -1877,7 +1892,7 @@ impl LeftoverTracker {
             // Pid reuse between the scan and this kill is not guarded beyond
             // the scan: both kernels allocate pids sequentially, so it would
             // take a full wraparound inside this window. Accepted cost.
-            for pid in owned {
+            for pid in to_kill {
                 match proc_table::kill_pid(pid) {
                     proc_table::PidKill::Killed => {
                         let mut state = self.state();
@@ -1917,6 +1932,39 @@ impl LeftoverTracker {
 /// agent stays unreaped (its pid valid, and a descendant link through it
 /// sound) until the sweep is over. The one scan before the kill serves both
 /// as the record and as the classification of the kill.
+///
+/// # What the sweep leaves to the group kill
+///
+/// When `killpg` returned 0, SIGKILL was delivered to every member of the
+/// agent's group, and it cannot be caught or ignored. A member may still be in
+/// the sweep's table, not yet a zombie, with the signal pending; killing it
+/// again by pid would succeed (`kill` also returns 0 for an unreaped zombie)
+/// and the turn would get a false `leftovers_killed` note for a process the
+/// group kill had already killed. So the sweep spares owned entries whose
+/// `pgid` is the agent's: it does not kill them, does not record them as
+/// killed, but still watches them, and lists one still in the table at the
+/// last round as a survivor. A process that left the group (`setpgid`,
+/// `setsid`) has another pgid and is killed and recorded as before.
+///
+/// When `killpg` returned an error (`GroupKill::Failed`, `Unknown` with an
+/// `Err` signal result, `NothingAlive` from `ESRCH`/`EPERM`, or the early
+/// returns where it is never called) nothing is spared: the sweep kills
+/// same-group entries by pid, as it did before this rule.
+///
+/// One tracker sees up to three sites in a turn (cancel, shutdown, settings
+/// or grace, then always the end of the turn). A member spared at one site is
+/// gone by the next, or a zombie (never owned), or still alive, in which case
+/// `killpg` returns 0 again and it is spared again; it is never recorded as
+/// killed later.
+///
+/// Accepted blind spots, in both of which the process is spared, watched, and
+/// listed as "could not be killed and may still be running" if still alive at
+/// the last round, so the note shows it instead of killing it:
+/// - (a) A process that enters the agent's group after `killpg` returned.
+///   Only `setpgid` from a process in the daemon's session can do that.
+/// - (b) A child whose fork completes while `killpg` is walking the group may
+///   not receive the signal. On macOS this is unverified; Linux delivers
+///   group signals to a child being forked.
 async fn kill_and_sweep(tracker: &LeftoverTracker, pgid: u32, site: &str) -> KillReport {
     let agent = pgid as i32;
     let scan = tracker.scan(false).await;
@@ -1927,7 +1975,7 @@ async fn kill_and_sweep(tracker: &LeftoverTracker, pgid: u32, site: &str) -> Kil
     if tracker.kind == SessionKind::Standing {
         // Chat sessions only get the group kill, as before.
         return KillReport {
-            group: crate::shell::kill_group_with(pgid, live),
+            group: crate::shell::kill_group_with(pgid, live).0,
             sweep_killed: 0,
         };
     }
@@ -1935,14 +1983,14 @@ async fn kill_and_sweep(tracker: &LeftoverTracker, pgid: u32, site: &str) -> Kil
         Ok(table) => tracker.record_table(table, agent),
         Err(err) => tracker.note_scan_failure(site, err),
     }
-    let group = crate::shell::kill_group_with(pgid, live);
+    let (group, delivered) = crate::shell::kill_group_with(pgid, live);
     if let GroupKill::Failed(err) = &group {
         tracker
             .state()
             .add_survivor(agent, format!("process group ({err})"));
     }
-    let sweep_killed = tracker.sweep(agent, site).await;
-    tracing::debug!(site, group = %describe_group_kill(&group), sweep_killed, "killed the agent's group and swept");
+    let sweep_killed = tracker.sweep(agent, delivered.then_some(agent), site).await;
+    tracing::debug!(site, group = %describe_group_kill(&group), delivered, sweep_killed, "killed the agent's group and swept");
     KillReport {
         group,
         sweep_killed,
@@ -5871,6 +5919,348 @@ mod tests {
             .filter(|(p, _)| *p == foreign)
             .count();
         assert_eq!(listed, 1, "{:?}", state.survivors);
+    }
+
+    // --- the sweep and the group kill's own members -----------------------
+
+    /// A real `sleep 300` for the sweep-selection tests. Killed and reaped on
+    /// drop, so a failed assert leaks nothing.
+    struct Sleeper(Option<std::process::Child>);
+
+    impl Sleeper {
+        /// `group`: `Some(pgid)` joins that group, `None` leads its own.
+        /// `own_session` calls `setsid` instead (a group leader cannot), as
+        /// Claude Code's Bash tool does; `group` is then ignored.
+        fn spawn(group: Option<i32>, own_session: bool) -> Self {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new("sleep");
+            command.arg("300");
+            if !own_session {
+                command.process_group(group.unwrap_or(0));
+            } else {
+                // SAFETY: `setsid` is async-signal-safe.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            Sleeper(Some(command.spawn().unwrap()))
+        }
+
+        fn pid(&self) -> i32 {
+            self.0.as_ref().unwrap().id() as i32
+        }
+
+        /// Not exited yet. (`kill(pid, 0)` also succeeds on an unreaped
+        /// zombie, so it cannot say this.)
+        fn is_running(&mut self) -> bool {
+            self.0.as_mut().unwrap().try_wait().unwrap().is_none()
+        }
+
+        /// Waits for the process and returns the signal that ended it.
+        fn reap_signal(&mut self) -> Option<i32> {
+            use std::os::unix::process::ExitStatusExt;
+            self.0.take().unwrap().wait().unwrap().signal()
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// A table entry for a `sleep` of the test's own uid, started in the
+    /// daemon's session unless `sid` says otherwise.
+    fn sleep_entry(
+        pid: i32,
+        ppid: i32,
+        pgid: i32,
+        sid: i32,
+        start: u64,
+    ) -> crate::proc_table::ProcEntry {
+        crate::proc_table::ProcEntry {
+            pid,
+            ppid,
+            pgid,
+            sid,
+            // SAFETY: only reads the process's own uid.
+            uid: unsafe { libc::geteuid() },
+            start,
+            zombie: false,
+            comm: "sleep".into(),
+            marker: crate::proc_table::MarkerStatus::Absent,
+        }
+    }
+
+    /// A reader whose table depends on the scan: `None` for the scan before
+    /// the kill (no marker asked for), `Some(n)` for the sweep's n-th scan.
+    fn scripted_reader(
+        table: impl Fn(Option<usize>) -> Vec<crate::proc_table::ProcEntry> + Send + Sync + 'static,
+    ) -> crate::proc_table::ProcReader {
+        let sweeps = std::sync::atomic::AtomicUsize::new(0);
+        Arc::new(move |marker| {
+            let call = marker.map(|_| sweeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
+            Ok(table(call))
+        })
+    }
+
+    fn sweep_tracker(reader: crate::proc_table::ProcReader) -> LeftoverTracker {
+        LeftoverTracker::new(
+            "CHOCOFACTORY_TURN_x".into(),
+            SessionKind::SingleShot,
+            reader,
+        )
+    }
+
+    fn pids_of(list: &[(i32, String)]) -> Vec<i32> {
+        list.iter().map(|(pid, _)| *pid).collect()
+    }
+
+    /// The agent `a`, its in-group member `p1` and, when given, `p2` in a
+    /// session and group of its own; `p1` and `p2` are shown on call 1 only,
+    /// or on every call when `always`.
+    fn group_table(
+        a: i32,
+        p1: i32,
+        p2: Option<i32>,
+        always: bool,
+    ) -> crate::proc_table::ProcReader {
+        // SAFETY: only reads the process's own session id.
+        let daemon_sid = unsafe { libc::getsid(0) };
+        let daemon = std::process::id() as i32;
+        scripted_reader(move |call| {
+            let mut table = vec![sleep_entry(a, daemon, a, daemon_sid, 100)];
+            if always || call.is_none_or(|n| n == 1) {
+                table.push(sleep_entry(p1, a, a, daemon_sid, 200));
+                if let Some(p2) = p2 {
+                    table.push(sleep_entry(p2, a, p2, p2, 300));
+                }
+            }
+            table
+        })
+    }
+
+    /// T1(a): a live in-group member that the group kill already signalled is
+    /// neither killed, recorded as killed, nor listed as a survivor once it is
+    /// gone.
+    #[tokio::test]
+    async fn a_sweep_leaves_the_group_kills_member_alone() {
+        let mut leader = Sleeper::spawn(None, false);
+        let a = leader.pid();
+        let mut p1 = Sleeper::spawn(Some(a), false);
+        let tracker = sweep_tracker(group_table(a, p1.pid(), None, false));
+        let returned = tracker.sweep(a, Some(a), "test").await;
+        let state = tracker.state();
+        assert!(
+            !pids_of(&state.killed).contains(&p1.pid()),
+            "P1 is not in killed: {:?}",
+            state.killed
+        );
+        assert!(
+            !pids_of(&state.survivors).contains(&p1.pid()),
+            "P1 is not in survivors: {:?}",
+            state.survivors
+        );
+        assert_eq!(returned, 0);
+        assert!(p1.is_running(), "the sweep sent P1 nothing");
+        assert!(leader.is_running(), "the sweep sent the agent nothing");
+    }
+
+    /// T1(b): a spared member still in the table at the last round is listed
+    /// as a survivor, once, and still not as killed.
+    #[tokio::test]
+    async fn a_spared_member_that_stays_is_listed_as_a_survivor() {
+        let leader = Sleeper::spawn(None, false);
+        let a = leader.pid();
+        let mut p1 = Sleeper::spawn(Some(a), false);
+        let tracker = sweep_tracker(group_table(a, p1.pid(), None, true));
+        let returned = tracker.sweep(a, Some(a), "test").await;
+        let state = tracker.state();
+        assert_eq!(
+            pids_of(&state.survivors)
+                .iter()
+                .filter(|p| **p == p1.pid())
+                .count(),
+            1,
+            "P1 is in survivors exactly once: {:?}",
+            state.survivors
+        );
+        assert!(
+            !pids_of(&state.killed).contains(&p1.pid()),
+            "{:?}",
+            state.killed
+        );
+        assert_eq!(returned, 0);
+        assert!(p1.is_running());
+    }
+
+    /// T1(c): mixed. The member that left the group is killed and recorded;
+    /// the member still in the group is spared.
+    #[tokio::test]
+    async fn a_sweep_kills_the_escaped_process_and_spares_the_group_member() {
+        let leader = Sleeper::spawn(None, false);
+        let a = leader.pid();
+        let mut p1 = Sleeper::spawn(Some(a), false);
+        let mut p2 = Sleeper::spawn(None, true);
+        let tracker = sweep_tracker(group_table(a, p1.pid(), Some(p2.pid()), false));
+        let returned = tracker.sweep(a, Some(a), "test").await;
+        {
+            let state = tracker.state();
+            assert_eq!(
+                pids_of(&state.killed)
+                    .iter()
+                    .filter(|p| **p == p2.pid())
+                    .count(),
+                1,
+                "P2 is in killed: {:?}",
+                state.killed
+            );
+            assert!(
+                !pids_of(&state.killed).contains(&p1.pid()),
+                "{:?}",
+                state.killed
+            );
+            assert!(
+                !pids_of(&state.survivors).contains(&p1.pid()),
+                "{:?}",
+                state.survivors
+            );
+        }
+        assert_eq!(returned, 1);
+        assert_eq!(p2.reap_signal(), Some(libc::SIGKILL));
+        assert!(p1.is_running());
+    }
+
+    /// T1(d): the same table as (a) when the group kill was not delivered:
+    /// the member is killed and recorded.
+    #[tokio::test]
+    async fn a_sweep_after_a_failed_group_kill_kills_the_member() {
+        let leader = Sleeper::spawn(None, false);
+        let a = leader.pid();
+        let mut p1 = Sleeper::spawn(Some(a), false);
+        let tracker = sweep_tracker(group_table(a, p1.pid(), None, false));
+        let returned = tracker.sweep(a, None, "test").await;
+        {
+            let state = tracker.state();
+            assert!(
+                pids_of(&state.killed).contains(&p1.pid()),
+                "P1 is in killed: {:?}",
+                state.killed
+            );
+        }
+        assert_eq!(returned, 1);
+        assert_eq!(p1.reap_signal(), Some(libc::SIGKILL));
+    }
+
+    /// T2: `killpg` fails (EPERM). A same-group process is then killed by pid
+    /// and recorded, and the agent's group is a survivor.
+    #[tokio::test]
+    async fn a_failed_group_kill_does_not_spare_the_groups_members() {
+        // SAFETY: only reads the uid and probes pids with signal 0.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, every pid is signalable");
+            return;
+        }
+        let foreign = (2..5000).find(|&pid| {
+            // SAFETY: signal 0 only checks permission, and the kill is a killpg.
+            let rc = unsafe { libc::killpg(pid, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        });
+        let Some(foreign) = foreign else {
+            eprintln!("skipped: no foreign pid found");
+            return;
+        };
+        let mut p3 = Sleeper::spawn(None, false);
+        let p3_pid = p3.pid();
+        let reader = scripted_reader(move |call| {
+            let mut table = vec![sleep_entry(foreign, 1, foreign, foreign, 100)];
+            if call.is_none_or(|n| n == 1) {
+                table.push(sleep_entry(p3_pid, foreign, foreign, foreign, 200));
+            }
+            table
+        });
+        let tracker = sweep_tracker(reader);
+        let report = kill_and_sweep(&tracker, foreign as u32, "test").await;
+        {
+            let state = tracker.state();
+            assert!(
+                pids_of(&state.killed).contains(&p3_pid),
+                "P3 is recorded in killed: {:?}",
+                state.killed
+            );
+            assert_eq!(
+                pids_of(&state.survivors)
+                    .iter()
+                    .filter(|p| **p == foreign)
+                    .count(),
+                1,
+                "{:?}",
+                state.survivors
+            );
+        }
+        assert_eq!(report.sweep_killed, 1);
+        assert!(
+            matches!(report.group, GroupKill::Failed(_)),
+            "{}",
+            describe_group_kill(&report.group)
+        );
+        assert_eq!(p3.reap_signal(), Some(libc::SIGKILL));
+    }
+
+    /// T3: the CI race. The table still shows a member alive after `killpg`,
+    /// as the kernel does while its SIGKILL is pending; it is the group
+    /// kill's, so it is not recorded as a leftover.
+    #[tokio::test]
+    async fn the_group_kills_own_member_is_not_recorded_as_a_leftover() {
+        let mut leader = Sleeper::spawn(None, false);
+        let l = leader.pid();
+        let mut p4 = Sleeper::spawn(Some(l), false);
+        let p4_pid = p4.pid();
+        // SAFETY: only reads the process's own session id.
+        let daemon_sid = unsafe { libc::getsid(0) };
+        let daemon = std::process::id() as i32;
+        let reader = scripted_reader(move |call| {
+            if call.is_none_or(|n| n == 1) {
+                vec![
+                    sleep_entry(l, daemon, l, daemon_sid, 100),
+                    sleep_entry(p4_pid, l, l, daemon_sid, 200),
+                ]
+            } else {
+                Vec::new()
+            }
+        });
+        let tracker = sweep_tracker(reader);
+        let report = kill_and_sweep(&tracker, l as u32, "test").await;
+        {
+            let state = tracker.state();
+            assert!(
+                !pids_of(&state.killed).contains(&p4_pid),
+                "the group kill's own member was recorded as a leftover (the CI flake): {:?}",
+                state.killed
+            );
+            assert!(
+                state.survivors.is_empty(),
+                "no leftovers_killed note would be written: {:?}",
+                state.survivors
+            );
+        }
+        assert!(
+            matches!(report.group, GroupKill::Killed(_)),
+            "{}",
+            describe_group_kill(&report.group)
+        );
+        assert_eq!(report.sweep_killed, 0);
+        // The real `killpg` was delivered to both.
+        assert_eq!(leader.reap_signal(), Some(libc::SIGKILL));
+        assert_eq!(p4.reap_signal(), Some(libc::SIGKILL));
     }
 
     /// Short waits that each end well inside the limit still add up to it.
