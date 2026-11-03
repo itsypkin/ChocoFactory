@@ -554,13 +554,16 @@ fn queued_turns_do_not_block_stop_and_start_after_the_restart() {
     });
     wait_for_state("the queued turn to start", || {
         let detail = env.json(&["task", "status", &second]);
+        // `server status` only after the task checks pass, as before: it
+        // is one more process per poll, and it fails if the daemon is slow.
+        if detail["status"] != "open" || detail["queued"].as_array().is_none_or(|q| !q.is_empty()) {
+            return Err(format!("task {detail}"));
+        }
         let server = env.json(&["server", "status"]);
-        let started = detail["status"] == "open"
-            && detail["queued"].as_array().is_some_and(|q| q.is_empty())
-            && server["daemon"]["in_flight"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|f| f["task_id"] == second.as_str()));
-        if started {
+        if server["daemon"]["in_flight"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|f| f["task_id"] == second.as_str()))
+        {
             Ok(())
         } else {
             Err(format!("task {detail}; server {server}"))

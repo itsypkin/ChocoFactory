@@ -292,6 +292,20 @@ struct ChocoOutput {
 }
 
 impl ChocoOutput {
+    /// Panics at once, with both streams, if `choco` did not exit 0. For
+    /// reads inside a wait: a failed read is a broken `choco` or daemon,
+    /// not "not yet", and must not run to the wait's bound.
+    fn expect_success(self, what: &str) -> Self {
+        assert_eq!(
+            self.code,
+            Some(0),
+            "{what} failed: stdout {:?}, stderr {:?}",
+            self.stdout,
+            self.stderr
+        );
+        self
+    }
+
     fn json(&self) -> Value {
         serde_json::from_str(self.stdout.trim())
             .unwrap_or_else(|err| panic!("choco stdout wasn't JSON ({err}): {:?}", self.stdout))
@@ -587,7 +601,9 @@ stages:
     .await;
     assert_eq!(accepted.code, Some(0), "stderr: {}", accepted.stderr);
     let status = wait_until("the task status to show done", || async {
-        let status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+        let status = run_choco(&daemon.base_url, &["task", "status", &task_id])
+            .await
+            .expect_success("`choco task status`");
         if status.stdout.contains("done") {
             Ok(status)
         } else {
@@ -915,7 +931,9 @@ async fn task_events_shows_the_conversation() {
     // mock-claude echoes `echo:{text}`; wait for that reply to land so the
     // assertion covers a real round trip, not just the human_message.
     let human = wait_until("the transcript to show the echoed prompt", || async {
-        let human = run_choco(&daemon.base_url, &["task", "events", &task_id]).await;
+        let human = run_choco(&daemon.base_url, &["task", "events", &task_id])
+            .await
+            .expect_success("`choco task events`");
         if human.stdout.contains("echo:hello there") {
             Ok(human)
         } else {
@@ -1036,7 +1054,9 @@ stages:
     // started in — `stage_history` never recorded that, because it only
     // appended on the way *out* of a stage (X-3).
     let fresh = wait_until("the entry stage in the trail", || async {
-        let fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+        let fresh = run_choco(&daemon.base_url, &["task", "status", &task_id])
+            .await
+            .expect_success("`choco task status`");
         if has_row(&fresh.stdout, &["1", "start", "gate"]) {
             Ok(fresh)
         } else {
@@ -1076,7 +1096,9 @@ stages:
         })
     };
     let status = wait_until("the gate hop, marked current", || async {
-        let status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
+        let status = run_choco(&daemon.base_url, &["task", "status", &task_id])
+            .await
+            .expect_success("`choco task status`");
         if settled(&status.stdout) {
             Ok(status)
         } else {
@@ -2877,4 +2899,26 @@ async fn task_list_search_json_rows_are_whole() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], full);
     assert!(rows[0].get("pr").is_some() && rows[0].get("usage_total").is_some());
+}
+
+#[test]
+fn expect_success_passes_an_exit_0_output_through() {
+    let out = ChocoOutput {
+        stdout: "done".into(),
+        stderr: String::new(),
+        code: Some(0),
+    }
+    .expect_success("`choco x`");
+    assert_eq!(out.stdout, "done");
+}
+
+#[test]
+#[should_panic(expected = "`choco x` failed: stdout \"out\", stderr \"no such task\"")]
+fn expect_success_panics_on_a_non_zero_exit_with_both_streams() {
+    ChocoOutput {
+        stdout: "out".into(),
+        stderr: "no such task".into(),
+        code: Some(1),
+    }
+    .expect_success("`choco x`");
 }
