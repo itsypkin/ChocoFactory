@@ -306,8 +306,8 @@ choco task create --project <p> --workflow coding-task-planned \
   If you capture `choco --json …` output in a variable, replay it with
   `printf '%s\n' "$x" | jq`, never `echo "$x"`: zsh's and `sh`'s `echo` turn
   the JSON's `\n` and `\u001b` escapes into raw characters, and jq then fails
-  with `control characters from U+0000 through U+001F must be escaped`.
-  The JSON itself is valid.
+  with `control characters from U+0000 through U+001F must be escaped` (or
+  `Invalid escape`). The JSON itself is valid.
 
 What each stage does, and what can mislead you while it runs, is in
 [reference/stages.md](reference/stages.md).

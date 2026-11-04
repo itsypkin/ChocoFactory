@@ -85,7 +85,8 @@ These are every role's reports, not only the reviewer's: `ready` or
 against the `Progress` table in `choco task status`. Use `printf '%s\n'`,
 not `echo`: `echo` in zsh and in `sh` turns the JSON's `\n` and `\u001b`
 escapes into raw characters, and jq then fails with `control characters from
-U+0000 through U+001F must be escaped`. The JSON `choco` printed was valid.
+U+0000 through U+001F must be escaped` (or `Invalid escape`). The JSON `choco`
+printed was valid.
 
 ## Watching commits in a revise lap
 
