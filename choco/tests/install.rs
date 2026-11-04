@@ -916,7 +916,7 @@ stages:
     kind: terminal
 "#;
 
-fn start_turn_in_flight(env: &Env) {
+fn start_turn_in_flight(env: &Env) -> String {
     let wf = env.home.join("wf.yaml");
     std::fs::write(&wf, AGENT_WF).unwrap();
     let repo = env.home.join("repo");
@@ -928,7 +928,7 @@ fn start_turn_in_flight(env: &Env) {
         "--repo",
         repo.to_str().unwrap(),
     ]);
-    env.json(&[
+    let task = env.json(&[
         "task",
         "create",
         "--project",
@@ -944,6 +944,7 @@ fn start_turn_in_flight(env: &Env) {
         let out = env.choco(NO_SERVER, &["--json", "server", "status"]);
         in_flight_state(&out)
     });
+    task["id"].as_str().unwrap().to_string()
 }
 
 #[test]
@@ -1425,4 +1426,431 @@ fn unparseable_server_status_output_fails_the_wait_at_once_naming_the_parse_erro
             && msg.contains("a warning"),
         "{msg}"
     );
+}
+
+// ---- #361: `--json` keeps stdout for JSON ----------------------------------
+//
+// `update --check` answers with one object; every other `update` outcome has
+// no JSON result, so its messages go to stderr and stdout stays empty.
+
+fn manifest(server: &Server, path: &str, version: &str) {
+    server.put(
+        path,
+        format!(r#"{{"version":"{version}","commit":"x"}}"#).into_bytes(),
+    );
+}
+
+/// `choco [--json] <args>` in the install dir.
+fn update_cmd(env: &Env, url: &str, json: bool, args: &[&str]) -> Output {
+    let mut a: Vec<&str> = Vec::new();
+    if json {
+        a.push("--json");
+    }
+    a.extend_from_slice(args);
+    env.choco(url, &a)
+}
+
+/// What an action printed: under `--json` stdout must be empty and the text
+/// is on stderr; otherwise it is on stdout and stderr is empty.
+fn said(label: &str, out: &Output, json: bool) -> String {
+    if json {
+        support::assert_empty_stdout(label, out);
+        stderr(out)
+    } else {
+        assert!(out.stderr.is_empty(), "{label}: {}", text(out));
+        stdout(out)
+    }
+}
+
+#[test]
+fn json_update_check_answers_with_exactly_three_fields() {
+    let env = Env::new();
+    env.install_from_archive();
+    // The marker's version must not be what `current` reports.
+    env.set_marker_version("0.0.1");
+    let marker_before = std::fs::read(env.marker()).unwrap();
+    let server = Server::new();
+    let before = env.inodes();
+
+    manifest(&server, "/latest/download/manifest.json", "9.9.9");
+    let out = update_cmd(&env, &server.url, true, &["update", "--check"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let v = support::json_stdout("update --check", &out);
+    assert_eq!(
+        v,
+        serde_json::json!({"current": VERSION, "latest": "9.9.9", "update_available": true})
+    );
+    assert_eq!(v.as_object().unwrap().len(), 3);
+    assert!(out.stderr.is_empty(), "{}", text(&out));
+
+    // The same version: no update is available.
+    manifest(&server, "/latest/download/manifest.json", VERSION);
+    let out = update_cmd(&env, &server.url, true, &["update", "--check"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        support::json_stdout("update --check (current)", &out),
+        serde_json::json!({"current": VERSION, "latest": VERSION, "update_available": false})
+    );
+
+    // `--version` picks the manifest, and `--force` does not make a check act.
+    manifest(&server, "/download/v8.8.8/manifest.json", "8.8.8");
+    let out = update_cmd(
+        &env,
+        &server.url,
+        true,
+        &["update", "--check", "--version", "8.8.8", "--force"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        support::json_stdout("update --check --version", &out),
+        serde_json::json!({"current": VERSION, "latest": "8.8.8", "update_available": true})
+    );
+
+    // Nothing changed and no archive was fetched.
+    assert_eq!(env.inodes(), before);
+    assert_eq!(std::fs::read(env.marker()).unwrap(), marker_before);
+    assert!(
+        server.requests().iter().all(|p| !p.ends_with(".tar.gz")),
+        "{:?}",
+        server.requests()
+    );
+}
+
+#[test]
+fn json_update_check_errors_print_no_partial_object() {
+    let env = Env::new();
+    env.install_from_archive();
+    let server = Server::new();
+    server.put("/latest/download/manifest.json", b"not json".to_vec());
+    let out = update_cmd(&env, &server.url, true, &["update", "--check"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("update --check (bad manifest)", &out);
+    assert!(stderr(&out).contains("not valid JSON"), "{}", text(&out));
+    server.put(
+        "/latest/download/manifest.json",
+        br#"{"commit":"x"}"#.to_vec(),
+    );
+    let out = update_cmd(&env, &server.url, true, &["update", "--check"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("update --check (no version)", &out);
+}
+
+fn up_to_date_scenario(json: bool) {
+    let env = Env::new();
+    env.install_from_archive();
+    let server = Server::new();
+    manifest(&server, "/latest/download/manifest.json", VERSION);
+    let before = env.inodes();
+    let out = update_cmd(&env, &server.url, json, &["update"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        said("update (up to date)", &out, json),
+        format!("choco is up to date ({VERSION})\n")
+    );
+    assert_eq!(env.inodes(), before);
+}
+
+#[test]
+fn update_up_to_date_says_so_on_stdout() {
+    up_to_date_scenario(false);
+}
+
+#[test]
+fn update_up_to_date_says_so_on_stderr_under_json() {
+    up_to_date_scenario(true);
+}
+
+fn replacement_scenario(json: bool) {
+    let env = Env::new();
+    env.install_from_archive();
+    let server = Server::new();
+    let archive = archive_bytes();
+    server.release(Some(VERSION), archive, sums_for(archive), VERSION);
+    manifest(&server, "/latest/download/manifest.json", VERSION);
+    let old = env.start_daemon();
+    env.set_marker_version("0.0.1");
+    let before = env.inodes();
+    let out = update_cmd(&env, &server.url, json, &["update", "--force"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let new = env.running();
+    assert_ne!(new.pid, old.pid);
+    assert_eq!(new.port, old.port);
+    let after = env.inodes();
+    assert_ne!(before.0, after.0);
+    assert_ne!(before.1, after.1);
+    let marker: Value =
+        serde_json::from_str(&std::fs::read_to_string(env.marker()).unwrap()).unwrap();
+    assert_eq!(marker["version"], VERSION);
+    // The daemon stop, the daemon start and the result, in this order.
+    assert_eq!(
+        said("update --force (replacement)", &out, json),
+        format!(
+            "chocofactoryd stopped (pid {})\nchocofactoryd {} started (pid {}, port {}); log: {}\nupdated {VERSION} → {VERSION}\n",
+            old.pid,
+            new.version,
+            new.pid,
+            new.port,
+            env.root().join("logs").join("chocofactoryd.log").display()
+        )
+    );
+}
+
+#[test]
+fn forced_update_prints_its_messages_on_stdout() {
+    replacement_scenario(false);
+}
+
+#[test]
+fn forced_update_prints_its_messages_on_stderr_under_json() {
+    replacement_scenario(true);
+}
+
+fn refusal_scenario(json: bool) {
+    let mut env = Env::new();
+    env.claude = blocking_claude(&env.home);
+    env.install_from_archive();
+    let server = Server::new();
+    // A version that is not this one, so the up-to-date early return is not taken.
+    manifest(&server, "/latest/download/manifest.json", "9.9.9");
+    env.start_daemon();
+    let id = start_turn_in_flight(&env);
+    let before = env.inodes();
+    let marker_before = std::fs::read(env.marker()).unwrap();
+    let pid = env.running().pid;
+
+    let out = update_cmd(&env, &server.url, json, &["update"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    let said = said("update (refused)", &out, json);
+    assert!(
+        said.starts_with(
+            "error: chocofactoryd is in the middle of work that updating would interrupt:\n"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains(&id) && said.contains("(agent_turn)"),
+        "{said}"
+    );
+    assert!(said.contains("pass --force to update anyway"), "{said}");
+    assert!(
+        server.requests().iter().all(|p| !p.ends_with(".tar.gz")),
+        "{:?}",
+        server.requests()
+    );
+    assert_eq!(env.inodes(), before);
+    assert_eq!(std::fs::read(env.marker()).unwrap(), marker_before);
+    assert_eq!(env.running().pid, pid);
+}
+
+#[test]
+fn update_refusal_names_the_task_on_stdout() {
+    refusal_scenario(false);
+}
+
+#[test]
+fn update_refusal_names_the_task_on_stderr_under_json() {
+    refusal_scenario(true);
+}
+
+fn other_dir_scenario(json: bool) {
+    let env = Env::new();
+    env.install_from_archive();
+    let other = env.home.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    for b in ["choco", "chocofactoryd"] {
+        std::fs::copy(target_dir().join(b), other.join(b)).unwrap();
+    }
+    let out = env
+        .base_cmd(other.join("choco"), NO_SERVER)
+        .args(["server", "start", "--port", "0"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let old = env.running();
+    let server = Server::new();
+    let archive = archive_bytes();
+    server.release(Some(VERSION), archive, sums_for(archive), VERSION);
+    manifest(&server, "/latest/download/manifest.json", VERSION);
+    let out = update_cmd(&env, &server.url, json, &["update", "--force"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        said("update --force (other directory)", &out, json),
+        format!(
+            "note: the running chocofactoryd is {} (not in {}); leaving it alone\nupdated {VERSION} → {VERSION}\n",
+            old.exe,
+            env.bin.display()
+        )
+    );
+    assert_eq!(env.running().pid, old.pid);
+}
+
+#[test]
+fn update_note_about_another_daemon_is_on_stdout() {
+    other_dir_scenario(false);
+}
+
+#[test]
+fn update_note_about_another_daemon_is_on_stderr_under_json() {
+    other_dir_scenario(true);
+}
+
+#[test]
+fn json_update_failures_keep_stdout_empty() {
+    let env = Env::new();
+    env.install_from_archive();
+    let server = Server::new();
+    let before = env.inodes();
+
+    server.put("/latest/download/manifest.json", b"not json".to_vec());
+    let out = update_cmd(&env, &server.url, true, &["update"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("update (bad manifest)", &out);
+    assert!(stderr(&out).contains("not valid JSON"), "{}", text(&out));
+
+    server.release(
+        Some("9.9.9"),
+        archive_bytes(),
+        b"abc  other.tar.gz\n".to_vec(),
+        "9.9.9",
+    );
+    manifest(&server, "/latest/download/manifest.json", "9.9.9");
+    let out = update_cmd(&env, &server.url, true, &["update"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("update (no checksum)", &out);
+    assert!(stderr(&out).contains("no checksum for"), "{}", text(&out));
+
+    // The archive holds this version, not 9.9.9.
+    server.release(
+        Some("9.9.9"),
+        archive_bytes(),
+        sums_for(archive_bytes()),
+        "9.9.9",
+    );
+    let out = update_cmd(&env, &server.url, true, &["update"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("update (wrong version)", &out);
+    assert!(stderr(&out).contains("expected 9.9.9"), "{}", text(&out));
+
+    let out = update_cmd(&env, &server.url, true, &["update", "--version", "a/b"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("update (bad --version)", &out);
+    assert_eq!(env.inodes(), before);
+    assert!(no_update_dirs(&env));
+}
+
+/// The daemon stop message is printed, then the restart fails: the failure
+/// after shared daemon output still leaves stdout empty under `--json`.
+fn restart_failure_scenario(json: bool) {
+    let env = Env::new();
+    env.install_from_archive();
+    let server = Server::new();
+    let archive = archive_bytes();
+    server.release(Some(VERSION), archive, sums_for(archive), VERSION);
+    manifest(&server, "/latest/download/manifest.json", VERSION);
+    let old = env.start_daemon();
+    // The running daemon keeps its open log; the path now cannot be inspected.
+    let log = env.root().join("logs").join("chocofactoryd.log");
+    std::fs::remove_file(&log).unwrap();
+    std::os::unix::fs::symlink("chocofactoryd.log", &log).unwrap();
+
+    let out = update_cmd(&env, &server.url, json, &["update", "--force"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let stopped = format!("chocofactoryd stopped (pid {})\n", old.pid);
+    let err = stderr(&out);
+    assert!(
+        err.contains("updated, but chocofactoryd did not restart"),
+        "{err}"
+    );
+    if json {
+        support::assert_empty_stdout("update --force (restart fails)", &out);
+        assert!(err.contains(&stopped), "{err}");
+    } else {
+        assert_eq!(stdout(&out), stopped);
+    }
+}
+
+#[test]
+fn update_restart_failure_after_the_stop_message_human() {
+    restart_failure_scenario(false);
+}
+
+#[test]
+fn update_restart_failure_after_the_stop_message_json() {
+    restart_failure_scenario(true);
+}
+
+/// A server that reads one request, tells the test, then never answers.
+fn silent_server() -> (String, std::sync::mpsc::Receiver<()>) {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut conn, _)) = listener.accept() else {
+            return;
+        };
+        conn.set_read_timeout(Some(DEADLINE)).unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+            match conn.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = tx.send(());
+        // Held open until the client goes away (EOF) or the bound passes.
+        while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
+    });
+    (url, rx)
+}
+
+fn interrupted_update_scenario(json: bool) {
+    use std::os::unix::process::ExitStatusExt;
+    let env = Env::new();
+    env.install_from_archive();
+    let old = env.start_daemon();
+    let marker_before = std::fs::read(env.marker()).unwrap();
+    let before = env.inodes();
+    let (url, requested) = silent_server();
+
+    let mut cmd = env.base_cmd(env.bin.join("choco"), &url);
+    if json {
+        cmd.arg("--json");
+    }
+    let mut child = cmd
+        .arg("update")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        requested
+            .recv_timeout(DEADLINE)
+            .expect("update never asked for the manifest");
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    }));
+    if outcome.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the update fixture failed before the interrupt");
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.signal(), Some(libc::SIGINT), "{}", text(&out));
+    support::assert_empty_stdout("update (interrupted)", &out);
+    assert_eq!(env.inodes(), before);
+    assert_eq!(std::fs::read(env.marker()).unwrap(), marker_before);
+    assert_eq!(env.running().pid, old.pid);
+    assert!(no_update_dirs(&env));
+    assert_eq!(env.leftovers(), Vec::<String>::new());
+}
+
+#[test]
+fn interrupting_update_changes_nothing() {
+    interrupted_update_scenario(false);
+}
+
+#[test]
+fn interrupting_update_changes_nothing_under_json() {
+    interrupted_update_scenario(true);
 }

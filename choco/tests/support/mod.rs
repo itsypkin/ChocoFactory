@@ -219,7 +219,10 @@ mod json_bytes_tests {
             let m = panic_message(|| {
                 parse_json_value("c", bytes);
             });
-            assert!(m.contains(&format!("raw control byte {byte} at offset 7")), "{m}");
+            assert!(
+                m.contains(&format!("raw control byte {byte} at offset 7")),
+                "{m}"
+            );
         }
     }
 
@@ -254,8 +257,9 @@ mod json_bytes_tests {
     fn ndjson_needs_complete_lf_terminated_lines() {
         let v = parse_ndjson("w", b"{\"a\":1}\n{\"a\":2}\n");
         assert_eq!(v.len(), 2);
-        assert!(panic_message(|| drop(parse_ndjson("w", b"{\"a\":1}\n{\"a\"")))
-            .contains("newline"));
+        assert!(
+            panic_message(|| drop(parse_ndjson("w", b"{\"a\":1}\n{\"a\""))).contains("newline")
+        );
         assert!(
             panic_message(|| drop(parse_ndjson("w", b"{\"a\":1}\n\n{\"a\":2}\n")))
                 .contains("line 1 is empty")

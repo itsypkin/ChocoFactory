@@ -221,12 +221,7 @@ fn running_from(dir: &Path, info: &LockInfo) -> bool {
     Path::new(&info.exe).parent().map(canon).as_deref() == Some(dir)
 }
 
-async fn update(
-    check: bool,
-    want: Option<String>,
-    force: bool,
-    json: bool,
-) -> Result<u8, Failure> {
+async fn update(check: bool, want: Option<String>, force: bool, json: bool) -> Result<u8, Failure> {
     let root = config_root().ok_or("HOME is not set")?;
     let marker_path = root.join("install.json");
     let exe = canon(&std::env::current_exe().map_err(|e| format!("cannot locate choco: {e}"))?);

@@ -2976,8 +2976,16 @@ async fn ctl_fixture() -> CtlFixture {
                 &base,
                 "task create",
                 &[
-                    "task", "create", "--project", &proj_id, "--workflow", &wf, "--title", title,
-                    "--prompt", "p",
+                    "task",
+                    "create",
+                    "--project",
+                    &proj_id,
+                    "--workflow",
+                    &wf,
+                    "--title",
+                    title,
+                    "--prompt",
+                    "p",
                 ],
             )
             .await;
@@ -3042,7 +3050,13 @@ async fn json_output_with_stored_control_bytes_is_strict_json_on_every_path() {
     // list and search: a mixed set, the control row found by its id, the
     // ordinary row present in `list` and absent from the search.
     let list = json_cmd(&base, "task list", &["task", "list"]).await;
-    let row = |v: &Value, id: &str| v.as_array().unwrap().iter().find(|r| r["id"] == id).cloned();
+    let row = |v: &Value, id: &str| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .cloned()
+    };
     assert_eq!(row(&list, &f.ctl_id).unwrap()["title"], CTL_TITLE);
     assert!(row(&list, &f.plain_id).is_some());
     let found = json_cmd(
@@ -3058,7 +3072,13 @@ async fn json_output_with_stored_control_bytes_is_strict_json_on_every_path() {
     let projects = json_cmd(&base, "project list", &["project", "list"]).await;
     let p = row(&projects, &f.project_ctl_id).unwrap();
     assert_eq!(p["name"], CTL_PROJECT);
-    assert!(projects.as_array().unwrap().iter().any(|r| r["name"] == "demo"));
+    assert!(
+        projects
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["name"] == "demo")
+    );
 }
 
 #[tokio::test]
@@ -3145,8 +3165,16 @@ async fn status_watch_emits_one_strict_json_line_per_change_with_control_bytes()
     let out = run_choco_raw(
         &f.daemon.base_url,
         &[
-            "--json", "task", "status", &f.ctl_id, "--until", "closed", "--interval", "1s",
-            "--timeout", &timeout_arg(),
+            "--json",
+            "task",
+            "status",
+            &f.ctl_id,
+            "--until",
+            "closed",
+            "--interval",
+            "1s",
+            "--timeout",
+            &timeout_arg(),
         ],
     )
     .await;

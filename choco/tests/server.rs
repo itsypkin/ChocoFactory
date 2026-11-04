@@ -1403,7 +1403,10 @@ fn cancel_task(env: &Env, id: &str) {
     wait_for_state("the cancelled task to leave the in-flight list", || {
         let out = env.choco(&["--json", "server", "status"]);
         let v = support::json_stdout("server status", &out);
-        if v["daemon"]["in_flight"].as_array().is_some_and(|a| a.is_empty()) {
+        if v["daemon"]["in_flight"]
+            .as_array()
+            .is_some_and(|a| a.is_empty())
+        {
             Ok(())
         } else {
             Err(format!("still in flight: {v}"))
@@ -1504,7 +1507,10 @@ fn interrupted_start_scenario(json: bool) {
     // Started, never ready: no lock, no answer.
     std::fs::write(
         &fake,
-        format!("#!/bin/sh\necho $$ > {}\nexec sleep 120\n", pidfile.display()),
+        format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 120\n",
+            pidfile.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1526,8 +1532,9 @@ fn interrupted_start_scenario(json: bool) {
     let guard = KillOnDrop::new(child);
     let daemon_pid: i32 = {
         let mut seen = None;
-        wait_for_state("the fake daemon to start", || {
-            match std::fs::read_to_string(&pidfile)
+        wait_for_state(
+            "the fake daemon to start",
+            || match std::fs::read_to_string(&pidfile)
                 .ok()
                 .and_then(|t| t.trim().parse::<i32>().ok())
             {
@@ -1536,8 +1543,8 @@ fn interrupted_start_scenario(json: bool) {
                     Ok(())
                 }
                 None => Err("no pid yet".to_string()),
-            }
-        });
+            },
+        );
         seen.unwrap()
     };
     assert_eq!(unsafe { libc::kill(cli_pid, libc::SIGINT) }, 0);
@@ -1548,7 +1555,10 @@ fn interrupted_start_scenario(json: bool) {
     // The detached daemon and the log stay behind, as before; no lock was taken.
     let alive = unsafe { libc::kill(daemon_pid, 0) } == 0;
     unsafe { libc::kill(daemon_pid, libc::SIGKILL) };
-    assert!(alive, "interrupting start must not kill the daemon it spawned");
+    assert!(
+        alive,
+        "interrupting start must not kill the daemon it spawned"
+    );
     assert!(matches!(env.lock(), LockState::NotRunning { .. }));
     let log = std::fs::read_to_string(env.log_path()).unwrap();
     assert!(log.contains("=== choco server start"), "{log}");

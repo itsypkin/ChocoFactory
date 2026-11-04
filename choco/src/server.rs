@@ -131,7 +131,9 @@ pub(crate) async fn start_daemon(
         say!(
             json,
             "chocofactoryd is already running (pid {}, port {}, version {})",
-            info.pid, info.port, info.version
+            info.pid,
+            info.port,
+            info.version
         );
         skew_warning(&info, expected_version);
         return Ok(0);
@@ -214,7 +216,9 @@ pub(crate) async fn start_daemon(
                 say!(
                     json,
                     "chocofactoryd is already running (pid {}, port {}, version {})",
-                    info.pid, info.port, info.version
+                    info.pid,
+                    info.port,
+                    info.version
                 );
                 skew_warning(&info, expected_version);
                 return Ok(0);
