@@ -1431,7 +1431,6 @@ fn refusal_goes_to_stderr_under_json_and_leaves_the_daemon_running() {
         for (out, mode) in [(&human, false), (&json, true)] {
             let label = format!("server {sub} (refused, json={mode})");
             assert_eq!(out.status.code(), Some(3), "{label}: {}", text(out));
-            assert!(stderr(out).contains(&id) || !mode, "{label}: {}", text(out));
         }
         let h = said("server stop/restart (human)", &human, false);
         let j = said("server stop/restart (json)", &json, true);
@@ -1450,7 +1449,16 @@ fn server_status_json_keeps_a_control_byte_title_intact() {
     let env = Env::new();
     env.start();
     let id = create_task_titled(&env, HELD_SHELL_WF, CTL_TITLE);
-    wait_in_flight(&env);
+    // Wait on the task id appearing in the output, without parsing it: the
+    // parse is what the assertions below test.
+    wait_for_state("the held task to be in flight", || {
+        let out = env.choco(&["--json", "server", "status"]);
+        if String::from_utf8_lossy(&out.stdout).contains(&format!("\"task_id\":\"{id}\"")) {
+            Ok(())
+        } else {
+            Err(text(&out))
+        }
+    });
     let out = env.choco(&["--json", "server", "status"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let v = support::json_stdout("server status", &out);

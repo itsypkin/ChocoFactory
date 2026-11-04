@@ -3002,10 +3002,16 @@ async fn ctl_fixture() -> CtlFixture {
     )
     .await;
     assert_eq!(pc["name"], CTL_PROJECT);
+    // Polled over the daemon's own API: the CLI output is what the tests
+    // assert on, so it must not also be what they wait on.
     for id in [&ctl_id, &plain_id] {
         wait_until("the fixture task to close", || async {
-            let out = run_choco_raw(&base, &["--json", "task", "status", id]).await;
-            let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+            let v: Value = reqwest::get(format!("{base}/tasks/{id}"))
+                .await
+                .map_err(|e| e.to_string())?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
             if v["status"] == "closed" {
                 Ok(())
             } else {
