@@ -19,7 +19,10 @@ have no result to report; their usual messages go to stderr, word for word,
 and their exit codes are unchanged. `choco update --check --json` prints
 `{"current","latest","update_available"}`. `--help` and `--version` are not
 JSON, and `dashboard` refuses `--json`. On failure it prints `error:
-<message>` to stderr, leaves stdout empty, and exits `1`.
+<message>` to stderr, leaves stdout empty, and exits `1`. The one exception
+is a watch (`task status --until` or `--live`): lines it already printed stay
+on stdout if a later poll fails, so a script reading it should check the exit
+code as well.
 
 `choco --version` (or `-V`) prints the CLI's version without contacting the
 daemon. `chocofactoryd --version` prints the daemon's version and exits

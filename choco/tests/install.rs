@@ -1780,29 +1780,92 @@ fn update_restart_failure_after_the_stop_message_json() {
 }
 
 /// A server that reads one request, tells the test, then never answers.
-fn silent_server() -> (String, std::sync::mpsc::Receiver<()>) {
-    use std::io::Read;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let Ok((mut conn, _)) = listener.accept() else {
-            return;
-        };
-        conn.set_read_timeout(Some(DEADLINE)).unwrap();
-        let mut seen = Vec::new();
-        let mut buf = [0u8; 1024];
-        while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
-            match conn.read(&mut buf) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => seen.extend_from_slice(&buf[..n]),
+/// Dropping it stops and joins its worker, so a CLI that fails before it
+/// ever connects leaves no thread or socket behind.
+struct SilentServer {
+    url: String,
+    requested: std::sync::mpsc::Receiver<()>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SilentServer {
+    fn start() -> Self {
+        use std::io::Read;
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (tx, requested) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut conn = loop {
+                match listener.accept() {
+                    Ok((conn, _)) => break conn,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if flag.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            };
+            conn.set_nonblocking(false).unwrap();
+            conn.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                .unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            let mut announced = false;
+            // Held open until the client goes away (EOF) or the owner stops us.
+            while !flag.load(Ordering::SeqCst) {
+                match conn.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return,
+                }
+                if !announced && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    announced = true;
+                    let _ = tx.send(());
+                }
             }
+        });
+        SilentServer {
+            url,
+            requested,
+            stop,
+            worker: Some(worker),
         }
-        let _ = tx.send(());
-        // Held open until the client goes away (EOF) or the bound passes.
-        while matches!(conn.read(&mut buf), Ok(n) if n > 0) {}
-    });
-    (url, rx)
+    }
+}
+
+impl Drop for SilentServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+#[test]
+fn silent_server_worker_ends_when_dropped_without_a_request() {
+    let server = SilentServer::start();
+    let stop = server.stop.clone();
+    let worker_alive = std::sync::Arc::downgrade(&stop);
+    drop(stop);
+    // Drop joins the worker; the worker's clone of the flag goes with it.
+    drop(server);
+    assert!(
+        worker_alive.upgrade().is_none(),
+        "the worker still holds the stop flag after the server was dropped"
+    );
 }
 
 fn interrupted_update_scenario(json: bool) {
@@ -1812,9 +1875,9 @@ fn interrupted_update_scenario(json: bool) {
     let old = env.start_daemon();
     let marker_before = std::fs::read(env.marker()).unwrap();
     let before = env.inodes();
-    let (url, requested) = silent_server();
+    let server = SilentServer::start();
 
-    let mut cmd = env.base_cmd(env.bin.join("choco"), &url);
+    let mut cmd = env.base_cmd(env.bin.join("choco"), &server.url);
     if json {
         cmd.arg("--json");
     }
@@ -1825,7 +1888,8 @@ fn interrupted_update_scenario(json: bool) {
         .spawn()
         .unwrap();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        requested
+        server
+            .requested
             .recv_timeout(DEADLINE)
             .expect("update never asked for the manifest");
         assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);

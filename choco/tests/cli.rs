@@ -3100,7 +3100,10 @@ async fn paging_events_one_at_a_time_keeps_every_control_byte_intact() {
         .await
         .unwrap();
     assert!(
-        snapshot["next_token"].is_null(),
+        snapshot
+            .get("next_token")
+            .expect("snapshot must carry next_token (null when final)")
+            .is_null(),
         "snapshot must be the whole log: {snapshot}"
     );
     let want = snapshot["events"].as_array().unwrap().clone();
@@ -3117,11 +3120,14 @@ async fn paging_events_one_at_a_time_keeps_every_control_byte_intact() {
         let page = json_cmd(&base, "task events --limit 1", &args).await;
         let events = page["events"].as_array().unwrap();
         assert_eq!(events.len(), 1, "{page}");
+        let token = page
+            .get("next_token")
+            .unwrap_or_else(|| panic!("task events --limit 1: next_token is missing: {page}"));
         if events[0]["event_type"] == "shell_output" {
-            shell_page_had_token = !page["next_token"].is_null();
+            shell_page_had_token = !token.is_null();
         }
         got.extend(events.iter().cloned());
-        match &page["next_token"] {
+        match token {
             Value::Null => {
                 after = None;
                 break;
