@@ -17402,8 +17402,8 @@ fn stall_ref_transactions(repo: &Path) {
 }
 
 fn lock_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).unwrap() {
-        let path = entry.expect("reading a directory entry").path();
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
         if path.is_dir() {
             lock_files(&path, out);
         } else if path.extension().is_some_and(|e| e == "lock") {

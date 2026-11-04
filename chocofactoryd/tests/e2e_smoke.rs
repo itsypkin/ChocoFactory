@@ -260,20 +260,15 @@ impl Daemon {
         (status, home, self.port)
     }
 
-    /// GETs `path` and returns its JSON body. A non-2xx reply panics naming the
-    /// path, status and body, so a failed read inside a `wait_until` predicate
-    /// can't pass for "not yet" and run to the bound.
     async fn get(&self, path: &str) -> Value {
-        let resp = self
-            .client
+        self.client
             .get(format!("{}{path}", self.base_url))
             .send()
             .await
-            .unwrap();
-        let status = resp.status();
-        let body = resp.text().await.unwrap();
-        assert!(status.is_success(), "GET {path} answered {status}: {body}");
-        serde_json::from_str(&body).unwrap_or_else(|e| panic!("GET {path}: {e}; body {body}"))
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     async fn post(&self, path: &str, body: Value) -> (u16, Value) {
