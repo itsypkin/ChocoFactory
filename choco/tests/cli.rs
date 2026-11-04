@@ -14,6 +14,8 @@
 //! workspace, and introducing one just for ~40 lines would be more
 //! machinery than it'd save.
 
+mod support;
+
 use std::net::TcpListener as StdTcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -2877,4 +2879,355 @@ async fn task_list_search_json_rows_are_whole() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], full);
     assert!(rows[0].get("pr").is_some() && rows[0].get("usage_total").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// #361: `--json` stdout is strict JSON for text that holds control bytes.
+//
+// The fixture stores real control characters through the real ingest path (a
+// shell stage whose output holds every byte below 0x20, DEL, and invalid
+// UTF-8), then every `--json` command that prints stored text is read back as
+// raw bytes and parsed without repair.
+// ---------------------------------------------------------------------------
+
+/// Prints ESC sequences, every byte 0x00-0x1f, DEL, invalid UTF-8 (`ff fe`),
+/// multibyte text and a trailing newline.
+const CTL_WF: &str = r#"
+name: ctl-bytes
+stages:
+  emit:
+    kind: shell
+    command: >-
+      printf 'S\033[31mred\033[0m|\000\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037|\177|\377\376|é🦀E\n'
+    on:
+      done: finish
+  finish:
+    kind: terminal
+"#;
+
+const CTL_TITLE: &str = "title \u{1b}[31mred \u{1b}[0m \u{1}\u{1f} x \u{7f}";
+const CTL_PROJECT: &str = "proj \u{1b}[31mname";
+
+/// What the stored `stdout_tail` must be, built char by char (not by running
+/// the code under test). Invalid `ff fe` is already U+FFFD each at ingest,
+/// and the event tail trims the final newline.
+fn expected_ctl_tail() -> String {
+    let mut s = String::from("S\u{1b}[31mred\u{1b}[0m|");
+    for c in 0u32..=0x1f {
+        s.push(char::from_u32(c).unwrap());
+    }
+    s.push_str("|\u{7f}|\u{fffd}\u{fffd}|é🦀E");
+    s
+}
+
+/// `choco` with `--base-url`, bounded, keeping raw stdout/stderr bytes.
+async fn run_choco_raw(base_url: &str, args: &[&str]) -> std::process::Output {
+    tokio::time::timeout(
+        LOAD_ALLOWANCE * 2,
+        Command::new(env!("CARGO_BIN_EXE_choco"))
+            .arg("--base-url")
+            .arg(base_url)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("`choco {args:?}` was still running"))
+    .expect("failed to spawn choco")
+}
+
+/// Runs `choco --json <args>`, expecting exit 0 and one strict JSON value.
+async fn json_cmd(base_url: &str, label: &str, args: &[&str]) -> Value {
+    let mut full = vec!["--json"];
+    full.extend_from_slice(args);
+    let out = run_choco_raw(base_url, &full).await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{label}: stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    support::json_stdout(label, &out)
+}
+
+struct CtlFixture {
+    daemon: Daemon,
+    ctl_id: String,
+    plain_id: String,
+    project_ctl_id: String,
+}
+
+/// A daemon with a closed control-byte task, a closed ordinary task, an
+/// ordinary project (holding both tasks) and an empty control-byte project.
+async fn ctl_fixture() -> CtlFixture {
+    let home = TempHome::new();
+    let wf = home.write_workflow("ctl-bytes", CTL_WF);
+    let wf = wf.to_str().unwrap().to_string();
+    let daemon = Daemon::spawn(home).await;
+    let base = daemon.base_url.clone();
+    let proj = json_cmd(&base, "project create", &["project", "create", "demo"]).await;
+    let proj_id = proj["id"].as_str().unwrap().to_string();
+    let create = |title: &'static str| {
+        let base = base.clone();
+        let wf = wf.clone();
+        let proj_id = proj_id.clone();
+        async move {
+            let t = json_cmd(
+                &base,
+                "task create",
+                &[
+                    "task", "create", "--project", &proj_id, "--workflow", &wf, "--title", title,
+                    "--prompt", "p",
+                ],
+            )
+            .await;
+            assert_eq!(t["title"], title, "task create echoes the exact title");
+            t["id"].as_str().unwrap().to_string()
+        }
+    };
+    let ctl_id = create(CTL_TITLE).await;
+    let plain_id = create("ordinary plain").await;
+    let pc = json_cmd(
+        &base,
+        "project create (control name)",
+        &["project", "create", CTL_PROJECT],
+    )
+    .await;
+    assert_eq!(pc["name"], CTL_PROJECT);
+    for id in [&ctl_id, &plain_id] {
+        wait_until("the fixture task to close", || async {
+            let out = run_choco_raw(&base, &["--json", "task", "status", id]).await;
+            let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+            if v["status"] == "closed" {
+                Ok(())
+            } else {
+                Err(format!("status {}", v["status"]))
+            }
+        })
+        .await;
+    }
+    CtlFixture {
+        daemon,
+        ctl_id,
+        plain_id,
+        project_ctl_id: pc["id"].as_str().unwrap().to_string(),
+    }
+}
+
+fn shell_output_event(events: &[Value]) -> &Value {
+    events
+        .iter()
+        .find(|e| e["event_type"] == "shell_output")
+        .unwrap_or_else(|| panic!("no shell_output event in {events:?}"))
+}
+
+#[tokio::test]
+async fn json_output_with_stored_control_bytes_is_strict_json_on_every_path() {
+    let f = ctl_fixture().await;
+    let base = f.daemon.base_url.clone();
+
+    // events: the payload text, in full, on the shell_output event of stage `emit`.
+    let page = json_cmd(&base, "task events", &["task", "events", &f.ctl_id]).await;
+    let events = page["events"].as_array().unwrap();
+    let ev = shell_output_event(events);
+    assert_eq!(ev["payload"]["stage"], "emit");
+    assert_eq!(ev["task_id"], f.ctl_id.as_str());
+    assert_eq!(ev["payload"]["stdout_tail"], expected_ctl_tail());
+
+    // status: the title, on the exact id.
+    let detail = json_cmd(&base, "task status", &["task", "status", &f.ctl_id]).await;
+    assert_eq!(detail["id"], f.ctl_id.as_str());
+    assert_eq!(detail["title"], CTL_TITLE);
+
+    // list and search: a mixed set, the control row found by its id, the
+    // ordinary row present in `list` and absent from the search.
+    let list = json_cmd(&base, "task list", &["task", "list"]).await;
+    let row = |v: &Value, id: &str| v.as_array().unwrap().iter().find(|r| r["id"] == id).cloned();
+    assert_eq!(row(&list, &f.ctl_id).unwrap()["title"], CTL_TITLE);
+    assert!(row(&list, &f.plain_id).is_some());
+    let found = json_cmd(
+        &base,
+        "task list --search",
+        &["task", "list", "--search", "title"],
+    )
+    .await;
+    assert_eq!(row(&found, &f.ctl_id).unwrap()["title"], CTL_TITLE);
+    assert!(row(&found, &f.plain_id).is_none(), "{found}");
+
+    // projects: the control-byte name, beside an ordinary project.
+    let projects = json_cmd(&base, "project list", &["project", "list"]).await;
+    let p = row(&projects, &f.project_ctl_id).unwrap();
+    assert_eq!(p["name"], CTL_PROJECT);
+    assert!(projects.as_array().unwrap().iter().any(|r| r["name"] == "demo"));
+}
+
+#[tokio::test]
+async fn paging_events_one_at_a_time_keeps_every_control_byte_intact() {
+    let f = ctl_fixture().await;
+    let base = f.daemon.base_url.clone();
+    // The task is closed, so no event can arrive while paging. The snapshot
+    // comes straight from the daemon's API, not through `choco`.
+    let snapshot: Value = reqwest::get(format!("{base}/tasks/{}/events", f.ctl_id))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        snapshot["next_token"].is_null(),
+        "snapshot must be the whole log: {snapshot}"
+    );
+    let want = snapshot["events"].as_array().unwrap().clone();
+
+    let mut got: Vec<Value> = Vec::new();
+    let mut seen_tokens = std::collections::HashSet::new();
+    let mut after: Option<String> = None;
+    let mut shell_page_had_token = false;
+    for _ in 0..=want.len() {
+        let mut args = vec!["task", "events", &f.ctl_id, "--limit", "1"];
+        if let Some(t) = &after {
+            args.extend_from_slice(&["--after", t]);
+        }
+        let page = json_cmd(&base, "task events --limit 1", &args).await;
+        let events = page["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{page}");
+        if events[0]["event_type"] == "shell_output" {
+            shell_page_had_token = !page["next_token"].is_null();
+        }
+        got.extend(events.iter().cloned());
+        match &page["next_token"] {
+            Value::Null => {
+                after = None;
+                break;
+            }
+            Value::String(t) => {
+                assert!(!t.is_empty(), "{page}");
+                assert!(seen_tokens.insert(t.clone()), "repeated token {t}");
+                after = Some(t.clone());
+            }
+            other => panic!("next_token has the wrong type: {other}"),
+        }
+    }
+    assert!(after.is_none(), "paging did not end with a null token");
+    assert!(
+        shell_page_had_token,
+        "the control-byte page must be a non-final page"
+    );
+    assert_eq!(got, want, "paged events differ from the snapshot");
+    assert_eq!(
+        shell_output_event(&got)["payload"]["stdout_tail"],
+        expected_ctl_tail()
+    );
+}
+
+/// A shell stage held by a sentinel file, so the test sees the task open
+/// before it lets it close.
+fn held_ctl_wf(sentinel: &std::path::Path) -> String {
+    format!(
+        r#"
+name: heldctl
+stages:
+  run:
+    kind: shell
+    command: "n=0; until [ -e '{}' ] || [ $n -ge 600 ]; do sleep 0.1; n=$((n+1)); done"
+    on: {{ done: finished }}
+  finished:
+    kind: terminal
+"#,
+        sentinel.display()
+    )
+}
+
+#[tokio::test]
+async fn status_watch_emits_one_strict_json_line_per_change_with_control_bytes() {
+    // Already closed: one line.
+    let f = ctl_fixture().await;
+    let out = run_choco_raw(
+        &f.daemon.base_url,
+        &[
+            "--json", "task", "status", &f.ctl_id, "--until", "closed", "--interval", "1s",
+            "--timeout", &timeout_arg(),
+        ],
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(0));
+    let lines = support::parse_ndjson("task status --until closed", &out.stdout);
+    assert!(lines.iter().all(|l| l["title"] == CTL_TITLE));
+    assert_eq!(lines.last().unwrap()["status"], "closed");
+
+    // Changing: the first line is read before the stage is released, so
+    // both the initial and the closed state are frames.
+    let dir = TempHome::new();
+    let sentinel = dir.0.join("go");
+    let (d, id) = {
+        let home = TempHome::new();
+        let wf = home.write_workflow("heldctl", &held_ctl_wf(&sentinel));
+        let daemon = Daemon::spawn(home).await;
+        let base = daemon.base_url.clone();
+        let proj = json_cmd(&base, "project create", &["project", "create", "demo"]).await;
+        let t = json_cmd(
+            &base,
+            "task create",
+            &[
+                "task",
+                "create",
+                "--project",
+                proj["id"].as_str().unwrap(),
+                "--workflow",
+                wf.to_str().unwrap(),
+                "--title",
+                CTL_TITLE,
+                "--prompt",
+                "p",
+            ],
+        )
+        .await;
+        (daemon, t["id"].as_str().unwrap().to_string())
+    };
+    let timeout = timeout_arg();
+    let mut child = spawn_watcher(
+        &d.base_url,
+        &id,
+        &[
+            "--json",
+            "--until",
+            "closed",
+            "--interval",
+            "1s",
+            "--timeout",
+            &timeout,
+        ],
+    );
+    let mut rd = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut raw = Vec::new();
+    tokio::time::timeout(LOAD_ALLOWANCE, rd.read_until(b'\n', &mut raw))
+        .await
+        .expect("no first watch line")
+        .unwrap();
+    let first = support::parse_ndjson("task status --until closed (first line)", &raw);
+    assert_eq!(first[0]["status"], "open", "{first:?}");
+    std::fs::write(&sentinel, "").unwrap();
+    tokio::time::timeout(LOAD_ALLOWANCE, rd.read_to_end(&mut raw))
+        .await
+        .expect("the watcher did not finish")
+        .unwrap();
+    let (code, stderr) = finish_watcher(child).await;
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let lines = support::parse_ndjson("task status --until closed (changing)", &raw);
+    assert!(lines.len() >= 2, "{lines:?}");
+    assert!(lines.iter().all(|l| l["title"] == CTL_TITLE));
+    assert_eq!(lines[0]["status"], "open");
+    assert_eq!(lines.last().unwrap()["status"], "closed");
+}
+
+#[tokio::test]
+async fn json_runtime_error_has_empty_stdout_and_exit_1() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let out = run_choco_raw(&daemon.base_url, &["--json", "task", "status", "nope"]).await;
+    // choco's own exit status, not the status of a pipeline after it.
+    assert_eq!(out.status.code(), Some(1));
+    support::assert_empty_stdout("task status nope", &out);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("error: "), "{err}");
+    assert!(err.contains("nope"), "{err}");
 }

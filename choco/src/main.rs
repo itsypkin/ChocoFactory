@@ -160,7 +160,7 @@ async fn main() -> ExitCode {
         force,
     } = cli.command
     {
-        return update::run(check, version, force).await;
+        return update::run(check, version, force, cli.json).await;
     }
 
     if let Command::Dashboard(args) = cli.command {

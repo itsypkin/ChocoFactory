@@ -83,9 +83,14 @@ pub struct Cli {
     #[arg(long, env = "CHOCO_BASE_URL")]
     pub base_url: Option<String>,
 
-    /// Print the daemon's raw JSON instead of a human-readable summary.
-    /// `choco` is meant to be both human-scriptable and agent-callable
-    /// (design Q12) — this is the machine-facing half.
+    /// Print machine-readable output instead of a human-readable summary:
+    /// one JSON value per command, or one JSON object per line for
+    /// `task status --until/--live`. `task send`, `task cancel`,
+    /// `server start|stop|restart` and `update` (without `--check`) print
+    /// nothing on stdout; their messages go to stderr. `update --check`
+    /// prints `{"current","latest","update_available"}`. `choco` is meant to
+    /// be both human-scriptable and agent-callable (design Q12) — this is
+    /// the machine-facing half.
     #[arg(long, global = true)]
     pub json: bool,
 
