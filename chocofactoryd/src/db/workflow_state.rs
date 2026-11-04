@@ -264,6 +264,7 @@ mod tests {
             .unwrap();
         assert_eq!(created.stage_entered_at, Some(created.updated_at));
 
+        // Not a wait: makes the next row's timestamp distinguishable.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let entered = update(
             &pool,
@@ -282,6 +283,7 @@ mod tests {
         assert_eq!(entered.stage_entered_at, Some(entered.updated_at));
         assert!(entered.stage_entered_at > created.stage_entered_at);
 
+        // Not a wait: makes the next row's timestamp distinguishable.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let kept = update(
             &pool,
@@ -311,6 +313,7 @@ mod tests {
             .unwrap();
         assert_eq!(created.stage_kind.as_deref(), Some("poll"));
 
+        // Not a wait: makes the next row's timestamp distinguishable.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         assert!(set_stage_kind(&pool, &task_id, "human_gate").await.unwrap());
         let after = get(&pool, &task_id).await.unwrap().unwrap();

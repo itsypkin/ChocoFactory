@@ -593,6 +593,8 @@ async fn cancelling_mid_group_leaves_the_payload_alone() {
     })
     .await;
     // Give the watchers (100ms poll) time to see it and, wrongly, write.
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(600)).await;
     assert_eq!(g.state().await.payload, before);
     assert_eq!(g.status().await, "cancelled");
@@ -799,6 +801,8 @@ async fn simultaneous_finishes_settle_exactly_once() {
     assert_eq!(a, BranchApplied::Recorded { done: true });
     assert_eq!(b, BranchApplied::Recorded { done: true });
     g.wait_sessions("summarize", 1).await;
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(300)).await;
     assert_eq!(g.sessions("summarize").await.len(), 1);
     let entered: Vec<_> = g

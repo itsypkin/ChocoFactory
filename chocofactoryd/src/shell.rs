@@ -405,15 +405,14 @@ mod tests {
     // --- group-kill outcomes ---------------------------------------------
 
     fn wait_for_table(what: &str, mut ok: impl FnMut(&[crate::proc_table::ProcEntry]) -> bool) {
-        for _ in 0..500 {
-            if let Ok(table) = crate::proc_table::read(None)
-                && ok(&table)
-            {
-                return;
+        chocofactory_test_support::wait_until_blocking(what, || {
+            let table = crate::proc_table::read(None).expect("reading the process table");
+            if ok(&table) {
+                Ok(())
+            } else {
+                Err(format!("{} process(es) in the table", table.len()))
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for {what}");
+        });
     }
 
     fn in_own_group(command: &mut std::process::Command) -> std::process::Child {
@@ -697,7 +696,9 @@ mod tests {
         assert!(outcome.timed_out);
         assert!(!outcome.escaped, "the group should have died on SIGKILL");
 
-        // Well past when the grandchild would have fired had it lived.
+        // Well past when the grandchild would have fired had it lived. A
+        // negative check (only "it did not happen" follows), so a fixed
+        // sleep can pass falsely but cannot fail.
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
             !marker.exists(),

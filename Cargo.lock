@@ -272,6 +272,7 @@ version = "0.3.4"
 dependencies = [
  "axum",
  "chocofactory-core",
+ "chocofactory-test-support",
  "chrono",
  "clap",
  "futures-util",
@@ -296,12 +297,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "chocofactory-test-support"
+version = "0.3.4"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "chocofactoryd"
 version = "0.3.4"
 dependencies = [
  "axum",
  "base64 0.23.1",
  "chocofactory-core",
+ "chocofactory-test-support",
  "chrono",
  "futures-util",
  "indexmap",

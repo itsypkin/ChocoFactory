@@ -791,32 +791,29 @@ stages:
         // The row exists only once the handler is inside create, past the
         // insert; the hook keeps it there for 3 s, so the client is still
         // waiting when it is aborted.
-        let mut id = None;
-        for _ in 0..300 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let id = crate::test_support::wait_until("the handler to insert the task", || async {
             let tasks = server
                 .get(&format!("/tasks?project_id={project_id}"))
                 .await
                 .json();
-            if let Some(found) = tasks[0]["id"].as_str() {
-                id = Some(found.to_string());
-                break;
+            match tasks[0]["id"].as_str() {
+                Some(found) => Ok(found.to_string()),
+                None => Err(format!("tasks: {tasks}")),
             }
-        }
-        let id = id.expect("the handler never inserted the task");
+        })
+        .await;
         assert!(!client.is_finished(), "the create should still be running");
         client.abort();
 
-        let mut staged = false;
-        for _ in 0..300 {
+        crate::test_support::wait_until("the task to reach a stage", || async {
             let detail = server.get(&format!("/tasks/{id}")).await.json();
-            if !detail["workflow_state"].is_null() {
-                staged = true;
-                break;
+            if detail["workflow_state"].is_null() {
+                Err(format!("detail: {detail}"))
+            } else {
+                Ok(())
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert!(staged, "the task never reached a stage");
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -748,6 +748,7 @@ mod tests {
         )
         .await
         .unwrap();
+        // Not a wait: makes the next row's timestamp distinguishable.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let second = create(
             &pool,

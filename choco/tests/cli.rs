@@ -20,16 +20,10 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use chocofactory_test_support::{LOAD_ALLOWANCE, wait_until};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
-
-/// How long a test waits for something asynchronous before declaring it
-/// never happened (#98, #152). A constants-only copy of the value in
-/// `chocofactoryd/src/test_support.rs`, which is the source of truth: this
-/// crate can't include that file because its tests need tokio's
-/// `test-util`, which `choco`'s dev-dependencies lack. Keep it in step.
-const LOAD_ALLOWANCE: Duration = Duration::from_secs(30);
 
 struct TempHome(PathBuf);
 
@@ -288,7 +282,7 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str, child: &mut 
         eprintln!("failed to kill unresponsive chocofactoryd: {err}");
     }
     let stderr = read_stderr_to_string(child).await;
-    panic!("chocofactoryd did not become ready within 5s: {stderr}");
+    panic!("chocofactoryd did not become ready within {LOAD_ALLOWANCE:?}: {stderr}");
 }
 
 struct ChocoOutput {
@@ -592,14 +586,15 @@ stages:
     )
     .await;
     assert_eq!(accepted.code, Some(0), "stderr: {}", accepted.stderr);
-    let mut status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
-    for _ in 0..100 {
+    let status = wait_until("the task status to show done", || async {
+        let status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
         if status.stdout.contains("done") {
-            break;
+            Ok(status)
+        } else {
+            Err(format!("status output: {:?}", status.stdout))
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
-    }
+    })
+    .await;
     assert!(
         status.stdout.contains("done"),
         "the task should have moved on: {}",
@@ -919,18 +914,15 @@ async fn task_events_shows_the_conversation() {
 
     // mock-claude echoes `echo:{text}`; wait for that reply to land so the
     // assertion covers a real round trip, not just the human_message.
-    let mut human = ChocoOutput {
-        stdout: String::new(),
-        stderr: String::new(),
-        code: None,
-    };
-    for _ in 0..100 {
-        human = run_choco(&daemon.base_url, &["task", "events", &task_id]).await;
+    let human = wait_until("the transcript to show the echoed prompt", || async {
+        let human = run_choco(&daemon.base_url, &["task", "events", &task_id]).await;
         if human.stdout.contains("echo:hello there") {
-            break;
+            Ok(human)
+        } else {
+            Err(format!("events output: {:?}", human.stdout))
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await;
     assert_eq!(human.code, Some(0), "stderr: {}", human.stderr);
     assert!(
         human.stdout.contains("human_message") && human.stdout.contains("hello there"),
@@ -1043,14 +1035,15 @@ stages:
     // Before any transition the trail already has the stage the task
     // started in — `stage_history` never recorded that, because it only
     // appended on the way *out* of a stage (X-3).
-    let mut fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
-    for _ in 0..100 {
+    let fresh = wait_until("the entry stage in the trail", || async {
+        let fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
         if has_row(&fresh.stdout, &["1", "start", "gate"]) {
-            break;
+            Ok(fresh)
+        } else {
+            Err(format!("status output: {:?}", fresh.stdout))
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        fresh = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
-    }
+    })
+    .await;
     assert!(
         has_row(&fresh.stdout, &["1", "start", "gate"]),
         "expected the entry stage in the trail: {:?}",
@@ -1082,14 +1075,15 @@ stages:
             t.windows(3).any(|w| w == ["gate", "resumed", "review"]) && l.ends_with("◀ current")
         })
     };
-    let mut status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
-    for _ in 0..100 {
+    let status = wait_until("the gate hop, marked current", || async {
+        let status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
         if settled(&status.stdout) {
-            break;
+            Ok(status)
+        } else {
+            Err(format!("status output: {:?}", status.stdout))
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        status = run_choco(&daemon.base_url, &["task", "status", &task_id]).await;
-    }
+    })
+    .await;
     assert_eq!(status.code, Some(0), "stderr: {}", status.stderr);
     // The stage the task entered is the last trail entry, so it's marked in
     // place instead of repeated on a trailing `→` line. Asserted against
@@ -1541,16 +1535,17 @@ stages:
         .unwrap()
         .to_string();
 
-    let mut status = Value::Null;
-    for _ in 0..100 {
-        status = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
+    let status = wait_until("the task to be stuck", || async {
+        let status = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
             .await
             .json();
         if status["status"] == "stuck" {
-            break;
+            Ok(status)
+        } else {
+            Err(format!("status: {status:?}"))
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await;
     assert_eq!(
         status["status"], "stuck",
         "task never got stuck: {status:?}"
@@ -1578,16 +1573,17 @@ stages:
         "retry should say what it did, and why"
     );
 
-    let mut status = Value::Null;
-    for _ in 0..100 {
-        status = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
+    let status = wait_until("the task to be closed", || async {
+        let status = run_choco_json(&daemon.base_url, &["task", "status", &task_id])
             .await
             .json();
         if status["status"] == "closed" {
-            break;
+            Ok(status)
+        } else {
+            Err(format!("status: {status:?}"))
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await;
     assert_eq!(status["status"], "closed", "task never closed: {status:?}");
     assert!(status["stuck_reason"].is_null());
 }

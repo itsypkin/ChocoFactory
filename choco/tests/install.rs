@@ -25,6 +25,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use chocofactory_core::daemon_lock::{LockInfo, LockState, read_lock};
 use chocofactory_core::version::VERSION;
+use chocofactory_test_support::wait_until_blocking_within;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -76,15 +77,42 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + DEADLINE;
-    while Instant::now() < end {
-        if f() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+/// Where `server status --json` stands on "a turn is in flight", as a wait
+/// predicate. A non-zero exit is "not yet": the daemon holds the lock but is
+/// not answering (slow, or a failed read), so `choco` prints nothing on stdout
+/// and the reason on stderr; for a dead daemon (exit 3) stdout says so. Both
+/// streams are carried as `Err`. Exit 0 with
+/// output that is not JSON is a broken `choco`: it panics with the parse error,
+/// stdout and stderr, rather than letting the wait run to its bound.
+fn in_flight_state(out: &Output) -> Result<(), String> {
+    if !out.status.success() {
+        return Err(format!(
+            "`server status --json` exited with {}: stdout {:?}, stderr {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
-    panic!("timed out waiting for {what}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "`server status --json` exited 0 but printed output that is not JSON ({e}): stdout {:?}, stderr {:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    if v["daemon"]["in_flight"]
+        .as_array()
+        .is_none_or(|a| a.is_empty())
+    {
+        Err(format!("no turn in flight yet: {v}"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Waits up to `DEADLINE` for a predicate that says what it saw while not ready.
+fn wait_for_state(what: &str, f: impl FnMut() -> Result<(), String>) {
+    wait_until_blocking_within(DEADLINE, what, f);
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -912,15 +940,9 @@ fn start_turn_in_flight(env: &Env) {
         "--prompt",
         "go",
     ]);
-    wait_for("an in-flight turn", || {
+    wait_for_state("an in-flight turn", || {
         let out = env.choco(NO_SERVER, &["--json", "server", "status"]);
-        serde_json::from_slice::<Value>(&out.stdout)
-            .map(|v| {
-                !v["daemon"]["in_flight"]
-                    .as_array()
-                    .is_none_or(|a| a.is_empty())
-            })
-            .unwrap_or(false)
+        in_flight_state(&out)
     });
 }
 
@@ -1314,7 +1336,7 @@ fn every_crate_inherits_the_dual_license() {
     assert!(out.status.success(), "{}", text(&out));
     let meta: Value = serde_json::from_slice(&out.stdout).unwrap();
     let packages = meta["packages"].as_array().unwrap();
-    assert_eq!(packages.len(), 4);
+    assert_eq!(packages.len(), 5);
     for p in packages {
         assert_eq!(p["license"], "MIT OR Apache-2.0", "{}", p["name"]);
     }
@@ -1341,4 +1363,66 @@ fn install_rejects_an_unrepresentable_dir_before_creating_it() {
         assert!(text(&out).contains("cannot hold"), "{}", text(&out));
         assert!(!dir.exists(), "{name:?} was created");
     }
+}
+
+fn status_output(code: i32, stdout: &str, stderr: &str) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[test]
+fn a_status_call_that_exits_non_zero_is_not_yet_and_carries_its_stderr() {
+    // What `choco --json server status` does when the daemon holds the lock
+    // but is not answering: empty stdout, the reason on stderr, exit 1.
+    let err = in_flight_state(&status_output(
+        1,
+        "",
+        "error: chocofactoryd (pid 1, port 1) holds the lock but isn't answering: failed to connect",
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("exited with") && err.contains("isn't answering: failed to connect"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_status_call_for_a_dead_daemon_is_not_yet_and_carries_its_stdout() {
+    // `choco --json server status` on a daemon that is not running exits 3 and
+    // says so on stdout, with nothing on stderr.
+    let err =
+        in_flight_state(&status_output(3, r#"{"running":false,"daemon":null}"#, "")).unwrap_err();
+    assert!(
+        err.contains("exited with") && err.contains("running"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unparseable_server_status_output_fails_the_wait_at_once_naming_the_parse_error() {
+    assert!(
+        in_flight_state(&status_output(
+            0,
+            r#"{"daemon":{"in_flight":[{"task_id":"t"}]}}"#,
+            ""
+        ))
+        .is_ok()
+    );
+    assert!(in_flight_state(&status_output(0, r#"{"daemon":{"in_flight":[]}}"#, "")).is_err());
+    let err = std::panic::catch_unwind(|| {
+        let _ = in_flight_state(&status_output(0, "starting up...", "a warning"));
+    })
+    .unwrap_err();
+    let msg = err.downcast_ref::<String>().cloned().unwrap();
+    assert!(
+        msg.contains("not JSON")
+            && msg.contains("expected")
+            && msg.contains("starting up...")
+            && msg.contains("a warning"),
+        "{msg}"
+    );
 }

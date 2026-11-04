@@ -1357,14 +1357,15 @@ fn client_files(env: &Env) -> Vec<String> {
 
 async fn wait_for_client_file(env: &Env, pid: u32) {
     let prefix = format!("{pid}-");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !client_files(env)
-        .iter()
-        .any(|name| name.starts_with(&prefix))
-    {
-        assert!(Instant::now() < deadline, "the fake wrote no client file");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    crate::test_support::wait_until(&format!("a client file for pid {pid}"), || async {
+        let files = client_files(env);
+        if files.iter().any(|name| name.starts_with(&prefix)) {
+            Ok(())
+        } else {
+            Err(format!("client files: {files:?}"))
+        }
+    })
+    .await;
 }
 
 #[tokio::test]

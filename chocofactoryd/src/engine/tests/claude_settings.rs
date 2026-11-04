@@ -528,6 +528,8 @@ async fn cancelling_a_turn_waiting_at_the_gate_leaves_nothing_behind() {
         .trim()
         .parse()
         .unwrap();
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(500)).await;
     assert!(!env.prompt_written(), "no prompt while the CLI is silent");
 

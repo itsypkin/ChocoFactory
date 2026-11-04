@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chocofactory_core::daemon_lock::{LockState, read_lock};
+use chocofactory_test_support::wait_until_blocking_within;
 use serde_json::Value;
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -167,15 +168,42 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + DEADLINE;
-    while Instant::now() < end {
-        if f() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+/// Where `server status --json` stands on "a turn is in flight", as a wait
+/// predicate. A non-zero exit is "not yet": the daemon holds the lock but is
+/// not answering (slow, or a failed read), so `choco` prints nothing on stdout
+/// and the reason on stderr; for a dead daemon (exit 3) stdout says so. Both
+/// streams are carried as `Err`. Exit 0 with
+/// output that is not JSON is a broken `choco`: it panics with the parse error,
+/// stdout and stderr, rather than letting the wait run to its bound.
+fn in_flight_state(out: &Output) -> Result<(), String> {
+    if !out.status.success() {
+        return Err(format!(
+            "`server status --json` exited with {}: stdout {:?}, stderr {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
-    panic!("timed out waiting for {what}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "`server status --json` exited 0 but printed output that is not JSON ({e}): stdout {:?}, stderr {:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    if v["daemon"]["in_flight"]
+        .as_array()
+        .is_none_or(|a| a.is_empty())
+    {
+        Err(format!("no turn in flight yet: {v}"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Waits up to `DEADLINE` for a predicate that says what it saw while not ready.
+fn wait_for_state(what: &str, f: impl FnMut() -> Result<(), String>) {
+    wait_until_blocking_within(DEADLINE, what, f);
 }
 
 /// A fixture "claude" that never finishes a turn.
@@ -247,15 +275,9 @@ fn create_task(env: &Env, workflow: &str) -> String {
 }
 
 fn wait_in_flight(env: &Env) {
-    wait_for("an in-flight turn", || {
+    wait_for_state("an in-flight turn", || {
         let out = env.choco(&["--json", "server", "status"]);
-        serde_json::from_slice::<Value>(&out.stdout)
-            .map(|v| {
-                !v["daemon"]["in_flight"]
-                    .as_array()
-                    .is_none_or(|a| a.is_empty())
-            })
-            .unwrap_or(false)
+        in_flight_state(&out)
     });
 }
 
@@ -384,8 +406,9 @@ fn stale_lock_makes_default_base_url_an_error_not_a_fallback() {
     let env = Env::new();
     let info = env.start();
     unsafe { libc::kill(info.pid as i32, libc::SIGKILL) };
-    wait_for("the lock to be released", || {
-        matches!(env.lock(), LockState::NotRunning { .. })
+    wait_for_state("the lock to be released", || match env.lock() {
+        LockState::NotRunning { .. } => Ok(()),
+        other => Err(format!("lock state {other:?}")),
     });
     let out = env.choco(&["project", "list"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
@@ -436,9 +459,13 @@ fn stop_refuses_while_an_agent_turn_runs_and_force_parks_it() {
     assert!(matches!(env.lock(), LockState::NotRunning { .. }));
 
     env.start();
-    wait_for("the task to be stuck", || {
+    wait_for_state("the task to be stuck", || {
         let detail = env.json(&["task", "status", &id]);
-        detail["status"] == "stuck" || detail["task"]["status"] == "stuck"
+        if detail["status"] == "stuck" || detail["task"]["status"] == "stuck" {
+            Ok(())
+        } else {
+            Err(format!("task status {detail}"))
+        }
     });
 }
 
@@ -517,16 +544,27 @@ fn queued_turns_do_not_block_stop_and_start_after_the_restart() {
     );
     env.start();
     // The running turn was parked; the queued one was not, and now runs.
-    wait_for("the first task to be stuck", || {
-        env.json(&["task", "status", &first])["status"] == "stuck"
+    wait_for_state("the first task to be stuck", || {
+        let detail = env.json(&["task", "status", &first]);
+        if detail["status"] == "stuck" {
+            Ok(())
+        } else {
+            Err(format!("task status {detail}"))
+        }
     });
-    wait_for("the queued turn to start", || {
+    wait_for_state("the queued turn to start", || {
         let detail = env.json(&["task", "status", &second]);
-        detail["status"] == "open"
+        let server = env.json(&["server", "status"]);
+        let started = detail["status"] == "open"
             && detail["queued"].as_array().is_some_and(|q| q.is_empty())
-            && env.json(&["server", "status"])["daemon"]["in_flight"]
+            && server["daemon"]["in_flight"]
                 .as_array()
-                .is_some_and(|a| a.iter().any(|f| f["task_id"] == second.as_str()))
+                .is_some_and(|a| a.iter().any(|f| f["task_id"] == second.as_str()));
+        if started {
+            Ok(())
+        } else {
+            Err(format!("task {detail}; server {server}"))
+        }
     });
 }
 
@@ -545,8 +583,9 @@ fn stale_lock_reads_as_not_running_and_start_recovers() {
     let env = Env::new();
     let info = env.start();
     unsafe { libc::kill(info.pid as i32, libc::SIGKILL) };
-    wait_for("the lock to be released", || {
-        matches!(env.lock(), LockState::NotRunning { .. })
+    wait_for_state("the lock to be released", || match env.lock() {
+        LockState::NotRunning { .. } => Ok(()),
+        other => Err(format!("lock state {other:?}")),
     });
     let out = env.choco(&["server", "status"]);
     assert_eq!(out.status.code(), Some(3), "{}", text(&out));
@@ -693,8 +732,9 @@ fn unanswering_daemon_is_reported_and_force_kills_it() {
     let out = env.choco(&["server", "stop", "--force"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(stdout(&out).contains("was killed"), "{}", text(&out));
-    wait_for("the lock to be released", || {
-        matches!(env.lock(), LockState::NotRunning { .. })
+    wait_for_state("the lock to be released", || match env.lock() {
+        LockState::NotRunning { .. } => Ok(()),
+        other => Err(format!("lock state {other:?}")),
     });
 }
 
@@ -868,14 +908,17 @@ fn start_that_loses_the_race_reports_the_other_daemon() {
 
     // Once start has written its separator it has passed the "already running" check.
     let log = env.root().join("logs").join("chocofactoryd.log");
-    let deadline = Instant::now() + DEADLINE;
-    while !std::fs::read_to_string(&log)
-        .map(|t| t.contains("=== choco server start"))
-        .unwrap_or(false)
-    {
-        assert!(Instant::now() < deadline, "start never wrote its log");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until_blocking_within(DEADLINE, "start to write its separator to the log", || {
+        match std::fs::read_to_string(&log) {
+            Ok(t) if t.contains("=== choco server start") => Ok(()),
+            Ok(t) => Err(format!("log so far: {t:?}")),
+            // Not created yet.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err("no log file yet".to_string())
+            }
+            Err(e) => panic!("reading {}: {e}", log.display()),
+        }
+    });
 
     // Play the winning daemon: hold the lock and publish our own info.
     let me = std::process::id();
@@ -1032,5 +1075,67 @@ async fn status_warns_once_for_a_version_mismatch_in_json_and_human_modes() {
         1,
         "{}",
         text(&human_out)
+    );
+}
+
+fn status_output(code: i32, stdout: &str, stderr: &str) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[test]
+fn a_status_call_that_exits_non_zero_is_not_yet_and_carries_its_stderr() {
+    // What `choco --json server status` does when the daemon holds the lock
+    // but is not answering: empty stdout, the reason on stderr, exit 1.
+    let err = in_flight_state(&status_output(
+        1,
+        "",
+        "error: chocofactoryd (pid 1, port 1) holds the lock but isn't answering: failed to connect",
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("exited with") && err.contains("isn't answering: failed to connect"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_status_call_for_a_dead_daemon_is_not_yet_and_carries_its_stdout() {
+    // `choco --json server status` on a daemon that is not running exits 3 and
+    // says so on stdout, with nothing on stderr.
+    let err =
+        in_flight_state(&status_output(3, r#"{"running":false,"daemon":null}"#, "")).unwrap_err();
+    assert!(
+        err.contains("exited with") && err.contains("running"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unparseable_server_status_output_fails_the_wait_at_once_naming_the_parse_error() {
+    assert!(
+        in_flight_state(&status_output(
+            0,
+            r#"{"daemon":{"in_flight":[{"task_id":"t"}]}}"#,
+            ""
+        ))
+        .is_ok()
+    );
+    assert!(in_flight_state(&status_output(0, r#"{"daemon":{"in_flight":[]}}"#, "")).is_err());
+    let err = std::panic::catch_unwind(|| {
+        let _ = in_flight_state(&status_output(0, "starting up...", "a warning"));
+    })
+    .unwrap_err();
+    let msg = err.downcast_ref::<String>().cloned().unwrap();
+    assert!(
+        msg.contains("not JSON")
+            && msg.contains("expected")
+            && msg.contains("starting up...")
+            && msg.contains("a warning"),
+        "{msg}"
     );
 }

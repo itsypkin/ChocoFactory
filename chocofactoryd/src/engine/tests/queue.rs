@@ -1121,6 +1121,40 @@ async fn deleting_a_task_deletes_its_queue_rows_first() {
 
 // ---- test 13: the dispatcher withdraws rows that can never start ----------
 
+impl Q {
+    /// Waits until `task_id` has at least `n` `turn_withdrawn` events and
+    /// returns all their payloads.
+    ///
+    /// The dispatcher deletes a row it withdraws and only then appends the
+    /// event (`record_withdrawn`), so a test that waited for the row to go
+    /// can still read before the event exists. "At least", so a duplicate
+    /// fails the caller's own count assertion with the payloads shown
+    /// rather than timing out here.
+    async fn wait_withdrawn(&self, task_id: &str, n: usize) -> Vec<Value> {
+        crate::test_support::wait_until(
+            &format!("{n} turn_withdrawn event(s) on task {task_id}"),
+            || async {
+                let events = self.events(task_id).await;
+                let withdrawn: Vec<Value> = events
+                    .iter()
+                    .filter(|e| e.event_type == EventType::TurnWithdrawn)
+                    .map(|e| e.payload.clone())
+                    .collect();
+                if withdrawn.len() >= n {
+                    Ok(withdrawn)
+                } else {
+                    let types: Vec<String> = events
+                        .iter()
+                        .map(|e| format!("{:?}", e.event_type))
+                        .collect();
+                    Err(format!("events {types:?}"))
+                }
+            },
+        )
+        .await
+    }
+}
+
 #[tokio::test]
 async fn the_dispatcher_withdraws_rows_of_tasks_that_can_never_start_and_starts_nothing() {
     let q = Q::new(Some(1)).await;
@@ -1133,7 +1167,7 @@ async fn the_dispatcher_withdraws_rows_of_tasks_that_can_never_start_and_starts_
     }
     q.wait_rows(0).await;
     for (id, status) in &gone {
-        let withdrawn = q.queue_events(id, EventType::TurnWithdrawn).await;
+        let withdrawn = q.wait_withdrawn(id, 1).await;
         assert_eq!(withdrawn.len(), 1, "{status}");
         assert_eq!(withdrawn[0]["reason"], format!("the task is {status}"));
         assert!(q.sessions(id).await.is_empty());
@@ -1152,7 +1186,7 @@ async fn the_dispatcher_withdraws_a_row_whose_task_moved_on_and_frees_the_slot()
     let task = q.task_at("finished", "open").await;
     q.insert_row(&task.id, "coding").await;
     q.wait_rows(0).await;
-    let withdrawn = q.queue_events(&task.id, EventType::TurnWithdrawn).await;
+    let withdrawn = q.wait_withdrawn(&task.id, 1).await;
     assert_eq!(withdrawn.len(), 1);
     assert!(
         withdrawn[0]["reason"]
@@ -1206,7 +1240,7 @@ async fn a_leftover_row_is_withdrawn_on_the_next_pass_and_a_retry_then_claims_no
     let q = Q::new(Some(1)).await;
     let task = stuck_with_leftover_row(&q).await;
     q.wait_rows(0).await;
-    let withdrawn = q.queue_events(&task.id, EventType::TurnWithdrawn).await;
+    let withdrawn = q.wait_withdrawn(&task.id, 1).await;
     assert_eq!(withdrawn.len(), 1);
     assert_eq!(withdrawn[0]["reason"], "the task is stuck");
     let outcome = q
@@ -2020,7 +2054,7 @@ async fn a_row_whose_task_has_no_workflow_state_is_withdrawn() {
     let task = q.task_row("job-n").await;
     q.insert_row(&task.id, "coding").await;
     q.wait_rows(0).await;
-    let withdrawn = q.queue_events(&task.id, EventType::TurnWithdrawn).await;
+    let withdrawn = q.wait_withdrawn(&task.id, 1).await;
     assert_eq!(withdrawn[0]["reason"], "the task has no workflow state");
 }
 
@@ -2030,7 +2064,7 @@ async fn a_row_for_a_stage_that_is_not_an_agent_turn_is_withdrawn() {
     let task = q.task_at("finished", "open").await;
     q.insert_row(&task.id, "finished").await;
     q.wait_rows(0).await;
-    let withdrawn = q.queue_events(&task.id, EventType::TurnWithdrawn).await;
+    let withdrawn = q.wait_withdrawn(&task.id, 1).await;
     assert!(
         withdrawn[0]["reason"]
             .as_str()
@@ -2225,7 +2259,7 @@ async fn a_queued_branch_the_workflow_no_longer_declares_is_withdrawn() {
     .unwrap();
     q.release("one");
     q.wait_rows(0).await;
-    let withdrawn = q.queue_events(&g.id, EventType::TurnWithdrawn).await;
+    let withdrawn = q.wait_withdrawn(&g.id, 1).await;
     assert!(
         withdrawn[0]["reason"]
             .as_str()

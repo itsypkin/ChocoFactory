@@ -1480,6 +1480,7 @@ stages:
     let at_gate = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
     assert_eq!(at_gate.stage_entered_at, Some(at_gate.updated_at));
 
+    // Not a wait: makes the next timestamp distinguishable.
     tokio::time::sleep(Duration::from_millis(5)).await;
     engine.advance(&task_id, &def, "resumed").await.unwrap();
     wait_until_task_status(&pool, &task_id, "stuck").await;
@@ -1487,6 +1488,7 @@ stages:
     assert_eq!(stuck.current_stage, "run");
     assert!(stuck.stage_entered_at > at_gate.stage_entered_at);
 
+    // Not a wait: makes the next timestamp distinguishable.
     tokio::time::sleep(Duration::from_millis(5)).await;
     engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
     wait_until_task_status(&pool, &task_id, "stuck").await;
@@ -1576,6 +1578,8 @@ stages:
     // fake_claude.py stays alive across turns; give the (nonexistent)
     // watcher a moment it would need if one had incorrectly been
     // spawned, then confirm the stage never moved.
+    // Negative: only "the stage did not move" follows, so a fixed sleep can
+    // pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(150)).await;
     let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
     assert_eq!(state.current_stage, "chatting");
@@ -4555,6 +4559,8 @@ stages:
 
     // Long enough that a loop which kept going would have run several
     // more attempts and recorded them.
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(2500)).await;
     assert_eq!(
         workflow_state::get(&pool, &task_id)
@@ -4618,6 +4624,8 @@ async fn a_poll_abandons_its_loop_once_the_task_leaves_the_stage() {
     wait_until_stage(&pool, &task_id, "failed").await;
     let recorded = poll_events(&pool, &task_id).await.len();
 
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(2500)).await;
     assert_eq!(
         workflow_state::get(&pool, &task_id)
@@ -9265,6 +9273,8 @@ async fn a_cancelled_task_does_not_advance_when_its_turn_completes() {
 
     // Long enough for the watcher (100ms poll) to have seen the turn
     // finish and tried to advance several times over.
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(600)).await;
 
     let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
@@ -9515,6 +9525,8 @@ stages:
         tokio::spawn(async move { engine.send_message(&task_id, "again").await })
     };
 
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(150)).await;
     assert!(
         !sender.is_finished(),
@@ -9568,6 +9580,8 @@ async fn a_cancelled_task_stops_polling() {
     let at_cancel = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
 
     // Several intervals' worth: a still-running loop would add attempts.
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(2500)).await;
     let later = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
     assert_eq!(
@@ -9629,6 +9643,8 @@ stages:
     tokio::time::sleep(StdDuration::from_millis(60)).await;
     let at_cancel = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
 
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_millis(500)).await;
     let later = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
     assert_eq!(
@@ -10602,14 +10618,16 @@ async fn a_resumed_read_only_turn_is_checked_against_the_original_baseline() {
         .unwrap();
     assert!(outcome.resumed);
     wait_until_task_status(&run.pool, &run.task_id, "stuck").await;
-    let mut reason = String::new();
-    for _ in 0..200 {
-        reason = stuck_reason(&run.pool, &run.task_id).await;
-        if reason.contains("changed the worktree") {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    let reason =
+        crate::test_support::wait_until("a stuck reason naming the worktree change", || async {
+            let reason = stuck_reason(&run.pool, &run.task_id).await;
+            if reason.contains("changed the worktree") {
+                Ok(reason)
+            } else {
+                Err(format!("stuck reason: {reason:?}"))
+            }
+        })
+        .await;
     assert!(reason.contains("changed the worktree"), "{reason}");
     assert!(reason.contains("git status changed"), "{reason}");
 
@@ -10756,13 +10774,10 @@ async fn read_only_turn_cut_off_with(
         ]),
     )
     .await;
-    for _ in 0..400 {
-        if run.worktree_dir.join("sneaky.txt").exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(run.worktree_dir.join("sneaky.txt").exists());
+    crate::test_support::wait_until("sneaky.txt in the worktree", || async {
+        file_exists_or_not_yet(&run.worktree_dir.join("sneaky.txt"))
+    })
+    .await;
     let session = runs_for_stage(&run.pool, &run.task_id, "review")
         .await
         .remove(0);
@@ -10787,13 +10802,10 @@ async fn a_read_only_turn_whose_session_cannot_be_read_is_checked() {
         ]),
     )
     .await;
-    for _ in 0..400 {
-        if run.worktree_dir.join("sneaky.txt").exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(run.worktree_dir.join("sneaky.txt").exists());
+    crate::test_support::wait_until("sneaky.txt in the worktree", || async {
+        file_exists_or_not_yet(&run.worktree_dir.join("sneaky.txt"))
+    })
+    .await;
     let session = runs_for_stage(&run.pool, &run.task_id, "review")
         .await
         .remove(0);
@@ -10829,13 +10841,16 @@ async fn an_abnormal_end_that_cannot_be_verified_does_not_claim_an_outcome_was_d
         ]),
     )
     .await;
-    for _ in 0..400 {
-        let pointer = std::fs::read_to_string(run.worktree_dir.join(".git"));
-        if pointer.is_ok_and(|p| p.contains("/nonexistent")) {
-            break;
+    crate::test_support::wait_until("the .git pointer to name /nonexistent", || async {
+        let path = run.worktree_dir.join(".git");
+        match std::fs::read_to_string(&path) {
+            Ok(p) if p.contains("/nonexistent") => Ok(()),
+            Ok(p) => Err(format!(".git holds {p:?}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("no .git yet".to_string()),
+            Err(e) => panic!("reading {}: {e}", path.display()),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    })
+    .await;
     let session = runs_for_stage(&run.pool, &run.task_id, "review")
         .await
         .remove(0);
@@ -12706,6 +12721,7 @@ async fn reentering_the_same_poll_stage_stamps_a_later_entered_at() {
     let first = poll_window_for(&state_of(&pool, &task_id).await.payload, "watch")
         .unwrap()
         .unwrap();
+    // Not a wait: makes the next timestamp distinguishable.
     tokio::time::sleep(StdDuration::from_millis(20)).await;
     engine.advance(&task_id, &def, "again").await.unwrap();
     let second = poll_window_for(&state_of(&pool, &task_id).await.payload, "watch")
@@ -13181,6 +13197,7 @@ async fn retrying_a_stuck_poll_stamps_a_fresh_window() {
     tasks::mark_stuck(&pool, &task_id, "x").await.unwrap();
     let entered_before = state_of(&pool, &task_id).await.stage_entered_at;
     assert!(entered_before.is_some());
+    // Not a wait: makes the next timestamp distinguishable.
     tokio::time::sleep(Duration::from_millis(5)).await;
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
     engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
@@ -14060,6 +14077,8 @@ stages:
     // And end to end: retry enters the shell stage, nothing runs.
     engine.park_interrupted_turns().await.unwrap();
     engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     assert!(!gc.exists(), "the shell command must never have started");
     assert!(engine.detached_runners.lock().unwrap().is_empty());
@@ -14451,6 +14470,8 @@ async fn a_marked_reply_resolves_a_watching_gate_and_stops_its_watcher() {
     assert_eq!(messages[0]["outcome"], json!("approved"));
     assert!(!engine.has_detached_runner(&task_id));
     let before = count_lines(&counter);
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_secs(3)).await;
     assert_eq!(count_lines(&counter), before, "the watcher kept running");
 }
@@ -14869,6 +14890,8 @@ stages:
     assert!(!engine.has_detached_runner(&task_id));
     assert_eq!(runner_slots(&engine, &task_id), 0);
     let before = count_lines(&counter);
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_secs(3)).await;
     assert_eq!(count_lines(&counter), before, "the watcher kept running");
     assert_eq!(state_of(&pool, &task_id).await.current_stage, "gate");
@@ -14893,6 +14916,8 @@ async fn cancelling_a_watching_gate_stops_the_watcher_and_refuses_later_replies(
     engine.cancel_task(&task_id, false).await.unwrap();
     assert!(!engine.has_detached_runner(&task_id));
     let before = count_lines(&counter);
+    // Negative: only "it did not happen" is asserted next, so a fixed sleep
+    // can pass falsely but cannot fail.
     tokio::time::sleep(StdDuration::from_secs(3)).await;
     assert_eq!(count_lines(&counter), before);
     let err = engine
@@ -15966,13 +15991,10 @@ async fn a_memory_role_routed_to_omp_by_the_global_config_spawns_omp_with_its_st
         ),
         "{created:?}"
     );
-    for _ in 0..200 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(marker.exists(), "omp must have been started");
+    crate::test_support::wait_until("omp to be started (its marker file)", || async {
+        file_exists_or_not_yet(&marker)
+    })
+    .await;
     assert!(
         dir.join("omp-state")
             .join("memory")
@@ -17390,18 +17412,29 @@ fn lock_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// `Ok` once `path` exists; `NotFound` is "not yet", any other error panics.
+fn file_exists_or_not_yet(path: &Path) -> Result<(), String> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("{} does not exist yet", path.display()))
+        }
+        Err(e) => panic!("checking {}: {e}", path.display()),
+    }
+}
+
 /// Waits (git needs a moment after SIGTERM) for the repo to hold no lock file.
 async fn assert_no_lock_files_soon(repo: &Path) {
-    let mut found = Vec::new();
-    for _ in 0..50 {
-        found.clear();
+    crate::test_support::wait_until("the repo to hold no lock file", || async {
+        let mut found = Vec::new();
         lock_files(&repo.join(".git"), &mut found);
         if found.is_empty() {
-            return;
+            Ok(())
+        } else {
+            Err(format!("lock files left behind: {found:?}"))
         }
-        tokio::time::sleep(StdDuration::from_millis(100)).await;
-    }
-    panic!("lock files left behind: {found:?}");
+    })
+    .await;
 }
 
 #[tokio::test]
