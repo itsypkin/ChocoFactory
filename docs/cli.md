@@ -604,9 +604,9 @@ $ printf '%s\n' "$page" | jq '.events | length'     # right
 $ echo "$page" | jq '.events | length'               # wrong in zsh and sh
 ```
 
-The wrong one fails with a jq parse error, usually `control characters from
-U+0000 through U+001F must be escaped` (or `Invalid escape`, depending on
-which sequence jq meets first).
+The wrong one fails with a jq parse error, usually
+`control characters from U+0000 through U+001F must be escaped`
+(or `Invalid escape`, depending on which sequence jq meets first).
 
 `choco` writes valid JSON: every control character in task text (a colour
 escape in a command's output, say) leaves it as a `\u001b`-style escape. zsh's
