@@ -8658,6 +8658,38 @@ mod tests {
     /// process is killed, and left unreaped so a second delivery succeeds.
     #[tokio::test]
     async fn cross_site_late_delivery_does_not_suppress_grace_policy() {
+        // Ordinary earlier delivery: counted once, and a later site signals
+        // the same pid again (redelivery verified through the refreshed
+        // identity) without counting it again.
+        let mut ordinary = Sleeper::spawn(None, true);
+        let f = ordinary.pid();
+        let (reader, phase) = phased_reader(move |phase, scan| {
+            Ok(match (phase, scan) {
+                (0, 0) => vec![escapee_row(f, 700, "ordinary-first")],
+                (1, 0) => vec![escapee_row(f, 701, "ordinary-second")],
+                _ => Vec::new(),
+            })
+        });
+        let tracker = sweep_tracker(reader);
+        let earlier = tracker.sweep(NO_AGENT, None, "cancel").await;
+        assert_eq!(earlier, 1);
+        phase.next();
+        let grace = tracker.sweep(NO_AGENT, None, "grace").await;
+        {
+            let state = tracker.state();
+            assert_eq!(
+                (state.killed.clone(), state.killed_starts.clone()),
+                (
+                    vec![(f, "ordinary-second".to_string())],
+                    HashMap::from([(f, 701)])
+                ),
+                "the second signal was delivered, not an ESRCH"
+            );
+        }
+        assert_eq!(grace, 0, "an ordinary earlier delivery already counted");
+        assert_eq!(ordinary.reap_signal(), Some(libc::SIGKILL));
+
+        // Late discovery: one tracker, the sites in the daemon's order.
         let (_, daemon_sid) = daemon_ids();
         let mut escapee = Sleeper::spawn(None, true);
         let e = escapee.pid();
@@ -8736,38 +8768,6 @@ mod tests {
             !pids_of(&tracker.state().killed).contains(&g)
                 && !pids_of(&tracker.state().killed).contains(&b)
         );
-
-        // Ordinary earlier delivery: counted once, and a later site signals
-        // the same pid again (redelivery verified through the refreshed
-        // identity) without counting it again. A fresh tracker, so nothing
-        // above can supply the history.
-        let mut ordinary = Sleeper::spawn(None, true);
-        let f = ordinary.pid();
-        let (reader, phase) = phased_reader(move |phase, scan| {
-            Ok(match (phase, scan) {
-                (0, 0) => vec![escapee_row(f, 700, "ordinary-first")],
-                (1, 0) => vec![escapee_row(f, 701, "ordinary-second")],
-                _ => Vec::new(),
-            })
-        });
-        let tracker = sweep_tracker(reader);
-        let earlier = tracker.sweep(NO_AGENT, None, "cancel").await;
-        assert_eq!(earlier, 1);
-        phase.next();
-        let grace = tracker.sweep(NO_AGENT, None, "grace").await;
-        {
-            let state = tracker.state();
-            assert_eq!(
-                (state.killed.clone(), state.killed_starts.clone()),
-                (
-                    vec![(f, "ordinary-second".to_string())],
-                    HashMap::from([(f, 701)])
-                ),
-                "the second signal was delivered, not an ESRCH"
-            );
-        }
-        assert_eq!(grace, 0, "an ordinary earlier delivery already counted");
-        assert_eq!(ordinary.reap_signal(), Some(libc::SIGKILL));
     }
 
     /// The whole drain: a completed turn, shut down. The shutdown-style
