@@ -256,24 +256,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-        type Writer = LogBuf;
-        fn make_writer(&'a self) -> LogBuf {
-            self.clone()
-        }
-    }
-
     #[tokio::test]
     async fn a_failed_store_removal_is_a_500_that_names_the_path_and_is_logged() {
         use std::os::unix::fs::PermissionsExt;
@@ -284,13 +266,8 @@ mod tests {
         let _restore = Restore(memory.clone());
         std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let log = LogBuf::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(log.clone())
-                .with_ansi(false)
-                .finish(),
-        );
+        let log = crate::test_support::LogBuf::default();
+        let _guard = log.capture();
         let response = server.delete(&format!("/projects/{id}")).await;
         assert_eq!(response.status(), 500, "{}", response.json());
         let error = response.json()["error"].as_str().unwrap().to_string();
@@ -302,7 +279,7 @@ mod tests {
             error.contains(&store.to_string_lossy().into_owned()),
             "{error}"
         );
-        let logged = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        let logged = log.text();
         assert!(logged.contains("was deleted, but"), "{logged}");
         // The project row is gone even though the folder could not be.
         assert_eq!(server.get(&format!("/projects/{id}")).await.status(), 404);
