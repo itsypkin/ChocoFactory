@@ -235,28 +235,39 @@ when it ends *after* the agent called `report_outcome`:
   `no_report` with a `session_note` that names the jobs; once the jobs are
   gone the nudge rule above applies again. Roles on omp keep the nudge rule.
 - Once a turn has reported and ended, its process has 30 seconds to exit. If
-  it's still running, the process and what the turn started are killed and the
-  task is marked `stuck`, rather than advancing past work that may still be
-  landing. A process that exited on its own, with nothing of the turn's left
+  it's still running, choco sends SIGKILL to the process and what the turn
+  started and the task is marked `stuck`, rather than advancing past work that
+  may still be landing (sending the signal does not prove anything died). A process that exited on its own, with nothing of the turn's left
   alive, does not park the task.
 - Output that arrives after a turn completed stays on the timeline, flagged
   `after_completion`. Nudges and kills appear as `session_note` events.
 - However a turn ends (reported, closed, cancelled, daemon stopped, or the
-  agent crashed), choco then kills the processes it can prove the turn
-  started. That includes background jobs the agent's tool ran in sessions
+  agent crashed), choco then sends SIGKILL to the processes it can prove the
+  turn started. That includes background jobs the agent's tool ran in sessions
   and process groups of their own (Claude Code runs every Bash call in a
   new session), such as a hung `cargo test` or a dev server. They are
-  listed in a `leftovers_killed` `session_note`, which also lists any that
-  could not be killed. When the group kill succeeded, the note names only
-  processes outside the agent's own process group: the group is killed as a
-  whole, so a turn whose only live processes were in that group has no
-  `leftovers_killed` note, because killing the group was enough. A group
-  member that is still present at the end of the check is listed as one that
-  could not be killed. When the group kill itself failed, the group is listed
-  as one that could not be killed, and its members are killed one by one and
-  listed with the rest. A `leftovers_unchecked` note means choco could not
-  read the process table, so the check could not run (the agent's own
-  process group was still killed). A process counts as the turn's if it
+  listed in a `leftovers_killed` `session_note`. Sending SIGKILL does not
+  prove a process died, so choco reads the process table again and the note
+  says what that last check saw. The last check covers the agent, its process
+  group and the processes choco can prove belong to the turn. A process it
+  signalled that the last check no longer sees is "killed"; one the last
+  check still sees is "still running at the last check", never "killed", and
+  appears in that clause only. When the group signal was delivered, the
+  "killed" clause names only processes outside the agent's own process group
+  that were signalled (the group's members are the group signal's), though the
+  leader and group members the last check still sees appear in the "still
+  running" clause. A turn whose only live processes were in that group, and are
+  gone by the last check, has no `leftovers_killed` note. A failed group
+  signal is added to a note that lists a survivor, but it does not make the
+  group a survivor by itself: the last check decides. A `leftovers_unchecked`
+  note means choco could not read the process table at least once, so nothing
+  confirms the turn's processes are gone, whatever the other notes say, and
+  the "killed" wording is replaced by "sent SIGKILL ... could not confirm".
+  None of this changes how the turn ended or whether the task advances: the
+  extra waiting for a leader or group member that is still exiting does not
+  count towards whether the turn lingered, which is decided by what the check
+  before the kill saw and what the first rounds of the sweep had to signal. A
+  process counts as the turn's if it
   descends from the agent, was seen descending from it earlier, carries
   the turn's marker in its environment, or shares a session with one that
   does. choco never signals anything else. One blind spot: on macOS the OS

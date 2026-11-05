@@ -216,11 +216,15 @@ pub enum SessionEndReason {
     /// one is *requested* rather than observed, so it takes precedence over
     /// `Reaped` when both could apply — see `session::drain_session`.
     Cancelled,
-    /// A single-shot turn had reported its outcome and ended (#90), but its
-    /// process group was still alive once the post-completion grace period
-    /// ran out, so `session::drain_session` killed it. Something the turn
-    /// started kept running after it said it was done, so the task parks
-    /// rather than advancing past work that may still be landing.
+    /// A single-shot turn ended or was closed (#90) and, once the
+    /// post-completion grace period ran out, `session::drain_session` found
+    /// cause to clean up after it: its process group was seen alive, a
+    /// process outside the group was signalled, or the process table could
+    /// not be read. It tried to SIGKILL what the turn may have left behind.
+    /// This records that attempt, not that anything was seen running or died;
+    /// the `lingered` and `leftovers_*` session notes say what the checks saw
+    /// or that they could not check. The task parks rather than advancing past
+    /// work that may still be landing.
     Lingered,
     /// A single-shot turn ended without ever calling `report_outcome`
     /// (#90), even after the daemon's nudges, so it was closed rather than
@@ -637,24 +641,34 @@ pub enum EventType {
     ///   to report;
     /// - `"no_report"`: closed a turn that never reported (nudges used up, or
     ///   its total job-wait limit ran out);
-    /// - `"lingered"`: the agent process was still alive after its turn ended
-    ///   and was killed;
+    /// - `"lingered"`: once the grace period after the turn ended (it
+    ///   reported, errored, was closed for never reporting, or was closed by
+    ///   the idle reaper) ran out, choco tried to SIGKILL what the turn may
+    ///   have left behind (the agent's process group, or something the turn
+    ///   started). The note says what the check before the kill saw, or that
+    ///   it could not check, and whether the group signal was sent or
+    ///   refused; it does not say anything died;
     /// - `"job_wait"`: the turn ended without reporting while background jobs
     ///   run, so it is not nudged until they finish or its total job-wait
     ///   limit runs out;
     /// - `"background_jobs"`: the CLI's list of running background jobs
     ///   changed;
     /// - `"resume"`: a retry resumed the interrupted turn's conversation;
-    /// - `"leftovers_killed"`: processes the turn started were still running
-    ///   when it ended and were killed. When the group kill succeeded, only
-    ///   processes outside the agent's own process group are listed: the
-    ///   group's members were killed by the group kill. When the group kill
-    ///   failed, the group is listed as a survivor and its members are killed
-    ///   one by one and listed with the rest. Survivors, including a group
-    ///   member still present after a successful group kill, are listed
-    ///   separately;
-    /// - `"leftovers_unchecked"`: the process table could not be read, so
-    ///   what the turn left running could not be checked.
+    /// - `"leftovers_killed"`: what the turn's cleanup found. Sending SIGKILL
+    ///   does not prove a process is dead, so choco reads the process table
+    ///   again and the note says what that last check saw. A process it
+    ///   signalled by pid that the last check no longer sees is listed as
+    ///   killed; one still alive (the agent, a member of its process group,
+    ///   or something the turn started) is listed as "still running at the
+    ///   last check", never as killed. A pid appears in one list only. When
+    ///   the group signal was delivered, a group member is not signalled
+    ///   again by pid and is listed only if it is still running. When the
+    ///   group signal failed, the failure is added to a note that lists a
+    ///   survivor; it does not make the group a survivor by itself. No task
+    ///   outcome depends on the note;
+    /// - `"leftovers_unchecked"`: the process table could not be read at
+    ///   least once, so nothing confirms the turn's processes are gone,
+    ///   whatever the other notes say. A failed group signal is appended.
     ///
     /// Without it those interventions would only be visible in the daemon's
     /// logs and in the run's `end_reason`.

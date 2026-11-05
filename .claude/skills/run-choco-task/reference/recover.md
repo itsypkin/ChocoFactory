@@ -61,25 +61,42 @@ and `choco task list --status stuck` finds every stuck task.
   different CLI.
 - `no_report`: the turn never called `report_outcome`, was nudged (or, with
   a background job still running, waited 60 minutes in total across all its
-  waits; its `session_note` names the jobs), and was closed. The processes the
-  turn started outside the agent's own process group, such as that job, were
-  killed when it closed; the `leftovers_killed` `session_note` lists them by
-  pid, and a
-  `leftovers_unchecked` note means the process table could not be read, so
-  look for strays yourself. There is no outcome to route on, so read its last
-  events before retrying. Blind spots, where a stray can survive: on macOS, a process the OS
+  waits; its `session_note` names the jobs), and was closed. choco then tried
+  to clean up after it: it signals the agent's process group and, by pid, the
+  processes it can show the turn started outside that group, such as that job,
+  and it reads the process table again. If the table cannot be read, or a
+  signal is refused, it cannot select or signal them, and the notes say so.
+  The `leftovers_killed` `session_note` lists by pid the processes it signalled
+  that the last check no longer saw ("killed") and, separately, the ones it
+  still saw ("still running at the last check"). A `leftovers_unchecked` note
+  means the process table could not be read at least once, so nothing confirms
+  they are gone: look for strays yourself. There is no outcome to route on, so
+  read its last events before retrying. Blind spots, where a stray can survive:
+  on macOS, a process the OS
   hides the environment of (`/bin/sleep`, `/bin/zsh`) that left the agent's
   tree early and shares no session with anything else of the turn's; on any
   OS, a process that dropped its environment (`env -i`) and left both the
   tree and its session before choco saw it; on Linux, a process whose
   environment is unreadable (setuid, or non-dumpable). `docs/workflows.md`
   has the details.
-- `lingered`: the agent process outlived its reported turn, or something the
-  turn started was still alive, and it was killed. The `leftovers_killed`
-  `session_note`, when there is one, names what was still running outside the
-  agent's own process group. A `lingered` run with no such note means only the
-  agent's group was alive and killing it was enough; nothing was skipped. The turn may have been writing to the worktree
-  until then, so check `git status` there before retrying.
+- `lingered`: once the grace period after the turn ended (it reported,
+  errored, was closed for never reporting, or was closed by the idle reaper)
+  ran out, choco found cause to clean up what the turn may have left behind,
+  and tried to SIGKILL it. The cause is the agent's process group seen alive,
+  a process outside it that choco signalled, or a process table that could not
+  be read, so a `lingered` run does not prove anything was running. The
+  `lingered` note says which: what the check before the kill saw, or that it
+  could not check, and whether the group signal was sent or refused. It does
+  not say anything died. The `leftovers_killed`
+  `session_note`, when there is one, names what choco signalled outside the
+  agent's own process group and what the last check still saw running. A
+  `lingered` run with a successful last check and no `leftovers_*` note means
+  that check found nothing left, which is the normal case of only the agent's
+  group being alive. A failed read supplies no such check: `leftovers_unchecked`
+  means nothing confirms the processes are gone, whatever else is said, and with
+  every read failing it is the only `leftovers_*` note (the `lingered` note is
+  written too). The turn may have been writing to the worktree until then, so
+  check `git status` there before retrying.
 - `claude_settings_rejected`: the reason says Claude Code did not apply role
   `<role>`'s `claude_settings` (it ignores the whole settings when one value is
   invalid). Choco normally sees this before the agent gets its prompt, so

@@ -10909,7 +10909,8 @@ async fn a_lingering_read_only_turn_is_checked() {
     .await;
     let reason = stuck_reason(&run.pool, &run.task_id).await;
     assert!(
-        reason.contains("kept running") && reason.contains("changed the worktree"),
+        reason.contains("choco tried to kill what it may have left running")
+            && reason.contains("changed the worktree"),
         "{reason}"
     );
     let session = runs_for_stage(&run.pool, &run.task_id, "review")
@@ -12171,6 +12172,7 @@ async fn a_turn_that_never_reports_parks_the_task_instead_of_advancing() {
 /// rather than moving past work that may still have been landing.
 #[tokio::test]
 async fn a_turn_whose_process_lingers_after_reporting_parks_the_task() {
+    let (log, _guard) = capture_logs();
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
     let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
@@ -12195,13 +12197,109 @@ async fn a_turn_whose_process_lingers_after_reporting_parks_the_task() {
         "must never advance past a turn whose process was still running: {trail:?}"
     );
     let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-    assert!(
-        task.stuck_reason
-            .as_deref()
-            .is_some_and(|r| r.contains("kept running")),
-        "{:?}",
-        task.stuck_reason
+    assert_eq!(
+        task.stuck_reason.as_deref(),
+        Some(
+            "stage 'coding': after the turn ended, choco tried to kill what it may have \
+             left running (the agent's process group or something it started); its \
+             session notes say what the last check saw, or that it could not check; \
+             work the turn started may be incomplete"
+        )
     );
+    // The log line makes the same claim: an attempt, not a death or a
+    // known-live process.
+    let line = log
+        .text()
+        .lines()
+        .find(|l| l.contains("not auto-advancing") && l.contains("tried to kill"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("no lingered warning in: {}", log.text()));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(&task_id), "{line}");
+    assert!(
+        line.contains(
+            "choco tried to kill what the session's turn may have left running after it \
+             ended; the session notes say what its last check saw; not auto-advancing"
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("was killed"), "{line}");
+    assert!(!line.contains("kept running"), "{line}");
+}
+
+/// The owner's round, item 1, end to end: the first table the grace cleanup's
+/// sweep reads holds only the leader, and the next reveals an owned escaped
+/// job. The extra round that waits for the leader still kills the job, but it
+/// does not change the grace result: the task advances to its terminal stage
+/// and closes, exactly as it did when the loop stopped at the first table.
+#[tokio::test]
+async fn a_job_found_while_the_sweep_waits_for_the_leader_does_not_park_the_task() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let leader_file = dir.join("leader.pid");
+    let job_file = dir.join("job.pid");
+    let _job_guard = crate::test_support::KillPidFileOnDrop(job_file.clone());
+    let binary = script_binary(
+        &dir,
+        crate::test_support::escaped_job_turn_steps(&leader_file, &job_file),
+    );
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(&binary));
+    let events_notify = Arc::new(Notify::new());
+    let session_manager = SessionManager::with_proc_reader(
+        pool.clone(),
+        Registry::single(adapter),
+        chrono::Duration::hours(1),
+        Arc::clone(&events_notify),
+        fast_turn_timers(),
+        crate::test_support::late_discovery_reader(leader_file),
+    );
+    let engine = WorkflowEngine::new(
+        pool.clone(),
+        session_manager,
+        PathBuf::from("."),
+        None,
+        events_notify,
+    );
+
+    engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "closed").await;
+
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "closed");
+    assert_eq!(task.stuck_reason, None);
+    let trail = stage_trail(&pool, &task_id).await;
+    assert_eq!(
+        trail.last().map(|(stage, _)| stage.as_str()),
+        Some("finished"),
+        "{trail:?}"
+    );
+    let job: u32 = std::fs::read_to_string(&job_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    crate::test_support::wait_until(&format!("escaped job {job} to be killed"), || async {
+        if !process_alive(job) {
+            Ok(())
+        } else {
+            Err(format!("pid {job} still alive"))
+        }
+    })
+    .await;
+}
+
+/// Captures this thread's log, DEBUG and above, through the shared helper
+/// whose `KEEPER` stops another thread reaching a log line first from
+/// hiding it.
+fn capture_logs() -> (
+    crate::test_support::LogBuf,
+    tracing::subscriber::DefaultGuard,
+) {
+    let buf = crate::test_support::LogBuf::default();
+    let guard = buf.capture_at(tracing::Level::DEBUG);
+    (buf, guard)
 }
 
 /// A single-shot stage with no `capture: json` may only report `done`,

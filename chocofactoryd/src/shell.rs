@@ -172,7 +172,10 @@ pub(crate) fn live_members(table: &[crate::proc_table::ProcEntry], pgid: i32) ->
 /// outcome is decided by a scan taken just before the signal.
 #[derive(Debug)]
 pub(crate) enum GroupKill {
-    /// `n` live members were seen before the kill, and it was delivered.
+    /// `n` live members were seen before the kill, and SIGKILL was delivered
+    /// to the group. That says nothing about whether they are dead: a
+    /// delivered signal is not a death, and the session's sweep checks the
+    /// process table afterwards.
     Killed(usize),
     /// The scan saw no live member, whatever `killpg` returned.
     NothingAlive,
@@ -500,6 +503,16 @@ mod tests {
         let (kill, delivered) = kill_group_with(u32::MAX, Ok(1));
         assert!(matches!(kill, GroupKill::NothingAlive), "{kill:?}");
         assert!(!delivered, "(v) delivered is false");
+    }
+
+    /// T8: pgid 0 means "my own group" to `killpg`; it is never signalled.
+    /// (Not mutation-tested: removing the guard would SIGKILL this test
+    /// runner's own process group.)
+    #[test]
+    fn a_zero_pgid_is_never_signalled() {
+        let (kill, delivered) = kill_group_with(0, Ok(1));
+        assert!(matches!(kill, GroupKill::NothingAlive), "{kill:?}");
+        assert!(!delivered);
     }
 
     #[test]
