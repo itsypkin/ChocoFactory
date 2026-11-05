@@ -1791,6 +1791,12 @@ struct SilentServer {
 
 impl SilentServer {
     fn start() -> Self {
+        Self::start_gated(None)
+    }
+
+    /// With a gate, the worker finishes serving, then waits for the gate before
+    /// it exits, so a test decides when the worker may end.
+    fn start_gated(gate: Option<std::sync::mpsc::Receiver<()>>) -> Self {
         use std::io::Read;
         use std::sync::atomic::Ordering;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1800,40 +1806,46 @@ impl SilentServer {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         let worker = std::thread::spawn(move || {
-            let mut conn = loop {
-                match listener.accept() {
-                    Ok((conn, _)) => break conn,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if flag.load(Ordering::SeqCst) {
-                            return;
+            let serve = || {
+                let mut conn = loop {
+                    match listener.accept() {
+                        Ok((conn, _)) => break conn,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if flag.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        Err(_) => return,
                     }
-                    Err(_) => return,
+                };
+                conn.set_nonblocking(false).unwrap();
+                conn.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                    .unwrap();
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                let mut announced = false;
+                // Held open until the client goes away (EOF) or the owner stops us.
+                while !flag.load(Ordering::SeqCst) {
+                    match conn.read(&mut buf) {
+                        Ok(0) => return,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => return,
+                    }
+                    if !announced && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        announced = true;
+                        let _ = tx.send(());
+                    }
                 }
             };
-            conn.set_nonblocking(false).unwrap();
-            conn.set_read_timeout(Some(std::time::Duration::from_millis(50)))
-                .unwrap();
-            let mut seen = Vec::new();
-            let mut buf = [0u8; 1024];
-            let mut announced = false;
-            // Held open until the client goes away (EOF) or the owner stops us.
-            while !flag.load(Ordering::SeqCst) {
-                match conn.read(&mut buf) {
-                    Ok(0) => return,
-                    Ok(n) => seen.extend_from_slice(&buf[..n]),
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(_) => return,
-                }
-                if !announced && seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                    announced = true;
-                    let _ = tx.send(());
-                }
+            serve();
+            if let Some(gate) = gate {
+                let _ = gate.recv();
             }
         });
         SilentServer {
@@ -1855,17 +1867,27 @@ impl Drop for SilentServer {
 }
 
 #[test]
-fn silent_server_worker_ends_when_dropped_without_a_request() {
-    let server = SilentServer::start();
-    let stop = server.stop.clone();
-    let worker_alive = std::sync::Arc::downgrade(&stop);
-    drop(stop);
-    // Drop joins the worker; the worker's clone of the flag goes with it.
-    drop(server);
+fn silent_server_drop_waits_for_its_worker() {
+    // The worker is held at its exit by a gate the test owns. Dropping the
+    // server must not complete until the test opens the gate.
+    let (open_gate, gate) = std::sync::mpsc::channel();
+    let server = SilentServer::start_gated(Some(gate));
+    let (dropped_tx, dropped) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(server);
+        let _ = dropped_tx.send(());
+    });
+    let early = dropped.recv_timeout(std::time::Duration::from_millis(500));
+    // Open the gate before asserting, so a failure cannot leave the thread stuck.
+    open_gate.send(()).unwrap();
     assert!(
-        worker_alive.upgrade().is_none(),
-        "the worker still holds the stop flag after the server was dropped"
+        early.is_err(),
+        "dropping the server returned while its worker was still running"
     );
+    dropped
+        .recv_timeout(DEADLINE)
+        .expect("dropping the server never finished after the worker was released");
+    dropper.join().unwrap();
 }
 
 fn interrupted_update_scenario(json: bool) {
