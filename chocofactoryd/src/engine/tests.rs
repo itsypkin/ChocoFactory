@@ -10909,7 +10909,8 @@ async fn a_lingering_read_only_turn_is_checked() {
     .await;
     let reason = stuck_reason(&run.pool, &run.task_id).await;
     assert!(
-        reason.contains("kept running") && reason.contains("changed the worktree"),
+        reason.contains("choco tried to kill what it may have left running")
+            && reason.contains("changed the worktree"),
         "{reason}"
     );
     let session = runs_for_stage(&run.pool, &run.task_id, "review")

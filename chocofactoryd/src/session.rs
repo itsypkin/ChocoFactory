@@ -5972,7 +5972,9 @@ mod tests {
             (SessionStatus::Exited, Some(SessionEndReason::Lingered))
         );
         assert_eq!(
-            note_message(&pool, &session_id, "lingered").await.as_deref(),
+            note_message(&pool, &session_id, "lingered")
+                .await
+                .as_deref(),
             Some(
                 "0.4s after its turn ended, could not check whether the agent's process \
                  group was still running; sent SIGKILL to the group"
