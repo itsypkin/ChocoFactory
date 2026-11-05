@@ -216,11 +216,15 @@ pub enum SessionEndReason {
     /// one is *requested* rather than observed, so it takes precedence over
     /// `Reaped` when both could apply — see `session::drain_session`.
     Cancelled,
-    /// A single-shot turn had reported its outcome and ended (#90), but its
-    /// process group was still alive once the post-completion grace period
-    /// ran out, so `session::drain_session` tried to kill it. Something the turn
-    /// started kept running after it said it was done, so the task parks
-    /// rather than advancing past work that may still be landing.
+    /// A single-shot turn ended or was closed (#90) and, once the
+    /// post-completion grace period ran out, `session::drain_session` found
+    /// cause to clean up after it: its process group was seen alive, a
+    /// process outside the group was signalled, or the process table could
+    /// not be read. It tried to SIGKILL what the turn may have left behind.
+    /// This records that attempt, not that anything was seen running or died;
+    /// the `lingered` and `leftovers_*` session notes say what the checks saw
+    /// or that they could not check. The task parks rather than advancing past
+    /// work that may still be landing.
     Lingered,
     /// A single-shot turn ended without ever calling `report_outcome`
     /// (#90), even after the daemon's nudges, so it was closed rather than
@@ -637,8 +641,10 @@ pub enum EventType {
     ///   to report;
     /// - `"no_report"`: closed a turn that never reported (nudges used up, or
     ///   its total job-wait limit ran out);
-    /// - `"lingered"`: after the turn reported, choco tried to SIGKILL what it
-    ///   left behind (the agent's process group, or something the turn
+    /// - `"lingered"`: once the grace period after the turn ended (it
+    ///   reported, errored, was closed for never reporting, or was closed by
+    ///   the idle reaper) ran out, choco tried to SIGKILL what the turn may
+    ///   have left behind (the agent's process group, or something the turn
     ///   started). The note says what the check before the kill saw, or that
     ///   it could not check, and whether the group signal was sent or
     ///   refused; it does not say anything died;

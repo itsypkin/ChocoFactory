@@ -346,8 +346,8 @@ finished) is a `409`.
 Sometimes the engine itself can't move a task forward — a stage's outcome
 has no `on:` edge to route through, a transition failed, an agent turn's
 session never started, a run was force-closed before it finished, an agent
-never reported its outcome, an agent's process kept running after its turn
-ended, or a read-only role changed its worktree. When
+never reported its outcome, choco tried to kill what an agent's turn may have
+left running after it ended, or a read-only role changed its worktree. When
 that happens the task is marked `stuck` rather than silently staying
 `open`, with a human-readable reason attached.
 

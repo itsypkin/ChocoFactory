@@ -12171,6 +12171,7 @@ async fn a_turn_that_never_reports_parks_the_task_instead_of_advancing() {
 /// rather than moving past work that may still have been landing.
 #[tokio::test]
 async fn a_turn_whose_process_lingers_after_reporting_parks_the_task() {
+    let (log, _guard) = capture_logs();
     let pool = connect_in_memory().await.unwrap();
     let dir = tempdir();
     let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
@@ -12198,11 +12199,73 @@ async fn a_turn_whose_process_lingers_after_reporting_parks_the_task() {
     assert_eq!(
         task.stuck_reason.as_deref(),
         Some(
-            "stage 'coding': the agent's process group or something it started kept \
-             running after its turn ended and choco tried to kill it; its session notes \
-             say what is still running; work it started may be incomplete"
+            "stage 'coding': after the turn ended, choco tried to kill what it may have \
+             left running (the agent's process group or something it started); its \
+             session notes say what the last check saw, or that it could not check; \
+             work the turn started may be incomplete"
         )
     );
+    // The log line makes the same claim: an attempt, not a death or a
+    // known-live process.
+    let line = log
+        .text()
+        .lines()
+        .find(|l| l.contains("not auto-advancing") && l.contains("tried to kill"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("no lingered warning in: {}", log.text()));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(&task_id), "{line}");
+    assert!(
+        line.contains(
+            "choco tried to kill what the session's turn may have left running after it \
+             ended; the session notes say what its last check saw; not auto-advancing"
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("was killed"), "{line}");
+    assert!(!line.contains("kept running"), "{line}");
+}
+
+/// A log sink one test owns. The subscriber is installed for this thread
+/// only (`#[tokio::test]` runs on it), so parallel tests cannot see each
+/// other's lines.
+#[derive(Clone, Default)]
+struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogBuf {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    (buf, tracing::subscriber::set_default(subscriber))
 }
 
 /// A single-shot stage with no `capture: json` may only report `done`,

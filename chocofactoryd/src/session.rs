@@ -5937,6 +5937,58 @@ mod tests {
         assert!(!notes.contains(&"lingered".to_string()), "{notes:?}");
     }
 
+    /// `Lingered` records that choco tried to clean up after the turn, not
+    /// that anything was seen running. A turn that ends in an error with no
+    /// report, a pre-kill read that fails and a sweep that finds nothing still
+    /// ends `Lingered`: the note says the check could not be made, there is no
+    /// survivor and no killed process, and the unreadable table is flagged.
+    #[tokio::test]
+    async fn a_lingered_run_need_not_have_been_seen_running() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "result", "is_error": true},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        // Marker-less scans are the pre-kill and turn-event reads; sweep scans
+        // carry a marker.
+        let reader: crate::proc_table::ProcReader = Arc::new(|marker| match marker {
+            None => Err(std::io::Error::other("injected pre-kill failure")),
+            Some(_) => Ok(Vec::new()),
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(
+            (run.status, run.end_reason),
+            (SessionStatus::Exited, Some(SessionEndReason::Lingered))
+        );
+        assert_eq!(
+            note_message(&pool, &session_id, "lingered").await.as_deref(),
+            Some(
+                "0.4s after its turn ended, could not check whether the agent's process \
+                 group was still running; sent SIGKILL to the group"
+            )
+        );
+        let notes = session_notes(&pool, &session_id).await;
+        assert!(
+            notes.contains(&"leftovers_unchecked".to_string()),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.contains(&"leftovers_killed".to_string()),
+            "nothing was seen running, so no process is named: {notes:?}"
+        );
+    }
+
     /// A process the sweep cannot get rid of is listed as a survivor in the
     /// `leftovers_killed` note rather than dropped.
     #[tokio::test]
@@ -7756,17 +7808,19 @@ mod tests {
         stat: String,
     }
 
-    /// Reads `ps` output for a pid list. `ps` exits 1 when some or all of the
-    /// pids do not exist (they are simply not listed), so that, with nothing
-    /// on stderr, is the only failure accepted. Any other status, any stderr
-    /// text, or a row that does not parse is an error: a failed or partial
-    /// reading must not look like a process being gone.
+    /// Reads `ps` output for a pid list. `ps` exits 0 when it lists at least
+    /// one of the pids (the rest are simply not listed) and 1 with no output
+    /// when it lists none. Those are the only readings accepted, and only with
+    /// nothing on stderr. Any other status, a status 1 that printed rows, any
+    /// stderr text, or a row that does not parse is an error: a failed or
+    /// partial reading must not look like a process being gone.
     fn parse_ps(
         code: Option<i32>,
         stdout: &str,
         stderr: &str,
     ) -> Result<HashMap<i32, PsRow>, String> {
-        if !matches!(code, Some(0 | 1)) || !stderr.trim().is_empty() {
+        let no_match = code == Some(1) && stdout.trim().is_empty();
+        if !(code == Some(0) || no_match) || !stderr.trim().is_empty() {
             return Err(format!(
                 "ps failed (status {code:?}); stderr: {:?}; stdout: {stdout:?}",
                 stderr.trim()
@@ -7810,12 +7864,17 @@ mod tests {
     fn a_failed_or_partial_ps_reading_is_an_error_not_an_absence() {
         let row = "124 1 124 Ss Thu Nov  5 12:00:00 2026";
         // A listing, with some pids unlisted: accepted.
-        let rows = parse_ps(Some(1), row, "").unwrap();
+        let rows = parse_ps(Some(0), row, "").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[&124].ppid, 1);
         assert_eq!(rows[&124].stat, "Ss");
         // Nothing matched: an empty reading, not an error.
         assert!(parse_ps(Some(1), "", "").unwrap().is_empty());
+        assert!(parse_ps(Some(1), " \n", "").unwrap().is_empty());
+        // Status 1 with rows is a failure that printed a partial listing, not
+        // the no-match case.
+        let err = parse_ps(Some(1), row, "").unwrap_err();
+        assert!(err.contains("status Some(1)"), "{err}");
         // A failing command is an error even when it printed a valid row.
         let err = parse_ps(Some(2), row, "simulated-error").unwrap_err();
         assert!(err.contains("simulated-error"), "{err}");
