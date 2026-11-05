@@ -20,13 +20,15 @@ stdout, and their usual messages go to stderr, word for word. Exit codes are
 unchanged. `choco update --check --json` prints
 `{"current","latest","update_available"}`. `--help` and `--version` are not
 JSON, and `dashboard` refuses `--json`. On failure it prints `error:
-<message>` to stderr, leaves stdout empty, and exits `1` (a watch that gives
-up exits with its own code, and a refused `server stop`, `server restart` or
-`update` exits `3`). There are two exceptions to "empty stdout on failure".
+<message>` to stderr, leaves stdout empty, and exits `1` (a usage error, such
+as an unexpected argument, exits `2`, a watch that gives up exits with its own
+code, and a refused `server stop`, `server restart` or `update` exits `3`).
+There are two exceptions to "empty stdout on failure".
 `server status` with no daemon running prints
 `{"running":false,…}` on stdout and exits `3`. A watch (`task status --until`
-or `--live`) keeps the lines it already printed on stdout if a later poll
-fails, so a script reading it should check the exit code as well.
+or `--live`) keeps the lines it already printed on stdout on any non-zero
+end: a failed poll, `--timeout` elapsing (exit `5`) or a cancelled task (exit
+`4`), so a script reading it should check the exit code as well.
 
 `choco --version` (or `-V`) prints the CLI's version without contacting the
 daemon. `chocofactoryd --version` prints the daemon's version and exits
@@ -612,9 +614,13 @@ $ printf '%s\n' "$page" | jq '.events | length'     # right
 $ echo "$page" | jq '.events | length'               # wrong: depends on the shell
 ```
 
-Where the replay corrupts the JSON, jq fails with a parse error, usually
+A corrupted replay either fails or silently changes the text, so a jq exit of
+0 proves nothing. A failure is a jq parse error, usually
 `control characters from U+0000 through U+001F must be escaped`
-(or `Invalid escape`, depending on which sequence jq meets first).
+(or `Invalid escape`, depending on which sequence jq meets first). A stored
+backslash can change with no error: `C:\new` is `C:\\new` in the JSON, `echo`
+in zsh, `sh` or dash turns that into `C:\new`, which is still valid JSON, and
+jq exits 0 and decodes a real newline.
 
 `choco` writes valid JSON: control characters in task text (a colour escape
 in a command's output, say) leave it as escapes: `\u001b` for ESC, and the
