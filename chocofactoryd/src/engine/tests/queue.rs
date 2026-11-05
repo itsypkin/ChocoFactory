@@ -9,6 +9,7 @@ use crate::db::turn_queue::{self, QueueRow};
 use crate::engine::turns::{
     Claim, Pass, QueuedAt, RowFate, TurnPermit, TurnSpec, is_admissible, queue_row_fate,
 };
+use crate::test_support::LogBuf;
 use chocofactory_core::models::Project;
 
 pub(super) const FLOW: &str = "name: qflow\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  coding:\n    kind: agent_turn\n    role: coder\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
@@ -2465,41 +2466,6 @@ async fn a_queue_that_cannot_be_written_leaves_the_dispatcher_idle_and_the_task_
         "an unreadable queue is a read error"
     );
     assert_eq!(q.engine.dispatch_pass().await, Pass::Idle);
-}
-
-/// Captures what the code under test logs, on this thread.
-#[derive(Clone, Default)]
-pub(super) struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogBuf {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-    type Writer = LogBuf;
-    fn make_writer(&'a self) -> LogBuf {
-        self.clone()
-    }
-}
-
-impl LogBuf {
-    pub(super) fn capture(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(self.clone())
-                .with_ansi(false)
-                .finish(),
-        )
-    }
-    pub(super) fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
 }
 
 /// A row whose task has a status the queue keeps (not `open`, not one that

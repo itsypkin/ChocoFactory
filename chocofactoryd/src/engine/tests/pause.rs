@@ -1163,7 +1163,7 @@ async fn a_group_settling_with_failures_marks_a_pausing_or_paused_task_stuck() {
 #[tokio::test]
 async fn a_settle_pause_write_that_fails_logs_at_error_leaves_the_task_pausing_and_resume_repairs_it()
  {
-    let logs = super::queue::LogBuf::default();
+    let logs = crate::test_support::LogBuf::default();
     let _logging = logs.capture();
     let q = Q::new(None).await;
     q.script(&[("job-a", Ending::Report)]);
@@ -1206,7 +1206,7 @@ async fn a_settle_pause_write_that_fails_logs_at_error_leaves_the_task_pausing_a
 
 #[tokio::test]
 async fn a_failed_stop_is_logged_at_error_and_listed_in_the_event_without_failing_the_pause() {
-    let logs = super::queue::LogBuf::default();
+    let logs = crate::test_support::LogBuf::default();
     let _logging = logs.capture();
     let q = Q::new(None).await;
     q.script(&[("job-a", Ending::Report)]);
