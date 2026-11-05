@@ -97,10 +97,11 @@ and `choco task list --status stuck` finds every stuck task.
   process choco had signalled that dropped its marker is "2 still running":
   two processes seen, not two deaths), and a later cleanup site's check
   replaces an earlier one's. An extra check that finds a leftover after the
-  first rounds does not by itself change whether the run is `lingered`. A failed read supplies no such check: `leftovers_unchecked`
-  means nothing confirms the processes are gone, whatever else is said, and with
-  every read failing it is the only `leftovers_*` note (the `lingered` note is
-  written too). The turn may have been writing to the worktree until then, so
+  first rounds does not by itself change whether the run is `lingered`. A
+  failed read supplies no such check: `leftovers_unchecked` means nothing
+  confirms the processes are gone, whatever else is said, and with every read
+  failing it is the only `leftovers_*` note (the `lingered` note is written
+  too). The turn may have been writing to the worktree until then, so
   check `git status` there before retrying.
 - `claude_settings_rejected`: the reason says Claude Code did not apply role
   `<role>`'s `claude_settings` (it ignores the whole settings when one value is
