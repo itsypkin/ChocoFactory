@@ -3271,3 +3271,260 @@ async fn json_runtime_error_has_empty_stdout_and_exit_1() {
     assert!(err.starts_with("error: "), "{err}");
     assert!(err.contains("nope"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// Every command with a response body prints exactly one strict JSON value
+// under `--json` (#361, owner's review round). Each test runs the real CLI on
+// one task or project and the daemon's own API on an identical twin, then
+// compares the decoded fields. The twin is needed because these calls change
+// state, so asking the API again about the same task would answer differently.
+// ---------------------------------------------------------------------------
+
+/// POSTs to the daemon directly and returns the decoded body of its 202/200.
+async fn api_post(base: &str, path: &str, body: Option<Value>) -> Value {
+    let client = reqwest::Client::new();
+    let req = client.post(format!("{base}{path}"));
+    let req = match body {
+        Some(b) => req.json(&b),
+        None => req,
+    };
+    let resp = req.send().await.expect("daemon API call failed");
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "POST {path}: {status} {text}");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("POST {path}: not JSON ({e}): {text}"))
+}
+
+/// Creates `count` tasks of `wf` in one fresh project; returns their ids.
+async fn make_twin_tasks(base: &str, wf: &str, count: usize) -> Vec<String> {
+    let proj = json_cmd(base, "project create", &["project", "create", "demo"]).await;
+    let proj_id = proj["id"].as_str().unwrap().to_string();
+    let mut ids = Vec::new();
+    for n in 0..count {
+        let title = format!("twin {n}");
+        let t = json_cmd(
+            base,
+            "task create",
+            &[
+                "task",
+                "create",
+                "--project",
+                &proj_id,
+                "--workflow",
+                wf,
+                "--title",
+                &title,
+                "--prompt",
+                "p",
+            ],
+        )
+        .await;
+        ids.push(t["id"].as_str().unwrap().to_string());
+    }
+    ids
+}
+
+/// Waits (over the daemon's API, not the CLI under test) for the task to
+/// reach `status`.
+async fn wait_for_status(base: &str, id: &str, status: &str) {
+    wait_until(&format!("task {id} to be {status}"), || async {
+        let v: Value = reqwest::get(format!("{base}/tasks/{id}"))
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        if v["status"] == status {
+            Ok(())
+        } else {
+            Err(format!("status {}", v["status"]))
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn task_pause_and_resume_print_the_daemons_answer_as_strict_json() {
+    let home = TempHome::new();
+    let wf = home.write_workflow("gatewf", GATE_WF);
+    let daemon = Daemon::spawn(home).await;
+    let base = daemon.base_url.clone();
+    let ids = make_twin_tasks(&base, wf.to_str().unwrap(), 2).await;
+    let (cli, api) = (&ids[0], &ids[1]);
+
+    // A gate holds no running work, so both pauses land at once and the
+    // two answers must be identical.
+    for (flag, mode) in [(None, "graceful"), (Some("--now"), "now")] {
+        let mut args = vec!["task", "pause", cli.as_str()];
+        args.extend(flag);
+        let label = format!("task pause {}", flag.unwrap_or(""));
+        let got = json_cmd(&base, label.trim(), &args).await;
+        let want = api_post(
+            &base,
+            &format!("/tasks/{api}/pause"),
+            Some(serde_json::json!({ "now": flag.is_some() })),
+        )
+        .await;
+        assert_eq!(want["mode"], mode, "daemon answer: {want}");
+        assert_eq!(want["status"], "paused", "daemon answer: {want}");
+        assert_eq!(got, want, "{label}: CLI JSON differs from the daemon's");
+
+        let got = json_cmd(&base, "task resume", &["task", "resume", cli]).await;
+        let want = api_post(&base, &format!("/tasks/{api}/resume"), None).await;
+        assert_eq!(want["stage"], "wait", "daemon answer: {want}");
+        assert_eq!(got, want, "task resume: CLI JSON differs from the daemon's");
+    }
+}
+
+#[tokio::test]
+async fn task_retry_prints_the_daemons_answer_as_strict_json() {
+    let home = TempHome::new();
+    // Always fails, so both twins get stuck and stay retryable.
+    let wf = home.write_workflow(
+        "failwf",
+        r#"
+name: failwf
+stages:
+  run:
+    kind: shell
+    command: "false"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+    );
+    let daemon = Daemon::spawn(home).await;
+    let base = daemon.base_url.clone();
+    let ids = make_twin_tasks(&base, wf.to_str().unwrap(), 2).await;
+    for id in &ids {
+        wait_for_status(&base, id, "stuck").await;
+    }
+    let got = json_cmd(&base, "task retry", &["task", "retry", &ids[0]]).await;
+    let want = api_post(
+        &base,
+        &format!("/tasks/{}/retry", ids[1]),
+        Some(serde_json::json!({ "mode": "auto" })),
+    )
+    .await;
+    assert_eq!(want["stage"], "run", "daemon answer: {want}");
+    assert_eq!(want["resumed"], false, "daemon answer: {want}");
+    assert_eq!(got, want, "task retry: CLI JSON differs from the daemon's");
+}
+
+/// The files in `answer[key]`, as paths relative to `answer["dir"]`.
+fn rel_files(answer: &Value, key: &str) -> Vec<String> {
+    let dir = answer["dir"].as_str().unwrap();
+    answer[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("{key} is not an array: {answer}"))
+        .iter()
+        .map(|f| {
+            let f = f.as_str().unwrap();
+            f.strip_prefix(dir)
+                .unwrap_or_else(|| panic!("{f} is not under {dir}"))
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn project_init_workflows_prints_the_daemons_answer_as_strict_json() {
+    let daemon = Daemon::spawn(TempHome::new()).await;
+    let base = daemon.base_url.clone();
+    let (repo_cli, repo_api) = (TempRepoDir::new(), TempRepoDir::new());
+    let mut ids = Vec::new();
+    for (name, repo) in [("a", &repo_cli), ("b", &repo_api)] {
+        let p = json_cmd(
+            &base,
+            "project create",
+            &[
+                "project",
+                "create",
+                name,
+                "--repo",
+                repo.0.to_str().unwrap(),
+            ],
+        )
+        .await;
+        ids.push(p["id"].as_str().unwrap().to_string());
+    }
+
+    let got = json_cmd(
+        &base,
+        "project init-workflows",
+        &["project", "init-workflows", &ids[0]],
+    )
+    .await;
+    let want = api_post(&base, &format!("/projects/{}/init-workflows", ids[1]), None).await;
+    // The two projects live in different repos, so the directory and every
+    // path under it differ; compare the paths relative to their directory.
+    assert_ne!(got["dir"], want["dir"], "{got} vs {want}");
+    assert!(
+        got["dir"]
+            .as_str()
+            .unwrap()
+            .ends_with(".chocofactory/workflows")
+    );
+    assert_eq!(rel_files(&got, "created"), rel_files(&want, "created"));
+    assert_eq!(rel_files(&got, "existing"), rel_files(&want, "existing"));
+    assert!(
+        got["created"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().is_some_and(|f| f.contains("coding-task.yaml"))),
+        "the answer must list what it created: {got}"
+    );
+
+    // Run again: everything is now `existing`, and the daemon says the same.
+    let got = json_cmd(
+        &base,
+        "project init-workflows (again)",
+        &["project", "init-workflows", &ids[0]],
+    )
+    .await;
+    let want = api_post(&base, &format!("/projects/{}/init-workflows", ids[1]), None).await;
+    assert_eq!(rel_files(&got, "created"), rel_files(&want, "created"));
+    assert_eq!(rel_files(&got, "existing"), rel_files(&want, "existing"));
+    assert!(got["created"].as_array().unwrap().is_empty(), "{got}");
+    assert!(!got["existing"].as_array().unwrap().is_empty(), "{got}");
+}
+
+/// `task send` and `task cancel` have no result, so under `--json` they print
+/// nothing at all: not on stdout and not on stderr. (Server actions and
+/// `update` are different: they move their messages to stderr.)
+#[tokio::test]
+async fn task_send_and_cancel_print_nothing_anywhere_under_json() {
+    let home = TempHome::new();
+    let wf = home.write_workflow("gatewf", GATE_WF);
+    let daemon = Daemon::spawn(home).await;
+    let base = daemon.base_url.clone();
+    let ids = make_twin_tasks(&base, wf.to_str().unwrap(), 3).await;
+
+    let cases: [(&str, Vec<&str>); 3] = [
+        (
+            "task send",
+            vec!["--json", "task", "send", &ids[0], "--text", "go"],
+        ),
+        ("task cancel", vec!["--json", "task", "cancel", &ids[1]]),
+        (
+            "task cancel --keep",
+            vec!["--json", "task", "cancel", &ids[2], "--keep"],
+        ),
+    ];
+    for (label, args) in cases {
+        let out = run_choco_raw(&base, &args).await;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{label}: stderr {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        support::assert_empty_stdout(label, &out);
+        assert!(
+            out.stderr.is_empty(),
+            "{label}: stderr must be empty, got {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

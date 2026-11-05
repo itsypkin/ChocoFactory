@@ -83,8 +83,9 @@ These are every role's reports, not only the reviewer's: `ready` or
 `needs_input` come from `spec_check`, `done` or `blocked` from `coding` or `revising`, and
 `approved` or `changes_requested` from `internal_review`. Match their times
 against the `Progress` table in `choco task status`. Use `printf '%s\n'`,
-not `echo`: `echo` in zsh and in `sh` turns the JSON's `\n` and `\u001b`
-escapes into raw characters, and jq then fails with
+not `echo`: zsh's `echo` turns the JSON's `\n` and `\u001b` escapes into raw
+characters, and `sh`'s turns `\n` and `\\` (not `\u001b`) into them, so a
+replay can pass by luck and still be unsafe. When it fails, jq says
 `control characters from U+0000 through U+001F must be escaped`
 (or `Invalid escape`). The JSON `choco`
 printed was valid.

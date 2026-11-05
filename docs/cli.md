@@ -13,16 +13,20 @@ machine-readable output instead — `choco` is meant to be both
 human-scriptable and agent-callable, and `--json` is the half you pipe into
 `jq` or parse from an agent. Under `--json`, stdout carries JSON or nothing:
 one JSON value per command (`task status --until` and `--live` print one JSON
-object per line instead), and no text at all from `task send`, `task cancel`,
-`server start|stop|restart` and `update` without `--check`. Those commands
-have no result to report; their usual messages go to stderr, word for word,
-and their exit codes are unchanged. `choco update --check --json` prints
+object per line instead). Two groups of commands have no result to report:
+`task send` and `task cancel` print nothing at all, on stdout or stderr;
+`server start|stop|restart` and `update` without `--check` print nothing on
+stdout, and their usual messages go to stderr, word for word. Exit codes are
+unchanged. `choco update --check --json` prints
 `{"current","latest","update_available"}`. `--help` and `--version` are not
 JSON, and `dashboard` refuses `--json`. On failure it prints `error:
-<message>` to stderr, leaves stdout empty, and exits `1`. The one exception
-is a watch (`task status --until` or `--live`): lines it already printed stay
-on stdout if a later poll fails, so a script reading it should check the exit
-code as well.
+<message>` to stderr, leaves stdout empty, and exits `1` (a watch that gives
+up exits with its own code, and a refused `server stop`, `server restart` or
+`update` exits `3`). There are two exceptions to "empty stdout on failure".
+`server status` with no daemon running prints
+`{"running":false,…}` on stdout and exits `3`. A watch (`task status --until`
+or `--live`) keeps the lines it already printed on stdout if a later poll
+fails, so a script reading it should check the exit code as well.
 
 `choco --version` (or `-V`) prints the CLI's version without contacting the
 daemon. `chocofactoryd --version` prints the daemon's version and exits
@@ -594,8 +598,9 @@ internal_review
 ```
 
 `task send` returns 202 with no body, so under `--json` it prints nothing
-at all rather than a message that would break a pipe; `task cancel`,
-`server start|stop|restart` and `update` (without `--check`) do the same.
+at all rather than a message that would break a pipe; `task cancel` does the
+same. `server start|stop|restart` and `update` (without `--check`) print
+nothing on stdout but still send their messages to stderr.
 `task status --until/--live` prints one JSON object per line.
 
 To keep the output in a variable, pipe it straight to `jq`, or save it and
@@ -604,19 +609,25 @@ replay it with `printf`, never with `echo`:
 ```
 $ page=$(choco --json task events <id>)
 $ printf '%s\n' "$page" | jq '.events | length'     # right
-$ echo "$page" | jq '.events | length'               # wrong in zsh and sh
+$ echo "$page" | jq '.events | length'               # wrong: depends on the shell
 ```
 
-The wrong one fails with a jq parse error, usually
+Where the replay corrupts the JSON, jq fails with a parse error, usually
 `control characters from U+0000 through U+001F must be escaped`
 (or `Invalid escape`, depending on which sequence jq meets first).
 
-`choco` writes valid JSON: every control character in task text (a colour
-escape in a command's output, say) leaves it as a `\u001b`-style escape. zsh's
-and `sh`'s `echo` turn those backslash sequences back into raw characters
-(`\n` becomes a real newline inside a string), so the JSON broke in the
-replay, not in `choco`. Don't work around it with a permissive parser or by
-rewriting the escapes; use `printf '%s\n'` (or write the output to a file).
+`choco` writes valid JSON: control characters in task text (a colour escape
+in a command's output, say) leave it as escapes: `\u001b` for ESC, and the
+short forms `\n` and `\t` for newline and tab. DEL (0x7f) is not escaped; JSON
+allows it raw. What breaks is the replay, not `choco`: `echo` rewrites
+backslash sequences, and which ones depends on the shell. zsh's `echo` turns
+both `\n` and `\u001b` into raw characters; `sh`'s (macOS `sh`, dash) turns `\n`
+and `\\` into raw characters but leaves `\uXXXX` alone, and bash's leaves them
+all. So under `sh` a captured page whose text has an ESC but no `\n` or `\\`
+can pass through `echo` unharmed. That is luck, not safety: the same command
+fails on the next page that has a newline in a string. Use `printf '%s\n'` (or
+write the output to a file). Don't work around it with a permissive parser or
+by rewriting the escapes.
 
 ## Watching a task
 
