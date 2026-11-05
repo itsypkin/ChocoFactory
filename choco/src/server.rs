@@ -61,11 +61,25 @@ fn skew_warning(info: &LockInfo, expected: &str) {
     }
 }
 
+/// Prints an action's message line: stdout normally, stderr under `--json`.
+/// With `--json`, stdout carries JSON or nothing, and these actions have no
+/// JSON result, so their courtesy text moves aside. Only the stream changes.
+macro_rules! say {
+    ($json:expr, $($arg:tt)*) => {
+        if $json {
+            eprintln!($($arg)*);
+        } else {
+            println!($($arg)*);
+        }
+    };
+}
+pub(crate) use say;
+
 pub async fn run(cmd: ServerCmd, json: bool) -> ExitCode {
     let result = match cmd {
-        ServerCmd::Start { port } => start(port).await,
-        ServerCmd::Stop { force } => stop(force).await,
-        ServerCmd::Restart { force, port } => restart(force, port).await,
+        ServerCmd::Start { port } => start(port, json).await,
+        ServerCmd::Stop { force } => stop(force, json).await,
+        ServerCmd::Restart { force, port } => restart(force, port, json).await,
         ServerCmd::Status => status(json).await,
     };
     match result {
@@ -90,14 +104,14 @@ fn last_lines(path: &Path, n: usize) -> String {
     }
 }
 
-async fn start(port: Option<u16>) -> Result<u8, Failure> {
+async fn start(port: Option<u16>, json: bool) -> Result<u8, Failure> {
     let root = root()?;
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate choco itself: {e}"))?;
     let daemon = exe
         .parent()
         .ok_or("cannot locate choco's directory")?
         .join("chocofactoryd");
-    start_daemon(&root, &daemon, port, VERSION).await
+    start_daemon(&root, &daemon, port, VERSION, json).await
 }
 
 /// Starts `daemon` in the background and waits until it answers. Shared by
@@ -111,11 +125,15 @@ pub(crate) async fn start_daemon(
     daemon: &Path,
     port: Option<u16>,
     expected_version: &str,
+    json: bool,
 ) -> Result<u8, Failure> {
     if let LockState::Running(info) = lock(root)? {
-        println!(
+        say!(
+            json,
             "chocofactoryd is already running (pid {}, port {}, version {})",
-            info.pid, info.port, info.version
+            info.pid,
+            info.port,
+            info.version
         );
         skew_warning(&info, expected_version);
         return Ok(0);
@@ -195,9 +213,12 @@ pub(crate) async fn start_daemon(
             if let Ok(LockState::Running(info)) = lock(root)
                 && info.pid != pid
             {
-                println!(
+                say!(
+                    json,
                     "chocofactoryd is already running (pid {}, port {}, version {})",
-                    info.pid, info.port, info.version
+                    info.pid,
+                    info.port,
+                    info.version
                 );
                 skew_warning(&info, expected_version);
                 return Ok(0);
@@ -221,7 +242,8 @@ pub(crate) async fn start_daemon(
             if let Ok(server) = client.server_status(PROBE_TIMEOUT).await
                 && server.pid == pid
             {
-                println!(
+                say!(
+                    json,
                     "chocofactoryd {} started (pid {pid}, port {}); log: {}",
                     server.version,
                     server.port,
@@ -275,7 +297,12 @@ async fn wait_released(root: &Path, pid: u32, timeout: Duration) -> Result<bool,
 
 /// Stops the daemon described by `info`. Exit code 0 stopped, 3 refused, 1
 /// killed after the timeout.
-pub(crate) async fn stop_daemon(root: &Path, info: LockInfo, force: bool) -> Result<u8, Failure> {
+pub(crate) async fn stop_daemon(
+    root: &Path,
+    info: LockInfo,
+    force: bool,
+    json: bool,
+) -> Result<u8, Failure> {
     let client = Client::new(url(&info));
     match client.server_status(STATUS_TIMEOUT).await {
         Ok(server) => {
@@ -303,13 +330,13 @@ pub(crate) async fn stop_daemon(root: &Path, info: LockInfo, force: bool) -> Res
                     text.push('\n');
                     text.push_str(&note);
                 }
-                println!("{text}");
+                say!(json, "{text}");
                 return Ok(EXIT_NOT_RUNNING_OR_REFUSED);
             }
             // Proceeding: queued turns hold no process, so they are not
             // stopped; say where they will be.
             if let Some(note) = render::queued_restart_note(server.queued.len()) {
-                println!("{note}");
+                say!(json, "{note}");
             }
         }
         Err(e) if !force => {
@@ -322,12 +349,13 @@ pub(crate) async fn stop_daemon(root: &Path, info: LockInfo, force: bool) -> Res
     }
     signal(info.pid, libc::SIGTERM)?;
     if wait_released(root, info.pid, STOP_TIMEOUT).await? {
-        println!("chocofactoryd stopped (pid {})", info.pid);
+        say!(json, "chocofactoryd stopped (pid {})", info.pid);
         return Ok(0);
     }
     signal(info.pid, libc::SIGKILL)?;
     let released = wait_released(root, info.pid, Duration::from_secs(5)).await?;
-    println!(
+    say!(
+        json,
         "warning: chocofactoryd did not stop within {}s and was killed; agent processes it started may still be running; their tasks are marked stuck when it next starts",
         STOP_TIMEOUT.as_secs()
     );
@@ -340,23 +368,23 @@ pub(crate) async fn stop_daemon(root: &Path, info: LockInfo, force: bool) -> Res
     Ok(1)
 }
 
-async fn stop(force: bool) -> Result<u8, Failure> {
+async fn stop(force: bool, json: bool) -> Result<u8, Failure> {
     let root = root()?;
     match lock(&root)? {
         LockState::NotRunning { .. } => {
-            println!("chocofactoryd is not running");
+            say!(json, "chocofactoryd is not running");
             Ok(0)
         }
-        LockState::Running(info) => stop_daemon(&root, info, force).await,
+        LockState::Running(info) => stop_daemon(&root, info, force, json).await,
     }
 }
 
-async fn restart(force: bool, port: Option<u16>) -> Result<u8, Failure> {
+async fn restart(force: bool, port: Option<u16>, json: bool) -> Result<u8, Failure> {
     let root = root()?;
     match lock(&root)? {
         LockState::Running(info) => {
             let old_port = info.port;
-            let code = stop_daemon(&root, info, force).await?;
+            let code = stop_daemon(&root, info, force, json).await?;
             if code == EXIT_NOT_RUNNING_OR_REFUSED {
                 return Ok(code);
             }
@@ -367,7 +395,7 @@ async fn restart(force: bool, port: Option<u16>) -> Result<u8, Failure> {
             // Code 1 means stop had to SIGKILL the daemon (the lock is released and a
             // warning was printed). The user still wants a daemon, so start one and
             // keep exit 1 as the warning.
-            let started = start(port.or(Some(old_port))).await?;
+            let started = start(port.or(Some(old_port)), json).await?;
             Ok(if code != 0 && started == 0 {
                 code
             } else {
@@ -375,8 +403,8 @@ async fn restart(force: bool, port: Option<u16>) -> Result<u8, Failure> {
             })
         }
         LockState::NotRunning { .. } => {
-            println!("chocofactoryd was not running; starting it");
-            start(port).await
+            say!(json, "chocofactoryd was not running; starting it");
+            start(port, json).await
         }
     }
 }

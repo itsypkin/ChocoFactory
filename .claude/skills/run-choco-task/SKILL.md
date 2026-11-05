@@ -303,6 +303,13 @@ choco task create --project <p> --workflow coding-task-planned \
   `${CLAUDE_SKILL_DIR}/scripts/tail-events.sh <task-id> [n]` (needs `jq`).
   `choco task events` is oldest first, so `choco task events | tail` shows
   the task's first minutes and looks stale.
+  If you capture `choco --json …` output in a variable, replay it with
+  `printf '%s\n' "$x" | jq`, never `echo "$x"`: zsh's `echo` turns the JSON's
+  `\n` and `\u001b` escapes into raw characters, and `sh`'s (macOS `sh`, dash)
+  turns `\n` and `\\` (not `\u001b`) into them, so a replay can pass by luck
+  and still be unsafe. When it fails, jq says
+  `control characters from U+0000 through U+001F must be escaped`
+  (or `Invalid escape`). The JSON itself is valid.
 
 What each stage does, and what can mislead you while it runs, is in
 [reference/stages.md](reference/stages.md).

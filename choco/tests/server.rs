@@ -66,6 +66,32 @@ impl Env {
         self.choco_at(&target_dir().join("choco"), args)
     }
 
+    /// `choco [--json] <args>`: the command as a script runs it in each mode.
+    fn act(&self, json: bool, args: &[&str]) -> Output {
+        let mut a: Vec<&str> = Vec::new();
+        if json {
+            a.push("--json");
+        }
+        a.extend_from_slice(args);
+        self.choco(&a)
+    }
+
+    /// The log `server start` reports, as it prints it.
+    fn log_path(&self) -> PathBuf {
+        self.root().join("logs").join("chocofactoryd.log")
+    }
+
+    /// The line `server start` prints for the daemon now holding the lock.
+    fn started_line(&self, info: &chocofactory_core::daemon_lock::LockInfo) -> String {
+        format!(
+            "chocofactoryd {} started (pid {}, port {}); log: {}",
+            info.version,
+            info.pid,
+            info.port,
+            self.log_path().display()
+        )
+    }
+
     fn lock(&self) -> LockState {
         read_lock(&self.root()).unwrap()
     }
@@ -152,6 +178,9 @@ fn a_panicking_test_leaves_no_daemon_behind() {
     assert_eq!(support::kill_processes_under(&home), Vec::<i32>::new());
 }
 
+/// What `stop` prints after it had to SIGKILL the daemon.
+const KILLED_WARNING: &str = "warning: chocofactoryd did not stop within 30s and was killed; agent processes it started may still be running; their tasks are marked stuck when it next starts";
+
 fn text(out: &Output) -> String {
     format!(
         "stdout: {}\nstderr: {}",
@@ -166,6 +195,18 @@ fn stdout(out: &Output) -> String {
 
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// The text an action printed. Under `--json` stdout must be empty and the
+/// text is on stderr; otherwise it is on stdout and stderr is empty.
+fn said(label: &str, out: &Output, json: bool) -> String {
+    if json {
+        support::assert_empty_stdout(label, out);
+        stderr(out)
+    } else {
+        assert!(out.stderr.is_empty(), "{label}: {}", text(out));
+        stdout(out)
+    }
 }
 
 /// Where `server status --json` stands on "a turn is in flight", as a wait
@@ -248,6 +289,10 @@ stages:
 
 /// Creates a project and a task on the already-running temp daemon.
 fn create_task(env: &Env, workflow: &str) -> String {
+    create_task_titled(env, workflow, "t")
+}
+
+fn create_task_titled(env: &Env, workflow: &str, title: &str) -> String {
     let wf = env.home.join("wf.yaml");
     std::fs::write(&wf, workflow).unwrap();
     let repo = env.home.join("repo");
@@ -267,7 +312,7 @@ fn create_task(env: &Env, workflow: &str) -> String {
         "--workflow",
         wf.to_str().unwrap(),
         "--title",
-        "t",
+        title,
         "--prompt",
         "go",
     ]);
@@ -351,12 +396,22 @@ fn start_when_running_is_a_noop() {
 
 #[test]
 fn start_fails_when_port_is_taken() {
+    port_taken_scenario(false);
+}
+
+#[test]
+fn start_fails_when_port_is_taken_json() {
+    port_taken_scenario(true);
+}
+
+fn port_taken_scenario(json: bool) {
     let env = Env::new();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port().to_string();
     let began = Instant::now();
-    let out = env.choco(&["server", "start", "--port", &port]);
-    assert!(!out.status.success());
+    let out = env.act(json, &["server", "start", "--port", &port]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("server start (port taken)", &out);
     assert!(began.elapsed() < Duration::from_secs(30));
     assert!(stderr(&out).contains("failed to bind"), "{}", text(&out));
 }
@@ -474,6 +529,15 @@ fn stop_refuses_while_an_agent_turn_runs_and_force_parks_it() {
 /// the restart it starts in its place (it is not parked `stuck`).
 #[test]
 fn queued_turns_do_not_block_stop_and_start_after_the_restart() {
+    queued_turns_scenario(false);
+}
+
+#[test]
+fn queued_turns_do_not_block_stop_and_start_after_the_restart_json() {
+    queued_turns_scenario(true);
+}
+
+fn queued_turns_scenario(json: bool) {
     let probe = Env::new();
     let claude = blocking_claude(&probe.home);
     let env = Env {
@@ -526,21 +590,23 @@ fn queued_turns_do_not_block_stop_and_start_after_the_restart() {
 
     // Stop refuses for the running turn only, and says what happens to the
     // queued one.
-    let out = env.choco(&["server", "stop"]);
+    let out = env.act(json, &["server", "stop"]);
     assert_eq!(out.status.code(), Some(3), "{}", text(&out));
-    let all = stdout(&out);
+    let all = said("server stop (refused, queued)", &out, json);
     assert!(all.contains(&first) && !all.contains(&second), "{all}");
     assert!(
         all.contains("1 queued turn will wait and start in order after the restart."),
         "{all}"
     );
 
-    let out = env.choco(&["server", "stop", "--force"]);
+    let stopped_pid = env.running().pid;
+    let out = env.act(json, &["server", "stop", "--force"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    assert!(
-        stdout(&out).contains("1 queued turn will wait and start in order after the restart."),
-        "{}",
-        text(&out)
+    assert_eq!(
+        said("server stop --force (queued note)", &out, json),
+        format!(
+            "1 queued turn will wait and start in order after the restart.\nchocofactoryd stopped (pid {stopped_pid})\n"
+        )
     );
     env.start();
     // The running turn was parked; the queued one was not, and now runs.
@@ -713,25 +779,38 @@ async fn missing_version_header_warns_once() {
 
 #[test]
 fn unanswering_daemon_is_reported_and_force_kills_it() {
+    unanswering_scenario(false);
+}
+
+#[test]
+fn unanswering_daemon_is_reported_and_force_kills_it_json() {
+    unanswering_scenario(true);
+}
+
+fn unanswering_scenario(json: bool) {
     let env = Env::new();
     let info = env.start();
     let pid = info.pid as i32;
     unsafe { libc::kill(pid, libc::SIGSTOP) };
 
-    let out = env.choco(&["server", "status"]);
+    let out = env.act(json, &["server", "status"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(stderr(&out).contains("isn't answering"), "{}", text(&out));
 
-    let out = env.choco(&["server", "stop"]);
+    let out = env.act(json, &["server", "stop"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("server stop (unanswering)", &out);
     assert!(stderr(&out).contains("stops it anyway"), "{}", text(&out));
     assert_eq!(env.running().pid, info.pid);
 
     // SIGTERM stays pending on a stopped process, so only the SIGKILL
     // fallback after the stop timeout ends it.
-    let out = env.choco(&["server", "stop", "--force"]);
+    let out = env.act(json, &["server", "stop", "--force"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-    assert!(stdout(&out).contains("was killed"), "{}", text(&out));
+    assert_eq!(
+        said("server stop --force (killed)", &out, json),
+        format!("{KILLED_WARNING}\n")
+    );
     wait_for_state("the lock to be released", || match env.lock() {
         LockState::NotRunning { .. } => Ok(()),
         other => Err(format!("lock state {other:?}")),
@@ -740,6 +819,15 @@ fn unanswering_daemon_is_reported_and_force_kills_it() {
 
 #[test]
 fn start_times_out_without_killing_a_daemon_that_never_answers() {
+    start_times_out_scenario(false);
+}
+
+#[test]
+fn start_times_out_without_killing_a_daemon_that_never_answers_json() {
+    start_times_out_scenario(true);
+}
+
+fn start_times_out_scenario(json: bool) {
     use std::os::unix::fs::PermissionsExt;
     let env = Env::new();
     let dir = env.home.join("fake");
@@ -757,7 +845,11 @@ fn start_times_out_without_killing_a_daemon_that_never_answers() {
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let out = env.choco_at(&dir.join("choco"), &["server", "start", "--port", "0"]);
+    let mut args = vec!["server", "start", "--port", "0"];
+    if json {
+        args.insert(0, "--json");
+    }
+    let out = env.choco_at(&dir.join("choco"), &args);
     // The pid comes from the fake's own pidfile; this test started it.
     let pid: i32 = std::fs::read_to_string(&pidfile)
         .unwrap()
@@ -767,6 +859,7 @@ fn start_times_out_without_killing_a_daemon_that_never_answers() {
     let alive = unsafe { libc::kill(pid, 0) } == 0;
     unsafe { libc::kill(pid, libc::SIGKILL) };
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("server start (timeout)", &out);
     assert!(
         stderr(&out).contains("did not answer within 30s"),
         "{}",
@@ -834,14 +927,25 @@ fn start_reports_a_log_it_cannot_inspect() {
 
 #[test]
 fn restart_starts_a_daemon_even_when_stop_had_to_kill_the_old_one() {
+    restart_after_kill_scenario(false);
+}
+
+#[test]
+fn restart_starts_a_daemon_even_when_stop_had_to_kill_the_old_one_json() {
+    restart_after_kill_scenario(true);
+}
+
+fn restart_after_kill_scenario(json: bool) {
     let env = Env::new();
     let info = env.start();
     unsafe { libc::kill(info.pid as i32, libc::SIGSTOP) };
-    let out = env.choco(&["server", "restart", "--force"]);
+    let out = env.act(json, &["server", "restart", "--force"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-    assert!(stdout(&out).contains("was killed"), "{}", text(&out));
-    assert!(stdout(&out).contains(" started (pid "), "{}", text(&out));
     let now = env.running();
+    assert_eq!(
+        said("server restart --force (killed)", &out, json),
+        format!("{KILLED_WARNING}\n{}\n", env.started_line(&now))
+    );
     assert_ne!(now.pid, info.pid);
     assert_eq!(now.port, info.port);
 }
@@ -868,12 +972,26 @@ fn oversized_log_is_rotated() {
 
 #[test]
 fn start_without_a_sibling_daemon_fails() {
+    no_sibling_scenario(false);
+}
+
+#[test]
+fn start_without_a_sibling_daemon_fails_json() {
+    no_sibling_scenario(true);
+}
+
+fn no_sibling_scenario(json: bool) {
     let env = Env::new();
     let lone = env.home.join("lone");
     std::fs::create_dir_all(&lone).unwrap();
     std::fs::copy(target_dir().join("choco"), lone.join("choco")).unwrap();
-    let out = env.choco_at(&lone.join("choco"), &["server", "start", "--port", "0"]);
-    assert!(!out.status.success());
+    let mut args = vec!["server", "start", "--port", "0"];
+    if json {
+        args.insert(0, "--json");
+    }
+    let out = env.choco_at(&lone.join("choco"), &args);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    support::assert_empty_stdout("server start (no sibling)", &out);
     assert!(
         stderr(&out).contains("chocofactoryd not found next to choco"),
         "{}",
@@ -883,6 +1001,15 @@ fn start_without_a_sibling_daemon_fails() {
 
 #[test]
 fn start_that_loses_the_race_reports_the_other_daemon() {
+    race_scenario(false);
+}
+
+#[test]
+fn start_that_loses_the_race_reports_the_other_daemon_json() {
+    race_scenario(true);
+}
+
+fn race_scenario(json: bool) {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
@@ -891,13 +1018,26 @@ fn start_that_loses_the_race_reports_the_other_daemon() {
     let dir = env.home.join("race");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
-    // A fake daemon that exits on its own, as one that lost the lock race would.
+    // A fake daemon that exits as one that lost the lock race would, but only
+    // once the test has published the winner's lock (no sleep to race against).
     let fake = dir.join("chocofactoryd");
-    std::fs::write(&fake, "#!/bin/sh\nsleep 2\nexit 1\n").unwrap();
+    let go = dir.join("go");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nuntil [ -e '{}' ]; do sleep 0.05; done\nexit 1\n",
+            go.display()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+    let mut args = vec!["server", "start", "--port", "0"];
+    if json {
+        args.insert(0, "--json");
+    }
     let child = Command::new(dir.join("choco"))
-        .args(["server", "start", "--port", "0"])
+        .args(&args)
         .env("HOME", &env.home)
         .env("CHOCOFACTORY_CLAUDE_BINARY", &env.claude)
         .env_remove("CHOCO_BASE_URL")
@@ -939,19 +1079,36 @@ fn start_that_loses_the_race_reports_the_other_daemon() {
     )
     .unwrap();
     file.sync_all().unwrap();
+    std::fs::write(&go, "").unwrap();
 
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", text(&out));
-    let so = stdout(&out);
-    assert!(
-        so.contains("already running") && so.contains(&format!("pid {me}")),
-        "{}",
-        text(&out)
+    let running = format!("chocofactoryd is already running (pid {me}, port 59999, version 0.0.0)");
+    let skew = format!(
+        "warning: choco {} is talking to chocofactoryd 0.0.0; run `choco server restart` (or `choco update`)",
+        chocofactory_core::version::VERSION
     );
+    // The warning is always stderr; the message follows the mode.
+    if json {
+        support::assert_empty_stdout("server start (lost the race)", &out);
+        assert_eq!(stderr(&out), format!("{running}\n{skew}\n"));
+    } else {
+        assert_eq!(stdout(&out), format!("{running}\n"));
+        assert_eq!(stderr(&out), format!("{skew}\n"));
+    }
 }
 
 #[test]
 fn restart_does_not_start_when_the_killed_daemon_still_holds_the_lock() {
+    unreleased_lock_scenario(false);
+}
+
+#[test]
+fn restart_does_not_start_when_the_killed_daemon_still_holds_the_lock_json() {
+    unreleased_lock_scenario(true);
+}
+
+fn unreleased_lock_scenario(json: bool) {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
 
@@ -979,11 +1136,15 @@ fn restart_does_not_start_when_the_killed_daemon_still_holds_the_lock() {
     .unwrap();
     file.sync_all().unwrap();
 
-    let out = env.choco(&["server", "restart", "--force"]);
+    let out = env.act(json, &["server", "restart", "--force"]);
     let _ = victim.kill();
     let _ = victim.wait();
 
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    if json {
+        support::assert_empty_stdout("server restart --force (unreleased lock)", &out);
+        assert!(stderr(&out).contains(KILLED_WARNING), "{}", text(&out));
+    }
     assert!(
         stderr(&out).contains("still holds the lock after SIGKILL"),
         "{}",
@@ -1138,4 +1299,385 @@ fn unparseable_server_status_output_fails_the_wait_at_once_naming_the_parse_erro
             && msg.contains("a warning"),
         "{msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #361: under `--json`, stdout carries JSON or nothing. `server start|stop|
+// restart` have no JSON result, so their messages go to stderr, word for
+// word, and the exit codes are unchanged.
+// ---------------------------------------------------------------------------
+
+fn lifecycle_scenario(json: bool) {
+    let env = Env::new();
+    let say = |label: &str, out: &Output| said(label, out, json);
+
+    // restart with nothing running: the note, then the start line.
+    let out = env.act(json, &["server", "restart", "--port", "0"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let first = env.running();
+    assert_eq!(
+        say("server restart (not running)", &out),
+        format!(
+            "chocofactoryd was not running; starting it\n{}\n",
+            env.started_line(&first)
+        )
+    );
+
+    // start while running.
+    let out = env.act(json, &["server", "start"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        say("server start (running)", &out),
+        format!(
+            "chocofactoryd is already running (pid {}, port {}, version {})\n",
+            first.pid, first.port, first.version
+        )
+    );
+
+    // restart while running: stopped, then started on the same port.
+    let out = env.act(json, &["server", "restart"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let second = env.running();
+    assert_ne!(second.pid, first.pid);
+    assert_eq!(second.port, first.port);
+    assert_eq!(
+        say("server restart (running)", &out),
+        format!(
+            "chocofactoryd stopped (pid {})\n{}\n",
+            first.pid,
+            env.started_line(&second)
+        )
+    );
+
+    // stop, then stop again.
+    let out = env.act(json, &["server", "stop"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        say("server stop (running)", &out),
+        format!("chocofactoryd stopped (pid {})\n", second.pid)
+    );
+    let out = env.act(json, &["server", "stop"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        say("server stop (not running)", &out),
+        "chocofactoryd is not running\n"
+    );
+
+    // start from stopped.
+    let out = env.act(json, &["server", "start", "--port", "0"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let third = env.running();
+    assert_eq!(
+        say("server start (stopped)", &out),
+        format!("{}\n", env.started_line(&third))
+    );
+}
+
+#[test]
+fn server_actions_print_their_messages_on_stdout() {
+    lifecycle_scenario(false);
+}
+
+#[test]
+fn server_actions_print_nothing_on_stdout_under_json() {
+    lifecycle_scenario(true);
+}
+
+const HELD_SHELL_WF: &str = r#"
+name: held
+stages:
+  run:
+    kind: shell
+    command: "sleep 600"
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#;
+
+const CTL_TITLE: &str = "title \u{1b}[31mred \u{1b}[0m \u{1}\u{1f} x \u{7f}";
+
+fn cancel_task(env: &Env, id: &str) {
+    let base = format!("http://127.0.0.1:{}", env.running().port);
+    let out = env.choco(&["--json", "--base-url", &base, "task", "cancel", id]);
+    assert!(out.status.success(), "cancel: {}", text(&out));
+    wait_for_state("the cancelled task to leave the in-flight list", || {
+        let out = env.choco(&["--json", "server", "status"]);
+        let v = support::json_stdout("server status", &out);
+        if v["daemon"]["in_flight"]
+            .as_array()
+            .is_some_and(|a| a.is_empty())
+        {
+            Ok(())
+        } else {
+            Err(format!("still in flight: {v}"))
+        }
+    });
+}
+
+/// A real shell stage is in flight: stop and restart refuse (exit 3) without
+/// touching the daemon, in both modes, and the refusal text is the same
+/// bytes on whichever stream the mode picks.
+#[test]
+fn refusal_goes_to_stderr_under_json_and_leaves_the_daemon_running() {
+    let env = Env::new();
+    let info = env.start();
+    let id = create_task(&env, HELD_SHELL_WF);
+    wait_in_flight(&env);
+
+    let mut texts: Vec<(String, String)> = Vec::new();
+    for sub in ["stop", "restart"] {
+        let human = env.act(false, &["server", sub]);
+        let json = env.act(true, &["server", sub]);
+        for (out, mode) in [(&human, false), (&json, true)] {
+            let label = format!("server {sub} (refused, json={mode})");
+            assert_eq!(out.status.code(), Some(3), "{label}: {}", text(out));
+        }
+        let h = said("server stop/restart (human)", &human, false);
+        let j = said("server stop/restart (json)", &json, true);
+        assert!(h.contains(&id) && h.contains("(shell)"), "{h}");
+        assert_eq!(h, j, "the refusal text differs between modes");
+        texts.push((sub.to_string(), j));
+        assert_eq!(env.running().pid, info.pid, "{sub} touched the daemon");
+    }
+    // `stop` and `restart` share the refusal.
+    assert_eq!(texts[0].1, texts[1].1);
+    cancel_task(&env, &id);
+}
+
+#[test]
+fn server_status_json_keeps_a_control_byte_title_intact() {
+    let env = Env::new();
+    env.start();
+    let id = create_task_titled(&env, HELD_SHELL_WF, CTL_TITLE);
+    // Wait on the task id appearing in the output, without parsing it: the
+    // parse is what the assertions below test.
+    wait_for_state("the held task to be in flight", || {
+        let out = env.choco(&["--json", "server", "status"]);
+        if String::from_utf8_lossy(&out.stdout).contains(&format!("\"task_id\":\"{id}\"")) {
+            Ok(())
+        } else {
+            Err(text(&out))
+        }
+    });
+    let out = env.choco(&["--json", "server", "status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let v = support::json_stdout("server status", &out);
+    assert_eq!(v["running"], true);
+    assert_eq!(v["daemon"]["in_flight"][0]["task_id"], id.as_str());
+    assert_eq!(v["daemon"]["in_flight"][0]["title"], CTL_TITLE);
+    cancel_task(&env, &id);
+}
+
+/// Kills a spawned process on drop, so a failed assertion leaks no child.
+struct KillOnDrop(Option<std::process::Child>);
+
+impl KillOnDrop {
+    fn new(child: std::process::Child) -> Self {
+        KillOnDrop(Some(child))
+    }
+
+    fn id(&self) -> u32 {
+        self.0.as_ref().expect("child already finished").id()
+    }
+
+    /// Waits for the child to end and returns what it wrote.
+    fn finish(mut self) -> Output {
+        self.0
+            .take()
+            .expect("child already finished")
+            .wait_with_output()
+            .unwrap()
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn signal_exit(out: &Output) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    out.status.signal()
+}
+
+fn interrupted_start_scenario(json: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let dir = env.home.join("fake");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
+    let pidfile = dir.join("pid");
+    let fake = dir.join("chocofactoryd");
+    // Started, never ready: no lock, no answer.
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 120\n",
+            pidfile.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut args = vec!["server", "start", "--port", "0"];
+    if json {
+        args.insert(0, "--json");
+    }
+    let child = Command::new(dir.join("choco"))
+        .args(&args)
+        .env("HOME", &env.home)
+        .env("RUST_LOG", "error")
+        .env_remove("CHOCO_BASE_URL")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let cli_pid = child.id() as i32;
+    let guard = KillOnDrop::new(child);
+    let daemon_pid: i32 = {
+        let mut seen = None;
+        wait_for_state(
+            "the fake daemon to start",
+            || match std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+            {
+                Some(p) => {
+                    seen = Some(p);
+                    Ok(())
+                }
+                None => Err("no pid yet".to_string()),
+            },
+        );
+        seen.unwrap()
+    };
+    assert_eq!(unsafe { libc::kill(cli_pid, libc::SIGINT) }, 0);
+    let out = guard.finish();
+    // Killed by SIGINT, not a clean exit.
+    assert_eq!(signal_exit(&out), Some(libc::SIGINT), "{}", text(&out));
+    support::assert_empty_stdout("server start (interrupted)", &out);
+    // The detached daemon and the log stay behind, as before; no lock was taken.
+    let alive = unsafe { libc::kill(daemon_pid, 0) } == 0;
+    unsafe { libc::kill(daemon_pid, libc::SIGKILL) };
+    assert!(
+        alive,
+        "interrupting start must not kill the daemon it spawned"
+    );
+    assert!(matches!(env.lock(), LockState::NotRunning { .. }));
+    let log = std::fs::read_to_string(env.log_path()).unwrap();
+    assert!(log.contains("=== choco server start"), "{log}");
+}
+
+#[test]
+fn interrupting_start_leaves_the_same_state_in_both_modes() {
+    interrupted_start_scenario(false);
+}
+
+#[test]
+fn interrupting_start_leaves_the_same_state_under_json() {
+    interrupted_start_scenario(true);
+}
+
+async fn interrupted_stop_scenario(json: bool) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+    let port = status_server().await;
+    let env = Env::new();
+    let receipt = env.home.join("got-sigterm");
+    let ready = env.home.join("handler-installed");
+    let script = env.home.join("owner.sh");
+    // A daemon stand-in that notes SIGTERM and keeps running.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ntrap 'echo got > {}' TERM\necho ready > {}\nwhile :; do sleep 0.1; done\n",
+            receipt.display(),
+            ready.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let owner = KillOnDrop::new(
+        Command::new(&script)
+            .current_dir(&env.home)
+            .spawn()
+            .unwrap(),
+    );
+    let owner_pid = owner.id();
+    // Only after the trap exists does SIGTERM mean "noted" rather than "dead".
+    wait_for_state("the owner to install its SIGTERM handler", || {
+        if ready.exists() {
+            Ok(())
+        } else {
+            Err("handler not installed yet".to_string())
+        }
+    });
+    std::fs::create_dir_all(env.root()).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.root().join("chocofactoryd.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    write!(
+        file,
+        r#"{{"pid":{owner_pid},"port":{port},"version":"0.0.0-test","commit":"c","started_at":"2026-01-01T00:00:00Z","exe":"/x"}}"#,
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+
+    let mut args = vec!["server", "stop"];
+    if json {
+        args.insert(0, "--json");
+    }
+    let cli = KillOnDrop::new(
+        Command::new(target_dir().join("choco"))
+            .args(&args)
+            .env("HOME", &env.home)
+            .env("RUST_LOG", "error")
+            .env_remove("CHOCO_BASE_URL")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let cli_pid = cli.id() as i32;
+    wait_for_state("the owner to receive SIGTERM", || {
+        if receipt.exists() {
+            Ok(())
+        } else {
+            Err("no SIGTERM yet".to_string())
+        }
+    });
+    assert_eq!(unsafe { libc::kill(cli_pid, libc::SIGINT) }, 0);
+    let out = cli.finish();
+    assert_eq!(signal_exit(&out), Some(libc::SIGINT), "{}", text(&out));
+    support::assert_empty_stdout("server stop (interrupted)", &out);
+    // The same owner still holds the lock, and was not SIGKILLed.
+    match env.lock() {
+        LockState::Running(info) => assert_eq!(info.pid, owner_pid),
+        other => panic!("lock should still be held: {other:?}"),
+    }
+    assert_eq!(unsafe { libc::kill(owner_pid as i32, 0) }, 0);
+    drop(file);
+    drop(owner);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupting_stop_leaves_the_owner_in_place() {
+    interrupted_stop_scenario(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupting_stop_leaves_the_owner_in_place_under_json() {
+    interrupted_stop_scenario(true).await;
 }

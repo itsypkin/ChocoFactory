@@ -23,15 +23,15 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::client::Client;
-use crate::server::{Failure, start_daemon, stop_daemon};
+use crate::server::{Failure, say, start_daemon, stop_daemon};
 
 const DEFAULT_RELEASES: &str = "https://github.com/itsypkin/ChocoFactory/releases";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_REFUSED: u8 = 3;
 
-pub async fn run(check: bool, version: Option<String>, force: bool) -> ExitCode {
-    match update(check, version, force).await {
+pub async fn run(check: bool, version: Option<String>, force: bool, json: bool) -> ExitCode {
+    match update(check, version, force, json).await {
         Ok(code) => ExitCode::from(code),
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -221,7 +221,7 @@ fn running_from(dir: &Path, info: &LockInfo) -> bool {
     Path::new(&info.exe).parent().map(canon).as_deref() == Some(dir)
 }
 
-async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Failure> {
+async fn update(check: bool, want: Option<String>, force: bool, json: bool) -> Result<u8, Failure> {
     let root = config_root().ok_or("HOME is not set")?;
     let marker_path = root.join("install.json");
     let exe = canon(&std::env::current_exe().map_err(|e| format!("cannot locate choco: {e}"))?);
@@ -264,7 +264,12 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
 
     let same = new_version == VERSION;
     if check {
-        if same {
+        if json {
+            println!(
+                "{}",
+                json!({"current": VERSION, "latest": new_version, "update_available": !same})
+            );
+        } else if same {
             println!("choco is up to date ({VERSION})");
         } else {
             println!("update available: {VERSION} → {new_version}");
@@ -272,7 +277,7 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
         return Ok(0);
     }
     if same && !force {
-        println!("choco is up to date ({VERSION})");
+        say!(json, "choco is up to date ({VERSION})");
         return Ok(0);
     }
 
@@ -315,12 +320,13 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
                         text.push('\n');
                         text.push_str(&note);
                     }
-                    println!("{text}");
+                    say!(json, "{text}");
                     return Ok(EXIT_REFUSED);
                 }
             }
         } else {
-            println!(
+            say!(
+                json,
                 "note: the running chocofactoryd is {} (not in {}); leaving it alone",
                 info.exe,
                 dir.display()
@@ -342,7 +348,7 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
             && running_from(&dir, &info)
         {
             let port = info.port;
-            let code = stop_daemon(&root, info, true).await?;
+            let code = stop_daemon(&root, info, true, json).await?;
             if code != 0
                 && matches!(
                     read_lock(&root).map_err(|e| format!(
@@ -370,7 +376,7 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
     // The daemon now on disk reports `new_version`, unless nothing was replaced.
     let daemon_version = installed_daemon_version(&replaced, &new_version);
     let restart_result = match old_port {
-        Some(port) => start_daemon(&root, &new_daemon, Some(port), daemon_version)
+        Some(port) => start_daemon(&root, &new_daemon, Some(port), daemon_version, json)
             .await
             .map(|_| ()),
         None => Ok(()),
@@ -391,7 +397,7 @@ async fn update(check: bool, want: Option<String>, force: bool) -> Result<u8, Fa
     if let Some(n) = restart_note {
         return Err(format!("updated, but {n}"));
     }
-    println!("updated {VERSION} → {new_version}");
+    say!(json, "updated {VERSION} → {new_version}");
     Ok(0)
 }
 

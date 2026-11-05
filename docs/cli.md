@@ -9,10 +9,24 @@ choco [--base-url <url>] [--json] <COMMAND>
 ```
 
 Commands print a human-readable summary by default. Pass `--json` to get
-the daemon's raw JSON instead — `choco` is meant to be both human-scriptable
-and agent-callable, and `--json` is the half you pipe into `jq` or parse
-from an agent. On failure it prints `error: <message>` to stderr and exits
-`1`.
+machine-readable output instead — `choco` is meant to be both
+human-scriptable and agent-callable, and `--json` is the half you pipe into
+`jq` or parse from an agent. Under `--json`, stdout carries JSON or nothing:
+one JSON value per command (`task status --until` and `--live` print one JSON
+object per line instead). Two groups of commands have no result to report:
+`task send` and `task cancel` print nothing at all, on stdout or stderr;
+`server start|stop|restart` and `update` without `--check` print nothing on
+stdout, and their usual messages go to stderr, word for word. Exit codes are
+unchanged. `choco update --check --json` prints
+`{"current","latest","update_available"}`. `--help` and `--version` are not
+JSON, and `dashboard` refuses `--json`. On failure it prints `error:
+<message>` to stderr, leaves stdout empty, and exits `1` (a watch that gives
+up exits with its own code, and a refused `server stop`, `server restart` or
+`update` exits `3`). There are two exceptions to "empty stdout on failure".
+`server status` with no daemon running prints
+`{"running":false,…}` on stdout and exits `3`. A watch (`task status --until`
+or `--live`) keeps the lines it already printed on stdout if a later poll
+fails, so a script reading it should check the exit code as well.
 
 `choco --version` (or `-V`) prints the CLI's version without contacting the
 daemon. `chocofactoryd --version` prints the daemon's version and exits
@@ -50,6 +64,13 @@ choco server status                # version, pid, port, uptime, open tasks, in-
 - **Exit codes:** `0` ok; `1` error; `3` means "not running" for `status`, and
   "refused" for `stop`/`restart`. `restart` also exits `1` when the old daemon
   had to be killed after 30 s; a new one is started only if the old one's lock was released.
+- **With `--json`:** `start`, `stop` and `restart` print nothing on stdout. The
+  messages (`chocofactoryd … started`, `stopped`, `is not running`, a refusal
+  listing in-flight work, the kill warning) go to stderr, and the exit codes
+  above are unchanged. `choco --json server start && choco --json server status
+  | jq .running` prints `true`. `server status --json` is one JSON object:
+  `.running` says whether a daemon holds the lock, and the daemon's own
+  fields, including `.daemon.in_flight[]`, are nested under `.daemon`.
 - **Stop and running tasks:** agent turns and shell steps are killed and the
   tasks marked `stuck` (`choco task retry <id>` continues them; an agent turn
   resumes its session). Tasks waiting on a poll or a human are not affected.
@@ -102,7 +123,13 @@ choco update [--check] [--version X.Y.Z] [--force]
 
 Works for copies installed by `install.sh` (it refuses, with instructions, for
 source builds and cargo installs). `--check` only reports whether an update is
-available. A daemon running from the install directory is stopped and restarted
+available; with `--json` it prints one object, `{"current": "0.3.4", "latest":
+"0.3.5", "update_available": true}`, where `update_available` is true when the
+two versions differ (`--version` chooses which release is checked, and
+`--force` does not make a check install anything). Without `--check`, `--json`
+makes `update` print nothing on stdout: its messages (`choco is up to date`,
+`updated …`, the daemon stop and start lines, the refusal, the note about a
+daemon from another directory) go to stderr. A daemon running from the install directory is stopped and restarted
 on the same port with the new binary; if an agent turn or shell step is in
 flight, `update` refuses (exit 3) unless `--force`, which parks that work like
 `choco server stop --force` (`choco task retry` continues it). A daemon running
@@ -559,7 +586,8 @@ queued        7d22e1a8-…  internal_review (2nd in line, server)  add-x
 
 ## Scripting it
 
-`--json` turns any command into machine-readable output:
+`--json` makes commands that return a result print JSON on stdout, and
+leaves stdout empty for those that have none (see [Global flags](#global-flags-json-and-errors)):
 
 ```
 $ choco --json task list | jq -r '.[0].id'
@@ -570,7 +598,36 @@ internal_review
 ```
 
 `task send` returns 202 with no body, so under `--json` it prints nothing
-at all rather than a message that would break a pipe.
+at all rather than a message that would break a pipe; `task cancel` does the
+same. `server start|stop|restart` and `update` (without `--check`) print
+nothing on stdout but still send their messages to stderr.
+`task status --until/--live` prints one JSON object per line.
+
+To keep the output in a variable, pipe it straight to `jq`, or save it and
+replay it with `printf`, never with `echo`:
+
+```
+$ page=$(choco --json task events <id>)
+$ printf '%s\n' "$page" | jq '.events | length'     # right
+$ echo "$page" | jq '.events | length'               # wrong: depends on the shell
+```
+
+Where the replay corrupts the JSON, jq fails with a parse error, usually
+`control characters from U+0000 through U+001F must be escaped`
+(or `Invalid escape`, depending on which sequence jq meets first).
+
+`choco` writes valid JSON: control characters in task text (a colour escape
+in a command's output, say) leave it as escapes: `\u001b` for ESC, and the
+short forms `\n` and `\t` for newline and tab. DEL (0x7f) is not escaped; JSON
+allows it raw. What breaks is the replay, not `choco`: `echo` rewrites
+backslash sequences, and which ones depends on the shell. zsh's `echo` turns
+both `\n` and `\u001b` into raw characters; `sh`'s (macOS `sh`, dash) turns `\n`
+and `\\` into raw characters but leaves `\uXXXX` alone, and bash's leaves them
+all. So under `sh` a captured page whose text has an ESC but no `\n` or `\\`
+can pass through `echo` unharmed. That is luck, not safety: the same command
+fails on the next page that has a newline in a string. Use `printf '%s\n'` (or
+write the output to a file). Don't work around it with a permissive parser or
+by rewriting the escapes.
 
 ## Watching a task
 
