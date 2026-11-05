@@ -12227,6 +12227,68 @@ async fn a_turn_whose_process_lingers_after_reporting_parks_the_task() {
     assert!(!line.contains("kept running"), "{line}");
 }
 
+/// The owner's round, item 1, end to end: the first table the grace cleanup's
+/// sweep reads holds only the leader, and the next reveals an owned escaped
+/// job. The extra round that waits for the leader still kills the job, but it
+/// does not change the grace result: the task advances to its terminal stage
+/// and closes, exactly as it did when the loop stopped at the first table.
+#[tokio::test]
+async fn a_job_found_while_the_sweep_waits_for_the_leader_does_not_park_the_task() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let leader_file = dir.join("leader.pid");
+    let job_file = dir.join("job.pid");
+    let binary = script_binary(
+        &dir,
+        crate::test_support::escaped_job_turn_steps(&leader_file, &job_file),
+    );
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(&binary));
+    let events_notify = Arc::new(Notify::new());
+    let session_manager = SessionManager::with_proc_reader(
+        pool.clone(),
+        Registry::single(adapter),
+        chrono::Duration::hours(1),
+        Arc::clone(&events_notify),
+        fast_turn_timers(),
+        crate::test_support::late_discovery_reader(leader_file),
+    );
+    let engine = WorkflowEngine::new(
+        pool.clone(),
+        session_manager,
+        PathBuf::from("."),
+        None,
+        events_notify,
+    );
+
+    engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "closed").await;
+
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(task.status, "closed");
+    assert_eq!(task.stuck_reason, None);
+    let trail = stage_trail(&pool, &task_id).await;
+    assert_eq!(
+        trail.last().map(|(stage, _)| stage.as_str()),
+        Some("finished"),
+        "{trail:?}"
+    );
+    let job: u32 = std::fs::read_to_string(&job_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    crate::test_support::wait_until(&format!("escaped job {job} to be killed"), || async {
+        if !process_alive(job) {
+            Ok(())
+        } else {
+            Err(format!("pid {job} still alive"))
+        }
+    })
+    .await;
+}
+
 /// A log sink one test owns. The subscriber is installed for this thread
 /// only (`#[tokio::test]` runs on it), so parallel tests cannot see each
 /// other's lines.

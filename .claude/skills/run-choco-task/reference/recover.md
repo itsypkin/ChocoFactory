@@ -94,9 +94,9 @@ and `choco task list --status stuck` finds every stuck task.
   that check found nothing left, which is the normal case of only the agent's
   group being alive. A failed read supplies no such check: `leftovers_unchecked`
   means nothing confirms the processes are gone, whatever else is said, and with
-  every read failing it is the only cleanup note. The turn may have been
-  writing to the worktree until then, so check `git status` there before
-  retrying.
+  every read failing it is the only `leftovers_*` note (the `lingered` note is
+  written too). The turn may have been writing to the worktree until then, so
+  check `git status` there before retrying.
 - `claude_settings_rejected`: the reason says Claude Code did not apply role
   `<role>`'s `claude_settings` (it ignores the whole settings when one value is
   invalid). Choco normally sees this before the agent gets its prompt, so

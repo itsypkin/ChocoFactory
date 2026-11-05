@@ -1096,7 +1096,9 @@ async fn drain_session(
                         session_id,
                         grace_ms = turn_timers.grace.as_millis() as u64,
                         cause = after,
-                        "process still running after stdin was closed; tried to kill its process group"
+                        group = %describe_group_kill(&report.group),
+                        "grace period over; tried to signal the agent's process group and sweep what \
+                         the turn started; this does not say a process was seen running"
                     );
                     let message = lingered_message(&report.group, turn_timers.grace.as_secs_f32(), after);
                     append_session_note(pool, session_id, "lingered", &message, events_notify)
@@ -1710,6 +1712,11 @@ struct LeftoverTracker {
     kind: SessionKind,
     reader: ProcReader,
     state: std::sync::Mutex<TrackerState>,
+    /// Test hook: runs at the start of every [`Self::state`] call, before the
+    /// lock is taken, so a test can look at the tracker where another writer
+    /// could run between two acquisitions.
+    #[cfg(test)]
+    before_lock: std::sync::OnceLock<Box<dyn Fn(&std::sync::Mutex<TrackerState>) + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -1725,6 +1732,11 @@ struct TrackerState {
     /// The start time of each pid in `survivors`, which together form that
     /// process's identity. Always holds exactly the pids in `survivors`.
     survivor_starts: HashMap<i32, u64>,
+    /// The start time of each pid in `killed`, taken from the scan that
+    /// selected it. With the pid it is the signalled process's identity, so
+    /// a final observation can tell that it is still alive even when the
+    /// selector no longer owns it. Holds exactly the pids in `killed`.
+    killed_starts: HashMap<i32, u64>,
     /// Every failed process-table read of the turn. Sticky: a later read
     /// that works cannot recover what an earlier one did not show.
     scan_failures: Vec<String>,
@@ -1839,6 +1851,23 @@ impl TrackerState {
                 self.add_survivor(pid, entry.comm.clone(), entry.start);
             }
         }
+        // A process SIGKILL was delivered to is a survivor if this scan still
+        // has that identity alive, even when the selector no longer owns it
+        // (it dropped its marker, say): the signal is not a death.
+        let still_alive: Vec<(i32, String, u64)> = self
+            .killed
+            .iter()
+            .filter_map(|(pid, comm)| {
+                let start = *self.killed_starts.get(pid)?;
+                table
+                    .iter()
+                    .any(|e| e.pid == *pid && e.start == start && !e.zombie)
+                    .then(|| (*pid, comm.clone(), start))
+            })
+            .collect();
+        for (pid, comm, start) in still_alive {
+            self.add_survivor(pid, comm, start);
+        }
     }
 
     /// Records a failed signal to the agent's group, once, for the site that
@@ -1865,10 +1894,16 @@ impl LeftoverTracker {
             kind,
             reader,
             state: Default::default(),
+            #[cfg(test)]
+            before_lock: Default::default(),
         }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, TrackerState> {
+        #[cfg(test)]
+        if let Some(hook) = self.before_lock.get() {
+            hook(&self.state);
+        }
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1912,8 +1947,11 @@ impl LeftoverTracker {
     /// Scans with the marker, SIGKILLs everything owned by pid, and repeats
     /// (bounded) to catch children forked between a scan and its kill.
     /// Returns how many processes it delivered SIGKILL to by pid and newly
-    /// listed in `killed`. A delivered signal is not a death, so the count
-    /// is not a count of deaths.
+    /// listed in `killed`, in the rounds up to the one where nothing owned was
+    /// left to signal or watch (what the loop always did). A process found
+    /// and signalled in the rounds that only wait for the leader or group is
+    /// listed in `killed` but not counted. A delivered signal is not a death,
+    /// so the count is not a count of deaths.
     ///
     /// The scan that ends the loop is the *final observation*: it is the one
     /// thing that says what is still running. It covers the agent, its
@@ -1933,6 +1971,13 @@ impl LeftoverTracker {
         let (daemon_sid, uid) = unsafe { (libc::getsid(0), libc::geteuid()) };
         let mut failed = std::collections::HashSet::new();
         let mut killed_here = 0usize;
+        // Set once a round has had nothing owned left to signal or watch: the
+        // point where this loop used to stop. The rounds after it exist only
+        // to observe a leader or group member that is still exiting. They
+        // still signal an owned process they find, but those signals are not
+        // counted in the returned total, which `lingered_decision` reads: more
+        // looking must not change what the grace cleanup means for the turn.
+        let mut past_original_stop = false;
         for round in 0..=SWEEP_ROUNDS {
             let table = match self.scan(true).await {
                 Ok(table) => table,
@@ -1999,6 +2044,9 @@ impl LeftoverTracker {
                 self.state().settle_survivors(&table, &live);
                 break;
             }
+            if watched.is_empty() && to_kill.is_empty() {
+                past_original_stop = true;
+            }
             // Pid reuse between the scan and this kill is not guarded beyond
             // the scan: both kernels allocate pids sequentially, so it would
             // take a full wraparound inside this window. Accepted cost.
@@ -2010,7 +2058,10 @@ impl LeftoverTracker {
                         let mut state = self.state();
                         if !state.killed.iter().any(|(p, _)| *p == pid) {
                             state.killed.push((pid, comm(pid)));
-                            killed_here += 1;
+                            state.killed_starts.insert(pid, start(pid));
+                            if !past_original_stop {
+                                killed_here += 1;
+                            }
                         }
                     }
                     proc_table::PidKill::Gone => {}
@@ -2198,6 +2249,7 @@ async fn write_leftover_notes(
     let (killed, survivors, failures, group_errors) = {
         let mut state = tracker.state();
         state.survivor_starts.clear();
+        state.killed_starts.clear();
         (
             std::mem::take(&mut state.killed),
             std::mem::take(&mut state.survivors),
@@ -7245,6 +7297,236 @@ mod tests {
             state.survivor_starts
         );
         assert!(state.recorded.contains(&(77, 7)));
+    }
+
+    /// The owner's round, item 2: SIGKILL was delivered by pid to X while the
+    /// selector owned it (marker present on sweep 1); on sweep 2 X has lost
+    /// its marker, so nothing owns it, but it is still in the table with the
+    /// same start. The signal is not a death: X is a survivor and not in the
+    /// killed clause.
+    #[tokio::test]
+    async fn a_signalled_process_the_selector_no_longer_owns_is_a_survivor_while_live() {
+        const X_START: u64 = 400;
+        let mut x = Sleeper::spawn(None, true);
+        let xp = x.pid();
+        let reader = scripted_reader(move |call| match call {
+            Some(1) => vec![marked(sleep_entry(xp, 1, xp, xp, X_START))],
+            _ => vec![sleep_entry(xp, 1, xp, xp, X_START)],
+        });
+        let tracker = sweep_tracker(reader);
+        let returned = tracker.sweep(NO_AGENT, None, "end of turn").await;
+        assert_eq!(returned, 1);
+        assert_eq!(x.reap_signal(), Some(libc::SIGKILL));
+        {
+            let state = tracker.state();
+            assert_eq!(
+                pids_of(&state.survivors),
+                vec![xp],
+                "a signalled pid still live by pid and start time is a survivor"
+            );
+            assert_eq!(state.survivor_starts, HashMap::from([(xp, X_START)]));
+            assert_eq!(
+                pids_of(&state.killed),
+                vec![xp],
+                "the signal is still recorded"
+            );
+        }
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(
+            killed_note,
+            Some(format!("1 still running at the last check: {xp} (sleep)"))
+        );
+        assert_eq!(unchecked, None);
+    }
+
+    /// The same sequence, but the later scan shows a different start at that
+    /// pid (the number was reused): the earlier process is gone, so the
+    /// signalled pid is not a survivor.
+    #[tokio::test]
+    async fn a_signalled_pid_reused_by_another_process_is_not_a_survivor() {
+        let mut x = Sleeper::spawn(None, true);
+        let xp = x.pid();
+        let reader = scripted_reader(move |call| match call {
+            Some(1) => vec![marked(sleep_entry(xp, 1, xp, xp, 400))],
+            _ => vec![sleep_entry(xp, 1, xp, xp, 999)],
+        });
+        let tracker = sweep_tracker(reader);
+        tracker.sweep(NO_AGENT, None, "end of turn").await;
+        assert_eq!(x.reap_signal(), Some(libc::SIGKILL));
+        {
+            let state = tracker.state();
+            assert!(state.survivors.is_empty(), "{:?}", state.survivors);
+        }
+        let (killed_note, _) = written_notes(&tracker).await;
+        assert_eq!(
+            killed_note,
+            Some(format!(
+                "killed 1 process(es) the turn left running: {xp} (sleep)"
+            ))
+        );
+    }
+
+    /// The owner's round, item 4: a contender that looks at the tracker at
+    /// the start of every lock acquisition, where another writer could run,
+    /// never sees a partly consumed state. Every finding (killed, survivors
+    /// and both identity maps, failed scans, group errors) leaves together.
+    #[tokio::test]
+    async fn the_notes_consume_every_finding_under_one_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let tracker = sweep_tracker(Arc::new(|_| Ok(Vec::new())));
+        {
+            let mut state = tracker.state();
+            state.killed.push((10, "k".into()));
+            state.killed_starts.insert(10, 100);
+            state.add_survivor(20, "s".into(), 200);
+            state.scan_failures.push("end of turn: read failed".into());
+            state
+                .group_kill_errors
+                .push("end of turn: signal failed".into());
+        }
+        let looks = Arc::new(AtomicUsize::new(0));
+        let torn = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (seen_looks, seen_torn) = (Arc::clone(&looks), Arc::clone(&torn));
+        let hook: Box<dyn Fn(&std::sync::Mutex<TrackerState>) + Send + Sync> =
+            Box::new(move |state| {
+                seen_looks.fetch_add(1, SeqCst);
+                let state = state.lock().unwrap();
+                let present = [
+                    !state.killed.is_empty(),
+                    !state.killed_starts.is_empty(),
+                    !state.survivors.is_empty(),
+                    !state.survivor_starts.is_empty(),
+                    !state.scan_failures.is_empty(),
+                    !state.group_kill_errors.is_empty(),
+                ];
+                if present.iter().any(|p| *p) && !present.iter().all(|p| *p) {
+                    seen_torn.lock().unwrap().push(format!("{present:?}"));
+                }
+            });
+        assert!(tracker.before_lock.set(hook).is_ok());
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert!(looks.load(SeqCst) >= 1, "the contender never looked");
+        assert_eq!(
+            *torn.lock().unwrap(),
+            Vec::<String>::new(),
+            "a contender saw some findings consumed and others not"
+        );
+        assert!(killed_note.is_some() && unchecked.is_some());
+        let state = tracker.state.lock().unwrap();
+        assert!(
+            state.killed.is_empty()
+                && state.killed_starts.is_empty()
+                && state.survivors.is_empty()
+                && state.survivor_starts.is_empty()
+                && state.scan_failures.is_empty()
+                && state.group_kill_errors.is_empty()
+        );
+    }
+
+    /// The owner's round, item 1, at session level: the first sweep table
+    /// holds only the leader, the next reveals an owned escaped job. The extra
+    /// round that waits for the leader still kills the job, but the grace
+    /// result is what it was when the loop stopped at the first table: nothing
+    /// lingered, and the turn ends as it did.
+    #[tokio::test]
+    async fn a_job_found_by_the_rounds_that_wait_for_the_leader_does_not_make_the_turn_linger() {
+        let dir = TempDir::new();
+        let leader_file = dir.0.join("leader.pid");
+        let job_file = dir.0.join("job.pid");
+        let binary = script_binary(
+            &dir.0,
+            crate::test_support::escaped_job_turn_steps(&leader_file, &job_file),
+        );
+        let reader = crate::test_support::late_discovery_reader(leader_file);
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, None);
+        assert_eq!(run.status, SessionStatus::Idle);
+        let notes = session_notes(&pool, &session_id).await;
+        assert!(!notes.contains(&"lingered".to_string()), "{notes:?}");
+        let job = read_pid_when_written(&job_file).await;
+        wait_until_gone(job).await;
+    }
+
+    /// The owner's round, item 3: the real grace caller, with a leader that
+    /// has already exited (an unreaped zombie), a pre-kill read that fails and
+    /// an empty final check. Nothing was seen running, so the warning claims
+    /// an attempt and an unavailable check, never a running process. The turn
+    /// still ends Lingered, as it always did.
+    #[tokio::test]
+    async fn the_grace_warning_does_not_claim_a_process_was_seen_running() {
+        struct KillOnDrop(PathBuf);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if let Some(pid) = std::fs::read_to_string(&self.0)
+                    .ok()
+                    .and_then(|t| t.trim().parse::<i32>().ok())
+                {
+                    // SAFETY: only signals the test's own stray sleep.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+        let (log, _guard) = capture_logs();
+        let dir = TempDir::new();
+        let stray_file = dir.0.join("stray.pid");
+        let _stray = KillOnDrop(stray_file.clone());
+        // A job in its own session that holds the output pipe open, so the
+        // stream does not end when the agent exits and the grace timer fires.
+        let spawn = format!(
+            "python3 -c 'import subprocess; p = subprocess.Popen([\"sleep\", \"30\"], \
+             start_new_session=True); open(\"{}\", \"w\").write(str(p.pid))'",
+            stray_file.display()
+        );
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "run", "command": spawn},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "exit"},
+            ]),
+        );
+        let reader: crate::proc_table::ProcReader = Arc::new(|marker| match marker {
+            None => Err(std::io::Error::other("injected pre-kill failure")),
+            Some(_) => Ok(Vec::new()),
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(
+            (run.status, run.end_reason),
+            (SessionStatus::Exited, Some(SessionEndReason::Lingered))
+        );
+        let text = log.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("grace period over"))
+            .unwrap_or_else(|| panic!("no grace warning in: {text}"));
+        assert!(line.contains("WARN"), "{line}");
+        assert!(
+            line.contains(
+                "tried to signal the agent's process group and sweep what the turn started; \
+                 this does not say a process was seen running"
+            ),
+            "{line}"
+        );
+        assert!(
+            !text.contains("process still running after stdin was closed"),
+            "{text}"
+        );
     }
 
     // --- a table that cannot be read ----------------------------------------

@@ -252,16 +252,21 @@ when it ends *after* the agent called `report_outcome`:
   group and the processes choco can prove belong to the turn. A process it
   signalled that the last check no longer sees is "killed"; one the last
   check still sees is "still running at the last check", never "killed", and
-  appears in that clause only. When the group signal was delivered, the note
-  names only processes outside the agent's own process group that were
-  signalled, so a turn whose only live processes were in that group, and are
+  appears in that clause only. When the group signal was delivered, the
+  "killed" clause names only processes outside the agent's own process group
+  that were signalled (the group's members are the group signal's), though the
+  leader and group members the last check still sees appear in the "still
+  running" clause. A turn whose only live processes were in that group, and are
   gone by the last check, has no `leftovers_killed` note. A failed group
   signal is added to a note that lists a survivor, but it does not make the
   group a survivor by itself: the last check decides. A `leftovers_unchecked`
   note means choco could not read the process table at least once, so nothing
   confirms the turn's processes are gone, whatever the other notes say, and
   the "killed" wording is replaced by "sent SIGKILL ... could not confirm".
-  None of this changes how the turn ended or whether the task advances. A
+  None of this changes how the turn ended or whether the task advances: the
+  extra waiting for a leader or group member that is still exiting does not
+  count towards whether the turn lingered, which is decided by what the check
+  before the kill saw and what the first rounds of the sweep had to signal. A
   process counts as the turn's if it
   descends from the agent, was seen descending from it earlier, carries
   the turn's marker in its environment, or shares a session with one that
