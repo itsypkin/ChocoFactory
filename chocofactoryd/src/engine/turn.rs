@@ -1182,12 +1182,13 @@ impl WorkflowEngine {
                         tracing::warn!(
                             task_id,
                             session_id,
-                            "session's process kept running after its turn ended and was killed; not auto-advancing"
+                            "session's process kept running after its turn ended and choco tried to kill it; not auto-advancing"
                         );
                         break TurnEnd::Incomplete(format!(
-                            "stage '{stage_name}': the agent process kept running after \
-                             its turn ended and was killed; work it started may be \
-                             incomplete"
+                            "stage '{stage_name}': the agent's process group or something it \
+                             started kept running after its turn ended and choco tried to \
+                             kill it; its session notes say what is still running; work it \
+                             started may be incomplete"
                         ));
                     }
                     Ok(Some(run)) if run.status == SessionStatus::Exited => {

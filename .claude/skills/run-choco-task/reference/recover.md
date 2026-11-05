@@ -61,12 +61,14 @@ and `choco task list --status stuck` finds every stuck task.
   different CLI.
 - `no_report`: the turn never called `report_outcome`, was nudged (or, with
   a background job still running, waited 60 minutes in total across all its
-  waits; its `session_note` names the jobs), and was closed. The processes the
-  turn started outside the agent's own process group, such as that job, were
-  killed when it closed; the `leftovers_killed` `session_note` lists them by
-  pid, and a
-  `leftovers_unchecked` note means the process table could not be read, so
-  look for strays yourself. There is no outcome to route on, so read its last
+  waits; its `session_note` names the jobs), and was closed. choco sent SIGKILL
+  to the processes the turn started outside the agent's own process group,
+  such as that job, and read the process table again; the `leftovers_killed`
+  `session_note` lists by pid the ones the last check no longer saw
+  ("killed") and, separately, the ones it still saw ("still running at the
+  last check"). A `leftovers_unchecked` note means the process table could not
+  be read at least once, so nothing confirms they are gone: look for strays
+  yourself. There is no outcome to route on, so read its last
   events before retrying. Blind spots, where a stray can survive: on macOS, a process the OS
   hides the environment of (`/bin/sleep`, `/bin/zsh`) that left the agent's
   tree early and shares no session with anything else of the turn's; on any
@@ -74,12 +76,17 @@ and `choco task list --status stuck` finds every stuck task.
   tree and its session before choco saw it; on Linux, a process whose
   environment is unreadable (setuid, or non-dumpable). `docs/workflows.md`
   has the details.
-- `lingered`: the agent process outlived its reported turn, or something the
-  turn started was still alive, and it was killed. The `leftovers_killed`
-  `session_note`, when there is one, names what was still running outside the
-  agent's own process group. A `lingered` run with no such note means only the
-  agent's group was alive and killing it was enough; nothing was skipped. The turn may have been writing to the worktree
-  until then, so check `git status` there before retrying.
+- `lingered`: the agent's process group outlived its reported turn, or
+  something the turn started was still alive, and choco sent it SIGKILL. The
+  `lingered` note says what was seen and whether the group could be signalled;
+  it does not say anything died. The `leftovers_killed` `session_note`, when
+  there is one, names what choco signalled outside the agent's own process
+  group and what the last check still saw running. A `lingered` run with no
+  such note means the last check found nothing left, which is the normal case
+  of only the agent's group being alive. A `leftovers_unchecked` note means
+  nothing confirms the processes are gone, whatever else is said. The turn may
+  have been writing to the worktree until then, so check `git status` there
+  before retrying.
 - `claude_settings_rejected`: the reason says Claude Code did not apply role
   `<role>`'s `claude_settings` (it ignores the whole settings when one value is
   invalid). Choco normally sees this before the agent gets its prompt, so

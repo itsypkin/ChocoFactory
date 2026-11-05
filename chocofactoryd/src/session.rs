@@ -1082,7 +1082,9 @@ async fn drain_session(
                 if let Some(report) = &report {
                     turn.lingered = lingered_after(report);
                 }
-                if turn.lingered {
+                if turn.lingered
+                    && let Some(report) = &report
+                {
                     let after = match turn.grace_cause {
                         Some(GraceCause::Reaped) => "the idle reaper closed its stalled turn",
                         Some(GraceCause::NoReport) => "it was closed for never reporting",
@@ -1096,25 +1098,7 @@ async fn drain_session(
                         cause = after,
                         "process still running after stdin was closed; tried to kill its process group"
                     );
-                    let grace_s = turn_timers.grace.as_secs_f32();
-                    let message = match report.as_ref().map(|r| &r.group) {
-                        Some(GroupKill::Killed(_)) => format!(
-                            "the agent process was still running {grace_s:.1}s after {after}; \
-                             killed its process group"
-                        ),
-                        Some(GroupKill::Failed(err)) => format!(
-                            "the agent process was still running {grace_s:.1}s after {after}; \
-                             could not kill its process group: {err}"
-                        ),
-                        Some(GroupKill::Unknown { .. }) => format!(
-                            "{grace_s:.1}s after {after}, could not check whether the agent \
-                             process was still running; sent the kill to its process group"
-                        ),
-                        _ => format!(
-                            "the agent process had exited {grace_s:.1}s after {after}, but \
-                             processes it started were still running; killed them"
-                        ),
-                    };
+                    let message = lingered_message(&report.group, turn_timers.grace.as_secs_f32(), after);
                     append_session_note(pool, session_id, "lingered", &message, events_notify)
                         .await;
                 } else if report.is_none() {
@@ -1164,6 +1148,12 @@ async fn drain_session(
         if kind == SessionKind::SingleShot
             && let Some(group) = *pgid
         {
+            // The report is dropped on purpose: the tracker holds everything
+            // a note needs from it. A group kill that signals live members
+            // here adds no note of its own. The leader is often still
+            // exiting at this point, and a note for members that were only
+            // signalled would bring back the false note (and the flake) that
+            // the sweep's same-group exemption exists to prevent.
             kill_and_sweep(&tracker, group, "end of turn").await;
         }
         *pgid = None;
@@ -1726,18 +1716,30 @@ struct LeftoverTracker {
 struct TrackerState {
     /// Identities of processes proven to descend from the agent.
     recorded: std::collections::HashSet<Identity>,
+    /// Processes the sweeps delivered SIGKILL to by pid. A delivered signal
+    /// is not a death: a pid can be here and in `survivors` at once.
     killed: Vec<(i32, String)>,
+    /// Processes the last completed check still saw alive (or a failed kill
+    /// left), each once per pid.
     survivors: Vec<(i32, String)>,
+    /// The start time of each pid in `survivors`, which together form that
+    /// process's identity. Always holds exactly the pids in `survivors`.
+    survivor_starts: HashMap<i32, u64>,
+    /// Every failed process-table read of the turn. Sticky: a later read
+    /// that works cannot recover what an earlier one did not show.
     scan_failures: Vec<String>,
+    /// Failed signals to the agent's group, as `"{site}: {error}"`.
+    group_kill_errors: Vec<String>,
 }
 
 /// What [`kill_and_sweep`] did at one site.
 struct KillReport {
     group: GroupKill,
-    /// Live processes the sweeps of this call killed. When the group kill
-    /// succeeded, the agent's group members are not counted: they are the
-    /// group kill's. When it failed, the sweeps kill them by pid and they are
-    /// counted.
+    /// Processes the sweeps of this call delivered SIGKILL to by pid, newly
+    /// listed in the turn's `killed`. A delivered signal is not a confirmed
+    /// death. When the group kill was delivered, the agent's group members
+    /// are not counted: they are the group kill's. When it was not, the
+    /// sweeps signal them by pid and they are counted.
     sweep_killed: usize,
 }
 
@@ -1750,7 +1752,7 @@ fn lingered_decision(group: &GroupKill, sweep_killed: usize) -> bool {
 
 fn describe_group_kill(group: &GroupKill) -> String {
     match group {
-        GroupKill::Killed(n) => format!("killed {n} live member(s)"),
+        GroupKill::Killed(n) => format!("signalled {n} live member(s)"),
         GroupKill::NothingAlive => "nothing alive".to_string(),
         GroupKill::Failed(err) => format!("failed: {err}"),
         GroupKill::Unknown {
@@ -1764,13 +1766,95 @@ fn lingered_after(report: &KillReport) -> bool {
     lingered_decision(&report.group, report.sweep_killed)
 }
 
+/// The `lingered` note for a grace-site kill: what the pre-kill scan saw, and
+/// what was done about it. Claims an attempt, never a death.
+fn lingered_message(group: &GroupKill, grace_s: f32, after: &str) -> String {
+    match group {
+        GroupKill::Killed(n) => format!(
+            "{n} process(es) of the agent's process group were still running {grace_s:.1}s \
+             after {after}; sent SIGKILL to the group"
+        ),
+        GroupKill::Failed(err) => format!(
+            "processes of the agent's process group were still running {grace_s:.1}s after \
+             {after}; could not signal the group: {err}"
+        ),
+        GroupKill::Unknown {
+            signal_result: Ok(()),
+            ..
+        } => format!(
+            "{grace_s:.1}s after {after}, could not check whether the agent's process group \
+             was still running; sent SIGKILL to the group"
+        ),
+        GroupKill::Unknown {
+            signal_result: Err(err),
+            ..
+        } => format!(
+            "{grace_s:.1}s after {after}, could not check whether the agent's process group \
+             was still running, and could not signal the group: {err}"
+        ),
+        GroupKill::NothingAlive => format!(
+            "the agent's process group had exited {grace_s:.1}s after {after}, but processes \
+             it started were still running; sent them SIGKILL"
+        ),
+    }
+}
+
 impl TrackerState {
-    /// Records a process that could not be killed, once per pid.
-    fn add_survivor(&mut self, pid: i32, comm: String) {
-        let listed = |list: &[(i32, String)]| list.iter().any(|(p, _)| *p == pid);
-        if !listed(&self.survivors) && !listed(&self.killed) {
+    /// Records a process a check still found alive, once per pid. A signal
+    /// sent earlier does not excuse it: `killed` lists signals the sweep
+    /// delivered and `survivors` lists what a check still saw, so one pid can
+    /// be in both. `write_leftover_notes` then names it as still running and
+    /// never as killed.
+    fn add_survivor(&mut self, pid: i32, comm: String, start: u64) {
+        if !self.survivors.iter().any(|(p, _)| *p == pid) {
             self.survivors.push((pid, comm));
+            self.survivor_starts.insert(pid, start);
         }
+    }
+
+    /// Applies one completed final observation. `table` is the scan that
+    /// ended the sweep and `live` the pids in it the check calls alive.
+    ///
+    /// A survivor listed earlier stays only while `table` still has a live
+    /// (non-zombie) entry with the same pid *and* start time: that is the
+    /// same process, even if the selector no longer owns it. A pid that is
+    /// gone, a zombie, or reused by another process clears it. Then every
+    /// pid in `live` is added with this scan's command and start. Vector and
+    /// map change together, under the caller's one lock.
+    fn settle_survivors(&mut self, table: &[ProcEntry], live: &[i32]) {
+        let starts = std::mem::take(&mut self.survivor_starts);
+        self.survivors.retain(|(pid, _)| {
+            starts.get(pid).is_some_and(|start| {
+                table
+                    .iter()
+                    .any(|e| e.pid == *pid && e.start == *start && !e.zombie)
+            })
+        });
+        self.survivor_starts = starts
+            .into_iter()
+            .filter(|(pid, _)| self.survivors.iter().any(|(p, _)| p == pid))
+            .collect();
+        for &pid in live {
+            if let Some(entry) = table.iter().find(|e| e.pid == pid) {
+                self.add_survivor(pid, entry.comm.clone(), entry.start);
+            }
+        }
+    }
+
+    /// Records a failed signal to the agent's group, once, for the site that
+    /// sent it: `Failed`, or `Unknown` whose signal failed for any reason but
+    /// `ESRCH` (the group was already gone). Records an error only: whether
+    /// anything survived is for the final observation to say.
+    fn record_group_kill_error(&mut self, site: &str, group: &GroupKill) {
+        let err = match group {
+            GroupKill::Failed(err) => err,
+            GroupKill::Unknown {
+                signal_result: Err(err),
+                ..
+            } if err.raw_os_error() != Some(libc::ESRCH) => err,
+            GroupKill::Killed(_) | GroupKill::NothingAlive | GroupKill::Unknown { .. } => return,
+        };
+        self.group_kill_errors.push(format!("{site}: {err}"));
     }
 }
 
@@ -1827,13 +1911,23 @@ impl LeftoverTracker {
 
     /// Scans with the marker, SIGKILLs everything owned by pid, and repeats
     /// (bounded) to catch children forked between a scan and its kill.
-    /// Returns how many live processes it killed.
+    /// Returns how many processes it delivered SIGKILL to by pid and newly
+    /// listed in `killed`. A delivered signal is not a death, so the count
+    /// is not a count of deaths.
+    ///
+    /// The scan that ends the loop is the *final observation*: it is the one
+    /// thing that says what is still running. It covers the agent, its
+    /// process group (`group_live`, observed but never signalled by pid) and
+    /// every owned process, including one whose kill failed. It settles the
+    /// turn's survivors (see [`TrackerState::settle_survivors`]), also when
+    /// it finds nothing. A scan that fails is not an observation: it records
+    /// a failure and leaves earlier survivors as they were.
     ///
     /// `spare_group` is the process group whose SIGKILL `killpg` already
     /// delivered (see [`kill_and_sweep`]). An owned entry in that group is
-    /// watched, not killed and not recorded as killed: it still keeps the
-    /// loop going, and if it is still in the table at the last round it is
-    /// listed as a survivor. `None` kills every owned entry.
+    /// watched, not signalled and not recorded as killed: it still keeps the
+    /// loop going, and if it is still in the table at the final observation
+    /// it is listed as a survivor. `None` signals every owned entry.
     async fn sweep(&self, agent: i32, spare_group: Option<i32>, site: &str) -> usize {
         // SAFETY: both only read process state.
         let (daemon_sid, uid) = unsafe { (libc::getsid(0), libc::geteuid()) };
@@ -1848,7 +1942,7 @@ impl LeftoverTracker {
                 }
             };
             let recorded = self.state().recorded.clone();
-            let owned: Vec<i32> = proc_table::owned_pids(
+            let all_owned = proc_table::owned_pids(
                 &table,
                 &OwnershipInput {
                     agent: Some(agent),
@@ -1857,10 +1951,19 @@ impl LeftoverTracker {
                     daemon_sid,
                     uid,
                 },
-            )
-            .into_iter()
-            .filter(|pid| !failed.contains(pid))
-            .collect();
+            );
+            // The agent and the members of its group that are still alive.
+            // Only observed and waited for, never added to `to_kill`.
+            let group_live: Vec<i32> = table
+                .iter()
+                .filter(|e| (e.pid == agent || e.pgid == agent) && !e.zombie)
+                .map(|e| e.pid)
+                .collect();
+            let owned: Vec<i32> = all_owned
+                .iter()
+                .copied()
+                .filter(|pid| !failed.contains(pid))
+                .collect();
             let in_spared_group = |pid: i32| {
                 spare_group
                     .is_some_and(|group| table.iter().any(|e| e.pid == pid && e.pgid == group))
@@ -1874,19 +1977,26 @@ impl LeftoverTracker {
                     .map(|e| e.comm.clone())
                     .unwrap_or_default()
             };
-            if watched.is_empty() && to_kill.is_empty() {
-                break;
-            }
-            if round == SWEEP_ROUNDS {
-                tracing::warn!(
-                    site,
-                    count = watched.len() + to_kill.len(),
-                    "processes the turn started survived the sweep"
-                );
-                let mut state = self.state();
-                for pid in watched.into_iter().chain(to_kill) {
-                    state.add_survivor(pid, comm(pid));
+            let start = |pid: i32| table.iter().find(|e| e.pid == pid).map_or(0, |e| e.start);
+            let group_waiting = group_live.iter().any(|pid| !failed.contains(pid));
+            if (watched.is_empty() && to_kill.is_empty() && !group_waiting) || round == SWEEP_ROUNDS
+            {
+                // The final observation: everything owned (a failed kill
+                // included) and everything alive in the agent's group.
+                let mut live = all_owned;
+                for pid in group_live {
+                    if !live.contains(&pid) {
+                        live.push(pid);
+                    }
                 }
+                if round == SWEEP_ROUNDS && !live.is_empty() {
+                    tracing::warn!(
+                        site,
+                        count = live.len(),
+                        "still running at the sweep's last check"
+                    );
+                }
+                self.state().settle_survivors(&table, &live);
                 break;
             }
             // Pid reuse between the scan and this kill is not guarded beyond
@@ -1895,9 +2005,9 @@ impl LeftoverTracker {
             for pid in to_kill {
                 match proc_table::kill_pid(pid) {
                     proc_table::PidKill::Killed => {
+                        // Delivered, not confirmed: only a later final
+                        // observation can clear a survivor.
                         let mut state = self.state();
-                        // Killed now: no longer a survivor of an earlier site.
-                        state.survivors.retain(|(p, _)| *p != pid);
                         if !state.killed.iter().any(|(p, _)| *p == pid) {
                             state.killed.push((pid, comm(pid)));
                             killed_here += 1;
@@ -1907,7 +2017,7 @@ impl LeftoverTracker {
                     proc_table::PidKill::Failed(err) => {
                         tracing::error!(site, pid, %err, "could not kill a leftover process");
                         failed.insert(pid);
-                        self.state().add_survivor(pid, comm(pid));
+                        self.state().add_survivor(pid, comm(pid), start(pid));
                     }
                 }
             }
@@ -1916,8 +2026,8 @@ impl LeftoverTracker {
         if killed_here > 0 {
             tracing::warn!(
                 site,
-                killed = killed_here,
-                "killed processes left behind by the turn"
+                signalled = killed_here,
+                "sent SIGKILL to processes left behind by the turn"
             );
         }
         killed_here
@@ -1933,33 +2043,43 @@ impl LeftoverTracker {
 /// sound) until the sweep is over. The one scan before the kill serves both
 /// as the record and as the classification of the kill.
 ///
+/// A signal is not a death. After the kill, the sweep reads the process
+/// table again, and what it still sees alive is what the turn's notes name
+/// as "still running at the last check": the agent, its process group and the
+/// processes the selector ([`proc_table::owned_pids`]) can prove belong to
+/// the turn. A failed group signal is recorded as an error, but it does not
+/// by itself make the group a survivor; the final observation decides. No
+/// task outcome depends on any of this.
+///
 /// # What the sweep leaves to the group kill
 ///
 /// When `killpg` returned 0, SIGKILL was delivered to every member of the
 /// agent's group, and it cannot be caught or ignored. A member may still be in
-/// the sweep's table, not yet a zombie, with the signal pending; killing it
-/// again by pid would succeed (`kill` also returns 0 for an unreaped zombie)
-/// and the turn would get a false `leftovers_killed` note for a process the
-/// group kill had already killed. So the sweep spares owned entries whose
-/// `pgid` is the agent's: it does not kill them, does not record them as
-/// killed, but still watches them, and lists one still in the table at the
-/// last round as a survivor. A process that left the group (`setpgid`,
-/// `setsid`) has another pgid and is killed and recorded as before.
+/// the sweep's table, not yet a zombie, with the signal pending; signalling it
+/// again by pid would succeed (`kill` also returns 0 for an unreaped
+/// zombie) and the turn would get a false `leftovers_killed` note for a
+/// process the group kill had already signalled. So the sweep spares owned
+/// entries whose `pgid` is the agent's: it does not signal them, does not
+/// record them as killed, but still watches them, and lists one still in the
+/// table at the final observation as a survivor. A process that left the
+/// group (`setpgid`, `setsid`) has another pgid and is signalled and recorded
+/// as before.
 ///
-/// When `killpg` returned an error (`GroupKill::Failed`, `Unknown` with an
+/// When `killpg` did not deliver (`GroupKill::Failed`, `Unknown` with an
 /// `Err` signal result, `NothingAlive` from `ESRCH`/`EPERM`, or the early
-/// returns where it is never called) nothing is spared: the sweep kills
+/// returns where it is never called) nothing is spared: the sweep signals
 /// same-group entries by pid, as it did before this rule.
 ///
 /// One tracker sees up to three sites in a turn (cancel, shutdown, settings
 /// or grace, then always the end of the turn). A member spared at one site is
 /// gone by the next, or a zombie (never owned), or still alive, in which case
 /// `killpg` returns 0 again and it is spared again; it is never recorded as
-/// killed later.
+/// killed later. The tail's observation can clear a survivor an earlier site
+/// listed.
 ///
 /// Accepted blind spots, in both of which the process is spared, watched, and
-/// listed as "could not be killed and may still be running" if still alive at
-/// the last round, so the note shows it instead of killing it:
+/// listed as "still running at the last check" if still alive at the final
+/// observation, so the note shows it instead of signalling it:
 /// - (a) A process that enters the agent's group after `killpg` returned.
 ///   Only `setpgid` from a process in the daemon's session can do that.
 /// - (b) A child whose fork completes while `killpg` is walking the group may
@@ -1984,17 +2104,85 @@ async fn kill_and_sweep(tracker: &LeftoverTracker, pgid: u32, site: &str) -> Kil
         Err(err) => tracker.note_scan_failure(site, err),
     }
     let (group, delivered) = crate::shell::kill_group_with(pgid, live);
-    if let GroupKill::Failed(err) = &group {
-        tracker
-            .state()
-            .add_survivor(agent, format!("process group ({err})"));
-    }
+    tracker.state().record_group_kill_error(site, &group);
     let sweep_killed = tracker.sweep(agent, delivered.then_some(agent), site).await;
-    tracing::debug!(site, group = %describe_group_kill(&group), delivered, sweep_killed, "killed the agent's group and swept");
+    tracing::debug!(site, group = %describe_group_kill(&group), delivered, sweep_killed, "tried to signal the agent's group and swept");
     KillReport {
         group,
         sweep_killed,
     }
+}
+
+/// The text of the `leftovers_killed` note, or `None` when there is nothing
+/// to say, and of the `leftovers_unchecked` note, from what a turn's cleanup
+/// recorded.
+///
+/// A pid in both `killed` and `survivors` is named once, as still running.
+/// Every list is sorted by pid. Group-kill errors appear only beside a
+/// survivor or a failed scan: on their own they do not say anything was left
+/// running.
+fn leftover_note_texts(
+    killed: &[(i32, String)],
+    survivors: &[(i32, String)],
+    failures: &[String],
+    group_errors: &[String],
+) -> (Option<String>, Option<String>) {
+    let list = |items: &mut Vec<&(i32, String)>| {
+        items.sort_by_key(|(pid, _)| *pid);
+        items
+            .iter()
+            .map(|(pid, comm)| format!("{pid} ({comm})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let group_failed = || {
+        format!(
+            "the kill of the agent's process group failed: {}",
+            group_errors.join("; ")
+        )
+    };
+    let mut killed_only: Vec<&(i32, String)> = killed
+        .iter()
+        .filter(|(pid, _)| !survivors.iter().any(|(p, _)| p == pid))
+        .collect();
+    let mut still_running: Vec<&(i32, String)> = survivors.iter().collect();
+    let mut parts = Vec::new();
+    if !killed_only.is_empty() {
+        let n = killed_only.len();
+        let list = list(&mut killed_only);
+        parts.push(if failures.is_empty() {
+            format!("killed {n} process(es) the turn left running: {list}")
+        } else {
+            format!(
+                "sent SIGKILL to {n} process(es) the turn left running, but could not confirm \
+                 they are gone: {list}"
+            )
+        });
+    }
+    if !still_running.is_empty() {
+        parts.push(format!(
+            "{} still running at the last check: {}",
+            still_running.len(),
+            list(&mut still_running)
+        ));
+        if !group_errors.is_empty() {
+            parts.push(group_failed());
+        }
+    }
+    let killed_note = (!parts.is_empty()).then(|| parts.join("; "));
+    let unchecked_note = (!failures.is_empty()).then(|| {
+        let mut message = format!(
+            "the process table could not be read, so nothing confirms the turn's processes \
+             are gone: {}",
+            failures.join("; ")
+        );
+        if !group_errors.is_empty() {
+            message.push_str("; ");
+            message.push_str(&group_failed());
+        }
+        message
+    });
+    (killed_note, unchecked_note)
 }
 
 /// Writes the `leftovers_killed` and `leftovers_unchecked` notes, once, at the
@@ -2005,38 +2193,29 @@ async fn write_leftover_notes(
     tracker: &LeftoverTracker,
     events_notify: &Notify,
 ) {
-    let (killed, survivors, failures) = {
+    // One lock for everything consumed, so the survivors and their identities
+    // leave together.
+    let (killed, survivors, failures, group_errors) = {
         let mut state = tracker.state();
+        state.survivor_starts.clear();
         (
             std::mem::take(&mut state.killed),
             std::mem::take(&mut state.survivors),
             std::mem::take(&mut state.scan_failures),
+            std::mem::take(&mut state.group_kill_errors),
         )
     };
-    let list = |items: &[(i32, String)]| {
-        items
-            .iter()
-            .map(|(pid, comm)| format!("{pid} ({comm})"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if !killed.is_empty() || !survivors.is_empty() {
-        let mut parts = Vec::new();
-        if !killed.is_empty() {
-            parts.push(format!(
-                "killed {} process(es) the turn left running: {}",
-                killed.len(),
-                list(&killed)
-            ));
-        }
-        if !survivors.is_empty() {
-            parts.push(format!(
-                "{} could not be killed and may still be running: {}",
-                survivors.len(),
-                list(&survivors)
-            ));
-        }
-        let message = parts.join("; ");
+    if !survivors.is_empty() || !failures.is_empty() {
+        tracing::warn!(
+            session_id,
+            still_running = survivors.len(),
+            failed_scans = failures.len(),
+            "the turn's cleanup is not verified; how the turn ended is unchanged"
+        );
+    }
+    let (killed_note, unchecked_note) =
+        leftover_note_texts(&killed, &survivors, &failures, &group_errors);
+    if let Some(message) = killed_note {
         append_session_note(
             pool,
             session_id,
@@ -2046,16 +2225,12 @@ async fn write_leftover_notes(
         )
         .await;
     }
-    if !failures.is_empty() {
+    if let Some(message) = unchecked_note {
         append_session_note(
             pool,
             session_id,
             "leftovers_unchecked",
-            &format!(
-                "the process table could not be read, so what the turn left running could not be \
-                 checked (the agent's process group was still killed): {}",
-                failures.join("; ")
-            ),
+            &message,
             events_notify,
         )
         .await;
@@ -5799,18 +5974,25 @@ mod tests {
             Some(reader),
         )
         .await;
-        wait_until_final(&pool, &session_id).await;
+        let run = wait_until_final(&pool, &session_id).await;
+        // The survivor changes neither how the turn ended nor its status.
+        assert_eq!(run.end_reason, None);
+        assert_eq!(run.status, SessionStatus::Idle);
         let message = note_message(&pool, &session_id, "leftovers_killed")
             .await
             .expect("a leftovers_killed note");
-        assert!(message.contains("could not be killed"), "{message}");
+        assert!(
+            message.contains("still running at the last check"),
+            "{message}"
+        );
         assert!(message.contains(&format!("{GHOST} (ghost)")), "{message}");
         // Listed once, though several sites swept.
         assert_eq!(message.matches("(ghost)").count(), 1, "{message}");
     }
 
     /// A leftover the daemon is not permitted to kill (EPERM) is listed as a
-    /// survivor, once, by the per-pid failure path.
+    /// survivor, once: the failed kill lists it at once, and the final
+    /// observation, which still sees it, keeps it.
     #[tokio::test]
     async fn a_leftover_that_cannot_be_killed_is_listed_as_a_survivor() {
         // SAFETY: only reads ids and probes pids with signal 0.
@@ -5864,12 +6046,17 @@ mod tests {
         let message = note_message(&pool, &session_id, "leftovers_killed")
             .await
             .expect("a leftovers_killed note");
-        assert!(message.starts_with("1 could not be killed"), "{message}");
+        assert!(
+            message.starts_with("1 still running at the last check"),
+            "{message}"
+        );
         assert_eq!(message.matches("(foreign)").count(), 1, "{message}");
     }
 
     /// A live agent group the daemon may not signal (EPERM) is listed as a
-    /// survivor by `kill_and_sweep`'s group-failure path.
+    /// survivor because the final observation still sees its leader alive.
+    /// The failed group signal alone lists nothing (see
+    /// `a_failed_group_signal_alone_lists_no_survivor`).
     #[tokio::test]
     async fn a_group_that_cannot_be_killed_is_listed_as_a_survivor() {
         // SAFETY: only reads the uid and probes pids with signal 0.
@@ -6161,7 +6348,8 @@ mod tests {
     }
 
     /// T2: `killpg` fails (EPERM). A same-group process is then killed by pid
-    /// and recorded, and the agent's group is a survivor.
+    /// and recorded, and the leader, still in every table, is a survivor
+    /// through the final observation.
     #[tokio::test]
     async fn a_failed_group_kill_does_not_spare_the_groups_members() {
         // SAFETY: only reads the uid and probes pids with signal 0.
@@ -6289,6 +6477,1261 @@ mod tests {
         assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
         let message = note_message(&pool, &session_id, "no_report").await.unwrap();
         assert!(message.contains("a total per turn"), "{message}");
+    }
+
+    // --- what the last check saw: records, not verdicts ---------------------
+
+    type ScanResult = std::io::Result<Vec<crate::proc_table::ProcEntry>>;
+
+    /// Like [`scripted_reader`], but a scan may fail.
+    fn fallible_reader(
+        table: impl Fn(Option<usize>) -> ScanResult + Send + Sync + 'static,
+    ) -> crate::proc_table::ProcReader {
+        let sweeps = std::sync::atomic::AtomicUsize::new(0);
+        Arc::new(move |marker| {
+            let call = marker.map(|_| sweeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
+            table(call)
+        })
+    }
+
+    /// A reader keyed by how many scans of any kind came before.
+    fn counting_reader(
+        table: impl Fn(usize) -> ScanResult + Send + Sync + 'static,
+    ) -> crate::proc_table::ProcReader {
+        let scans = std::sync::atomic::AtomicUsize::new(0);
+        Arc::new(move |_| table(scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst)))
+    }
+
+    /// The phase a test is in, and how many scans it has seen in that phase.
+    #[derive(Default)]
+    struct Phase {
+        phase: std::sync::atomic::AtomicUsize,
+        scans: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Phase {
+        fn next(&self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.phase.fetch_add(1, SeqCst);
+            self.scans.store(0, SeqCst);
+        }
+    }
+
+    /// A reader whose answer is a function of `(phase, scan number in phase)`.
+    fn phased_reader(
+        table: impl Fn(usize, usize) -> ScanResult + Send + Sync + 'static,
+    ) -> (crate::proc_table::ProcReader, Arc<Phase>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let phase = Arc::new(Phase::default());
+        let seen = Arc::clone(&phase);
+        let reader: crate::proc_table::ProcReader = Arc::new(move |_| {
+            let scan = seen.scans.fetch_add(1, SeqCst);
+            table(seen.phase.load(SeqCst), scan)
+        });
+        (reader, phase)
+    }
+
+    fn marked(mut entry: crate::proc_table::ProcEntry) -> crate::proc_table::ProcEntry {
+        entry.marker = crate::proc_table::MarkerStatus::Present;
+        entry
+    }
+
+    fn daemon_ids() -> (i32, i32) {
+        // SAFETY: only reads the process's own session id.
+        (std::process::id() as i32, unsafe { libc::getsid(0) })
+    }
+
+    /// Writes the tracker's notes to a fresh session and returns the
+    /// `leftovers_killed` and `leftovers_unchecked` messages.
+    async fn written_notes(tracker: &LeftoverTracker) -> (Option<String>, Option<String>) {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        write_leftover_notes(&pool, &session_id, tracker, &Notify::new()).await;
+        (
+            note_message(&pool, &session_id, "leftovers_killed").await,
+            note_message(&pool, &session_id, "leftovers_unchecked").await,
+        )
+    }
+
+    fn sorted(mut pids: Vec<i32>) -> Vec<i32> {
+        pids.sort_unstable();
+        pids
+    }
+
+    /// Survivors and their identities cover the same pids.
+    fn assert_paired(state: &TrackerState) {
+        let mut listed = pids_of(&state.survivors);
+        listed.sort_unstable();
+        let mut with_start: Vec<i32> = state.survivor_starts.keys().copied().collect();
+        with_start.sort_unstable();
+        assert_eq!(listed, with_start, "survivors and survivor_starts disagree");
+    }
+
+    /// T1: a delivered group kill, an escaped job, and an unrelated process
+    /// in one turn. The group's members and the unowned process are never
+    /// signalled by pid; what the last check still sees is named as running.
+    #[tokio::test]
+    async fn a_mixed_turn_names_what_the_last_check_saw_and_signals_only_what_it_owns() {
+        let (daemon, daemon_sid) = daemon_ids();
+        let leader = Sleeper::spawn(None, false);
+        let a = leader.pid();
+        let (g1, g2) = (
+            Sleeper::spawn(Some(a), false),
+            Sleeper::spawn(Some(a), false),
+        );
+        let (mut e1, mut e2) = (Sleeper::spawn(None, true), Sleeper::spawn(None, true));
+        let mut u = Sleeper::spawn(None, true);
+        let (g1p, g2p, e1p, e2p, up) = (g1.pid(), g2.pid(), e1.pid(), e2.pid(), u.pid());
+        let reader = scripted_reader(move |call| {
+            let mut table = vec![
+                sleep_entry(g2p, a, a, daemon_sid, 300),
+                sleep_entry(e1p, a, e1p, e1p, 400),
+                sleep_entry(up, 1, up, up, 600),
+            ];
+            // From sweep scan 2 on, A, G1 and E2 are gone.
+            if call.is_none_or(|n| n < 2) {
+                table.extend([
+                    sleep_entry(a, daemon, a, daemon_sid, 100),
+                    sleep_entry(g1p, a, a, daemon_sid, 200),
+                    sleep_entry(e2p, a, e2p, e2p, 500),
+                ]);
+            }
+            table
+        });
+        let tracker = sweep_tracker(reader);
+        kill_and_sweep(&tracker, a as u32, "test").await;
+        let (killed, survivors) = {
+            let state = tracker.state();
+            assert_paired(&state);
+            (pids_of(&state.killed), pids_of(&state.survivors))
+        };
+        assert!(u.is_running(), "U is not the turn's and is never signalled");
+        assert!(!killed.contains(&g1p), "G1 is the group kill's: {killed:?}");
+        assert!(survivors.contains(&e1p), "E1 is a survivor: {survivors:?}");
+        assert!(!killed.contains(&g2p), "G2 is the group kill's: {killed:?}");
+        assert_eq!(sorted(killed), sorted(vec![e1p, e2p]));
+        assert_eq!(sorted(survivors), sorted(vec![g2p, e1p]));
+        assert_eq!(e1.reap_signal(), Some(libc::SIGKILL));
+        assert_eq!(e2.reap_signal(), Some(libc::SIGKILL));
+        let (low, high) = (g2p.min(e1p), g2p.max(e1p));
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(
+            killed_note.as_deref(),
+            Some(
+                format!(
+                    "killed 1 process(es) the turn left running: {e2p} (sleep); 2 still running \
+                     at the last check: {low} (sleep), {high} (sleep)"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(unchecked, None);
+    }
+
+    /// T1b: no group signal was delivered (`spare_group` is `None`), and a
+    /// same-group process the selector does not own is only observed.
+    #[tokio::test]
+    async fn an_unowned_group_member_is_listed_but_never_signalled() {
+        let (_, daemon_sid) = daemon_ids();
+        let leader = Sleeper::spawn(None, false);
+        let a = leader.pid();
+        let mut n = Sleeper::spawn(Some(a), false);
+        let np = n.pid();
+        let reader = scripted_reader(move |_| vec![sleep_entry(np, 1, a, daemon_sid, 200)]);
+        let tracker = sweep_tracker(reader);
+        let returned = tracker.sweep(a, None, "test").await;
+        assert!(n.is_running(), "N is not owned, so it is never signalled");
+        let state = tracker.state();
+        assert_paired(&state);
+        assert_eq!(pids_of(&state.survivors), vec![np]);
+        assert!(state.killed.is_empty(), "{:?}", state.killed);
+        assert_eq!(returned, 0);
+    }
+
+    /// What a delivered group kill and the tables after it leave behind.
+    struct AfterGroupKill {
+        a: i32,
+        n: i32,
+        survivors: Vec<(i32, String)>,
+        killed: Vec<(i32, String)>,
+        note: Option<String>,
+    }
+
+    /// Runs `kill_and_sweep` on a real leader `a` with a real same-group
+    /// member `n`; `table(call, a, n)` is what the reader shows (`None` for
+    /// the scan before the kill, `Some(k)` for the k-th sweep scan).
+    async fn after_a_delivered_group_kill(
+        table: impl Fn(Option<usize>, i32, i32) -> Vec<crate::proc_table::ProcEntry>
+        + Send
+        + Sync
+        + 'static,
+    ) -> AfterGroupKill {
+        let leader = Sleeper::spawn(None, false);
+        let a = leader.pid();
+        let member = Sleeper::spawn(Some(a), false);
+        let n = member.pid();
+        let tracker = sweep_tracker(scripted_reader(move |call| table(call, a, n)));
+        let report = kill_and_sweep(&tracker, a as u32, "test").await;
+        assert!(
+            matches!(report.group, GroupKill::Killed(_)),
+            "{}",
+            describe_group_kill(&report.group)
+        );
+        let (survivors, killed) = {
+            let state = tracker.state();
+            assert_paired(&state);
+            (state.survivors.clone(), state.killed.clone())
+        };
+        let (note, _) = written_notes(&tracker).await;
+        AfterGroupKill {
+            a,
+            n,
+            survivors,
+            killed,
+            note,
+        }
+    }
+
+    fn leader_row(a: i32, pgid: i32) -> crate::proc_table::ProcEntry {
+        let (daemon, daemon_sid) = daemon_ids();
+        sleep_entry(a, daemon, pgid, daemon_sid, 100)
+    }
+
+    /// T2(a): the leader stays in the table after the group kill.
+    #[tokio::test]
+    async fn a_leader_still_in_the_table_after_the_group_kill_is_still_running() {
+        let r = after_a_delivered_group_kill(|_, a, _| vec![leader_row(a, a)]).await;
+        assert_eq!(pids_of(&r.survivors), vec![r.a], "shape (a)");
+        assert!(r.killed.is_empty(), "shape (a): {:?}", r.killed);
+        assert_eq!(
+            r.note,
+            Some(format!(
+                "1 still running at the last check: {} (sleep)",
+                r.a
+            ))
+        );
+    }
+
+    /// T2(b): the leader stays but outside its group; only its pid matches.
+    #[tokio::test]
+    async fn a_leader_that_left_its_group_is_still_observed_by_pid() {
+        let (daemon, _) = daemon_ids();
+        let r = after_a_delivered_group_kill(move |call, a, _| {
+            vec![leader_row(a, if call.is_some() { daemon } else { a })]
+        })
+        .await;
+        assert_eq!(pids_of(&r.survivors), vec![r.a], "shape (b)");
+        assert!(r.killed.is_empty(), "shape (b): {:?}", r.killed);
+        assert_eq!(
+            r.note,
+            Some(format!(
+                "1 still running at the last check: {} (sleep)",
+                r.a
+            ))
+        );
+    }
+
+    /// T2(c): only an unowned member of the group stays.
+    #[tokio::test]
+    async fn an_unowned_group_member_still_in_the_table_is_still_running() {
+        let (_, daemon_sid) = daemon_ids();
+        let r = after_a_delivered_group_kill(move |call, a, n| {
+            let member = sleep_entry(n, 1, a, daemon_sid, 200);
+            match call {
+                None => vec![leader_row(a, a), member],
+                Some(_) => vec![member],
+            }
+        })
+        .await;
+        assert_eq!(pids_of(&r.survivors), vec![r.n], "shape (c)");
+        assert!(r.killed.is_empty(), "shape (c): {:?}", r.killed);
+        assert_eq!(
+            r.note,
+            Some(format!(
+                "1 still running at the last check: {} (sleep)",
+                r.n
+            ))
+        );
+    }
+
+    /// T2(d): the leader leaves at the second sweep scan.
+    #[tokio::test]
+    async fn a_leader_that_leaves_by_the_second_check_is_not_listed() {
+        let r = after_a_delivered_group_kill(|call, a, _| match call {
+            None | Some(1) => vec![leader_row(a, a)],
+            Some(_) => Vec::new(),
+        })
+        .await;
+        assert!(r.survivors.is_empty(), "shape (d): {:?}", r.survivors);
+        assert!(r.killed.is_empty(), "shape (d): {:?}", r.killed);
+        assert_eq!(r.note, None, "shape (d)");
+    }
+
+    /// T2(e): only a zombie leader row remains.
+    #[tokio::test]
+    async fn a_zombie_leader_row_is_not_listed() {
+        let r = after_a_delivered_group_kill(|call, a, _| {
+            let mut row = leader_row(a, a);
+            row.zombie = call.is_some();
+            vec![row]
+        })
+        .await;
+        assert!(r.survivors.is_empty(), "shape (e): {:?}", r.survivors);
+        assert_eq!(r.note, None, "shape (e)");
+    }
+
+    // --- one tracker, several sites ------------------------------------------
+
+    /// An agent pid no table lists, so only `spare_group` and ownership matter.
+    const NO_AGENT: i32 = 99_999_990;
+    const X_START: u64 = 777;
+
+    /// X is a real process the first site lists as a survivor: marker-only
+    /// ownership (ppid 1, not a descendant), watched in its own spared
+    /// group. `later(x, scan)` is what the reader shows once a test calls
+    /// `Phase::next`.
+    async fn x_listed_at_a_first_site(
+        later: impl Fn(i32, usize) -> ScanResult + Send + Sync + 'static,
+    ) -> (Sleeper, LeftoverTracker, Arc<Phase>) {
+        let (_, daemon_sid) = daemon_ids();
+        let x = Sleeper::spawn(None, false);
+        let xp = x.pid();
+        let (reader, phase) = phased_reader(move |phase, scan| match phase {
+            0 => Ok(vec![marked(sleep_entry(xp, 1, xp, daemon_sid, X_START))]),
+            _ => later(xp, scan),
+        });
+        let tracker = sweep_tracker(reader);
+        tracker.sweep(NO_AGENT, Some(xp), "site 1").await;
+        {
+            let state = tracker.state();
+            assert_eq!(state.survivors, vec![(xp, "sleep".to_string())]);
+            assert_eq!(state.survivor_starts, HashMap::from([(xp, X_START)]));
+            assert!(state.killed.is_empty());
+        }
+        phase.next();
+        (x, tracker, phase)
+    }
+
+    /// T3(a): X is absent from the second site's table.
+    #[tokio::test]
+    async fn a_survivor_gone_by_the_next_site_is_cleared() {
+        let (mut x, tracker, _) = x_listed_at_a_first_site(|_, _| Ok(Vec::new())).await;
+        tracker.sweep(NO_AGENT, None, "site 2").await;
+        let state = tracker.state();
+        assert!(state.survivors.is_empty(), "{:?}", state.survivors);
+        assert!(
+            state.survivor_starts.is_empty(),
+            "{:?}",
+            state.survivor_starts
+        );
+        assert!(x.is_running());
+    }
+
+    /// T3(b): X is still there with the same start, but nothing owns it now:
+    /// it stays listed, with its identity, and is not signalled.
+    #[tokio::test]
+    async fn a_survivor_that_lost_its_ownership_evidence_stays_listed() {
+        let (_, daemon_sid) = daemon_ids();
+        let (mut x, tracker, _) = x_listed_at_a_first_site(move |xp, _| {
+            Ok(vec![sleep_entry(xp, 1, xp, daemon_sid, X_START)])
+        })
+        .await;
+        let returned = tracker.sweep(NO_AGENT, None, "site 2").await;
+        assert!(x.is_running(), "an unowned process is never signalled");
+        let state = tracker.state();
+        let xp = x.pid();
+        assert_eq!(state.survivors, vec![(xp, "sleep".to_string())]);
+        assert_eq!(state.survivor_starts, HashMap::from([(xp, X_START)]));
+        assert_eq!(returned, 0);
+    }
+
+    /// T3(c): the pid is back with another start time and no ownership: a
+    /// different process, so the old survivor is cleared and nothing is sent.
+    #[tokio::test]
+    async fn a_reused_pid_does_not_keep_the_old_survivor() {
+        let (_, daemon_sid) = daemon_ids();
+        let (mut x, tracker, _) = x_listed_at_a_first_site(move |xp, _| {
+            Ok(vec![sleep_entry(xp, 1, xp, daemon_sid, X_START + 111)])
+        })
+        .await;
+        tracker.sweep(NO_AGENT, None, "site 2").await;
+        assert!(x.is_running(), "an unowned process is never signalled");
+        let state = tracker.state();
+        assert!(state.survivors.is_empty(), "{:?}", state.survivors);
+        assert!(
+            state.survivor_starts.is_empty(),
+            "{:?}",
+            state.survivor_starts
+        );
+        assert!(state.killed.is_empty());
+    }
+
+    /// A zombie row is not alive: it clears a survivor of an earlier site.
+    #[tokio::test]
+    async fn a_later_zombie_clears_a_survivor() {
+        let (_, daemon_sid) = daemon_ids();
+        let (_x, tracker, _) = x_listed_at_a_first_site(move |xp, _| {
+            let mut row = marked(sleep_entry(xp, 1, xp, daemon_sid, X_START));
+            row.zombie = true;
+            Ok(vec![row])
+        })
+        .await;
+        tracker.sweep(NO_AGENT, None, "site 2").await;
+        let state = tracker.state();
+        assert!(state.survivors.is_empty(), "{:?}", state.survivors);
+        assert!(state.survivor_starts.is_empty());
+    }
+
+    /// A different process at the same pid that the selector does own is
+    /// listed as a new survivor, with its own start.
+    #[tokio::test]
+    async fn a_new_identity_at_a_reused_pid_replaces_the_old_one() {
+        let (_, daemon_sid) = daemon_ids();
+        let (x, tracker, _) = x_listed_at_a_first_site(move |xp, _| {
+            let mut row = marked(sleep_entry(xp, 1, xp, daemon_sid, X_START + 111));
+            row.comm = "reused".into();
+            Ok(vec![row])
+        })
+        .await;
+        tracker.sweep(NO_AGENT, Some(x.pid()), "site 2").await;
+        let state = tracker.state();
+        assert_eq!(state.survivors, vec![(x.pid(), "reused".to_string())]);
+        assert_eq!(
+            state.survivor_starts,
+            HashMap::from([(x.pid(), X_START + 111)])
+        );
+    }
+
+    /// T3(d): the signal is delivered, and the next scan fails. A signal is
+    /// not a death and a failed read is not an observation: X stays listed.
+    #[tokio::test]
+    async fn a_delivered_signal_followed_by_a_failed_read_leaves_the_survivor_listed() {
+        let (_, daemon_sid) = daemon_ids();
+        let (mut x, tracker, _) = x_listed_at_a_first_site(move |xp, scan| match scan {
+            0 => Ok(vec![marked(sleep_entry(xp, 1, xp, daemon_sid, X_START))]),
+            _ => Err(std::io::Error::other("second read failed")),
+        })
+        .await;
+        let xp = x.pid();
+        let returned = tracker.sweep(NO_AGENT, None, "site 2").await;
+        {
+            let state = tracker.state();
+            assert_eq!(state.survivors, vec![(xp, "sleep".to_string())]);
+            assert_paired(&state);
+            assert_eq!(state.killed, vec![(xp, "sleep".to_string())]);
+            assert_eq!(state.scan_failures, vec!["site 2: second read failed"]);
+        }
+        assert_eq!(returned, 1);
+        assert_eq!(x.reap_signal(), Some(libc::SIGKILL));
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(
+            killed_note,
+            Some(format!("1 still running at the last check: {xp} (sleep)"))
+        );
+        assert!(unchecked.is_some());
+    }
+
+    /// Survivors and their identities move together.
+    #[test]
+    fn survivor_identities_stay_paired_with_survivors() {
+        let live = |pid, start, comm: &str| {
+            let mut entry = sleep_entry(pid, 1, pid, pid, start);
+            entry.comm = comm.into();
+            entry
+        };
+        let mut state = TrackerState::default();
+        state.add_survivor(10, "a".into(), 1000);
+        state.add_survivor(20, "b".into(), 2000);
+        state.add_survivor(10, "dup".into(), 9999);
+        assert_eq!(
+            state.survivors,
+            vec![(10, "a".to_string()), (20, "b".to_string())]
+        );
+        assert_eq!(
+            state.survivor_starts,
+            HashMap::from([(10, 1000), (20, 2000)]),
+            "a missing start"
+        );
+        assert_paired(&state);
+
+        // Pid 10 left the table: cleared from both.
+        state.settle_survivors(&[live(20, 2000, "b")], &[]);
+        assert_eq!(state.survivors, vec![(20, "b".to_string())]);
+        assert_eq!(
+            state.survivor_starts,
+            HashMap::from([(20, 2000)]),
+            "a stale start"
+        );
+
+        // Pid 20 came back as another process the check calls alive.
+        state.settle_survivors(&[live(20, 2500, "new")], &[20]);
+        assert_eq!(state.survivors, vec![(20, "new".to_string())]);
+        assert_eq!(state.survivor_starts, HashMap::from([(20, 2500)]));
+
+        // A survivor with no recorded identity cannot be matched to anything.
+        state.survivors.push((30, "c".into()));
+        state.settle_survivors(&[live(30, 0, "c"), live(20, 2500, "new")], &[]);
+        assert_eq!(state.survivors, vec![(20, "new".to_string())]);
+        assert_paired(&state);
+
+        // Start time 0 is a value, not a wildcard.
+        state.add_survivor(40, "z".into(), 0);
+        state.settle_survivors(&[live(40, 5, "z")], &[]);
+        assert!(!pids_of(&state.survivors).contains(&40));
+        assert_paired(&state);
+    }
+
+    /// Writing the notes consumes survivors and their identities together
+    /// and leaves the recorded ownership alone.
+    #[tokio::test]
+    async fn writing_the_notes_consumes_survivors_with_their_identities() {
+        let tracker = sweep_tracker(Arc::new(|_| Ok(Vec::new())));
+        {
+            let mut state = tracker.state();
+            state.recorded.insert((77, 7));
+            state.add_survivor(10, "a".into(), 1000);
+        }
+        let (killed_note, _) = written_notes(&tracker).await;
+        assert_eq!(
+            killed_note.as_deref(),
+            Some("1 still running at the last check: 10 (a)")
+        );
+        let state = tracker.state();
+        assert!(state.survivors.is_empty());
+        assert!(
+            state.survivor_starts.is_empty(),
+            "{:?}",
+            state.survivor_starts
+        );
+        assert!(state.recorded.contains(&(77, 7)));
+    }
+
+    // --- a table that cannot be read ----------------------------------------
+
+    /// T4(a): the first sweep scan shows an owned E, the second fails.
+    #[tokio::test]
+    async fn a_failed_scan_after_a_kill_says_the_kill_is_unconfirmed() {
+        let mut e = Sleeper::spawn(None, true);
+        let ep = e.pid();
+        let reader = fallible_reader(move |call| match call {
+            Some(1) => Ok(vec![marked(sleep_entry(ep, 1, ep, ep, 400))]),
+            _ => Err(std::io::Error::other("table read failed")),
+        });
+        let tracker = sweep_tracker(reader);
+        let returned = tracker.sweep(NO_AGENT, None, "end of turn").await;
+        assert_eq!(returned, 1);
+        assert_eq!(e.reap_signal(), Some(libc::SIGKILL));
+        {
+            let state = tracker.state();
+            assert_eq!(state.killed, vec![(ep, "sleep".to_string())]);
+            assert!(state.survivors.is_empty(), "{:?}", state.survivors);
+        }
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(
+            unchecked.as_deref(),
+            Some(
+                "the process table could not be read, so nothing confirms the turn's processes \
+                 are gone: end of turn: table read failed"
+            ),
+            "the unchecked note"
+        );
+        assert_eq!(
+            killed_note,
+            Some(format!(
+                "sent SIGKILL to 1 process(es) the turn left running, but could not confirm \
+                 they are gone: {ep} (sleep)"
+            )),
+            "the downgraded wording"
+        );
+    }
+
+    /// T4(b): the pre-kill scan fails and every later scan works, at two
+    /// sites of one tracker. The failure stays.
+    #[tokio::test]
+    async fn an_early_failed_read_is_not_recovered_by_later_good_ones() {
+        let (first, second) = (Sleeper::spawn(None, false), Sleeper::spawn(None, false));
+        let reader = counting_reader(|scan| match scan {
+            0 => Err(std::io::Error::other("pre-kill read failed")),
+            _ => Ok(Vec::new()),
+        });
+        let tracker = sweep_tracker(reader);
+        kill_and_sweep(&tracker, first.pid() as u32, "cancel").await;
+        kill_and_sweep(&tracker, second.pid() as u32, "end of turn").await;
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(killed_note, None);
+        assert_eq!(
+            unchecked.as_deref(),
+            Some(
+                "the process table could not be read, so nothing confirms the turn's processes \
+                 are gone: cancel: pre-kill read failed"
+            )
+        );
+    }
+
+    /// T4(c): every scan fails.
+    #[tokio::test]
+    async fn when_every_read_fails_only_the_unchecked_note_is_written() {
+        let leader = Sleeper::spawn(None, false);
+        let reader =
+            counting_reader(|scan| Err(std::io::Error::other(format!("read {scan} failed"))));
+        let tracker = sweep_tracker(reader);
+        kill_and_sweep(&tracker, leader.pid() as u32, "end of turn").await;
+        {
+            let state = tracker.state();
+            assert!(state.killed.is_empty() && state.survivors.is_empty());
+        }
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(killed_note, None);
+        assert_eq!(
+            unchecked.as_deref(),
+            Some(
+                "the process table could not be read, so nothing confirms the turn's processes \
+                 are gone: end of turn: read 0 failed; end of turn: read 1 failed"
+            )
+        );
+    }
+
+    /// A turn-event read that fails is as sticky as one inside a kill site,
+    /// and a later good site does not undo it.
+    #[tokio::test]
+    async fn a_failed_turn_event_read_downgrades_the_later_kill_wording() {
+        let leader = Sleeper::spawn(None, false);
+        let mut e = Sleeper::spawn(None, true);
+        let ep = e.pid();
+        let reader = fallible_reader(move |call| match call {
+            None => Ok(Vec::new()),
+            Some(1) => Ok(vec![marked(sleep_entry(ep, 1, ep, ep, 400))]),
+            Some(_) => Ok(Vec::new()),
+        });
+        // Call 0 is the turn-event scan, the only one that fails.
+        let failing_first = {
+            let first = std::sync::atomic::AtomicBool::new(true);
+            Arc::new(move |marker: Option<&str>| {
+                if marker.is_none() && first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    Err(std::io::Error::other("turn event read failed"))
+                } else {
+                    reader(marker)
+                }
+            }) as crate::proc_table::ProcReader
+        };
+        let tracker = sweep_tracker(failing_first);
+        tracker
+            .record_descendants(leader.pid() as u32, "turn event")
+            .await;
+        kill_and_sweep(&tracker, leader.pid() as u32, "end of turn").await;
+        assert_eq!(e.reap_signal(), Some(libc::SIGKILL));
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(
+            unchecked.as_deref(),
+            Some(
+                "the process table could not be read, so nothing confirms the turn's processes \
+                 are gone: turn event: turn event read failed"
+            )
+        );
+        assert_eq!(
+            killed_note,
+            Some(format!(
+                "sent SIGKILL to 1 process(es) the turn left running, but could not confirm \
+                 they are gone: {ep} (sleep)"
+            ))
+        );
+    }
+
+    // --- the note writer and the group-kill errors ----------------------------
+
+    fn named(items: &[(i32, &str)]) -> Vec<(i32, String)> {
+        items.iter().map(|(p, c)| (*p, c.to_string())).collect()
+    }
+
+    fn texts(
+        killed: &[(i32, &str)],
+        survivors: &[(i32, &str)],
+        failures: &[&str],
+        group_errors: &[&str],
+    ) -> (Option<String>, Option<String>) {
+        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        leftover_note_texts(
+            &named(killed),
+            &named(survivors),
+            &strings(failures),
+            &strings(group_errors),
+        )
+    }
+
+    /// T5: a pid in both lists is named once, as still running.
+    #[test]
+    fn a_pid_in_both_lists_is_named_once_as_still_running() {
+        let (killed, unchecked) = texts(&[(5, "a")], &[(5, "a")], &[], &[]);
+        assert_eq!(
+            killed.as_deref(),
+            Some("1 still running at the last check: 5 (a)")
+        );
+        assert_eq!(unchecked, None);
+        let (killed, _) = texts(&[(5, "a"), (6, "b")], &[(5, "a")], &[], &[]);
+        assert_eq!(
+            killed.as_deref(),
+            Some(
+                "killed 1 process(es) the turn left running: 6 (b); 1 still running at the last check: 5 (a)"
+            )
+        );
+    }
+
+    /// T5: each clause is sorted by number, not by text, and the overlap is
+    /// filtered before the killed count.
+    #[test]
+    fn each_clause_is_sorted_by_pid() {
+        let (killed, _) = texts(
+            &[(100, "d"), (9, "a"), (50, "x"), (20, "b")],
+            &[(300, "f"), (50, "x"), (45, "e"), (1000, "g")],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            killed.as_deref(),
+            Some(
+                "killed 3 process(es) the turn left running: 9 (a), 20 (b), 100 (d); \
+                 4 still running at the last check: 45 (e), 50 (x), 300 (f), 1000 (g)"
+            )
+        );
+    }
+
+    /// T5: group errors beside a survivor, beside a failed scan, and alone.
+    #[test]
+    fn group_errors_appear_only_beside_a_survivor_or_a_failed_scan() {
+        let (killed, unchecked) = texts(
+            &[],
+            &[(5, "a")],
+            &[],
+            &["cancel: eperm", "end of turn: eperm"],
+        );
+        assert_eq!(
+            killed.as_deref(),
+            Some(
+                "1 still running at the last check: 5 (a); the kill of the agent's process \
+                 group failed: cancel: eperm; end of turn: eperm"
+            )
+        );
+        assert_eq!(unchecked, None);
+
+        let (killed, unchecked) = texts(&[], &[], &["grace: read failed"], &["grace: eperm"]);
+        assert_eq!(killed, None);
+        let unchecked = unchecked.unwrap();
+        assert_eq!(
+            unchecked,
+            "the process table could not be read, so nothing confirms the turn's processes are \
+             gone: grace: read failed; the kill of the agent's process group failed: grace: eperm"
+        );
+        assert!(!unchecked.contains("was still killed"));
+
+        // Group errors alone say nothing was left running.
+        assert_eq!(
+            texts(&[(7, "k")], &[], &[], &["grace: eperm"]),
+            (
+                Some("killed 1 process(es) the turn left running: 7 (k)".to_string()),
+                None
+            )
+        );
+        assert_eq!(texts(&[], &[], &[], &["grace: eperm"]), (None, None));
+    }
+
+    /// T5: which group classifications record an error. None adds a survivor.
+    #[test]
+    fn only_a_failed_group_signal_is_recorded_as_a_group_error() {
+        let eperm = || std::io::Error::from_raw_os_error(libc::EPERM);
+        let esrch = || std::io::Error::from_raw_os_error(libc::ESRCH);
+        let unknown = |signal_result| GroupKill::Unknown {
+            scan_error: std::io::Error::other("scan"),
+            signal_result,
+        };
+        let cases: Vec<(&str, GroupKill, Option<String>)> = vec![
+            (
+                "Failed",
+                GroupKill::Failed(eperm()),
+                Some(format!("s: {}", eperm())),
+            ),
+            (
+                "Unknown, signal EPERM",
+                unknown(Err(eperm())),
+                Some(format!("s: {}", eperm())),
+            ),
+            (
+                "Unknown, signal other",
+                unknown(Err(std::io::Error::other("sig boom"))),
+                Some("s: sig boom".to_string()),
+            ),
+            ("Unknown, signal ESRCH", unknown(Err(esrch())), None),
+            ("Unknown, signal Ok", unknown(Ok(())), None),
+            ("Killed", GroupKill::Killed(2), None),
+            ("NothingAlive", GroupKill::NothingAlive, None),
+        ];
+        for (name, group, expected) in cases {
+            let mut state = TrackerState::default();
+            state.record_group_kill_error("s", &group);
+            assert_eq!(
+                state.group_kill_errors,
+                expected.into_iter().collect::<Vec<_>>(),
+                "{name}"
+            );
+            assert!(state.survivors.is_empty(), "{name}");
+            assert!(state.survivor_starts.is_empty(), "{name}");
+        }
+    }
+
+    /// T5: a Failed classification followed by a final observation with
+    /// nothing alive (the macOS zombie-group `EPERM`) lists no survivor and
+    /// writes no `leftovers_killed` note; the failed signal is kept.
+    #[tokio::test]
+    async fn a_failed_group_signal_followed_by_an_empty_check_lists_nothing() {
+        let tracker = sweep_tracker(Arc::new(|_| Ok(Vec::new())));
+        tracker
+            .state()
+            .record_group_kill_error("grace", &GroupKill::Failed(std::io::Error::other("eperm")));
+        tracker.sweep(NO_AGENT, None, "grace").await;
+        {
+            let state = tracker.state();
+            assert!(state.survivors.is_empty(), "{:?}", state.survivors);
+            assert_eq!(state.group_kill_errors, vec!["grace: eperm"]);
+        }
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(killed_note, None);
+        assert_eq!(unchecked, None);
+
+        // With an earlier failed read, the failure is in the unchecked note.
+        let tracker = sweep_tracker(Arc::new(|_| Ok(Vec::new())));
+        tracker.note_scan_failure("cancel", &std::io::Error::other("early read failed"));
+        tracker
+            .state()
+            .record_group_kill_error("grace", &GroupKill::Failed(std::io::Error::other("eperm")));
+        tracker.sweep(NO_AGENT, None, "grace").await;
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(killed_note, None);
+        assert_eq!(
+            unchecked.as_deref(),
+            Some(
+                "the process table could not be read, so nothing confirms the turn's processes \
+                 are gone: cancel: early read failed; the kill of the agent's process group \
+                 failed: grace: eperm"
+            )
+        );
+    }
+
+    /// A process group the daemon may not signal, probed as the existing
+    /// tests do. `None` (with the reason printed) when this machine has none.
+    fn foreign_group() -> Option<i32> {
+        // SAFETY: only reads the uid and probes pids with signal 0.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, every pid is signalable");
+            return None;
+        }
+        let foreign = (2..5000).find(|&pid| {
+            // SAFETY: signal 0 only checks permission, and the kill is a killpg.
+            let rc = unsafe { libc::killpg(pid, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        });
+        if foreign.is_none() {
+            eprintln!("skipped: no foreign pid found");
+        }
+        foreign
+    }
+
+    /// T5: with a real refused group signal, the error is recorded and the
+    /// final observation alone decides whether the group is a survivor.
+    #[tokio::test]
+    async fn a_failed_group_signal_alone_lists_no_survivor() {
+        let Some(foreign) = foreign_group() else {
+            return;
+        };
+        let (daemon, daemon_sid) = daemon_ids();
+        let row = move || sleep_entry(foreign, daemon, foreign, daemon_sid, 100);
+        // Live in every table: a survivor, and the error is recorded.
+        let tracker = sweep_tracker(scripted_reader(move |_| vec![row()]));
+        let report = kill_and_sweep(&tracker, foreign as u32, "test").await;
+        assert!(matches!(report.group, GroupKill::Failed(_)));
+        {
+            let state = tracker.state();
+            assert_eq!(pids_of(&state.survivors), vec![foreign]);
+            assert_eq!(
+                state.group_kill_errors.len(),
+                1,
+                "{:?}",
+                state.group_kill_errors
+            );
+            assert!(state.group_kill_errors[0].starts_with("test: "));
+        }
+        // Live before the signal, gone from every later table: no survivor.
+        let tracker = sweep_tracker(scripted_reader(move |call| {
+            if call.is_none() {
+                vec![row()]
+            } else {
+                Vec::new()
+            }
+        }));
+        let report = kill_and_sweep(&tracker, foreign as u32, "test").await;
+        assert!(matches!(report.group, GroupKill::Failed(_)));
+        {
+            let state = tracker.state();
+            assert!(state.survivors.is_empty(), "{:?}", state.survivors);
+            assert_eq!(
+                state.group_kill_errors.len(),
+                1,
+                "{:?}",
+                state.group_kill_errors
+            );
+        }
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!((killed_note, unchecked), (None, None));
+    }
+
+    /// T6: the five shapes of the `lingered` note, for each of the three
+    /// reasons a grace period starts.
+    #[test]
+    fn the_lingered_note_says_what_was_seen_and_what_was_tried() {
+        let unknown = |signal_result| GroupKill::Unknown {
+            scan_error: std::io::Error::other("scan"),
+            signal_result,
+        };
+        let cases: Vec<(&str, GroupKill, &str)> = vec![
+            (
+                "Killed",
+                GroupKill::Killed(3),
+                "3 process(es) of the agent's process group were still running 0.4s after \
+                 {after}; sent SIGKILL to the group",
+            ),
+            (
+                "Failed",
+                GroupKill::Failed(std::io::Error::other("eperm boom")),
+                "processes of the agent's process group were still running 0.4s after {after}; \
+                 could not signal the group: eperm boom",
+            ),
+            (
+                "Unknown, signal Ok",
+                unknown(Ok(())),
+                "0.4s after {after}, could not check whether the agent's process group was still \
+                 running; sent SIGKILL to the group",
+            ),
+            (
+                "Unknown, signal Err",
+                unknown(Err(std::io::Error::other("sig boom"))),
+                "0.4s after {after}, could not check whether the agent's process group was still \
+                 running, and could not signal the group: sig boom",
+            ),
+            (
+                "NothingAlive",
+                GroupKill::NothingAlive,
+                "the agent's process group had exited 0.4s after {after}, but processes it \
+                 started were still running; sent them SIGKILL",
+            ),
+        ];
+        for after in [
+            "the idle reaper closed its stalled turn",
+            "it was closed for never reporting",
+            "its turn ended",
+        ] {
+            for (name, group, template) in &cases {
+                assert_eq!(
+                    lingered_message(group, 0.4, after),
+                    template.replace("{after}", after),
+                    "{name} after {after}"
+                );
+            }
+        }
+    }
+
+    // --- the turn's outcome does not depend on the cleanup's findings ---------
+
+    /// A turn that reports, ends its turn and exits on its own.
+    fn autonomous_exit_binary(dir: &std::path::Path) -> String {
+        script_binary(
+            dir,
+            json!([
+                {"op": "read_turn"},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "exit"},
+            ]),
+        )
+    }
+
+    /// The grace timer must not fire in these: the process exits at once.
+    fn no_grace() -> TurnTimers {
+        TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(3)
+        }
+    }
+
+    /// T7: a process the last check still sees does not park the turn.
+    #[tokio::test]
+    async fn a_survivor_changes_neither_the_status_nor_the_end_reason() {
+        const GHOST: i32 = 99_999_999;
+        let dir = TempDir::new();
+        // SAFETY: only reads the process's own uid.
+        let uid = unsafe { libc::geteuid() };
+        let reader: crate::proc_table::ProcReader = Arc::new(move |_| {
+            Ok(vec![crate::proc_table::ProcEntry {
+                pid: GHOST,
+                ppid: 1,
+                pgid: GHOST,
+                sid: GHOST,
+                uid,
+                start: 1,
+                zombie: false,
+                comm: "ghost".into(),
+                marker: crate::proc_table::MarkerStatus::Present,
+            }])
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            autonomous_exit_binary(&dir.0),
+            no_grace(),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, None);
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(
+            note_message(&pool, &session_id, "leftovers_killed").await,
+            Some(format!(
+                "1 still running at the last check: {GHOST} (ghost)"
+            ))
+        );
+    }
+
+    /// T7: a sweep that cannot read the table does not park the turn either.
+    #[tokio::test]
+    async fn a_failed_sweep_read_changes_neither_the_status_nor_the_end_reason() {
+        let dir = TempDir::new();
+        let reader: crate::proc_table::ProcReader = Arc::new(|marker| {
+            if marker.is_some() {
+                Err(std::io::Error::other("sweep read failed"))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            autonomous_exit_binary(&dir.0),
+            no_grace(),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, None);
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(
+            note_message(&pool, &session_id, "leftovers_killed").await,
+            None
+        );
+        assert_eq!(
+            note_message(&pool, &session_id, "leftovers_unchecked")
+                .await
+                .as_deref(),
+            Some(
+                "the process table could not be read, so nothing confirms the turn's processes \
+                 are gone: end of turn: sweep read failed"
+            )
+        );
+    }
+
+    // --- the pid lives until the handle is waited for -----------------------
+
+    /// The tail signals the group before `AgentHandle::wait`, so the pid must
+    /// still be the process's own until then: an exited agent whose output
+    /// has drained keeps its pid, and the handle gives it up only on `wait`.
+    #[tokio::test]
+    async fn a_drained_exited_agent_keeps_its_pid_until_it_is_waited_for() {
+        let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_oneshot.py"));
+        let mut handle = adapter.start("hello", &single_shot_role_config()).unwrap();
+        while handle.recv().await.is_some() {}
+        let pid = handle.pid();
+        assert!(
+            pid.is_some(),
+            "the pid is kept until the child is waited for"
+        );
+        // The fixture has exited: its unreaped zombie is still the pid's.
+        assert!(process_alive(pid.unwrap()));
+        handle.wait().await.unwrap();
+        assert_eq!(
+            handle.pid(),
+            None,
+            "the pid is gone once the child is reaped"
+        );
+    }
+
+    // --- one real cleanup against `ps` ---------------------------------------
+
+    /// One row of `ps -o pid=,ppid=,pgid=,stat=,lstart=`.
+    #[derive(Debug)]
+    struct PsRow {
+        ppid: i32,
+        pgid: i32,
+        stat: String,
+    }
+
+    /// Runs `ps` for `pids`; returns its output and the rows it listed. A
+    /// pid that does not exist is simply not listed (and ps exits 1).
+    fn ps_rows(pids: &[i32]) -> (String, HashMap<i32, PsRow>) {
+        let list = pids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let out = std::process::Command::new("ps")
+            .args(["-o", "pid=,ppid=,pgid=,stat=,lstart=", "-p", &list])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let rows = text
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let pid = words.next()?.parse().ok()?;
+                let ppid = words.next()?.parse().ok()?;
+                let pgid = words.next()?.parse().ok()?;
+                let stat = words.next()?.to_string();
+                Some((pid, PsRow { ppid, pgid, stat }))
+            })
+            .collect();
+        (text, rows)
+    }
+
+    /// SIGKILLs processes on drop, so a failed assertion leaves none behind.
+    struct KillOnDrop(Vec<i32>);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            for pid in &self.0 {
+                // SAFETY: only sends a signal to a pid this test started.
+                unsafe { libc::kill(*pid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// Real reader, real processes, the agent test fixture (no model, no
+    /// daemon): before cleanup the reader agrees with `ps`, after it the
+    /// turn's processes are gone and an unrelated one is untouched.
+    ///
+    /// `cargo test -p chocofactoryd --lib -- --exact --ignored --nocapture
+    /// session::tests::real_cleanup_agrees_with_ps`
+    #[tokio::test]
+    #[ignore = "real cleanup against ps; run once"]
+    async fn real_cleanup_agrees_with_ps() {
+        let dir = TempDir::new();
+        let heartbeat = dir.0.join("heartbeat");
+        let child_pid_file = dir.0.join("child.pid");
+        let job_pid_file = dir.0.join("job.pid");
+        let release = dir.0.join("release");
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "spawn_child", "heartbeat": heartbeat, "pid_file": child_pid_file},
+                {
+                    "op": "spawn_escaped", "setsid": true, "double_fork": true,
+                    "wait_orphaned": true, "pid_file": job_pid_file,
+                },
+                // Holds the fixture so the "before" readings are taken while
+                // everything it started is alive and settled.
+                {"op": "wait_file", "path": release},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        let timers = TurnTimers {
+            grace: crate::test_support::RESPONSE_MARGIN,
+            ..fast_timers(3)
+        };
+        let mut unrelated = Sleeper::spawn(None, true);
+        let (pool, session_id, manager) =
+            start_leftovers(binary, timers, chrono::Duration::hours(1), None).await;
+        let child = read_pid_when_written(&child_pid_file).await as i32;
+        let job = read_pid_when_written(&job_pid_file).await as i32;
+        let _cleanup = KillOnDrop(vec![child, job]);
+        crate::test_support::wait_until("the same-group heartbeat", || async {
+            match std::fs::metadata(&heartbeat) {
+                Ok(meta) if meta.len() > 0 => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+        let leader = {
+            let sessions = manager.sessions.lock().await;
+            let Some(SessionSlot::Live(session)) = sessions.get(&session_id) else {
+                panic!("session should be live");
+            };
+            let pgid = *session.signals.pgid.lock().await;
+            pgid.expect("a live session has a pgid") as i32
+        };
+        let pids = [leader, child, job, unrelated.pid()];
+
+        let table = proc_table::read(None).unwrap();
+        let (ps_before, rows_before) = ps_rows(&pids);
+        println!("ps before cleanup:\n{ps_before}");
+        for (name, pid) in ["leader", "same-group child", "escaped job", "unrelated"]
+            .iter()
+            .zip(pids)
+        {
+            let entry = table
+                .iter()
+                .find(|e| e.pid == pid)
+                .unwrap_or_else(|| panic!("the reader lists the {name} ({pid})"));
+            let row = rows_before
+                .get(&pid)
+                .unwrap_or_else(|| panic!("ps lists the {name} ({pid})"));
+            println!(
+                "{name} {pid}: reader ppid {} pgid {} start {}; ps ppid {} pgid {} stat {}",
+                entry.ppid, entry.pgid, entry.start, row.ppid, row.pgid, row.stat
+            );
+            assert_eq!(entry.ppid, row.ppid, "{name} ppid");
+            assert_eq!(entry.pgid, row.pgid, "{name} pgid");
+        }
+        let job_comm = table.iter().find(|e| e.pid == job).unwrap().comm.clone();
+
+        let released = std::time::Instant::now();
+        std::fs::write(&release, "").unwrap();
+        let run = wait_until_final(&pool, &session_id).await;
+        println!(
+            "release to final status: {:?} (end_reason {:?})",
+            released.elapsed(),
+            run.end_reason
+        );
+        for note in note_events(&pool, &session_id).await {
+            println!("note {}: {}", note.payload["kind"], note.payload["message"]);
+        }
+        assert_eq!(
+            note_message(&pool, &session_id, "leftovers_killed").await,
+            Some(format!(
+                "killed 1 process(es) the turn left running: {job} ({job_comm})"
+            ))
+        );
+        assert_eq!(
+            note_message(&pool, &session_id, "leftovers_unchecked").await,
+            None
+        );
+
+        // The turn's processes end up absent or zombies awaiting a reaper.
+        let gone = |rows: &HashMap<i32, PsRow>, pid: i32| {
+            rows.get(&pid).is_none_or(|row| row.stat.starts_with('Z'))
+        };
+        let (ps_after, rows_after) =
+            crate::test_support::wait_until("the turn's processes to be gone", || async {
+                let (text, rows) = ps_rows(&pids);
+                if [leader, child, job].iter().all(|pid| gone(&rows, *pid)) {
+                    Ok((text, rows))
+                } else {
+                    Err(text)
+                }
+            })
+            .await;
+        println!("ps after cleanup:\n{ps_after}");
+        let unrelated_row = rows_after.get(&unrelated.pid());
+        assert!(
+            unrelated_row.is_some_and(|row| !row.stat.starts_with('Z')),
+            "the unrelated sleeper is still running: {unrelated_row:?}"
+        );
+        assert!(unrelated.is_running());
     }
 
     #[test]
