@@ -637,10 +637,11 @@ pub enum EventType {
     ///   to report;
     /// - `"no_report"`: closed a turn that never reported (nudges used up, or
     ///   its total job-wait limit ran out);
-    /// - `"lingered"`: the agent's process group, or something the turn
-    ///   started, was still running after its turn ended, and choco sent it
-    ///   SIGKILL (the note says whether the group could be signalled; it does
-    ///   not say anything died);
+    /// - `"lingered"`: after the turn reported, choco tried to SIGKILL what it
+    ///   left behind (the agent's process group, or something the turn
+    ///   started). The note says what the check before the kill saw, or that
+    ///   it could not check, and whether the group signal was sent or
+    ///   refused; it does not say anything died;
     /// - `"job_wait"`: the turn ended without reporting while background jobs
     ///   run, so it is not nudged until they finish or its total job-wait
     ///   limit runs out;

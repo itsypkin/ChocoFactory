@@ -6780,6 +6780,193 @@ mod tests {
         assert_eq!(r.note, None, "shape (e)");
     }
 
+    // --- what the logs say ------------------------------------------------------
+
+    /// A log sink one test owns. The subscriber is installed for this thread
+    /// only (`#[tokio::test]` runs on it), so parallel tests cannot see each
+    /// other's lines.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        (buf, tracing::subscriber::set_default(subscriber))
+    }
+
+    const NOT_VERIFIED: &str =
+        "the turn's cleanup is not verified; how the turn ended is unchanged";
+
+    /// Writes the notes of a tracker holding these findings, with the log
+    /// captured; returns the log.
+    async fn log_of_writing_notes(
+        survivors: &[(i32, &str)],
+        failures: &[&str],
+        group_errors: &[&str],
+        killed: &[(i32, &str)],
+    ) -> String {
+        let tracker = sweep_tracker(scripted_reader(|_| Vec::new()));
+        {
+            let mut state = tracker.state();
+            for (pid, comm) in survivors {
+                state.add_survivor(*pid, comm.to_string(), 10);
+            }
+            state.scan_failures = failures.iter().map(|s| s.to_string()).collect();
+            state.group_kill_errors = group_errors.iter().map(|s| s.to_string()).collect();
+            state.killed = killed.iter().map(|(p, c)| (*p, c.to_string())).collect();
+        }
+        let (log, _guard) = capture_logs();
+        written_notes(&tracker).await;
+        log.text()
+    }
+
+    /// The verification warning fires for survivors and for failed scans, with
+    /// their counts, and for nothing else.
+    #[tokio::test]
+    async fn the_not_verified_warning_follows_survivors_and_failed_scans() {
+        let log = log_of_writing_notes(&[(5, "a"), (6, "b")], &[], &[], &[]).await;
+        assert!(log.contains(NOT_VERIFIED), "survivors only: {log}");
+        assert!(log.contains("still_running=2"), "survivors only: {log}");
+        assert!(log.contains("failed_scans=0"), "survivors only: {log}");
+        assert!(log.contains("session_id="), "{log}");
+
+        let log = log_of_writing_notes(&[], &["site: boom"], &[], &[]).await;
+        assert!(log.contains(NOT_VERIFIED), "failed scan only: {log}");
+        assert!(log.contains("still_running=0"), "failed scan only: {log}");
+        assert!(log.contains("failed_scans=1"), "failed scan only: {log}");
+
+        let log = log_of_writing_notes(&[(5, "a")], &["s: x", "s: y"], &["s: g"], &[]).await;
+        assert!(log.contains("still_running=1"), "both: {log}");
+        assert!(log.contains("failed_scans=2"), "both: {log}");
+
+        // Neither a delivered kill, nor a group error alone, is a warning.
+        let log = log_of_writing_notes(&[], &[], &["cancel: EPERM"], &[(7, "c")]).await;
+        assert!(!log.contains(NOT_VERIFIED), "no findings to doubt: {log}");
+        let log = log_of_writing_notes(&[], &[], &[], &[]).await;
+        assert!(!log.contains(NOT_VERIFIED), "nothing at all: {log}");
+    }
+
+    /// At the last round the warning counts the deduplicated union of what is
+    /// owned and what is alive in the group, once each.
+    #[tokio::test]
+    async fn the_last_round_warning_counts_each_live_process_once() {
+        let (a, n, x) = (NO_AGENT, NO_AGENT + 1, NO_AGENT + 2);
+        let (_, daemon_sid) = daemon_ids();
+        // Leader, an unowned member, and a marker-owned member: three
+        // processes; the owned one is in both the owned list and the group.
+        let reader = scripted_reader(move |_| {
+            vec![
+                leader_row(a, a),
+                sleep_entry(n, 1, a, daemon_sid, 200),
+                marked(sleep_entry(x, 1, a, daemon_sid, 300)),
+            ]
+        });
+        let tracker = sweep_tracker(reader);
+        let (log, _guard) = capture_logs();
+        let returned = tracker.sweep(a, Some(a), "grace site").await;
+        let log = log.text();
+        assert_eq!(returned, 0);
+        assert!(
+            log.contains("still running at the sweep's last check"),
+            "{log}"
+        );
+        assert!(log.contains("count=3"), "{log}");
+        assert!(log.contains("site=\"grace site\""), "{log}");
+        assert!(
+            !log.contains("sent SIGKILL to processes left behind"),
+            "nothing was signalled by pid: {log}"
+        );
+    }
+
+    /// An ordinary empty finish is silent; a delivered kill is reported with
+    /// its count and is not a last-round warning.
+    #[tokio::test]
+    async fn the_sweep_warns_only_about_what_it_saw_or_signalled() {
+        let tracker = sweep_tracker(scripted_reader(|_| Vec::new()));
+        let (log, guard) = capture_logs();
+        tracker.sweep(NO_AGENT, None, "quiet").await;
+        let quiet = log.text();
+        drop(guard);
+        assert!(!quiet.contains("last check"), "{quiet}");
+        assert!(!quiet.contains("left behind"), "{quiet}");
+
+        let mut e = Sleeper::spawn(None, true);
+        let ep = e.pid();
+        let reader = scripted_reader(move |call| match call {
+            None | Some(1) => vec![marked(sleep_entry(ep, 1, ep, ep, 400))],
+            Some(_) => Vec::new(),
+        });
+        let tracker = sweep_tracker(reader);
+        let (log, _guard) = capture_logs();
+        let returned = tracker.sweep(NO_AGENT, None, "end of turn").await;
+        let loud = log.text();
+        assert_eq!(returned, 1);
+        assert_eq!(e.reap_signal(), Some(libc::SIGKILL));
+        assert!(
+            loud.contains("sent SIGKILL to processes left behind by the turn"),
+            "{loud}"
+        );
+        assert!(loud.contains("signalled=1"), "{loud}");
+        assert!(loud.contains("site=\"end of turn\""), "{loud}");
+        assert!(!loud.contains("last check"), "it was gone by then: {loud}");
+    }
+
+    /// The group-kill description and the shared debug line say a signal was
+    /// delivered or tried, never that the group is dead.
+    #[tokio::test]
+    async fn the_group_kill_log_claims_a_signal_not_a_death() {
+        assert_eq!(
+            describe_group_kill(&GroupKill::Killed(3)),
+            "signalled 3 live member(s)"
+        );
+        let leader = Sleeper::spawn(None, false);
+        let a = leader.pid();
+        let reader = scripted_reader(move |call| match call {
+            None => vec![leader_row(a, a)],
+            Some(_) => Vec::new(),
+        });
+        let tracker = sweep_tracker(reader);
+        let (log, _guard) = capture_logs();
+        kill_and_sweep(&tracker, a as u32, "end of turn").await;
+        let log = log.text();
+        assert!(
+            log.contains("tried to signal the agent's group and swept"),
+            "{log}"
+        );
+        assert!(log.contains("signalled 1 live member(s)"), "{log}");
+        assert!(log.contains("site=\"end of turn\""), "{log}");
+    }
+
     // --- one tracker, several sites ------------------------------------------
 
     /// An agent pid no table lists, so only `spare_group` and ownership matter.
@@ -7569,8 +7756,40 @@ mod tests {
         stat: String,
     }
 
-    /// Runs `ps` for `pids`; returns its output and the rows it listed. A
-    /// pid that does not exist is simply not listed (and ps exits 1).
+    /// Reads `ps` output for a pid list. `ps` exits 1 when some or all of the
+    /// pids do not exist (they are simply not listed), so that, with nothing
+    /// on stderr, is the only failure accepted. Any other status, any stderr
+    /// text, or a row that does not parse is an error: a failed or partial
+    /// reading must not look like a process being gone.
+    fn parse_ps(
+        code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<HashMap<i32, PsRow>, String> {
+        if !matches!(code, Some(0 | 1)) || !stderr.trim().is_empty() {
+            return Err(format!(
+                "ps failed (status {code:?}); stderr: {:?}; stdout: {stdout:?}",
+                stderr.trim()
+            ));
+        }
+        let mut rows = HashMap::new();
+        for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+            let mut words = line.split_whitespace();
+            let parsed = (|| {
+                let pid: i32 = words.next()?.parse().ok()?;
+                let ppid = words.next()?.parse().ok()?;
+                let pgid = words.next()?.parse().ok()?;
+                let stat = words.next()?.to_string();
+                Some((pid, PsRow { ppid, pgid, stat }))
+            })();
+            let (pid, row) = parsed.ok_or_else(|| format!("malformed ps row: {line:?}"))?;
+            rows.insert(pid, row);
+        }
+        Ok(rows)
+    }
+
+    /// Runs `ps` for `pids`; returns its output and the rows it listed.
+    /// Panics if `ps` fails or prints a row it cannot read.
     fn ps_rows(pids: &[i32]) -> (String, HashMap<i32, PsRow>) {
         let list = pids
             .iter()
@@ -7582,18 +7801,31 @@ mod tests {
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        let rows = text
-            .lines()
-            .filter_map(|line| {
-                let mut words = line.split_whitespace();
-                let pid = words.next()?.parse().ok()?;
-                let ppid = words.next()?.parse().ok()?;
-                let pgid = words.next()?.parse().ok()?;
-                let stat = words.next()?.to_string();
-                Some((pid, PsRow { ppid, pgid, stat }))
-            })
-            .collect();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let rows = parse_ps(out.status.code(), &text, &stderr).unwrap_or_else(|e| panic!("{e}"));
         (text, rows)
+    }
+
+    #[test]
+    fn a_failed_or_partial_ps_reading_is_an_error_not_an_absence() {
+        let row = "124 1 124 Ss Thu Nov  5 12:00:00 2026";
+        // A listing, with some pids unlisted: accepted.
+        let rows = parse_ps(Some(1), row, "").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[&124].ppid, 1);
+        assert_eq!(rows[&124].stat, "Ss");
+        // Nothing matched: an empty reading, not an error.
+        assert!(parse_ps(Some(1), "", "").unwrap().is_empty());
+        // A failing command is an error even when it printed a valid row.
+        let err = parse_ps(Some(2), row, "simulated-error").unwrap_err();
+        assert!(err.contains("simulated-error"), "{err}");
+        assert!(parse_ps(Some(2), row, "").is_err(), "status 2");
+        assert!(parse_ps(None, row, "").is_err(), "killed by a signal");
+        assert!(parse_ps(Some(1), row, "oops").is_err(), "stderr text");
+        // A row that cannot be read is an error, not a missing process.
+        let err = parse_ps(Some(0), &format!("{row}\nxx 1 2 S"), "").unwrap_err();
+        assert!(err.contains("malformed ps row"), "{err}");
+        assert!(parse_ps(Some(0), "123 1 123", "").is_err(), "short row");
     }
 
     /// SIGKILLs processes on drop, so a failed assertion leaves none behind.

@@ -12195,12 +12195,13 @@ async fn a_turn_whose_process_lingers_after_reporting_parks_the_task() {
         "must never advance past a turn whose process was still running: {trail:?}"
     );
     let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-    assert!(
-        task.stuck_reason
-            .as_deref()
-            .is_some_and(|r| r.contains("kept running")),
-        "{:?}",
-        task.stuck_reason
+    assert_eq!(
+        task.stuck_reason.as_deref(),
+        Some(
+            "stage 'coding': the agent's process group or something it started kept \
+             running after its turn ended and choco tried to kill it; its session notes \
+             say what is still running; work it started may be incomplete"
+        )
     );
 }
 

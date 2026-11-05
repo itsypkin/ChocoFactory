@@ -76,17 +76,21 @@ and `choco task list --status stuck` finds every stuck task.
   tree and its session before choco saw it; on Linux, a process whose
   environment is unreadable (setuid, or non-dumpable). `docs/workflows.md`
   has the details.
-- `lingered`: the agent's process group outlived its reported turn, or
-  something the turn started was still alive, and choco sent it SIGKILL. The
-  `lingered` note says what was seen and whether the group could be signalled;
-  it does not say anything died. The `leftovers_killed` `session_note`, when
-  there is one, names what choco signalled outside the agent's own process
-  group and what the last check still saw running. A `lingered` run with no
-  such note means the last check found nothing left, which is the normal case
-  of only the agent's group being alive. A `leftovers_unchecked` note means
-  nothing confirms the processes are gone, whatever else is said. The turn may
-  have been writing to the worktree until then, so check `git status` there
-  before retrying.
+- `lingered`: after the turn reported, choco found cause to clean up what it
+  left behind, and tried to SIGKILL it. That is either the agent's process
+  group still running, something the turn started outside it, or a process
+  table that could not be read. The `lingered` note says which: what the check
+  before the kill saw, or that it could not check, and whether the group signal
+  was sent or refused. It does not say anything died. The `leftovers_killed`
+  `session_note`, when there is one, names what choco signalled outside the
+  agent's own process group and what the last check still saw running. A
+  `lingered` run with a successful last check and no `leftovers_*` note means
+  that check found nothing left, which is the normal case of only the agent's
+  group being alive. A failed read supplies no such check: `leftovers_unchecked`
+  means nothing confirms the processes are gone, whatever else is said, and with
+  every read failing it is the only cleanup note. The turn may have been
+  writing to the worktree until then, so check `git status` there before
+  retrying.
 - `claude_settings_rejected`: the reason says Claude Code did not apply role
   `<role>`'s `claude_settings` (it ignores the whole settings when one value is
   invalid). Choco normally sees this before the agent gets its prompt, so
