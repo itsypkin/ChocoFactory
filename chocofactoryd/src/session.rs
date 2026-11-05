@@ -1704,6 +1704,10 @@ fn final_run_state_ranked(
 const SWEEP_ROUNDS: usize = 10;
 const SWEEP_INTERVAL: Duration = Duration::from_millis(50);
 
+/// A test hook run before each lock of the tracker's state.
+#[cfg(test)]
+type LockHook = Box<dyn Fn(&std::sync::Mutex<TrackerState>) + Send + Sync>;
+
 /// What a turn's kills and sweeps found, collected from every site that
 /// signals the agent's group (`cancel`, `shutdown`, the grace branch, the
 /// tail) and reported once by `drain_session`.
@@ -1716,7 +1720,7 @@ struct LeftoverTracker {
     /// lock is taken, so a test can look at the tracker where another writer
     /// could run between two acquisitions.
     #[cfg(test)]
-    before_lock: std::sync::OnceLock<Box<dyn Fn(&std::sync::Mutex<TrackerState>) + Send + Sync>>,
+    before_lock: std::sync::OnceLock<LockHook>,
 }
 
 #[derive(Default)]
@@ -7387,22 +7391,21 @@ mod tests {
         let looks = Arc::new(AtomicUsize::new(0));
         let torn = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let (seen_looks, seen_torn) = (Arc::clone(&looks), Arc::clone(&torn));
-        let hook: Box<dyn Fn(&std::sync::Mutex<TrackerState>) + Send + Sync> =
-            Box::new(move |state| {
-                seen_looks.fetch_add(1, SeqCst);
-                let state = state.lock().unwrap();
-                let present = [
-                    !state.killed.is_empty(),
-                    !state.killed_starts.is_empty(),
-                    !state.survivors.is_empty(),
-                    !state.survivor_starts.is_empty(),
-                    !state.scan_failures.is_empty(),
-                    !state.group_kill_errors.is_empty(),
-                ];
-                if present.iter().any(|p| *p) && !present.iter().all(|p| *p) {
-                    seen_torn.lock().unwrap().push(format!("{present:?}"));
-                }
-            });
+        let hook: LockHook = Box::new(move |state| {
+            seen_looks.fetch_add(1, SeqCst);
+            let state = state.lock().unwrap();
+            let present = [
+                !state.killed.is_empty(),
+                !state.killed_starts.is_empty(),
+                !state.survivors.is_empty(),
+                !state.survivor_starts.is_empty(),
+                !state.scan_failures.is_empty(),
+                !state.group_kill_errors.is_empty(),
+            ];
+            if present.iter().any(|p| *p) && !present.iter().all(|p| *p) {
+                seen_torn.lock().unwrap().push(format!("{present:?}"));
+            }
+        });
         assert!(tracker.before_lock.set(hook).is_ok());
         let (killed_note, unchecked) = written_notes(&tracker).await;
         assert!(looks.load(SeqCst) >= 1, "the contender never looked");
