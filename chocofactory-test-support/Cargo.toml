@@ -9,4 +9,5 @@ publish = false
 tokio = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

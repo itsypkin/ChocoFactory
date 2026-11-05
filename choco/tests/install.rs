@@ -25,7 +25,7 @@ use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use chocofactory_core::daemon_lock::{LockInfo, LockState, read_lock};
 use chocofactory_core::version::VERSION;
-use chocofactory_test_support::wait_until_blocking_within;
+use chocofactory_test_support::{copy_executable, wait_until_blocking_within, write_executable};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -592,12 +592,10 @@ fn unsupported_platform_is_refused() {
     let fake = env.home.join("fakebin");
     std::fs::create_dir_all(&fake).unwrap();
     let uname = fake.join("uname");
-    std::fs::write(
+    write_executable(
         &uname,
         "#!/bin/sh\ncase \"$1\" in -s) echo FreeBSD ;; -m) echo amd64 ;; esac\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let out = env
         .install_cmd(NO_SERVER)
         .env("PATH", format!("{}:/usr/bin:/bin", fake.display()))
@@ -665,7 +663,7 @@ fn update_refuses_without_a_marker() {
     let env = Env::new();
     std::fs::create_dir_all(&env.bin).unwrap();
     for b in ["choco", "chocofactoryd"] {
-        std::fs::copy(target_dir().join(b), env.bin.join(b)).unwrap();
+        copy_executable(&target_dir().join(b), &env.bin.join(b));
     }
     let out = env.choco(NO_SERVER, &["update"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
@@ -896,8 +894,7 @@ fn update_warns_when_another_daemon_won_the_start_race_with_the_wrong_version() 
 
 fn blocking_claude(home: &Path) -> PathBuf {
     let path = home.join("blocking-claude.sh");
-    std::fs::write(&path, "#!/bin/sh\nexec sleep 600\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&path, "#!/bin/sh\nexec sleep 600\n");
     path
 }
 
@@ -1108,7 +1105,7 @@ fn update_leaves_a_daemon_running_from_another_dir_alone() {
     let other = env.home.join("other");
     std::fs::create_dir_all(&other).unwrap();
     for b in ["choco", "chocofactoryd"] {
-        std::fs::copy(target_dir().join(b), other.join(b)).unwrap();
+        copy_executable(&target_dir().join(b), &other.join(b));
     }
     let out = env
         .base_cmd(other.join("choco"), NO_SERVER)
@@ -1173,7 +1170,7 @@ fn update_refuses_a_cargo_install() {
     let env = Env::new();
     let cb = env.home.join(".cargo").join("bin");
     std::fs::create_dir_all(&cb).unwrap();
-    std::fs::copy(target_dir().join("choco"), cb.join("choco")).unwrap();
+    copy_executable(&target_dir().join("choco"), &cb.join("choco"));
     let out = env
         .base_cmd(cb.join("choco"), NO_SERVER)
         .arg("update")
@@ -1658,7 +1655,7 @@ fn other_dir_scenario(json: bool) {
     let other = env.home.join("other");
     std::fs::create_dir_all(&other).unwrap();
     for b in ["choco", "chocofactoryd"] {
-        std::fs::copy(target_dir().join(b), other.join(b)).unwrap();
+        copy_executable(&target_dir().join(b), &other.join(b));
     }
     let out = env
         .base_cmd(other.join("choco"), NO_SERVER)

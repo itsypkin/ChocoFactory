@@ -3,9 +3,9 @@
 //! checks that nothing is left in it. Needs `sh`, `jq`, `git` and `tar`; a
 //! missing one fails the test.
 
+use chocofactory_test_support::write_executable;
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -133,8 +133,7 @@ impl Case {
         );
         let commit = sh(&repo, "git", &["rev-parse", "HEAD"]);
         let fake = dir.join("choco");
-        fs::write(&fake, FAKE).unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&fake, FAKE);
         fs::write(dir.join("watch_code"), watch_code.to_string()).unwrap();
         fs::write(dir.join("events.json"), events.to_string()).unwrap();
         Case {

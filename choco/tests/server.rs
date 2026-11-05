@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chocofactory_core::daemon_lock::{LockState, read_lock};
-use chocofactory_test_support::wait_until_blocking_within;
+use chocofactory_test_support::{copy_executable, wait_until_blocking_within, write_executable};
 use serde_json::Value;
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -130,7 +130,12 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        if let Ok(LockState::Running(info)) = read_lock(&self.root()) {
+        // A few tests publish this process as the lock's owner. They release
+        // the lock before this runs, but a sibling test's child between fork
+        // and exec can still hold it, so it can still read as `Running` here.
+        if let Ok(LockState::Running(info)) = read_lock(&self.root())
+            && info.pid != std::process::id()
+        {
             unsafe { libc::kill(info.pid as i32, libc::SIGKILL) };
         }
         support::kill_processes_under(&self.home);
@@ -176,6 +181,40 @@ fn a_panicking_test_leaves_no_daemon_behind() {
     }
     assert!(gone, "daemon {pid} survived the Env being dropped");
     assert_eq!(support::kill_processes_under(&home), Vec::<i32>::new());
+}
+
+/// `Env::drop` must not kill this process when the lock names it and still
+/// reads as held. Without the check, this test binary dies with SIGKILL.
+#[test]
+fn an_env_dropped_while_the_lock_names_this_process_leaves_it_alive() {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let env = Env::new();
+    std::fs::create_dir_all(env.root()).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(env.root().join("chocofactoryd.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    write!(
+        file,
+        r#"{{"pid":{},"port":59997,"version":"0.0.0","commit":"c","started_at":"2026-01-01T00:00:00Z","exe":"/x"}}"#,
+        std::process::id()
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(env.running().pid, std::process::id());
+
+    let home = env.home.clone();
+    drop(env);
+    assert!(!home.exists(), "the Env's drop did not finish");
+    drop(file);
 }
 
 /// What `stop` prints after it had to SIGKILL the daemon.
@@ -249,10 +288,8 @@ fn wait_for_state(what: &str, f: impl FnMut() -> Result<(), String>) {
 
 /// A fixture "claude" that never finishes a turn.
 fn blocking_claude(env_home: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = env_home.join("blocking-claude.sh");
-    std::fs::write(&path, "#!/bin/sh\nexec sleep 600\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&path, "#!/bin/sh\nexec sleep 600\n");
     path
 }
 
@@ -828,22 +865,19 @@ fn start_times_out_without_killing_a_daemon_that_never_answers_json() {
 }
 
 fn start_times_out_scenario(json: bool) {
-    use std::os::unix::fs::PermissionsExt;
     let env = Env::new();
     let dir = env.home.join("fake");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
+    copy_executable(&target_dir().join("choco"), &dir.join("choco"));
     let pidfile = dir.join("pid");
     let fake = dir.join("chocofactoryd");
-    std::fs::write(
+    write_executable(
         &fake,
         format!(
             "#!/bin/sh\necho $$ > {}\nexec sleep 120\n",
             pidfile.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let mut args = vec!["server", "start", "--port", "0"];
     if json {
@@ -877,20 +911,18 @@ fn start_keeps_waiting_through_an_unreadable_lock_and_reports_it() {
     let env = Env::new();
     let dir = env.home.join("fake");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
+    copy_executable(&target_dir().join("choco"), &dir.join("choco"));
     let pidfile = dir.join("pid");
     let lockfile = env.root().join("chocofactoryd.lock");
     let fake = dir.join("chocofactoryd");
-    std::fs::write(
+    write_executable(
         &fake,
         format!(
             "#!/bin/sh\necho $$ > {}\n: > {lock}\nchmod 000 {lock}\nexec sleep 120\n",
             pidfile.display(),
             lock = lockfile.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let started = std::time::Instant::now();
     let out = env.choco_at(&dir.join("choco"), &["server", "start", "--port", "0"]);
@@ -984,7 +1016,7 @@ fn no_sibling_scenario(json: bool) {
     let env = Env::new();
     let lone = env.home.join("lone");
     std::fs::create_dir_all(&lone).unwrap();
-    std::fs::copy(target_dir().join("choco"), lone.join("choco")).unwrap();
+    copy_executable(&target_dir().join("choco"), &lone.join("choco"));
     let mut args = vec!["server", "start", "--port", "0"];
     if json {
         args.insert(0, "--json");
@@ -1011,26 +1043,23 @@ fn start_that_loses_the_race_reports_the_other_daemon_json() {
 
 fn race_scenario(json: bool) {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
 
     let env = Env::new();
     let dir = env.home.join("race");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
+    copy_executable(&target_dir().join("choco"), &dir.join("choco"));
     // A fake daemon that exits as one that lost the lock race would, but only
     // once the test has published the winner's lock (no sleep to race against).
     let fake = dir.join("chocofactoryd");
     let go = dir.join("go");
-    std::fs::write(
+    write_executable(
         &fake,
         format!(
             "#!/bin/sh\nuntil [ -e '{}' ]; do sleep 0.05; done\nexit 1\n",
             go.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let mut args = vec!["server", "start", "--port", "0"];
     if json {
@@ -1505,23 +1534,20 @@ fn signal_exit(out: &Output) -> Option<i32> {
 }
 
 fn interrupted_start_scenario(json: bool) {
-    use std::os::unix::fs::PermissionsExt;
     let env = Env::new();
     let dir = env.home.join("fake");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(target_dir().join("choco"), dir.join("choco")).unwrap();
+    copy_executable(&target_dir().join("choco"), &dir.join("choco"));
     let pidfile = dir.join("pid");
     let fake = dir.join("chocofactoryd");
     // Started, never ready: no lock, no answer.
-    std::fs::write(
+    write_executable(
         &fake,
         format!(
             "#!/bin/sh\necho $$ > {}\nexec sleep 120\n",
             pidfile.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let mut args = vec!["server", "start", "--port", "0"];
     if json {
@@ -1584,7 +1610,6 @@ fn interrupting_start_leaves_the_same_state_under_json() {
 
 async fn interrupted_stop_scenario(json: bool) {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
     let port = status_server().await;
     let env = Env::new();
@@ -1592,16 +1617,14 @@ async fn interrupted_stop_scenario(json: bool) {
     let ready = env.home.join("handler-installed");
     let script = env.home.join("owner.sh");
     // A daemon stand-in that notes SIGTERM and keeps running.
-    std::fs::write(
+    write_executable(
         &script,
         format!(
             "#!/bin/sh\ntrap 'echo got > {}' TERM\necho ready > {}\nwhile :; do sleep 0.1; done\n",
             receipt.display(),
             ready.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let owner = KillOnDrop::new(
         Command::new(&script)
             .current_dir(&env.home)

@@ -300,6 +300,7 @@ dependencies = [
 name = "chocofactory-test-support"
 version = "0.3.4"
 dependencies = [
+ "libc",
  "tokio",
 ]
 
