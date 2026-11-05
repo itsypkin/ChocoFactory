@@ -7622,6 +7622,7 @@ mod tests {
         let child_pid_file = dir.0.join("child.pid");
         let job_pid_file = dir.0.join("job.pid");
         let release = dir.0.join("release");
+        let ready = dir.0.join("ready");
         let binary = script_binary(
             &dir.0,
             json!([
@@ -7631,8 +7632,12 @@ mod tests {
                     "op": "spawn_escaped", "setsid": true, "double_fork": true,
                     "wait_orphaned": true, "pid_file": job_pid_file,
                 },
-                // Holds the fixture so the "before" readings are taken while
-                // everything it started is alive and settled.
+                // `spawn_escaped` returns only once the intermediate process
+                // has exited, so the job is reparented: this file says the
+                // fixture is there. Then it is held, so the "before"
+                // readings are taken while everything it started is alive
+                // and settled.
+                {"op": "run", "command": format!("touch '{}'", ready.display())},
                 {"op": "wait_file", "path": release},
                 {"op": "report", "outcome": "done"},
                 {"op": "result"},
@@ -7653,6 +7658,14 @@ mod tests {
             match std::fs::metadata(&heartbeat) {
                 Ok(meta) if meta.len() > 0 => Ok(()),
                 other => Err(format!("{other:?}")),
+            }
+        })
+        .await;
+        crate::test_support::wait_until("the fixture to reach its barrier", || async {
+            if ready.exists() {
+                Ok(())
+            } else {
+                Err("not yet".to_string())
             }
         })
         .await;
