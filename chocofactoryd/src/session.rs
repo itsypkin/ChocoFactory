@@ -1746,13 +1746,23 @@ struct TrackerState {
     scan_failures: Vec<String>,
     /// Failed signals to the agent's group, as `"{site}: {error}"`.
     group_kill_errors: Vec<String>,
+    /// Pids a sweep has counted towards the turn's grace decision: the first
+    /// successful by-pid delivery at each, before a sweep's original stop
+    /// point, at any cleanup site. Pid-based on purpose (a reused pid already
+    /// counted stays counted), turn-wide, and separate from `killed`, which
+    /// lists every delivery for diagnostics, late ones included. It only
+    /// deduplicates policy counts and never says whether a process is alive.
+    policy_counted_pids: std::collections::HashSet<i32>,
 }
 
 /// What [`kill_and_sweep`] did at one site.
 struct KillReport {
     group: GroupKill,
-    /// Processes the sweeps of this call delivered SIGKILL to by pid, newly
-    /// listed in the turn's `killed`. A delivered signal is not a confirmed
+    /// Processes the sweeps of this call delivered SIGKILL to by pid, before
+    /// a sweep's original stop point, and that no earlier site of the turn
+    /// had counted (the turn's `policy_counted_pids`). A delivery that only
+    /// the extra observation rounds made is listed in `killed` for
+    /// diagnostics but is not counted. A delivered signal is not a confirmed
     /// death. When the group kill was delivered, the agent's group members
     /// are not counted: they are the group kill's. When it was not, the
     /// sweeps signal them by pid and they are counted.
@@ -1837,7 +1847,10 @@ impl TrackerState {
     /// gone, a zombie, or reused by another process clears it. Then every
     /// pid in `live` is added with this scan's command and start. Vector and
     /// map change together, under the caller's one lock.
-    fn settle_survivors(&mut self, table: &[ProcEntry], live: &[i32]) {
+    ///
+    /// Returns how many survivors that leaves: the observed-live set that the
+    /// last-check warning, the survivor list and the note all report.
+    fn settle_survivors(&mut self, table: &[ProcEntry], live: &[i32]) -> usize {
         let starts = std::mem::take(&mut self.survivor_starts);
         self.survivors.retain(|(pid, _)| {
             starts.get(pid).is_some_and(|start| {
@@ -1872,6 +1885,7 @@ impl TrackerState {
         for (pid, comm, start) in still_alive {
             self.add_survivor(pid, comm, start);
         }
+        self.survivors.len()
     }
 
     /// Records a failed signal to the agent's group, once, for the site that
@@ -1950,12 +1964,14 @@ impl LeftoverTracker {
 
     /// Scans with the marker, SIGKILLs everything owned by pid, and repeats
     /// (bounded) to catch children forked between a scan and its kill.
-    /// Returns how many processes it delivered SIGKILL to by pid and newly
-    /// listed in `killed`, in the rounds up to the one where nothing owned was
-    /// left to signal or watch (what the loop always did). A process found
-    /// and signalled in the rounds that only wait for the leader or group is
-    /// listed in `killed` but not counted. A delivered signal is not a death,
-    /// so the count is not a count of deaths.
+    /// Returns how many processes it delivered SIGKILL to by pid that the
+    /// turn had not yet counted (`policy_counted_pids`), in the rounds up to
+    /// the one where nothing owned was left to signal or watch (what the loop
+    /// always did). A process found and signalled in the rounds that only
+    /// wait for the leader or group is listed in `killed` (diagnostics) but
+    /// neither counted nor entered in the policy history, so a later site
+    /// still counts it. A delivered signal is not a death, so the count is
+    /// not a count of deaths.
     ///
     /// The scan that ends the loop is the *final observation*: it is the one
     /// thing that says what is still running. It covers the agent, its
@@ -2041,14 +2057,17 @@ impl LeftoverTracker {
                         live.push(pid);
                     }
                 }
-                if round == SWEEP_ROUNDS && !live.is_empty() {
+                // One lock settles the survivors and says how many there are,
+                // so the warning counts what the list and the note report:
+                // also a signalled identity the selector no longer owns.
+                let still_running = self.state().settle_survivors(&table, &live);
+                if round == SWEEP_ROUNDS && still_running > 0 {
                     tracing::warn!(
                         site,
-                        count = live.len(),
+                        count = still_running,
                         "still running at the sweep's last check"
                     );
                 }
-                self.state().settle_survivors(&table, &live);
                 break;
             }
             if watched.is_empty() && to_kill.is_empty() {
@@ -2072,9 +2091,14 @@ impl LeftoverTracker {
                         } else {
                             state.killed.push((pid, comm(pid)));
                             delivered_here += 1;
-                            if !past_original_stop {
-                                killed_here += 1;
-                            }
+                        }
+                        // The grace decision counts a pid once per turn, at
+                        // any site, and only before the original stop point.
+                        // `killed` above is diagnostics: a delivery made only
+                        // by the extra rounds is listed there without using
+                        // up the pid's count at a later site.
+                        if !past_original_stop && state.policy_counted_pids.insert(pid) {
+                            killed_here += 1;
                         }
                     }
                     proc_table::PidKill::Gone => {}
@@ -2263,6 +2287,7 @@ async fn write_leftover_notes(
         let mut state = tracker.state();
         state.survivor_starts.clear();
         state.killed_starts.clear();
+        state.policy_counted_pids.clear();
         (
             std::mem::take(&mut state.killed),
             std::mem::take(&mut state.survivors),
@@ -7368,8 +7393,10 @@ mod tests {
         let tracker = sweep_tracker(reader);
         assert_eq!(tracker.sweep(NO_AGENT, None, "site one").await, 1);
         assert!(tracker.state().survivors.is_empty());
-        // Site 2: signalling a pid that is already listed adds nothing to the
-        // count the grace decision reads.
+        // Site 2: signalling a pid the turn already counted for the grace
+        // decision (its policy-counted history, kept by pid) adds nothing to
+        // the count the grace decision reads, though `killed_starts` still
+        // takes the new identity.
         assert_eq!(tracker.sweep(NO_AGENT, None, "site two").await, 0);
         {
             let state = tracker.state();
@@ -7507,7 +7534,8 @@ mod tests {
     /// The owner's round, item 4: a contender that looks at the tracker at
     /// the start of every lock acquisition, where another writer could run,
     /// never sees a partly consumed state. Every finding (killed, survivors
-    /// and both identity maps, failed scans, group errors) leaves together.
+    /// and both identity maps, failed scans, group errors) leaves together,
+    /// with the policy-counted pids. Recorded ownership is not consumed.
     #[tokio::test]
     async fn the_notes_consume_every_finding_under_one_lock() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -7516,6 +7544,8 @@ mod tests {
             let mut state = tracker.state();
             state.killed.push((10, "k".into()));
             state.killed_starts.insert(10, 100);
+            state.policy_counted_pids.insert(10);
+            state.recorded.insert((30, 300));
             state.add_survivor(20, "s".into(), 200);
             state.scan_failures.push("end of turn: read failed".into());
             state
@@ -7535,6 +7565,7 @@ mod tests {
                 !state.survivor_starts.is_empty(),
                 !state.scan_failures.is_empty(),
                 !state.group_kill_errors.is_empty(),
+                !state.policy_counted_pids.is_empty(),
             ];
             if present.iter().any(|p| *p) && !present.iter().all(|p| *p) {
                 seen_torn.lock().unwrap().push(format!("{present:?}"));
@@ -7557,6 +7588,12 @@ mod tests {
                 && state.survivor_starts.is_empty()
                 && state.scan_failures.is_empty()
                 && state.group_kill_errors.is_empty()
+                && state.policy_counted_pids.is_empty()
+        );
+        assert_eq!(
+            state.recorded,
+            std::collections::HashSet::from([(30, 300)]),
+            "recorded ownership is not a consumed finding"
         );
     }
 
@@ -8569,5 +8606,416 @@ mod tests {
         assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
         wait_until_gone(sleep_pid).await;
         wait_until_gone(python_pid).await;
+    }
+
+    // --- diagnostics apart from grace policy ---------------------------------
+
+    /// A table row the marker owns, outside the agent's group, with its own
+    /// command so the tests can tell which scan a name came from.
+    fn escapee_row(pid: i32, start: u64, comm: &str) -> crate::proc_table::ProcEntry {
+        let mut row = marked(sleep_entry(pid, 1, pid, pid, start));
+        row.comm = comm.into();
+        row
+    }
+
+    fn named_leader(agent: i32) -> crate::proc_table::ProcEntry {
+        let mut row = leader_row(agent, agent);
+        row.comm = "leader".into();
+        row
+    }
+
+    /// A row no evidence ties to the turn: its own session and group, no
+    /// marker, parent 1.
+    fn bystander_row(pid: i32) -> crate::proc_table::ProcEntry {
+        let mut row = sleep_entry(pid, 1, pid, pid, 900);
+        row.comm = "bystander".into();
+        row
+    }
+
+    /// The count the production sweep put on its last-round warning, if it
+    /// logged one.
+    fn last_check_count(log: &str) -> Option<usize> {
+        let line = log
+            .lines()
+            .find(|l| l.contains("still running at the sweep's last check"))?;
+        let digits: String = line
+            .split("count=")
+            .nth(1)?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    }
+
+    /// One tracker, three sites, in the order the daemon runs them for a
+    /// completed turn that is shut down: an earlier site, grace, the tail.
+    ///
+    /// The earlier site finds an owned job only in a round past its original
+    /// stop point, so it signals it for the diagnostics without a policy
+    /// count. The job is still there at grace, which finds it before its own
+    /// stop point: that is the count the grace decision reads. The table
+    /// rows after a SIGKILL are scripted visibility, not survival: the real
+    /// process is killed, and left unreaped so a second delivery succeeds.
+    #[tokio::test]
+    async fn cross_site_late_delivery_does_not_suppress_grace_policy() {
+        let (_, daemon_sid) = daemon_ids();
+        let mut escapee = Sleeper::spawn(None, true);
+        let e = escapee.pid();
+        let mut group_member = Sleeper::spawn(None, false);
+        let g = group_member.pid();
+        let mut bystander = Sleeper::spawn(None, true);
+        let b = bystander.pid();
+        let (reader, phase) = phased_reader(move |phase, scan| {
+            let mut table = vec![bystander_row(b)];
+            match (phase, scan) {
+                // Earlier site: the leader, then the job past the stop point.
+                (0, 0) => table.push(leader_row(NO_AGENT, NO_AGENT)),
+                (0, 1) => {
+                    table.push(leader_row(NO_AGENT, NO_AGENT));
+                    table.push(escapee_row(e, 400, "escapee-late"));
+                }
+                // Grace: the job before its stop point, and an owned member
+                // of the group whose kill was delivered (watched, spared).
+                (1, 0..=1) => {
+                    if scan == 0 {
+                        table.push(escapee_row(e, 555, "escapee-grace"));
+                    }
+                    table.push(marked(sleep_entry(g, 1, g, daemon_sid, 300)));
+                }
+                // The tail finds it once more.
+                (2, 0) => table.push(escapee_row(e, 556, "escapee-tail")),
+                _ => {}
+            }
+            Ok(table)
+        });
+        let tracker = sweep_tracker(reader);
+
+        let earlier = tracker.sweep(NO_AGENT, None, "shutdown").await;
+        {
+            let state = tracker.state();
+            assert_eq!(earlier, 0, "a late delivery is not a policy count");
+            assert!(state.policy_counted_pids.is_empty());
+            assert_eq!(state.killed, vec![(e, "escapee-late".to_string())]);
+            assert_eq!(state.killed_starts, HashMap::from([(e, 400)]));
+        }
+        phase.next();
+        let grace = tracker.sweep(NO_AGENT, Some(g), "grace").await;
+        {
+            let state = tracker.state();
+            assert_eq!(grace, 1, "the late discovery must not use up the count");
+            assert_eq!(
+                state.policy_counted_pids,
+                std::collections::HashSet::from([e])
+            );
+            assert_eq!(
+                state.killed,
+                vec![(e, "escapee-grace".to_string())],
+                "listed once, with the latest command"
+            );
+            assert_eq!(state.killed_starts, HashMap::from([(e, 555)]));
+        }
+        assert!(lingered_decision(&GroupKill::NothingAlive, grace));
+        phase.next();
+        let tail = tracker.sweep(NO_AGENT, None, "end of turn").await;
+        assert_eq!(tail, 0, "the tail does not count the pid again");
+        assert_eq!(tracker.state().killed_starts, HashMap::from([(e, 556)]));
+        assert!(
+            lingered_decision(&GroupKill::NothingAlive, grace),
+            "the grace decision was made before the tail and stays"
+        );
+        assert_eq!(escapee.reap_signal(), Some(libc::SIGKILL));
+        assert!(
+            group_member.is_running(),
+            "a spared group member is not signalled"
+        );
+        assert!(
+            bystander.is_running(),
+            "an unrelated process is never signalled"
+        );
+        assert!(
+            !pids_of(&tracker.state().killed).contains(&g)
+                && !pids_of(&tracker.state().killed).contains(&b)
+        );
+
+        // Ordinary earlier delivery: counted once, and a later site signals
+        // the same pid again (redelivery verified through the refreshed
+        // identity) without counting it again. A fresh tracker, so nothing
+        // above can supply the history.
+        let mut ordinary = Sleeper::spawn(None, true);
+        let f = ordinary.pid();
+        let (reader, phase) = phased_reader(move |phase, scan| {
+            Ok(match (phase, scan) {
+                (0, 0) => vec![escapee_row(f, 700, "ordinary-first")],
+                (1, 0) => vec![escapee_row(f, 701, "ordinary-second")],
+                _ => Vec::new(),
+            })
+        });
+        let tracker = sweep_tracker(reader);
+        let earlier = tracker.sweep(NO_AGENT, None, "cancel").await;
+        assert_eq!(earlier, 1);
+        phase.next();
+        let grace = tracker.sweep(NO_AGENT, None, "grace").await;
+        {
+            let state = tracker.state();
+            assert_eq!(
+                (state.killed.clone(), state.killed_starts.clone()),
+                (
+                    vec![(f, "ordinary-second".to_string())],
+                    HashMap::from([(f, 701)])
+                ),
+                "the second signal was delivered, not an ESRCH"
+            );
+        }
+        assert_eq!(grace, 0, "an ordinary earlier delivery already counted");
+        assert_eq!(ordinary.reap_signal(), Some(libc::SIGKILL));
+    }
+
+    /// The whole drain: a completed turn, shut down. The shutdown-style
+    /// cleanup holds the group lock first and finds an owned job only after
+    /// its original stop point; grace, with the event stream still open,
+    /// finds the same job before its own. Both pre-kill checks see nothing
+    /// alive in the group. The run keeps the status and reason it has
+    /// without the earlier discovery.
+    #[tokio::test]
+    async fn shutdown_then_grace_preserves_completed_run_status() {
+        use crate::adapter::{BillingMode, TokenCounts, TurnUsage, UsageCounting};
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let mut escapee = Sleeper::spawn(None, true);
+        let e = escapee.pid();
+        let mut bystander = Sleeper::spawn(None, true);
+        let b = bystander.pid();
+
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("300").process_group(0).kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let leader = child.id().unwrap() as i32;
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (stdin_tx, _stdin_rx) = mpsc::unbounded_channel();
+        let marker = crate::adapter::new_turn_marker().unwrap();
+        let handle = AgentHandle::new(child, events_rx, stdin_tx, marker);
+
+        // Marker scans, in order: 0-2 the earlier site, 3-4 grace, 5 the tail.
+        // The unmarked pre-kill scans see no live group member.
+        let marker_scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&marker_scans);
+        let reader: crate::proc_table::ProcReader = Arc::new(move |marker| {
+            if marker.is_none() {
+                return Ok(Vec::new());
+            }
+            let mut table = vec![bystander_row(b)];
+            match seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => table.push(leader_row(leader, leader)),
+                1 => {
+                    table.push(leader_row(leader, leader));
+                    table.push(escapee_row(e, 400, "escapee-late"));
+                }
+                3 => table.push(escapee_row(e, 555, "escapee-grace")),
+                _ => {}
+            }
+            Ok(table)
+        });
+        let tracker = Arc::new(LeftoverTracker::new(
+            handle.marker().to_string(),
+            SessionKind::SingleShot,
+            reader,
+        ));
+        let signals = SessionSignals {
+            last_activity: Arc::new(Mutex::new(Utc::now())),
+            pgid: Arc::new(Mutex::new(handle.pid())),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(true)),
+            tracker: Arc::clone(&tracker),
+        };
+        let pgid = Arc::clone(&signals.pgid);
+
+        // The report call, its successful result and the end of the turn are
+        // queued before the drain starts; the sender stays open.
+        let report_tool = chocofactory_core::mcp::qualified_report_outcome_tool_name();
+        let tokens = TokenCounts {
+            input: Some(120),
+            output: Some(45),
+            cache_read: Some(900),
+            cache_write: Some(30),
+        };
+        for event in [
+            AgentEvent::ToolCall {
+                tool_use_id: "toolu_report".into(),
+                tool: report_tool.clone(),
+                input: json!({"outcome": "done", "report": "## Summary\nImplemented the change and ran the tests."}),
+            },
+            AgentEvent::ToolResult {
+                tool_use_id: "toolu_report".into(),
+                tool: report_tool,
+                output: "reported: done".into(),
+                is_error: false,
+            },
+            AgentEvent::TurnCompleted {
+                is_error: false,
+                usage: TurnUsage {
+                    cost_usd: Some(0.0123),
+                    tokens,
+                    models: None,
+                    wall_time_ms: Some(4200),
+                    model_turns: Some(3),
+                    billing: BillingMode::Subscription,
+                    counting: UsageCounting::PerTurn,
+                },
+            },
+        ] {
+            events_tx.send(event).unwrap();
+        }
+
+        // The shutdown-style cleanup owns the group lock before the drain
+        // can take it for the turn's end.
+        let held = pgid.lock().await;
+        let drain = tokio::spawn({
+            let (pool, session_id) = (pool.clone(), session_id.clone());
+            async move {
+                let timers = TurnTimers {
+                    grace: StdDuration::from_millis(20),
+                    ..fast_timers(0)
+                };
+                drain_session(
+                    &pool,
+                    &session_id,
+                    handle,
+                    SessionKind::SingleShot,
+                    mpsc::unbounded_channel().1,
+                    signals,
+                    chrono::Duration::hours(1),
+                    &timers,
+                    &Notify::new(),
+                )
+                .await;
+            }
+        });
+        let earlier = kill_and_sweep(&tracker, leader as u32, "shutdown").await;
+        drop(held);
+        assert!(
+            matches!(earlier.group, GroupKill::NothingAlive),
+            "{:?}",
+            earlier.group
+        );
+        assert_eq!(earlier.sweep_killed, 0, "found only past the stop point");
+
+        // Grace's final scan (marker scan 4) is the last thing the stream
+        // must outlive; the sweep's body then runs to its end regardless.
+        crate::test_support::wait_until("grace's final scan", || async {
+            let n = marker_scans.load(std::sync::atomic::Ordering::SeqCst);
+            if n >= 5 {
+                Ok(())
+            } else {
+                Err(format!("{n} marker scans so far"))
+            }
+        })
+        .await;
+        drop(events_tx);
+        drain.await.unwrap();
+
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(
+            (run.status, run.end_reason),
+            (SessionStatus::Exited, Some(SessionEndReason::Lingered)),
+            "cross-site late discovery must preserve the original persisted status and reason"
+        );
+        let lingered = note_message(&pool, &session_id, "lingered").await.unwrap();
+        assert!(
+            lingered.contains("the agent's process group had exited"),
+            "grace's pre-kill check saw nothing alive: {lingered}"
+        );
+        assert_eq!(
+            note_message(&pool, &session_id, "leftovers_killed").await,
+            Some(format!(
+                "killed 1 process(es) the turn left running: {e} (escapee-grace)"
+            ))
+        );
+        assert_eq!(escapee.reap_signal(), Some(libc::SIGKILL));
+        assert!(
+            bystander.is_running(),
+            "an unrelated process is never signalled"
+        );
+        assert_eq!(
+            *pgid.lock().await,
+            None,
+            "the group was retired before the reap"
+        );
+        // SAFETY: signal 0 only checks that the pid exists.
+        assert_eq!(
+            unsafe { libc::kill(leader, 0) },
+            -1,
+            "the leader was reaped"
+        );
+        assert!(tracker.state().policy_counted_pids.is_empty());
+    }
+
+    /// The last-round warning counts what the survivor list and the note
+    /// report: here the leader and a signalled job whose marker is gone, so
+    /// only the signal's identity keeps it in the final set. The job is
+    /// really signalled; its rows after the signal are scripted visibility,
+    /// not survival.
+    #[tokio::test]
+    async fn final_warning_counts_signalled_identity_after_marker_loss() {
+        let a = NO_AGENT;
+        let mut escapee = Sleeper::spawn(None, true);
+        let e = escapee.pid();
+        let mut bystander = Sleeper::spawn(None, true);
+        let b = bystander.pid();
+        let leader = move |_: ()| named_leader(a);
+        let reader = scripted_reader(move |call| match call {
+            // The marker shows in the first scan only.
+            Some(1) => vec![leader(()), escapee_row(e, 400, "escapee"), bystander_row(b)],
+            _ => {
+                let mut row = sleep_entry(e, 1, e, e, 400);
+                row.comm = "escapee".into();
+                vec![leader(()), row, bystander_row(b)]
+            }
+        });
+        let tracker = sweep_tracker(reader);
+        let (log, guard) = capture_logs();
+        tracker.sweep(a, None, "grace").await;
+        let log_text = log.text();
+        drop(guard);
+        assert_eq!(
+            last_check_count(&log_text),
+            Some(2),
+            "final warning must count the leader and the live signalled identity: {log_text}"
+        );
+        {
+            let state = tracker.state();
+            assert_eq!(sorted(pids_of(&state.survivors)), vec![e, a]);
+            assert_eq!(state.survivor_starts, HashMap::from([(e, 400), (a, 100)]));
+            assert_paired(&state);
+        }
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(
+            killed_note,
+            Some(format!(
+                "2 still running at the last check: {e} (escapee), {a} (leader)"
+            ))
+        );
+        assert_eq!(unchecked, None);
+        assert_eq!(escapee.reap_signal(), Some(libc::SIGKILL));
+        assert!(bystander.is_running());
+
+        // The same job named by all three sources at once (marker, group,
+        // signal) is one process, counted once.
+        let mut both = Sleeper::spawn(None, true);
+        let o = both.pid();
+        let reader = scripted_reader(move |_| {
+            let mut row = marked(sleep_entry(o, 1, a, o, 400));
+            row.comm = "overlap".into();
+            vec![leader(()), row, bystander_row(b)]
+        });
+        let tracker = sweep_tracker(reader);
+        let (log, guard) = capture_logs();
+        tracker.sweep(a, None, "grace").await;
+        let log_text = log.text();
+        drop(guard);
+        assert_eq!(last_check_count(&log_text), Some(2), "{log_text}");
+        assert_eq!(sorted(pids_of(&tracker.state().survivors)), vec![o, a]);
+        assert_eq!(both.reap_signal(), Some(libc::SIGKILL));
+        assert!(bystander.is_running());
     }
 }

@@ -266,7 +266,20 @@ when it ends *after* the agent called `report_outcome`:
   None of this changes how the turn ended or whether the task advances: the
   extra waiting for a leader or group member that is still exiting does not
   count towards whether the turn lingered, which is decided by what the check
-  before the kill saw and what the first rounds of the sweep had to signal. A
+  before the kill saw and what the first rounds of the sweep had to signal.
+  That also holds across the turn's cleanup sites (a cancel, pause or
+  shutdown kill, then the grace kill, then the end-of-turn kill): a process
+  that an earlier site signalled only in those extra rounds is still listed
+  as signalled, but it does not use up the count the grace decision reads,
+  while one an earlier site signalled before its stop point is counted once
+  and not again. The last-check warning in the daemon log, the survivor list
+  and the "still running" clause of the note all report the same final
+  observation: the processes that check saw alive, including one choco had
+  signalled whose marker and tree link are gone by then. Two such processes
+  are "2 still running", and that is two processes seen, not two kills or two
+  deaths. A later site's check replaces an earlier one's. A check that could
+  not read the table is still unknown, also after a SIGKILL was delivered:
+  it never counts as zero survivors. A
   process counts as the turn's if it
   descends from the agent, was seen descending from it earlier, carries
   the turn's marker in its environment, or shares a session with one that

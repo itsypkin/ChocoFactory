@@ -92,7 +92,12 @@ and `choco task list --status stuck` finds every stuck task.
   agent's own process group and what the last check still saw running. A
   `lingered` run with a successful last check and no `leftovers_*` note means
   that check found nothing left, which is the normal case of only the agent's
-  group being alive. A failed read supplies no such check: `leftovers_unchecked`
+  group being alive. The "still running" clause and the daemon log's
+  last-check warning count the same final observation (a leader plus a
+  process choco had signalled that dropped its marker is "2 still running":
+  two processes seen, not two deaths), and a later cleanup site's check
+  replaces an earlier one's. An extra check that finds a leftover after the
+  first rounds does not by itself change whether the run is `lingered`. A failed read supplies no such check: `leftovers_unchecked`
   means nothing confirms the processes are gone, whatever else is said, and with
   every read failing it is the only `leftovers_*` note (the `lingered` note is
   written too). The turn may have been writing to the worktree until then, so
