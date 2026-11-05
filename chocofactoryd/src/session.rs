@@ -6901,46 +6901,16 @@ mod tests {
 
     // --- what the logs say ------------------------------------------------------
 
-    /// A log sink one test owns. The subscriber is installed for this thread
-    /// only (`#[tokio::test]` runs on it), so parallel tests cannot see each
-    /// other's lines.
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    use crate::test_support::LogBuf;
 
-    impl LogBuf {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for LogBuf {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-        type Writer = LogBuf;
-
-        fn make_writer(&'a self) -> LogBuf {
-            self.clone()
-        }
-    }
-
+    /// Captures this thread's log, DEBUG and above, through the shared
+    /// helper whose `KEEPER` stops another thread reaching a log line first
+    /// from hiding it (`#[tokio::test]` runs on this thread, so parallel
+    /// tests cannot see each other's lines).
     fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
         let buf = LogBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .without_time()
-            .with_max_level(tracing::Level::DEBUG)
-            .finish();
-        (buf, tracing::subscriber::set_default(subscriber))
+        let guard = buf.capture_at(tracing::Level::DEBUG);
+        (buf, guard)
     }
 
     const NOT_VERIFIED: &str =
