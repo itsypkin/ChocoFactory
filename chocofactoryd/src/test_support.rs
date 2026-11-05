@@ -70,3 +70,22 @@ pub(crate) fn late_discovery_reader(
         }])
     })
 }
+
+/// Kills the process whose pid is in the file when dropped, so a test that
+/// fails (or never gets that far) leaves no orphaned job behind. Declare it
+/// after the test's temporary directory, so it drops first and the file is
+/// still there. A missing or unparseable file means there is nothing to kill.
+pub(crate) struct KillPidFileOnDrop(pub(crate) std::path::PathBuf);
+
+impl Drop for KillPidFileOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = std::fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 1)
+        {
+            // SAFETY: signals only the pid the test's own fixture wrote.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}

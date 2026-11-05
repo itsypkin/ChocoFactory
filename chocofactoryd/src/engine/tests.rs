@@ -12240,6 +12240,7 @@ async fn a_job_found_while_the_sweep_waits_for_the_leader_does_not_park_the_task
     let task_id = seed_task(&pool, &def.name).await;
     let leader_file = dir.join("leader.pid");
     let job_file = dir.join("job.pid");
+    let _job_guard = crate::test_support::KillPidFileOnDrop(job_file.clone());
     let binary = script_binary(
         &dir,
         crate::test_support::escaped_job_turn_steps(&leader_file, &job_file),

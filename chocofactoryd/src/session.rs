@@ -1975,6 +1975,9 @@ impl LeftoverTracker {
         let (daemon_sid, uid) = unsafe { (libc::getsid(0), libc::geteuid()) };
         let mut failed = std::collections::HashSet::new();
         let mut killed_here = 0usize;
+        // Every pid this sweep newly signalled, for the warning below. Unlike
+        // `killed_here` it also counts the rounds past the old stop point.
+        let mut delivered_here = 0usize;
         // Set once a round has had nothing owned left to signal or watch: the
         // point where this loop used to stop. The rounds after it exist only
         // to observe a leader or group member that is still exiting. They
@@ -2060,9 +2063,15 @@ impl LeftoverTracker {
                         // Delivered, not confirmed: only a later final
                         // observation can clear a survivor.
                         let mut state = self.state();
-                        if !state.killed.iter().any(|(p, _)| *p == pid) {
+                        // The latest signalled identity at this pid, listed
+                        // before or not: a reused pid signalled again is a
+                        // new process, and the final scan must match it.
+                        state.killed_starts.insert(pid, start(pid));
+                        if let Some(entry) = state.killed.iter_mut().find(|(p, _)| *p == pid) {
+                            entry.1 = comm(pid);
+                        } else {
                             state.killed.push((pid, comm(pid)));
-                            state.killed_starts.insert(pid, start(pid));
+                            delivered_here += 1;
                             if !past_original_stop {
                                 killed_here += 1;
                             }
@@ -2078,10 +2087,10 @@ impl LeftoverTracker {
             }
             tokio::time::sleep(SWEEP_INTERVAL).await;
         }
-        if killed_here > 0 {
+        if delivered_here > 0 {
             tracing::warn!(
                 site,
-                signalled = killed_here,
+                signalled = delivered_here,
                 "sent SIGKILL to processes left behind by the turn"
             );
         }
@@ -7370,6 +7379,161 @@ mod tests {
         );
     }
 
+    /// Internal review, finding 1: one tracker, two sites. Site 1 signals X
+    /// (start 400) and its final scan is empty. At site 2 the pid is another
+    /// process (start 999), the selector owns it on the first scan and signals
+    /// it, then it loses its marker. The final scan still shows that second
+    /// identity, so it is a survivor: the map must hold the latest signalled
+    /// start, not the first.
+    #[tokio::test]
+    async fn a_reused_pid_signalled_again_is_matched_by_its_new_start() {
+        let mut x = Sleeper::spawn(None, true);
+        let xp = x.pid();
+        let reader = scripted_reader(move |call| match call {
+            Some(1) => vec![marked(sleep_entry(xp, 1, xp, xp, 400))],
+            Some(2) => Vec::new(),
+            Some(3) => vec![marked(sleep_entry(xp, 1, xp, xp, 999))],
+            _ => vec![sleep_entry(xp, 1, xp, xp, 999)],
+        });
+        let tracker = sweep_tracker(reader);
+        assert_eq!(tracker.sweep(NO_AGENT, None, "site one").await, 1);
+        assert!(tracker.state().survivors.is_empty());
+        // Site 2: signalling a pid that is already listed adds nothing to the
+        // count the grace decision reads.
+        assert_eq!(tracker.sweep(NO_AGENT, None, "site two").await, 0);
+        {
+            let state = tracker.state();
+            assert_eq!(
+                pids_of(&state.survivors),
+                vec![xp],
+                "the second identity at this pid is still live"
+            );
+            assert_eq!(state.survivor_starts, HashMap::from([(xp, 999)]));
+            assert_eq!(state.killed_starts, HashMap::from([(xp, 999)]));
+        }
+        assert_eq!(x.reap_signal(), Some(libc::SIGKILL));
+        let (killed_note, unchecked) = written_notes(&tracker).await;
+        assert_eq!(
+            killed_note,
+            Some(format!("1 still running at the last check: {xp} (sleep)"))
+        );
+        assert_eq!(unchecked, None);
+    }
+
+    /// Internal review, finding 3: a signalled pid whose last row is a zombie
+    /// has exited, so it is killed, not a survivor. Only the signalled
+    /// identity's own matcher can say this: nothing was listed before.
+    #[tokio::test]
+    async fn a_signalled_process_that_is_a_zombie_at_the_last_check_is_gone() {
+        let mut x = Sleeper::spawn(None, true);
+        let xp = x.pid();
+        let reader = scripted_reader(move |call| match call {
+            Some(1) => vec![marked(sleep_entry(xp, 1, xp, xp, 400))],
+            _ => {
+                let mut entry = sleep_entry(xp, 1, xp, xp, 400);
+                entry.zombie = true;
+                vec![entry]
+            }
+        });
+        let tracker = sweep_tracker(reader);
+        tracker.sweep(NO_AGENT, None, "end of turn").await;
+        assert_eq!(x.reap_signal(), Some(libc::SIGKILL));
+        {
+            let state = tracker.state();
+            assert!(
+                state.survivors.is_empty(),
+                "a signalled zombie is gone, not a survivor: {:?}",
+                state.survivors
+            );
+        }
+        let (killed_note, _) = written_notes(&tracker).await;
+        assert_eq!(
+            killed_note,
+            Some(format!(
+                "killed 1 process(es) the turn left running: {xp} (sleep)"
+            ))
+        );
+    }
+
+    /// Internal review, finding 2: the warning counts every process a sweep
+    /// signalled, including those found by the rounds that only wait for the
+    /// leader, while the returned total (read by the grace decision) does not.
+    #[tokio::test]
+    async fn the_signal_warning_counts_late_deliveries_the_total_does_not() {
+        let leader = Sleeper::spawn(None, false);
+        let lp = leader.pid();
+        let leader_entry = move || sleep_entry(lp, 1, lp, lp, 10);
+        let mut late = Sleeper::spawn(None, true);
+        let late_pid = late.pid();
+        let mut early = Sleeper::spawn(None, true);
+        let early_pid = early.pid();
+        let mut later = Sleeper::spawn(None, true);
+        let later_pid = later.pid();
+
+        // Only a late delivery: the first table has just the leader.
+        let (log, _guard) = capture_logs();
+        let reader = scripted_reader(move |call| match call {
+            Some(1) => vec![leader_entry()],
+            Some(2) => vec![
+                leader_entry(),
+                marked(sleep_entry(late_pid, 1, late_pid, late_pid, 400)),
+            ],
+            _ => Vec::new(),
+        });
+        let total = sweep_tracker(reader).sweep(lp, None, "late only").await;
+        assert_eq!(total, 0, "the policy total ignores the late delivery");
+        assert_eq!(late.reap_signal(), Some(libc::SIGKILL));
+        let text = log.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("sent SIGKILL to processes left behind"))
+            .unwrap_or_else(|| panic!("no signal warning: {text}"));
+        assert!(line.contains("signalled=1"), "{line}");
+
+        // One early and one late delivery.
+        let (log, _guard) = capture_logs();
+        let reader = scripted_reader(move |call| match call {
+            Some(1) => vec![
+                leader_entry(),
+                marked(sleep_entry(early_pid, 1, early_pid, early_pid, 500)),
+            ],
+            Some(2) => vec![leader_entry()],
+            Some(3) => vec![
+                leader_entry(),
+                marked(sleep_entry(later_pid, 1, later_pid, later_pid, 600)),
+            ],
+            _ => Vec::new(),
+        });
+        let total = sweep_tracker(reader)
+            .sweep(lp, None, "early and late")
+            .await;
+        assert_eq!(total, 1, "only the delivery before the old stop counts");
+        assert_eq!(early.reap_signal(), Some(libc::SIGKILL));
+        assert_eq!(later.reap_signal(), Some(libc::SIGKILL));
+        let text = log.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("sent SIGKILL to processes left behind"))
+            .unwrap_or_else(|| panic!("no signal warning: {text}"));
+        assert!(line.contains("signalled=2"), "{line}");
+    }
+
+    /// The guard that keeps the late-discovery tests from leaking their job
+    /// kills the process named in its pid file, and does nothing for a file
+    /// that was never written.
+    #[test]
+    fn the_pid_file_guard_kills_the_process_it_names() {
+        let dir = TempDir::new();
+        let file = dir.0.join("job.pid");
+        let mut sleeper = Sleeper::spawn(None, true);
+        std::fs::write(&file, sleeper.pid().to_string()).unwrap();
+        drop(crate::test_support::KillPidFileOnDrop(file));
+        assert_eq!(sleeper.reap_signal(), Some(libc::SIGKILL));
+        drop(crate::test_support::KillPidFileOnDrop(
+            dir.0.join("none.pid"),
+        ));
+    }
+
     /// The owner's round, item 4: a contender that looks at the tracker at
     /// the start of every lock acquisition, where another writer could run,
     /// never sees a partly consumed state. Every finding (killed, survivors
@@ -7436,6 +7600,7 @@ mod tests {
         let dir = TempDir::new();
         let leader_file = dir.0.join("leader.pid");
         let job_file = dir.0.join("job.pid");
+        let _job_guard = crate::test_support::KillPidFileOnDrop(job_file.clone());
         let binary = script_binary(
             &dir.0,
             crate::test_support::escaped_job_turn_steps(&leader_file, &job_file),
