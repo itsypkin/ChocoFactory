@@ -12264,17 +12264,35 @@ async fn a_job_found_while_the_sweep_waits_for_the_leader_does_not_park_the_task
     );
 
     engine.start_task(&task_id, &def, Some("go")).await.unwrap();
-    wait_until_task_status(&pool, &task_id, "closed").await;
-
-    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-    assert_eq!(task.status, "closed");
-    assert_eq!(task.stuck_reason, None);
-    let trail = stage_trail(&pool, &task_id).await;
+    // Any settled state ends the wait, so a task parked "stuck" fails the
+    // status assertion below instead of timing out on a "closed" that never
+    // comes. An open task is still running its turn: not yet.
+    let task = crate::test_support::wait_until(
+        &format!("task {task_id} to settle (closed, stuck or cancelled)"),
+        || async {
+            let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+            match task.status.as_str() {
+                "closed" | "stuck" | "cancelled" => Ok(task),
+                other => Err(format!("status {other:?}")),
+            }
+        },
+    )
+    .await;
     assert_eq!(
-        trail.last().map(|(stage, _)| stage.as_str()),
-        Some("finished"),
-        "{trail:?}"
+        task.status, "closed",
+        "observation-only discovery must not change task status"
     );
+    assert_eq!(task.stuck_reason, None);
+    assert_eq!(
+        stage_trail(&pool, &task_id).await,
+        vec![
+            ("coding".to_string(), Value::Null),
+            ("finished".to_string(), json!("done")),
+        ]
+    );
+    let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(state.current_stage, "finished");
+    assert_eq!(state.stage_kind.as_deref(), Some("terminal"));
     let job: u32 = std::fs::read_to_string(&job_file)
         .unwrap()
         .trim()
