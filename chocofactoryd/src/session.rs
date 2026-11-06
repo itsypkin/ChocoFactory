@@ -4448,6 +4448,66 @@ mod tests {
         assert_eq!(run.status, SessionStatus::Idle, "clean EOF after the close");
     }
 
+    /// The fixture's report results are the shapes the real CLI sends: a
+    /// success has no `is_error` key and array content naming the outcome; a
+    /// rejection is `is_error: true` with string content. The call's tool
+    /// name is the one Rust builds, not a copy of it.
+    #[test]
+    fn the_script_fixtures_report_results_have_the_real_cli_shapes() {
+        let dir = TempDir::new();
+        let script = dir.0.join("script.json");
+        std::fs::write(
+            &script,
+            json!([
+                {"op": "report", "outcome": "done"},
+                {"op": "report", "outcome": "lgtm", "is_error": true},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(fixture_binary("fake_claude_script.py"))
+            .env("FAKE_CLAUDE_SCRIPT", &script)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let lines: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let blocks = |kind: &str| -> Vec<serde_json::Value> {
+            lines
+                .iter()
+                .flat_map(|l| {
+                    l["message"]["content"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter(|b| b["type"] == kind)
+                .collect()
+        };
+        let calls = blocks("tool_use");
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert_eq!(
+                call["name"],
+                chocofactory_core::mcp::qualified_report_outcome_tool_name()
+            );
+        }
+        let results = blocks("tool_result");
+        assert_eq!(results.len(), 2);
+        let success = results[0].as_object().unwrap();
+        assert!(!success.contains_key("is_error"), "{success:?}");
+        assert_eq!(
+            results[0]["content"],
+            json!([{"type": "text", "text": "Accepted outcome 'done'."}])
+        );
+        assert_eq!(results[1]["is_error"], true);
+        assert!(results[1]["content"].is_string());
+    }
+
     /// Neither a top-level nor a wrapped `ProtocolError` is main-agent
     /// activity, and neither changes what the turn is waiting for.
     #[test]
@@ -4463,8 +4523,10 @@ mod tests {
                 event: Box::new(diagnostic),
             },
         ] {
-            let mut turn = SingleShotTurn::default();
-            turn.waiting_for_report = true;
+            let mut turn = SingleShotTurn {
+                waiting_for_report: true,
+                ..Default::default()
+            };
             turn.pending_reports.insert("toolu_01pending".to_string());
             assert!(matches!(turn.observe(&event), TurnStep::Continue));
             assert!(
