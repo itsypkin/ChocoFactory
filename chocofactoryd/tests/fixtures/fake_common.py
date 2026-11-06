@@ -360,20 +360,30 @@ def emit_report(
         },
         "session_id": session_id,
     }
-    result = {
-        "type": "user",
-        "message": {
+    # The real CLI leaves `is_error` off a successful result and gives its
+    # content as an array of text blocks; a rejection is `is_error: true`
+    # with a plain string.
+    if is_error:
+        block = {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": "outcome not allowed",
+            "is_error": True,
+        }
+    else:
+        block = {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
             "content": [
                 {
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": "outcome not allowed"
-                    if is_error
-                    else "Recorded outcome '{}'.".format(report_input.get("outcome")),
-                    "is_error": is_error,
+                    "type": "text",
+                    "text": "Accepted outcome '{}'.".format(report_input.get("outcome")),
                 }
-            ]
-        },
+            ],
+        }
+    result = {
+        "type": "user",
+        "message": {"content": [block]},
         "session_id": session_id,
     }
     if parent is not None:

@@ -136,6 +136,20 @@ and `choco task list --status stuck` finds every stuck task.
   other retry (a fresh session) baselines whatever is in the worktree at
   that point, so reset it first. The check also runs when a read-only turn
   crashes or ends without reporting; the stuck reason then carries both.
+- An `error` event on the session whose message starts `malformed CLI output:`
+  names native output choco did not count. Three cases: a whole line with a
+  bad `parent_tool_use_id` (nothing from that line counted, and if it was the
+  turn's `result` line the turn has no observed end and may wait for the idle
+  reaper); one block of a line (a tool call or result with a bad id, name or
+  `is_error`), after which a report that therefore never registered is the
+  usual cause of the stuck state; or a `result` line whose own `is_error` was
+  not `true`/`false`, which makes that line's scope end in an error rather
+  than a clean end: for a main-agent line the turn ends as an error, and the
+  `turn_completed` event with `is_error` true follows the diagnostic if its
+  write succeeded; for a sub-agent line (the events carry a
+  `parent_tool_use_id`) only that helper's end is an error and the main turn
+  can still finish cleanly. Read it together with the turn's last events
+  before retrying. It is not a reason to restart the daemon.
 
 ## `escalate_to_human`: watch again or send a note
 

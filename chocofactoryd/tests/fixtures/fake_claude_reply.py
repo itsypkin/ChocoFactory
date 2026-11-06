@@ -137,7 +137,7 @@ def main():
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_use_id,
-                            "content": f"Recorded outcome '{outcome}'.",
+                            "content": f"Accepted outcome '{outcome}'.",
                         }
                     ]
                 },
