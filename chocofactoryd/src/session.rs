@@ -1831,15 +1831,15 @@ fn lingered_after(report: &KillReport) -> bool {
 }
 
 /// The `lingered` note when the group had nothing alive and the only count
-/// is an earlier cleanup's kill, which is still counted as left running. It
-/// says only that kill and its consequence: a deduplicated count of zero at
-/// grace does not show that grace's own sweep saw or signalled nothing (it may
+/// is an earlier cleanup's signal delivery, still counted as left running.
+/// Claims a delivery, never a death: a deduplicated count of zero at grace
+/// does not show that grace's own sweep saw or signalled nothing (it may
 /// have signalled the carried process again, or failed to read the table).
 fn lingered_carried_message(grace_s: f32, after: &str) -> String {
     format!(
         "the agent's process group had exited {grace_s:.1}s after {after}; an earlier \
-         cleanup of this turn had killed a process it started, so the run is recorded as \
-         lingered"
+         cleanup of this turn sent SIGKILL to a process it started, so the run is recorded \
+         as lingered"
     )
 }
 
@@ -8890,11 +8890,10 @@ mod tests {
     }
 
     /// The whole drain: a completed turn, shut down. The shutdown-style
-    /// cleanup holds the group lock first and finds an owned job only after
-    /// its original stop point; grace, with the event stream still open,
-    /// finds the same job before its own. Both pre-kill checks see nothing
-    /// alive in the group. The run keeps the status and reason it has
-    /// without the earlier discovery.
+    /// cleanup finds an owned job only after its original stop point, and
+    /// grace carries that delivery. Controlled tables keep the same identity
+    /// visible through grace and the tail: scripted visibility after real
+    /// SIGKILL delivery, not OS survival. Neither note may call it killed.
     #[tokio::test]
     async fn shutdown_then_grace_preserves_completed_run_status() {
         let pool = connect_in_memory().await.unwrap();
@@ -8913,7 +8912,7 @@ mod tests {
         let marker = crate::adapter::new_turn_marker().unwrap();
         let handle = AgentHandle::new(child, events_rx, stdin_tx, marker);
 
-        // Marker scans, in order: 0-2 the earlier site, 3-4 grace, 5 the tail.
+        // Every sweep uses all its rounds while the same job stays visible.
         // The unmarked pre-kill scans see no live group member.
         let marker_scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = Arc::clone(&marker_scans);
@@ -8922,14 +8921,12 @@ mod tests {
                 return Ok(Vec::new());
             }
             let mut table = vec![bystander_row(b)];
-            match seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                0 => table.push(leader_row(leader, leader)),
-                1 => {
-                    table.push(leader_row(leader, leader));
-                    table.push(escapee_row(e, 400, "escapee-late"));
-                }
-                3 => table.push(escapee_row(e, 555, "escapee-grace")),
-                _ => {}
+            let scan = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if scan <= 1 {
+                table.push(leader_row(leader, leader));
+            }
+            if scan > 0 {
+                table.push(escapee_row(e, 400, "escapee"));
             }
             Ok(table)
         });
@@ -8985,11 +8982,11 @@ mod tests {
         );
         assert_eq!(earlier.sweep_killed, 0, "found only past the stop point");
 
-        // Grace's final scan (marker scan 4) is the last thing the stream
-        // must outlive; the sweep's body then runs to its end regardless.
+        // Hold the event stream through grace's final observation, after the
+        // earlier sweep has already used all its rounds.
         crate::test_support::wait_until("grace's final scan", || async {
             let n = marker_scans.load(std::sync::atomic::Ordering::SeqCst);
-            if n >= 5 {
+            if n >= 2 * (SWEEP_ROUNDS + 1) {
                 Ok(())
             } else {
                 Err(format!("{n} marker scans so far"))
@@ -9005,7 +9002,17 @@ mod tests {
             (SessionStatus::Exited, Some(SessionEndReason::Lingered)),
             "cross-site late discovery must preserve the original persisted status and reason"
         );
+        assert_eq!(
+            note_message(&pool, &session_id, "leftovers_killed").await,
+            Some(format!("1 still running at the last check: {e} (escapee)")),
+            "the carried identity is still observed at the tail's last check"
+        );
         let lingered = note_message(&pool, &session_id, "lingered").await.unwrap();
+        assert!(
+            lingered.contains("an earlier cleanup of this turn sent SIGKILL to a process")
+                && !lingered.contains("killed"),
+            "a carry-only note claims SIGKILL delivery, never death: {lingered}"
+        );
         assert!(
             lingered.contains("the agent's process group had exited"),
             "grace's pre-kill check saw nothing alive: {lingered}"
@@ -9014,16 +9021,8 @@ mod tests {
         // already covers it, so grace's own count is zero. The note must not
         // claim grace found or signalled nothing.
         assert!(
-            lingered.contains("an earlier cleanup of this turn had killed a process")
-                && !lingered.contains("nothing to signal")
-                && !lingered.contains("found nothing"),
+            !lingered.contains("nothing to signal") && !lingered.contains("found nothing"),
             "a deduplicated count of zero says nothing about what grace signalled: {lingered}"
-        );
-        assert_eq!(
-            note_message(&pool, &session_id, "leftovers_killed").await,
-            Some(format!(
-                "killed 1 process(es) the turn left running: {e} (escapee-grace)"
-            ))
         );
         assert_eq!(escapee.reap_signal(), Some(libc::SIGKILL));
         assert!(
@@ -9286,11 +9285,11 @@ mod tests {
         );
         let lingered = note_message(&pool, &session_id, "lingered").await.unwrap();
         assert!(
-            lingered.contains("an earlier cleanup of this turn had killed a process")
-                && !lingered.contains("sent")
+            lingered.contains("an earlier cleanup of this turn sent SIGKILL to a process")
+                && !lingered.contains("killed")
                 && !lingered.contains("still running")
                 && !lingered.contains("found nothing"),
-            "the note names only the earlier kill: {lingered}"
+            "the note names only the earlier signal delivery: {lingered}"
         );
         assert_eq!(
             note_message(&pool, &session_id, "leftovers_killed").await,
