@@ -1020,6 +1020,15 @@ fn normalize(
     tool_names: &mut HashMap<String, String>,
     billing: &mut BillingMode,
 ) -> Vec<AgentEvent> {
+    // Whether the line's `parent_tool_use_id` has a shape the attribution
+    // below can use. A line that fails this is dropped whole (when it has
+    // any events), so whatever it would have registered in `tool_names` must
+    // not survive it either.
+    let parent_shape_ok = match value.get("parent_tool_use_id") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(p)) => !p.is_empty(),
+        Some(_) => false,
+    };
     let events = match value.get("type").and_then(Value::as_str) {
         Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
             if value.get("parent_tool_use_id").is_none_or(Value::is_null) {
@@ -1055,7 +1064,9 @@ fn normalize(
                 running: parse_background_jobs(value),
             }]
         }
-        Some("assistant") => normalize_assistant(value, tool_names),
+        Some("assistant") if parent_shape_ok => normalize_assistant(value, tool_names),
+        // Normalized against a scratch copy that is then thrown away.
+        Some("assistant") => normalize_assistant(value, &mut tool_names.clone()),
         Some("user") => normalize_user(value, tool_names),
         Some("result") => normalize_result(value, *billing),
         Some("control_response") => normalize_control_response(value),
@@ -1081,15 +1092,56 @@ fn normalize(
     // it (#90, confirmed against a real session). Wrapped here, at the one
     // place that sees the raw line, so nothing downstream can mistake a
     // delegated helper's tool call or reply for the main agent's.
-    match value.get("parent_tool_use_id").and_then(Value::as_str) {
-        Some(parent) => events
+    match value.get("parent_tool_use_id") {
+        None | Some(Value::Null) => events,
+        Some(Value::String(parent)) if !parent.is_empty() => events
             .into_iter()
             .map(|event| AgentEvent::Subagent {
-                parent_tool_use_id: parent.to_string(),
+                parent_tool_use_id: parent.clone(),
                 event: Box::new(event),
             })
             .collect(),
-        None => events,
+        // Nothing to attribute, so nothing to refuse.
+        Some(_) if events.is_empty() => events,
+        // Whose events these are is unknown, so none of them may count as
+        // the main agent's: the whole line becomes one diagnostic.
+        Some(other) => vec![AgentEvent::ProtocolError {
+            message: format!(
+                "malformed CLI output: parent_tool_use_id is {}, not a non-empty string or null",
+                kind(Some(other))
+            ),
+        }],
+    }
+}
+
+/// What a JSON value (or its absence) is, for a `ProtocolError` message.
+/// `None` is a field that is not there at all, which reads differently from
+/// an explicit `null`.
+fn kind(value: Option<&Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "a boolean",
+        Some(Value::Number(_)) => "a number",
+        Some(Value::String(s)) if s.is_empty() => "an empty string",
+        Some(Value::String(_)) => "a string",
+        Some(Value::Array(_)) => "an array",
+        Some(Value::Object(_)) => "an object",
+    }
+}
+
+fn protocol_error(detail: String) -> AgentEvent {
+    AgentEvent::ProtocolError {
+        message: format!("malformed CLI output: {detail}"),
+    }
+}
+
+/// A field that must be a non-empty string. No trimming and no character
+/// set: only the shapes that would otherwise be defaulted to `""`.
+fn non_empty_str(value: Option<&Value>) -> Result<&str, &'static str> {
+    match value {
+        Some(Value::String(s)) if !s.is_empty() => Ok(s),
+        other => Err(kind(other)),
     }
 }
 
@@ -1195,21 +1247,38 @@ fn normalize_assistant(value: &Value, tool_names: &mut HashMap<String, String>) 
                 }
             }
             Some("tool_use") => {
-                let tool_use_id = block
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let tool = block
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                let id = match non_empty_str(block.get("id")) {
+                    Ok(id) => id,
+                    Err(found) => {
+                        out.push(protocol_error(format!("a tool_use block's id is {found}")));
+                        continue;
+                    }
+                };
+                let name = match non_empty_str(block.get("name")) {
+                    Ok(name) => name,
+                    Err(found) => {
+                        out.push(protocol_error(format!(
+                            "a tool_use block's name is {found}"
+                        )));
+                        continue;
+                    }
+                };
+                // An id is the only key a result is matched back to its call
+                // by, so a second call may not quietly rename it. The first
+                // mapping stays as it was.
+                if let Some(old) = tool_names.get(id)
+                    && old != name
+                {
+                    out.push(protocol_error(format!(
+                        "tool_use id '{id}' was already used for tool '{old}', now for '{name}'"
+                    )));
+                    continue;
+                }
                 let input = block.get("input").cloned().unwrap_or(Value::Null);
-                tool_names.insert(tool_use_id.clone(), tool.clone());
+                tool_names.insert(id.to_string(), name.to_string());
                 out.push(AgentEvent::ToolCall {
-                    tool_use_id,
-                    tool,
+                    tool_use_id: id.to_string(),
+                    tool: name.to_string(),
                     input,
                 });
             }
@@ -1228,16 +1297,30 @@ fn normalize_user(value: &Value, tool_names: &HashMap<String, String>) -> Vec<Ag
         if block.get("type").and_then(Value::as_str) != Some("tool_result") {
             continue;
         }
-        let tool_use_id = block
-            .get("tool_use_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let tool_use_id = match non_empty_str(block.get("tool_use_id")) {
+            Ok(id) => id.to_string(),
+            Err(found) => {
+                out.push(protocol_error(format!(
+                    "a tool_result block's tool_use_id is {found}"
+                )));
+                continue;
+            }
+        };
         let tool = tool_names.get(&tool_use_id).cloned().unwrap_or_default();
-        let is_error = block
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        // The CLI leaves `is_error` off a successful result (824 of 824
+        // observed successful `report_outcome` results did), so absent is
+        // success. Anything present that is not a boolean is not.
+        let is_error = match block.get("is_error") {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(other) => {
+                out.push(protocol_error(format!(
+                    "a tool_result block's is_error is {}, not true or false",
+                    kind(Some(other))
+                )));
+                continue;
+            }
+        };
         let output = match block.get("content") {
             Some(Value::String(s)) => s.clone(),
             Some(other) => other.to_string(),
@@ -1260,10 +1343,24 @@ fn normalize_user(value: &Value, tool_names: &HashMap<String, String>) -> Vec<Ag
 // only a clean finish after a `report_outcome` call does (#90), which is why
 // the flag rides along rather than being collapsed here.
 fn normalize_result(value: &Value, billing: BillingMode) -> Vec<AgentEvent> {
-    let is_error = value
-        .get("is_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // Unlike a tool result, a `result` line always carries its flag. Without
+    // a boolean there is no clean end to report, so it ends the turn as an
+    // error (with the usage it did carry) after saying why.
+    let is_error = match value.get("is_error") {
+        Some(Value::Bool(b)) => *b,
+        other => {
+            return vec![
+                protocol_error(format!(
+                    "a result line's is_error is {}, not true or false",
+                    kind(other)
+                )),
+                AgentEvent::TurnCompleted {
+                    is_error: true,
+                    usage: result_usage(value, billing),
+                },
+            ];
+        }
+    };
     if !is_error {
         return vec![AgentEvent::TurnCompleted {
             is_error: false,
@@ -2369,7 +2466,9 @@ mod tests {
                 .expect("no event in 120 s")
                 .expect("the stream ended before the turn completed");
             match event {
-                AgentEvent::Error { message, .. } => panic!("the turn failed: {message}"),
+                AgentEvent::Error { message, .. } | AgentEvent::ProtocolError { message } => {
+                    panic!("the turn failed: {message}")
+                }
                 AgentEvent::TurnCompleted { .. } => break,
                 _ => {}
             }
@@ -2589,7 +2688,9 @@ mod tests {
         loop {
             match handle.recv().await.expect("stream ended before a reply") {
                 AgentEvent::AssistantMessage { .. } => break,
-                AgentEvent::Error { message } => panic!("unexpected warning: {message}"),
+                AgentEvent::Error { message } | AgentEvent::ProtocolError { message } => {
+                    panic!("unexpected warning: {message}")
+                }
                 _ => {}
             }
         }
@@ -2737,7 +2838,10 @@ mod tests {
         }
         std::fs::remove_file(&script).unwrap();
         assert!(
-            !seen.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+            !seen.iter().any(|e| matches!(
+                e,
+                AgentEvent::Error { .. } | AgentEvent::ProtocolError { .. }
+            )),
             "{seen:?}"
         );
         assert!(matches!(
@@ -3721,6 +3825,7 @@ mod tests {
                     assert_eq!(role, "coder");
                     Some(verdict)
                 }
+                AgentEvent::ProtocolError { .. } => None,
                 _ => None,
             })
             .collect()
@@ -3743,6 +3848,7 @@ mod tests {
             .iter()
             .find_map(|e| match e {
                 AgentEvent::SessionMeta { details, .. } => Some(details),
+                AgentEvent::ProtocolError { .. } => None,
                 _ => None,
             })
             .unwrap();
@@ -3861,3 +3967,9 @@ mod tests {
         assert!(!gate.prompt_written());
     }
 }
+
+#[cfg(test)]
+mod real_capture;
+
+#[cfg(test)]
+mod protocol_tests;

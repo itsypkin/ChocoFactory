@@ -129,11 +129,18 @@ fn main() {
             if !called {
                 return;
             }
+            let outcome = report
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // Like the real CLI, a successful result carries no `is_error`
+            // and its content is an array of text blocks.
             let recorded = emit(&json!({
                 "type": "user",
                 "message": { "content": [
                     { "type": "tool_result", "tool_use_id": "toolu_report",
-                      "content": "Recorded outcome." },
+                      "content": [{ "type": "text",
+                                    "text": format!("Accepted outcome '{outcome}'.") }] },
                 ]},
                 "session_id": session_id,
             }));

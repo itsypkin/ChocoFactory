@@ -150,6 +150,7 @@ fn usage_of(events: &[AgentEvent]) -> TurnUsage {
         .iter()
         .find_map(|event| match event {
             AgentEvent::TurnCompleted { usage, .. } => Some(usage.clone()),
+            AgentEvent::ProtocolError { .. } => None,
             _ => None,
         })
         .expect("no TurnCompleted")
@@ -162,6 +163,7 @@ fn echo_report(events: &[AgentEvent]) -> Value {
         .rev()
         .find_map(|event| match event {
             AgentEvent::AssistantMessage { text } => Some(text.clone()),
+            AgentEvent::ProtocolError { .. } => None,
             _ => None,
         })
         .expect("no assistant message");
@@ -276,7 +278,7 @@ async fn a_valid_report_completes_the_turn_with_the_captured_outcome() {
             &AgentEvent::ToolResult {
                 tool_use_id: "call-report-0".to_string(),
                 tool: qualified,
-                output: "Recorded outcome 'failed'.".to_string(),
+                output: "Accepted outcome 'failed'.".to_string(),
                 is_error: false,
             },
         ],
@@ -314,6 +316,7 @@ async fn a_rejected_report_is_an_error_result_and_the_retry_is_accepted() {
                     output,
                     ..
                 } if tool.contains("report_outcome") => Some((*is_error, output.clone())),
+                AgentEvent::ProtocolError { .. } => None,
                 _ => None,
             })
             .collect();
@@ -345,6 +348,7 @@ async fn the_third_section_missing_call_is_accepted_with_the_gap_message() {
                 output,
                 ..
             } if tool.contains("report_outcome") => Some((*is_error, output.clone())),
+            AgentEvent::ProtocolError { .. } => None,
             _ => None,
         })
         .collect();
@@ -567,6 +571,7 @@ async fn a_report_whose_reply_cannot_be_sent_is_not_recorded_as_accepted() {
         AgentEvent::ToolResult { tool, is_error, .. } if tool.contains("report_outcome") => {
             Some(*is_error)
         }
+        AgentEvent::ProtocolError { .. } => None,
         _ => None,
     });
     assert_eq!(result, Some(true), "{events:?}");
@@ -591,6 +596,7 @@ async fn an_unknown_host_tool_is_answered_as_an_error() {
         .iter()
         .find_map(|event| match event {
             AgentEvent::AssistantMessage { text } => text.strip_prefix("unknown-tool-reply:"),
+            AgentEvent::ProtocolError { .. } => None,
             _ => None,
         })
         .expect("the fake saw the daemon's reply");
@@ -1566,6 +1572,7 @@ async fn omp_turn_leaves_nothing_in_the_operators_omp_folder() {
             AgentEvent::SessionMeta {
                 adapter_session_id, ..
             } => Some(adapter_session_id.clone()),
+            AgentEvent::ProtocolError { .. } => None,
             _ => None,
         })
         .expect("a SessionMeta");
@@ -2358,9 +2365,10 @@ async fn the_default_adapter_expands_home_relative_paths_against_its_own_home() 
     let events = until_turn_completed(&mut handle).await;
     drain(&mut handle).await;
     assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::Error { .. })),
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error { .. } | AgentEvent::ProtocolError { .. }
+        )),
         "{events:?}"
     );
     assert!(
@@ -2377,9 +2385,10 @@ async fn a_store_omp_prints_as_home_relative_passes_the_check() {
         let env = Env::new();
         let (events, log) = failed_session_with(&env, "home_relative", resume, false).await;
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::Error { .. })),
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error { .. } | AgentEvent::ProtocolError { .. }
+            )),
             "resume={resume}: {events:?}"
         );
         assert!(log.contains("do the work"), "resume={resume}: {log}");
@@ -2447,6 +2456,7 @@ async fn a_memory_store_that_did_not_open_fails_the_turn_before_the_stage_prompt
                 .iter()
                 .find_map(|event| match event {
                     AgentEvent::Error { message } => Some(message.clone()),
+                    AgentEvent::ProtocolError { .. } => None,
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("{stats}: no Error in {events:?}"));
@@ -3308,6 +3318,7 @@ async fn a_rejected_prompt_ends_the_turn_with_its_error_exactly_once() {
             .iter()
             .filter_map(|e| match e {
                 AgentEvent::Error { message } => Some(message.as_str()),
+                AgentEvent::ProtocolError { .. } => None,
                 _ => None,
             })
             .collect();
@@ -3359,6 +3370,7 @@ async fn a_rejected_follow_up_does_not_end_the_running_turn() {
         .iter()
         .filter_map(|e| match e {
             AgentEvent::TurnCompleted { is_error, usage } => Some((*is_error, usage.clone())),
+            AgentEvent::ProtocolError { .. } => None,
             _ => None,
         })
         .collect();
@@ -3394,6 +3406,7 @@ async fn a_rejected_follow_up_does_not_end_a_turn_waiting_to_settle() {
         .iter()
         .filter_map(|e| match e {
             AgentEvent::TurnCompleted { is_error, usage } => Some((*is_error, usage.clone())),
+            AgentEvent::ProtocolError { .. } => None,
             _ => None,
         })
         .collect();
@@ -3474,6 +3487,7 @@ async fn a_host_tool_call_without_its_fields_is_answered_as_an_error() {
         .iter()
         .find_map(|event| match event {
             AgentEvent::AssistantMessage { text } => text.strip_prefix("bad-call-reply:"),
+            AgentEvent::ProtocolError { .. } => None,
             _ => None,
         })
         .expect("the fake got a reply");

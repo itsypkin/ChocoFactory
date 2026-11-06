@@ -1431,6 +1431,9 @@ impl SingleShotTurn {
                 }
                 TurnStep::Continue
             }
+            // A diagnostic about native output the adapter refused: not
+            // evidence of anything, so it changes no turn state.
+            AgentEvent::ProtocolError { .. } => TurnStep::Continue,
             AgentEvent::TurnCompleted { is_error: true, .. } => {
                 self.errored = true;
                 self.waiting_for_report = false;
@@ -4205,6 +4208,278 @@ mod tests {
             sub_agent_rows, 3,
             "tool call, tool result and text: {stored:?}"
         );
+    }
+
+    // ---- malformed CLI output as evidence (step 2a of 7) ----
+
+    const REPORT_CALL_ID: &str = "toolu_01A1jR6fBWvWfbjeVUvegCuS";
+
+    /// A production-shaped `report_outcome` call line.
+    fn raw_report_call() -> serde_json::Value {
+        json!({"op": "raw", "line": {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": REPORT_CALL_ID,
+                "name": chocofactory_core::mcp::qualified_report_outcome_tool_name(),
+                "input": {"outcome": "done", "summary": ""},
+            }]},
+            "session_id": "s",
+        }})
+    }
+
+    /// The result the real CLI sends for that call: no `is_error`, array
+    /// content. `with_flag` adds an `is_error` of the given value.
+    fn raw_report_result(with_flag: Option<serde_json::Value>) -> serde_json::Value {
+        let mut block = json!({
+            "tool_use_id": REPORT_CALL_ID, "type": "tool_result",
+            "content": [{"type": "text", "text": "Accepted outcome 'done'."}],
+        });
+        if let Some(flag) = with_flag {
+            block["is_error"] = flag;
+        }
+        json!({"op": "raw", "line": {
+            "type": "user", "message": {"role": "user", "content": [block]}, "session_id": "s",
+        }})
+    }
+
+    fn raw_result_line(with: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let mut line = json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "",
+            "duration_ms": 1200, "num_turns": 2, "total_cost_usd": 0.01,
+            "usage": {"input_tokens": 3, "output_tokens": 9},
+            "session_id": "s",
+        });
+        for (key, value) in with {
+            line[*key] = value.clone();
+        }
+        json!({"op": "raw", "line": line})
+    }
+
+    fn without_key(mut step: serde_json::Value, key: &str) -> serde_json::Value {
+        step["line"].as_object_mut().unwrap().remove(key);
+        step
+    }
+
+    fn protocol_errors(stored: &[chocofactory_core::models::Event]) -> Vec<String> {
+        stored
+            .iter()
+            .filter(|e| e.payload["protocol_error"] == true)
+            .map(|e| e.payload["message"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// NA8(a): the control. A production-shaped report whose success carries
+    /// no `is_error` still completes the turn.
+    #[tokio::test]
+    async fn na8a_a_report_success_without_is_error_completes_the_turn() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+            ]),
+        );
+        let timers = TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        assert_eq!(protocol_errors(&stored), Vec::<String>::new());
+        let results: Vec<_> = stored
+            .iter()
+            .filter(|e| e.event_type == EventType::ToolResult)
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].payload["is_error"], false);
+        assert_eq!(
+            results[0].payload["tool"],
+            chocofactory_core::mcp::qualified_report_outcome_tool_name()
+        );
+    }
+
+    /// NA8(b): a report whose result carries `is_error: null` is not a
+    /// successful report, so a clean end after it is a turn that never
+    /// reported.
+    #[tokio::test]
+    async fn na8b_a_report_result_with_a_null_flag_is_not_a_report() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(Some(json!(null))),
+                raw_result_line(&[]),
+            ]),
+        );
+        let timers = TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        assert_eq!(
+            protocol_errors(&stored),
+            vec!["malformed CLI output: a tool_result block's is_error is null, not true or false"]
+        );
+        assert!(
+            !stored.iter().any(|e| e.event_type == EventType::ToolResult),
+            "no successful ToolResult for the call: {stored:?}"
+        );
+    }
+
+    /// NA8(c): a `result` line with no `is_error` is not a clean end.
+    #[tokio::test]
+    async fn na8c_a_result_line_without_its_flag_ends_the_turn_as_an_error() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                without_key(raw_result_line(&[]), "is_error"),
+            ]),
+        );
+        let timers = TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        let tail: Vec<_> = stored
+            .iter()
+            .rev()
+            .take(2)
+            .map(|e| (e.event_type, e.payload.clone()))
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                (EventType::TurnCompleted, json!({"is_error": true})),
+                (
+                    EventType::Error,
+                    json!({"message": "malformed CLI output: a result line's is_error is missing, not true or false",
+                           "protocol_error": true})
+                ),
+            ]
+        );
+        let usage: Vec<(Option<f64>, Option<i64>)> =
+            sqlx::query_as("SELECT cost_usd, output_tokens FROM turn_usage WHERE session_id = ?")
+                .bind(&session_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            usage,
+            vec![(Some(0.01), Some(9))],
+            "the usage the line carried is kept"
+        );
+    }
+
+    /// The accepted cost of dropping a line for a malformed parent: when it
+    /// is the turn's `result`, nothing observes an end, and the turn stays
+    /// open until the idle reaper closes it. That is `Reaped`, never a
+    /// completion, even though a clean EOF leaves the status `Idle`.
+    #[tokio::test]
+    async fn a_result_line_dropped_for_its_parent_leaves_the_turn_to_the_reaper() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[("parent_tool_use_id", json!(7))]),
+            ]),
+        );
+        let (pool, session_id, manager) = start_with_reaper_ready(
+            binary,
+            TurnTimers {
+                grace: crate::test_support::LOAD_ALLOWANCE,
+                ..fast_timers(0)
+            },
+        )
+        .await;
+        // The reaper's timeout is zero, so it must not run until the line
+        // under test has been read and persisted.
+        let stored = crate::test_support::wait_until("the parent diagnostic", || async {
+            let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+            if protocol_errors(&stored).is_empty() {
+                Err(format!("{} events", stored.len()))
+            } else {
+                Ok(stored)
+            }
+        })
+        .await;
+        assert_eq!(
+            protocol_errors(&stored),
+            vec![
+                "malformed CLI output: parent_tool_use_id is a number, not a non-empty string or null"
+            ]
+        );
+        assert!(
+            !stored
+                .iter()
+                .any(|e| e.event_type == EventType::TurnCompleted),
+            "the dropped line produced no end: {stored:?}"
+        );
+
+        reap_once(&manager).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::Reaped));
+        assert_eq!(run.status, SessionStatus::Idle, "clean EOF after the close");
+    }
+
+    /// Neither a top-level nor a wrapped `ProtocolError` is main-agent
+    /// activity, and neither changes what the turn is waiting for.
+    #[test]
+    fn a_protocol_error_changes_no_turn_state() {
+        let diagnostic = AgentEvent::ProtocolError {
+            message: "malformed CLI output: a result line's is_error is null, not true or false"
+                .to_string(),
+        };
+        for event in [
+            diagnostic.clone(),
+            AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_01W3VQxTmyXy3B7b1bmz9YaX".to_string(),
+                event: Box::new(diagnostic),
+            },
+        ] {
+            let mut turn = SingleShotTurn::default();
+            turn.waiting_for_report = true;
+            turn.pending_reports.insert("toolu_01pending".to_string());
+            assert!(matches!(turn.observe(&event), TurnStep::Continue));
+            assert!(
+                turn.waiting_for_report,
+                "a diagnostic is not the agent working again"
+            );
+            assert_eq!(
+                turn.pending_reports,
+                std::collections::HashSet::from(["toolu_01pending".to_string()])
+            );
+            assert!(!turn.reported);
+            assert!(!turn.completed);
+            assert!(!turn.errored);
+            assert!(!turn.gave_up);
+        }
     }
 
     /// #92's case: the turn was working, the account hit its usage limit,
