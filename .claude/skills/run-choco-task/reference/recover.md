@@ -101,12 +101,12 @@ and `choco task list --status stuck` finds every stuck task.
   sooner logs no such warning, and the note is the record. An extra check
   that finds a leftover after the first rounds does not by itself change
   whether the run is `lingered`, with one exception: a process an earlier
-  cleanup killed in such a check still counts as left running at the grace
+  cleanup signalled in such a check still counts as left running at the grace
   check, even if it has exited by then (it may have exited on its own), and
-  the `lingered` note then says an earlier cleanup of the turn killed a
-  process. A
-  failed read supplies no such check: `leftovers_unchecked` means nothing
-  confirms the processes are gone, whatever else is said, and with every read
+  the `lingered` note then says an earlier cleanup of the turn sent SIGKILL
+  to a process, not that it died. A failed read supplies no such check:
+  `leftovers_unchecked` means nothing confirms the processes are gone,
+  whatever else is said, and with every read
   failing it is the only `leftovers_*` note (the `lingered` note is written
   too). The turn may have been writing to the worktree until then, so
   check `git status` there before retrying.
