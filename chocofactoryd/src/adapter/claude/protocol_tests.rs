@@ -391,7 +391,6 @@ fn na4_tool_result_flag() {
         (json!(""), "an empty string"),
     ] {
         let events = result_for(Some(flag.clone()), json!("c"));
-        assert!(!has_result(&events), "no ToolResult for {flag}: {events:?}");
         assert_eq!(
             events,
             vec![pe(&format!(
@@ -399,6 +398,7 @@ fn na4_tool_result_flag() {
             ))],
             "ProtocolError for {flag}"
         );
+        assert!(!has_result(&events), "no ToolResult for {flag}: {events:?}");
     }
 }
 
