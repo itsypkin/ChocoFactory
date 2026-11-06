@@ -129,7 +129,7 @@ fn main() {
             if !called {
                 return;
             }
-            let recorded = emit(&report_result(&report, session_id.as_str()));
+            let recorded = emit(&report_result(report, session_id.as_str()));
             if !recorded {
                 return;
             }
