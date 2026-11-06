@@ -273,12 +273,13 @@ when it ends *after* the agent called `report_outcome`:
   once and not again. The exception: a process an earlier site signalled only
   in those extra rounds is still listed as signalled, and the grace site
   counts it once towards the lingered decision even if it has exited by
-  then. It is counted, not looked for or signalled; when that is all that
+  then. Carrying it looks for and signals nothing; when that is all that
   made the run lingered, the `lingered` note says that an earlier cleanup of
-  the turn had killed a process, not that grace found or signalled anything. A process killed early might have
-  exited on its own before the grace check; the run is still `lingered`. The
-  extra-round finds of the grace site itself and the end-of-turn site's are
-  not carried. The survivor list and the "still running" clause of the note
+  the turn had killed a process, not what grace found or signalled (grace may
+  have signalled that process again; the earlier count covers it). A process
+  killed early might have exited on its own before the grace check; the run
+  is still `lingered`. The extra-round finds of the grace site itself and the
+  end-of-turn site's are not carried. The survivor list and the "still running" clause of the note
   report the final observation of a site's sweep: the processes that check
   saw alive, including one choco had signalled whose marker and tree link are
   gone by then. The last-check warning in the daemon log reports the same

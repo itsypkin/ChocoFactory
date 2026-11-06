@@ -1115,8 +1115,10 @@ async fn drain_session(
                          the turn started; this does not say a process was seen running"
                     );
                     let grace_s = turn_timers.grace.as_secs_f32();
-                    // Only an earlier cleanup's kill made it lingering: grace
-                    // found nothing and signalled nothing.
+                    // Only the earlier cleanup's kill is counted here. Whether
+                    // grace's own sweep still saw or signalled that process (or
+                    // anything) is not known from the counts, so the note does
+                    // not say.
                     let message = if carried > 0
                         && ordinary == 0
                         && matches!(report.group, GroupKill::NothingAlive)
@@ -1770,12 +1772,14 @@ struct TrackerState {
     scan_failures: Vec<String>,
     /// Failed signals to the agent's group, as `"{site}: {error}"`.
     group_kill_errors: Vec<String>,
-    /// Pids a sweep has counted towards the turn's grace decision: the first
-    /// successful by-pid delivery at each, before a sweep's original stop
-    /// point, at any cleanup site. Pid-based on purpose (a reused pid already
-    /// counted stays counted), turn-wide, and separate from `killed`, which
-    /// lists every delivery for diagnostics, late ones included. It only
-    /// deduplicates policy counts and never says whether a process is alive.
+    /// Pids counted towards the turn's grace decision: the first successful
+    /// by-pid delivery at each, before a sweep's original stop point, at any
+    /// cleanup site, and the earlier sites' extra-round deliveries that the
+    /// grace site carried on entry (`carry_late_kills`, which may be gone by
+    /// then). Pid-based on purpose (a reused pid already counted stays
+    /// counted), turn-wide, and separate from `killed`, which lists every
+    /// delivery for diagnostics, late ones included. It only deduplicates
+    /// policy counts and never says whether a process is alive.
     policy_counted_pids: std::collections::HashSet<i32>,
     /// Pids a sweep signalled successfully only in its extra observation
     /// rounds, that no site had policy-counted at that time, each once, in
@@ -1796,9 +1800,10 @@ struct KillReport {
     /// the extra observation rounds made is listed in `killed` for
     /// diagnostics but is not counted by that call; the grace site adds
     /// the ones earlier sites made that way (`carry_late_kills`). A
-    /// delivered signal is not a confirmed death. When the group kill was delivered, the agent's group members
-    /// are not counted: they are the group kill's. When it was not, the
-    /// sweeps signal them by pid and they are counted.
+    /// delivered signal is not a confirmed death. When the group kill was
+    /// delivered, the agent's group members are not counted: they are the
+    /// group kill's. When it was not, the sweeps signal them by pid and they
+    /// are counted.
     sweep_killed: usize,
 }
 
@@ -1825,14 +1830,16 @@ fn lingered_after(report: &KillReport) -> bool {
     lingered_decision(&report.group, report.sweep_killed)
 }
 
-/// The `lingered` note when grace itself found and signalled nothing and the
-/// run is lingering only because an earlier cleanup of the turn killed a
-/// process, which is still counted as left running.
+/// The `lingered` note when the group had nothing alive and the only count
+/// is an earlier cleanup's kill, which is still counted as left running. It
+/// says only that kill and its consequence: a deduplicated count of zero at
+/// grace does not show that grace's own sweep saw or signalled nothing (it may
+/// have signalled the carried process again, or failed to read the table).
 fn lingered_carried_message(grace_s: f32, after: &str) -> String {
     format!(
-        "the agent's process group had exited {grace_s:.1}s after {after}, and grace found \
-         nothing to signal; an earlier cleanup of this turn had killed a process it started, \
-         so the run is recorded as lingered"
+        "the agent's process group had exited {grace_s:.1}s after {after}; an earlier \
+         cleanup of this turn had killed a process it started, so the run is recorded as \
+         lingered"
     )
 }
 
@@ -7603,7 +7610,8 @@ mod tests {
     /// the start of every lock acquisition, where another writer could run,
     /// never sees a partly consumed state. Every finding (killed, survivors
     /// and both identity maps, failed scans, group errors) leaves together,
-    /// with the policy-counted pids. Recorded ownership is not consumed.
+    /// with the policy-counted pids and the pending late kills. Recorded
+    /// ownership is not consumed.
     #[tokio::test]
     async fn the_notes_consume_every_finding_under_one_lock() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -7613,6 +7621,7 @@ mod tests {
             state.killed.push((10, "k".into()));
             state.killed_starts.insert(10, 100);
             state.policy_counted_pids.insert(10);
+            state.late_killed_pids.push(40);
             state.recorded.insert((30, 300));
             state.add_survivor(20, "s".into(), 200);
             state.scan_failures.push("end of turn: read failed".into());
@@ -7634,6 +7643,7 @@ mod tests {
                 !state.scan_failures.is_empty(),
                 !state.group_kill_errors.is_empty(),
                 !state.policy_counted_pids.is_empty(),
+                !state.late_killed_pids.is_empty(),
             ];
             if present.iter().any(|p| *p) && !present.iter().all(|p| *p) {
                 seen_torn.lock().unwrap().push(format!("{present:?}"));
@@ -7657,6 +7667,7 @@ mod tests {
                 && state.scan_failures.is_empty()
                 && state.group_kill_errors.is_empty()
                 && state.policy_counted_pids.is_empty()
+                && state.late_killed_pids.is_empty()
         );
         assert_eq!(
             state.recorded,
@@ -8999,6 +9010,15 @@ mod tests {
             lingered.contains("the agent's process group had exited"),
             "grace's pre-kill check saw nothing alive: {lingered}"
         );
+        // Grace signalled the escapee again, but the earlier site's count
+        // already covers it, so grace's own count is zero. The note must not
+        // claim grace found or signalled nothing.
+        assert!(
+            lingered.contains("an earlier cleanup of this turn had killed a process")
+                && !lingered.contains("nothing to signal")
+                && !lingered.contains("found nothing"),
+            "a deduplicated count of zero says nothing about what grace signalled: {lingered}"
+        );
         assert_eq!(
             note_message(&pool, &session_id, "leftovers_killed").await,
             Some(format!(
@@ -9081,6 +9101,8 @@ mod tests {
                     table.push(escapee_row(p2, 620, "l2-late"));
                     table.push(escapee_row(pm, 650, "m-late"));
                 }
+                // `l1` is still there next round: signalled a second time.
+                (0, 3) => table.push(escapee_row(p1, 612, "l1-late-again")),
                 // Second site: `m`, before its stop point.
                 (1, 0) => table.push(escapee_row(pm, 651, "m-ordinary")),
                 // Grace: `l1` before its stop point; `g` after it.
@@ -9096,11 +9118,19 @@ mod tests {
 
         let first = tracker.sweep(a, None, "shutdown").await;
         assert_eq!(first, 1, "only `o` was found before the stop point");
-        assert_eq!(
-            tracker.state().late_killed_pids,
-            vec![p1, p2, pm],
-            "`o` was already counted"
-        );
+        {
+            let state = tracker.state();
+            assert_eq!(
+                state.killed_starts.get(&p1),
+                Some(&612),
+                "`l1` was signalled a second time in the extra rounds"
+            );
+            assert_eq!(
+                state.late_killed_pids,
+                vec![p1, p2, pm],
+                "`o` was already counted; `l1`, signalled twice, is listed once"
+            );
+        }
         assert_eq!(
             l2.reap_signal(),
             Some(libc::SIGKILL),
@@ -9258,8 +9288,9 @@ mod tests {
         assert!(
             lingered.contains("an earlier cleanup of this turn had killed a process")
                 && !lingered.contains("sent")
-                && !lingered.contains("still running"),
-            "grace found and signalled nothing: {lingered}"
+                && !lingered.contains("still running")
+                && !lingered.contains("found nothing"),
+            "the note names only the earlier kill: {lingered}"
         );
         assert_eq!(
             note_message(&pool, &session_id, "leftovers_killed").await,
