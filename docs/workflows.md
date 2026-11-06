@@ -263,23 +263,32 @@ when it ends *after* the agent called `report_outcome`:
   note means choco could not read the process table at least once, so nothing
   confirms the turn's processes are gone, whatever the other notes say, and
   the "killed" wording is replaced by "sent SIGKILL ... could not confirm".
-  None of this changes how the turn ended or whether the task advances: the
-  extra waiting for a leader or group member that is still exiting does not
-  count towards whether the turn lingered, which is decided by what the check
-  before the kill saw and what the first rounds of the sweep had to signal.
-  That also holds across the turn's cleanup sites (a cancel, pause or
-  shutdown kill, then the grace kill, then the end-of-turn kill): a process
-  that an earlier site signalled only in those extra rounds is still listed
-  as signalled, but it does not use up the count the grace decision reads,
-  while one an earlier site signalled before its stop point is counted once
-  and not again. The last-check warning in the daemon log, the survivor list
-  and the "still running" clause of the note all report the same final
-  observation: the processes that check saw alive, including one choco had
-  signalled whose marker and tree link are gone by then. Two such processes
-  are "2 still running", and that is two processes seen, not two kills or two
-  deaths. A later site's check replaces an earlier one's. A check that could
-  not read the table is still unknown, also after a SIGKILL was delivered:
-  it never counts as zero survivors. A
+  None of this changes how the turn ended or whether the task advances, with
+  one exception below: the extra waiting for a leader or group member that is
+  still exiting does not count towards whether the turn lingered, which is
+  decided by what the check before the kill saw and what the first rounds of
+  the sweep had to signal. That also holds across the turn's cleanup sites (a
+  cancel, pause or shutdown kill, then the grace kill, then the end-of-turn
+  kill): a process an earlier site signalled before its stop point is counted
+  once and not again. The exception: a process an earlier site signalled only
+  in those extra rounds is still listed as signalled, and the grace site
+  counts it once towards the lingered decision even if it has exited by
+  then. It is counted, not looked for or signalled; when that is all that
+  made the run lingered, the `lingered` note says that an earlier cleanup of
+  the turn had killed a process, not that grace found or signalled anything. A process killed early might have
+  exited on its own before the grace check; the run is still `lingered`. The
+  extra-round finds of the grace site itself and the end-of-turn site's are
+  not carried. The survivor list and the "still running" clause of the note
+  report the final observation of a site's sweep: the processes that check
+  saw alive, including one choco had signalled whose marker and tree link are
+  gone by then. The last-check warning in the daemon log reports the same
+  observation, but it is logged only when the sweep used all its rounds and
+  was still seeing processes then; a sweep that ends earlier, with nothing
+  left to signal or watch, logs no such warning, and the note is the record.
+  Two such processes are "2 still running", and that is two processes seen,
+  not two kills or two deaths. A later site's check replaces an earlier
+  one's. A check that could not read the table is still unknown, also after a
+  SIGKILL was delivered: it never counts as zero survivors. A
   process counts as the turn's if it
   descends from the agent, was seen descending from it earlier, carries
   the turn's marker in its environment, or shares a session with one that
