@@ -9037,11 +9037,13 @@ mod tests {
 
     /// One tracker through the sites in the daemon's order, with the carry
     /// the grace site takes on entry. Which kills count at grace:
-    /// - `o`: counted by the earlier site's ordinary round, signalled again
-    ///   in its extra rounds: already counted, not carried.
-    /// - `l1`, `l2`: signalled only in the earlier site's extra rounds. `l2`
+    /// - `o`: counted by the first site's ordinary round, signalled again in
+    ///   its extra rounds: already counted, not carried.
+    /// - `l1`, `l2`: signalled only in the first site's extra rounds. `l2`
     ///   has exited by grace; `l1` is found again by grace before its own
     ///   stop point. Each is carried and counts once.
+    /// - `m`: signalled in the first site's extra rounds, then counted by a
+    ///   second site's ordinary round: counted already, not carried.
     /// - `g`: found by grace after its own stop point; `t`: found only by the
     ///   tail. Neither is carried, and neither counts.
     ///
@@ -9052,13 +9054,15 @@ mod tests {
         let mut o = Sleeper::spawn(None, true);
         let mut l1 = Sleeper::spawn(None, true);
         let mut l2 = Sleeper::spawn(None, true);
+        let mut m = Sleeper::spawn(None, true);
         let mut g = Sleeper::spawn(None, true);
         let mut t = Sleeper::spawn(None, true);
         let mut bystander = Sleeper::spawn(None, true);
-        let (po, p1, p2, pg, pt, pb) = (
+        let (po, p1, p2, pm, pg, pt, pb) = (
             o.pid(),
             l1.pid(),
             l2.pid(),
+            m.pid(),
             g.pid(),
             t.pid(),
             bystander.pid(),
@@ -9066,32 +9070,35 @@ mod tests {
         let (reader, phase) = phased_reader(move |phase, scan| {
             let mut table = vec![bystander_row(pb)];
             match (phase, scan) {
-                // Earlier site: `o` before its stop point; the leader alone
+                // First site: `o` before its stop point; the leader alone
                 // marks the stop point; then the extra rounds see `o` again
-                // and find `l1` and `l2`.
+                // and find `l1`, `l2` and `m`.
                 (0, 0) => table.push(escapee_row(po, 600, "o")),
-                (0, 1) | (1, 1) | (2, 0) => table.push(leader_row(a, a)),
+                (0, 1) | (2, 1) | (3, 0) => table.push(leader_row(a, a)),
                 (0, 2) => {
                     table.push(escapee_row(po, 600, "o-again"));
                     table.push(escapee_row(p1, 610, "l1-late"));
                     table.push(escapee_row(p2, 620, "l2-late"));
+                    table.push(escapee_row(pm, 650, "m-late"));
                 }
+                // Second site: `m`, before its stop point.
+                (1, 0) => table.push(escapee_row(pm, 651, "m-ordinary")),
                 // Grace: `l1` before its stop point; `g` after it.
-                (1, 0) => table.push(escapee_row(p1, 611, "l1-grace")),
-                (1, 2) => table.push(escapee_row(pg, 630, "g-late")),
+                (2, 0) => table.push(escapee_row(p1, 611, "l1-grace")),
+                (2, 2) => table.push(escapee_row(pg, 630, "g-late")),
                 // The tail: `t`, after its stop point.
-                (2, 1) => table.push(escapee_row(pt, 640, "t-late")),
+                (3, 1) => table.push(escapee_row(pt, 640, "t-late")),
                 _ => {}
             }
             Ok(table)
         });
         let tracker = sweep_tracker(reader);
 
-        let earlier = tracker.sweep(a, None, "shutdown").await;
-        assert_eq!(earlier, 1, "only `o` was found before the stop point");
+        let first = tracker.sweep(a, None, "shutdown").await;
+        assert_eq!(first, 1, "only `o` was found before the stop point");
         assert_eq!(
             tracker.state().late_killed_pids,
-            vec![p1, p2],
+            vec![p1, p2, pm],
             "`o` was already counted"
         );
         assert_eq!(
@@ -9100,8 +9107,10 @@ mod tests {
             "`l2` is gone by grace"
         );
         phase.next();
+        assert_eq!(tracker.sweep(a, None, "cancel").await, 1, "`m`, once");
+        phase.next();
         let carried = tracker.state().carry_late_kills();
-        assert_eq!(carried, 2, "`l1` and `l2` are carried, `o` is not");
+        assert_eq!(carried, 2, "`l1` and `l2` are carried; `o` and `m` are not");
         let grace = tracker.sweep(a, None, "grace").await;
         assert_eq!(grace, 0, "`l1` is deduplicated against the carried count");
         {
@@ -9113,17 +9122,17 @@ mod tests {
             );
             assert_eq!(
                 state.policy_counted_pids,
-                std::collections::HashSet::from([po, p1, p2])
+                std::collections::HashSet::from([po, p1, p2, pm])
             );
         }
         phase.next();
         assert_eq!(tracker.sweep(a, None, "end of turn").await, 0);
         assert_eq!(
             tracker.state().policy_counted_pids,
-            std::collections::HashSet::from([po, p1, p2]),
+            std::collections::HashSet::from([po, p1, p2, pm]),
             "neither grace's own extra-round find nor the tail's is counted"
         );
-        for sleeper in [&mut o, &mut l1, &mut g, &mut t] {
+        for sleeper in [&mut o, &mut l1, &mut m, &mut g, &mut t] {
             assert_eq!(sleeper.reap_signal(), Some(libc::SIGKILL));
         }
         assert!(
