@@ -129,21 +129,7 @@ fn main() {
             if !called {
                 return;
             }
-            let outcome = report
-                .get("outcome")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            // Like the real CLI, a successful result carries no `is_error`
-            // and its content is an array of text blocks.
-            let recorded = emit(&json!({
-                "type": "user",
-                "message": { "content": [
-                    { "type": "tool_result", "tool_use_id": "toolu_report",
-                      "content": [{ "type": "text",
-                                    "text": format!("Accepted outcome '{outcome}'.") }] },
-                ]},
-                "session_id": session_id,
-            }));
+            let recorded = emit(&report_result(&report, session_id.as_str()));
             if !recorded {
                 return;
             }
@@ -248,6 +234,25 @@ fn allowed_outcomes(args: &[String]) -> Vec<String> {
     outcomes
 }
 
+/// The `user` line answering the report call. Like the real CLI, a
+/// successful result carries no `is_error` and its content is an array of
+/// text blocks; the text names the call's outcome (empty if it has none).
+fn report_result(report: &Value, session_id: &str) -> Value {
+    let outcome = report
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "type": "user",
+        "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_report",
+              "content": [{ "type": "text",
+                            "text": format!("Accepted outcome '{outcome}'.") }] },
+        ]},
+        "session_id": session_id,
+    })
+}
+
 /// Extracts the value following a `--resume` flag, if present.
 fn resume_session_id(args: &[String]) -> Option<String> {
     args.iter()
@@ -265,4 +270,40 @@ fn emit(value: &Value) -> bool {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     writeln!(handle, "{value}").is_ok() && handle.flush().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(line: &Value) -> &str {
+        line.pointer("/message/content/0/content/0/text")
+            .and_then(Value::as_str)
+            .expect("array content with a text block")
+    }
+
+    #[test]
+    fn the_report_result_names_the_outcome_and_omits_is_error() {
+        for outcome in ["approved", "changes_requested"] {
+            let line = report_result(&json!({ "outcome": outcome, "summary": "" }), "s1");
+            assert_eq!(text_of(&line), format!("Accepted outcome '{outcome}'."));
+            assert!(
+                line.pointer("/message/content/0/is_error").is_none(),
+                "a success carries no is_error: {line}"
+            );
+            assert_eq!(line["session_id"], "s1");
+        }
+    }
+
+    #[test]
+    fn a_report_without_a_string_outcome_gets_the_empty_outcome_text() {
+        for report in [
+            json!({}),
+            json!({ "outcome": 7 }),
+            json!({ "outcome": null }),
+        ] {
+            let line = report_result(&report, "s1");
+            assert_eq!(text_of(&line), "Accepted outcome ''.", "{report}");
+        }
+    }
 }

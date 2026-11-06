@@ -315,8 +315,9 @@ the tool rejected.
 Malformed output from the Claude CLI doesn't count either. Claude omits
 `is_error` on a successful tool result; that is the supported success form,
 not malformed output. Anything else that is not `true` or `false` is
-malformed. Each refusal is recorded as an `error` event whose message begins
-`malformed CLI output:`:
+malformed. Each refusal produces an `error` event whose message begins
+`malformed CLI output:`; it appears on the timeline when the ordinary event
+write succeeds, and a failed write is not retried:
 
 - A line with a `parent_tool_use_id` that is not a non-empty string or null
   is discarded whole when it would have produced events, and none of those
@@ -329,8 +330,10 @@ malformed. Each refusal is recorded as an `error` event whose message begins
   blocks in the same line are still taken.
 - A main-agent `result` line whose `is_error` is not `true` or `false` ends
   the turn as an error, not a clean end. A sub-agent's stays scoped to that
-  sub-agent. A `result` line refused for its parent has no observed end at
-  all: the turn waits for the idle reaper and closes as `reaped`.
+  sub-agent. A `result` line refused for its parent contributes no observed
+  end at all: if no later valid end arrives and the process doesn't exit, the
+  turn stays open until the idle reaper closes it as `reaped`. A later valid
+  end, or the process exiting, takes the usual path instead.
 
 ## What an agent inherits from your Claude setup
 
