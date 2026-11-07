@@ -760,11 +760,104 @@ fn parent_attribution_applies_to_every_eventful_line_type() {
             &with(line.clone(), "parent_tool_use_id", json!(7)),
             &mut seeded(),
         );
-        assert_eq!(
-            dropped,
-            vec![parent_pe("a number")],
-            "{what}: malformed parent"
-        );
+        // Only a `result` line also leaves an end, and that end is the
+        // refusal itself, never the payload's.
+        let expected = if what.starts_with("result") {
+            vec![parent_pe("a number"), refusal_end()]
+        } else {
+            vec![parent_pe("a number")]
+        };
+        assert_eq!(dropped, expected, "{what}: malformed parent");
+    }
+}
+
+/// The end an unattributable `result` line is replaced by: an error end
+/// with nothing known about its usage.
+fn refusal_end() -> AgentEvent {
+    AgentEvent::TurnCompleted {
+        is_error: true,
+        usage: TurnUsage {
+            cost_usd: None,
+            tokens: Default::default(),
+            models: None,
+            wall_time_ms: None,
+            model_turns: None,
+            billing: BillingMode::Unknown,
+            counting: UsageCounting::CumulativePerConversation,
+        },
+    }
+}
+
+/// A `result` line with a malformed parent is a protocol-refusal end,
+/// whatever its own flag says, and nothing from its payload survives.
+#[test]
+fn a_result_line_with_a_malformed_parent_ends_as_a_refusal() {
+    let flags: [(&str, Value); 4] = [
+        ("clean", json!(false)),
+        ("error", json!(true)),
+        ("missing", Value::Null),
+        ("non-boolean", json!("false")),
+    ];
+    let parents = [
+        (json!(7), "a number"),
+        (json!(true), "a boolean"),
+        (json!({}), "an object"),
+        (json!([]), "an array"),
+        (json!(""), "an empty string"),
+    ];
+    for (what, flag) in flags {
+        for (parent, parent_kind) in &parents {
+            let mut line = with(result_line(), "parent_tool_use_id", parent.clone());
+            line = match what {
+                "missing" => without(line, "is_error"),
+                _ => with(line, "is_error", flag.clone()),
+            };
+            assert_eq!(
+                norm(&line),
+                vec![parent_pe(parent_kind), refusal_end()],
+                "{what} result, parent {parent_kind}"
+            );
+        }
+    }
+    // A usage-limit text on the dropped line is not promoted to an
+    // interruption either.
+    let line = with(
+        with(result_line(), "is_error", json!(true)),
+        "result",
+        json!("You've hit your limit"),
+    );
+    let line = with(line, "parent_tool_use_id", json!(7));
+    assert_eq!(norm(&line), vec![parent_pe("a number"), refusal_end()]);
+}
+
+/// Control: a valid helper scope or a missing/null parent is not refused.
+#[test]
+fn a_result_line_with_a_valid_scope_keeps_its_own_end() {
+    let main = norm(&result_line());
+    assert_eq!(
+        norm(&with(result_line(), "parent_tool_use_id", Value::Null)),
+        main
+    );
+    assert_eq!(
+        norm(&with(
+            result_line(),
+            "parent_tool_use_id",
+            json!(SUB_PARENT)
+        )),
+        wrap(SUB_PARENT, main)
+    );
+}
+
+/// Only `result` lines get a synthetic end: every other eventful line with
+/// a malformed parent stays diagnostic-only.
+#[test]
+fn only_result_lines_get_a_refusal_end() {
+    for (what, line) in eventful_lines() {
+        if what.starts_with("result") {
+            continue;
+        }
+        let events = norm_with(&with(line, "parent_tool_use_id", json!(7)), &mut seeded());
+        assert_eq!(events, vec![parent_pe("a number")], "{what}");
     }
 }
 

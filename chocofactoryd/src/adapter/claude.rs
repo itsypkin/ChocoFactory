@@ -1105,12 +1105,50 @@ fn normalize(
         Some(_) if events.is_empty() => events,
         // Whose events these are is unknown, so none of them may count as
         // the main agent's: the whole line becomes one diagnostic.
-        Some(other) => vec![AgentEvent::ProtocolError {
-            message: format!(
-                "malformed CLI output: parent_tool_use_id is {}, not a non-empty string or null",
-                kind(Some(other))
-            ),
-        }],
+        Some(other) => {
+            let diagnostic = parent_protocol_error(other);
+            if value.get("type").and_then(Value::as_str) == Some("result") {
+                // An end whose owner is unknown. Dropping it silently would
+                // let a failed main attempt escape: its error end vanishes,
+                // and a later valid report and clean end would complete the
+                // turn. So the loss is itself an error end, with nothing
+                // from the payload (usage, report, interruption) promoted.
+                // Not attribution to the main agent; a turn that has
+                // already completed ignores a late end as before.
+                vec![
+                    diagnostic,
+                    AgentEvent::TurnCompleted {
+                        is_error: true,
+                        usage: unknown_usage(),
+                    },
+                ]
+            } else {
+                vec![diagnostic]
+            }
+        }
+    }
+}
+
+fn parent_protocol_error(parent: &Value) -> AgentEvent {
+    AgentEvent::ProtocolError {
+        message: format!(
+            "malformed CLI output: parent_tool_use_id is {}, not a non-empty string or null",
+            kind(Some(parent))
+        ),
+    }
+}
+
+/// The usage of an end the adapter could not read: nothing is known, which
+/// is `None` / `BillingMode::Unknown`, never zero.
+fn unknown_usage() -> TurnUsage {
+    TurnUsage {
+        cost_usd: None,
+        tokens: TokenCounts::default(),
+        models: None,
+        wall_time_ms: None,
+        model_turns: None,
+        billing: BillingMode::Unknown,
+        counting: UsageCounting::CumulativePerConversation,
     }
 }
 

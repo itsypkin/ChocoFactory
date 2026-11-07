@@ -4393,12 +4393,58 @@ mod tests {
         );
     }
 
-    /// The accepted cost of dropping a line for a malformed parent: when it
-    /// is the turn's `result`, nothing observes an end, and the turn stays
-    /// open until the idle reaper closes it. That is `Reaped`, never a
-    /// completion, even though a clean EOF leaves the status `Idle`.
+    fn load_timers() -> TurnTimers {
+        TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        }
+    }
+
+    /// A numeric-parent `result` whose owner cannot be known. Dropping it
+    /// without an end would let a failed attempt be followed by a valid
+    /// report and a clean end and count as a success, which attributing the
+    /// line to the main agent would not: so the loss is an error end.
     #[tokio::test]
-    async fn a_result_line_dropped_for_its_parent_leaves_the_turn_to_the_reaper() {
+    async fn a_failed_end_with_a_malformed_parent_is_not_followed_by_a_success() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_result_line(&[("parent_tool_use_id", json!(7)), ("is_error", json!(true))]),
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        assert_eq!(
+            protocol_errors(&stored),
+            vec![
+                "malformed CLI output: parent_tool_use_id is a number, not a non-empty string or null"
+            ]
+        );
+        let ends: Vec<_> = stored
+            .iter()
+            .filter(|e| e.event_type == EventType::TurnCompleted)
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(
+            ends.first(),
+            Some(&json!({"is_error": true})),
+            "the refusal is the turn's first end: {ends:?}"
+        );
+    }
+
+    /// Control: a clean (`is_error: false`) malformed-parent `result` also
+    /// ends an unfinished turn as an error, even after a valid report.
+    #[tokio::test]
+    async fn a_clean_end_with_a_malformed_parent_ends_an_unfinished_turn_as_an_error() {
         let dir = TempDir::new();
         let binary = script_binary(
             &dir.0,
@@ -4409,43 +4455,99 @@ mod tests {
                 raw_result_line(&[("parent_tool_use_id", json!(7))]),
             ]),
         );
-        let (pool, session_id, manager) = start_with_reaper_ready(
-            binary,
-            TurnTimers {
-                grace: crate::test_support::LOAD_ALLOWANCE,
-                ..fast_timers(0)
-            },
-        )
-        .await;
-        // The reaper's timeout is zero, so it must not run until the line
-        // under test has been read and persisted.
-        let stored = crate::test_support::wait_until("the parent diagnostic", || async {
-            let stored = events::list_for_session(&pool, &session_id).await.unwrap();
-            if protocol_errors(&stored).is_empty() {
-                Err(format!("{} events", stored.len()))
-            } else {
-                Ok(stored)
-            }
-        })
-        .await;
-        assert_eq!(
-            protocol_errors(&stored),
-            vec![
-                "malformed CLI output: parent_tool_use_id is a number, not a non-empty string or null"
-            ]
-        );
-        assert!(
-            !stored
-                .iter()
-                .any(|e| e.event_type == EventType::TurnCompleted),
-            "the dropped line produced no end: {stored:?}"
-        );
-
-        reap_once(&manager).await;
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
 
         let run = wait_until_final(&pool, &session_id).await;
-        assert_eq!(run.end_reason, Some(SessionEndReason::Reaped));
-        assert_eq!(run.status, SessionStatus::Idle, "clean EOF after the close");
+        assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
+        assert_eq!(run.end_reason, None);
+    }
+
+    /// Control: a helper's `result` with a valid parent is scoped to the
+    /// helper and does not end the main turn.
+    #[tokio::test]
+    async fn a_helper_scoped_end_does_not_end_the_main_turn() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_result_line(&[
+                    ("parent_tool_use_id", json!("toolu_01W3VQxTmyXy3B7b1bmz9YaX")),
+                    ("is_error", json!(true)),
+                ]),
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{run:?}");
+        assert_eq!(run.end_reason, None);
+    }
+
+    /// Control: a turn that has already completed stays `Idle` when an
+    /// unattributable end arrives after it. The late end is history.
+    #[tokio::test]
+    async fn a_malformed_parent_end_after_completion_does_not_reclassify_the_turn() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+                raw_result_line(&[("parent_tool_use_id", json!(7)), ("is_error", json!(true))]),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        let late: Vec<_> = stored
+            .iter()
+            .filter(|e| e.event_type == EventType::TurnCompleted)
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(
+            late,
+            vec![
+                json!({"is_error": false}),
+                json!({"is_error": true, "after_completion": true}),
+            ]
+        );
+    }
+
+    /// A main `result` with no flag fails an unfinished turn (NA8(c)) but
+    /// does not reopen or reclassify one that has already completed.
+    #[tokio::test]
+    async fn a_missing_flag_end_after_completion_leaves_the_turn_idle() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+                without_key(raw_result_line(&[]), "is_error"),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        let late = stored
+            .iter()
+            .filter(|e| e.payload["after_completion"] == true)
+            .count();
+        assert_eq!(late, 2, "the diagnostic and the end are both history");
     }
 
     /// The fixture's report results are the shapes the real CLI sends: a

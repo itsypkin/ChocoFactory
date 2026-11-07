@@ -323,17 +323,21 @@ write succeeds, and a failed write is not retried:
   is discarded whole when it would have produced events, and none of those
   events counts as a report, a call, a result or an end. Lines that produce
   no events anyway (unknown types, ordinary rate-limit and successful control
-  lines) are not refused for the parent's shape alone.
+  lines) are not refused for the parent's shape alone. A `result` line
+  refused this way is replaced by an error end with unknown usage, whatever
+  its own flag said: nothing from its payload counts, but its loss can't turn
+  an unfinished turn into a success. The cost: an unfinished main turn fails
+  if any helper's end arrives with a malformed parent, because its scope
+  can't be known. That shape has not been seen in real Claude output.
 - A `tool_use` or `tool_result` block with a missing or malformed id, name or
   `is_error`, or a `tool_use` id reused for a different tool name, is refused
   as a block: its report call or successful result doesn't count. Valid
   blocks in the same line are still taken.
-- A main-agent `result` line whose `is_error` is not `true` or `false` ends
-  the turn as an error, not a clean end. A sub-agent's stays scoped to that
-  sub-agent. A `result` line refused for its parent contributes no observed
-  end at all: if no later valid end arrives and the process doesn't exit, the
-  turn stays open until the idle reaper closes it as `reaped`. A later valid
-  end, or the process exiting, takes the usual path instead.
+- A main-agent `result` line whose `is_error` is not `true` or `false` fails
+  an unfinished turn as an error, not a clean end. It doesn't reopen or
+  reclassify a turn that has already completed: the late end is recorded
+  (marked `after_completion`) and the turn stays `idle`. A sub-agent's stays
+  scoped to that sub-agent.
 
 ## What an agent inherits from your Claude setup
 
