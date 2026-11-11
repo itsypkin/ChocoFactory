@@ -9509,7 +9509,8 @@ mod tests {
             .iter()
             .filter(|e| {
                 e.event_type == EventType::ToolResult
-                    && e.payload["tool"] == chocofactory_core::mcp::qualified_report_outcome_tool_name()
+                    && e.payload["tool"]
+                        == chocofactory_core::mcp::qualified_report_outcome_tool_name()
                     && e.payload["parent_tool_use_id"].is_null()
             })
             .map(|e| {
