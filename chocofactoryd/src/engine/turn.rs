@@ -1093,7 +1093,7 @@ impl WorkflowEngine {
                         );
                         break TurnEnd::Incomplete(format!(
                             "stage '{stage_name}': the agent's turn was interrupted by a \
-                             usage limit before it could report; 'choco task retry' will \
+                             usage limit before it could complete its turn; 'choco task retry' will \
                              resume it"
                         ));
                     }

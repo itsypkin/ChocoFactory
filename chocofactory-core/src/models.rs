@@ -226,26 +226,35 @@ pub enum SessionEndReason {
     /// or that they could not check. The task parks rather than advancing past
     /// work that may still be landing.
     Lingered,
-    /// A single-shot turn ended without ever calling `report_outcome`
-    /// (#90), even after the daemon's nudges, so it was closed rather than
-    /// treated as complete.
+    /// A single-shot turn ended without ever completing (#90): it never
+    /// called `report_outcome` successfully, even after the daemon's
+    /// nudges, or its process ended cleanly with no accepted report at all,
+    /// so it was closed rather than treated as complete. (An accepted report
+    /// followed by the process ending without a clean end is not this; it
+    /// has no reason.)
     NoReport,
     /// The turn was cut off from outside rather than by anything the agent
     /// did (#92): the CLI reported a usage/rate limit for the account and
-    /// ended the turn. The session's transcript is intact and the work was
-    /// healthy, so `retry` resumes it instead of starting from scratch —
-    /// unlike a crash, which would only be resumed straight back into
-    /// itself. Detected by `adapter::claude`'s structured markers (see
+    /// ended the turn. The CLI's own session transcript is what `retry`
+    /// resumes instead of starting from scratch — unlike a crash, which
+    /// would only be resumed straight back into itself. It says nothing of
+    /// choco's own timeline: a turn can be cut off after choco stopped
+    /// counting it (malformed output, contradictory report evidence, or an
+    /// event it could not record), and the resumed run needs its own
+    /// report. Detected by `adapter::claude`'s structured markers (see
     /// `AgentEvent::Interrupted`), never by the engine.
     Interrupted,
     /// The daemon stopped or restarted during the turn. Like `Cancelled`
     /// it is requested rather than observed (shutdown kills the process
     /// group, or the startup park sweep records it after a crash); like
-    /// `Interrupted` the transcript is intact, so `retry` resumes it.
+    /// `Interrupted` the CLI's transcript is what `retry` resumes. Rows the
+    /// daemon was writing when it stopped may be missing from choco's own
+    /// timeline.
     DaemonStopped,
     /// An operator paused the task with `--now` and `SessionManager::stop`
-    /// killed this run. Requested like `DaemonStopped`; the transcript is
-    /// intact, so `resume` continues it.
+    /// killed this run. Requested like `DaemonStopped`; `resume` continues
+    /// the CLI's transcript. Rows being written when the run was killed may
+    /// be missing from choco's own timeline.
     Paused,
     /// Claude Code did not apply the role's `claude_settings` (it discards
     /// the whole bundle when one value is invalid), so choco ended the turn
@@ -642,8 +651,9 @@ pub enum EventType {
     /// - `"no_report"`: closed a turn that never reported (nudges used up, or
     ///   its total job-wait limit ran out);
     /// - `"lingered"`: once the grace period after the turn ended (it
-    ///   reported, errored, was closed for never reporting, or was closed by
-    ///   the idle reaper) ran out, choco tried to SIGKILL what the turn may
+    ///   reported, errored, was closed for never reporting, was closed by
+    ///   the idle reaper, or stopped counting after a failure: output choco
+    ///   could not trust or record) ran out, choco tried to SIGKILL what the turn may
     ///   have left behind (the agent's process group, or something the turn
     ///   started). The note says what the check before the kill saw, or that
     ///   it could not check, and whether the group signal was sent or

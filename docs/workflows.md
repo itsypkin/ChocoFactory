@@ -218,7 +218,8 @@ The agent sees the accepted outcomes in its instruction ("It must be one of: …
 The CLI's end-of-turn line doesn't mean the work is done: an
 agent waiting on a background sub-agent or a long test run ends its turn and
 is woken when that finishes. So the daemon treats a turn as complete only
-when it ends *after* the agent called `report_outcome`:
+when the main agent's `report_outcome` call was accepted by the tool and the
+turn then ends cleanly:
 
 - A turn that ends without reporting is left open. After 5 minutes with no
   output it's nudged (up to 3 times); after that it's closed, and the task is
@@ -310,37 +311,87 @@ when it ends *after* the agent called `report_outcome`:
   or a shared session.
 
 A sub-agent calling `report_outcome` doesn't count, and neither does a call
-the tool rejected.
+the tool rejected. What counts is the main agent's call whose result the tool
+did not reject, followed by a later clean end. If the agent reports more than
+once, the newest accepted report is the one counted (a report the tool
+rejected can be corrected by a new call); an identical repeat of a call or
+its result changes nothing. This describes how the running turn is counted.
+Which stored report a stage's routing reads is separate work, not changed
+here. A report followed by the process ending (EOF or a crash) without a
+clean end is not a completion, and is not described as a turn that never
+reported either.
 
-Malformed output from the Claude CLI doesn't count either. Claude omits
-`is_error` on a successful tool result; that is the supported success form,
-not malformed output. Anything else that is not `true` or `false` is
-malformed. Each refusal produces an `error` event whose message begins
-`malformed CLI output:`; it appears on the timeline when the ordinary event
-write succeeds, and a failed write is not retried:
+### When a turn can no longer complete
 
-- A line with a `parent_tool_use_id` that is not a non-empty string or null
-  is discarded whole when it would have produced events, and none of those
-  events counts as a report, a call, a result or an end. Lines that produce
-  no events anyway (unknown types, ordinary rate-limit and successful control
-  lines) are not refused for the parent's shape alone. A `result` line
-  refused this way is replaced by an error end with unknown usage, whatever
-  its own flag said: nothing from its payload counts, but its loss can't turn
-  an unfinished turn into a success. The cost: an unfinished main turn fails
-  if any helper's end arrives with a malformed parent, because its scope
-  can't be known. That shape has not been seen in real Claude output.
-- A `tool_use` or `tool_result` block with a missing or malformed id, name or
-  `is_error`, or a `tool_use` id reused for a different tool name, is refused
-  as a block: its report call or successful result doesn't count. Valid
-  blocks in the same line are still taken.
-- A main-agent `result` line whose `is_error` is not `true` or `false` fails
-  an unfinished turn as an error, not a clean end. It doesn't reopen or
-  reclassify a turn that has already completed: the late end is recorded,
-  marked `after_completion`, if its own write succeeds (that write is
-  independent of the diagnostic's), and it does not change the completion.
-  The run's final status still follows the usual cleanup rules; for
-  example, a process still alive after the grace period ends it as
-  `lingered`. A sub-agent's stays scoped to that sub-agent.
+Some evidence makes a turn that has not yet completed unable to complete,
+even if an accepted report and a clean end follow. The first one stops the
+count: choco closes the turn's stdin at once and the run ends `exited`.
+Where an `error` event is written for it, it appears on the timeline when
+that write succeeds.
+
+- **Contradictory report evidence.** The same `report_outcome` call id
+  repeated with different input, or a changed verdict for that id (rejected
+  and then accepted, or accepted and then rejected). The error event reads
+  `report_outcome call '…' was repeated with different input; this turn
+  cannot complete` or `… got a … result after a … result; this turn cannot
+  complete`. The first input and the first verdict are kept. The cost: a CLI
+  that re-sent a call under the same id with a changed verdict would fail an
+  otherwise healthy turn. No such stream has been seen; Claude and omp
+  correct a rejected report under a new id.
+- **Malformed CLI output** at the top level, while the turn is unfinished.
+  Claude omits `is_error` on a successful tool result; that is the supported
+  success form, not malformed output. Anything else that is not `true` or
+  `false` is malformed. Each refusal produces an `error` event whose message
+  begins `malformed CLI output:`; a failed write is not retried. A
+  diagnostic about the main agent's output, or about a line whose owner
+  can't be told, prevents completion. One scoped to a sub-agent does not.
+  - A line with a `parent_tool_use_id` that is not a non-empty string or null
+    is discarded whole when it would have produced events, and none of those
+    events counts as a report, a call, a result or an end; the diagnostic
+    has no `parent_tool_use_id`. Lines that produce no events anyway (unknown
+    types, ordinary rate-limit and successful control lines) are not refused
+    for the parent's shape alone. The cost: any such line, whatever its type
+    (an assistant message, a tool result, an `init` or an end, because its
+    owner is unknown), fails an unfinished main turn. That shape has not been
+    seen in real Claude output.
+  - A `tool_use` or `tool_result` block with a missing or malformed id, name
+    or `is_error`, or a `tool_use` id reused for a different tool name, is
+    refused as a block: its report call or successful result doesn't count.
+    Valid sibling blocks in the same line are still normalized and recorded,
+    but cannot rescue a turn once a top-level diagnostic has stopped it.
+  - A main-agent `result` line whose `is_error` is not `true` or `false`
+    ends an unfinished turn as an error, not a clean end.
+- **Evidence choco could not record.** A report call, the result of a
+  recorded report call, or the clean end that would complete the turn (with
+  its usage row, which are written together) whose write failed. The error
+  event reads `choco could not record a … event (…); this turn cannot
+  complete`. SQLite's own wait of about 5 seconds for a locked database is the
+  only wait; choco does not retry the write, and any other failure (a full
+  disk, a corrupt database) fails it at once. A failed write of anything
+  else (assistant text, other tools, an end with no accepted report or with
+  an error, session notes) is logged and the turn carries on.
+
+Nothing here reopens or reclassifies a turn that has already completed:
+later diagnostics, conflicts and failed writes stay on the timeline, marked
+`after_completion` when their write succeeds, and change nothing. A chat
+session records a diagnostic and carries on.
+
+How the run ends: cancel, pause and daemon stop keep their usual meaning. If
+the process then had to be killed after the grace period, the run ends
+`lingered`, and its note says choco stopped counting the turn because its
+output could not be trusted or recorded (it does not say a process died).
+If the usage limit is what actually ended the turn, the run ends
+`interrupted`. Otherwise it ends `exited` with no reason, and the task is
+`stuck` with "exited without completing its turn". In a parallel group the
+branch fails and the task parks once no branch is running.
+
+`choco task retry` resumes the CLI's conversation only for a run that ended
+`interrupted`, `reaped`, `daemon_stopped` or `paused`, and only when the run
+recorded a session id, the role's CLI is the one that ran it, and it has
+been resumed fewer than 3 times in a row. Everything else starts a fresh
+conversation. `--fresh` always starts fresh; `--resume` refuses when the run
+is not resumable. A resumed run is a new run: it needs its own accepted report
+and clean end, and earlier runs' reports are not carried over.
 
 ## What an agent inherits from your Claude setup
 

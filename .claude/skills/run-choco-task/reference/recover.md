@@ -37,13 +37,18 @@ seconds; then `choco task retry <id>` each task that parked `stuck`.
 `stuck` means the engine gave up. `choco task status <id>` shows the reason,
 and `choco task list --status stuck` finds every stuck task.
 
-- `choco task retry <id>` re-enters the current stage. A turn that was cut
-  off from outside (a usage limit, a daemon stop, the daemon closing an idle
-  session) **resumes its session**, with the work already in the worktree. A
-  turn that failed on its own (`no_report`, a crash) starts fresh, and
-  can't be resumed; neither can a turn choco stopped because its
-  `claude_settings` were not applied. `--fresh` forces a fresh start; `--resume` refuses,
-  changing nothing, rather than start fresh when the turn can't resume.
+- `choco task retry <id>` re-enters the current stage. Without a flag
+  (Auto), a run that ended `interrupted` (a usage limit), `reaped`,
+  `daemon_stopped` or `paused` **resumes its session**, with the work
+  already in the worktree, but only if the run recorded a session id, the
+  role's CLI is still the one that ran it, and it has not already been
+  resumed 3 times in a row. A resume is a new run: it needs its own accepted
+  `report_outcome` and clean end, and earlier runs' reports do not count.
+  Every other run starts fresh: `no_report`, `lingered`, `cancelled`, a crash
+  (no reason), a failed start, and a turn choco stopped because its
+  `claude_settings` were not applied. `--fresh` forces a fresh start;
+  `--resume` refuses, changing nothing, rather than start fresh when the run
+  can't resume.
 - On a task stuck in a parallel group, `choco task retry <id>` re-runs only
   the failed branches. Each one resumes or starts fresh by the same rules as
   a stage, and finished branches are kept with their results. Retry is
@@ -80,7 +85,8 @@ and `choco task list --status stuck` finds every stuck task.
   environment is unreadable (setuid, or non-dumpable). `docs/workflows.md`
   has the details.
 - `lingered`: once the grace period after the turn ended (it reported,
-  errored, was closed for never reporting, or was closed by the idle reaper)
+  errored, was closed for never reporting, was closed by the idle reaper, or
+  stopped counting after a failure: output choco could not trust or record)
   ran out, choco found cause to clean up what the turn may have left behind,
   and tried to SIGKILL it. The cause is the agent's process group seen alive,
   a process outside it that choco signalled, or a process table that could not
@@ -136,26 +142,34 @@ and `choco task list --status stuck` finds every stuck task.
   other retry (a fresh session) baselines whatever is in the worktree at
   that point, so reset it first. The check also runs when a read-only turn
   crashes or ends without reporting; the stuck reason then carries both.
-- An `error` event on the session whose message starts `malformed CLI output:`
-  names native output choco did not count. Three cases: a whole line with a
-  bad `parent_tool_use_id` (nothing from that line counted; if it was a
-  `result` line, an error `turn_completed` with unknown usage is meant to
-  follow, which fails an unfinished main turn because the end's scope can't
-  be known, but that row is absent if its own write failed); one block of a
-  line (a tool call or result with a bad id, name or `is_error`), after which
-  a report that therefore never registered is the usual cause of the stuck
-  state; or a `result` line whose own `is_error` was not `true`/`false`,
-  which makes that line's scope end in an error rather than a clean end: for
-  a main-agent line an unfinished turn ends as an error, and the
-  `turn_completed` event with `is_error` true follows the diagnostic if its
-  write succeeded, while a turn that had already completed is not reopened
-  or reclassified by it (the late end is marked `after_completion`, and the
-  run's final status still follows the usual cleanup rules, for example
-  `lingered` if the process outlives the grace period); for a sub-agent line
-  (the events carry a `parent_tool_use_id`) only that helper's end is an
-  error and the main turn can still finish cleanly. Read it together with
-  the turn's last events before retrying. It is not a reason to restart the
-  daemon.
+- A top-level `error` event on the session (no `parent_tool_use_id`, and not
+  marked `after_completion`) whose message starts `malformed CLI output:` or
+  ends `this turn cannot complete` means the turn did not complete, however
+  its last events look: choco closed the turn's stdin when it was written.
+  Read the message:
+  - `malformed CLI output:` names native output choco did not count: a
+    whole line with a bad `parent_tool_use_id` (nothing from that line
+    counted, and the line's owner is unknown, so it fails an unfinished main
+    turn whatever its type); one block of a line (a tool call or result with
+    a bad id, name or `is_error`); or a `result` line whose own `is_error`
+    was not `true`/`false`, which ends an unfinished main turn as an error.
+  - `report_outcome call '…' was repeated with different input` or `… got a …
+    result after a … result` means the agent or the CLI contradicted its own
+    report under one call id. Retry starts a fresh session.
+  - `choco could not record a … event (…)` points at the database: the write
+    of a report call, a report's result or the completing end failed. Check
+    disk space and the daemon log for `failed to append event`; a database
+    locked for longer than SQLite's 5-second wait also ends here.
+  Helper diagnostics (the event carries a `parent_tool_use_id`) and errors
+  marked `after_completion` do not establish that the main turn failed.
+  The run ends `exited` with no reason (retry starts fresh), `lingered` if
+  its process had to be killed (the note says choco stopped counting the turn
+  because its output could not be trusted or recorded; it does not say
+  anything was running or died), or `interrupted` if a usage limit is what
+  actually ended it (retry resumes, into a run that needs a new report). A
+  failed run with no explanatory `error` event may have lost that diagnostic
+  write too: search the daemon log for `failed to append event`. Neither is a
+  reason to restart the shared daemon.
 
 ## `escalate_to_human`: watch again or send a note
 

@@ -489,6 +489,43 @@ async fn a_failed_branch_settles_with_its_sibling_kept() {
     );
 }
 
+// LA14, mixed group: one healthy branch finishes, one latches. The failed
+// branch cannot route, the healthy result stays, and the task parks once the
+// running work has settled.
+#[tokio::test]
+async fn a_branch_that_cannot_complete_fails_while_its_sibling_finishes() {
+    let script = by_prompt(&[
+        ("BRANCH-ONE", conflicting_report_steps("clean")),
+        ("BRANCH-TWO", report_steps("clean", "sum-two")),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    let reason = stuck_reason(&g.pool, &g.task_id).await;
+    assert!(reason.contains("'one'"), "{reason}");
+    assert_incomplete_reason(Some(&reason));
+    assert!(reason.contains("1 of 2 branch(es) failed"), "{reason}");
+    let state = g.state().await;
+    assert_eq!(
+        state.current_stage, "panel",
+        "no transition to the done target"
+    );
+    let payload = &state.payload;
+    assert_eq!(branch_slot(payload, "one")["state"], "failed");
+    assert!(
+        payload["stages"].get("one").is_none(),
+        "nothing merged for the failed branch"
+    );
+    assert_eq!(branch_slot(payload, "two")["state"], "done");
+    assert_eq!(payload["stages"]["two"]["summary"], "sum-two");
+    let trail = stage_trail(&g.pool, &g.task_id).await;
+    assert!(
+        trail
+            .iter()
+            .all(|(stage, _)| stage != "summarize" && stage != "finished"),
+        "{trail:?}"
+    );
+}
+
 // 13
 #[tokio::test]
 async fn a_usage_limit_interruption_is_resumable() {

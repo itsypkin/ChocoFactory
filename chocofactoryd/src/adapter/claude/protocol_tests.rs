@@ -760,38 +760,22 @@ fn parent_attribution_applies_to_every_eventful_line_type() {
             &with(line.clone(), "parent_tool_use_id", json!(7)),
             &mut seeded(),
         );
-        // Only a `result` line also leaves an end, and that end is the
-        // refusal itself, never the payload's.
-        let expected = if what.starts_with("result") {
-            vec![parent_pe("a number"), refusal_end()]
-        } else {
-            vec![parent_pe("a number")]
-        };
-        assert_eq!(dropped, expected, "{what}: malformed parent");
+        // The diagnostic alone, for every line type: a `result` line
+        // contributes no end of its own (nor the payload's) either.
+        assert_eq!(
+            dropped,
+            vec![parent_pe("a number")],
+            "{what}: malformed parent"
+        );
     }
 }
 
-/// The end an unattributable `result` line is replaced by: an error end
-/// with nothing known about its usage.
-fn refusal_end() -> AgentEvent {
-    AgentEvent::TurnCompleted {
-        is_error: true,
-        usage: TurnUsage {
-            cost_usd: None,
-            tokens: Default::default(),
-            models: None,
-            wall_time_ms: None,
-            model_turns: None,
-            billing: BillingMode::Unknown,
-            counting: UsageCounting::CumulativePerConversation,
-        },
-    }
-}
-
-/// A `result` line with a malformed parent is a protocol-refusal end,
-/// whatever its own flag says, and nothing from its payload survives.
+/// A `result` line with a malformed parent is the diagnostic alone,
+/// whatever its own flag says: no end, no usage, nothing from its payload
+/// survives. (What the diagnostic does to the turn is the session's
+/// first-failure latch, not an end the adapter invents.)
 #[test]
-fn a_result_line_with_a_malformed_parent_ends_as_a_refusal() {
+fn a_result_line_with_a_malformed_parent_yields_the_diagnostic_alone() {
     let flags: [(&str, Value); 4] = [
         ("clean", json!(false)),
         ("error", json!(true)),
@@ -814,7 +798,7 @@ fn a_result_line_with_a_malformed_parent_ends_as_a_refusal() {
             };
             assert_eq!(
                 norm(&line),
-                vec![parent_pe(parent_kind), refusal_end()],
+                vec![parent_pe(parent_kind)],
                 "{what} result, parent {parent_kind}"
             );
         }
@@ -827,7 +811,7 @@ fn a_result_line_with_a_malformed_parent_ends_as_a_refusal() {
         json!("You've hit your limit"),
     );
     let line = with(line, "parent_tool_use_id", json!(7));
-    assert_eq!(norm(&line), vec![parent_pe("a number"), refusal_end()]);
+    assert_eq!(norm(&line), vec![parent_pe("a number")]);
 }
 
 /// Control: a valid helper scope or a missing/null parent is not refused.
@@ -848,14 +832,11 @@ fn a_result_line_with_a_valid_scope_keeps_its_own_end() {
     );
 }
 
-/// Only `result` lines get a synthetic end: every other eventful line with
-/// a malformed parent stays diagnostic-only.
+/// No eventful line with a malformed parent gets a synthetic end: each is
+/// the diagnostic alone, `result` lines included.
 #[test]
-fn only_result_lines_get_a_refusal_end() {
+fn no_eventful_line_with_a_malformed_parent_gets_a_synthetic_end() {
     for (what, line) in eventful_lines() {
-        if what.starts_with("result") {
-            continue;
-        }
         let events = norm_with(&with(line, "parent_tool_use_id", json!(7)), &mut seeded());
         assert_eq!(events, vec![parent_pe("a number")], "{what}");
     }

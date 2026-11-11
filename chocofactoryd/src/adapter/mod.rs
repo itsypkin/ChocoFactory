@@ -211,9 +211,13 @@ pub enum AgentEvent {
     /// Native output from the CLI that the adapter refused to treat as
     /// evidence: a line or block whose required field was missing or of the
     /// wrong type. Recorded as an ordinary `error` event with
-    /// `protocol_error: true`; nothing downstream reacts to it as a control
-    /// signal, and it is not main-agent activity. What matters is the
-    /// `ToolCall`, `ToolResult` or clean `TurnCompleted` that is *not* emitted.
+    /// `protocol_error: true`. A top-level one (not wrapped in
+    /// [`AgentEvent::Subagent`]) stops an unfinished single-shot turn from
+    /// completing: `session::drain_session` closes its stdin and ends the run
+    /// without a completion. It is still not main-agent *activity* (it does
+    /// not wake a turn that is waiting for a report), and a standing session
+    /// records it and carries on. Also what matters is the `ToolCall`,
+    /// `ToolResult` or clean `TurnCompleted` that is *not* emitted.
     ProtocolError {
         message: String,
     },

@@ -12167,6 +12167,144 @@ async fn a_turn_that_never_reports_parks_the_task_instead_of_advancing() {
     );
 }
 
+/// A production-shaped `report_outcome` call line (the claude adapter's
+/// native shape), for turns the `report` op cannot script: a repeated id, a
+/// changed input.
+fn raw_report_call_line(id: &str, input: Value) -> Value {
+    json!({"op": "raw", "line": {
+        "type": "assistant",
+        "message": {"content": [{
+            "type": "tool_use", "id": id,
+            "name": chocofactory_core::mcp::qualified_report_outcome_tool_name(),
+            "input": input,
+        }]},
+        "session_id": "s",
+    }})
+}
+
+/// The tool's acceptance of call `id`: no `is_error`, array content.
+fn raw_report_accepted_line(id: &str, outcome: &str) -> Value {
+    json!({"op": "raw", "line": {
+        "type": "user",
+        "message": {"role": "user", "content": [{
+            "tool_use_id": id, "type": "tool_result",
+            "content": [{"type": "text", "text": format!("Accepted outcome '{outcome}'.")}],
+        }]},
+        "session_id": "s",
+    }})
+}
+
+fn raw_clean_end_line() -> Value {
+    json!({"op": "raw", "line": {
+        "type": "result", "subtype": "success", "is_error": false, "result": "",
+        "duration_ms": 1200, "num_turns": 2, "total_cost_usd": 0.01,
+        "usage": {"input_tokens": 3, "output_tokens": 9}, "session_id": "s",
+    }})
+}
+
+const CONFLICT_CALL_ID: &str = "toolu_01A1jR6fBWvWfbjeVUvegCuS";
+
+/// A report call repeated with different input: the turn can no longer
+/// complete, whatever follows.
+fn conflicting_report_steps(outcome: &str) -> Value {
+    json!([
+        {"op": "read_turn"},
+        raw_report_call_line(CONFLICT_CALL_ID, json!({"outcome": outcome, "summary": ""})),
+        raw_report_accepted_line(CONFLICT_CALL_ID, outcome),
+        raw_report_call_line(CONFLICT_CALL_ID, json!({"outcome": outcome, "summary": "changed"})),
+        raw_clean_end_line(),
+    ])
+}
+
+fn assert_incomplete_reason(reason: Option<&str>) {
+    assert!(
+        reason.is_some_and(|r| r.contains("exited without completing its turn")),
+        "{reason:?}"
+    );
+}
+
+/// LA14: a turn that latched a failure ends `Exited` with no reason, so the
+/// task parks at the stage instead of moving to `finished`.
+#[tokio::test]
+async fn a_turn_with_contradictory_report_evidence_parks_the_task_instead_of_advancing() {
+    let pool = connect_in_memory().await.unwrap();
+    let dir = tempdir();
+    let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let binary = script_binary(&dir, conflicting_report_steps("done"));
+    let engine = engine_with_turn_timers(pool.clone(), &binary, fast_turn_timers());
+
+    engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "stuck").await;
+
+    let session = runs_for_stage(&pool, &task_id, "coding").await.remove(0);
+    assert_eq!(session.status, SessionStatus::Exited, "{session:?}");
+    assert_eq!(session.end_reason, None);
+    let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(state.current_stage, "coding");
+    let trail = stage_trail(&pool, &task_id).await;
+    assert!(
+        trail.iter().all(|(stage, _)| stage != "finished"),
+        "must never advance past a turn that cannot complete: {trail:?}"
+    );
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_incomplete_reason(task.stuck_reason.as_deref());
+}
+
+/// LA14, second case: the tool's acceptance could not be written down, so
+/// the daemon cannot count it. The same stuck task; the recording diagnostic
+/// is on the session's timeline.
+#[tokio::test]
+async fn a_report_result_that_could_not_be_recorded_parks_the_task_instead_of_advancing() {
+    let pool = connect_in_memory().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER abort_report_result BEFORE INSERT ON events
+         WHEN NEW.event_type = 'tool_result'
+              AND json_extract(NEW.payload, '$.tool_use_id') = '{CONFLICT_CALL_ID}'
+         BEGIN SELECT RAISE(ABORT, 'disk I/O error (test trigger)'); END"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let dir = tempdir();
+    let def = Arc::new(WorkflowDefinition::parse(single_turn_yaml(), &dir).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let binary = script_binary(
+        &dir,
+        json!([
+            {"op": "read_turn"},
+            raw_report_call_line(CONFLICT_CALL_ID, json!({"outcome": "done", "summary": ""})),
+            raw_report_accepted_line(CONFLICT_CALL_ID, "done"),
+            raw_clean_end_line(),
+        ]),
+    );
+    let engine = engine_with_turn_timers(pool.clone(), &binary, fast_turn_timers());
+
+    engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+    wait_until_task_status(&pool, &task_id, "stuck").await;
+
+    let session = runs_for_stage(&pool, &task_id, "coding").await.remove(0);
+    assert_eq!(session.status, SessionStatus::Exited, "{session:?}");
+    assert_eq!(session.end_reason, None);
+    let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_eq!(state.current_stage, "coding");
+    let trail = stage_trail(&pool, &task_id).await;
+    assert!(
+        trail.iter().all(|(stage, _)| stage != "finished"),
+        "{trail:?}"
+    );
+    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
+    assert_incomplete_reason(task.stuck_reason.as_deref());
+    let errors = session_events(&pool, &session, EventType::Error).await;
+    assert!(
+        errors.iter().any(|e| e["protocol_error"] == true
+            && e["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("choco could not record a tool_result event ("))),
+        "{errors:?}"
+    );
+}
+
 /// The turn reported and ended, but its process kept going. The stage
 /// must not advance while it runs, and once it's killed the task parks
 /// rather than moving past work that may still have been landing.

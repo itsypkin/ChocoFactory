@@ -744,12 +744,15 @@ impl SessionManager {
 /// nothing committed, and had the workflow advance past it while the
 /// sub-agent kept writing to the worktree. So a single-shot turn completes
 /// only on a `result` that follows a successful `report_outcome` call by the
-/// main agent (not a sub-agent, not one the tool rejected):
+/// main agent (not a sub-agent, not one the tool rejected). The newest such
+/// accepted call is the turn's selected report; it is frozen when the
+/// completing `result` arrives:
 ///
 /// 1. Report, then `result`: the turn is complete. Stdin is closed so the CLI
 ///    exits, and a grace timer starts. If the process is still alive when it
 ///    runs out, its whole group is killed and the run ends `Lingered`: the
-///    turn said it was done while something it started kept going.
+///    turn said it was done while something it started kept going. A report
+///    followed by the process ending with no `result` is not complete.
 /// 2. `result` with no report: the turn is waiting (or forgot). Stdin stays
 ///    open, so a background job's notification can wake it. After
 ///    `nudge_after` with no events at all it is nudged on stdin, up to
@@ -760,6 +763,15 @@ impl SessionManager {
 ///    waiting, and the idle reaper leaves it alone (#271).
 /// 3. A `result` with `is_error` closes stdin and applies the grace rule; the
 ///    run ends `exited`, as a crash would.
+/// 4. A first failure while the turn is unfinished means it can no longer
+///    complete: a top-level `ProtocolError`, a report call repeated with
+///    different input, a changed verdict for a report call, or a failed
+///    write of a report call, a recorded report's result, or the completing
+///    `result` and its usage row (any `Err`; SQLx's own busy wait is the only
+///    retry). Stdin is closed at once, before the failure is written down as
+///    an `error` event, and the run ends `exited` without a completion. The
+///    failed write of anything else is logged and the turn carries on. A
+///    standing session never latches.
 ///
 /// `idle` is written only once the process has actually gone, so the engine's
 /// watcher can never advance a workflow while the turn's process is still
@@ -864,18 +876,45 @@ async fn drain_session(
                 // together (or not at all); a sub-agent's records no usage,
                 // since the main conversation's cost and per-model figures
                 // already include it (its tokens come from those figures).
+                //
+                // Decided before the write, against the state before this
+                // event: whether the turn needs this row to have been
+                // recorded in order to count the event.
+                let required = kind == SessionKind::SingleShot && turn.needs_recording(&event);
+                let append_started = tokio::time::Instant::now();
                 let appended = match &event {
                     AgentEvent::TurnCompleted { usage, .. } => {
                         usage::append_turn_completed(pool, session_id, payload, usage).await
                     }
                     _ => events::append(pool, session_id, event_type, payload).await,
                 };
+                let append_elapsed_ms = append_started.elapsed().as_millis() as u64;
+                let mut recording_failure = None;
                 match appended {
                     Ok(appended) => {
-                        tracing::debug!(session_id, event_type = %appended.event_type, "appended event");
+                        tracing::debug!(
+                            session_id,
+                            event_type = %appended.event_type,
+                            append_elapsed_ms,
+                            "appended event"
+                        );
                         events_notify.notify_waiters();
                     }
-                    Err(err) => tracing::error!(session_id, %err, "failed to append event"),
+                    Err(err) => {
+                        tracing::error!(
+                            session_id,
+                            %event_type,
+                            %err,
+                            append_elapsed_ms,
+                            "failed to append event"
+                        );
+                        if required {
+                            recording_failure = Some(format!(
+                                "choco could not record a {event_type} event ({err}); this turn \
+                                 cannot complete"
+                            ));
+                        }
+                    }
                 }
                 // Whether or not the prompt was written, the turn is over:
                 // kill the process group now, the way `cancel` does, and
@@ -893,8 +932,38 @@ async fn drain_session(
                     }
                 }
                 if kind == SessionKind::SingleShot {
-                    match turn.observe(&event) {
+                    // A required row that could not be written latches the
+                    // failure first. The event is still observed, for the
+                    // bookkeeping that precedes `observe`'s guard (cutoff,
+                    // background jobs), but the latched turn takes none of
+                    // it as report or completion evidence.
+                    let latched = recording_failure.map(|reason| turn.fail_with_diagnostic(reason));
+                    let observed = turn.observe(&event);
+                    let step = match latched {
+                        Some(step @ TurnStep::EvidenceFailed { .. }) => step,
+                        _ => observed,
+                    };
+                    match step {
                         TurnStep::Continue => {}
+                        TurnStep::EvidenceFailed { diagnostic } => {
+                            // Before anything is awaited: the turn stops
+                            // counting now, and its process is told so.
+                            handle.close_stdin();
+                            turn.arm_grace(turn_timers.grace, GraceCause::EvidenceFailed);
+                            tracing::warn!(
+                                session_id,
+                                "single-shot turn cannot complete; closing stdin"
+                            );
+                            if let Some(message) = diagnostic {
+                                append_failure_diagnostic(
+                                    pool,
+                                    session_id,
+                                    &message,
+                                    events_notify,
+                                )
+                                .await;
+                            }
+                        }
                         TurnStep::Completed => {
                             tracing::info!(
                                 session_id,
@@ -1101,6 +1170,10 @@ async fn drain_session(
                     let after = match turn.grace_cause {
                         Some(GraceCause::Reaped) => "the idle reaper closed its stalled turn",
                         Some(GraceCause::NoReport) => "it was closed for never reporting",
+                        Some(GraceCause::EvidenceFailed) => {
+                            "choco stopped counting its turn because its output could not be \
+                             trusted or recorded"
+                        }
                         Some(GraceCause::Completed) | Some(GraceCause::Errored) | None => {
                             "its turn ended"
                         }
@@ -1270,11 +1343,32 @@ impl Default for TurnTimers {
 /// A single-shot turn's progress towards completion, as `drain_session`
 /// observes it (#90). Kept apart from the I/O so the rules read in one place.
 struct SingleShotTurn {
-    /// Main-agent `report_outcome` calls still waiting on their result.
-    pending_reports: std::collections::HashSet<String>,
-    /// A main-agent `report_outcome` call succeeded.
-    reported: bool,
-    /// A `result` followed a successful report: the turn is done.
+    /// Main-agent `report_outcome` calls seen while the turn was open: call
+    /// id -> the input it first carried. A repeat of the id with different
+    /// input is a failure (see `failure`).
+    report_calls: HashMap<String, Value>,
+    /// The first verdict seen for each recorded report call: `true` the tool
+    /// accepted it, `false` rejected it. A later opposite verdict is a
+    /// failure; a repeat of the same one changes nothing.
+    report_results: HashMap<String, bool>,
+    /// The newest *accepted* report call, in the order the daemon saw the
+    /// acceptances. A rejection of another call does not clear it.
+    selected_report: Option<String>,
+    /// `selected_report` as it stood when a clean end completed the turn.
+    /// Frozen: nothing seen after completion changes it.
+    completed_report: Option<String>,
+    /// Why the turn can no longer complete: the first of a top-level
+    /// `ProtocolError`, a report call or verdict that contradicts an earlier
+    /// one, and a failed write of evidence the daemon needs to have recorded.
+    /// Written once, while the turn is open; it never completes afterwards.
+    failure: Option<String>,
+    /// An `Interrupted` marker has been seen and nothing since has shown the
+    /// turn carrying on (see `track_cutoff`).
+    cutoff_pending: bool,
+    /// An error end arrived while `cutoff_pending`: the usage limit is what
+    /// actually ended the turn, not merely something it saw earlier.
+    cutoff_confirmed: bool,
+    /// A clean `result` followed an accepted report: the turn is done.
     completed: bool,
     /// A clean `result` arrived with no report, and stdin is still open.
     waiting_for_report: bool,
@@ -1317,8 +1411,13 @@ struct SingleShotTurn {
 impl Default for SingleShotTurn {
     fn default() -> Self {
         Self {
-            pending_reports: Default::default(),
-            reported: false,
+            report_calls: HashMap::new(),
+            report_results: HashMap::new(),
+            selected_report: None,
+            completed_report: None,
+            failure: None,
+            cutoff_pending: false,
+            cutoff_confirmed: false,
             completed: false,
             waiting_for_report: false,
             nudges_sent: 0,
@@ -1363,16 +1462,111 @@ enum GraceCause {
     NoReport,
     /// The idle reaper closed a turn that had gone silent mid-turn.
     Reaped,
+    /// The turn's first failure (a malformed-output diagnostic, contradictory
+    /// report evidence, or a write the daemon could not make) stopped it
+    /// counting towards completion.
+    EvidenceFailed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum TurnStep {
     Continue,
     Completed,
     EndedWithError,
     WaitingForReport,
+    /// The turn just latched its first failure and can no longer complete.
+    /// `diagnostic` is the message of the `error` event the drain must still
+    /// write: `None` for a native `ProtocolError`, which was already
+    /// recorded as one.
+    EvidenceFailed {
+        diagnostic: Option<String>,
+    },
 }
 
 impl SingleShotTurn {
+    /// The turn can still complete: it has not, and nothing has ended or
+    /// closed it.
+    fn open(&self) -> bool {
+        !self.completed && !self.errored && !self.gave_up
+    }
+
+    /// Whether `event`, arriving now, is evidence the daemon must have
+    /// recorded before it may count it: a report call, the result of a
+    /// recorded report call, or the clean end that would complete the turn
+    /// (with its usage row). Decided from the state *before* the event, and
+    /// only for an open turn: whether observing it would change anything is
+    /// not the question. A report-less end or an error end is not required.
+    fn needs_recording(&self, event: &AgentEvent) -> bool {
+        if !self.open() {
+            return false;
+        }
+        match event {
+            AgentEvent::ToolCall { tool, .. } => {
+                *tool == chocofactory_core::mcp::qualified_report_outcome_tool_name()
+            }
+            AgentEvent::ToolResult { tool_use_id, .. } => {
+                self.report_calls.contains_key(tool_use_id)
+            }
+            AgentEvent::TurnCompleted {
+                is_error: false, ..
+            } => self.selected_report.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The one place the first failure is written. First write wins; the
+    /// turn stops counting at once (it is `errored`, no longer waiting) and a
+    /// grace timer that is already running is attributed to the failure,
+    /// keeping its deadline. Returns whether this call was the first.
+    fn latch_failure(&mut self, reason: String) -> bool {
+        if self.failure.is_some() {
+            return false;
+        }
+        self.failure = Some(reason);
+        self.errored = true;
+        self.waiting_for_report = false;
+        if self.grace_deadline.is_some() {
+            self.grace_cause = Some(GraceCause::EvidenceFailed);
+        }
+        true
+    }
+
+    /// [`Self::latch_failure`] for a failure the drain must also record as an
+    /// `error` event.
+    fn fail_with_diagnostic(&mut self, reason: String) -> TurnStep {
+        if self.latch_failure(reason.clone()) {
+            TurnStep::EvidenceFailed {
+                diagnostic: Some(reason),
+            }
+        } else {
+            TurnStep::Continue
+        }
+    }
+
+    /// Whether a usage-limit marker actually ended the turn, tracked from the
+    /// top-level event stream alone (a sub-agent's events never count). An
+    /// `Interrupted` marker is only pending: any activity after it shows the
+    /// turn carrying on, so a later failure is not the limit's doing. An
+    /// error end that arrives while it is still pending confirms it; any end
+    /// clears it. `Error`, metadata, background-job, diagnostic and settings
+    /// events are not activity, so they neither clear nor confirm.
+    fn track_cutoff(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::Interrupted { .. } => self.cutoff_pending = true,
+            AgentEvent::AssistantMessage { .. }
+            | AgentEvent::Thinking { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolResult { .. } => self.cutoff_pending = false,
+            AgentEvent::TurnCompleted { is_error, .. } => {
+                if *is_error && self.cutoff_pending {
+                    self.cutoff_confirmed = true;
+                }
+                self.cutoff_pending = false;
+            }
+            _ => {}
+        }
+    }
+
     /// Folds one drained event into the turn's state.
     fn observe(&mut self, event: &AgentEvent) -> TurnStep {
         // Recorded before the guard below, not after: the CLI reports a
@@ -1383,13 +1577,14 @@ impl SingleShotTurn {
         if let AgentEvent::Interrupted { .. } = event {
             self.interrupted = true;
         }
+        self.track_cutoff(event);
         // Not main-agent activity, so it neither clears `waiting_for_report`
         // nor needs the guard below.
         if let AgentEvent::BackgroundJobs { running } = event {
             self.background_jobs = running.clone();
             return TurnStep::Continue;
         }
-        if self.completed || self.errored || self.gave_up {
+        if !self.open() {
             return TurnStep::Continue;
         }
         // The agent is working again after a report-less `result`: woken by a
@@ -1416,24 +1611,62 @@ impl SingleShotTurn {
             // Only the main agent's calls: a sub-agent's arrive wrapped in
             // `AgentEvent::Subagent` and never match here.
             AgentEvent::ToolCall {
-                tool_use_id, tool, ..
-            } if *tool == report_tool => {
-                self.pending_reports.insert(tool_use_id.clone());
-                TurnStep::Continue
-            }
+                tool_use_id,
+                tool,
+                input,
+            } if *tool == report_tool => match self.report_calls.get(tool_use_id) {
+                None => {
+                    self.report_calls.insert(tool_use_id.clone(), input.clone());
+                    TurnStep::Continue
+                }
+                // A replay of the same call: nothing new.
+                Some(first) if first == input => TurnStep::Continue,
+                Some(_) => self.fail_with_diagnostic(format!(
+                    "report_outcome call '{tool_use_id}' was repeated with different input; \
+                     this turn cannot complete"
+                )),
+            },
             AgentEvent::ToolResult {
                 tool_use_id,
                 is_error,
                 ..
             } => {
-                if self.pending_reports.remove(tool_use_id) && !is_error {
-                    self.reported = true;
+                // A result for a call this turn never recorded as a report
+                // is not report evidence, and is not associated with one
+                // that arrives later.
+                if !self.report_calls.contains_key(tool_use_id) {
+                    return TurnStep::Continue;
                 }
-                TurnStep::Continue
+                let accepted = !is_error;
+                match self.report_results.get(tool_use_id) {
+                    None => {
+                        self.report_results.insert(tool_use_id.clone(), accepted);
+                        if accepted {
+                            self.selected_report = Some(tool_use_id.clone());
+                        }
+                        TurnStep::Continue
+                    }
+                    // The same verdict again: no re-selection.
+                    Some(&first) if first == accepted => TurnStep::Continue,
+                    Some(&first) => {
+                        let word =
+                            |accepted: bool| if accepted { "successful" } else { "rejected" };
+                        self.fail_with_diagnostic(format!(
+                            "report_outcome call '{tool_use_id}' got a {} result after a {} \
+                             result; this turn cannot complete",
+                            word(accepted),
+                            word(first)
+                        ))
+                    }
+                }
             }
-            // A diagnostic about native output the adapter refused: not
-            // evidence of anything, so it changes no turn state.
-            AgentEvent::ProtocolError { .. } => TurnStep::Continue,
+            // Native output the adapter refused to read: the turn can no
+            // longer be trusted to complete. Its own `error` event is the
+            // ordinary write of this very event, so there is no second one.
+            AgentEvent::ProtocolError { message } => {
+                self.latch_failure(message.clone());
+                TurnStep::EvidenceFailed { diagnostic: None }
+            }
             AgentEvent::TurnCompleted { is_error: true, .. } => {
                 self.errored = true;
                 self.waiting_for_report = false;
@@ -1441,8 +1674,9 @@ impl SingleShotTurn {
             }
             AgentEvent::TurnCompleted {
                 is_error: false, ..
-            } if self.reported => {
+            } if self.selected_report.is_some() => {
                 self.completed = true;
+                self.completed_report = self.selected_report.clone();
                 self.waiting_for_report = false;
                 TurnStep::Completed
             }
@@ -1610,13 +1844,19 @@ async fn close_after_job_wait(
 /// a standing session goes to `idle` with it so a chat stays resumable.
 ///
 /// For a single-shot turn (#90), only a completed turn is `idle`. After
-/// `Cancelled`, the most specific explanation wins: a turn that never
-/// reported is `NoReport`, even if its process then had to be killed; one the
-/// idle reaper closed mid-turn is `Reaped`, whether it exited cleanly
-/// (`idle`, as before #90) or had to be killed (`exited`); one that
-/// completed or errored but whose process had to be killed is `Lingered`.
-/// Anything else that exits without having completed is `exited`: cleanly
-/// means it never reported (`NoReport`), otherwise it crashed (no reason).
+/// `Cancelled`, the most specific explanation wins. A turn that latched a
+/// failure (a malformed-output diagnostic, contradictory report evidence, or
+/// required evidence the daemon could not record) is `exited`: `Lingered` if
+/// its process had to be killed, `Interrupted` if a usage limit actually
+/// ended it, otherwise no reason; none of the arms below describes it. After
+/// that: a turn that never reported is `NoReport`, even if its process then
+/// had to be killed; one the idle reaper closed mid-turn is `Reaped`,
+/// whether it exited cleanly (`idle`, as before #90) or had to be killed
+/// (`exited`); one that completed or errored but whose process had to be
+/// killed is `Lingered`. Anything else that exits without having completed
+/// is `exited`: a clean exit with no accepted report means it never
+/// reported (`NoReport`), otherwise it ended without completing (no reason,
+/// or `Interrupted` when a usage limit cut it off).
 ///
 /// A run the claude adapter ended because the role's `claude_settings` were
 /// not applied (`ClaudeSettingsRejected` / `ClaudeSettingsUnconfirmed`, #346)
@@ -1696,6 +1936,21 @@ fn final_run_state_ranked(
                 (Exited, Some(DaemonStopped))
             } else if let Some(reason) = settings_end {
                 (Exited, Some(reason))
+            } else if turn.failure.is_some() {
+                // A first failure stopped the turn counting: none of the
+                // arms below describes it (it did not give up, was not
+                // reaped as stalled, did not complete, and "never
+                // reported" would be false after an accepted report).
+                if turn.lingered {
+                    // As an unlatched errored run: the leftovers are the
+                    // first thing to see.
+                    (Exited, Some(Lingered))
+                } else if turn.cutoff_confirmed {
+                    // Resumable, as an unlatched cutoff.
+                    (Exited, Some(Interrupted))
+                } else {
+                    (Exited, None)
+                }
             } else if turn.gave_up {
                 (Exited, Some(NoReport))
             } else if reaped && !turn.completed {
@@ -1707,12 +1962,15 @@ fn final_run_state_ranked(
                 (Exited, Some(Lingered))
             } else if turn.completed {
                 (Idle, None)
-            } else if clean_exit && !turn.errored {
+            } else if clean_exit && !turn.errored && turn.selected_report.is_none() {
                 // Ahead of the interruption arm below on purpose: a turn
                 // that saw a limit, carried on, and then ended its turn
                 // cleanly without reporting was not stopped by the limit —
                 // it is the #90 case, and resuming it would resume a turn
-                // that has nothing to say.
+                // that has nothing to say. Only when nothing was accepted: a
+                // report followed by a clean exit with no clean end did
+                // report, and it falls through (the process died before the
+                // end the daemon needs).
                 (Exited, Some(NoReport))
             } else if turn.interrupted {
                 // #92. Last of the named reasons, because every one above
@@ -2405,6 +2663,37 @@ async fn write_leftover_notes(
     }
 }
 
+/// Records why a single-shot turn can no longer complete, as an ordinary
+/// `error` event flagged `protocol_error`. A failed write is logged and the
+/// failure stays latched: it is never retried, and it does not recurse into
+/// another diagnostic.
+async fn append_failure_diagnostic(
+    pool: &SqlitePool,
+    session_id: &str,
+    message: &str,
+    events_notify: &Notify,
+) {
+    let started = tokio::time::Instant::now();
+    let result = events::append(
+        pool,
+        session_id,
+        EventType::Error,
+        serde_json::json!({ "message": message, "protocol_error": true }),
+    )
+    .await;
+    let append_elapsed_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(_) => events_notify.notify_waiters(),
+        Err(err) => tracing::error!(
+            session_id,
+            event_type = %EventType::Error,
+            %err,
+            append_elapsed_ms,
+            "failed to append event (the diagnostic for a turn that cannot complete)"
+        ),
+    }
+}
+
 /// Records one of the daemon's own interventions on a run's timeline (#90).
 /// Best-effort, like every other event append here: the intervention itself
 /// has already happened, and the run's `end_reason` still records the
@@ -2439,6 +2728,8 @@ mod tests {
     use super::*;
     use crate::adapter::{AgentAdapter, ClaudeAdapter};
     use crate::db::{connect_in_memory, events, projects, sessions, tasks};
+
+    mod report_evidence;
 
     fn fixture_binary(name: &str) -> String {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4216,12 +4507,17 @@ mod tests {
 
     /// A production-shaped `report_outcome` call line.
     fn raw_report_call() -> serde_json::Value {
+        raw_report_call_for(REPORT_CALL_ID, json!({"outcome": "done", "summary": ""}))
+    }
+
+    /// The same line for call `id` with this `input`.
+    fn raw_report_call_for(id: &str, input: serde_json::Value) -> serde_json::Value {
         json!({"op": "raw", "line": {
             "type": "assistant",
             "message": {"content": [{
-                "type": "tool_use", "id": REPORT_CALL_ID,
+                "type": "tool_use", "id": id,
                 "name": chocofactory_core::mcp::qualified_report_outcome_tool_name(),
-                "input": {"outcome": "done", "summary": ""},
+                "input": input,
             }]},
             "session_id": "s",
         }})
@@ -4230,13 +4526,28 @@ mod tests {
     /// The result the real CLI sends for that call: no `is_error`, array
     /// content. `with_flag` adds an `is_error` of the given value.
     fn raw_report_result(with_flag: Option<serde_json::Value>) -> serde_json::Value {
-        let mut block = json!({
-            "tool_use_id": REPORT_CALL_ID, "type": "tool_result",
-            "content": [{"type": "text", "text": "Accepted outcome 'done'."}],
-        });
+        let mut line = raw_report_result_for(REPORT_CALL_ID, "done", false);
         if let Some(flag) = with_flag {
-            block["is_error"] = flag;
+            line["line"]["message"]["content"][0]["is_error"] = flag;
         }
+        line
+    }
+
+    /// The tool's verdict on call `id`: an acceptance names the outcome in
+    /// array content and has no `is_error`; a rejection is `is_error: true`
+    /// with string content, the shapes the real CLI was observed to send.
+    fn raw_report_result_for(id: &str, outcome: &str, rejected: bool) -> serde_json::Value {
+        let block = if rejected {
+            json!({
+                "tool_use_id": id, "type": "tool_result", "is_error": true,
+                "content": format!("Rejected outcome '{outcome}': not one of the allowed outcomes."),
+            })
+        } else {
+            json!({
+                "tool_use_id": id, "type": "tool_result",
+                "content": [{"type": "text", "text": format!("Accepted outcome '{outcome}'.")}],
+            })
+        };
         json!({"op": "raw", "line": {
             "type": "user", "message": {"role": "user", "content": [block]}, "session_id": "s",
         }})
@@ -4306,8 +4617,9 @@ mod tests {
     }
 
     /// NA8(b): a report whose result carries `is_error: null` is not a
-    /// successful report, so a clean end after it is a turn that never
-    /// reported.
+    /// successful report, and the diagnostic it leaves fails the unfinished
+    /// turn: the clean end after it neither completes it nor makes it a turn
+    /// that "never reported".
     #[tokio::test]
     async fn na8b_a_report_result_with_a_null_flag_is_not_a_report() {
         let dir = TempDir::new();
@@ -4328,7 +4640,7 @@ mod tests {
 
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
-        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        assert_eq!(run.end_reason, None);
         let stored = events::list_for_session(&pool, &session_id).await.unwrap();
         assert_eq!(
             protocol_errors(&stored),
@@ -4400,10 +4712,10 @@ mod tests {
         }
     }
 
-    /// A numeric-parent `result` whose owner cannot be known. Dropping it
-    /// without an end would let a failed attempt be followed by a valid
-    /// report and a clean end and count as a success, which attributing the
-    /// line to the main agent would not: so the loss is an error end.
+    /// A numeric-parent `result` whose owner cannot be known. Neither
+    /// attributing it to the main agent nor dropping it silently is right:
+    /// its diagnostic fails the unfinished turn, so a valid report and clean
+    /// end that follow are recorded but cannot complete it.
     #[tokio::test]
     async fn a_failed_end_with_a_malformed_parent_is_not_followed_by_a_success() {
         let dir = TempDir::new();
@@ -4434,11 +4746,21 @@ mod tests {
             .filter(|e| e.event_type == EventType::TurnCompleted)
             .map(|e| e.payload.clone())
             .collect();
+        // The malformed line contributed no end and no usage row; the only
+        // end is the later valid clean one, which cannot complete the
+        // latched turn.
         assert_eq!(
-            ends.first(),
-            Some(&json!({"is_error": true})),
-            "the refusal is the turn's first end: {ends:?}"
+            ends,
+            vec![json!({"is_error": false})],
+            "the malformed line is not an end: {ends:?}"
         );
+        let usage_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM turn_usage WHERE session_id = ?")
+                .bind(&session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(usage_rows, 1, "one usage row, from the valid end only");
     }
 
     /// Control: a clean (`is_error: false`) malformed-parent `result` also
@@ -4515,10 +4837,21 @@ mod tests {
             .collect();
         assert_eq!(
             late,
+            vec![json!({"is_error": false})],
+            "the malformed line contributes no end, before or after completion"
+        );
+        assert_eq!(
+            protocol_errors(&stored),
             vec![
-                json!({"is_error": false}),
-                json!({"is_error": true, "after_completion": true}),
+                "malformed CLI output: parent_tool_use_id is a number, not a non-empty string or null"
             ]
+        );
+        assert!(
+            stored
+                .iter()
+                .any(|e| e.payload["protocol_error"] == true
+                    && e.payload["after_completion"] == true),
+            "the late diagnostic is history, flagged after_completion"
         );
     }
 
@@ -4610,40 +4943,59 @@ mod tests {
         assert!(results[1]["content"].is_string());
     }
 
-    /// Neither a top-level nor a wrapped `ProtocolError` is main-agent
-    /// activity, and neither changes what the turn is waiting for.
+    /// A top-level `ProtocolError` ends an unfinished turn's chance of
+    /// completing: it latches, stops the wait for a report and asks the drain
+    /// to close stdin without writing a second diagnostic. A sub-agent's
+    /// wrapped one changes no turn state at all.
     #[test]
-    fn a_protocol_error_changes_no_turn_state() {
+    fn a_top_level_protocol_error_latches_and_a_wrapped_one_changes_nothing() {
+        let message =
+            "malformed CLI output: a result line's is_error is null, not true or false".to_string();
         let diagnostic = AgentEvent::ProtocolError {
-            message: "malformed CLI output: a result line's is_error is null, not true or false"
-                .to_string(),
+            message: message.clone(),
         };
-        for event in [
-            diagnostic.clone(),
-            AgentEvent::Subagent {
-                parent_tool_use_id: "toolu_01W3VQxTmyXy3B7b1bmz9YaX".to_string(),
-                event: Box::new(diagnostic),
-            },
-        ] {
-            let mut turn = SingleShotTurn {
-                waiting_for_report: true,
-                ..Default::default()
-            };
-            turn.pending_reports.insert("toolu_01pending".to_string());
-            assert!(matches!(turn.observe(&event), TurnStep::Continue));
-            assert!(
-                turn.waiting_for_report,
-                "a diagnostic is not the agent working again"
-            );
-            assert_eq!(
-                turn.pending_reports,
-                std::collections::HashSet::from(["toolu_01pending".to_string()])
-            );
-            assert!(!turn.reported);
-            assert!(!turn.completed);
-            assert!(!turn.errored);
-            assert!(!turn.gave_up);
-        }
+        let fresh = || SingleShotTurn {
+            waiting_for_report: true,
+            ..Default::default()
+        };
+
+        let mut turn = fresh();
+        turn.report_calls
+            .insert("toolu_01pending".to_string(), json!({"outcome": "done"}));
+        assert!(matches!(
+            turn.observe(&diagnostic),
+            TurnStep::EvidenceFailed { diagnostic: None }
+        ));
+        assert_eq!(turn.failure, Some(message));
+        assert!(turn.errored, "the latched turn no longer counts");
+        assert!(!turn.waiting_for_report);
+        assert!(!turn.completed);
+        assert!(!turn.gave_up);
+        assert!(turn.selected_report.is_none());
+
+        let wrapped = AgentEvent::Subagent {
+            parent_tool_use_id: "toolu_01W3VQxTmyXy3B7b1bmz9YaX".to_string(),
+            event: Box::new(diagnostic),
+        };
+        let mut turn = fresh();
+        turn.report_calls
+            .insert("toolu_01pending".to_string(), json!({"outcome": "done"}));
+        assert!(matches!(turn.observe(&wrapped), TurnStep::Continue));
+        assert!(
+            turn.waiting_for_report,
+            "a diagnostic is not the agent working again"
+        );
+        assert_eq!(
+            turn.report_calls,
+            HashMap::from([("toolu_01pending".to_string(), json!({"outcome": "done"}))])
+        );
+        assert!(
+            turn.failure.is_none(),
+            "a helper's diagnostic never latches"
+        );
+        assert!(!turn.completed);
+        assert!(!turn.errored);
+        assert!(!turn.gave_up);
     }
 
     /// #92's case: the turn was working, the account hit its usage limit,
@@ -9124,6 +9476,224 @@ mod tests {
         assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
         wait_until_gone(sleep_pid).await;
         wait_until_gone(python_pid).await;
+    }
+
+    /// The path of the workspace's own `choco` (the one `cargo build
+    /// --workspace --all-targets` put next to this test binary), never an
+    /// installed one: the probe below is about what this build's tool server
+    /// says.
+    fn workspace_choco() -> String {
+        let mut path = std::env::current_exe().unwrap();
+        path.pop();
+        if path.ends_with("deps") {
+            path.pop();
+        }
+        let path = path.join("choco");
+        assert!(
+            path.exists(),
+            "{} is missing: run `cargo build --workspace --all-targets` first",
+            path.display()
+        );
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Opt-in probe against the real `claude` on haiku, at most two paid
+    /// turns. Run A: a rejected `report_outcome` (the `Findings` section
+    /// check, not a schema error) corrected by a second call under a new id,
+    /// then a one-word reply; it must complete. Run B: A's conversation
+    /// resumed into a new run, told to call nothing; it must end `NoReport`,
+    /// and A's call ids should not show up in its stream. The expectations
+    /// are unverified until this runs: they are claims about the real CLI.
+    ///
+    /// `CHOCOFACTORY_REAL_CLAUDE_TESTS=1 cargo test -p chocofactoryd
+    /// the_real_claude_corrects_a_rejected_report_and_a_resume_does_not_replay_it
+    /// -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "drives the real claude; set CHOCOFACTORY_REAL_CLAUDE_TESTS=1"]
+    async fn the_real_claude_corrects_a_rejected_report_and_a_resume_does_not_replay_it() {
+        assert_eq!(
+            std::env::var("CHOCOFACTORY_REAL_CLAUDE_TESTS").as_deref(),
+            Ok("1"),
+            "set CHOCOFACTORY_REAL_CLAUDE_TESTS=1 to run this test against the real claude"
+        );
+        assert!(
+            std::env::var_os("CHOCOFACTORY_CLAUDE_BINARY").is_none(),
+            "CHOCOFACTORY_CLAUDE_BINARY is set; this probe must drive the real claude"
+        );
+        // Bounded by hand: a real turn takes longer than `wait_until_final`'s
+        // allowance for a fake.
+        async fn final_row(
+            pool: &SqlitePool,
+            session_id: &str,
+        ) -> chocofactory_core::models::Session {
+            let deadline = tokio::time::Instant::now() + StdDuration::from_secs(420);
+            loop {
+                let run = sessions::get(pool, session_id).await.unwrap().unwrap();
+                if run.status != SessionStatus::Active {
+                    return run;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no end after 420 s: {run:?}"
+                );
+                tokio::time::sleep(StdDuration::from_millis(500)).await;
+            }
+        }
+        fn report_results(stored: &[chocofactory_core::models::Event]) -> Vec<(String, bool)> {
+            stored
+                .iter()
+                .filter(|e| {
+                    e.event_type == EventType::ToolResult
+                        && e.payload["tool"]
+                            == chocofactory_core::mcp::qualified_report_outcome_tool_name()
+                })
+                .map(|e| {
+                    (
+                        e.payload["tool_use_id"].as_str().unwrap().to_string(),
+                        e.payload["is_error"] == true,
+                    )
+                })
+                .collect()
+        }
+
+        let pool = connect_in_memory().await.unwrap();
+        let session_a = seed_session(&pool).await;
+        let task_id = sessions::get(&pool, &session_a)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id;
+        let adapter: Arc<dyn AgentAdapter> =
+            Arc::new(ClaudeAdapter::new().with_choco_binary(workspace_choco()));
+        let dir = TempDir::new();
+        let cfg = RoleConfig {
+            role: "coder".to_string(),
+            project_id: None,
+            model: Some("haiku".to_string()),
+            cwd: dir.0.clone(),
+            sandboxed: true,
+            report_outcomes: vec!["approved".to_string(), "changes_requested".to_string()],
+            report_sections: vec!["Findings".to_string()],
+            ..role_config()
+        };
+        let manager_a = SessionManager::with_turn_timers(
+            pool.clone(),
+            Registry::single(Arc::clone(&adapter)),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+            TurnTimers::default(),
+        );
+        let prompt = "Do exactly this, in order. First call the report_outcome tool with \
+             outcome approved and summary ok. Then call report_outcome a second time with \
+             outcome approved and a summary that is exactly these two lines, with a real \
+             line break between them: `## Findings` and `none`. If a call is refused, do \
+             not stop. Afterwards reply with one word and nothing else.";
+        manager_a
+            .start(&session_a, "claude", prompt, &cfg, SessionKind::SingleShot)
+            .await
+            .unwrap();
+        let run_a = final_row(&pool, &session_a).await;
+        let stored_a = events::list_for_session(&pool, &session_a).await.unwrap();
+        let meta = stored_a
+            .iter()
+            .find(|e| e.event_type == EventType::SessionMeta)
+            .map(|e| e.payload.clone());
+        let cost: Option<f64> =
+            sqlx::query_scalar("SELECT SUM(cost_usd) FROM turn_usage WHERE session_id = ?")
+                .bind(&session_a)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        println!(
+            "A: status {:?}, end_reason {:?}",
+            run_a.status, run_a.end_reason
+        );
+        println!(
+            "A: cli/model {:?}",
+            meta.as_ref()
+                .map(|m| (&m["init"]["version"], &m["init"]["model"]))
+        );
+        println!("A: approximate cost USD {cost:?}");
+        let results_a = report_results(&stored_a);
+        println!("A: report results (call id, rejected) {results_a:?}");
+        for event in &stored_a {
+            println!("A event {}: {}", event.event_type, event.payload);
+        }
+        assert_eq!(run_a.status, SessionStatus::Idle, "{run_a:?}");
+        assert_eq!(run_a.end_reason, None, "{run_a:?}");
+        let rejected: Vec<_> = results_a.iter().filter(|(_, rejected)| *rejected).collect();
+        let accepted: Vec<_> = results_a
+            .iter()
+            .filter(|(_, rejected)| !*rejected)
+            .collect();
+        assert_eq!((rejected.len(), accepted.len()), (1, 1), "{results_a:?}");
+        assert_ne!(rejected[0].0, accepted[0].0, "different call ids");
+        assert_eq!(protocol_errors(&stored_a), Vec::<String>::new());
+
+        // Run B: the same conversation, a new run, no report asked for.
+        let adapter_session_id = run_a
+            .adapter_session_id
+            .clone()
+            .expect("A's conversation id");
+        let session_b = sessions::create(
+            &pool,
+            sessions::NewSession {
+                task_id: &task_id,
+                stage: "chatting",
+                role: "chat",
+                cli_adapter: "claude",
+                model: "haiku",
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let manager_b = SessionManager::with_turn_timers(
+            pool.clone(),
+            Registry::single(adapter),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+            TurnTimers {
+                max_nudges: 0,
+                nudge_after: StdDuration::from_secs(5),
+                ..TurnTimers::default()
+            },
+        );
+        manager_b
+            .resume(
+                &session_b,
+                "claude",
+                &adapter_session_id,
+                "Reply with the single word done. Do not call any tool.",
+                &cfg,
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+        let run_b = final_row(&pool, &session_b).await;
+        let stored_b = events::list_for_session(&pool, &session_b).await.unwrap();
+        println!(
+            "B: status {:?}, end_reason {:?}",
+            run_b.status, run_b.end_reason
+        );
+        let old_ids: Vec<&str> = results_a.iter().map(|(id, _)| id.as_str()).collect();
+        let replayed: Vec<_> = stored_b
+            .iter()
+            .filter(|e| {
+                let text = e.payload.to_string();
+                old_ids.iter().any(|id| text.contains(id))
+            })
+            .collect();
+        for event in &stored_b {
+            println!("B event {}: {}", event.event_type, event.payload);
+        }
+        println!("B: events naming one of A's call ids: {replayed:?}");
+        assert_eq!(run_b.status, SessionStatus::Exited, "{run_b:?}");
+        assert_eq!(
+            run_b.end_reason,
+            Some(SessionEndReason::NoReport),
+            "{run_b:?}"
+        );
     }
 
     // --- diagnostics apart from grace policy ---------------------------------
