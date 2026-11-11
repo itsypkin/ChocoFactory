@@ -139,18 +139,21 @@ and `choco task list --status stuck` finds every stuck task.
 - An `error` event on the session whose message starts `malformed CLI output:`
   names native output choco did not count. Three cases: a whole line with a
   bad `parent_tool_use_id` (nothing from that line counted; if it was a
-  `result` line, an error `turn_completed` with unknown usage follows, which
-  fails an unfinished main turn, because the end's scope can't be known); one
-  block of a line (a tool call or result with a bad id, name or
-  `is_error`), after which a report that therefore never registered is the
-  usual cause of the stuck state; or a `result` line whose own `is_error` was
-  not `true`/`false`, which makes that line's scope end in an error rather
-  than a clean end: for a main-agent line an unfinished turn ends as an
-  error, and the `turn_completed` event with `is_error` true follows the
-  diagnostic if its write succeeded, while a turn that had already completed
-  stays `idle` (the late end is marked `after_completion`); for a sub-agent
-  line (the events carry a `parent_tool_use_id`) only that helper's end is
-  an error and the main turn can still finish cleanly. Read it together with
+  `result` line, an error `turn_completed` with unknown usage is meant to
+  follow, which fails an unfinished main turn because the end's scope can't
+  be known, but that row is absent if its own write failed); one block of a
+  line (a tool call or result with a bad id, name or `is_error`), after which
+  a report that therefore never registered is the usual cause of the stuck
+  state; or a `result` line whose own `is_error` was not `true`/`false`,
+  which makes that line's scope end in an error rather than a clean end: for
+  a main-agent line an unfinished turn ends as an error, and the
+  `turn_completed` event with `is_error` true follows the diagnostic if its
+  write succeeded, while a turn that had already completed is not reopened
+  or reclassified by it (the late end is marked `after_completion`, and the
+  run's final status still follows the usual cleanup rules, for example
+  `lingered` if the process outlives the grace period); for a sub-agent line
+  (the events carry a `parent_tool_use_id`) only that helper's end is an
+  error and the main turn can still finish cleanly. Read it together with
   the turn's last events before retrying. It is not a reason to restart the
   daemon.
 
