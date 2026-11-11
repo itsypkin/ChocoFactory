@@ -155,7 +155,9 @@ and `choco task list --status stuck` finds every stuck task.
     was not `true`/`false`, which ends an unfinished main turn as an error.
   - `report_outcome call '…' was repeated with different input` or `… got a …
     result after a … result` means the agent or the CLI contradicted its own
-    report under one call id. Retry starts a fresh session.
+    report under one call id. Read the run's end reason: `exited` with none
+    retries fresh; `interrupted` (a usage limit also ended the turn) retries
+    by resuming, if the session is eligible.
   - `choco could not record a … event (…)` points at the database: the write
     of a report call, a report's result or the completing end failed. Check
     disk space and the daemon log for `failed to append event`; a database
@@ -165,8 +167,11 @@ and `choco task list --status stuck` finds every stuck task.
   The run ends `exited` with no reason (retry starts fresh), `lingered` if
   its process had to be killed (the note says choco stopped counting the turn
   because its output could not be trusted or recorded; it does not say
-  anything was running or died), or `interrupted` if a usage limit is what
-  actually ended it (retry resumes, into a run that needs a new report). A
+  anything was running or died; retry starts fresh), or `interrupted` if a
+  usage limit is what actually ended it (retry resumes into a run that needs
+  a new report, only if the session is eligible: it reported a session id,
+  its CLI is unchanged, and it has not already been resumed 3 times in a row;
+  otherwise retry starts fresh). A
   failed run with no explanatory `error` event may have lost that diagnostic
   write too: search the daemon log for `failed to append event`. Neither is a
   reason to restart the shared daemon.

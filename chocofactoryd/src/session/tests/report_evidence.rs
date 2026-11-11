@@ -1847,6 +1847,33 @@ async fn la12_a_latched_turn_is_interrupted_only_if_the_limit_actually_ended_it(
     }
 }
 
+/// A report conflict does not by itself mean a fresh retry: when a usage
+/// limit then really ends the turn, the run is interrupted (resumable, if
+/// the session is eligible), as the recovery guide says.
+#[tokio::test]
+async fn a_conflict_followed_by_a_real_usage_limit_is_interrupted() {
+    let dir = TempDir::new();
+    let steps = script(vec![
+        raw_report_call_for(CALL_A, json!({"outcome": "done", "summary": ""})),
+        raw_report_result_for(CALL_A, "done", false),
+        raw_report_call_for(CALL_A, json!({"outcome": "done", "summary": "changed"})),
+        json!({"op": "usage_limit"}),
+    ]);
+    let (pool, session_id, _manager) =
+        start_prepared(steps, &dir, la_timers(0), |_, _| async {}).await;
+
+    let run = wait_final(&pool, &session_id).await;
+    assert_eq!(run.status, SessionStatus::Exited, "status: {run:?}");
+    assert_eq!(run.end_reason, Some(SessionEndReason::Interrupted));
+    let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+    assert_eq!(
+        protocol_errors(&stored),
+        vec![format!(
+            "report_outcome call '{CALL_A}' was repeated with different input; this turn cannot complete"
+        )]
+    );
+}
+
 // ------------------------------------------------ drain: per-drain state
 
 /// Rows from an earlier drain are history: a new drain over a session with

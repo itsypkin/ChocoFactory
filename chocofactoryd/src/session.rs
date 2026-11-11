@@ -768,8 +768,12 @@ impl SessionManager {
 ///    different input, a changed verdict for a report call, or a failed
 ///    write of a report call, a recorded report's result, or the completing
 ///    `result` and its usage row (any `Err`; SQLx's own busy wait is the only
-///    retry). Stdin is closed at once, before the failure is written down as
-///    an `error` event, and the run ends `exited` without a completion. The
+///    retry). Stdin is closed as soon as the failure is known: for a conflict
+///    or a failed required write, before choco's own `error` event for it is
+///    written (the failed write has already been attempted). A native
+///    `ProtocolError` is different: its ordinary write is attempted first, so
+///    a locked database can delay the close by up to SQLite's busy wait. The
+///    run ends `exited` without a completion. The
 ///    failed write of anything else is logged and the turn carries on. A
 ///    standing session never latches.
 ///
@@ -1476,8 +1480,8 @@ enum TurnStep {
     WaitingForReport,
     /// The turn just latched its first failure and can no longer complete.
     /// `diagnostic` is the message of the `error` event the drain must still
-    /// write: `None` for a native `ProtocolError`, which was already
-    /// recorded as one.
+    /// write: `None` for a native `ProtocolError`, whose own ordinary write
+    /// was already attempted (it may have failed).
     EvidenceFailed {
         diagnostic: Option<String>,
     },
@@ -9497,6 +9501,62 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// The main agent's `report_outcome` results in a stored timeline, as
+    /// (call id, rejected). A helper's results (they carry a
+    /// `parent_tool_use_id`) are not the main agent's evidence.
+    fn main_report_results(stored: &[chocofactory_core::models::Event]) -> Vec<(String, bool)> {
+        stored
+            .iter()
+            .filter(|e| {
+                e.event_type == EventType::ToolResult
+                    && e.payload["tool"] == chocofactory_core::mcp::qualified_report_outcome_tool_name()
+                    && e.payload["parent_tool_use_id"].is_null()
+            })
+            .map(|e| {
+                (
+                    e.payload["tool_use_id"].as_str().unwrap().to_string(),
+                    e.payload["is_error"] == true,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_probes_report_counter_leaves_out_a_helpers_results() {
+        let result = |id: &str, is_error: bool, parent: Option<&str>| {
+            let mut payload = json!({
+                "tool": chocofactory_core::mcp::qualified_report_outcome_tool_name(),
+                "tool_use_id": id,
+                "is_error": is_error,
+            });
+            if let Some(parent) = parent {
+                payload["parent_tool_use_id"] = json!(parent);
+            }
+            chocofactory_core::models::Event {
+                id: format!("event-{id}"),
+                task_id: "task".to_string(),
+                session_id: Some("session".to_string()),
+                event_type: EventType::ToolResult,
+                payload,
+                created_at: chrono::Utc::now(),
+            }
+        };
+        let stored = vec![
+            result("toolu_01MainRejected", true, None),
+            result("toolu_01HelperAccepted", false, Some("toolu_01Helper")),
+            result("toolu_01MainAccepted", false, None),
+            result("toolu_01HelperRejected", true, Some("toolu_01Helper")),
+        ];
+        assert_eq!(
+            main_report_results(&stored),
+            vec![
+                ("toolu_01MainRejected".to_string(), true),
+                ("toolu_01MainAccepted".to_string(), false)
+            ],
+            "only the main agent's two results count"
+        );
+    }
+
     /// Opt-in probe against the real `claude` on haiku, at most two paid
     /// turns. Run A: a rejected `report_outcome` (the `Findings` section
     /// check, not a schema error) corrected by a second call under a new id,
@@ -9539,23 +9599,6 @@ mod tests {
                 tokio::time::sleep(StdDuration::from_millis(500)).await;
             }
         }
-        fn report_results(stored: &[chocofactory_core::models::Event]) -> Vec<(String, bool)> {
-            stored
-                .iter()
-                .filter(|e| {
-                    e.event_type == EventType::ToolResult
-                        && e.payload["tool"]
-                            == chocofactory_core::mcp::qualified_report_outcome_tool_name()
-                })
-                .map(|e| {
-                    (
-                        e.payload["tool_use_id"].as_str().unwrap().to_string(),
-                        e.payload["is_error"] == true,
-                    )
-                })
-                .collect()
-        }
-
         let pool = connect_in_memory().await.unwrap();
         let session_a = seed_session(&pool).await;
         let task_id = sessions::get(&pool, &session_a)
@@ -9614,7 +9657,7 @@ mod tests {
                 .map(|m| (&m["init"]["version"], &m["init"]["model"]))
         );
         println!("A: approximate cost USD {cost:?}");
-        let results_a = report_results(&stored_a);
+        let results_a = main_report_results(&stored_a);
         println!("A: report results (call id, rejected) {results_a:?}");
         for event in &stored_a {
             println!("A event {}: {}", event.event_type, event.payload);

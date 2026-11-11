@@ -11224,6 +11224,18 @@ async fn an_interrupted_turn_marks_the_task_stuck_saying_so() {
         reason.contains("interrupted by a usage limit") && reason.contains("retry"),
         "the stuck reason should name the interruption and the way out: {reason}"
     );
+    // The advice depends on the session's eligibility; it does not promise a
+    // resume that the cap or another prerequisite would refuse.
+    assert!(
+        reason.contains("if its session is eligible")
+            && reason.contains("otherwise starts a fresh session")
+            && reason.contains(&format!("{MAX_CONSECUTIVE_RESUMES} times in a row")),
+        "the advice should be conditional on eligibility: {reason}"
+    );
+    assert!(
+        !reason.contains("will resume it"),
+        "an unconditional promise to resume: {reason}"
+    );
     let runs = runs_for_stage(&pool, &task_id, "coding").await;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].end_reason, Some(SessionEndReason::Interrupted));

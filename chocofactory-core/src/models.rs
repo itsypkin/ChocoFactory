@@ -231,7 +231,8 @@ pub enum SessionEndReason {
     /// nudges, or its process ended cleanly with no accepted report at all,
     /// so it was closed rather than treated as complete. (An accepted report
     /// followed by the process ending without a clean end is not this; it
-    /// has no reason.)
+    /// ordinarily has no reason, unless a higher-priority one applies, such
+    /// as a requested end or a usage limit that cut it off.)
     NoReport,
     /// The turn was cut off from outside rather than by anything the agent
     /// did (#92): the CLI reported a usage/rate limit for the account and

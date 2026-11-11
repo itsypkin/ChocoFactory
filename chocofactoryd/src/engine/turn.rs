@@ -1093,8 +1093,10 @@ impl WorkflowEngine {
                         );
                         break TurnEnd::Incomplete(format!(
                             "stage '{stage_name}': the agent's turn was interrupted by a \
-                             usage limit before it could complete its turn; 'choco task retry' will \
-                             resume it"
+                             usage limit before it could complete its turn; 'choco task retry' \
+                             resumes it if its session is eligible (it reported a session id, its \
+                             CLI is unchanged, and it has not been resumed {MAX_CONSECUTIVE_RESUMES} \
+                             times in a row) and otherwise starts a fresh session"
                         ));
                     }
                     // #84: the daemon stopped under this turn (graceful

@@ -325,7 +325,10 @@ reported either.
 
 Some evidence makes a turn that has not yet completed unable to complete,
 even if an accepted report and a clean end follow. The first one stops the
-count: choco closes the turn's stdin at once and the run ends `exited`.
+count: choco closes the turn's stdin as soon as it knows (for a conflict or
+a failed write, before it writes its own `error` event; for a malformed-output
+diagnostic, after that line's ordinary write was attempted, which a locked
+database can delay by up to SQLite's 5-second wait) and the run ends `exited`.
 Where an `error` event is written for it, it appears on the timeline when
 that write succeeds.
 
