@@ -152,7 +152,7 @@ fn split_word_internal_hyphens(text: &str) -> String {
 /// sent back is what makes it do the walk. But a turn that *never* reports
 /// is worse than a thin one: the session nudges it, runs out of nudges and
 /// parks the task for a human (#73, #91). So a model that can't satisfy the
-/// rule costs two retries, and its third call is recorded with the gap named
+/// rule costs two retries, and its third call is accepted with the gap named
 /// in the tool's reply — which lands on the task's timeline as a
 /// `tool_result` event, where whoever reads the review can see it.
 pub const MAX_SECTION_REJECTIONS: u32 = 2;
@@ -544,14 +544,14 @@ pub fn check_report_call(
             ));
         }
         return ReportCheck::success(format!(
-            "Recorded outcome '{outcome}'. Its report is still missing {}, and this is attempt \
-             {}, so it was recorded as it stands.",
+            "Accepted outcome '{outcome}'. Its report is still missing {}, and this is attempt \
+             {}, so it was accepted as it stands.",
             quoted_list(&missing),
             *thin_reports,
         ));
     }
 
-    ReportCheck::success(format!("Recorded outcome '{outcome}'."))
+    ReportCheck::success(format!("Accepted outcome '{outcome}'."))
 }
 
 #[cfg(test)]

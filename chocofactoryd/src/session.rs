@@ -1431,6 +1431,9 @@ impl SingleShotTurn {
                 }
                 TurnStep::Continue
             }
+            // A diagnostic about native output the adapter refused: not
+            // evidence of anything, so it changes no turn state.
+            AgentEvent::ProtocolError { .. } => TurnStep::Continue,
             AgentEvent::TurnCompleted { is_error: true, .. } => {
                 self.errored = true;
                 self.waiting_for_report = false;
@@ -4205,6 +4208,442 @@ mod tests {
             sub_agent_rows, 3,
             "tool call, tool result and text: {stored:?}"
         );
+    }
+
+    // ---- malformed CLI output as evidence (step 2a of 7) ----
+
+    const REPORT_CALL_ID: &str = "toolu_01A1jR6fBWvWfbjeVUvegCuS";
+
+    /// A production-shaped `report_outcome` call line.
+    fn raw_report_call() -> serde_json::Value {
+        json!({"op": "raw", "line": {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": REPORT_CALL_ID,
+                "name": chocofactory_core::mcp::qualified_report_outcome_tool_name(),
+                "input": {"outcome": "done", "summary": ""},
+            }]},
+            "session_id": "s",
+        }})
+    }
+
+    /// The result the real CLI sends for that call: no `is_error`, array
+    /// content. `with_flag` adds an `is_error` of the given value.
+    fn raw_report_result(with_flag: Option<serde_json::Value>) -> serde_json::Value {
+        let mut block = json!({
+            "tool_use_id": REPORT_CALL_ID, "type": "tool_result",
+            "content": [{"type": "text", "text": "Accepted outcome 'done'."}],
+        });
+        if let Some(flag) = with_flag {
+            block["is_error"] = flag;
+        }
+        json!({"op": "raw", "line": {
+            "type": "user", "message": {"role": "user", "content": [block]}, "session_id": "s",
+        }})
+    }
+
+    fn raw_result_line(with: &[(&str, serde_json::Value)]) -> serde_json::Value {
+        let mut line = json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "",
+            "duration_ms": 1200, "num_turns": 2, "total_cost_usd": 0.01,
+            "usage": {"input_tokens": 3, "output_tokens": 9},
+            "session_id": "s",
+        });
+        for (key, value) in with {
+            line[*key] = value.clone();
+        }
+        json!({"op": "raw", "line": line})
+    }
+
+    fn without_key(mut step: serde_json::Value, key: &str) -> serde_json::Value {
+        step["line"].as_object_mut().unwrap().remove(key);
+        step
+    }
+
+    fn protocol_errors(stored: &[chocofactory_core::models::Event]) -> Vec<String> {
+        stored
+            .iter()
+            .filter(|e| e.payload["protocol_error"] == true)
+            .map(|e| e.payload["message"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// NA8(a): the control. A production-shaped report whose success carries
+    /// no `is_error` still completes the turn.
+    #[tokio::test]
+    async fn na8a_a_report_success_without_is_error_completes_the_turn() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+            ]),
+        );
+        let timers = TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        assert_eq!(protocol_errors(&stored), Vec::<String>::new());
+        let results: Vec<_> = stored
+            .iter()
+            .filter(|e| e.event_type == EventType::ToolResult)
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].payload["is_error"], false);
+        assert_eq!(
+            results[0].payload["tool"],
+            chocofactory_core::mcp::qualified_report_outcome_tool_name()
+        );
+    }
+
+    /// NA8(b): a report whose result carries `is_error: null` is not a
+    /// successful report, so a clean end after it is a turn that never
+    /// reported.
+    #[tokio::test]
+    async fn na8b_a_report_result_with_a_null_flag_is_not_a_report() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(Some(json!(null))),
+                raw_result_line(&[]),
+            ]),
+        );
+        let timers = TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        assert_eq!(
+            protocol_errors(&stored),
+            vec!["malformed CLI output: a tool_result block's is_error is null, not true or false"]
+        );
+        assert!(
+            !stored.iter().any(|e| e.event_type == EventType::ToolResult),
+            "no successful ToolResult for the call: {stored:?}"
+        );
+    }
+
+    /// NA8(c): a `result` line with no `is_error` is not a clean end.
+    #[tokio::test]
+    async fn na8c_a_result_line_without_its_flag_ends_the_turn_as_an_error() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                without_key(raw_result_line(&[]), "is_error"),
+            ]),
+        );
+        let timers = TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        };
+        let (pool, session_id, _manager) = start_single_shot(binary, timers).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        let tail: Vec<_> = stored
+            .iter()
+            .rev()
+            .take(2)
+            .map(|e| (e.event_type, e.payload.clone()))
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                (EventType::TurnCompleted, json!({"is_error": true})),
+                (
+                    EventType::Error,
+                    json!({"message": "malformed CLI output: a result line's is_error is missing, not true or false",
+                           "protocol_error": true})
+                ),
+            ]
+        );
+        let usage: Vec<(Option<f64>, Option<i64>)> =
+            sqlx::query_as("SELECT cost_usd, output_tokens FROM turn_usage WHERE session_id = ?")
+                .bind(&session_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            usage,
+            vec![(Some(0.01), Some(9))],
+            "the usage the line carried is kept"
+        );
+    }
+
+    fn load_timers() -> TurnTimers {
+        TurnTimers {
+            grace: crate::test_support::LOAD_ALLOWANCE,
+            ..fast_timers(0)
+        }
+    }
+
+    /// A numeric-parent `result` whose owner cannot be known. Dropping it
+    /// without an end would let a failed attempt be followed by a valid
+    /// report and a clean end and count as a success, which attributing the
+    /// line to the main agent would not: so the loss is an error end.
+    #[tokio::test]
+    async fn a_failed_end_with_a_malformed_parent_is_not_followed_by_a_success() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_result_line(&[("parent_tool_use_id", json!(7)), ("is_error", json!(true))]),
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        assert_eq!(
+            protocol_errors(&stored),
+            vec![
+                "malformed CLI output: parent_tool_use_id is a number, not a non-empty string or null"
+            ]
+        );
+        let ends: Vec<_> = stored
+            .iter()
+            .filter(|e| e.event_type == EventType::TurnCompleted)
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(
+            ends.first(),
+            Some(&json!({"is_error": true})),
+            "the refusal is the turn's first end: {ends:?}"
+        );
+    }
+
+    /// Control: a clean (`is_error: false`) malformed-parent `result` also
+    /// ends an unfinished turn as an error, even after a valid report.
+    #[tokio::test]
+    async fn a_clean_end_with_a_malformed_parent_ends_an_unfinished_turn_as_an_error() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[("parent_tool_use_id", json!(7))]),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited, "never Idle: {run:?}");
+        assert_eq!(run.end_reason, None);
+    }
+
+    /// Control: a helper's `result` with a valid parent is scoped to the
+    /// helper and does not end the main turn.
+    #[tokio::test]
+    async fn a_helper_scoped_end_does_not_end_the_main_turn() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_result_line(&[
+                    ("parent_tool_use_id", json!("toolu_01W3VQxTmyXy3B7b1bmz9YaX")),
+                    ("is_error", json!(true)),
+                ]),
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{run:?}");
+        assert_eq!(run.end_reason, None);
+    }
+
+    /// Control: a turn that has already completed stays `Idle` when an
+    /// unattributable end arrives after it. The late end is history.
+    #[tokio::test]
+    async fn a_malformed_parent_end_after_completion_does_not_reclassify_the_turn() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+                raw_result_line(&[("parent_tool_use_id", json!(7)), ("is_error", json!(true))]),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        let late: Vec<_> = stored
+            .iter()
+            .filter(|e| e.event_type == EventType::TurnCompleted)
+            .map(|e| e.payload.clone())
+            .collect();
+        assert_eq!(
+            late,
+            vec![
+                json!({"is_error": false}),
+                json!({"is_error": true, "after_completion": true}),
+            ]
+        );
+    }
+
+    /// A main `result` with no flag fails an unfinished turn (NA8(c)) but
+    /// does not reopen or reclassify one that has already completed.
+    #[tokio::test]
+    async fn a_missing_flag_end_after_completion_leaves_the_turn_idle() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                raw_report_call(),
+                raw_report_result(None),
+                raw_result_line(&[]),
+                without_key(raw_result_line(&[]), "is_error"),
+            ]),
+        );
+        let (pool, session_id, _manager) = start_single_shot(binary, load_timers()).await;
+
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{run:?}");
+        assert_eq!(run.end_reason, None);
+        let stored = events::list_for_session(&pool, &session_id).await.unwrap();
+        let late = stored
+            .iter()
+            .filter(|e| e.payload["after_completion"] == true)
+            .count();
+        assert_eq!(late, 2, "the diagnostic and the end are both history");
+    }
+
+    /// The fixture's report results are the shapes the real CLI sends: a
+    /// success has no `is_error` key and array content naming the outcome; a
+    /// rejection is `is_error: true` with string content. The call's tool
+    /// name is the one Rust builds, not a copy of it.
+    #[test]
+    fn the_script_fixtures_report_results_have_the_real_cli_shapes() {
+        let dir = TempDir::new();
+        let script = dir.0.join("script.json");
+        std::fs::write(
+            &script,
+            json!([
+                {"op": "report", "outcome": "done"},
+                {"op": "report", "outcome": "lgtm", "is_error": true},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(fixture_binary("fake_claude_script.py"))
+            .env("FAKE_CLAUDE_SCRIPT", &script)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let lines: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let blocks = |kind: &str| -> Vec<serde_json::Value> {
+            lines
+                .iter()
+                .flat_map(|l| {
+                    l["message"]["content"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .filter(|b| b["type"] == kind)
+                .collect()
+        };
+        let calls = blocks("tool_use");
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            assert_eq!(
+                call["name"],
+                chocofactory_core::mcp::qualified_report_outcome_tool_name()
+            );
+        }
+        let results = blocks("tool_result");
+        assert_eq!(results.len(), 2);
+        let success = results[0].as_object().unwrap();
+        assert!(!success.contains_key("is_error"), "{success:?}");
+        assert_eq!(
+            results[0]["content"],
+            json!([{"type": "text", "text": "Accepted outcome 'done'."}])
+        );
+        assert_eq!(results[1]["is_error"], true);
+        assert!(results[1]["content"].is_string());
+    }
+
+    /// Neither a top-level nor a wrapped `ProtocolError` is main-agent
+    /// activity, and neither changes what the turn is waiting for.
+    #[test]
+    fn a_protocol_error_changes_no_turn_state() {
+        let diagnostic = AgentEvent::ProtocolError {
+            message: "malformed CLI output: a result line's is_error is null, not true or false"
+                .to_string(),
+        };
+        for event in [
+            diagnostic.clone(),
+            AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_01W3VQxTmyXy3B7b1bmz9YaX".to_string(),
+                event: Box::new(diagnostic),
+            },
+        ] {
+            let mut turn = SingleShotTurn {
+                waiting_for_report: true,
+                ..Default::default()
+            };
+            turn.pending_reports.insert("toolu_01pending".to_string());
+            assert!(matches!(turn.observe(&event), TurnStep::Continue));
+            assert!(
+                turn.waiting_for_report,
+                "a diagnostic is not the agent working again"
+            );
+            assert_eq!(
+                turn.pending_reports,
+                std::collections::HashSet::from(["toolu_01pending".to_string()])
+            );
+            assert!(!turn.reported);
+            assert!(!turn.completed);
+            assert!(!turn.errored);
+            assert!(!turn.gave_up);
+        }
     }
 
     /// #92's case: the turn was working, the account hit its usage limit,

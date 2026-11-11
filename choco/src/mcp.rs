@@ -540,6 +540,10 @@ mod tests {
     fn an_empty_summary_is_accepted() {
         let result = call(&outcomes(), json!({ "outcome": "approved", "summary": "" }));
         assert_eq!(result["isError"], false, "got {result}");
+        assert_eq!(
+            result["content"][0]["text"], "Accepted outcome 'approved'.",
+            "got {result}"
+        );
     }
 
     #[test]
@@ -874,9 +878,12 @@ mod tests {
         );
         let third = &responses[2]["result"];
         assert_eq!(third["isError"], false, "got {third}");
-        let text = third["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("'States'"), "got {text}");
-        assert!(text.contains("attempt 3"), "got {text}");
+        assert_eq!(
+            third["content"][0]["text"],
+            "Accepted outcome 'approved'. Its report is still missing 'States', and this is \
+             attempt 3, so it was accepted as it stands.",
+            "got {third}"
+        );
     }
 
     /// The attempt number in that reply is the attempt it really is
@@ -897,8 +904,12 @@ mod tests {
         let responses = session(&stage, &[thin.clone(), thin.clone(), thin.clone(), thin]);
         let fourth = &responses[3]["result"];
         assert_eq!(fourth["isError"], false, "got {fourth}");
-        let text = fourth["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("attempt 4"), "got {text}");
+        assert_eq!(
+            fourth["content"][0]["text"],
+            "Accepted outcome 'approved'. Its report is still missing 'States', and this is \
+             attempt 4, so it was accepted as it stands.",
+            "got {fourth}"
+        );
     }
 
     /// The allowance is for a model that can't satisfy the rule, not for one
@@ -931,8 +942,35 @@ mod tests {
         let responses = session(&stage, &[thin.clone(), thin, complete]);
         let third = &responses[2]["result"];
         assert_eq!(third["isError"], false, "got {third}");
-        let text = third["content"][0]["text"].as_str().unwrap();
-        assert!(!text.contains("still missing"), "got {text}");
+        assert_eq!(
+            third["content"][0]["text"], "Accepted outcome 'approved'.",
+            "got {third}"
+        );
+    }
+
+    /// The missing sections are named in the existing quoted-list form when
+    /// there are several.
+    #[test]
+    fn a_third_thin_attempt_names_several_missing_sections() {
+        let stage = with_sections(&["Findings", "States", "Side effects"]);
+        let thin = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": TOOL_NAME,
+                "arguments": { "outcome": "approved", "summary": "Findings: none" },
+            },
+        });
+        let responses = session(&stage, &[thin.clone(), thin.clone(), thin]);
+        let third = &responses[2]["result"];
+        assert_eq!(third["isError"], false, "got {third}");
+        assert_eq!(
+            third["content"][0]["text"],
+            "Accepted outcome 'approved'. Its report is still missing 'States' and 'Side effects', \
+             and this is attempt 3, so it was accepted as it stands.",
+            "got {third}"
+        );
     }
 
     /// The count is per section-rejection, not per call: an off-list outcome

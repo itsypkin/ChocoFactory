@@ -208,6 +208,15 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    /// Native output from the CLI that the adapter refused to treat as
+    /// evidence: a line or block whose required field was missing or of the
+    /// wrong type. Recorded as an ordinary `error` event with
+    /// `protocol_error: true`; nothing downstream reacts to it as a control
+    /// signal, and it is not main-agent activity. What matters is the
+    /// `ToolCall`, `ToolResult` or clean `TurnCompleted` that is *not* emitted.
+    ProtocolError {
+        message: String,
+    },
     /// The turn was cut off from outside: the CLI reported that the account
     /// hit a usage/rate limit (#92). Recorded as an ordinary `Error` on the
     /// timeline — it *is* an error for the turn — but carried as its own
@@ -414,6 +423,7 @@ impl AgentEvent {
             AgentEvent::Thinking { .. } => EventType::Thinking,
             AgentEvent::SessionMeta { .. } => EventType::SessionMeta,
             AgentEvent::Error { .. }
+            | AgentEvent::ProtocolError { .. }
             | AgentEvent::Interrupted { .. }
             | AgentEvent::SettingsNotApplied { .. } => EventType::Error,
             AgentEvent::TurnCompleted { .. } => EventType::TurnCompleted,
@@ -459,6 +469,9 @@ impl AgentEvent {
                 payload
             }
             AgentEvent::Error { message } => serde_json::json!({ "message": message }),
+            AgentEvent::ProtocolError { message } => {
+                serde_json::json!({ "message": message, "protocol_error": true })
+            }
             AgentEvent::Interrupted {
                 message,
                 detected_by,
