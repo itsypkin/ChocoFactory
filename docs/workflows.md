@@ -335,11 +335,12 @@ write succeeds, and a failed write is not retried:
   blocks in the same line are still taken.
 - A main-agent `result` line whose `is_error` is not `true` or `false` fails
   an unfinished turn as an error, not a clean end. It doesn't reopen or
-  reclassify a turn that has already completed: the late end is recorded
-  (marked `after_completion`) and does not change the completion. The run's
-  final status still follows the usual cleanup rules; for example, a process
-  still alive after the grace period ends it as `lingered`. A sub-agent's
-  stays scoped to that sub-agent.
+  reclassify a turn that has already completed: the late end is recorded,
+  marked `after_completion`, if its own write succeeds (that write is
+  independent of the diagnostic's), and it does not change the completion.
+  The run's final status still follows the usual cleanup rules; for
+  example, a process still alive after the grace period ends it as
+  `lingered`. A sub-agent's stays scoped to that sub-agent.
 
 ## What an agent inherits from your Claude setup
 
