@@ -362,6 +362,8 @@ async fn omp_unsignalled_work_is_nudged_and_a_wake_before_exhaustion_applies_onc
     wait_until_task_status(&run.pool, &run.task_id, "closed").await;
     run.script.wait_log("script_done").await;
     run.script.wait_log("eof").await;
+    // The outcome event is appended after the task transition, so wait for it.
+    wait_until_turn_outcome_event(&run.pool, &run.task_id).await;
     assert_eq!(run.outcomes().await.len(), 1);
     assert_eq!(
         stage_trail(&run.pool, &run.task_id).await,
