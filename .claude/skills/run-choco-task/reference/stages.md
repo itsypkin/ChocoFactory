@@ -17,14 +17,18 @@ Read this while watching a task, when its behaviour surprises you.
 - **spec_questions** (`coding-task-planned` only). Waits, with no time
   limit, for `choco task send`. The answer goes back to `spec_check`,
   never straight to the coder.
-- **coding / revising.** The coder's turn ends when it calls
-  `report_outcome`, not when it stops printing. It reports `done`, or
+- **coding / revising.** The coder's turn is complete when
+  it has called `report_outcome` and its run then ends cleanly, and the
+  process exits and is cleaned up; the call alone does not complete it, and
+  neither does stopping output. It reports `done`, or
   `blocked` when the spec's rules leave it no way forward (see the `blocker`
   entry). A turn that goes quiet
-  without reporting is nudged, then closed, unless a background job it started
-  is still running (Claude Code only): then it is not nudged, and is closed
-  once its waits on jobs add up to 60 minutes in total for the turn (a later
-  wait gets only what is left, never a fresh 60 minutes). In `revising`, the coder decides
+  without reporting is nudged, then closed, unless its CLI says background
+  work it started is still pending (Claude Code and omp): then it is not
+  nudged, and is closed once its waits add up to 60 minutes in total for the
+  turn (a later wait gets only what is left, never a fresh 60 minutes). Work
+  the CLI does not signal as pending, such as a named omp service, gets the
+  ordinary nudges. In `revising`, the coder decides
   which PR comments are new by comparing their times with its last commit,
   and it can get that wrong across time zones, so a comment of yours may be
   treated as already handled.

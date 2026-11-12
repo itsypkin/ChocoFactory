@@ -1060,8 +1060,10 @@ fn normalize(
                 tracing::debug!("ignoring a sub-agent-scoped background_tasks_changed line");
                 return Vec::new();
             }
+            let running = parse_background_jobs(value);
             vec![AgentEvent::BackgroundJobs {
-                running: parse_background_jobs(value),
+                pending: !running.is_empty(),
+                running,
             }]
         }
         Some("assistant") if parent_shape_ok => normalize_assistant(value, tool_names),
@@ -3248,7 +3250,10 @@ mod tests {
         normalize(&parse(line), &mut HashMap::new(), &mut BillingMode::Unknown)
             .into_iter()
             .map(|event| match event {
-                AgentEvent::BackgroundJobs { running } => running,
+                AgentEvent::BackgroundJobs { running, pending } => {
+                    assert_eq!(pending, !running.is_empty());
+                    running
+                }
                 other => panic!("expected BackgroundJobs, got {other:?}"),
             })
             .collect()
@@ -3320,6 +3325,7 @@ mod tests {
                 job("a", "local_bash", "first"),
                 job("b", "local_agent", "second"),
             ],
+            pending: true,
         };
         assert_eq!(event.event_type(), EventType::SessionNote);
         let payload = event.payload();
@@ -3335,8 +3341,17 @@ mod tests {
                 {"id": "b", "kind": "local_agent", "description": "second"},
             ])
         );
-        let none = AgentEvent::BackgroundJobs { running: vec![] }.payload();
-        assert_eq!(none["message"], "no background jobs running");
+        assert_eq!(payload["pending"], true);
+        let none = AgentEvent::BackgroundJobs {
+            running: vec![],
+            pending: false,
+        }
+        .payload();
+        assert_eq!(
+            none["message"],
+            "no pending background work reported by the CLI"
+        );
+        assert_eq!(none["pending"], false);
     }
 
     // ---- claude_settings and the settings check (#346) -------------------

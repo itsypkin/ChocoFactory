@@ -8,6 +8,7 @@ use super::*;
 
 mod claude_settings;
 mod model_level;
+mod omp_wake;
 mod parallel;
 mod pause;
 mod queue;

@@ -310,7 +310,9 @@ pub async fn list_for_session(
 ///
 /// `background_jobs` session notes are skipped too (#271): the CLI's job list
 /// can change between the final reply and its `result`, and that must not cut
-/// the reply off. Other session notes, `job_wait` included, still end a message.
+/// the reply off. So are `execution_started` notes: the main agent starting
+/// another execution after its final text must not erase that text. Other
+/// session notes, `job_wait` included, still end a message.
 ///
 /// Two kinds of row on the session are skipped outright rather than scanned
 /// (#90): a sub-agent's own events (`parent_tool_use_id` set), which are not
@@ -350,12 +352,13 @@ pub async fn final_assistant_text_for_session(
            AND json_extract(payload, '$.parent_tool_use_id') IS NULL
            AND json_extract(payload, '$.after_completion') IS NULL
            AND NOT (event_type = ? AND json_extract(payload, '$.kind')
-                IN ('background_jobs', 'leftovers_killed', 'leftovers_unchecked'))
+                IN ('background_jobs', 'leftovers_killed', 'leftovers_unchecked', ?))
          ORDER BY created_at, id",
     )
     .bind(&assistant)
     .bind(session_id)
     .bind(EventType::SessionNote.to_string())
+    .bind(crate::adapter::EXECUTION_STARTED_NOTE_KIND)
     .fetch_all(pool)
     .await?;
 
@@ -1825,6 +1828,95 @@ mod tests {
                 .await
                 .unwrap(),
             ""
+        );
+    }
+
+    /// The main agent starting another execution after its final text (omp's
+    /// `agent_start`) is only an activity note: it must not erase the reply.
+    /// Built from the production event so the payload and the query agree.
+    #[tokio::test]
+    async fn execution_start_notes_preserve_the_final_answer() {
+        use crate::adapter::{AgentEvent, BackgroundJob};
+        let started = AgentEvent::ExecutionStarted;
+        assert_eq!(started.event_type(), EventType::SessionNote);
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let pending_clear = AgentEvent::BackgroundJobs {
+            running: Vec::<BackgroundJob>::new(),
+            pending: false,
+        };
+        append_all(
+            &pool,
+            &session_id,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "the exact final answer" }),
+                ),
+                (started.event_type(), started.payload()),
+                (EventType::TurnCompleted, json!({ "is_error": false })),
+                (pending_clear.event_type(), pending_clear.payload()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            final_assistant_text_for_session(&pool, &session_id)
+                .await
+                .unwrap(),
+            "the exact final answer"
+        );
+
+        // A nudge between the old answer and the start still ends it, so the
+        // transparent note is the only thing that changed.
+        let other = seed_session(&pool).await;
+        append_all(
+            &pool,
+            &other,
+            &[
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "the old answer" }),
+                ),
+                (
+                    EventType::SessionNote,
+                    json!({ "kind": "nudge", "message": "asked the agent to report" }),
+                ),
+                (started.event_type(), started.payload()),
+                (EventType::TurnCompleted, json!({ "is_error": false })),
+            ],
+        )
+        .await;
+        assert_eq!(
+            final_assistant_text_for_session(&pool, &other)
+                .await
+                .unwrap(),
+            ""
+        );
+
+        // A start inside a helper's output stays helper output, and a start
+        // after completion is not part of the answer either.
+        let helper = seed_session(&pool).await;
+        let mut after = started.payload();
+        after["after_completion"] = json!(true);
+        append_all(
+            &pool,
+            &helper,
+            &[
+                (EventType::AssistantMessage, json!({ "text": "reply" })),
+                (EventType::TurnCompleted, json!({ "is_error": false })),
+                (started.event_type(), after),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "late", "after_completion": true }),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(
+            final_assistant_text_for_session(&pool, &helper)
+                .await
+                .unwrap(),
+            "reply"
         );
     }
 

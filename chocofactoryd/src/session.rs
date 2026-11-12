@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{
     AdapterError, AgentEvent, AgentHandle, BackgroundJob, Registry, RoleConfig, SettingsVerdict,
-    UnknownCliError, describe_jobs,
+    UnknownCliError, describe_background_work,
 };
 use crate::db::{events, sessions, usage};
 
@@ -744,7 +744,10 @@ impl SessionManager {
 /// nothing committed, and had the workflow advance past it while the
 /// sub-agent kept writing to the worktree. So a single-shot turn completes
 /// only on a `result` that follows a successful `report_outcome` call by the
-/// main agent (not a sub-agent, not one the tool rejected):
+/// main agent (not a sub-agent, not one the tool rejected). (For omp, the
+/// `result` is the `TurnCompleted` of one native execution: its closing
+/// `agent_end` with `yielded: true`, never a prompt's result or a
+/// settlement; a woken run has its own.)
 ///
 /// 1. Report, then `result`: the turn is complete. Stdin is closed so the CLI
 ///    exits, and a grace timer starts. If the process is still alive when it
@@ -754,10 +757,13 @@ impl SessionManager {
 ///    open, so a background job's notification can wake it. After
 ///    `nudge_after` with no events at all it is nudged on stdin, up to
 ///    `max_nudges` times; after that, stdin is closed, the grace rule
-///    applies, and the run ends `NoReport`. While the CLI reports background
-///    jobs still running (claude only), the turn is not nudged: it is closed
-///    the same way if still waiting `job_wait_limit` after it started
-///    waiting, and the idle reaper leaves it alone (#271).
+///    applies, and the run ends `NoReport`. While the CLI signals background
+///    work as pending (claude from its running jobs, omp from
+///    `awaitingAsyncWork`), the turn is not nudged: it is closed the same way
+///    once the waits add up to `job_wait_limit` in total, and the idle reaper
+///    leaves it alone (#271). A start by the main agent ends a wait, running
+///    time spends none of the budget, and a later wait gets only what is
+///    left.
 /// 3. A `result` with `is_error` closes stdin and applies the grace rule; the
 ///    run ends `exited`, as a crash would.
 ///
@@ -918,7 +924,7 @@ async fn drain_session(
                             note_job_wait_entered(
                                 pool,
                                 session_id,
-                                &turn.background_jobs,
+                                &turn,
                                 turn_timers.job_wait_limit,
                                 remaining,
                                 events_notify,
@@ -1274,7 +1280,8 @@ struct SingleShotTurn {
     pending_reports: std::collections::HashSet<String>,
     /// A main-agent `report_outcome` call succeeded.
     reported: bool,
-    /// A `result` followed a successful report: the turn is done.
+    /// A clean end (claude's `result`, omp's yielded `agent_end`) followed a
+    /// successful report: the turn is done.
     completed: bool,
     /// A clean `result` arrived with no report, and stdin is still open.
     waiting_for_report: bool,
@@ -1301,9 +1308,14 @@ struct SingleShotTurn {
     /// unconfirmed) (#346); holds the end reason to record.
     /// Set for a standing session too.
     settings_end: Option<SessionEndReason>,
-    /// The background jobs the CLI last reported as running (#271). Each
-    /// `BackgroundJobs` event replaces it.
+    /// The background jobs the CLI last named as running (#271). Each
+    /// `BackgroundJobs` event replaces it. Display only: omp names none, so an
+    /// empty list is not evidence that nothing is pending.
     background_jobs: Vec<BackgroundJob>,
+    /// The CLI says background work can still wake the agent. This, not the
+    /// list above, decides whether the turn is waiting on jobs. Each
+    /// `BackgroundJobs` event replaces it.
+    background_pending: bool,
     /// When the turn's wait on its background jobs runs out. Fixed when the
     /// turn starts waiting on jobs; see [`SingleShotTurn::update_job_wait`].
     job_wait_deadline: Option<tokio::time::Instant>,
@@ -1332,6 +1344,7 @@ impl Default for SingleShotTurn {
             interrupted: false,
             settings_end: None,
             background_jobs: Vec::new(),
+            background_pending: false,
             job_wait_deadline: None,
             job_wait_started_at: None,
             job_wait_spent: Duration::ZERO,
@@ -1385,8 +1398,9 @@ impl SingleShotTurn {
         }
         // Not main-agent activity, so it neither clears `waiting_for_report`
         // nor needs the guard below.
-        if let AgentEvent::BackgroundJobs { running } = event {
+        if let AgentEvent::BackgroundJobs { running, pending } = event {
             self.background_jobs = running.clone();
+            self.background_pending = *pending;
             return TurnStep::Continue;
         }
         if self.completed || self.errored || self.gave_up {
@@ -1407,6 +1421,9 @@ impl SingleShotTurn {
                     | AgentEvent::ToolCall { .. }
                     | AgentEvent::ToolResult { .. }
                     | AgentEvent::SessionMeta { .. }
+                    // The CLI's own start of a main execution is activity
+                    // even before it produces any output.
+                    | AgentEvent::ExecutionStarted
             )
         {
             self.waiting_for_report = false;
@@ -1471,13 +1488,13 @@ impl SingleShotTurn {
             && !self.waiting_on_jobs()
     }
 
-    /// The turn ended without reporting and the CLI says its background jobs
-    /// are still running (#271): it is waiting on them, not silent.
+    /// The turn ended without reporting and the CLI says background work is
+    /// still pending (#271): it is waiting on it, not silent.
     fn waiting_on_jobs(&self) -> bool {
         self.waiting_for_report
             && !self.gave_up
             && self.grace_deadline.is_none()
-            && !self.background_jobs.is_empty()
+            && self.background_pending
     }
 
     /// The one place the job-wait deadline and budget are written.
@@ -1530,34 +1547,68 @@ fn describe_limit(limit: Duration) -> String {
     }
 }
 
-/// Records that a turn has started waiting on its background jobs (#271).
+/// Records that a turn has started waiting on its background work (#271).
 async fn note_job_wait_entered(
     pool: &SqlitePool,
     session_id: &str,
-    jobs: &[BackgroundJob],
+    turn: &SingleShotTurn,
     limit: Duration,
     remaining: Duration,
     events_notify: &Notify,
 ) {
-    let deadline = chrono::Duration::from_std(remaining)
-        .ok()
-        .and_then(|limit| Utc::now().checked_add_signed(limit))
-        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .unwrap_or_else(|| "never".to_string());
     append_session_note(
         pool,
         session_id,
         "job_wait",
-        &format!(
-            "the turn ended without reporting while {} background job(s) run ({}); not nudging \
-             until they finish, closing it at {deadline} (the {} limit is a total for the turn)",
-            jobs.len(),
-            describe_jobs(jobs),
-            describe_limit(limit)
-        ),
+        &job_wait_entered_message(turn, limit, remaining, Utc::now()),
         events_notify,
     )
     .await;
+}
+
+/// The wait-entry note's text. The deadline is what is left of the turn's
+/// total wait budget if the turn keeps waiting; it is not a promise that the
+/// process closes then, because main execution resuming ends the wait.
+fn job_wait_entered_message(
+    turn: &SingleShotTurn,
+    limit: Duration,
+    remaining: Duration,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    let deadline = chrono::Duration::from_std(remaining)
+        .ok()
+        .and_then(|left| now.checked_add_signed(left))
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "never".to_string());
+    format!(
+        "the turn ended without an accepted report while {}; not nudging while that is \
+         pending. If it keeps waiting, its wait budget (the {} limit is a total for the turn, \
+         {} of it left) runs out at {deadline}; if the agent starts working again first, the \
+         wait ends and the rest of the budget stays for a later wait",
+        describe_background_work(&turn.background_jobs, turn.background_pending),
+        describe_limit(limit),
+        describe_limit(remaining),
+    )
+}
+
+/// The exhaustion note's text: the turn's total wait budget ran out while it
+/// waited, or earlier waits had already used it up before this one began.
+fn job_wait_exhausted_message(
+    turn: &SingleShotTurn,
+    limit: Duration,
+    already_used_up: bool,
+) -> String {
+    let when = if already_used_up {
+        "had already been used up by its earlier waits"
+    } else {
+        "was exhausted while it waited"
+    };
+    format!(
+        "the turn ended without an accepted report and was still waiting ({}) when the \
+         turn's job-wait budget of {} (a total per turn) {when}; closing it",
+        describe_background_work(&turn.background_jobs, turn.background_pending),
+        describe_limit(limit)
+    )
 }
 
 /// Closes a turn whose job-wait limit ran out, the way an exhausted nudge
@@ -1572,18 +1623,7 @@ async fn close_after_job_wait(
     events_notify: &Notify,
 ) {
     // The note is built before `gave_up` makes the turn stop waiting on jobs.
-    let when = if already_used_up {
-        "had already been used up by its earlier waits"
-    } else {
-        "ran out"
-    };
-    let message = format!(
-        "the turn never called report_outcome and was still waiting on {} background job(s) \
-         ({}) when the turn's job-wait limit of {} (a total per turn) {when}; closing it",
-        turn.background_jobs.len(),
-        describe_jobs(&turn.background_jobs),
-        describe_limit(turn_timers.job_wait_limit)
-    );
+    let message = job_wait_exhausted_message(turn, turn_timers.job_wait_limit, already_used_up);
     turn.gave_up = true;
     turn.job_wait_deadline = None;
     tracing::warn!(
@@ -3764,6 +3804,7 @@ mod tests {
                     description: "d".into(),
                 })
                 .collect(),
+            pending: n > 0,
         };
         let mut turn = turn_with(|t| t.waiting_for_report = true);
         assert!(turn.should_nudge());
@@ -3786,6 +3827,7 @@ mod tests {
                 kind: "k".into(),
                 description: "d".into(),
             }],
+            pending: true,
         });
         assert!(!turn.waiting_for_report);
         assert!(!turn.should_nudge());
@@ -3804,6 +3846,7 @@ mod tests {
         turn_with(|t| {
             t.waiting_for_report = true;
             t.background_jobs = vec![a_job()];
+            t.background_pending = true;
         })
     }
 
@@ -3825,6 +3868,7 @@ mod tests {
         assert!(turn.job_wait_expired(now + limit));
 
         turn.background_jobs.clear();
+        turn.background_pending = false;
         assert_eq!(turn.update_job_wait(later, limit), JobWaitChange::NoChange);
         assert_eq!(turn.job_wait_deadline, None);
     }
@@ -3841,12 +3885,14 @@ mod tests {
         ));
         // The jobs finish after 4 s.
         turn.background_jobs.clear();
+        turn.background_pending = false;
         let t4 = t0 + StdDuration::from_secs(4);
         assert_eq!(turn.update_job_wait(t4, limit), JobWaitChange::NoChange);
         assert_eq!(turn.job_wait_spent, StdDuration::from_secs(4));
 
         // A new wait gets what is left, not a fresh limit.
         turn.background_jobs = vec![a_job()];
+        turn.background_pending = true;
         let t5 = t0 + StdDuration::from_secs(5);
         assert_eq!(
             turn.update_job_wait(t5, limit),
@@ -3857,18 +3903,395 @@ mod tests {
         assert_eq!(turn.job_wait_deadline, Some(t5 + StdDuration::from_secs(6)));
         // It lasts 6 s: the budget is gone.
         turn.background_jobs.clear();
+        turn.background_pending = false;
         let t11 = t5 + StdDuration::from_secs(6);
         turn.update_job_wait(t11, limit);
         assert_eq!(turn.job_wait_spent, limit);
 
         // Entering with nothing left is refused, and `spent` is not reset.
         turn.background_jobs = vec![a_job()];
+        turn.background_pending = true;
         assert_eq!(
             turn.update_job_wait(t11, limit),
             JobWaitChange::ExhaustedOnEntry
         );
         assert_eq!(turn.job_wait_deadline, None);
         assert_eq!(turn.job_wait_spent, limit);
+    }
+
+    // ---- pending work with no job identities (omp) ----
+
+    fn omp_level(pending: bool) -> AgentEvent {
+        AgentEvent::BackgroundJobs {
+            running: Vec::new(),
+            pending,
+        }
+    }
+
+    fn named_level(pending: bool) -> AgentEvent {
+        AgentEvent::BackgroundJobs {
+            running: vec![a_job()],
+            pending,
+        }
+    }
+
+    fn clean_end() -> AgentEvent {
+        use crate::adapter::{BillingMode, TokenCounts, TurnUsage, UsageCounting};
+        AgentEvent::TurnCompleted {
+            is_error: false,
+            usage: TurnUsage {
+                cost_usd: None,
+                tokens: TokenCounts::default(),
+                models: None,
+                wall_time_ms: None,
+                model_turns: None,
+                billing: BillingMode::Unknown,
+                counting: UsageCounting::PerTurn,
+            },
+        }
+    }
+
+    /// The signal, not the list, decides whether the turn is waiting: pending
+    /// work with no identities waits (named Claude jobs too), the list alone
+    /// does not.
+    #[test]
+    fn pending_work_waits_whether_or_not_the_cli_names_it() {
+        for (event, waits) in [
+            (omp_level(true), true),
+            (named_level(true), true),
+            (omp_level(false), false),
+            (named_level(false), false),
+        ] {
+            let mut turn = SingleShotTurn::default();
+            turn.observe(&event);
+            turn.observe(&clean_end());
+            assert!(turn.waiting_for_report);
+            assert_eq!(turn.waiting_on_jobs(), waits, "{event:?}");
+            assert_eq!(turn.should_nudge(), !waits, "{event:?}");
+        }
+    }
+
+    /// A deterministic timeline of the one budget: a 4 s wait, 7 s of active
+    /// work, then a wait that has only the 6 s that are left.
+    #[test]
+    fn omp_pending_wait_uses_the_existing_budget() {
+        let limit = StdDuration::from_secs(10);
+        let t0 = tokio::time::Instant::now();
+        let at = |secs: u64| t0 + StdDuration::from_secs(secs);
+        let mut turn = SingleShotTurn::default();
+
+        // Yield #1: pending work published, then a report-less clean end.
+        turn.observe(&omp_level(true));
+        assert!(matches!(
+            turn.observe(&clean_end()),
+            TurnStep::WaitingForReport
+        ));
+        assert!(turn.waiting_on_jobs());
+        assert!(!turn.should_nudge(), "pending work is never nudged");
+        assert_eq!(
+            turn.update_job_wait(t0, limit),
+            JobWaitChange::Entered { remaining: limit }
+        );
+
+        // 4 s later the main agent starts: that alone ends the wait and
+        // clears the deadline, with no assistant or tool output required.
+        turn.observe(&AgentEvent::ExecutionStarted);
+        assert!(!turn.waiting_for_report);
+        assert!(!turn.waiting_on_jobs());
+        assert_eq!(turn.update_job_wait(at(4), limit), JobWaitChange::NoChange);
+        assert_eq!(turn.job_wait_deadline, None);
+        assert_eq!(turn.job_wait_spent, StdDuration::from_secs(4));
+
+        // 7 s of silent active work: nothing is spent, nothing is nudged.
+        assert!(!turn.should_nudge());
+        assert_eq!(turn.update_job_wait(at(11), limit), JobWaitChange::NoChange);
+        assert_eq!(
+            turn.job_wait_spent,
+            StdDuration::from_secs(4),
+            "active time is free"
+        );
+
+        // Yield #2, pending again: only the remaining 6 s are available.
+        turn.observe(&clean_end());
+        assert_eq!(
+            turn.update_job_wait(at(11), limit),
+            JobWaitChange::Entered {
+                remaining: StdDuration::from_secs(6)
+            }
+        );
+        assert_eq!(turn.job_wait_deadline, Some(at(17)));
+        assert!(!turn.job_wait_expired(at(16)));
+        assert!(
+            turn.job_wait_expired(at(17)),
+            "exhaustion at the remaining budget"
+        );
+
+        // Waking again after it all, then waiting a third time: spent only
+        // ever rose, so there is nothing left on entry.
+        turn.observe(&AgentEvent::ExecutionStarted);
+        assert_eq!(turn.update_job_wait(at(17), limit), JobWaitChange::NoChange);
+        assert_eq!(turn.job_wait_spent, limit);
+        turn.observe(&clean_end());
+        assert_eq!(
+            turn.update_job_wait(at(18), limit),
+            JobWaitChange::ExhaustedOnEntry
+        );
+        assert_eq!(turn.job_wait_spent, limit);
+    }
+
+    /// A wrapped helper's start is not the main agent working again.
+    #[test]
+    fn a_helpers_start_is_not_main_activity() {
+        let mut turn = SingleShotTurn::default();
+        turn.observe(&omp_level(true));
+        turn.observe(&clean_end());
+        turn.observe(&AgentEvent::Subagent {
+            parent_tool_use_id: "toolu_h".into(),
+            event: Box::new(AgentEvent::ExecutionStarted),
+        });
+        assert!(turn.waiting_for_report);
+        assert!(turn.waiting_on_jobs());
+    }
+
+    #[test]
+    fn pending_work_notes_do_not_claim_known_job_identities() {
+        let limit = StdDuration::from_secs(10);
+        let t0 = tokio::time::Instant::now();
+        let now = Utc::now();
+        let mut turn = SingleShotTurn::default();
+        turn.observe(&omp_level(true));
+        turn.observe(&clean_end());
+        assert!(matches!(
+            turn.update_job_wait(t0, limit),
+            JobWaitChange::Entered { .. }
+        ));
+        let entered = job_wait_entered_message(&turn, limit, limit, now);
+        assert!(
+            entered.contains("pending background work; job list unavailable"),
+            "{entered}"
+        );
+        for banned in ["no background jobs running", "0 background job(s)"] {
+            assert!(!entered.contains(banned), "{entered}");
+        }
+        let payload = omp_level(true).payload();
+        assert_eq!(
+            payload["message"],
+            "pending background work; job list unavailable"
+        );
+        assert_eq!(payload["pending"], true);
+        assert_eq!(payload["running"], json!([]));
+
+        // The deadline is a remaining budget, not a promise to close then.
+        assert!(entered.contains("If it keeps waiting"), "{entered}");
+        assert!(entered.contains("the wait ends"), "{entered}");
+
+        // Wait / start / wait: the second entry shows what is left, and
+        // exhaustion wording follows from the budget.
+        turn.observe(&AgentEvent::ExecutionStarted);
+        turn.update_job_wait(t0 + StdDuration::from_secs(4), limit);
+        turn.observe(&clean_end());
+        let JobWaitChange::Entered { remaining } =
+            turn.update_job_wait(t0 + StdDuration::from_secs(5), limit)
+        else {
+            panic!("a second wait begins");
+        };
+        let second = job_wait_entered_message(&turn, limit, remaining, now);
+        assert!(second.contains("6s of it left"), "{second}");
+        let during = job_wait_exhausted_message(&turn, limit, false);
+        assert!(during.contains("was exhausted while it waited"), "{during}");
+        assert!(during.contains("job list unavailable"), "{during}");
+        let on_entry = job_wait_exhausted_message(&turn, limit, true);
+        assert!(
+            on_entry.contains("had already been used up by its earlier waits"),
+            "{on_entry}"
+        );
+
+        // Start / settle: the cleared level says what the CLI reported, not
+        // that no job exists.
+        turn.observe(&AgentEvent::ExecutionStarted);
+        turn.observe(&omp_level(false));
+        assert!(!turn.background_pending);
+        let settled = omp_level(false).payload();
+        assert_eq!(
+            settled["message"],
+            "no pending background work reported by the CLI"
+        );
+        assert_eq!(settled["pending"], false);
+        assert!(
+            !settled["message"]
+                .as_str()
+                .unwrap()
+                .contains("no background jobs"),
+            "{settled}"
+        );
+
+        // Named Claude jobs keep their descriptions and count.
+        let mut named = SingleShotTurn::default();
+        named.observe(&named_level(true));
+        named.observe(&clean_end());
+        let message = job_wait_entered_message(&named, limit, limit, now);
+        assert!(
+            message.contains("1 background job(s) running: d"),
+            "{message}"
+        );
+        assert_eq!(
+            named_level(true).payload()["message"],
+            "1 background job(s) running: d"
+        );
+    }
+
+    /// The start note says only that main-agent activity was observed.
+    #[test]
+    fn the_execution_start_note_claims_only_observed_activity() {
+        let payload = AgentEvent::ExecutionStarted.payload();
+        assert_eq!(payload["kind"], "execution_started");
+        assert_eq!(payload["message"], "main-agent activity observed");
+        assert_eq!(
+            AgentEvent::ExecutionStarted.event_type(),
+            EventType::SessionNote
+        );
+    }
+
+    /// A manager running a real `OmpAdapter` against the scripted fixture.
+    async fn start_omp_single_shot(
+        state_dir: &std::path::Path,
+        script: &crate::test_support::OmpScript,
+        timers: TurnTimers,
+        idle: chrono::Duration,
+    ) -> (SqlitePool, String, Arc<SessionManager>) {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(crate::adapter::OmpAdapter::with_binary(
+            &script.binary,
+            state_dir,
+        ));
+        let manager = SessionManager::with_turn_timers(
+            pool.clone(),
+            Registry::single(adapter),
+            idle,
+            Arc::new(Notify::new()),
+            timers,
+        );
+        let role = RoleConfig {
+            model: Some("openai-codex/gpt-5.6-terra".to_string()),
+            sandboxed: true,
+            isolation: crate::adapter::Isolation::default(),
+            ..single_shot_role_config()
+        };
+        manager
+            .start(&session_id, "omp", "go", &role, SessionKind::SingleShot)
+            .await
+            .unwrap();
+        (pool, session_id, manager)
+    }
+
+    fn omp_wake_steps(awaiting: serde_json::Value, finish: bool) -> serde_json::Value {
+        let mut steps = vec![
+            json!({"op": "agent_start"}),
+            json!({"op": "assistant", "text": "started the service"}),
+            json!({"op": "agent_end", "terminal": false, "awaiting": awaiting}),
+            json!({"op": "prompt_result", "settled": false}),
+            json!({"op": "gate", "name": "wake"}),
+        ];
+        if finish {
+            steps.extend([
+                json!({"op": "agent_start"}),
+                json!({"op": "report", "args": {"outcome": "done", "summary": "s"}}),
+                json!({"op": "assistant", "text": "finished"}),
+                json!({"op": "agent_end"}),
+                json!({"op": "session_settled"}),
+            ]);
+        }
+        serde_json::Value::Array(steps)
+    }
+
+    /// Through the real session and adapter: pending work with no identities
+    /// is neither nudged nor reaped while it is pending, and a wake that
+    /// reports and ends completes the turn once.
+    #[tokio::test]
+    async fn omp_pending_work_is_not_nudged_or_reaped_and_a_wake_completes() {
+        let dir = TempDir::new();
+        let script =
+            crate::test_support::OmpScript::new(&dir.0, omp_wake_steps(json!(true), true), &[]);
+        let (pool, session_id, manager) =
+            start_omp_single_shot(&dir.0, &script, fast_timers(3), chrono::Duration::zero()).await;
+        wait_for_note(&pool, &session_id, "job_wait").await;
+
+        // The reaper's staleness is zero, so freshness cannot be what saves
+        // the turn; and the nudge timer (150 ms) gets several chances.
+        reap_once(&manager).await;
+        tokio::time::sleep(StdDuration::from_millis(700)).await;
+        reap_once(&manager).await;
+        let kinds = session_notes(&pool, &session_id).await;
+        assert!(
+            !kinds
+                .iter()
+                .any(|k| ["nudge", "no_report", "lingered"].contains(&k.as_str())),
+            "{kinds:?}"
+        );
+        assert_eq!(
+            sessions::get(&pool, &session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Active
+        );
+
+        script.release("wake");
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle, "{:?}", script.lines());
+        assert_eq!(run.end_reason, None);
+        assert_eq!(script.prompts_received(), 1, "no nudge or second prompt");
+        let kinds = session_notes(&pool, &session_id).await;
+        assert!(!kinds.iter().any(|k| k == "nudge"), "{kinds:?}");
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "execution_started").count(),
+            2,
+            "{kinds:?}"
+        );
+    }
+
+    /// The same pending work, never woken: bounded by the existing wait
+    /// budget, closing the turn as no-report.
+    #[tokio::test]
+    async fn omp_pending_work_that_never_wakes_closes_at_the_budget() {
+        let dir = TempDir::new();
+        let script =
+            crate::test_support::OmpScript::new(&dir.0, omp_wake_steps(json!(true), false), &[]);
+        let timers = TurnTimers {
+            job_wait_limit: StdDuration::from_millis(400),
+            ..fast_timers(3)
+        };
+        let (pool, session_id, _manager) =
+            start_omp_single_shot(&dir.0, &script, timers, chrono::Duration::hours(1)).await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Exited);
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        let kinds = session_notes(&pool, &session_id).await;
+        assert!(kinds.iter().any(|k| k == "job_wait"), "{kinds:?}");
+        assert!(kinds.iter().any(|k| k == "no_report"), "{kinds:?}");
+        assert!(!kinds.iter().any(|k| k == "nudge"), "{kinds:?}");
+    }
+
+    /// Settled with nothing signalled pending (a named-service shape): the
+    /// ordinary silence handling applies, the budget does not.
+    #[tokio::test]
+    async fn omp_work_not_signalled_pending_is_nudged_like_any_silence() {
+        let dir = TempDir::new();
+        let script = crate::test_support::OmpScript::new(
+            &dir.0,
+            omp_wake_steps(json!("ABSENT"), false),
+            &[],
+        );
+        let (pool, session_id, _manager) =
+            start_omp_single_shot(&dir.0, &script, fast_timers(1), chrono::Duration::hours(1))
+                .await;
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
+        let kinds = session_notes(&pool, &session_id).await;
+        assert!(kinds.iter().any(|k| k == "nudge"), "{kinds:?}");
+        assert!(!kinds.iter().any(|k| k == "job_wait"), "{kinds:?}");
     }
 
     #[test]

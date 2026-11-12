@@ -5,8 +5,11 @@ Speaks enough of omp's JSONL RPC protocol for the adapter: a `ready` frame
 offering protocol versions [1, 2], `negotiate_protocol`, `set_event_filter`,
 `set_host_tools`, `get_state`, `get_session_stats` and `prompt`. A prompt is
 answered with assistant `message_end` frames carrying usage, a
-`host_tool_call` for `report_outcome`, a `prompt_result` and a
-`session_settled`.
+`host_tool_call` for `report_outcome`, an `agent_end` that closes the run
+(its `stopReason` is the run's status), a `prompt_result` and, when the
+session was left unsettled, a `session_settled`. Every run is bracketed by
+`agent_start` / `agent_end`; `set_event_filter` is honoured, so a session
+that doesn't subscribe to those never sees them.
 
 Behaviour is driven by environment variables (tests set them through a tiny
 wrapper script, never through the test process's own environment):
@@ -15,8 +18,11 @@ wrapper script, never through the test process's own environment):
   in turn, stopping at the first the daemon accepts. Default: one `done`.
 - FAKE_OMP_MODES: comma-separated flags, any of
   unpriced   assistant usage has cost.total 0 (a model with no price list)
-  error      `prompt_result` is an error (FAKE_OMP_ERROR_MESSAGE, FAKE_OMP_ERROR_STATUS)
-  unsettled  `prompt_result.sessionSettled` is false; `session_settled` follows
+  error      the run's final assistant message and the `prompt_result` are errors
+             (FAKE_OMP_ERROR_MESSAGE, FAKE_OMP_ERROR_STATUS)
+  unsettled  `agent_end` says background work is awaited and `prompt_result.sessionSettled`
+             is false; the background run (its own start, message and end) and
+             `session_settled` follow
   garbage    a malformed line and an unknown frame precede the turn
   bad_chunk  an invalid `rpc_chunk` sequence precedes the turn
   chunked    the final assistant message is sent as `rpc_chunk` frames
@@ -35,7 +41,8 @@ wrapper script, never through the test process's own environment):
   second_model  before the final message, one extra assistant message from
              FAKE_OMP_SECOND_PROVIDER / FAKE_OMP_SECOND_MODEL (default
              other-provider / other-model), counted in the statistics
-  no_messages  the prompt sends no message_end at all; the statistics gain
+  no_messages  the prompt sends no message_end at all (its `agent_end` still
+             carries a final assistant message); the statistics gain
              FAKE_OMP_SIDE_TOKENS input and FAKE_OMP_SIDE_COST cost
   client_file  at start, before anything else, write omp's "project
              presence" file `$XDG_STATE_HOME/omp/run/daemons/<hash>/clients/<pid>-<uuid>.json`
@@ -63,6 +70,24 @@ wrapper script, never through the test process's own environment):
   tools_error   `set_host_tools` fails
   v1_only       `ready` offers only protocol 1; negotiating kills the process
   negotiate_error  `negotiate_protocol` fails (the session stays on v1)
+- FAKE_OMP_SCRIPT: a JSON file holding a list of steps. The first agent
+  prompt runs them instead of the canned turn (later prompts are only
+  logged and answered; `/skill:…` is rejected, `/help` is a builtin command
+  answered with agentInvoked false). FAKE_OMP_GATE_DIR names the directory whose files
+  release `gate` / `hold_stats` steps; FAKE_OMP_LOG names a file that gets
+  one progress line per step and per interesting frame, so a test can wait
+  on what the fixture really did. Steps (`op`):
+  agent_start / turn_end / session_settled / log {tag} / pid / sleep {seconds} /
+  exit {code} / gate {name} (blocks, still answering requests, until the file
+  exists) / hold_stats {gate} (the next get_session_stats reply is delayed
+  until that gate file exists, and then reports the totals of that moment) /
+  assistant {text, usage, counted, stop_reason, error_message, error_status}
+  / report {args} (a real host call under fresh ids; waits for the reply) /
+  agent_end {yielded, terminal, awaiting, messages} (`yielded` and
+  `awaiting` take a JSON value or "ABSENT"; `messages` is last (default),
+  empty, absent, string, unknown_reason or raw: the step's own `raw` list is
+  sent as the closing messages) / prompt_result {status, settled,
+  error_message, error_status} / add_totals {input, cost}.
 - FAKE_OMP_STATS_SEQ: comma list of `ok|error|garbled|silent`, one per
   `get_session_stats` call (the last repeats). Default `ok`.
 - FAKE_OMP_START_TOKENS: input tokens the session already has at start (a
@@ -98,6 +123,7 @@ import base64
 import json
 import os
 import re
+import select
 import sys
 import time
 
@@ -131,6 +157,24 @@ if "client_file" in MODES and os.environ.get("XDG_STATE_HOME"):
 def emit(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+FILTERABLE = {"agent_start", "agent_end", "turn_end", "message_end"}
+
+
+def emit_event(obj):
+    """An agent event: sent only if the session's event filter allows it."""
+    if STATE.filter is not None and obj.get("type") in FILTERABLE:
+        if obj["type"] not in STATE.filter:
+            return
+    emit(obj)
+
+
+def log(tag):
+    path = os.environ.get("FAKE_OMP_LOG")
+    if path:
+        with open(path, "a") as handle:
+            handle.write(tag + "\n")
 
 
 def flag(name):
@@ -169,6 +213,14 @@ class State:
         self.cost = 0.0
         self.session_id = flag("--resume") or "omp-session-1"
         self.tools = (flag("--tools") or "").split(",")
+        # The events `set_event_filter` asked for; None until it is sent.
+        self.filter = None
+        self.script_ran = False
+        self.prompt_id = None
+        self.report_n = 0
+        self.last_assistant = None
+        self.hold_next = None
+        self.held = None
 
 
 STATE = State()
@@ -182,6 +234,24 @@ def stats_mode():
 
 
 def handle_stats(request):
+    log("stats_request")
+    if STATE.hold_next:
+        STATE.held = (request, STATE.hold_next)
+        STATE.hold_next = None
+        log("stats_held")
+        return
+    send_stats(request)
+
+
+def service():
+    """Releases a held statistics reply once its gate file exists."""
+    held = STATE.held
+    if held and os.path.exists(held[1]):
+        STATE.held = None
+        send_stats(held[0])
+
+
+def send_stats(request):
     mode = stats_mode()
     if "exit_on_stats" in MODES and STATE.stats_calls > 1:
         assistant([{"type": "text", "text": "late text"}])
@@ -195,6 +265,7 @@ def handle_stats(request):
         respond(request, data={"unexpected": True})
         return
     t = STATE.totals
+    log("stats_response input=%d" % t["input"])
     respond(
         request,
         data={
@@ -231,15 +302,20 @@ def send_maybe_chunked(frame, chunked):
         )
 
 
-def assistant(content, usage=True, final=False, provider=None, model=None, counted=True):
+def assistant(content, usage=True, final=False, provider=None, model=None, counted=True,
+              stop_reason="stop", error_message=None, error_status=None, send=True):
     unpriced = "unpriced" in MODES
     message = {
         "role": "assistant",
         "content": content,
         "provider": provider or os.environ.get("FAKE_OMP_PROVIDER", "openai-codex"),
         "model": model or os.environ.get("FAKE_OMP_MODEL", "gpt-5.6-terra"),
-        "stopReason": "stop",
+        "stopReason": stop_reason,
     }
+    if error_message is not None:
+        message["errorMessage"] = error_message
+    if error_status is not None:
+        message["errorStatus"] = error_status
     if os.environ.get("FAKE_OMP_NO_PROVIDER") == "1":
         del message["provider"]
     if usage:
@@ -256,18 +332,42 @@ def assistant(content, usage=True, final=False, provider=None, model=None, count
                 STATE.totals[key] += USAGE[key]
             if not unpriced:
                 STATE.cost += COST
-    frame = {"type": "message_end", "message": message}
-    send_maybe_chunked(frame, final and "chunked" in MODES)
+    STATE.last_assistant = message
+    if send:
+        frame = {"type": "message_end", "message": message}
+        if STATE.filter is None or "message_end" in STATE.filter:
+            send_maybe_chunked(frame, final and "chunked" in MODES)
+    return message
 
 
-def read_frame():
-    line = sys.stdin.readline()
-    if not line:
-        return None
-    try:
-        return json.loads(line)
-    except ValueError:
-        return {}
+_BUF = b""
+TIMEOUT = object()
+
+
+def read_frame(timeout=None):
+    """The next frame from stdin: None at EOF, {} for a line that isn't JSON,
+    TIMEOUT when `timeout` seconds pass first. Releases held statistics
+    replies while it waits."""
+    global _BUF
+    deadline = None if timeout is None else time.time() + timeout
+    while True:
+        service()
+        index = _BUF.find(b"\n")
+        if index >= 0:
+            line, _BUF = _BUF[:index], _BUF[index + 1:]
+            try:
+                return json.loads(line)
+            except ValueError:
+                return {}
+        ready, _, _ = select.select([0], [], [], 0.02)
+        if ready:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                log("eof")
+                return None
+            _BUF += chunk
+        elif deadline is not None and time.time() >= deadline:
+            return TIMEOUT
 
 
 def final_text(prompt_frame):
@@ -335,7 +435,7 @@ def run_reports():
                 rejected = bool(frame.get("isError"))
                 break
             dispatch(frame)
-        emit(
+        emit_event(
             {
                 "type": "message_end",
                 "message": {
@@ -399,13 +499,31 @@ def memory_stats(request):
 
 
 def run_prompt(request):
-    log = os.environ.get("FAKE_OMP_PROMPT_LOG")
-    if log:
-        with open(log, "a") as handle:
+    prompt_log = os.environ.get("FAKE_OMP_PROMPT_LOG")
+    if prompt_log:
+        with open(prompt_log, "a") as handle:
             handle.write(json.dumps({"message": request.get("message"),
                                      "streamingBehavior": request.get("streamingBehavior")}) + "\n")
     if request.get("message") == "/memory stats":
         memory_stats(request)
+        return
+    if os.environ.get("FAKE_OMP_SCRIPT"):
+        log("prompt_in:%s" % request.get("message"))
+        message = request.get("message") or ""
+        if message.startswith("/skill:"):
+            respond(request, success=False, error="no such skill: nope")
+            log("rejected")
+            return
+        if message.startswith("/help"):
+            # A builtin command: no agent run and no `prompt_result`.
+            respond(request, data={"agentInvoked": False})
+            log("builtin_answered")
+            return
+        respond(request, data={"agentInvoked": True})
+        if not STATE.script_ran:
+            STATE.script_ran = True
+            STATE.prompt_id = request.get("id")
+            run_script()
         return
     if "reject_noerror" in MODES:
         respond(request, success=False)
@@ -421,6 +539,7 @@ def run_prompt(request):
         respond(request, data={"agentInvoked": False})
         return
     respond(request, data={"agentInvoked": True})
+    emit_event({"type": "agent_start"})
     if "reject_followup" in MODES:
         second = read_frame()
         respond(second, success=False, error="no such skill: nope")
@@ -463,6 +582,9 @@ def run_prompt(request):
     if "no_messages" in MODES:
         STATE.totals["input"] += int(os.environ.get("FAKE_OMP_SIDE_TOKENS", "0"))
         STATE.cost += float(os.environ.get("FAKE_OMP_SIDE_COST", "0"))
+        final = assistant([{"type": "text", "text": "no messages"}], send=False, counted=False)
+        emit_event({"type": "agent_end", "isTerminal": True, "yielded": True,
+                    "awaitingAsyncWork": False, "messages": [final]})
         emit({"type": "prompt_result", "id": request.get("id"), "agentInvoked": True,
               "status": "completed", "sessionSettled": True})
         return
@@ -474,7 +596,7 @@ def run_prompt(request):
              "arguments": {"path": "a.txt"}},
         ]
     )
-    emit(
+    emit_event(
         {
             "type": "message_end",
             "message": {
@@ -501,8 +623,17 @@ def run_prompt(request):
                   model=os.environ.get("FAKE_OMP_SECOND_MODEL", "other-model"))
     if "side_calls" in MODES:
         STATE.totals["input"] += int(os.environ.get("FAKE_OMP_SIDE_TOKENS", "0"))
-    assistant([{"type": "text", "text": final_text(request)}], final=True)
     unsettled = "unsettled" in MODES or "unsettled_die" in MODES
+    failing = {}
+    if "error" in MODES:
+        failing = {"stop_reason": "error",
+                   "error_message": os.environ.get("FAKE_OMP_ERROR_MESSAGE", "boom")}
+        if os.environ.get("FAKE_OMP_ERROR_STATUS"):
+            failing["error_status"] = int(os.environ["FAKE_OMP_ERROR_STATUS"])
+    final = assistant([{"type": "text", "text": final_text(request)}], final=True, **failing)
+    emit_event({"type": "turn_end"})
+    emit_event({"type": "agent_end", "isTerminal": not unsettled, "yielded": True,
+                "awaitingAsyncWork": unsettled, "messages": [final]})
     if "error" in MODES:
         error = {"message": os.environ.get("FAKE_OMP_ERROR_MESSAGE", "boom"), "retryable": False}
         if os.environ.get("FAKE_OMP_ERROR_STATUS"):
@@ -515,14 +646,139 @@ def run_prompt(request):
     if "unsettled_die" in MODES:
         sys.exit(0)
     if unsettled:
-        # Background work wakes the agent after the yield; its run streams
-        # before `session_settled`.
+        # Background work wakes the agent after the yield; it is a run of its
+        # own, with its own start and end, before `session_settled`.
         if "reject_unsettled" in MODES:
             second = read_frame()
             respond(second, success=False, error="no such skill: nope")
-        assistant([{"type": "text", "text": "background result"}])
+        emit_event({"type": "agent_start"})
+        background = assistant([{"type": "text", "text": "background result"}])
         time.sleep(0.3)
+        emit_event({"type": "agent_end", "isTerminal": True, "yielded": True,
+                    "awaitingAsyncWork": False, "messages": [background]})
         emit({"type": "session_settled"})
+
+
+# ---------------------------------------------------------------------------
+# Scripted runs
+# ---------------------------------------------------------------------------
+
+
+def gate_path(name):
+    return os.path.join(os.environ.get("FAKE_OMP_GATE_DIR", ""), name)
+
+
+def wait_for(path, what):
+    """Blocks, still answering requests, until `path` exists."""
+    deadline = time.time() + 60
+    while not os.path.exists(path):
+        frame = read_frame(timeout=0.05)
+        if frame is None:
+            sys.exit(0)
+        if frame is TIMEOUT:
+            if time.time() > deadline:
+                log("gate_timeout:%s" % what)
+                sys.exit(7)
+            continue
+        dispatch(frame)
+
+
+def script_report(args):
+    n = STATE.report_n
+    STATE.report_n += 1
+    call_id = "call-script-%d" % n
+    host_id = "htc-script-%d" % n
+    assistant([{"type": "toolCall", "id": call_id, "name": "report_outcome",
+                "arguments": args}], stop_reason="toolUse")
+    emit({"type": "host_tool_call", "id": host_id, "toolCallId": call_id,
+          "toolName": "report_outcome", "arguments": args})
+    log("host_call:%d" % n)
+    while True:
+        frame = read_frame()
+        if frame is None:
+            sys.exit(0)
+        if frame.get("type") == "host_tool_result" and frame.get("id") == host_id:
+            rejected = bool(frame.get("isError"))
+            break
+        dispatch(frame)
+    log("host_result:%d:%s" % (n, "rejected" if rejected else "accepted"))
+    emit_event({"type": "message_end", "message": {
+        "role": "toolResult", "toolCallId": call_id, "toolName": "report_outcome",
+        "content": [{"type": "text", "text": "reported"}], "isError": rejected}})
+
+
+def run_script():
+    with open(os.environ["FAKE_OMP_SCRIPT"]) as handle:
+        steps = json.load(handle)
+    for step in steps:
+        op = step["op"]
+        log("op:%s%s" % (op, ":" + str(step["label"]) if "label" in step else ""))
+        if op == "agent_start":
+            emit_event({"type": "agent_start"})
+        elif op == "turn_end":
+            emit_event({"type": "turn_end"})
+        elif op == "session_settled":
+            emit({"type": "session_settled"})
+        elif op == "log":
+            log(step["tag"])
+        elif op == "pid":
+            log("pid:%d" % os.getpid())
+        elif op == "sleep":
+            time.sleep(step["seconds"])
+        elif op == "exit":
+            sys.exit(step.get("code", 0))
+        elif op == "gate":
+            wait_for(gate_path(step["name"]), step["name"])
+        elif op == "hold_stats":
+            STATE.hold_next = gate_path(step["gate"])
+        elif op == "add_totals":
+            STATE.totals["input"] += int(step.get("input", 0))
+            STATE.cost += float(step.get("cost", 0))
+        elif op == "assistant":
+            assistant(
+                [{"type": "text", "text": step.get("text", "text")}],
+                usage=step.get("usage", True),
+                counted=step.get("counted", True),
+                stop_reason=step.get("stop_reason", "stop"),
+                error_message=step.get("error_message"),
+                error_status=step.get("error_status"),
+            )
+        elif op == "report":
+            script_report(step["args"])
+        elif op == "prompt_result":
+            frame = {"type": "prompt_result", "id": STATE.prompt_id, "agentInvoked": True,
+                     "status": step.get("status", "completed"),
+                     "sessionSettled": step.get("settled", True)}
+            if step.get("status") == "error":
+                error = {"message": step.get("error_message", "boom"), "retryable": False}
+                if step.get("error_status"):
+                    error["httpStatus"] = step["error_status"]
+                frame["error"] = error
+            emit(frame)
+        elif op == "agent_end":
+            frame = {"type": "agent_end"}
+            for key, field, default in (("yielded", "yielded", True),
+                                        ("terminal", "isTerminal", True),
+                                        ("awaiting", "awaitingAsyncWork", False)):
+                value = step.get(key, default)
+                if value != "ABSENT":
+                    frame[field] = value
+            mode = step.get("messages", "last")
+            last = STATE.last_assistant
+            if mode == "last":
+                frame["messages"] = [last] if last else []
+            elif mode == "empty":
+                frame["messages"] = []
+            elif mode == "string":
+                frame["messages"] = "oops"
+            elif mode == "unknown_reason":
+                frame["messages"] = [dict(last, stopReason="mystery")]
+            elif mode == "raw":
+                frame["messages"] = step["raw"]
+            emit_event(frame)
+        else:
+            raise SystemExit("unknown script op %r" % op)
+    log("script_done")
 
 
 def dispatch(request):
@@ -536,6 +792,7 @@ def dispatch(request):
         STATE.v2 = request.get("protocolVersion") == 2
         respond(request, data={"protocolVersion": 2})
     elif kind == "set_event_filter":
+        STATE.filter = set(request.get("events") or [])
         respond(request, data={"events": request.get("events"),
                                "messageUpdates": request.get("messageUpdates")})
     elif kind == "set_host_tools":

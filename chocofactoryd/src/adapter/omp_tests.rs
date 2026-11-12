@@ -493,7 +493,9 @@ async fn prompt_result_errors_become_error_or_interrupted_then_a_failed_turn() {
             .filter(|e| matches!(e, AgentEvent::Error { .. } | AgentEvent::Interrupted { .. }))
             .count();
         assert_eq!(flagged, 1, "{events:?}");
-        drain(&mut handle).await;
+        // The failed prompt's result adds no second end or second evidence.
+        let rest = drain(&mut handle).await;
+        assert!(rest.is_empty(), "{rest:?}");
     }
 }
 
@@ -510,25 +512,56 @@ async fn an_errored_turn_completes_without_waiting_for_the_session_to_settle() {
     ));
 }
 
+/// The end belongs to the execution that yielded, not to the settlement
+/// that follows: the first turn completes at its own `agent_end` (pending
+/// work published before it), and the background run completes at its own.
 #[tokio::test]
-async fn an_unsettled_session_completes_on_session_settled() {
+async fn an_unsettled_session_completes_at_its_native_ends_not_at_settlement() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
-    let events = until_turn_completed(&mut handle).await;
-    // The follow-up run that background work started streams before the
-    // session settles, so it comes before the turn completes.
+    let mut events = until_turn_completed(&mut handle).await;
     assert!(
         matches!(
             &events[events.len() - 2..],
             [
-                AgentEvent::AssistantMessage { text },
+                AgentEvent::BackgroundJobs { running, pending: true },
                 AgentEvent::TurnCompleted { is_error: false, .. },
-            ] if text == "background result"
+            ] if running.is_empty()
         ),
         "{events:?}"
     );
-    drain(&mut handle).await;
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::AssistantMessage { text } if text == "background result"
+        )),
+        "the first end waited for the background run: {events:?}"
+    );
+    // The background run is an execution of its own: start, message, end.
+    let rest = until_turn_completed(&mut handle).await;
+    assert!(
+        matches!(
+            &rest[..],
+            [
+                AgentEvent::ExecutionStarted,
+                AgentEvent::AssistantMessage { text },
+                AgentEvent::BackgroundJobs { pending: false, .. },
+                AgentEvent::TurnCompleted { is_error: false, .. },
+            ] if text == "background result"
+        ),
+        "{rest:?}"
+    );
+    events.extend(rest);
+    events.extend(drain(&mut handle).await);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+            .count(),
+        2,
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -578,12 +611,16 @@ async fn a_report_whose_reply_cannot_be_sent_is_not_recorded_as_accepted() {
 }
 
 #[tokio::test]
-async fn background_messages_count_toward_the_turn_that_waited_for_them() {
+async fn a_background_run_counts_its_messages_in_its_own_interval() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
-    let events = until_turn_completed(&mut handle).await;
-    assert_eq!(usage_of(&events).model_turns, Some(3));
+    let first = until_turn_completed(&mut handle).await;
+    // The tool-call message and the final one; the background message is
+    // the next execution's.
+    assert_eq!(usage_of(&first).model_turns, Some(2));
+    let second = until_turn_completed(&mut handle).await;
+    assert_eq!(usage_of(&second).model_turns, Some(1));
 }
 
 #[tokio::test]
@@ -3395,7 +3432,7 @@ async fn a_rejected_follow_up_does_not_end_the_running_turn() {
 }
 
 #[tokio::test]
-async fn a_rejected_follow_up_does_not_end_a_turn_waiting_to_settle() {
+async fn a_rejected_follow_up_does_not_end_a_turn_with_pending_work() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled,reject_unsettled")]);
     let mut handle = adapter.start("one", &env.cfg()).unwrap();
@@ -3405,32 +3442,24 @@ async fn a_rejected_follow_up_does_not_end_a_turn_waiting_to_settle() {
     let completions: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::TurnCompleted { is_error, usage } => Some((*is_error, usage.clone())),
-            AgentEvent::ProtocolError { .. } => None,
+            AgentEvent::TurnCompleted { is_error, .. } => Some(*is_error),
             _ => None,
         })
         .collect();
-    assert_eq!(completions.len(), 1, "{events:?}");
-    assert!(!completions[0].0, "{events:?}");
+    // The prompt's own end and the background run's: the rejection, which
+    // arrives while work is pending, adds no failed end of its own.
+    assert_eq!(completions, vec![false, false], "{events:?}");
     let error_at = events
         .iter()
         .position(
             |e| matches!(e, AgentEvent::Error { message } if message == "no such skill: nope"),
         )
         .expect("the rejection is reported");
-    let done_at = events
+    let first_done = events
         .iter()
         .position(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
         .unwrap();
-    assert!(error_at < done_at, "{events:?}");
-    // The running turn keeps its own messages, background run included.
-    assert!(
-        events[..done_at].iter().any(|e| matches!(
-            e,
-            AgentEvent::AssistantMessage { text } if text == "background result"
-        )),
-        "{events:?}"
-    );
+    assert!(error_at > first_done, "{events:?}");
 }
 
 #[tokio::test]
@@ -3495,4 +3524,874 @@ async fn a_host_tool_call_without_its_fields_is_answered_as_an_error() {
     assert_eq!(reply["id"], "htc-bad");
     assert_eq!(reply["isError"], true);
     drain(&mut handle).await;
+}
+
+// ---------------------------------------------------------------------------
+// The native lifecycle: an execution ends at its own `agent_end`
+// ---------------------------------------------------------------------------
+
+/// A run of the fake driven by a script of steps (see `fake_omp.py`), with
+/// gates the test releases and a log of what the fixture really did.
+struct Scripted {
+    gates: PathBuf,
+    log: PathBuf,
+    prompts: PathBuf,
+}
+
+impl Scripted {
+    fn start(env: &Env, steps: Value, extra: &[(&str, &str)]) -> (Self, OmpAdapter) {
+        let dir = env.dir.join(format!("script-{}", uuid::Uuid::new_v4()));
+        let gates = dir.join("gates");
+        std::fs::create_dir_all(&gates).unwrap();
+        let script = dir.join("script.json");
+        std::fs::write(&script, serde_json::to_string(&steps).unwrap()).unwrap();
+        let this = Self {
+            log: dir.join("progress.log"),
+            prompts: dir.join("prompts.log"),
+            gates,
+        };
+        let mut vars: Vec<(&str, String)> = vec![
+            ("FAKE_OMP_SCRIPT", script.to_string_lossy().into_owned()),
+            (
+                "FAKE_OMP_GATE_DIR",
+                this.gates.to_string_lossy().into_owned(),
+            ),
+            ("FAKE_OMP_LOG", this.log.to_string_lossy().into_owned()),
+            (
+                "FAKE_OMP_PROMPT_LOG",
+                this.prompts.to_string_lossy().into_owned(),
+            ),
+        ];
+        vars.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+        let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let adapter = env.adapter(&refs);
+        (this, adapter)
+    }
+
+    fn release(&self, gate: &str) {
+        std::fs::write(self.gates.join(gate), "").unwrap();
+    }
+
+    fn lines(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Waits for the fixture to have logged `tag`, and returns the log.
+    async fn wait_log(&self, tag: &str) -> Vec<String> {
+        for _ in 0..1500 {
+            let lines = self.lines();
+            if lines.iter().any(|line| line == tag) {
+                return lines;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the fixture never logged {tag}: {:?}", self.lines());
+    }
+
+    fn prompts_received(&self) -> usize {
+        std::fs::read_to_string(&self.prompts)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+}
+
+fn s_start() -> Value {
+    json!({"op": "agent_start"})
+}
+
+fn s_text(text: &str) -> Value {
+    json!({"op": "assistant", "text": text})
+}
+
+fn s_report(summary: &str) -> Value {
+    json!({"op": "report", "args": {"outcome": "done", "summary": summary}})
+}
+
+fn s_end() -> Value {
+    json!({"op": "agent_end"})
+}
+
+fn is_report_call(event: &AgentEvent) -> bool {
+    matches!(event, AgentEvent::ToolCall { tool, .. } if *tool == qualified_report_outcome_tool_name())
+}
+
+fn is_report_result(event: &AgentEvent) -> bool {
+    matches!(event, AgentEvent::ToolResult { tool, .. } if *tool == qualified_report_outcome_tool_name())
+}
+
+fn is_end(event: &AgentEvent) -> bool {
+    matches!(event, AgentEvent::TurnCompleted { .. })
+}
+
+fn ends_in(events: &[AgentEvent]) -> Vec<bool> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TurnCompleted { is_error, .. } => Some(*is_error),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Events up to and including the first one `done` accepts.
+async fn events_until(
+    handle: &mut AgentHandle,
+    done: impl Fn(&AgentEvent) -> bool,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), handle.recv())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("the stream ended before the awaited event");
+        let stop = done(&event);
+        events.push(event);
+        if stop {
+            return events;
+        }
+    }
+}
+
+/// A report-less yield, the original prompt's result, then a gate; then an
+/// autonomous wake that reports and ends on its own.
+fn wake_script(awaiting: Value, settled: bool, wake_tail: Vec<Value>) -> Value {
+    let mut steps = vec![
+        s_start(),
+        s_text("started the service"),
+        json!({"op": "agent_end", "terminal": false, "awaiting": awaiting}),
+        json!({"op": "prompt_result", "settled": settled}),
+        json!({"op": "gate", "name": "wake"}),
+        s_start(),
+        s_text("the service finished"),
+        s_report("woken summary"),
+    ];
+    steps.extend(wake_tail);
+    Value::Array(steps)
+}
+
+#[tokio::test]
+async fn omp_autonomous_wake_completes_after_its_own_end() {
+    // Two controlled shapes: background work signalled as awaited with an
+    // unsettled ticket, and a named-service shape (nothing signalled, the
+    // ticket already settled).
+    for (awaiting, settled, signalled) in
+        [(json!(true), false, true), (json!("ABSENT"), true, false)]
+    {
+        let env = Env::new();
+        let tail = vec![
+            s_text("all done"),
+            json!({"op": "turn_end"}),
+            s_end(),
+            json!({"op": "session_settled"}),
+        ];
+        let (script, adapter) =
+            Scripted::start(&env, wake_script(awaiting.clone(), settled, tail), &[]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+
+        // The fixture yields, consumes the original prompt's result and
+        // waits at the gate: nothing more happens until it is released.
+        script.wait_log("op:gate").await;
+        script.release("wake");
+        script.wait_log("script_done").await;
+        // Everything is sent; read it all to the end of the stream.
+        let all = drain(&mut handle).await;
+        let context = format!(
+            "awaiting={awaiting} settled={settled}: {all:?} log={:?}",
+            script.lines()
+        );
+
+        let call = all
+            .iter()
+            .position(is_report_call)
+            .expect("the wake's report call");
+        let result = all
+            .iter()
+            .position(is_report_result)
+            .expect("the report's result");
+        assert!(
+            all[result..].iter().any(is_end),
+            "a later native end follows the accepted wake report: {context}"
+        );
+        assert!(
+            matches!(
+                &all[result],
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            ),
+            "{context}"
+        );
+        assert_eq!(
+            ends_in(&all),
+            vec![false, false],
+            "exactly two ends: {context}"
+        );
+        let ends: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| is_end(e))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            ends[0] < call && call < result && result < ends[1],
+            "the report-less end precedes the report; the wake's end follows its accepted result: {context}"
+        );
+        assert_eq!(script.prompts_received(), 1, "no second prompt: {context}");
+        let levels: Vec<bool> = all
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::BackgroundJobs { pending, running } => {
+                    assert!(running.is_empty(), "omp names no jobs");
+                    Some(*pending)
+                }
+                _ => None,
+            })
+            .collect();
+        if signalled {
+            // Published before the report-less end; cleared before the
+            // wake's end (its own `awaitingAsyncWork` is false).
+            assert_eq!(levels, vec![true, false], "{context}");
+            let up = all
+                .iter()
+                .position(|e| matches!(e, AgentEvent::BackgroundJobs { pending: true, .. }))
+                .unwrap();
+            assert!(
+                up < ends[0],
+                "pending is published before the end: {context}"
+            );
+        } else {
+            assert!(
+                levels.is_empty(),
+                "nothing signalled, nothing pending: {context}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn omp_report_without_a_later_native_end_does_not_complete() {
+    let env = Env::new();
+    // The wake reports, a tool iteration ends and the session settles, but
+    // the run never yields again. The marker message is queued behind
+    // everything those frames could have caused.
+    let tail = vec![
+        json!({"op": "turn_end"}),
+        json!({"op": "session_settled"}),
+        s_text("tail-marker"),
+        json!({"op": "log", "tag": "tail_sent"}),
+    ];
+    let (script, adapter) = Scripted::start(&env, wake_script(json!(true), false, tail), &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("op:gate").await;
+    script.release("wake");
+    script.wait_log("tail_sent").await;
+
+    // The process is alive (stdin is still open) and the report is in.
+    let seen = events_until(
+        &mut handle,
+        |e| matches!(e, AgentEvent::AssistantMessage { text } if text == "tail-marker"),
+    )
+    .await;
+    assert!(
+        seen.iter().any(is_report_result),
+        "the report is recorded: {seen:?}"
+    );
+    let first_end = seen
+        .iter()
+        .position(is_end)
+        .expect("the report-less first end");
+    let report = seen.iter().position(is_report_result).unwrap();
+    assert!(
+        first_end < report && !seen[report..].iter().any(is_end),
+        "no end after the report while the process is alive: {seen:?} log={:?}",
+        script.lines()
+    );
+    let rest = drain(&mut handle).await;
+    let all: Vec<_> = seen.iter().chain(rest.iter()).cloned().collect();
+    assert_eq!(
+        ends_in(&all),
+        vec![false],
+        "only the report-less first end exists; after EOF still no end: {all:?} log={:?}",
+        script.lines()
+    );
+}
+
+#[tokio::test]
+async fn omp_wake_error_does_not_inherit_prompt_success() {
+    type Check = fn(&AgentEvent) -> bool;
+    let cases: [(&str, &str, Option<u64>, Check); 5] = [
+        (
+            "error",
+            "502 upstream connect error: connection refused by the provider",
+            None,
+            |e| matches!(e, AgentEvent::Error { message } if message.starts_with("502 upstream")),
+        ),
+        ("error", "slow down", Some(429), |e| {
+            matches!(
+                e,
+                AgentEvent::Interrupted { message, detected_by: InterruptionEvidence::Structured }
+                    if message == "slow down"
+            )
+        }),
+        ("error", "You've hit your usage limit", None, |e| {
+            matches!(
+                e,
+                AgentEvent::Interrupted {
+                    detected_by: InterruptionEvidence::MessageText,
+                    ..
+                }
+            )
+        }),
+        // Both kinds of evidence at once: the structured status wins.
+        ("error", "You've hit your usage limit", Some(429), |e| {
+            matches!(
+                e,
+                AgentEvent::Interrupted {
+                    detected_by: InterruptionEvidence::Structured,
+                    ..
+                }
+            )
+        }),
+        ("aborted", "", None, |e| {
+            matches!(e, AgentEvent::Error { .. })
+        }),
+    ];
+    for (reason, message, status, evidence) in cases {
+        let env = Env::new();
+        let mut last = json!({"op": "assistant", "text": "stopped", "stop_reason": reason});
+        if reason == "error" {
+            last["error_message"] = json!(message);
+        }
+        if let Some(status) = status {
+            last["error_status"] = json!(status);
+        }
+        let tail = vec![last, s_end(), json!({"op": "session_settled"})];
+        let (script, adapter) = Scripted::start(&env, wake_script(json!(true), false, tail), &[]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        let first = until_turn_completed(&mut handle).await;
+        assert!(matches!(
+            first.last(),
+            Some(AgentEvent::TurnCompleted {
+                is_error: false,
+                ..
+            })
+        ));
+        script.wait_log("op:gate").await;
+        script.release("wake");
+        let mut rest = events_until(&mut handle, is_end).await;
+        rest.extend(drain(&mut handle).await);
+        assert!(rest.iter().any(is_report_result), "{reason}: {rest:?}");
+        assert_eq!(
+            ends_in(&rest),
+            vec![true],
+            "{reason}: the wake's end is a failure, whatever the original prompt said: {rest:?}"
+        );
+        let flagged: Vec<_> = rest
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Error { .. } | AgentEvent::Interrupted { .. }))
+            .collect();
+        assert_eq!(
+            flagged.len(),
+            1,
+            "{reason}/{status:?}: one piece of evidence: {rest:?}"
+        );
+        assert!(evidence(flagged[0]), "{reason}/{status:?}: {rest:?}");
+    }
+}
+
+/// A closing `agent_end.messages` array as omp sends it: several messages,
+/// the run's last assistant message is the one that decides the status.
+#[tokio::test]
+async fn omp_the_last_assistant_message_of_an_end_decides_its_status() {
+    let assistant = |reason: &str| {
+        let mut message = json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "x"}],
+            "stopReason": reason,
+        });
+        if reason == "error" {
+            message["errorMessage"] = json!("502 upstream connect error");
+        }
+        message
+    };
+    let tool_result = json!({"role": "toolResult", "toolName": "bash", "isError": false});
+    let user = json!({"role": "user", "content": "go on"});
+    let cases = [
+        (
+            "an error after a clean message",
+            vec![
+                assistant("stop"),
+                tool_result.clone(),
+                assistant("error"),
+                user.clone(),
+            ],
+            true,
+        ),
+        (
+            "a clean message after an error",
+            vec![
+                assistant("error"),
+                tool_result.clone(),
+                assistant("stop"),
+                user.clone(),
+            ],
+            false,
+        ),
+    ];
+    for (what, raw, failed) in cases {
+        let env = Env::new();
+        let steps = json!([
+            s_start(),
+            s_text("hello"),
+            {"op": "agent_end", "messages": "raw", "raw": raw},
+        ]);
+        let (_script, adapter) = Scripted::start(&env, steps, &[]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        let mut events = until_turn_completed(&mut handle).await;
+        events.extend(drain(&mut handle).await);
+        assert_eq!(
+            ends_in(&events),
+            vec![failed],
+            "{what}: the last assistant message decides: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn a_repeated_start_keeps_the_open_execution_and_its_start() {
+    use tokio::time::Instant;
+    let mut executions = Executions::default();
+    let t0 = Instant::now();
+    assert_eq!(executions.start(t0), t0);
+    assert!(executions.add_assistant(None));
+    // A second start, much later, neither reopens nor resets anything.
+    let later = t0 + Duration::from_secs(5);
+    assert_eq!(executions.start(later), t0, "the original start survives");
+    assert!(executions.add_assistant(None));
+    let closed = executions.close().expect("the execution is still open");
+    assert_eq!(closed.started, t0);
+    assert_eq!(
+        closed.messages.assistant_messages, 2,
+        "the messages survive"
+    );
+    // After the yield the next start opens a new interval.
+    assert!(executions.close().is_none());
+    assert!(
+        !executions.add_assistant(None),
+        "no open execution counts nothing"
+    );
+    assert_eq!(executions.start(later), later);
+}
+
+#[tokio::test]
+async fn omp_consecutive_starts_preserve_open_execution() {
+    let env = Env::new();
+    let steps = json!([
+        s_start(),
+        s_text("first"),
+        s_report("kept across the second start"),
+        // A run that ends without yielding leaves the execution open.
+        {"op": "agent_end", "yielded": false},
+        {"op": "sleep", "seconds": 1.5},
+        s_start(),
+        s_text("second"),
+        {"op": "gate", "name": "yield"},
+        s_end(),
+        {"op": "prompt_result"},
+        {"op": "session_settled"},
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    // Everything up to the gate has been read by the driver once the second
+    // message shows.
+    let before = events_until(
+        &mut handle,
+        |e| matches!(e, AgentEvent::AssistantMessage { text } if text == "second"),
+    )
+    .await;
+    script.wait_log("op:gate").await;
+    assert!(!before.iter().any(is_end), "no end was made up: {before:?}");
+    assert!(
+        !before.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "a repeated start is not an error: {before:?}"
+    );
+    assert_eq!(
+        before
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ExecutionStarted))
+            .count(),
+        2,
+        "every start is an activity signal: {before:?}"
+    );
+    assert!(
+        before.iter().any(|e| is_report_result(e)
+            && matches!(
+                e,
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            )),
+        "the report stays accepted across the second start: {before:?}"
+    );
+
+    script.release("yield");
+    let mut rest = events_until(&mut handle, is_end).await;
+    let usage = usage_of(&rest);
+    // First interval: its text and the report-call message; second: one.
+    assert_eq!(
+        usage.model_turns,
+        Some(3),
+        "both starts' messages: {rest:?}"
+    );
+    // The 1.5 s before the second start is part of the same interval.
+    assert!(
+        usage.wall_time_ms.unwrap() >= 1400,
+        "the original start time is kept: {usage:?}"
+    );
+    rest.extend(drain(&mut handle).await);
+    assert_eq!(ends_in(&rest), vec![false], "{rest:?}");
+}
+
+/// The two-interval script of the accounting tests: interval one has two
+/// assistant messages, interval two a message, a report call and a final
+/// message.
+fn accounting_script(hold: bool) -> Value {
+    let mut steps = vec![s_start(), s_text("one"), s_text("two")];
+    if hold {
+        steps.push(json!({"op": "hold_stats", "gate": "stats"}));
+    } else {
+        // Keeps the first reading from covering the second execution.
+        steps.push(json!({"op": "log", "tag": "first_end_next"}));
+    }
+    steps.extend([
+        json!({"op": "agent_end", "terminal": false, "awaiting": true}),
+        json!({"op": "prompt_result", "settled": false}),
+    ]);
+    if !hold {
+        steps.push(json!({"op": "gate", "name": "wake"}));
+    }
+    steps.extend([
+        s_start(),
+        s_text("three"),
+        s_report("accounted"),
+        s_text("four"),
+        s_end(),
+        json!({"op": "session_settled"}),
+        json!({"op": "log", "tag": "second_end_sent"}),
+    ]);
+    Value::Array(steps)
+}
+
+#[tokio::test]
+async fn omp_native_ends_keep_fifo_and_do_not_double_charge() {
+    let env = Env::new();
+    let (script, adapter) = Scripted::start(&env, accounting_script(true), &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+
+    // The first end's statistics reply is held while the wake runs, reports
+    // and ends. The driver must keep answering the host's callback.
+    let lines = script.wait_log("second_end_sent").await;
+    let held = lines
+        .iter()
+        .position(|l| l == "stats_held")
+        .expect("the reading was held");
+    let accepted = lines
+        .iter()
+        .position(|l| l == "host_result:0:accepted")
+        .expect("the host call was answered while the statistics waited");
+    assert!(held < accepted, "{lines:?}");
+    assert!(
+        !lines[held..]
+            .iter()
+            .any(|l| l.starts_with("stats_response")),
+        "nothing has been released yet: {lines:?}"
+    );
+    script.release("stats");
+
+    let mut events = events_until(&mut handle, |e| {
+        matches!(e, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    events.extend(events_until(&mut handle, is_end).await);
+    events.extend(drain(&mut handle).await);
+    let ends: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_end(e))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(ends.len(), 2, "exactly two usage records: {events:?}");
+    let report_call = events.iter().position(is_report_call).unwrap();
+    assert!(
+        ends[0] < report_call && report_call < ends[1],
+        "first end < accepted wake report < second end: {events:?}"
+    );
+    let usages: Vec<TurnUsage> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnCompleted { usage, .. } => Some(usage.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usages.iter().map(|u| u.model_turns).collect::<Vec<_>>(),
+        vec![Some(2), Some(3)],
+        "each interval counts its own messages"
+    );
+    for usage in &usages {
+        assert_eq!(
+            usage.tokens,
+            TokenCounts::default(),
+            "overlap: unknown tokens: {usage:?}"
+        );
+        assert_eq!(usage.cost_usd, None);
+        assert_eq!(
+            usage.models, None,
+            "no partial remainder for either interval: {usage:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn omp_nonoverlapping_native_ends_sum_their_exact_deltas_once() {
+    let env = Env::new();
+    let (script, adapter) = Scripted::start(&env, accounting_script(false), &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let first = until_turn_completed(&mut handle).await;
+    script.wait_log("op:gate").await;
+    script.release("wake");
+    let mut second = until_turn_completed(&mut handle).await;
+    second.extend(drain(&mut handle).await);
+    // 100 input tokens per message: two in the first interval, three in the
+    // second. Together exactly the five messages' worth, once.
+    assert_eq!(usage_of(&first).tokens.input, Some(200), "{first:?}");
+    assert_eq!(usage_of(&second).tokens.input, Some(300), "{second:?}");
+    assert_eq!(usage_of(&first).model_turns, Some(2));
+    assert_eq!(usage_of(&second).model_turns, Some(3));
+}
+
+#[tokio::test]
+async fn omp_a_failed_reading_leaves_unknown_figures_and_the_ends_in_order() {
+    let env = Env::new();
+    // Call 0 is the baseline; the first end's reading fails; the second is
+    // fine but has no baseline to be measured from.
+    let (script, adapter) = Scripted::start(
+        &env,
+        accounting_script(false),
+        &[("FAKE_OMP_STATS_SEQ", "ok,error,ok")],
+    );
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    let first = until_turn_completed(&mut handle).await;
+    script.wait_log("op:gate").await;
+    script.release("wake");
+    let mut second = events_until(&mut handle, is_end).await;
+    second.extend(drain(&mut handle).await);
+    assert_eq!(usage_of(&first).tokens, TokenCounts::default());
+    assert_eq!(usage_of(&first).models, None);
+    assert_eq!(usage_of(&second).tokens, TokenCounts::default());
+    assert!(second.iter().any(is_report_result), "{second:?}");
+    assert_eq!(ends_in(&second), vec![false]);
+}
+
+#[tokio::test]
+async fn omp_an_end_without_a_clean_yield_never_completes() {
+    // Missing, null, wrong-typed and false `yielded` all leave the execution
+    // open; a successful prompt result and a settlement do not close it.
+    for yielded in [
+        json!(false),
+        json!("ABSENT"),
+        json!(null),
+        json!("true"),
+        json!(1),
+    ] {
+        let env = Env::new();
+        let steps = json!([
+            s_start(),
+            s_text("hello"),
+            {"op": "agent_end", "yielded": yielded},
+            {"op": "prompt_result"},
+            {"op": "session_settled"},
+            {"op": "log", "tag": "tail_sent"},
+        ]);
+        let (script, adapter) = Scripted::start(&env, steps, &[]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        script.wait_log("tail_sent").await;
+        let events = drain(&mut handle).await;
+        assert!(
+            !events.iter().any(is_end),
+            "yielded={yielded}: {events:?} log={:?}",
+            script.lines()
+        );
+    }
+    // An end with no execution open is not an end either.
+    let env = Env::new();
+    let (script, adapter) = Scripted::start(
+        &env,
+        json!([s_end(), {"op": "log", "tag": "tail_sent"}]),
+        &[],
+    );
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("tail_sent").await;
+    let events = drain(&mut handle).await;
+    assert!(!events.iter().any(is_end), "{events:?}");
+}
+
+#[tokio::test]
+async fn omp_a_yield_with_an_unreadable_status_is_a_failure() {
+    for mode in ["empty", "absent", "string", "unknown_reason"] {
+        let env = Env::new();
+        let steps = json!([
+            s_start(),
+            s_text("hello"),
+            {"op": "agent_end", "messages": mode},
+            {"op": "prompt_result"},
+        ]);
+        let (_script, adapter) = Scripted::start(&env, steps, &[]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        let mut events = until_turn_completed(&mut handle).await;
+        events.extend(drain(&mut handle).await);
+        assert_eq!(
+            ends_in(&events),
+            vec![true],
+            "{mode}: a yield with no readable status is failed, not clean: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn omp_length_and_tool_use_are_normal_stops() {
+    for reason in ["length", "toolUse"] {
+        let env = Env::new();
+        let steps = json!([
+            s_start(),
+            {"op": "assistant", "text": "cut short", "stop_reason": reason},
+            s_end(),
+        ]);
+        let (_script, adapter) = Scripted::start(&env, steps, &[]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        let mut events = until_turn_completed(&mut handle).await;
+        events.extend(drain(&mut handle).await);
+        assert_eq!(ends_in(&events), vec![false], "{reason}: {events:?}");
+    }
+}
+
+#[tokio::test]
+async fn omp_a_builtin_answer_during_an_execution_is_not_its_end() {
+    let env = Env::new();
+    let steps = json!([
+        s_start(),
+        s_text("working"),
+        {"op": "gate", "name": "finish"},
+        s_text("done"),
+        s_end(),
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("op:gate").await;
+    handle.send("/help").unwrap();
+    script.wait_log("builtin_answered").await;
+    script.release("finish");
+    script.wait_log("script_done").await;
+    let all = drain(&mut handle).await;
+    assert_eq!(
+        ends_in(&all),
+        vec![false],
+        "the builtin answer is not the running execution's end: {all:?} log={:?}",
+        script.lines()
+    );
+}
+
+#[tokio::test]
+async fn omp_a_rejected_prompt_during_a_woken_execution_does_not_end_it() {
+    let env = Env::new();
+    // The original ticket is consumed and nothing is signalled pending; a
+    // wake is running when a prompt is rejected.
+    let steps = json!([
+        s_start(),
+        s_text("started"),
+        s_end(),
+        {"op": "prompt_result"},
+        s_start(),
+        s_text("woken"),
+        {"op": "gate", "name": "finish"},
+        s_text("done"),
+        s_end(),
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("op:gate").await;
+    handle.send("/skill:nope").unwrap();
+    script.wait_log("rejected").await;
+    script.release("finish");
+    script.wait_log("script_done").await;
+    let all = drain(&mut handle).await;
+    assert_eq!(
+        ends_in(&all),
+        vec![false, false],
+        "the rejection adds no end of its own: {all:?} log={:?}",
+        script.lines()
+    );
+    assert!(
+        all.iter().any(
+            |e| matches!(e, AgentEvent::Error { message } if message == "no such skill: nope")
+        ),
+        "{all:?}"
+    );
+}
+
+#[tokio::test]
+async fn omp_a_failed_prompt_that_never_ran_ends_the_turn_as_failed() {
+    let env = Env::new();
+    // The prompt is admitted and fails with no execution at all.
+    let steps = json!([
+        {"op": "prompt_result", "status": "error", "error_message": "no model available"},
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("script_done").await;
+    let all = drain(&mut handle).await;
+    assert_eq!(ends_in(&all), vec![true], "{all:?}");
+    assert!(
+        all.iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message == "no model available")),
+        "{all:?}"
+    );
+}
+
+#[tokio::test]
+async fn omp_settlement_clears_pending_work_and_completes_nothing() {
+    let env = Env::new();
+    let steps = json!([
+        s_start(),
+        s_text("started"),
+        {"op": "agent_end", "terminal": false, "awaiting": true},
+        {"op": "prompt_result", "settled": false},
+        {"op": "session_settled"},
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("script_done").await;
+    let all = drain(&mut handle).await;
+    let end = all.iter().position(is_end).expect("the one native end");
+    let up = all
+        .iter()
+        .position(|e| matches!(e, AgentEvent::BackgroundJobs { pending: true, .. }))
+        .expect("pending published");
+    let down = all
+        .iter()
+        .position(|e| matches!(e, AgentEvent::BackgroundJobs { pending: false, .. }))
+        .expect("settlement clears pending");
+    assert!(up < end && end < down, "{all:?}");
+    assert_eq!(
+        ends_in(&all),
+        vec![false],
+        "settlement ends nothing: {all:?}"
+    );
 }
