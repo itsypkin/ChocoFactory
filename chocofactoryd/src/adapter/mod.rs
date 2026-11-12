@@ -254,12 +254,22 @@ pub enum AgentEvent {
         parent_tool_use_id: String,
         event: Box<AgentEvent>,
     },
-    /// The full list of background jobs the CLI says are running right now
-    /// (#271). A level signal: each one replaces the previous list. Only the
-    /// claude adapter sends it.
+    /// What the CLI says about background work right now (#271). A level
+    /// signal: each one replaces the previous list and the previous
+    /// `pending`. `running` names the jobs when the CLI says which they are
+    /// (claude does; omp does not, so its list is empty). `pending` is
+    /// whether the CLI says background work can still wake the agent. It is
+    /// the part that decides whether the turn is waiting: an empty `running`
+    /// is not evidence that there is no work.
     BackgroundJobs {
         running: Vec<BackgroundJob>,
+        pending: bool,
     },
+    /// The main agent started an execution (omp's `agent_start`). It is only
+    /// an observation that the main agent is active: it says nothing about an
+    /// execution completing or about what woke the agent. Recorded as an
+    /// ordinary `session_note` (kind [`EXECUTION_STARTED_NOTE_KIND`]).
+    ExecutionStarted,
     /// Claude Code did not apply the role's `claude_settings`, or choco could
     /// not confirm it did (#346). Recorded as an ordinary `error` event;
     /// carried as its own variant so `session::drain_session` can kill the
@@ -308,6 +318,34 @@ pub struct BackgroundJob {
     pub id: String,
     pub kind: String,
     pub description: String,
+}
+
+/// The `session_note` kind of [`AgentEvent::ExecutionStarted`]. Shared with
+/// the query that reads a session's final reply back
+/// (`db::events::final_assistant_text_for_session`), which must let these
+/// notes through.
+pub const EXECUTION_STARTED_NOTE_KIND: &str = "execution_started";
+
+/// The note's text: only that main-agent activity was observed.
+pub const EXECUTION_STARTED_MESSAGE: &str = "main-agent activity observed";
+
+/// How a note names pending background work. Pending work with no job
+/// identities says so (the CLI did not list them); it never claims zero jobs.
+/// `pending == false` with no identities is what the CLI reported, not a
+/// claim that no job exists: a live named service need not be in the CLI's
+/// pending inventory.
+pub fn describe_background_work(running: &[BackgroundJob], pending: bool) -> String {
+    if !running.is_empty() {
+        format!(
+            "{} background job(s) running: {}",
+            running.len(),
+            describe_jobs(running)
+        )
+    } else if pending {
+        "pending background work; job list unavailable".to_string()
+    } else {
+        "no pending background work reported by the CLI".to_string()
+    }
 }
 
 /// The jobs' descriptions joined by "; ", for every message that names them.
@@ -428,7 +466,9 @@ impl AgentEvent {
             | AgentEvent::SettingsNotApplied { .. } => EventType::Error,
             AgentEvent::TurnCompleted { .. } => EventType::TurnCompleted,
             AgentEvent::Subagent { event, .. } => event.event_type(),
-            AgentEvent::BackgroundJobs { .. } => EventType::SessionNote,
+            AgentEvent::BackgroundJobs { .. } | AgentEvent::ExecutionStarted => {
+                EventType::SessionNote
+            }
         }
     }
 
@@ -486,19 +526,11 @@ impl AgentEvent {
             AgentEvent::TurnCompleted { is_error, .. } => {
                 serde_json::json!({ "is_error": is_error })
             }
-            AgentEvent::BackgroundJobs { running } => {
-                let message = if running.is_empty() {
-                    "no background jobs running".to_string()
-                } else {
-                    format!(
-                        "{} background job(s) running: {}",
-                        running.len(),
-                        describe_jobs(running)
-                    )
-                };
+            AgentEvent::BackgroundJobs { running, pending } => {
                 serde_json::json!({
                     "kind": "background_jobs",
-                    "message": message,
+                    "message": describe_background_work(running, *pending),
+                    "pending": pending,
                     "running": running
                         .iter()
                         .map(|job| serde_json::json!({
@@ -509,6 +541,10 @@ impl AgentEvent {
                         .collect::<Vec<_>>(),
                 })
             }
+            AgentEvent::ExecutionStarted => serde_json::json!({
+                "kind": EXECUTION_STARTED_NOTE_KIND,
+                "message": EXECUTION_STARTED_MESSAGE,
+            }),
             AgentEvent::Subagent {
                 parent_tool_use_id,
                 event,

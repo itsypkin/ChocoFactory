@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::adapter::{
     AdapterError, AgentEvent, AgentHandle, BackgroundJob, Registry, RoleConfig, SettingsVerdict,
-    UnknownCliError, describe_jobs,
+    UnknownCliError, describe_background_work,
 };
 use crate::db::{events, sessions, usage};
 
@@ -918,7 +918,7 @@ async fn drain_session(
                             note_job_wait_entered(
                                 pool,
                                 session_id,
-                                &turn.background_jobs,
+                                &turn,
                                 turn_timers.job_wait_limit,
                                 remaining,
                                 events_notify,
@@ -1301,9 +1301,14 @@ struct SingleShotTurn {
     /// unconfirmed) (#346); holds the end reason to record.
     /// Set for a standing session too.
     settings_end: Option<SessionEndReason>,
-    /// The background jobs the CLI last reported as running (#271). Each
-    /// `BackgroundJobs` event replaces it.
+    /// The background jobs the CLI last named as running (#271). Each
+    /// `BackgroundJobs` event replaces it. Display only: omp names none, so an
+    /// empty list is not evidence that nothing is pending.
     background_jobs: Vec<BackgroundJob>,
+    /// The CLI says background work can still wake the agent. This, not the
+    /// list above, decides whether the turn is waiting on jobs. Each
+    /// `BackgroundJobs` event replaces it.
+    background_pending: bool,
     /// When the turn's wait on its background jobs runs out. Fixed when the
     /// turn starts waiting on jobs; see [`SingleShotTurn::update_job_wait`].
     job_wait_deadline: Option<tokio::time::Instant>,
@@ -1332,6 +1337,7 @@ impl Default for SingleShotTurn {
             interrupted: false,
             settings_end: None,
             background_jobs: Vec::new(),
+            background_pending: false,
             job_wait_deadline: None,
             job_wait_started_at: None,
             job_wait_spent: Duration::ZERO,
@@ -1385,8 +1391,9 @@ impl SingleShotTurn {
         }
         // Not main-agent activity, so it neither clears `waiting_for_report`
         // nor needs the guard below.
-        if let AgentEvent::BackgroundJobs { running } = event {
+        if let AgentEvent::BackgroundJobs { running, pending } = event {
             self.background_jobs = running.clone();
+            self.background_pending = *pending;
             return TurnStep::Continue;
         }
         if self.completed || self.errored || self.gave_up {
@@ -1407,6 +1414,9 @@ impl SingleShotTurn {
                     | AgentEvent::ToolCall { .. }
                     | AgentEvent::ToolResult { .. }
                     | AgentEvent::SessionMeta { .. }
+                    // The CLI's own start of a main execution is activity
+                    // even before it produces any output.
+                    | AgentEvent::ExecutionStarted
             )
         {
             self.waiting_for_report = false;
@@ -1471,13 +1481,13 @@ impl SingleShotTurn {
             && !self.waiting_on_jobs()
     }
 
-    /// The turn ended without reporting and the CLI says its background jobs
-    /// are still running (#271): it is waiting on them, not silent.
+    /// The turn ended without reporting and the CLI says background work is
+    /// still pending (#271): it is waiting on it, not silent.
     fn waiting_on_jobs(&self) -> bool {
         self.waiting_for_report
             && !self.gave_up
             && self.grace_deadline.is_none()
-            && !self.background_jobs.is_empty()
+            && self.background_pending
     }
 
     /// The one place the job-wait deadline and budget are written.
@@ -1530,34 +1540,48 @@ fn describe_limit(limit: Duration) -> String {
     }
 }
 
-/// Records that a turn has started waiting on its background jobs (#271).
+/// Records that a turn has started waiting on its background work (#271).
 async fn note_job_wait_entered(
     pool: &SqlitePool,
     session_id: &str,
-    jobs: &[BackgroundJob],
+    turn: &SingleShotTurn,
     limit: Duration,
     remaining: Duration,
     events_notify: &Notify,
 ) {
-    let deadline = chrono::Duration::from_std(remaining)
-        .ok()
-        .and_then(|limit| Utc::now().checked_add_signed(limit))
-        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .unwrap_or_else(|| "never".to_string());
     append_session_note(
         pool,
         session_id,
         "job_wait",
-        &format!(
-            "the turn ended without reporting while {} background job(s) run ({}); not nudging \
-             until they finish, closing it at {deadline} (the {} limit is a total for the turn)",
-            jobs.len(),
-            describe_jobs(jobs),
-            describe_limit(limit)
-        ),
+        &job_wait_entered_message(turn, limit, remaining, Utc::now()),
         events_notify,
     )
     .await;
+}
+
+/// The wait-entry note's text. The deadline is what is left of the turn's
+/// total wait budget if the turn keeps waiting; it is not a promise that the
+/// process closes then, because main execution resuming ends the wait.
+fn job_wait_entered_message(
+    turn: &SingleShotTurn,
+    limit: Duration,
+    remaining: Duration,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    let deadline = chrono::Duration::from_std(remaining)
+        .ok()
+        .and_then(|left| now.checked_add_signed(left))
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "never".to_string());
+    format!(
+        "the turn ended without an accepted report while {}; not nudging while that is \
+         pending. If it keeps waiting, its wait budget (the {} limit is a total for the turn, \
+         {} of it left) runs out at {deadline}; if the agent starts working again first, the \
+         wait ends and the rest of the budget stays for a later wait",
+        describe_background_work(&turn.background_jobs, turn.background_pending),
+        describe_limit(limit),
+        describe_limit(remaining),
+    )
 }
 
 /// Closes a turn whose job-wait limit ran out, the way an exhausted nudge
@@ -1575,13 +1599,12 @@ async fn close_after_job_wait(
     let when = if already_used_up {
         "had already been used up by its earlier waits"
     } else {
-        "ran out"
+        "was exhausted while it waited"
     };
     let message = format!(
-        "the turn never called report_outcome and was still waiting on {} background job(s) \
-         ({}) when the turn's job-wait limit of {} (a total per turn) {when}; closing it",
-        turn.background_jobs.len(),
-        describe_jobs(&turn.background_jobs),
+        "the turn ended without an accepted report and was still waiting ({}) when the \
+         turn's job-wait budget of {} (a total per turn) {when}; closing it",
+        describe_background_work(&turn.background_jobs, turn.background_pending),
         describe_limit(turn_timers.job_wait_limit)
     );
     turn.gave_up = true;
@@ -3764,6 +3787,7 @@ mod tests {
                     description: "d".into(),
                 })
                 .collect(),
+            pending: n > 0,
         };
         let mut turn = turn_with(|t| t.waiting_for_report = true);
         assert!(turn.should_nudge());
@@ -3786,6 +3810,7 @@ mod tests {
                 kind: "k".into(),
                 description: "d".into(),
             }],
+            pending: true,
         });
         assert!(!turn.waiting_for_report);
         assert!(!turn.should_nudge());
@@ -3804,6 +3829,7 @@ mod tests {
         turn_with(|t| {
             t.waiting_for_report = true;
             t.background_jobs = vec![a_job()];
+            t.background_pending = true;
         })
     }
 
@@ -3825,6 +3851,7 @@ mod tests {
         assert!(turn.job_wait_expired(now + limit));
 
         turn.background_jobs.clear();
+        turn.background_pending = false;
         assert_eq!(turn.update_job_wait(later, limit), JobWaitChange::NoChange);
         assert_eq!(turn.job_wait_deadline, None);
     }
@@ -3841,12 +3868,14 @@ mod tests {
         ));
         // The jobs finish after 4 s.
         turn.background_jobs.clear();
+        turn.background_pending = false;
         let t4 = t0 + StdDuration::from_secs(4);
         assert_eq!(turn.update_job_wait(t4, limit), JobWaitChange::NoChange);
         assert_eq!(turn.job_wait_spent, StdDuration::from_secs(4));
 
         // A new wait gets what is left, not a fresh limit.
         turn.background_jobs = vec![a_job()];
+        turn.background_pending = true;
         let t5 = t0 + StdDuration::from_secs(5);
         assert_eq!(
             turn.update_job_wait(t5, limit),
@@ -3857,12 +3886,14 @@ mod tests {
         assert_eq!(turn.job_wait_deadline, Some(t5 + StdDuration::from_secs(6)));
         // It lasts 6 s: the budget is gone.
         turn.background_jobs.clear();
+        turn.background_pending = false;
         let t11 = t5 + StdDuration::from_secs(6);
         turn.update_job_wait(t11, limit);
         assert_eq!(turn.job_wait_spent, limit);
 
         // Entering with nothing left is refused, and `spent` is not reset.
         turn.background_jobs = vec![a_job()];
+        turn.background_pending = true;
         assert_eq!(
             turn.update_job_wait(t11, limit),
             JobWaitChange::ExhaustedOnEntry

@@ -510,25 +510,56 @@ async fn an_errored_turn_completes_without_waiting_for_the_session_to_settle() {
     ));
 }
 
+/// The end belongs to the execution that yielded, not to the settlement
+/// that follows: the first turn completes at its own `agent_end` (pending
+/// work published before it), and the background run completes at its own.
 #[tokio::test]
-async fn an_unsettled_session_completes_on_session_settled() {
+async fn an_unsettled_session_completes_at_its_native_ends_not_at_settlement() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
-    let events = until_turn_completed(&mut handle).await;
-    // The follow-up run that background work started streams before the
-    // session settles, so it comes before the turn completes.
+    let mut events = until_turn_completed(&mut handle).await;
     assert!(
         matches!(
             &events[events.len() - 2..],
             [
-                AgentEvent::AssistantMessage { text },
+                AgentEvent::BackgroundJobs { running, pending: true },
                 AgentEvent::TurnCompleted { is_error: false, .. },
-            ] if text == "background result"
+            ] if running.is_empty()
         ),
         "{events:?}"
     );
-    drain(&mut handle).await;
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::AssistantMessage { text } if text == "background result"
+        )),
+        "the first end waited for the background run: {events:?}"
+    );
+    // The background run is an execution of its own: start, message, end.
+    let rest = until_turn_completed(&mut handle).await;
+    assert!(
+        matches!(
+            &rest[..],
+            [
+                AgentEvent::ExecutionStarted,
+                AgentEvent::AssistantMessage { text },
+                AgentEvent::BackgroundJobs { pending: false, .. },
+                AgentEvent::TurnCompleted { is_error: false, .. },
+            ] if text == "background result"
+        ),
+        "{rest:?}"
+    );
+    events.extend(rest);
+    events.extend(drain(&mut handle).await);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+            .count(),
+        2,
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -578,12 +609,16 @@ async fn a_report_whose_reply_cannot_be_sent_is_not_recorded_as_accepted() {
 }
 
 #[tokio::test]
-async fn background_messages_count_toward_the_turn_that_waited_for_them() {
+async fn a_background_run_counts_its_messages_in_its_own_interval() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled")]);
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
-    let events = until_turn_completed(&mut handle).await;
-    assert_eq!(usage_of(&events).model_turns, Some(3));
+    let first = until_turn_completed(&mut handle).await;
+    // The tool-call message and the final one; the background message is
+    // the next execution's.
+    assert_eq!(usage_of(&first).model_turns, Some(2));
+    let second = until_turn_completed(&mut handle).await;
+    assert_eq!(usage_of(&second).model_turns, Some(1));
 }
 
 #[tokio::test]
@@ -3395,7 +3430,7 @@ async fn a_rejected_follow_up_does_not_end_the_running_turn() {
 }
 
 #[tokio::test]
-async fn a_rejected_follow_up_does_not_end_a_turn_waiting_to_settle() {
+async fn a_rejected_follow_up_does_not_end_a_turn_with_pending_work() {
     let env = Env::new();
     let adapter = env.adapter(&[("FAKE_OMP_MODES", "noreport,unsettled,reject_unsettled")]);
     let mut handle = adapter.start("one", &env.cfg()).unwrap();
@@ -3405,32 +3440,24 @@ async fn a_rejected_follow_up_does_not_end_a_turn_waiting_to_settle() {
     let completions: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::TurnCompleted { is_error, usage } => Some((*is_error, usage.clone())),
-            AgentEvent::ProtocolError { .. } => None,
+            AgentEvent::TurnCompleted { is_error, .. } => Some(*is_error),
             _ => None,
         })
         .collect();
-    assert_eq!(completions.len(), 1, "{events:?}");
-    assert!(!completions[0].0, "{events:?}");
+    // The prompt's own end and the background run's: the rejection, which
+    // arrives while work is pending, adds no failed end of its own.
+    assert_eq!(completions, vec![false, false], "{events:?}");
     let error_at = events
         .iter()
         .position(
             |e| matches!(e, AgentEvent::Error { message } if message == "no such skill: nope"),
         )
         .expect("the rejection is reported");
-    let done_at = events
+    let first_done = events
         .iter()
         .position(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
         .unwrap();
-    assert!(error_at < done_at, "{events:?}");
-    // The running turn keeps its own messages, background run included.
-    assert!(
-        events[..done_at].iter().any(|e| matches!(
-            e,
-            AgentEvent::AssistantMessage { text } if text == "background result"
-        )),
-        "{events:?}"
-    );
+    assert!(error_at > first_done, "{events:?}");
 }
 
 #[tokio::test]

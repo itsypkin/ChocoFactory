@@ -1106,17 +1106,86 @@ fn acquire_memory_startup(
     }
 }
 
-/// A prompt omp has finished, waiting for its statistics.
+/// One run of the main agent: from its `agent_start` to the `agent_end`
+/// that yields. Opened by the first start; further starts before the yield
+/// belong to it. It owns the messages of the run and the instant it began.
+struct Execution {
+    started: Instant,
+    messages: TurnMessages,
+}
+
+/// The one optional open [`Execution`].
+#[derive(Default)]
+struct Executions {
+    open: Option<Execution>,
+}
+
+impl Executions {
+    /// A main-agent start. Opens an execution unless one is open; returns
+    /// the instant the (possibly older) open execution began.
+    fn start(&mut self, now: Instant) -> Instant {
+        self.open
+            .get_or_insert_with(|| Execution {
+                started: now,
+                messages: TurnMessages::default(),
+            })
+            .started
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Counts an assistant message towards the open execution. `false` when
+    /// none is open (the message is then not counted anywhere).
+    fn add_assistant(&mut self, usage: Option<super::pi_family::MessageUsage>) -> bool {
+        match self.open.as_mut() {
+            Some(execution) => {
+                execution.messages.add(usage);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Closes the open execution at a yield, handing over its start and its
+    /// messages. `None` when nothing is open.
+    fn close(&mut self) -> Option<Execution> {
+        self.open.take()
+    }
+}
+
+/// An execution omp has ended (or a prompt it finished without one),
+/// waiting for its statistics.
 struct Completion {
     is_error: bool,
+    /// When the execution began.
     sent_at: Instant,
     messages: TurnMessages,
+    /// How many main-agent starts had been seen when this was queued. A
+    /// start seen after that, before its statistics arrive, makes the
+    /// reading cover a later execution too.
+    starts_at_end: u64,
 }
 
 struct StatsWait {
     id: String,
     deadline: Instant,
     completion: Completion,
+}
+
+/// What is queued for delivery, in the order omp sent it. An `End` holds
+/// every later entry back until its statistics reading is in or has failed.
+enum Queued {
+    Event(AgentEvent),
+    End(Completion),
+}
+
+/// A prompt of ours, with when it was sent and how many native ends had
+/// been seen by then.
+struct PromptTicket {
+    sent_at: Instant,
+    ends_at_send: u64,
 }
 
 /// One driver per omp process. It owns stdin and serialises every outbound
@@ -1129,7 +1198,7 @@ struct Driver {
     /// Section-rejection count for `report_outcome`; per process.
     thin_reports: u32,
     normalizer: MessageNormalizer,
-    messages: TurnMessages,
+    executions: Executions,
     /// The usage baseline; `None` is unknown (the next reading becomes it).
     baseline: Option<SessionStats>,
     /// The session's model as `get_state` named it (`<provider>/<id>`).
@@ -1137,15 +1206,20 @@ struct Driver {
     billing: BillingMode,
     next_request: u64,
     prompts_sent: u32,
-    /// Our prompt ids, with when each was sent.
-    prompts: HashMap<String, Instant>,
-    /// Finished prompts whose session hasn't settled yet.
-    awaiting_settle: Vec<Completion>,
-    ready_completions: VecDeque<Completion>,
+    /// Our prompt ids.
+    prompts: HashMap<String, PromptTicket>,
+    /// Main-agent starts seen so far.
+    starts_seen: u64,
+    /// Native (yielded) ends seen so far.
+    ends_seen: u64,
+    /// The pending-background-work level last published.
+    pending_level: bool,
+    /// The last native end already published its own error evidence, so the
+    /// `prompt_result` that repeats it adds none.
+    end_error_published: bool,
+    /// Everything not yet delivered, in wire order.
+    queue: VecDeque<Queued>,
     stats_wait: Option<StatsWait>,
-    /// Events produced while a statistics reading is outstanding; flushed
-    /// after the `TurnCompleted` they must follow.
-    buffered: Vec<AgentEvent>,
     /// The event receiver is gone: nobody is listening any more.
     closed: bool,
 }
@@ -1164,17 +1238,19 @@ impl Driver {
             config,
             thin_reports: 0,
             normalizer: MessageNormalizer::default(),
-            messages: TurnMessages::default(),
+            executions: Executions::default(),
             baseline: None,
             main_model: None,
             billing: BillingMode::Unknown,
             next_request: 0,
             prompts_sent: 0,
             prompts: HashMap::new(),
-            awaiting_settle: Vec::new(),
-            ready_completions: VecDeque::new(),
+            starts_seen: 0,
+            ends_seen: 0,
+            pending_level: false,
+            end_error_published: false,
+            queue: VecDeque::new(),
             stats_wait: None,
-            buffered: Vec::new(),
             closed: false,
         }
     }
@@ -1184,7 +1260,8 @@ impl Driver {
         let version = tokio::spawn(async move { omp_version(&binary, &launch).await });
         if let Err(message) = self.startup(version).await {
             tracing::warn!("omp session didn't start: {message}");
-            self.emit(AgentEvent::Error { message });
+            // Nothing is queued yet: deliver it directly.
+            self.send_event(AgentEvent::Error { message });
             // Nothing will ever drive this process: stop it, so the event
             // stream ends and the turn fails now rather than at the reaper.
             self.kill_child();
@@ -1214,12 +1291,12 @@ impl Driver {
                 } => {
                     tracing::warn!("omp: get_session_stats timed out");
                     self.finish_stats(None);
-                    self.start_next_completion().await;
+                    self.pump().await;
                 }
             }
         }
-        // Stdout ended. Turns omp had already finished still complete, with
-        // no statistics; a turn it hadn't finished ends the way a crashed
+        // Stdout ended. Executions omp had already ended still complete, with
+        // no statistics; one it hadn't ended ends the way a crashed
         // `claude` does, by closing the channel.
         self.finish_pending_at_exit();
     }
@@ -1272,7 +1349,13 @@ impl Driver {
             frame["streamingBehavior"] = json!("followUp");
         }
         self.prompts_sent += 1;
-        self.prompts.insert(id, Instant::now());
+        self.prompts.insert(
+            id,
+            PromptTicket {
+                sent_at: Instant::now(),
+                ends_at_send: self.ends_seen,
+            },
+        );
         if !self.send_frame(&frame).await {
             self.emit(AgentEvent::Error {
                 message: "omp: couldn't write a prompt to the process".to_string(),
@@ -1341,11 +1424,15 @@ impl Driver {
         if let Err(err) = self
             .request(
                 "set_event_filter",
-                json!({ "events": ["message_end"], "messageUpdates": "delta" }),
+                json!({
+                    "events": ["agent_start", "agent_end", "message_end"],
+                    "messageUpdates": "delta",
+                }),
             )
             .await
         {
-            // Unfiltered is noisier, not wrong: other events are ignored.
+            // Unfiltered is noisier, not wrong: other events are ignored. It
+            // does not make anything complete: only a native end does.
             tracing::warn!("omp: {err}");
         }
 
@@ -1483,14 +1570,10 @@ impl Driver {
 
     // -- events -------------------------------------------------------------
 
-    /// Delivers an event, or holds it behind the `TurnCompleted` that is
-    /// being assembled.
+    /// Queues an event behind everything omp sent before it. `pump` delivers
+    /// it once no earlier end is still waiting for its statistics.
     fn emit(&mut self, event: AgentEvent) {
-        if self.stats_wait.is_some() {
-            self.buffered.push(event);
-        } else {
-            self.send_event(event);
-        }
+        self.queue.push_back(Queued::Event(event));
     }
 
     fn send_event(&mut self, event: AgentEvent) {
@@ -1503,26 +1586,74 @@ impl Driver {
 
     async fn on_frame(&mut self, frame: Value) {
         match frame.get("type").and_then(Value::as_str) {
+            Some("agent_start") => self.on_agent_start(),
+            Some("agent_end") => self.on_agent_end(&frame),
             Some("message_end") => self.on_message_end(&frame),
             Some("host_tool_call") => self.on_host_tool_call(&frame).await,
             Some("prompt_result") => self.on_prompt_result(&frame),
-            Some("session_settled") => {
-                let mut settled = std::mem::take(&mut self.awaiting_settle);
-                // The background run's messages belong to the turn that was
-                // waiting for it, not to the next one.
-                if let Some(first) = settled.first_mut() {
-                    first.messages = std::mem::take(&mut self.messages);
-                }
-                self.ready_completions.extend(settled);
-                self.start_next_completion().await;
-            }
+            Some("session_settled") => self.on_session_settled(),
             Some("response") => self.on_response(&frame).await,
             Some("host_tool_cancel") => {
                 tracing::debug!("omp: host_tool_cancel ignored: {frame}");
             }
             other => tracing::debug!("omp: ignoring frame {other:?}"),
         }
-        self.start_next_completion().await;
+        self.pump().await;
+    }
+
+    /// The main agent started running. Opens the execution unless one is
+    /// open already; a start never ends or resets anything.
+    fn on_agent_start(&mut self) {
+        self.starts_seen += 1;
+        self.end_error_published = false;
+        self.executions.start(Instant::now());
+        self.emit(AgentEvent::ExecutionStarted);
+    }
+
+    /// The main agent's run ended. Only a `yielded: true` end completes the
+    /// open execution; its status is the final assistant message of the
+    /// run, never an earlier prompt's result.
+    fn on_agent_end(&mut self, frame: &Value) {
+        if frame.get("yielded").and_then(Value::as_bool) != Some(true) {
+            tracing::debug!("omp: agent_end without yielded:true leaves the execution open");
+            return;
+        }
+        let Some(execution) = self.executions.close() else {
+            tracing::debug!("omp: a yielded agent_end with no open execution");
+            return;
+        };
+        self.ends_seen += 1;
+        // Published first, so a report-less end goes straight into the
+        // right wait.
+        let pending = frame.get("awaitingAsyncWork").and_then(Value::as_bool) == Some(true);
+        self.publish_pending(pending);
+        let status = native_end_status(frame);
+        self.end_error_published = status.evidence.is_some();
+        if let Some(event) = status.evidence {
+            self.emit(event);
+        }
+        self.queue.push_back(Queued::End(Completion {
+            is_error: status.is_error,
+            sent_at: execution.started,
+            messages: execution.messages,
+            starts_at_end: self.starts_seen,
+        }));
+    }
+
+    /// Settlement clears pending background work. It completes nothing.
+    fn on_session_settled(&mut self) {
+        self.publish_pending(false);
+    }
+
+    /// Publishes the pending level when it changed.
+    fn publish_pending(&mut self, pending: bool) {
+        if pending != self.pending_level {
+            self.pending_level = pending;
+            self.emit(AgentEvent::BackgroundJobs {
+                running: Vec::new(),
+                pending,
+            });
+        }
     }
 
     fn on_message_end(&mut self, frame: &Value) {
@@ -1530,8 +1661,10 @@ impl Driver {
             tracing::warn!("omp: message_end without a message");
             return;
         };
-        if message.get("role").and_then(Value::as_str) == Some("assistant") {
-            self.messages.add(parse_message_usage(message));
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && !self.executions.add_assistant(parse_message_usage(message))
+        {
+            tracing::debug!("omp: an assistant message outside an execution isn't counted");
         }
         for event in self.normalizer.normalize(message, REPORT_OUTCOME_TOOL_NAME) {
             self.emit(event);
@@ -1586,8 +1719,10 @@ impl Driver {
         });
     }
 
+    /// A prompt's result. It supplies admission and error evidence, never a
+    /// successful end: only the execution's own `agent_end` does that.
     fn on_prompt_result(&mut self, frame: &Value) {
-        let Some(sent_at) = frame
+        let Some(ticket) = frame
             .get("id")
             .and_then(Value::as_str)
             .and_then(|id| self.prompts.remove(id))
@@ -1596,46 +1731,27 @@ impl Driver {
             return;
         };
         let status = frame.get("status").and_then(Value::as_str).unwrap_or("");
-        let is_error = status != "completed";
-        if status == "error" {
+        if status == "error" && !std::mem::take(&mut self.end_error_published) {
             let error = frame.get("error").cloned().unwrap_or(Value::Null);
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("omp reported an error")
                 .to_string();
-            let event = if error.get("httpStatus").and_then(Value::as_u64) == Some(429) {
-                AgentEvent::Interrupted {
-                    message,
-                    detected_by: InterruptionEvidence::Structured,
-                }
-            } else if usage_limit_text(&message) {
-                AgentEvent::Interrupted {
-                    message,
-                    detected_by: InterruptionEvidence::MessageText,
-                }
-            } else {
-                AgentEvent::Error { message }
-            };
-            self.emit(event);
+            let status = error.get("httpStatus").and_then(Value::as_u64);
+            self.emit(error_evidence(message, status));
         }
-        // An error completes at once; anything else waits for the session to
-        // settle when omp says background work can still wake it. A waiting
-        // turn takes its messages when it is released, so the background
-        // run's messages count toward it.
-        if status != "error" && frame.get("sessionSettled").and_then(Value::as_bool) == Some(false)
+        // A failed prompt that never ran an execution to a native end (and
+        // has none open) ends the turn here, as failed. A prompt that did
+        // run is ended by its execution's own `agent_end`.
+        if status != "completed" && !self.executions.is_open() && self.ends_seen <= ticket.ends_at_send
         {
-            self.awaiting_settle.push(Completion {
-                is_error,
-                sent_at,
+            self.queue.push_back(Queued::End(Completion {
+                is_error: true,
+                sent_at: ticket.sent_at,
                 messages: TurnMessages::default(),
-            });
-        } else {
-            self.ready_completions.push_back(Completion {
-                is_error,
-                sent_at,
-                messages: std::mem::take(&mut self.messages),
-            });
+                starts_at_end: self.starts_seen,
+            }));
         }
     }
 
@@ -1661,15 +1777,21 @@ impl Driver {
         }
         if frame.get("command").and_then(Value::as_str) == Some("prompt")
             && frame.pointer("/data/agentInvoked").and_then(Value::as_bool) == Some(false)
-            && let Some(sent_at) = id.and_then(|id| self.prompts.remove(id))
+            && let Some(ticket) = id.and_then(|id| self.prompts.remove(id))
         {
             // A builtin slash command finished without an agent turn; omp
             // sends no `prompt_result` for it, so the response completes it.
-            self.ready_completions.push_back(Completion {
+            // While the main agent is running it is not that run's end.
+            if self.executions.is_open() {
+                tracing::warn!("omp: a builtin command answered during an execution; not an end");
+                return;
+            }
+            self.queue.push_back(Queued::End(Completion {
                 is_error: false,
-                sent_at,
+                sent_at: ticket.sent_at,
                 messages: TurnMessages::default(),
-            });
+                starts_at_end: self.starts_seen,
+            }));
             return;
         }
         if frame.get("success").and_then(Value::as_bool) == Some(false) {
@@ -1681,7 +1803,7 @@ impl Driver {
             // `prompt_result` does follow, its id is no longer pending and
             // it is skipped, so the turn completes once.
             if frame.get("command").and_then(Value::as_str) == Some("prompt")
-                && let Some(sent_at) = id.and_then(|id| self.prompts.remove(id))
+                && let Some(ticket) = id.and_then(|id| self.prompts.remove(id))
             {
                 let message = frame
                     .get("error")
@@ -1689,17 +1811,16 @@ impl Driver {
                     .unwrap_or("omp rejected the prompt")
                     .to_string();
                 self.emit(AgentEvent::Error { message });
-                // Another prompt of ours is still running: a completion
-                // carries no prompt id, so ending a turn here would end
-                // that running turn early (also one parked in
-                // `awaiting_settle`). Report the rejection only; the
-                // running prompt completes the turn.
-                if self.prompts.is_empty() && self.awaiting_settle.is_empty() {
-                    self.ready_completions.push_back(Completion {
+                // Other work of ours is still active or pending: a
+                // completion carries no prompt id, so ending a turn here
+                // would end that work early. Report the rejection only.
+                if self.prompts.is_empty() && !self.executions.is_open() && !self.pending_level {
+                    self.queue.push_back(Queued::End(Completion {
                         is_error: true,
-                        sent_at,
-                        messages: std::mem::take(&mut self.messages),
-                    });
+                        sent_at: ticket.sent_at,
+                        messages: TurnMessages::default(),
+                        starts_at_end: self.starts_seen,
+                    }));
                 }
             }
         }
@@ -1707,39 +1828,49 @@ impl Driver {
 
     // -- completion ---------------------------------------------------------
 
-    async fn start_next_completion(&mut self) {
-        if self.stats_wait.is_some() {
-            return;
+    /// Delivers the queue in order, stopping at an end whose statistics are
+    /// still being read.
+    async fn pump(&mut self) {
+        while self.stats_wait.is_none() {
+            match self.queue.pop_front() {
+                None => return,
+                Some(Queued::Event(event)) => self.send_event(event),
+                Some(Queued::End(completion)) => {
+                    let id = self.request_id("stats");
+                    let frame = json!({ "id": id, "type": "get_session_stats" });
+                    if self.send_frame(&frame).await {
+                        self.stats_wait = Some(StatsWait {
+                            id,
+                            deadline: Instant::now() + STATS_TIMEOUT,
+                            completion,
+                        });
+                    } else {
+                        self.complete(completion, None);
+                    }
+                }
+            }
         }
-        let Some(completion) = self.ready_completions.pop_front() else {
-            return;
-        };
-        let id = self.request_id("stats");
-        let frame = json!({ "id": id, "type": "get_session_stats" });
-        if !self.send_frame(&frame).await {
-            self.complete(completion, None);
-            return;
-        }
-        self.stats_wait = Some(StatsWait {
-            id,
-            deadline: Instant::now() + STATS_TIMEOUT,
-            completion,
-        });
     }
 
     /// Ends the outstanding statistics wait with `reading` (`None` = failed).
+    /// The caller pumps the queue afterwards.
     fn finish_stats(&mut self, reading: Option<SessionStats>) {
         let Some(wait) = self.stats_wait.take() else {
             return;
         };
         self.complete(wait.completion, reading);
-        // Everything that arrived while waiting follows the TurnCompleted.
-        for event in std::mem::take(&mut self.buffered) {
-            self.send_event(event);
-        }
     }
 
     fn complete(&mut self, completion: Completion, reading: Option<SessionStats>) {
+        // A reading taken after a later execution started also counts that
+        // execution's usage: it belongs to neither end. It is dropped, and
+        // the baseline with it, so the later end is unknown too.
+        let reading = if reading.is_some() && self.starts_seen > completion.starts_at_end {
+            tracing::warn!("omp: statistics overlap a later execution; usage is unknown");
+            None
+        } else {
+            reading
+        };
         let delta = match (&self.baseline, &reading) {
             (Some(before), Some(now)) => Some(stats_delta(before, now)),
             _ => None,
@@ -1767,23 +1898,90 @@ impl Driver {
         });
     }
 
+    /// Stdout ended: delivers the queue in order. Ends already seen complete
+    /// with unknown figures; an execution still open completes nothing.
     fn finish_pending_at_exit(&mut self) {
         if self.stats_wait.is_some() {
             self.finish_stats(None);
         }
-        if let Some(first) = self.awaiting_settle.first_mut() {
-            first.messages = std::mem::take(&mut self.messages);
+        while let Some(entry) = self.queue.pop_front() {
+            match entry {
+                Queued::Event(event) => self.send_event(event),
+                Queued::End(completion) => self.complete(completion, None),
+            }
         }
-        let pending: Vec<Completion> = std::mem::take(&mut self.awaiting_settle)
-            .into_iter()
-            .chain(std::mem::take(&mut self.ready_completions))
-            .collect();
-        for completion in pending {
-            self.complete(completion, None);
+    }
+}
+
+/// How an execution ended, from its closing `agent_end`.
+struct NativeEnd {
+    is_error: bool,
+    /// The error evidence to record before the end, if any.
+    evidence: Option<AgentEvent>,
+}
+
+/// The error evidence for an end or prompt result: a structured 429 or a
+/// usage-limit message is an interruption, anything else an error.
+fn error_evidence(message: String, status: Option<u64>) -> AgentEvent {
+    if status == Some(429) {
+        AgentEvent::Interrupted {
+            message,
+            detected_by: InterruptionEvidence::Structured,
         }
-        for event in std::mem::take(&mut self.buffered) {
-            self.send_event(event);
+    } else if usage_limit_text(&message) {
+        AgentEvent::Interrupted {
+            message,
+            detected_by: InterruptionEvidence::MessageText,
         }
+    } else {
+        AgentEvent::Error { message }
+    }
+}
+
+/// The outcome of the run that `agent_end` closes: its last assistant
+/// message's `stopReason` (`stop`, `length` and `toolUse` are normal;
+/// `error` and `aborted` are failures). An end with no readable final
+/// assistant message or an unknown reason is a failure, never a guess.
+fn native_end_status(frame: &Value) -> NativeEnd {
+    let failed = |message: &str| NativeEnd {
+        is_error: true,
+        evidence: Some(AgentEvent::Error {
+            message: message.to_string(),
+        }),
+    };
+    let last = frame
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        });
+    let Some(last) = last else {
+        return failed("omp ended an execution without a readable final assistant message");
+    };
+    match last.get("stopReason").and_then(Value::as_str) {
+        Some("stop" | "length" | "toolUse") => NativeEnd {
+            is_error: false,
+            evidence: None,
+        },
+        Some("error") => {
+            let message = last
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("omp ended the execution with an error")
+                .to_string();
+            NativeEnd {
+                is_error: true,
+                evidence: Some(error_evidence(
+                    message,
+                    last.get("errorStatus").and_then(Value::as_u64),
+                )),
+            }
+        }
+        Some("aborted") => failed("omp aborted the execution"),
+        _ => failed("omp ended an execution with an unreadable stop reason"),
     }
 }
 
