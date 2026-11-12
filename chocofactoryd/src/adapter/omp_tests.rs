@@ -3740,32 +3740,39 @@ async fn omp_autonomous_wake_completes_after_its_own_end() {
 async fn omp_report_without_a_later_native_end_does_not_complete() {
     let env = Env::new();
     // The wake reports, a tool iteration ends and the session settles, but
-    // the run never yields again.
+    // the run never yields again. The marker message is queued behind
+    // everything those frames could have caused.
     let tail = vec![
         json!({"op": "turn_end"}),
         json!({"op": "session_settled"}),
+        s_text("tail-marker"),
         json!({"op": "log", "tag": "tail_sent"}),
     ];
     let (script, adapter) = Scripted::start(&env, wake_script(json!(true), false, tail), &[]);
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
-    let first = until_turn_completed(&mut handle).await;
     script.wait_log("op:gate").await;
     script.release("wake");
     script.wait_log("tail_sent").await;
 
     // The process is alive (stdin is still open) and the report is in.
-    let seen = events_until(&mut handle, |e| matches!(e, AgentEvent::BackgroundJobs { pending: false, .. })).await;
+    let seen = events_until(
+        &mut handle,
+        |e| matches!(e, AgentEvent::AssistantMessage { text } if text == "tail-marker"),
+    )
+    .await;
     assert!(
         seen.iter().any(is_report_result),
         "the report is recorded: {seen:?}"
     );
+    let first_end = seen.iter().position(is_end).expect("the report-less first end");
+    let report = seen.iter().position(is_report_result).unwrap();
     assert!(
-        !seen.iter().any(is_end),
+        first_end < report && !seen[report..].iter().any(is_end),
         "no end after the report while the process is alive: {seen:?} log={:?}",
         script.lines()
     );
     let rest = drain(&mut handle).await;
-    let all: Vec<_> = first.iter().chain(seen.iter()).chain(rest.iter()).cloned().collect();
+    let all: Vec<_> = seen.iter().chain(rest.iter()).cloned().collect();
     assert_eq!(
         ends_in(&all),
         vec![false],
