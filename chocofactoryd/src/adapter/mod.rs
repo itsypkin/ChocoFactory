@@ -233,8 +233,12 @@ pub enum AgentEvent {
         message: String,
         detected_by: InterruptionEvidence,
     },
-    /// The CLI's `result` line: this turn is over and the process is now
-    /// only waiting on stdin EOF to exit — it never exits on its own (#70).
+    /// One native execution of the main agent has ended: claude's `result`
+    /// line, or omp's yielded `agent_end` (a prompt's result or the session
+    /// settling is not one). The process is now only waiting on stdin EOF to
+    /// exit — it never exits on its own (#70). An agent woken later by
+    /// background work ends again with its own `TurnCompleted`, carrying its
+    /// own status.
     /// `is_error` mirrors the `result` message's own flag, so a caller that
     /// only wants to treat a *clean* finish as completion (§5.2, a
     /// single-shot `agent_turn`) doesn't have to re-inspect the raw JSON.

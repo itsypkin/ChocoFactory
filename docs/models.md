@@ -218,5 +218,23 @@ roles:
   login it is shown as the API-equivalent price, like a claude subscription's;
   for a model omp has no price for, the cost is unknown rather than zero.
   Usage is best-effort: a failed read never changes how a turn ends.
+- **When a turn ends.** omp runs the main agent in executions: each one starts
+  when the agent starts and ends when it yields. choco takes the end of an
+  execution, with that execution's own final status (`stop`, `length` and
+  `toolUse` are normal; `error` and `aborted` are failures; an unreadable
+  status counts as a failure), as the end of a turn. A prompt's result, the
+  session settling and a model/tool iteration finishing do not end anything,
+  so an agent woken later by a background job is judged by its own run, with
+  or without the original prompt having succeeded. Each end gets one usage
+  record, counting only the assistant messages of its own execution and read
+  from the session statistics. If another execution started before an end's
+  statistics were read, the reading covers both, so both ends have unknown
+  token and cost figures rather than a guess; a failed or timed-out reading
+  is unknown too, and the next good reading starts over. omp reports whether
+  background work is awaited but not which jobs, so choco's waiting notes say
+  "pending background work; job list unavailable". A named background
+  service that omp does not report as pending is not waited for, and the turn
+  follows the ordinary nudge rule (see
+  [When a turn counts as complete](workflows.md#when-a-turn-counts-as-complete)).
 - **Telemetry.** No telemetry is sent: omp's QA reporting and OpenTelemetry
   export are switched off for every omp process choco starts.

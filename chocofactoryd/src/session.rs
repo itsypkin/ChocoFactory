@@ -1274,7 +1274,8 @@ struct SingleShotTurn {
     pending_reports: std::collections::HashSet<String>,
     /// A main-agent `report_outcome` call succeeded.
     reported: bool,
-    /// A `result` followed a successful report: the turn is done.
+    /// A clean end (claude's `result`, omp's yielded `agent_end`) followed a
+    /// successful report: the turn is done.
     completed: bool,
     /// A clean `result` arrived with no report, and stdin is still open.
     waiting_for_report: bool,
@@ -3998,7 +3999,11 @@ mod tests {
         // 7 s of silent active work: nothing is spent, nothing is nudged.
         assert!(!turn.should_nudge());
         assert_eq!(turn.update_job_wait(at(11), limit), JobWaitChange::NoChange);
-        assert_eq!(turn.job_wait_spent, StdDuration::from_secs(4), "active time is free");
+        assert_eq!(
+            turn.job_wait_spent,
+            StdDuration::from_secs(4),
+            "active time is free"
+        );
 
         // Yield #2, pending again: only the remaining 6 s are available.
         turn.observe(&clean_end());
@@ -4010,7 +4015,10 @@ mod tests {
         );
         assert_eq!(turn.job_wait_deadline, Some(at(17)));
         assert!(!turn.job_wait_expired(at(16)));
-        assert!(turn.job_wait_expired(at(17)), "exhaustion at the remaining budget");
+        assert!(
+            turn.job_wait_expired(at(17)),
+            "exhaustion at the remaining budget"
+        );
 
         // Waking again after it all, then waiting a third time: spent only
         // ever rose, so there is nothing left on entry.
@@ -4104,7 +4112,10 @@ mod tests {
         );
         assert_eq!(settled["pending"], false);
         assert!(
-            !settled["message"].as_str().unwrap().contains("no background jobs"),
+            !settled["message"]
+                .as_str()
+                .unwrap()
+                .contains("no background jobs"),
             "{settled}"
         );
 
@@ -4113,7 +4124,10 @@ mod tests {
         named.observe(&named_level(true));
         named.observe(&clean_end());
         let message = job_wait_entered_message(&named, limit, limit, now);
-        assert!(message.contains("1 background job(s) running: d"), "{message}");
+        assert!(
+            message.contains("1 background job(s) running: d"),
+            "{message}"
+        );
         assert_eq!(
             named_level(true).payload()["message"],
             "1 background job(s) running: d"
@@ -4191,7 +4205,8 @@ mod tests {
     #[tokio::test]
     async fn omp_pending_work_is_not_nudged_or_reaped_and_a_wake_completes() {
         let dir = TempDir::new();
-        let script = crate::test_support::OmpScript::new(&dir.0, omp_wake_steps(json!(true), true), &[]);
+        let script =
+            crate::test_support::OmpScript::new(&dir.0, omp_wake_steps(json!(true), true), &[]);
         let (pool, session_id, manager) =
             start_omp_single_shot(&script, fast_timers(3), chrono::Duration::zero()).await;
         wait_for_note(&pool, &session_id, "job_wait").await;
@@ -4203,10 +4218,19 @@ mod tests {
         reap_once(&manager).await;
         let kinds = session_notes(&pool, &session_id).await;
         assert!(
-            !kinds.iter().any(|k| ["nudge", "no_report", "lingered"].contains(&k.as_str())),
+            !kinds
+                .iter()
+                .any(|k| ["nudge", "no_report", "lingered"].contains(&k.as_str())),
             "{kinds:?}"
         );
-        assert_eq!(sessions::get(&pool, &session_id).await.unwrap().unwrap().status, SessionStatus::Active);
+        assert_eq!(
+            sessions::get(&pool, &session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Active
+        );
 
         script.release("wake");
         let run = wait_until_final(&pool, &session_id).await;
@@ -4227,7 +4251,8 @@ mod tests {
     #[tokio::test]
     async fn omp_pending_work_that_never_wakes_closes_at_the_budget() {
         let dir = TempDir::new();
-        let script = crate::test_support::OmpScript::new(&dir.0, omp_wake_steps(json!(true), false), &[]);
+        let script =
+            crate::test_support::OmpScript::new(&dir.0, omp_wake_steps(json!(true), false), &[]);
         let timers = TurnTimers {
             job_wait_limit: StdDuration::from_millis(400),
             ..fast_timers(3)
@@ -4248,7 +4273,11 @@ mod tests {
     #[tokio::test]
     async fn omp_work_not_signalled_pending_is_nudged_like_any_silence() {
         let dir = TempDir::new();
-        let script = crate::test_support::OmpScript::new(&dir.0, omp_wake_steps(json!("ABSENT"), false), &[]);
+        let script = crate::test_support::OmpScript::new(
+            &dir.0,
+            omp_wake_steps(json!("ABSENT"), false),
+            &[],
+        );
         let (pool, session_id, _manager) =
             start_omp_single_shot(&script, fast_timers(1), chrono::Duration::hours(1)).await;
         let run = wait_until_final(&pool, &session_id).await;

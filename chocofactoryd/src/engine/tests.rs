@@ -7,8 +7,8 @@ use super::watch::{catch_up_len, final_attempt_limit, missed};
 use super::*;
 
 mod claude_settings;
-mod omp_wake;
 mod model_level;
+mod omp_wake;
 mod parallel;
 mod pause;
 mod queue;

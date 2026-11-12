@@ -154,38 +154,6 @@ impl LogBuf {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The pause-settle failure, with its order forced. A thread with no
-    /// capture reaches a log line first, and the capture alive at that
-    /// moment must still get the line when its own thread reaches it. The
-    /// line's callsite is this test's own, so the uncaptured thread's call
-    /// is its first hit in the process, whatever else runs.
-    ///
-    /// Without `KEEPER` this fails whenever this capture is the only live
-    /// `Dispatch`, always when the test runs alone. With another test's
-    /// capture alive at that moment it would pass without `KEEPER` too.
-    #[test]
-    fn a_capture_keeps_a_line_an_uncaptured_thread_reached_first() {
-        fn line() {
-            tracing::error!("a line an uncaptured thread reached first");
-        }
-        let logs = LogBuf::default();
-        let _capture = logs.capture();
-        std::thread::spawn(line).join().unwrap();
-        line();
-        let text = logs.text();
-        assert_eq!(
-            text.matches("a line an uncaptured thread reached first")
-                .count(),
-            1,
-            "the capture should hold its own thread's line, once: {text:?}"
-        );
-    }
-}
-
 /// A scripted run of `tests/fixtures/fake_omp.py` (see its docstring): the
 /// wrapper binary to hand to an `OmpAdapter`, the gates the test releases
 /// and the log of what the fixture really did.
@@ -211,8 +179,8 @@ impl OmpScript {
         std::fs::write(&script, steps.to_string()).unwrap();
         let log = root.join("progress.log");
         let prompts = root.join("prompts.log");
-        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/fake_omp.py");
+        let fixture =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_omp.py");
         let mut text = String::from("#!/bin/sh\n[ \"$1\" = --choco-warm-up ] && exit 0\n");
         let mut vars = vec![
             ("FAKE_OMP_SCRIPT", script.display().to_string()),
@@ -222,7 +190,10 @@ impl OmpScript {
         ];
         vars.extend(extra_env.iter().map(|(k, v)| (*k, v.to_string())));
         for (key, value) in vars {
-            text.push_str(&format!("export {key}='{}'\n", value.replace('\'', "'\\''")));
+            text.push_str(&format!(
+                "export {key}='{}'\n",
+                value.replace('\'', "'\\''")
+            ));
         }
         text.push_str("case \"$1\" in --version) echo 'omp/fake-1.0'; exit 0;; esac\n");
         text.push_str(&format!("exec '{}' \"$@\"\n", fixture.display()));
@@ -266,7 +237,7 @@ impl OmpScript {
                 .lines()
                 .map(str::to_string)
                 .collect();
-            if lines.iter().any(|line| *line == tag) {
+            if lines.contains(&tag) {
                 Ok(())
             } else {
                 Err(format!("{lines:?}"))
@@ -307,5 +278,37 @@ impl OmpScript {
             .unwrap_or_default()
             .lines()
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pause-settle failure, with its order forced. A thread with no
+    /// capture reaches a log line first, and the capture alive at that
+    /// moment must still get the line when its own thread reaches it. The
+    /// line's callsite is this test's own, so the uncaptured thread's call
+    /// is its first hit in the process, whatever else runs.
+    ///
+    /// Without `KEEPER` this fails whenever this capture is the only live
+    /// `Dispatch`, always when the test runs alone. With another test's
+    /// capture alive at that moment it would pass without `KEEPER` too.
+    #[test]
+    fn a_capture_keeps_a_line_an_uncaptured_thread_reached_first() {
+        fn line() {
+            tracing::error!("a line an uncaptured thread reached first");
+        }
+        let logs = LogBuf::default();
+        let _capture = logs.capture();
+        std::thread::spawn(line).join().unwrap();
+        line();
+        let text = logs.text();
+        assert_eq!(
+            text.matches("a line an uncaptured thread reached first")
+                .count(),
+            1,
+            "the capture should hold its own thread's line, once: {text:?}"
+        );
     }
 }

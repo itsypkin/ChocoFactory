@@ -59,8 +59,10 @@ async fn start_wake(steps: Value, timers: TurnTimers) -> WakeRun {
     .await
     .unwrap()
     .id;
-    let adapter: Arc<dyn AgentAdapter> =
-        Arc::new(OmpAdapter::with_binary(&script.binary, dir.join("omp-state")));
+    let adapter: Arc<dyn AgentAdapter> = Arc::new(OmpAdapter::with_binary(
+        &script.binary,
+        dir.join("omp-state"),
+    ));
     let events_notify = Arc::new(Notify::new());
     let manager = SessionManager::with_turn_timers(
         pool.clone(),
@@ -69,7 +71,13 @@ async fn start_wake(steps: Value, timers: TurnTimers) -> WakeRun {
         Arc::clone(&events_notify),
         timers,
     );
-    let engine = WorkflowEngine::new(pool.clone(), manager, PathBuf::from("."), None, events_notify);
+    let engine = WorkflowEngine::new(
+        pool.clone(),
+        manager,
+        PathBuf::from("."),
+        None,
+        events_notify,
+    );
     engine.start_task(&task_id, &def, Some("go")).await.unwrap();
     WakeRun {
         pool,
@@ -117,7 +125,10 @@ impl WakeRun {
 
     /// Everything the run left: for failure messages.
     async fn describe(&self) -> String {
-        let task = tasks::get(&self.pool, &self.task_id).await.unwrap().unwrap();
+        let task = tasks::get(&self.pool, &self.task_id)
+            .await
+            .unwrap()
+            .unwrap();
         let session = self.session().await;
         let all = events::list_for_session(&self.pool, &session.id)
             .await
@@ -207,7 +218,11 @@ async fn assert_applied_once(run: &WakeRun) {
         run.describe().await
     );
     assert_eq!(run.outcomes().await.len(), 1, "one ordinary application");
-    assert_eq!(run.script.prompts_received(), 1, "no nudge or second prompt");
+    assert_eq!(
+        run.script.prompts_received(),
+        1,
+        "no nudge or second prompt"
+    );
     // The session closed stdin and the child went away.
     run.script.wait_log("eof").await;
     let kinds = run.notes().await;
@@ -222,7 +237,11 @@ async fn assert_not_applied(run: &WakeRun, what: &str) {
     // Any settled state ends the wait, so an application that should not
     // have happened (a closed task) fails the assertions below, not a wait.
     let status = crate::test_support::wait_until("the task to settle", || async {
-        let status = tasks::get(&run.pool, &run.task_id).await.unwrap().unwrap().status;
+        let status = tasks::get(&run.pool, &run.task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status;
         match status.as_str() {
             "stuck" | "closed" | "cancelled" => Ok(status),
             other => Err(other.to_string()),
@@ -246,12 +265,20 @@ async fn assert_not_applied(run: &WakeRun, what: &str) {
 #[tokio::test]
 async fn omp_wake_routes_the_accepted_outcome_once() {
     for awaiting in [json!(true), json!("ABSENT")] {
-        let run = start_wake(wake_steps(awaiting.clone(), changes_requested(), clean_finish()), timers()).await;
+        let run = start_wake(
+            wake_steps(awaiting.clone(), changes_requested(), clean_finish()),
+            timers(),
+        )
+        .await;
         // The first end was report-less: the task is waiting in its stage.
         run.script.wait_log("op:gate").await;
         assert!(run.outcomes().await.is_empty());
         assert_eq!(
-            tasks::get(&run.pool, &run.task_id).await.unwrap().unwrap().status,
+            tasks::get(&run.pool, &run.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "open"
         );
         run.script.release("wake");
@@ -268,7 +295,11 @@ async fn omp_a_failed_or_unfinished_wake_is_not_applied() {
         ("a wake with no final end", no_final_end),
     ];
     for (what, tail) in cases {
-        let run = start_wake(wake_steps(json!(true), changes_requested(), tail()), timers()).await;
+        let run = start_wake(
+            wake_steps(json!(true), changes_requested(), tail()),
+            timers(),
+        )
+        .await;
         run.script.wait_log("op:gate").await;
         run.script.release("wake");
         assert_not_applied(&run, what).await;
@@ -279,7 +310,11 @@ async fn omp_a_failed_or_unfinished_wake_is_not_applied() {
 /// session ends `(Exited, NoReport)` and the report alone is not applied.
 #[tokio::test]
 async fn omp_clean_eof_after_a_report_is_no_report() {
-    let run = start_wake(wake_steps(json!(true), changes_requested(), no_final_end()), timers()).await;
+    let run = start_wake(
+        wake_steps(json!(true), changes_requested(), no_final_end()),
+        timers(),
+    )
+    .await;
     run.script.wait_log("op:gate").await;
     run.script.release("wake");
     assert_not_applied(&run, "eof").await;
@@ -306,7 +341,11 @@ async fn omp_unsignalled_work_is_nudged_and_a_wake_before_exhaustion_applies_onc
         max_nudges: 4,
         ..timers()
     };
-    let run = start_wake(wake_steps(json!("ABSENT"), changes_requested(), tail), timers).await;
+    let run = start_wake(
+        wake_steps(json!("ABSENT"), changes_requested(), tail),
+        timers,
+    )
+    .await;
     run.script.wait_log("op:gate").await;
     // The ordinary silence nudge is actually sent while nothing is reported.
     run.script.wait_prompts(2).await;
@@ -341,7 +380,11 @@ async fn omp_unsignalled_work_that_fails_or_never_ends_is_still_not_applied() {
             max_nudges: 4,
             ..timers()
         };
-        let run = start_wake(wake_steps(json!("ABSENT"), changes_requested(), tail()), timers).await;
+        let run = start_wake(
+            wake_steps(json!("ABSENT"), changes_requested(), tail()),
+            timers,
+        )
+        .await;
         run.script.wait_log("op:gate").await;
         run.script.wait_prompts(2).await;
         run.script.release("wake");
@@ -359,7 +402,11 @@ async fn omp_a_wake_after_nudges_run_out_does_not_revive_the_turn() {
         grace: StdDuration::from_secs(2),
         ..timers()
     };
-    let run = start_wake(wake_steps(json!("ABSENT"), changes_requested(), clean_finish()), timers).await;
+    let run = start_wake(
+        wake_steps(json!("ABSENT"), changes_requested(), clean_finish()),
+        timers,
+    )
+    .await;
     run.script.wait_log("op:gate").await;
     wait_until_task_status(&run.pool, &run.task_id, "stuck").await;
     run.script.release("wake");
@@ -370,7 +417,11 @@ async fn omp_a_wake_after_nudges_run_out_does_not_revive_the_turn() {
 
 #[tokio::test]
 async fn omp_cancel_during_background_wait_does_not_apply() {
-    let run = start_wake(wake_steps(json!(true), changes_requested(), clean_finish()), timers()).await;
+    let run = start_wake(
+        wake_steps(json!(true), changes_requested(), clean_finish()),
+        timers(),
+    )
+    .await;
     run.script.wait_log("op:gate").await;
     // The turn is waiting on signalled pending work.
     crate::test_support::wait_until("the wait note", || async {
@@ -392,7 +443,10 @@ async fn omp_cancel_during_background_wait_does_not_apply() {
     assert_eq!(task.status, "cancelled");
     let session = run.session().await;
     crate::test_support::wait_until("the session to end as cancelled", || async {
-        let s = sessions::get(&run.pool, &session.id).await.unwrap().unwrap();
+        let s = sessions::get(&run.pool, &session.id)
+            .await
+            .unwrap()
+            .unwrap();
         if s.status == SessionStatus::Active {
             Err("still active".to_string())
         } else {
@@ -400,7 +454,10 @@ async fn omp_cancel_during_background_wait_does_not_apply() {
         }
     })
     .await;
-    let session = sessions::get(&run.pool, &session.id).await.unwrap().unwrap();
+    let session = sessions::get(&run.pool, &session.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(session.end_reason, Some(SessionEndReason::Cancelled));
     assert!(run.outcomes().await.is_empty(), "{}", run.describe().await);
     assert_eq!(

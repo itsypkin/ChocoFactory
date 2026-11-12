@@ -3552,7 +3552,10 @@ impl Scripted {
         };
         let mut vars: Vec<(&str, String)> = vec![
             ("FAKE_OMP_SCRIPT", script.to_string_lossy().into_owned()),
-            ("FAKE_OMP_GATE_DIR", this.gates.to_string_lossy().into_owned()),
+            (
+                "FAKE_OMP_GATE_DIR",
+                this.gates.to_string_lossy().into_owned(),
+            ),
             ("FAKE_OMP_LOG", this.log.to_string_lossy().into_owned()),
             (
                 "FAKE_OMP_PROMPT_LOG",
@@ -3636,7 +3639,10 @@ fn ends_in(events: &[AgentEvent]) -> Vec<bool> {
 }
 
 /// Events up to and including the first one `done` accepts.
-async fn events_until(handle: &mut AgentHandle, done: impl Fn(&AgentEvent) -> bool) -> Vec<AgentEvent> {
+async fn events_until(
+    handle: &mut AgentHandle,
+    done: impl Fn(&AgentEvent) -> bool,
+) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(30), handle.recv())
@@ -3673,7 +3679,8 @@ async fn omp_autonomous_wake_completes_after_its_own_end() {
     // Two controlled shapes: background work signalled as awaited with an
     // unsettled ticket, and a named-service shape (nothing signalled, the
     // ticket already settled).
-    for (awaiting, settled, signalled) in [(json!(true), false, true), (json!("ABSENT"), true, false)]
+    for (awaiting, settled, signalled) in
+        [(json!(true), false, true), (json!("ABSENT"), true, false)]
     {
         let env = Env::new();
         let tail = vec![
@@ -3682,7 +3689,8 @@ async fn omp_autonomous_wake_completes_after_its_own_end() {
             s_end(),
             json!({"op": "session_settled"}),
         ];
-        let (script, adapter) = Scripted::start(&env, wake_script(awaiting.clone(), settled, tail), &[]);
+        let (script, adapter) =
+            Scripted::start(&env, wake_script(awaiting.clone(), settled, tail), &[]);
         let mut handle = adapter.start("go", &env.cfg()).unwrap();
 
         // The fixture yields, consumes the original prompt's result and
@@ -3692,20 +3700,44 @@ async fn omp_autonomous_wake_completes_after_its_own_end() {
         script.wait_log("script_done").await;
         // Everything is sent; read it all to the end of the stream.
         let all = drain(&mut handle).await;
-        let context = format!("awaiting={awaiting} settled={settled}: {all:?} log={:?}", script.lines());
+        let context = format!(
+            "awaiting={awaiting} settled={settled}: {all:?} log={:?}",
+            script.lines()
+        );
 
-        let call = all.iter().position(is_report_call).expect("the wake's report call");
-        let result = all.iter().position(is_report_result).expect("the report's result");
+        let call = all
+            .iter()
+            .position(is_report_call)
+            .expect("the wake's report call");
+        let result = all
+            .iter()
+            .position(is_report_result)
+            .expect("the report's result");
         assert!(
             all[result..].iter().any(is_end),
             "a later native end follows the accepted wake report: {context}"
         );
         assert!(
-            matches!(&all[result], AgentEvent::ToolResult { is_error: false, .. }),
+            matches!(
+                &all[result],
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            ),
             "{context}"
         );
-        assert_eq!(ends_in(&all), vec![false, false], "exactly two ends: {context}");
-        let ends: Vec<usize> = all.iter().enumerate().filter(|(_, e)| is_end(e)).map(|(i, _)| i).collect();
+        assert_eq!(
+            ends_in(&all),
+            vec![false, false],
+            "exactly two ends: {context}"
+        );
+        let ends: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| is_end(e))
+            .map(|(i, _)| i)
+            .collect();
         assert!(
             ends[0] < call && call < result && result < ends[1],
             "the report-less end precedes the report; the wake's end follows its accepted result: {context}"
@@ -3729,9 +3761,15 @@ async fn omp_autonomous_wake_completes_after_its_own_end() {
                 .iter()
                 .position(|e| matches!(e, AgentEvent::BackgroundJobs { pending: true, .. }))
                 .unwrap();
-            assert!(up < ends[0], "pending is published before the end: {context}");
+            assert!(
+                up < ends[0],
+                "pending is published before the end: {context}"
+            );
         } else {
-            assert!(levels.is_empty(), "nothing signalled, nothing pending: {context}");
+            assert!(
+                levels.is_empty(),
+                "nothing signalled, nothing pending: {context}"
+            );
         }
     }
 }
@@ -3764,7 +3802,10 @@ async fn omp_report_without_a_later_native_end_does_not_complete() {
         seen.iter().any(is_report_result),
         "the report is recorded: {seen:?}"
     );
-    let first_end = seen.iter().position(is_end).expect("the report-less first end");
+    let first_end = seen
+        .iter()
+        .position(is_end)
+        .expect("the report-less first end");
     let report = seen.iter().position(is_report_result).unwrap();
     assert!(
         first_end < report && !seen[report..].iter().any(is_end),
@@ -3801,10 +3842,15 @@ async fn omp_wake_error_does_not_inherit_prompt_success() {
         ("error", "You've hit your usage limit", None, |e| {
             matches!(
                 e,
-                AgentEvent::Interrupted { detected_by: InterruptionEvidence::MessageText, .. }
+                AgentEvent::Interrupted {
+                    detected_by: InterruptionEvidence::MessageText,
+                    ..
+                }
             )
         }),
-        ("aborted", "", None, |e| matches!(e, AgentEvent::Error { .. })),
+        ("aborted", "", None, |e| {
+            matches!(e, AgentEvent::Error { .. })
+        }),
     ];
     for (reason, message, status, evidence) in cases {
         let env = Env::new();
@@ -3819,7 +3865,13 @@ async fn omp_wake_error_does_not_inherit_prompt_success() {
         let (script, adapter) = Scripted::start(&env, wake_script(json!(true), false, tail), &[]);
         let mut handle = adapter.start("go", &env.cfg()).unwrap();
         let first = until_turn_completed(&mut handle).await;
-        assert!(matches!(first.last(), Some(AgentEvent::TurnCompleted { is_error: false, .. })));
+        assert!(matches!(
+            first.last(),
+            Some(AgentEvent::TurnCompleted {
+                is_error: false,
+                ..
+            })
+        ));
         script.wait_log("op:gate").await;
         script.release("wake");
         let mut rest = events_until(&mut handle, is_end).await;
@@ -3834,7 +3886,11 @@ async fn omp_wake_error_does_not_inherit_prompt_success() {
             .iter()
             .filter(|e| matches!(e, AgentEvent::Error { .. } | AgentEvent::Interrupted { .. }))
             .collect();
-        assert_eq!(flagged.len(), 1, "{reason}/{status:?}: one piece of evidence: {rest:?}");
+        assert_eq!(
+            flagged.len(),
+            1,
+            "{reason}/{status:?}: one piece of evidence: {rest:?}"
+        );
         assert!(evidence(flagged[0]), "{reason}/{status:?}: {rest:?}");
     }
 }
@@ -3852,10 +3908,16 @@ fn a_repeated_start_keeps_the_open_execution_and_its_start() {
     assert!(executions.add_assistant(None));
     let closed = executions.close().expect("the execution is still open");
     assert_eq!(closed.started, t0);
-    assert_eq!(closed.messages.assistant_messages, 2, "the messages survive");
+    assert_eq!(
+        closed.messages.assistant_messages, 2,
+        "the messages survive"
+    );
     // After the yield the next start opens a new interval.
     assert!(executions.close().is_none());
-    assert!(!executions.add_assistant(None), "no open execution counts nothing");
+    assert!(
+        !executions.add_assistant(None),
+        "no open execution counts nothing"
+    );
     assert_eq!(executions.start(later), later);
 }
 
@@ -3880,7 +3942,11 @@ async fn omp_consecutive_starts_preserve_open_execution() {
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
     // Everything up to the gate has been read by the driver once the second
     // message shows.
-    let before = events_until(&mut handle, |e| matches!(e, AgentEvent::AssistantMessage { text } if text == "second")).await;
+    let before = events_until(
+        &mut handle,
+        |e| matches!(e, AgentEvent::AssistantMessage { text } if text == "second"),
+    )
+    .await;
     script.wait_log("op:gate").await;
     assert!(!before.iter().any(is_end), "no end was made up: {before:?}");
     assert!(
@@ -3888,14 +3954,22 @@ async fn omp_consecutive_starts_preserve_open_execution() {
         "a repeated start is not an error: {before:?}"
     );
     assert_eq!(
-        before.iter().filter(|e| matches!(e, AgentEvent::ExecutionStarted)).count(),
+        before
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ExecutionStarted))
+            .count(),
         2,
         "every start is an activity signal: {before:?}"
     );
     assert!(
-        before
-            .iter()
-            .any(|e| is_report_result(e) && matches!(e, AgentEvent::ToolResult { is_error: false, .. })),
+        before.iter().any(|e| is_report_result(e)
+            && matches!(
+                e,
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            )),
         "the report stays accepted across the second start: {before:?}"
     );
 
@@ -3903,7 +3977,11 @@ async fn omp_consecutive_starts_preserve_open_execution() {
     let mut rest = events_until(&mut handle, is_end).await;
     let usage = usage_of(&rest);
     // First interval: its text and the report-call message; second: one.
-    assert_eq!(usage.model_turns, Some(3), "both starts' messages: {rest:?}");
+    assert_eq!(
+        usage.model_turns,
+        Some(3),
+        "both starts' messages: {rest:?}"
+    );
     // The 1.5 s before the second start is part of the same interval.
     assert!(
         usage.wall_time_ms.unwrap() >= 1400,
@@ -3952,22 +4030,35 @@ async fn omp_native_ends_keep_fifo_and_do_not_double_charge() {
     // The first end's statistics reply is held while the wake runs, reports
     // and ends. The driver must keep answering the host's callback.
     let lines = script.wait_log("second_end_sent").await;
-    let held = lines.iter().position(|l| l == "stats_held").expect("the reading was held");
+    let held = lines
+        .iter()
+        .position(|l| l == "stats_held")
+        .expect("the reading was held");
     let accepted = lines
         .iter()
         .position(|l| l == "host_result:0:accepted")
         .expect("the host call was answered while the statistics waited");
     assert!(held < accepted, "{lines:?}");
     assert!(
-        !lines[held..].iter().any(|l| l.starts_with("stats_response")),
+        !lines[held..]
+            .iter()
+            .any(|l| l.starts_with("stats_response")),
         "nothing has been released yet: {lines:?}"
     );
     script.release("stats");
 
-    let mut events = events_until(&mut handle, |e| matches!(e, AgentEvent::TurnCompleted { .. })).await;
+    let mut events = events_until(&mut handle, |e| {
+        matches!(e, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
     events.extend(events_until(&mut handle, is_end).await);
     events.extend(drain(&mut handle).await);
-    let ends: Vec<usize> = events.iter().enumerate().filter(|(_, e)| is_end(e)).map(|(i, _)| i).collect();
+    let ends: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_end(e))
+        .map(|(i, _)| i)
+        .collect();
     assert_eq!(ends.len(), 2, "exactly two usage records: {events:?}");
     let report_call = events.iter().position(is_report_call).unwrap();
     assert!(
@@ -3987,9 +4078,16 @@ async fn omp_native_ends_keep_fifo_and_do_not_double_charge() {
         "each interval counts its own messages"
     );
     for usage in &usages {
-        assert_eq!(usage.tokens, TokenCounts::default(), "overlap: unknown tokens: {usage:?}");
+        assert_eq!(
+            usage.tokens,
+            TokenCounts::default(),
+            "overlap: unknown tokens: {usage:?}"
+        );
         assert_eq!(usage.cost_usd, None);
-        assert_eq!(usage.models, None, "no partial remainder for either interval: {usage:?}");
+        assert_eq!(
+            usage.models, None,
+            "no partial remainder for either interval: {usage:?}"
+        );
     }
 }
 
@@ -4038,7 +4136,13 @@ async fn omp_a_failed_reading_leaves_unknown_figures_and_the_ends_in_order() {
 async fn omp_an_end_without_a_clean_yield_never_completes() {
     // Missing, null, wrong-typed and false `yielded` all leave the execution
     // open; a successful prompt result and a settlement do not close it.
-    for yielded in [json!(false), json!("ABSENT"), json!(null), json!("true"), json!(1)] {
+    for yielded in [
+        json!(false),
+        json!("ABSENT"),
+        json!(null),
+        json!("true"),
+        json!(1),
+    ] {
         let env = Env::new();
         let steps = json!([
             s_start(),
@@ -4060,7 +4164,11 @@ async fn omp_an_end_without_a_clean_yield_never_completes() {
     }
     // An end with no execution open is not an end either.
     let env = Env::new();
-    let (script, adapter) = Scripted::start(&env, json!([s_end(), {"op": "log", "tag": "tail_sent"}]), &[]);
+    let (script, adapter) = Scripted::start(
+        &env,
+        json!([s_end(), {"op": "log", "tag": "tail_sent"}]),
+        &[],
+    );
     let mut handle = adapter.start("go", &env.cfg()).unwrap();
     script.wait_log("tail_sent").await;
     let events = drain(&mut handle).await;
@@ -4163,7 +4271,9 @@ async fn omp_a_rejected_prompt_during_a_woken_execution_does_not_end_it() {
         script.lines()
     );
     assert!(
-        all.iter().any(|e| matches!(e, AgentEvent::Error { message } if message == "no such skill: nope")),
+        all.iter().any(
+            |e| matches!(e, AgentEvent::Error { message } if message == "no such skill: nope")
+        ),
         "{all:?}"
     );
 }
@@ -4181,7 +4291,8 @@ async fn omp_a_failed_prompt_that_never_ran_ends_the_turn_as_failed() {
     let all = drain(&mut handle).await;
     assert_eq!(ends_in(&all), vec![true], "{all:?}");
     assert!(
-        all.iter().any(|e| matches!(e, AgentEvent::Error { message } if message == "no model available")),
+        all.iter()
+            .any(|e| matches!(e, AgentEvent::Error { message } if message == "no model available")),
         "{all:?}"
     );
 }

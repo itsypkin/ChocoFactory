@@ -59,9 +59,16 @@ and `choco task list --status stuck` finds every stuck task.
   `choco task reconfigure <id> --role-cli <role>=claude` (and `--role-model`),
   then `choco task retry <id> --fresh`, since a session can't resume on a
   different CLI.
-- `no_report`: the turn never called `report_outcome`, was nudged (or, with
-  a background job still running, waited 60 minutes in total across all its
-  waits; its `session_note` names the jobs), and was closed. choco then tried
+- `no_report`: the turn did not produce an accepted `report_outcome` call
+  followed by a later clean end of the agent's run. Usually it never called
+  `report_outcome` and was nudged, or waited on pending background work for
+  60 minutes in total across all its waits (the `session_note` says what it
+  waited on; omp names no jobs, so for omp it says "pending background work;
+  job list unavailable"). It can also be a report that was accepted while the
+  process then ended cleanly with no later clean end, or a late run that
+  errored or was aborted: an accepted report in the history alone is not an
+  applicable outcome, so read the last events before retrying. A note is only
+  present if its own write succeeded. The turn was closed. choco then tried
   to clean up after it: it signals the agent's process group and, by pid, the
   processes it can show the turn started outside that group, such as that job,
   and it reads the process table again. If the table cannot be read, or a

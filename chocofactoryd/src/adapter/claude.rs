@@ -3347,7 +3347,10 @@ mod tests {
             pending: false,
         }
         .payload();
-        assert_eq!(none["message"], "no pending background work reported by the CLI");
+        assert_eq!(
+            none["message"],
+            "no pending background work reported by the CLI"
+        );
         assert_eq!(none["pending"], false);
     }
 

@@ -218,29 +218,53 @@ The agent sees the accepted outcomes in its instruction ("It must be one of: …
 The CLI's end-of-turn line doesn't mean the work is done: an
 agent waiting on a background sub-agent or a long test run ends its turn and
 is woken when that finishes. So the daemon treats a turn as complete only
-when it ends *after* the agent called `report_outcome`:
+when an accepted `report_outcome` call is followed by a later clean end of
+the agent's own run. On omp each run of the main agent (from its start to the
+point where it yields) is one such end, and it is the run's own final status
+that counts, so a woken run is judged by itself: it does not inherit an
+earlier prompt's success, and a run that errors or is aborted never completes
+the turn. A prompt's result, the session settling, and a tool iteration
+finishing complete nothing. An accepted report in the history alone is not an
+applicable outcome:
 
 - A turn that ends without reporting is left open. After 5 minutes with no
   output it's nudged (up to 3 times); after that it's closed, and the task is
   marked `stuck`. (In a [parallel group](#parallel-stages), where this section
   says the task is marked `stuck`, the branch fails instead, and the task
   parks once no branch is running.)
-- The exception is a turn whose own background job is still running. On
-  Claude Code, the CLI reports the session's running background jobs, and
-  while any are running a report-less turn is not nudged. A `job_wait`
-  `session_note` marks the start of each wait. The 60 minutes are a total for
-  the whole turn, summed over all its waits: a wait that begins after the CLI
-  woke the agent and it ended again without reporting gets only what is left,
-  never a fresh 60 minutes. When the total is used up the turn is closed as
-  `no_report` with a `session_note` that names the jobs; once the jobs are
-  gone the nudge rule above applies again. Roles on omp keep the nudge rule.
+- The exception is a turn whose CLI says background work is still pending.
+  Claude Code reports the session's running background jobs by name; omp
+  reports only that background work is awaited (it names no jobs), and says
+  when the session settles. While work is signalled pending, a report-less
+  turn is not nudged. A `job_wait` `session_note` marks the start of each
+  wait. The 60 minutes are a total for the whole turn, summed over all its
+  waits: the main agent starting to run again ends a wait (running time costs
+  none of the budget), and a wait that begins after it ended again without
+  reporting gets only what is left, never a fresh 60 minutes. The deadline
+  the note shows is what remains of that budget if the turn keeps waiting;
+  it is not a promise to close then. When the total is used up the turn is
+  closed as `no_report` with a `session_note`; when the CLI no longer
+  signals pending work the nudge rule above applies again. An empty job list
+  is not evidence that nothing is pending: for omp the notes say "pending
+  background work; job list unavailable".
+- Limit: only work the CLI actually signals as pending is protected. A named
+  omp background service can stay live while omp reports nothing pending and
+  has settled. That turn follows the ordinary silence rule: after five minutes
+  it can be nudged, and if the accepted report and a later clean end do not
+  arrive before the nudges run out, it closes as `no_report` and the task is
+  marked `stuck`. A service that wakes the agent, which reports and ends
+  before then, completes normally. Neither outcome is guaranteed.
 - Once a turn has reported and ended, its process has 30 seconds to exit. If
   it's still running, choco sends SIGKILL to the process and what the turn
   started and the task is marked `stuck`, rather than advancing past work that
   may still be landing (sending the signal does not prove anything died). A process that exited on its own, with nothing of the turn's left
   alive, does not park the task.
 - Output that arrives after a turn completed stays on the timeline, flagged
-  `after_completion`. Nudges and kills appear as `session_note` events.
+  `after_completion`. Nudges and kills appear as `session_note` events, as do
+  the `execution_started` notes ("main-agent activity observed") that omp
+  leaves each time the main agent starts running; they say only that the agent
+  was active, not that anything completed or what woke it. A note is present
+  only if its own write succeeded.
 - However a turn ends (reported, closed, cancelled, daemon stopped, or the
   agent crashed), choco then sends SIGKILL to the processes it can prove the
   turn started. That includes background jobs the agent's tool ran in sessions

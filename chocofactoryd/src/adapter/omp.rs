@@ -1744,7 +1744,9 @@ impl Driver {
         // A failed prompt that never ran an execution to a native end (and
         // has none open) ends the turn here, as failed. A prompt that did
         // run is ended by its execution's own `agent_end`.
-        if status != "completed" && !self.executions.is_open() && self.ends_seen <= ticket.ends_at_send
+        if status != "completed"
+            && !self.executions.is_open()
+            && self.ends_seen <= ticket.ends_at_send
         {
             self.queue.push_back(Queued::End(Completion {
                 is_error: true,
