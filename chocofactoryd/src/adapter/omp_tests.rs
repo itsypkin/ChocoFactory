@@ -493,7 +493,9 @@ async fn prompt_result_errors_become_error_or_interrupted_then_a_failed_turn() {
             .filter(|e| matches!(e, AgentEvent::Error { .. } | AgentEvent::Interrupted { .. }))
             .count();
         assert_eq!(flagged, 1, "{events:?}");
-        drain(&mut handle).await;
+        // The failed prompt's result adds no second end or second evidence.
+        let rest = drain(&mut handle).await;
+        assert!(rest.is_empty(), "{rest:?}");
     }
 }
 
@@ -3683,47 +3685,53 @@ async fn omp_autonomous_wake_completes_after_its_own_end() {
         let (script, adapter) = Scripted::start(&env, wake_script(awaiting.clone(), settled, tail), &[]);
         let mut handle = adapter.start("go", &env.cfg()).unwrap();
 
-        let first = until_turn_completed(&mut handle).await;
+        // The fixture yields, consumes the original prompt's result and
+        // waits at the gate: nothing more happens until it is released.
+        script.wait_log("op:gate").await;
+        script.release("wake");
+        script.wait_log("script_done").await;
+        // Everything is sent; read it all to the end of the stream.
+        let all = drain(&mut handle).await;
+        let context = format!("awaiting={awaiting} settled={settled}: {all:?} log={:?}", script.lines());
+
+        let call = all.iter().position(is_report_call).expect("the wake's report call");
+        let result = all.iter().position(is_report_result).expect("the report's result");
         assert!(
-            !first.iter().any(|e| is_report_call(e) || is_report_result(e)),
-            "the first end precedes any report: {first:?}"
+            all[result..].iter().any(is_end),
+            "a later native end follows the accepted wake report: {context}"
         );
-        assert!(matches!(first.last(), Some(AgentEvent::TurnCompleted { is_error: false, .. })));
-        let pending_events: Vec<_> = first
+        assert!(
+            matches!(&all[result], AgentEvent::ToolResult { is_error: false, .. }),
+            "{context}"
+        );
+        assert_eq!(ends_in(&all), vec![false, false], "exactly two ends: {context}");
+        let ends: Vec<usize> = all.iter().enumerate().filter(|(_, e)| is_end(e)).map(|(i, _)| i).collect();
+        assert!(
+            ends[0] < call && call < result && result < ends[1],
+            "the report-less end precedes the report; the wake's end follows its accepted result: {context}"
+        );
+        assert_eq!(script.prompts_received(), 1, "no second prompt: {context}");
+        let levels: Vec<bool> = all
             .iter()
-            .filter(|e| matches!(e, AgentEvent::BackgroundJobs { .. }))
+            .filter_map(|e| match e {
+                AgentEvent::BackgroundJobs { pending, running } => {
+                    assert!(running.is_empty(), "omp names no jobs");
+                    Some(*pending)
+                }
+                _ => None,
+            })
             .collect();
         if signalled {
-            assert!(
-                matches!(pending_events[..], [AgentEvent::BackgroundJobs { pending: true, running }] if running.is_empty()),
-                "{first:?}"
-            );
+            // Published before the report-less end; cleared before the
+            // wake's end (its own `awaitingAsyncWork` is false).
+            assert_eq!(levels, vec![true, false], "{context}");
+            let up = all
+                .iter()
+                .position(|e| matches!(e, AgentEvent::BackgroundJobs { pending: true, .. }))
+                .unwrap();
+            assert!(up < ends[0], "pending is published before the end: {context}");
         } else {
-            assert!(pending_events.is_empty(), "nothing signalled, nothing pending: {first:?}");
-        }
-        // The gate is held: the original prompt's result has been consumed.
-        script.wait_log("op:gate").await;
-
-        script.release("wake");
-        let mut rest = events_until(&mut handle, is_end).await;
-        let call = rest.iter().position(is_report_call).expect("the wake's report call");
-        let result = rest.iter().position(is_report_result).expect("the report's result");
-        let end = rest.len() - 1;
-        assert!(
-            matches!(&rest[result], AgentEvent::ToolResult { is_error: false, .. }),
-            "{rest:?}"
-        );
-        assert!(call < result && result < end, "the later end follows the accepted report: {rest:?}");
-        assert!(matches!(rest[end], AgentEvent::TurnCompleted { is_error: false, .. }));
-        rest.extend(drain(&mut handle).await);
-        let all: Vec<_> = first.iter().chain(rest.iter()).cloned().collect();
-        assert_eq!(ends_in(&all), vec![false, false], "exactly two ends: {all:?}");
-        assert_eq!(script.prompts_received(), 1, "no second prompt");
-        if signalled {
-            assert!(
-                all.iter().any(|e| matches!(e, AgentEvent::BackgroundJobs { pending: false, .. })),
-                "settlement clears pending: {all:?}"
-            );
+            assert!(levels.is_empty(), "nothing signalled, nothing pending: {context}");
         }
     }
 }
@@ -4089,4 +4097,84 @@ async fn omp_length_and_tool_use_are_normal_stops() {
         events.extend(drain(&mut handle).await);
         assert_eq!(ends_in(&events), vec![false], "{reason}: {events:?}");
     }
+}
+
+#[tokio::test]
+async fn omp_a_builtin_answer_during_an_execution_is_not_its_end() {
+    let env = Env::new();
+    let steps = json!([
+        s_start(),
+        s_text("working"),
+        {"op": "gate", "name": "finish"},
+        s_text("done"),
+        s_end(),
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("op:gate").await;
+    handle.send("/help").unwrap();
+    script.wait_log("builtin_answered").await;
+    script.release("finish");
+    script.wait_log("script_done").await;
+    let all = drain(&mut handle).await;
+    assert_eq!(
+        ends_in(&all),
+        vec![false],
+        "the builtin answer is not the running execution's end: {all:?} log={:?}",
+        script.lines()
+    );
+}
+
+#[tokio::test]
+async fn omp_a_rejected_prompt_during_a_woken_execution_does_not_end_it() {
+    let env = Env::new();
+    // The original ticket is consumed and nothing is signalled pending; a
+    // wake is running when a prompt is rejected.
+    let steps = json!([
+        s_start(),
+        s_text("started"),
+        s_end(),
+        {"op": "prompt_result"},
+        s_start(),
+        s_text("woken"),
+        {"op": "gate", "name": "finish"},
+        s_text("done"),
+        s_end(),
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("op:gate").await;
+    handle.send("/skill:nope").unwrap();
+    script.wait_log("rejected").await;
+    script.release("finish");
+    script.wait_log("script_done").await;
+    let all = drain(&mut handle).await;
+    assert_eq!(
+        ends_in(&all),
+        vec![false, false],
+        "the rejection adds no end of its own: {all:?} log={:?}",
+        script.lines()
+    );
+    assert!(
+        all.iter().any(|e| matches!(e, AgentEvent::Error { message } if message == "no such skill: nope")),
+        "{all:?}"
+    );
+}
+
+#[tokio::test]
+async fn omp_a_failed_prompt_that_never_ran_ends_the_turn_as_failed() {
+    let env = Env::new();
+    // The prompt is admitted and fails with no execution at all.
+    let steps = json!([
+        {"op": "prompt_result", "status": "error", "error_message": "no model available"},
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("script_done").await;
+    let all = drain(&mut handle).await;
+    assert_eq!(ends_in(&all), vec![true], "{all:?}");
+    assert!(
+        all.iter().any(|e| matches!(e, AgentEvent::Error { message } if message == "no model available")),
+        "{all:?}"
+    );
 }

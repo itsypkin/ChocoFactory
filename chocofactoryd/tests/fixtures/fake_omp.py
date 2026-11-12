@@ -72,7 +72,8 @@ wrapper script, never through the test process's own environment):
   negotiate_error  `negotiate_protocol` fails (the session stays on v1)
 - FAKE_OMP_SCRIPT: a JSON file holding a list of steps. The first agent
   prompt runs them instead of the canned turn (later prompts are only
-  logged and answered). FAKE_OMP_GATE_DIR names the directory whose files
+  logged and answered; `/skill:…` is rejected, `/help` is a builtin command
+  answered with agentInvoked false). FAKE_OMP_GATE_DIR names the directory whose files
   release `gate` / `hold_stats` steps; FAKE_OMP_LOG names a file that gets
   one progress line per step and per interesting frame, so a test can wait
   on what the fixture really did. Steps (`op`):
@@ -507,6 +508,16 @@ def run_prompt(request):
         return
     if os.environ.get("FAKE_OMP_SCRIPT"):
         log("prompt_in:%s" % request.get("message"))
+        message = request.get("message") or ""
+        if message.startswith("/skill:"):
+            respond(request, success=False, error="no such skill: nope")
+            log("rejected")
+            return
+        if message.startswith("/help"):
+            # A builtin command: no agent run and no `prompt_result`.
+            respond(request, data={"agentInvoked": False})
+            log("builtin_answered")
+            return
         respond(request, data={"agentInvoked": True})
         if not STATE.script_ran:
             STATE.script_ran = True

@@ -219,15 +219,13 @@ async fn assert_applied_once(run: &WakeRun) {
 /// A failed or unfinished wake must advance nothing: the task parks at the
 /// review stage with no outcome written.
 async fn assert_not_applied(run: &WakeRun, what: &str) {
-    wait_until_task_status(&run.pool, &run.task_id, "stuck").await;
-    // Let the fixture run to EOF so a late application would have shown.
-    let session = run.session().await;
-    crate::test_support::wait_until("the session to end", || async {
-        let s = sessions::get(&run.pool, &session.id).await.unwrap().unwrap();
-        if s.status == SessionStatus::Active {
-            Err(format!("{:?}", s.status))
-        } else {
-            Ok(())
+    // Any settled state ends the wait, so an application that should not
+    // have happened (a closed task) fails the assertions below, not a wait.
+    let status = crate::test_support::wait_until("the task to settle", || async {
+        let status = tasks::get(&run.pool, &run.task_id).await.unwrap().unwrap().status;
+        match status.as_str() {
+            "stuck" | "closed" | "cancelled" => Ok(status),
+            other => Err(other.to_string()),
         }
     })
     .await;
@@ -242,6 +240,7 @@ async fn assert_not_applied(run: &WakeRun, what: &str) {
         "{what}: no outcome applied: {}",
         run.describe().await
     );
+    assert_eq!(status, "stuck", "{what}: {}", run.describe().await);
 }
 
 #[tokio::test]
