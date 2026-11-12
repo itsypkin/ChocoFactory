@@ -4321,5 +4321,9 @@ async fn omp_settlement_clears_pending_work_and_completes_nothing() {
         .position(|e| matches!(e, AgentEvent::BackgroundJobs { pending: false, .. }))
         .expect("settlement clears pending");
     assert!(up < end && end < down, "{all:?}");
-    assert_eq!(ends_in(&all), vec![false], "settlement ends nothing: {all:?}");
+    assert_eq!(
+        ends_in(&all),
+        vec![false],
+        "settlement ends nothing: {all:?}"
+    );
 }
