@@ -4296,3 +4296,30 @@ async fn omp_a_failed_prompt_that_never_ran_ends_the_turn_as_failed() {
         "{all:?}"
     );
 }
+
+#[tokio::test]
+async fn omp_settlement_clears_pending_work_and_completes_nothing() {
+    let env = Env::new();
+    let steps = json!([
+        s_start(),
+        s_text("started"),
+        {"op": "agent_end", "terminal": false, "awaiting": true},
+        {"op": "prompt_result", "settled": false},
+        {"op": "session_settled"},
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let mut handle = adapter.start("go", &env.cfg()).unwrap();
+    script.wait_log("script_done").await;
+    let all = drain(&mut handle).await;
+    let end = all.iter().position(is_end).expect("the one native end");
+    let up = all
+        .iter()
+        .position(|e| matches!(e, AgentEvent::BackgroundJobs { pending: true, .. }))
+        .expect("pending published");
+    let down = all
+        .iter()
+        .position(|e| matches!(e, AgentEvent::BackgroundJobs { pending: false, .. }))
+        .expect("settlement clears pending");
+    assert!(up < end && end < down, "{all:?}");
+    assert_eq!(ends_in(&all), vec![false], "settlement ends nothing: {all:?}");
+}
