@@ -76,7 +76,7 @@ wrapper script, never through the test process's own environment):
   release `gate` / `hold_stats` steps; FAKE_OMP_LOG names a file that gets
   one progress line per step and per interesting frame, so a test can wait
   on what the fixture really did. Steps (`op`):
-  agent_start / turn_end / session_settled / log {tag} / sleep {seconds} /
+  agent_start / turn_end / session_settled / log {tag} / pid / sleep {seconds} /
   exit {code} / gate {name} (blocks, still answering requests, until the file
   exists) / hold_stats {gate} (the next get_session_stats reply is delayed
   until that gate file exists, and then reports the totals of that moment) /
@@ -709,6 +709,8 @@ def run_script():
             emit({"type": "session_settled"})
         elif op == "log":
             log(step["tag"])
+        elif op == "pid":
+            log("pid:%d" % os.getpid())
         elif op == "sleep":
             time.sleep(step["seconds"])
         elif op == "exit":

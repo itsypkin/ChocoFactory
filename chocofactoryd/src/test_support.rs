@@ -185,3 +185,127 @@ mod tests {
         );
     }
 }
+
+/// A scripted run of `tests/fixtures/fake_omp.py` (see its docstring): the
+/// wrapper binary to hand to an `OmpAdapter`, the gates the test releases
+/// and the log of what the fixture really did.
+pub(crate) struct OmpScript {
+    pub binary: String,
+    gates: std::path::PathBuf,
+    log: std::path::PathBuf,
+    prompts: std::path::PathBuf,
+}
+
+impl OmpScript {
+    /// Writes the script and a wrapper under `dir` (any existing directory).
+    /// The wrapper answers `--version` itself, like the adapter tests'.
+    pub(crate) fn new(
+        dir: &std::path::Path,
+        steps: serde_json::Value,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        let root = dir.join(format!("omp-script-{}", uuid::Uuid::new_v4()));
+        let gates = root.join("gates");
+        std::fs::create_dir_all(&gates).unwrap();
+        let script = root.join("script.json");
+        std::fs::write(&script, steps.to_string()).unwrap();
+        let log = root.join("progress.log");
+        let prompts = root.join("prompts.log");
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake_omp.py");
+        let mut text = String::from("#!/bin/sh\n[ \"$1\" = --choco-warm-up ] && exit 0\n");
+        let mut vars = vec![
+            ("FAKE_OMP_SCRIPT", script.display().to_string()),
+            ("FAKE_OMP_GATE_DIR", gates.display().to_string()),
+            ("FAKE_OMP_LOG", log.display().to_string()),
+            ("FAKE_OMP_PROMPT_LOG", prompts.display().to_string()),
+        ];
+        vars.extend(extra_env.iter().map(|(k, v)| (*k, v.to_string())));
+        for (key, value) in vars {
+            text.push_str(&format!("export {key}='{}'\n", value.replace('\'', "'\\''")));
+        }
+        text.push_str("case \"$1\" in --version) echo 'omp/fake-1.0'; exit 0;; esac\n");
+        text.push_str(&format!("exec '{}' \"$@\"\n", fixture.display()));
+        let wrapper = root.join("omp-wrapper");
+        write_executable(&wrapper, text);
+        // The first exec of a fresh file pays a one-time Gatekeeper check on
+        // macOS; pay it here, outside the adapter's version-probe timeout.
+        let status = std::process::Command::new(&wrapper)
+            .arg("--choco-warm-up")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        Self {
+            binary: wrapper.display().to_string(),
+            gates,
+            log,
+            prompts,
+        }
+    }
+
+    /// Lets the fixture past the gate named `name`.
+    pub(crate) fn release(&self, name: &str) {
+        std::fs::write(self.gates.join(name), "").unwrap();
+    }
+
+    pub(crate) fn lines(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Waits for the fixture to log `tag`; fails with the whole log.
+    pub(crate) async fn wait_log(&self, tag: &str) {
+        let log = self.log.clone();
+        let tag = tag.to_string();
+        wait_until(&format!("the fixture to log {tag}"), || async {
+            let lines: Vec<String> = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            if lines.iter().any(|line| *line == tag) {
+                Ok(())
+            } else {
+                Err(format!("{lines:?}"))
+            }
+        })
+        .await
+    }
+
+    /// The pid the fixture logged for itself (its `pid` step).
+    pub(crate) fn pid(&self) -> u32 {
+        self.lines()
+            .iter()
+            .find_map(|line| line.strip_prefix("pid:"))
+            .and_then(|pid| pid.parse().ok())
+            .expect("the fixture logged its pid")
+    }
+
+    /// Waits until the fixture has received at least `count` prompts.
+    pub(crate) async fn wait_prompts(&self, count: usize) {
+        let prompts = self.prompts.clone();
+        wait_until(&format!("{count} prompts"), || async {
+            let seen = std::fs::read_to_string(&prompts)
+                .unwrap_or_default()
+                .lines()
+                .count();
+            if seen >= count {
+                Ok(())
+            } else {
+                Err(format!("{seen} prompts"))
+            }
+        })
+        .await
+    }
+
+    /// How many prompts the fixture has received.
+    pub(crate) fn prompts_received(&self) -> usize {
+        std::fs::read_to_string(&self.prompts)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+}
