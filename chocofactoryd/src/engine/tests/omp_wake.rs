@@ -666,6 +666,34 @@ async fn omp_a_wake_in_a_chat_stage_leaves_the_conversation_open() {
         1,
         "no nudge or second prompt"
     );
-    // Cancelling is what ends a standing conversation.
+    // Cancelling is what ends a standing conversation. Wait for the session
+    // to end and the child to be reaped, so nothing is still tearing down
+    // when the test's directories go.
+    let pid = run.script.pid();
     run.engine.cancel_task(&run.task_id, false).await.unwrap();
+    crate::test_support::wait_until("the chat session to end as cancelled", || async {
+        let s = sessions::get(&run.pool, &session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        if s.status == SessionStatus::Active {
+            Err("still active".to_string())
+        } else {
+            Ok(s)
+        }
+    })
+    .await;
+    let ended = sessions::get(&run.pool, &session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.end_reason, Some(SessionEndReason::Cancelled));
+    crate::test_support::wait_until("the chat child to be reaped", || async {
+        if process_alive(pid) {
+            Err(format!("pid {pid} still alive"))
+        } else {
+            Ok(())
+        }
+    })
+    .await;
 }
