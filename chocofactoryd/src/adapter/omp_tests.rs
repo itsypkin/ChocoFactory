@@ -3825,7 +3825,7 @@ async fn omp_report_without_a_later_native_end_does_not_complete() {
 #[tokio::test]
 async fn omp_wake_error_does_not_inherit_prompt_success() {
     type Check = fn(&AgentEvent) -> bool;
-    let cases: [(&str, &str, Option<u64>, Check); 4] = [
+    let cases: [(&str, &str, Option<u64>, Check); 5] = [
         (
             "error",
             "502 upstream connect error: connection refused by the provider",
@@ -3844,6 +3844,16 @@ async fn omp_wake_error_does_not_inherit_prompt_success() {
                 e,
                 AgentEvent::Interrupted {
                     detected_by: InterruptionEvidence::MessageText,
+                    ..
+                }
+            )
+        }),
+        // Both kinds of evidence at once: the structured status wins.
+        ("error", "You've hit your usage limit", Some(429), |e| {
+            matches!(
+                e,
+                AgentEvent::Interrupted {
+                    detected_by: InterruptionEvidence::Structured,
                     ..
                 }
             )
@@ -3892,6 +3902,64 @@ async fn omp_wake_error_does_not_inherit_prompt_success() {
             "{reason}/{status:?}: one piece of evidence: {rest:?}"
         );
         assert!(evidence(flagged[0]), "{reason}/{status:?}: {rest:?}");
+    }
+}
+
+/// A closing `agent_end.messages` array as omp sends it: several messages,
+/// the run's last assistant message is the one that decides the status.
+#[tokio::test]
+async fn omp_the_last_assistant_message_of_an_end_decides_its_status() {
+    let assistant = |reason: &str| {
+        let mut message = json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "x"}],
+            "stopReason": reason,
+        });
+        if reason == "error" {
+            message["errorMessage"] = json!("502 upstream connect error");
+        }
+        message
+    };
+    let tool_result = json!({"role": "toolResult", "toolName": "bash", "isError": false});
+    let user = json!({"role": "user", "content": "go on"});
+    let cases = [
+        (
+            "an error after a clean message",
+            vec![
+                assistant("stop"),
+                tool_result.clone(),
+                assistant("error"),
+                user.clone(),
+            ],
+            true,
+        ),
+        (
+            "a clean message after an error",
+            vec![
+                assistant("error"),
+                tool_result.clone(),
+                assistant("stop"),
+                user.clone(),
+            ],
+            false,
+        ),
+    ];
+    for (what, raw, failed) in cases {
+        let env = Env::new();
+        let steps = json!([
+            s_start(),
+            s_text("hello"),
+            {"op": "agent_end", "messages": "raw", "raw": raw},
+        ]);
+        let (_script, adapter) = Scripted::start(&env, steps, &[]);
+        let mut handle = adapter.start("go", &env.cfg()).unwrap();
+        let mut events = until_turn_completed(&mut handle).await;
+        events.extend(drain(&mut handle).await);
+        assert_eq!(
+            ends_in(&events),
+            vec![failed],
+            "{what}: the last assistant message decides: {events:?}"
+        );
     }
 }
 

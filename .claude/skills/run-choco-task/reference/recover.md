@@ -65,9 +65,11 @@ and `choco task list --status stuck` finds every stuck task.
   60 minutes in total across all its waits (the `session_note` says what it
   waited on; omp names no jobs, so for omp it says "pending background work;
   job list unavailable"). It can also be a report that was accepted while the
-  process then ended cleanly with no later clean end, or a late run that
-  errored or was aborted: an accepted report in the history alone is not an
-  applicable outcome, so read the last events before retrying. A note is only
+  process then ended cleanly with no later clean end: an accepted report in
+  the history alone is not an applicable outcome, so read the last events
+  before retrying. (A later run that errored or was aborted is not
+  `no_report`: it ends the session as `exited`, or as an interruption after a
+  usage limit.) A note is only
   present if its own write succeeded. The turn was closed. choco then tried
   to clean up after it: it signals the agent's process group and, by pid, the
   processes it can show the turn started outside that group, such as that job,

@@ -222,9 +222,10 @@ roles:
   when the agent starts and ends when it yields. choco takes the end of an
   execution, with that execution's own final status (`stop`, `length` and
   `toolUse` are normal; `error` and `aborted` are failures; an unreadable
-  status counts as a failure), as the end of a turn. A prompt's result, the
-  session settling and a model/tool iteration finishing do not end anything,
-  so an agent woken later by a background job is judged by its own run, with
+  status counts as a failure), as the end of a turn. A successful prompt
+  result, the session settling and a model/tool iteration finishing end
+  nothing. (A prompt that fails before the agent runs, and a built-in command
+  that starts no agent run, are still ended by their own response.) So an agent woken later by a background job is judged by its own run, with
   or without the original prompt having succeeded. Each end gets one usage
   record, counting only the assistant messages of its own execution and read
   from the session statistics. If another execution started before an end's

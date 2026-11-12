@@ -223,8 +223,9 @@ the agent's own run. On omp each run of the main agent (from its start to the
 point where it yields) is one such end, and it is the run's own final status
 that counts, so a woken run is judged by itself: it does not inherit an
 earlier prompt's success, and a run that errors or is aborted never completes
-the turn. A prompt's result, the session settling, and a tool iteration
-finishing complete nothing. An accepted report in the history alone is not an
+the turn. A successful prompt result, the session settling, and a tool
+iteration finishing complete nothing (a prompt that fails before the agent
+runs, and a built-in command, are ended by their own response). An accepted report in the history alone is not an
 applicable outcome:
 
 - A turn that ends without reporting is left open. After 5 minutes with no

@@ -35,12 +35,18 @@ fn timers() -> TurnTimers {
 /// A task on `WAKE_YAML` in a disposable git repository, with a file-backed
 /// database, whose reviewer is a real `OmpAdapter` on the scripted fixture.
 async fn start_wake(steps: Value, timers: TurnTimers) -> WakeRun {
+    start_wake_on(WAKE_YAML, steps, timers).await
+}
+
+/// `start_wake` for a workflow other than `WAKE_YAML` (its stage must be
+/// `review` and its terminals `finished` / `bounced`).
+async fn start_wake_on(yaml: &str, steps: Value, timers: TurnTimers) -> WakeRun {
     let dir = tempdir();
     let repo = tempdir();
     init_git_repo(&repo).await;
     let pool = connect(&dir.join("choco.db")).await.unwrap();
     let script = OmpScript::new(&dir, steps, &[]);
-    let def = Arc::new(WorkflowDefinition::parse(WAKE_YAML, &dir).unwrap());
+    let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
     let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
     let task_id = tasks::create(
         &pool,
@@ -472,4 +478,194 @@ async fn omp_cancel_during_background_wait_does_not_apply() {
         }
     })
     .await;
+}
+
+/// A closing message array as omp sends it: an earlier clean message, a tool
+/// result, the run's last assistant message and a trailing user message.
+fn multi_message_end(first: &str, last: &str) -> Value {
+    let assistant = |reason: &str| {
+        let mut message = json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "x"}],
+            "stopReason": reason,
+        });
+        if reason == "error" {
+            message["errorMessage"] = json!("provider fell over mid-answer");
+        }
+        message
+    };
+    json!({"op": "agent_end", "messages": "raw", "raw": [
+        assistant(first),
+        {"role": "toolResult", "toolName": "bash", "isError": false},
+        assistant(last),
+        {"role": "user", "content": "go on"},
+    ]})
+}
+
+/// The last assistant message of the closing array decides: an error after
+/// a clean message is not applied, a clean message after an error is.
+#[tokio::test]
+async fn omp_the_last_message_of_a_wakes_end_decides_whether_it_applies() {
+    let failed = start_wake(
+        wake_steps(
+            json!(true),
+            changes_requested(),
+            vec![
+                multi_message_end("stop", "error"),
+                json!({"op": "session_settled"}),
+            ],
+        ),
+        timers(),
+    )
+    .await;
+    failed.script.wait_log("op:gate").await;
+    failed.script.release("wake");
+    assert_not_applied(&failed, "an error after a clean message").await;
+
+    let clean = start_wake(
+        wake_steps(
+            json!(true),
+            changes_requested(),
+            vec![
+                multi_message_end("error", "stop"),
+                json!({"op": "session_settled"}),
+            ],
+        ),
+        timers(),
+    )
+    .await;
+    clean.script.wait_log("op:gate").await;
+    clean.script.release("wake");
+    assert_applied_once(&clean).await;
+}
+
+fn yaml_with_stage(stage: &str) -> String {
+    format!(
+        "name: omp-wake\nroles:\n  reviewer:\n    cli: omp\n    model: openai-codex/gpt-5.6-terra\nstages:\n  review:\n    kind: agent_turn\n    role: reviewer\n{stage}\n  finished:\n    kind: terminal\n"
+    )
+}
+
+fn done_report() -> Value {
+    json!({"outcome": "done", "summary": SUMMARY})
+}
+
+/// `capture: text`: the reply of the wake's own run is what is stored.
+#[tokio::test]
+async fn omp_a_wake_on_a_text_capture_stage_stores_its_final_reply() {
+    let tail = vec![
+        json!({"op": "assistant", "text": "wake-reply-5d2e: all done"}),
+        json!({"op": "agent_end"}),
+        json!({"op": "session_settled"}),
+    ];
+    let yaml = yaml_with_stage("    capture: text\n    on: { done: finished }");
+    let run = start_wake_on(
+        &yaml,
+        wake_steps(json!(true), done_report(), tail),
+        timers(),
+    )
+    .await;
+    run.script.wait_log("op:gate").await;
+    assert!(run.outcomes().await.is_empty());
+    run.script.release("wake");
+    wait_until_stage(&run.pool, &run.task_id, "finished").await;
+    wait_until_task_status(&run.pool, &run.task_id, "closed").await;
+    assert_eq!(
+        payload_of(&run.pool, &run.task_id).await["stages"]["review"],
+        json!("wake-reply-5d2e: all done"),
+        "the wake's own final reply, not the first run's: {}",
+        run.describe().await
+    );
+    assert_eq!(run.script.prompts_received(), 1);
+    run.script.wait_log("eof").await;
+}
+
+/// No `capture:`: the accepted `done` advances the stage once and nothing is
+/// stored for it.
+#[tokio::test]
+async fn omp_a_wake_on_a_stage_without_capture_advances_and_stores_nothing() {
+    let yaml = yaml_with_stage("    on: { done: finished }");
+    let run = start_wake_on(
+        &yaml,
+        wake_steps(json!(true), done_report(), clean_finish()),
+        timers(),
+    )
+    .await;
+    run.script.wait_log("op:gate").await;
+    run.script.release("wake");
+    wait_until_stage(&run.pool, &run.task_id, "finished").await;
+    wait_until_task_status(&run.pool, &run.task_id, "closed").await;
+    let stored = payload_of(&run.pool, &run.task_id).await["stages"]["review"].clone();
+    assert!(stored.is_null(), "nothing captured: {stored}");
+    assert_eq!(
+        stage_trail(&run.pool, &run.task_id).await,
+        vec![
+            ("review".to_string(), Value::Null),
+            ("finished".to_string(), json!("done")),
+        ]
+    );
+    // Without `capture: json` no turn outcome is recorded; the single
+    // advance on `done` above is the one application.
+    assert!(run.outcomes().await.is_empty());
+    assert_eq!(run.script.prompts_received(), 1);
+    run.script.wait_log("eof").await;
+}
+
+/// A chat stage (empty `on:`) never concludes: the wake's end is recorded,
+/// the session stays open for the next message and nothing is applied.
+#[tokio::test]
+async fn omp_a_wake_in_a_chat_stage_leaves_the_conversation_open() {
+    let steps = json!([
+        {"op": "pid"},
+        {"op": "agent_start"},
+        {"op": "assistant", "text": "started the service"},
+        {"op": "agent_end", "terminal": false, "awaiting": true},
+        {"op": "prompt_result", "settled": false},
+        {"op": "gate", "name": "wake"},
+        {"op": "agent_start"},
+        {"op": "assistant", "text": "the service finished"},
+        {"op": "agent_end"},
+        {"op": "session_settled"},
+    ]);
+    let yaml = yaml_with_stage("    on: {}");
+    let run = start_wake_on(&yaml, steps, timers()).await;
+    run.script.wait_log("op:gate").await;
+    run.script.release("wake");
+    run.script.wait_log("script_done").await;
+    let session = run.session().await;
+    crate::test_support::wait_until("the wake's own end to be recorded", || async {
+        let ends = events::list_for_session(&run.pool, &session.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == EventType::TurnCompleted)
+            .count();
+        if ends == 2 {
+            Ok(())
+        } else {
+            Err(format!("{ends} ends so far"))
+        }
+    })
+    .await;
+    let session = sessions::get(&run.pool, &session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        SessionStatus::Active,
+        "{}",
+        run.describe().await
+    );
+    assert!(run.outcomes().await.is_empty());
+    assert_eq!(
+        stage_trail(&run.pool, &run.task_id).await,
+        vec![("review".to_string(), Value::Null)]
+    );
+    assert_eq!(
+        run.script.prompts_received(),
+        1,
+        "no nudge or second prompt"
+    );
+    // Cancelling is what ends a standing conversation.
+    run.engine.cancel_task(&run.task_id, false).await.unwrap();
 }

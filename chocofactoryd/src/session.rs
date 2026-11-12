@@ -744,7 +744,10 @@ impl SessionManager {
 /// nothing committed, and had the workflow advance past it while the
 /// sub-agent kept writing to the worktree. So a single-shot turn completes
 /// only on a `result` that follows a successful `report_outcome` call by the
-/// main agent (not a sub-agent, not one the tool rejected):
+/// main agent (not a sub-agent, not one the tool rejected). (For omp, the
+/// `result` is the `TurnCompleted` of one native execution: its closing
+/// `agent_end` with `yielded: true`, never a prompt's result or a
+/// settlement; a woken run has its own.)
 ///
 /// 1. Report, then `result`: the turn is complete. Stdin is closed so the CLI
 ///    exits, and a grace timer starts. If the process is still alive when it
@@ -754,10 +757,13 @@ impl SessionManager {
 ///    open, so a background job's notification can wake it. After
 ///    `nudge_after` with no events at all it is nudged on stdin, up to
 ///    `max_nudges` times; after that, stdin is closed, the grace rule
-///    applies, and the run ends `NoReport`. While the CLI reports background
-///    jobs still running (claude only), the turn is not nudged: it is closed
-///    the same way if still waiting `job_wait_limit` after it started
-///    waiting, and the idle reaper leaves it alone (#271).
+///    applies, and the run ends `NoReport`. While the CLI signals background
+///    work as pending (claude from its running jobs, omp from
+///    `awaitingAsyncWork`), the turn is not nudged: it is closed the same way
+///    once the waits add up to `job_wait_limit` in total, and the idle reaper
+///    leaves it alone (#271). A start by the main agent ends a wait, running
+///    time spends none of the budget, and a later wait gets only what is
+///    left.
 /// 3. A `result` with `is_error` closes stdin and applies the grace rule; the
 ///    run ends `exited`, as a crash would.
 ///
@@ -4148,16 +4154,16 @@ mod tests {
 
     /// A manager running a real `OmpAdapter` against the scripted fixture.
     async fn start_omp_single_shot(
+        state_dir: &std::path::Path,
         script: &crate::test_support::OmpScript,
         timers: TurnTimers,
         idle: chrono::Duration,
     ) -> (SqlitePool, String, Arc<SessionManager>) {
         let pool = connect_in_memory().await.unwrap();
         let session_id = seed_session(&pool).await;
-        let state = std::env::temp_dir().join(format!("choco-omp-state-{}", uuid::Uuid::new_v4()));
         let adapter: Arc<dyn AgentAdapter> = Arc::new(crate::adapter::OmpAdapter::with_binary(
             &script.binary,
-            &state,
+            state_dir,
         ));
         let manager = SessionManager::with_turn_timers(
             pool.clone(),
@@ -4208,7 +4214,7 @@ mod tests {
         let script =
             crate::test_support::OmpScript::new(&dir.0, omp_wake_steps(json!(true), true), &[]);
         let (pool, session_id, manager) =
-            start_omp_single_shot(&script, fast_timers(3), chrono::Duration::zero()).await;
+            start_omp_single_shot(&dir.0, &script, fast_timers(3), chrono::Duration::zero()).await;
         wait_for_note(&pool, &session_id, "job_wait").await;
 
         // The reaper's staleness is zero, so freshness cannot be what saves
@@ -4258,7 +4264,7 @@ mod tests {
             ..fast_timers(3)
         };
         let (pool, session_id, _manager) =
-            start_omp_single_shot(&script, timers, chrono::Duration::hours(1)).await;
+            start_omp_single_shot(&dir.0, &script, timers, chrono::Duration::hours(1)).await;
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Exited);
         assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
@@ -4279,7 +4285,8 @@ mod tests {
             &[],
         );
         let (pool, session_id, _manager) =
-            start_omp_single_shot(&script, fast_timers(1), chrono::Duration::hours(1)).await;
+            start_omp_single_shot(&dir.0, &script, fast_timers(1), chrono::Duration::hours(1))
+                .await;
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.end_reason, Some(SessionEndReason::NoReport));
         let kinds = session_notes(&pool, &session_id).await;

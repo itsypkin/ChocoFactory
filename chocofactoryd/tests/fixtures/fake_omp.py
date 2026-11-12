@@ -85,7 +85,8 @@ wrapper script, never through the test process's own environment):
   / report {args} (a real host call under fresh ids; waits for the reply) /
   agent_end {yielded, terminal, awaiting, messages} (`yielded` and
   `awaiting` take a JSON value or "ABSENT"; `messages` is last (default),
-  empty, absent, string or unknown_reason) / prompt_result {status, settled,
+  empty, absent, string, unknown_reason or raw: the step's own `raw` list is
+  sent as the closing messages) / prompt_result {status, settled,
   error_message, error_status} / add_totals {input, cost}.
 - FAKE_OMP_STATS_SEQ: comma list of `ok|error|garbled|silent`, one per
   `get_session_stats` call (the last repeats). Default `ok`.
@@ -772,6 +773,8 @@ def run_script():
                 frame["messages"] = "oops"
             elif mode == "unknown_reason":
                 frame["messages"] = [dict(last, stopReason="mystery")]
+            elif mode == "raw":
+                frame["messages"] = step["raw"]
             emit_event(frame)
         else:
             raise SystemExit("unknown script op %r" % op)

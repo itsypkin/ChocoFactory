@@ -234,8 +234,9 @@ pub enum AgentEvent {
         detected_by: InterruptionEvidence,
     },
     /// One native execution of the main agent has ended: claude's `result`
-    /// line, or omp's yielded `agent_end` (a prompt's result or the session
-    /// settling is not one). The process is now only waiting on stdin EOF to
+    /// line, or omp's yielded `agent_end` (a successful prompt result or the
+    /// session settling is not one; a prompt that failed before any run, or
+    /// a built-in command that started none, ends from its own response). The process is now only waiting on stdin EOF to
     /// exit — it never exits on its own (#70). An agent woken later by
     /// background work ends again with its own `TurnCompleted`, carrying its
     /// own status.
