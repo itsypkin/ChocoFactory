@@ -261,8 +261,12 @@ applicable outcome:
   advances only if the cleanup is then verified: the end-of-turn sweep ran,
   the output stream ended on its own, the last check of the process table saw
   nothing of the turn's alive with no read of it having failed during the
-  turn, and the process was reaped. Then the turn counts as complete and
-  its report is applied once, as if the process had exited on time. Otherwise
+  turn, and the process was reaped. Then the turn counts as complete, as if
+  the process had exited on time: its report goes through the same checks as
+  any completed turn (a read-only role's worktree check, the capture, the
+  stage's routing), and if they pass it is applied once. Verified cleanup
+  makes the report eligible; it does not by itself advance the task, and a
+  task cancelled meanwhile is not advanced. Otherwise
   (a process still seen at the last check, or a process table that could not
   be read) the run ends `lingered` and the task is marked `stuck`, rather than
   advancing past work that may still be landing; the accepted report stays on
@@ -275,8 +279,12 @@ applicable outcome:
   run still ends `interrupted` (as it would with nothing left running), so
   `choco task retry` can resume the same conversation when the usual rules
   allow it. This holds only when the usage limit was the last thing the main
-  agent met: a limit it carried on past, or a sub-agent working after the
-  limit, doesn't count, and an unverified cleanup ends `lingered`.
+  agent met before its turn ended with an error. A limit the main agent
+  recovered from does not count: any message, thinking, tool call, tool result
+  or start of execution by the main agent after the limit, or a clean end of
+  its turn, withdraws it, and the run stays `lingered`. A sub-agent working
+  after the limit neither withdraws it nor confirms it. An unverified cleanup
+  ends `lingered` as well.
 - Output that arrives after a turn completed stays on the timeline, flagged
   `after_completion`. Nudges and kills appear as `session_note` events, as do
   the `execution_started` notes ("main-agent activity observed") that omp
@@ -794,9 +802,11 @@ again (after a revise lap, say) runs every branch again.
 
 A branch fails when its turn can't complete: it ends without reporting (reason
 such as `stage 'security_review': the agent's turn ended without calling
-report_outcome`), crashes, leaves a process running that the cleanup cannot verifiably remove
-(one that the turn's cleanup removes and verifies after an accepted report does
-not fail the branch), changes the worktree, or hits a usage limit. It also fails if it reports a result outside its
+report_outcome`), crashes, leaves a process running whose cleanup cannot be
+verified, changes the worktree, or hits a usage limit. (A process left running
+after an accepted report and a clean end of the branch's main turn does not
+fail the branch when the cleanup of it is verified; without that clean end, or
+with an unverified cleanup, it does.) It also fails if it reports a result outside its
 `results:`, and its capture is then dropped (the tool normally refuses such a
 value, so this is a guard). The other branches keep running. When none is left
 running, the task is marked `stuck` with a reason naming each failed branch,

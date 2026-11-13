@@ -10397,13 +10397,16 @@ async fn session_events(pool: &SqlitePool, session: &Session, kind: EventType) -
 }
 
 async fn stuck_reason(pool: &SqlitePool, task_id: &str) -> String {
-    wait_until_task_status(pool, task_id, "stuck").await;
-    tasks::get(pool, task_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .stuck_reason
-        .unwrap()
+    // Any settled state ends the wait, so a task that routed on instead of
+    // parking fails here with what it did, not on a timeout.
+    let task = wait_until_task_settled(pool, task_id).await;
+    assert_eq!(
+        task.status,
+        "stuck",
+        "expected the task to park; stage trail {:?}",
+        stage_trail(pool, task_id).await
+    );
+    task.stuck_reason.unwrap()
 }
 
 #[tokio::test]
@@ -11346,37 +11349,162 @@ async fn retry_resumes_the_session_a_usage_limit_interrupted() {
     );
 }
 
+/// A test directory that also owns the pid file of a job the test's fake
+/// agent started. Dropping it kills that job *before* the directory goes, so
+/// teardown never depends on the order its owner's fields are declared in: a
+/// regression that leaves the job alive cannot make it outlive its test.
+struct JobDir {
+    dir: TempDir,
+}
+
+impl JobDir {
+    fn new() -> Self {
+        JobDir { dir: tempdir() }
+    }
+
+    fn job_file(&self) -> PathBuf {
+        self.dir.join("job.pid")
+    }
+
+    fn job_pid(&self) -> u32 {
+        fs::read_to_string(self.job_file())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+}
+
+impl std::ops::Deref for JobDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for JobDir {
+    fn drop(&mut self) {
+        // Runs before the fields drop, so the pid file is still there.
+        drop(crate::test_support::KillPidFileOnDrop(self.job_file()));
+    }
+}
+
+/// The teardown the lingering fixtures rely on: a job still alive when its
+/// directory's owner goes is killed, and the directory goes with it.
+#[tokio::test]
+async fn a_job_dir_kills_its_job_before_removing_the_directory() {
+    let jobs = JobDir::new();
+    // A grandchild that outlives the shell that started it, bounded at two
+    // minutes so a failure cannot leave it for long.
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "sleep 120 >/dev/null 2>&1 </dev/null & echo $! > '{}'",
+            jobs.job_file().display()
+        ))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let pid = jobs.job_pid();
+    assert!(process_alive(pid), "the job is running before teardown");
+    let dir = jobs.to_path_buf();
+    drop(jobs);
+    assert!(!dir.exists(), "the directory is removed");
+    wait_until_pid_gone(pid).await;
+}
+
+/// Waits for the task to reach a state it stays in (closed, stuck or
+/// cancelled), so a test that expects one of them fails an assertion of its
+/// own, with the observed state, when another is reached instead of timing
+/// out on the expected one.
+async fn wait_until_task_settled(pool: &SqlitePool, task_id: &str) -> Task {
+    crate::test_support::wait_until(
+        &format!("task {task_id} to settle (closed, stuck or cancelled)"),
+        || async {
+            let task = tasks::get(pool, task_id).await.unwrap().unwrap();
+            match task.status.as_str() {
+                "closed" | "stuck" | "cancelled" => Ok(task),
+                other => Err(format!("status {other:?}")),
+            }
+        },
+    )
+    .await
+}
+
+/// The `TurnOutcome` events of a task. The engine appends one after the task
+/// has already moved on, so a test that counts them after a transition waits
+/// for the first one with [`wait_until_turn_outcome_event`] first.
+async fn turn_outcomes(pool: &SqlitePool, task_id: &str) -> Vec<chocofactory_core::models::Event> {
+    events::list_for_task(pool, task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == EventType::TurnOutcome)
+        .collect()
+}
+
+/// The turn's end the way the real CLI sends it when the account runs out of
+/// usage: the limit message with the CLI's own structured error fields.
+fn raw_limit_message() -> Value {
+    json!({"op": "raw", "line": {
+        "type": "assistant",
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": "You've hit your session limit \u{b7} resets 3:40pm (Europe/Berlin)"
+            }],
+        },
+        "error": "rate_limit",
+        "isApiErrorMessage": true,
+        "apiErrorStatus": 429,
+        "session_id": "limit-session",
+    }})
+}
+
 /// A turn cut off by a usage limit after doing work, with a job it started
 /// still running and the CLI alive through grace.
 struct CutoffRun {
     pool: SqlitePool,
-    dir: TempDir,
+    jobs: JobDir,
     task_id: String,
+    task: Task,
     session: Session,
     job_pid: u32,
     reads_after_failure: Arc<std::sync::atomic::AtomicUsize>,
-    _job_guard: crate::test_support::KillPidFileOnDrop,
+}
+
+/// The tail of the usual cut-off turn: the accepted report, then the account's
+/// usage limit as one message and an error end, then the CLI stays alive.
+fn usage_limit_tail() -> Vec<Value> {
+    vec![
+        json!({"op": "report", "outcome": "done"}),
+        json!({"op": "usage_limit"}),
+        json!({"op": "sleep", "seconds": 60}),
+    ]
 }
 
 async fn cutoff_with_leftover(cleanup: Cleanup) -> CutoffRun {
+    cutoff_with_leftover_tail(cleanup, usage_limit_tail()).await
+}
+
+/// Runs a coding turn that starts an owned escaped job, edits the worktree
+/// and then follows `tail`. Waits for the task to settle anywhere, so a wrong
+/// routing (a task that advanced) fails the caller's assertion with the
+/// observed state instead of a timeout on the expected one.
+async fn cutoff_with_leftover_tail(cleanup: Cleanup, tail: Vec<Value>) -> CutoffRun {
     let pool = connect_in_memory().await.unwrap();
-    let dir = tempdir();
-    let def = coding_workflow(&dir);
+    let jobs = JobDir::new();
+    let def = coding_workflow(&jobs);
     let task_id = seed_task(&pool, &def.name).await;
-    let job_file = dir.join("job.pid");
-    let job_guard = crate::test_support::KillPidFileOnDrop(job_file.clone());
-    let binary = named_script_binary(
-        &dir,
-        "fake-claude-cutoff",
-        json!([
-            {"op": "read_turn"},
-            {"op": "spawn_escaped", "setsid": true, "double_fork": true, "pid_file": job_file},
-            {"op": "run", "command": format!("echo edited > '{}'", dir.join("edit.txt").display())},
-            {"op": "report", "outcome": "done"},
-            {"op": "usage_limit"},
-            {"op": "sleep", "seconds": 60},
-        ]),
-    );
+    let mut steps = vec![
+        json!({"op": "read_turn"}),
+        json!({"op": "spawn_escaped", "setsid": true, "double_fork": true, "pid_file": jobs.job_file()}),
+        json!({"op": "run", "command": format!("echo edited > '{}'", jobs.join("edit.txt").display())}),
+    ];
+    steps.extend(tail);
+    let binary = named_script_binary(&jobs, "fake-claude-cutoff", Value::Array(steps));
     let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(&binary));
     let events_notify = Arc::new(Notify::new());
     let reads_after_failure = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -11391,12 +11519,12 @@ async fn cutoff_with_leftover(cleanup: Cleanup) -> CutoffRun {
     let engine = WorkflowEngine::new(
         pool.clone(),
         session_manager,
-        dir.to_path_buf(),
+        jobs.to_path_buf(),
         None,
         events_notify,
     );
     engine.start_task(&task_id, &def, None).await.unwrap();
-    wait_until_task_status(&pool, &task_id, "stuck").await;
+    let task = wait_until_task_settled(&pool, &task_id).await;
     let session = crate::test_support::wait_until("the cutoff session to be final", || async {
         let runs = runs_for_stage(&pool, &task_id, "coding").await;
         match runs.as_slice() {
@@ -11405,19 +11533,15 @@ async fn cutoff_with_leftover(cleanup: Cleanup) -> CutoffRun {
         }
     })
     .await;
-    let job_pid: u32 = fs::read_to_string(&job_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let job_pid = jobs.job_pid();
     CutoffRun {
         pool,
-        dir,
+        jobs,
         task_id,
+        task,
         session,
         job_pid,
         reads_after_failure,
-        _job_guard: job_guard,
     }
 }
 
@@ -11440,6 +11564,97 @@ fn logging_script_binary(dir: &Path, name: &str, steps: Value) -> (String, PathB
     (wrapper.display().to_string(), log)
 }
 
+/// What every verified cutoff must look like before retry: the turn was
+/// interrupted, not completed, whatever it reported; nothing advanced; the
+/// job is gone and the work is intact.
+async fn assert_parked_as_interrupted(c: &CutoffRun, what: &str) {
+    assert_eq!(
+        (c.session.status, c.session.end_reason, c.session.cleanup),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::Interrupted),
+            Some(SessionCleanup::Verified)
+        ),
+        "{what}: task {:?} stuck_reason {:?}",
+        c.task.status,
+        c.task.stuck_reason
+    );
+    wait_until_pid_gone(c.job_pid).await;
+    assert_eq!(c.task.status, "stuck", "{what}: {:?}", c.task);
+    assert!(
+        c.task
+            .stuck_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("before completing")),
+        "{what}: {:?}",
+        c.task.stuck_reason
+    );
+    assert!(c.jobs.join("edit.txt").exists(), "{what}");
+    assert_eq!(
+        stage_trail(&c.pool, &c.task_id).await,
+        vec![("coding".to_string(), Value::Null)],
+        "{what}: an accepted report with a cutoff end must not advance"
+    );
+}
+
+/// Retries the cutoff task in `mode` on a CLI that resumes whatever session
+/// id it is started with, and checks the conversation really was resumed.
+async fn retry_and_assert_resumed(c: &CutoffRun, mode: RetryMode) {
+    let interrupted = c.session.clone();
+    let (resumed_binary, argv_log) = logging_script_binary(
+        &c.jobs,
+        "fake-claude-cutoff-resumed",
+        json!([
+            {"op": "echo_turn"},
+            {"op": "report", "outcome": "done"},
+            {"op": "result"},
+        ]),
+    );
+    let engine = engine_with_adapter_and_workflows_dir(c.pool.clone(), &resumed_binary, &c.jobs);
+    let outcome = engine.retry_task(&c.task_id, mode).await.unwrap();
+    assert!(outcome.resumed, "{mode:?}: {outcome:?}");
+    assert_eq!(
+        outcome.adapter_session_id, interrupted.adapter_session_id,
+        "{mode:?}"
+    );
+    let task = wait_until_task_settled(&c.pool, &c.task_id).await;
+    assert_eq!(task.status, "closed", "{mode:?}: {task:?}");
+    let resumed = run_after(&c.pool, &c.task_id, "coding", &interrupted).await;
+    assert_eq!(
+        resumed.resumed_from.as_deref(),
+        Some(interrupted.id.as_str()),
+        "{mode:?}"
+    );
+    assert_eq!(resumed.adapter_session_id, interrupted.adapter_session_id);
+    // The CLI was really asked to resume that conversation.
+    let argv = fs::read_to_string(&argv_log).unwrap();
+    let wanted = interrupted.adapter_session_id.clone().unwrap();
+    assert!(
+        argv.contains("--resume") && argv.contains(&wanted),
+        "{mode:?}: argv: {argv}"
+    );
+    let echoed = events::list_for_session(&c.pool, &resumed.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| e.payload["text"].as_str().map(str::to_string))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(echoed.contains("interrupted"), "{mode:?}: {echoed}");
+    assert!(c.jobs.join("edit.txt").exists(), "the work is intact");
+    // The stage has no capture, so its one application is the one move out of
+    // `coding`, made by the resumed turn's own report.
+    assert_eq!(
+        stage_trail(&c.pool, &c.task_id).await,
+        vec![
+            ("coding".to_string(), Value::Null),
+            ("coding".to_string(), json!("retry_resume")),
+            ("finished".to_string(), json!("done")),
+        ],
+        "{mode:?}: the retry re-enters the stage once and the turn then advances once"
+    );
+}
+
 /// The usage-limit cutoff of a turn that reported, with its job still
 /// running through grace: once the cleanup is verified the run is the
 /// `Interrupted` one it would have been with nothing left running, never a
@@ -11448,85 +11663,30 @@ fn logging_script_binary(dir: &Path, name: &str, steps: Value) -> (String, PathB
 async fn terminating_cutoff_with_verified_cleanup_resumes_the_same_conversation() {
     for mode in [RetryMode::Auto, RetryMode::Resume] {
         let c = cutoff_with_leftover(Cleanup::Clean).await;
-        let interrupted = c.session.clone();
-        assert_eq!(
-            (
-                interrupted.status,
-                interrupted.end_reason,
-                interrupted.cleanup
-            ),
-            (
-                SessionStatus::Exited,
-                Some(SessionEndReason::Interrupted),
-                Some(SessionCleanup::Verified)
-            ),
-            "{mode:?}"
-        );
-        wait_until_pid_gone(c.job_pid).await;
-        let task = tasks::get(&c.pool, &c.task_id).await.unwrap().unwrap();
-        assert_eq!(task.status, "stuck");
-        assert!(
-            task.stuck_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("before completing")),
-            "{:?}",
-            task.stuck_reason
-        );
-        assert!(c.dir.join("edit.txt").exists());
-        assert_eq!(
-            stage_trail(&c.pool, &c.task_id).await,
-            vec![("coding".to_string(), Value::Null)],
-            "an accepted report with a cutoff end must not advance"
-        );
-
-        let (resumed_binary, argv_log) = logging_script_binary(
-            &c.dir,
-            "fake-claude-cutoff-resumed",
-            json!([
-                {"op": "echo_turn"},
-                {"op": "report", "outcome": "done"},
-                {"op": "result"},
-            ]),
-        );
-        let engine = engine_with_adapter_and_workflows_dir(c.pool.clone(), &resumed_binary, &c.dir);
-        let outcome = engine.retry_task(&c.task_id, mode).await.unwrap();
-        assert!(outcome.resumed, "{mode:?}: {outcome:?}");
-        assert_eq!(
-            outcome.adapter_session_id, interrupted.adapter_session_id,
-            "{mode:?}"
-        );
-        wait_until_task_status(&c.pool, &c.task_id, "closed").await;
-
-        let resumed = run_after(&c.pool, &c.task_id, "coding", &interrupted).await;
-        assert_eq!(
-            resumed.resumed_from.as_deref(),
-            Some(interrupted.id.as_str()),
-            "{mode:?}"
-        );
-        assert_eq!(resumed.adapter_session_id, interrupted.adapter_session_id);
-        // The CLI was really asked to resume that conversation.
-        let argv = fs::read_to_string(&argv_log).unwrap();
-        let wanted = interrupted.adapter_session_id.clone().unwrap();
-        assert!(
-            argv.contains("--resume") && argv.contains(&wanted),
-            "{mode:?}: argv: {argv}"
-        );
-        let echoed = events::list_for_session(&c.pool, &resumed.id)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter_map(|e| e.payload["text"].as_str().map(str::to_string))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(echoed.contains("interrupted"), "{mode:?}: {echoed}");
-        assert!(c.dir.join("edit.txt").exists(), "the work is intact");
-        let applied = stage_trail(&c.pool, &c.task_id)
-            .await
-            .into_iter()
-            .filter(|(stage, _)| stage != "coding")
-            .count();
-        assert_eq!(applied, 1, "{mode:?}: exactly one normal advance");
+        assert_parked_as_interrupted(&c, &format!("{mode:?}")).await;
+        retry_and_assert_resumed(&c, mode).await;
     }
+}
+
+/// The limit is the main agent's, only a sub-agent worked after it, and the
+/// turn ends with an ordinary error rather than a second limit (which would
+/// hide a regression). The cutoff stands, and retry resumes the same
+/// conversation: helper activity neither confirms nor undoes it.
+#[tokio::test]
+async fn work_by_a_helper_after_the_limit_still_resumes_the_same_conversation() {
+    let c = cutoff_with_leftover_tail(
+        Cleanup::Clean,
+        vec![
+            json!({"op": "report", "outcome": "done"}),
+            raw_limit_message(),
+            json!({"op": "text", "text": "helper busy", "parent": "toolu_01W3VQxTmyXy3B7b1bmz9YaX"}),
+            json!({"op": "result", "is_error": true}),
+            json!({"op": "sleep", "seconds": 60}),
+        ],
+    )
+    .await;
+    assert_parked_as_interrupted(&c, "helper after the limit").await;
+    retry_and_assert_resumed(&c, RetryMode::Auto).await;
 }
 
 /// The same cutoff with a cleanup that cannot be verified is not made
@@ -11546,8 +11706,10 @@ async fn unverified_cutoff_is_not_newly_made_resumable() {
                 Some(SessionEndReason::Lingered),
                 Some(SessionCleanup::Unverified)
             ),
-            "{name}"
+            "{name}: {:?}",
+            c.task
         );
+        assert_eq!(c.task.status, "stuck", "{name}: {:?}", c.task);
         wait_until_pid_gone(c.job_pid).await;
         if name == "a failed read" {
             assert!(
@@ -11558,11 +11720,11 @@ async fn unverified_cutoff_is_not_newly_made_resumable() {
             );
         }
         let (binary, _argv) = logging_script_binary(
-            &c.dir,
+            &c.jobs,
             "fake-claude-not-started",
             json!([{"op": "echo_turn"}, {"op": "report", "outcome": "done"}, {"op": "result"}]),
         );
-        let engine = engine_with_adapter_and_workflows_dir(c.pool.clone(), &binary, &c.dir);
+        let engine = engine_with_adapter_and_workflows_dir(c.pool.clone(), &binary, &c.jobs);
         let err = engine
             .retry_task(&c.task_id, RetryMode::Resume)
             .await
@@ -11576,7 +11738,7 @@ async fn unverified_cutoff_is_not_newly_made_resumable() {
             1,
             "{name}: the refused retry created no session"
         );
-        assert!(c.dir.join("edit.txt").exists());
+        assert!(c.jobs.join("edit.txt").exists());
         let reported = events::list_for_session(&c.pool, &c.session.id)
             .await
             .unwrap()
@@ -12495,82 +12657,117 @@ fn cleanup_reader(
     cleanup: Cleanup,
     later_reads: Arc<std::sync::atomic::AtomicUsize>,
 ) -> crate::proc_table::ProcReader {
+    gated_cleanup_reader(
+        cleanup,
+        later_reads,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    )
+}
+
+/// [`cleanup_reader`] that leaves every read alone until `armed` is set, so a
+/// test with several sessions can aim the injected fault at the one it
+/// chooses (the others finish before it is armed).
+fn gated_cleanup_reader(
+    cleanup: Cleanup,
+    later_reads: Arc<std::sync::atomic::AtomicUsize>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+) -> crate::proc_table::ProcReader {
+    use std::sync::atomic::{AtomicBool, Ordering};
     // SAFETY: only reads the process's own uid.
     let uid = unsafe { libc::geteuid() };
     match cleanup {
         Cleanup::Clean => Arc::new(crate::proc_table::read),
         Cleanup::SurvivorAlive => tampered_reader(move |_, table| {
-            table.push(crate::proc_table::ProcEntry {
-                pid: GHOST_PID,
-                ppid: 1,
-                pgid: GHOST_PID,
-                sid: GHOST_PID,
-                uid,
-                start: 1,
-                zombie: false,
-                comm: "ghost".into(),
-                marker: crate::proc_table::MarkerStatus::Present,
-            });
+            if armed.load(Ordering::SeqCst) {
+                table.push(crate::proc_table::ProcEntry {
+                    pid: GHOST_PID,
+                    ppid: 1,
+                    pgid: GHOST_PID,
+                    sid: GHOST_PID,
+                    uid,
+                    start: 1,
+                    zombie: false,
+                    comm: "ghost".into(),
+                    marker: crate::proc_table::MarkerStatus::Present,
+                });
+            }
             Ok(())
         }),
-        Cleanup::OneFailedRead => tampered_reader(move |n, _| {
-            if n == 0 {
-                Err(std::io::Error::other("injected failure"))
-            } else {
-                later_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            }
-        }),
+        Cleanup::OneFailedRead => {
+            let failed = AtomicBool::new(false);
+            tampered_reader(move |_, _| {
+                if !armed.load(Ordering::SeqCst) {
+                    Ok(())
+                } else if !failed.swap(true, Ordering::SeqCst) {
+                    Err(std::io::Error::other("injected failure"))
+                } else {
+                    later_reads.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+        }
     }
+}
+
+/// A lingering review turn that has been started and not yet settled.
+struct LingeringStart {
+    jobs: JobDir,
+    pool: SqlitePool,
+    engine: Arc<WorkflowEngine>,
+    task_id: String,
+    reads_after_failure: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// What a lingering review turn left: the settled task, the engine's records.
 struct LingeringReview {
+    /// Kept so the job is killed and its directory removed when this goes.
+    _jobs: JobDir,
     pool: SqlitePool,
+    _engine: Arc<WorkflowEngine>,
     task_id: String,
     task: Task,
     session: Session,
     job_pid: u32,
     reads_after_failure: Arc<std::sync::atomic::AtomicUsize>,
-    _job_guard: crate::test_support::KillPidFileOnDrop,
 }
 
-/// Runs a reviewer that spawns an owned escaped job, reports
-/// `changes_requested` with a distinctive summary, ends its turn cleanly and
-/// then stays alive through the grace period. Waits for the task to settle
-/// anywhere (closed, stuck or cancelled) so a wrong outcome fails an assertion
-/// of the caller's instead of timing out on an expected state.
-async fn lingering_review(cleanup: Cleanup, extra_edit: Option<&str>) -> LingeringReview {
-    let pool = connect_in_memory().await.unwrap();
-    let dir = tempdir();
-    let def = Arc::new(WorkflowDefinition::parse(lingering_review_yaml(), &dir).unwrap());
-    let task_id = seed_task(&pool, &def.name).await;
-    let job_file = dir.join("job.pid");
-    let job_guard = crate::test_support::KillPidFileOnDrop(job_file.clone());
-    let mut steps = vec![
-        json!({"op": "read_turn"}),
-        json!({"op": "spawn_escaped", "setsid": true, "double_fork": true, "pid_file": job_file}),
-    ];
-    if let Some(command) = extra_edit {
-        steps.push(json!({"op": "run", "command": command}));
-    }
-    steps.extend([
+/// The usual lingering review: report `changes_requested` with a distinctive
+/// summary, end the turn cleanly, then stay alive through grace.
+fn lingering_review_tail() -> Vec<Value> {
+    vec![
         json!({"op": "report", "outcome": "changes_requested", "summary": "distinctive-summary-7f3a"}),
         json!({"op": "result"}),
         json!({"op": "sleep", "seconds": 60}),
-    ]);
-    let binary = script_binary(&dir, Value::Array(steps));
+    ]
+}
+
+/// Starts a reviewer that spawns an owned escaped job and then follows
+/// `tail`, with the process table read as `cleanup` says.
+async fn start_lingering(
+    cleanup: Cleanup,
+    tail: Vec<Value>,
+    timers: crate::session::TurnTimers,
+) -> LingeringStart {
+    let pool = connect_in_memory().await.unwrap();
+    let jobs = JobDir::new();
+    let def = Arc::new(WorkflowDefinition::parse(lingering_review_yaml(), &jobs).unwrap());
+    let task_id = seed_task(&pool, &def.name).await;
+    let mut steps = vec![
+        json!({"op": "read_turn"}),
+        json!({"op": "spawn_escaped", "setsid": true, "double_fork": true, "pid_file": jobs.job_file()}),
+    ];
+    steps.extend(tail);
+    let binary = script_binary(&jobs, Value::Array(steps));
     let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(&binary));
     let events_notify = Arc::new(Notify::new());
     let reads_after_failure = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let reader = cleanup_reader(cleanup, Arc::clone(&reads_after_failure));
     let session_manager = SessionManager::with_proc_reader(
         pool.clone(),
         Registry::single(adapter),
         chrono::Duration::hours(1),
         Arc::clone(&events_notify),
-        fast_turn_timers(),
-        reader,
+        timers,
+        cleanup_reader(cleanup, Arc::clone(&reads_after_failure)),
     );
     let engine = WorkflowEngine::new(
         pool.clone(),
@@ -12583,41 +12780,52 @@ async fn lingering_review(cleanup: Cleanup, extra_edit: Option<&str>) -> Lingeri
         .start_task(&task_id, &def, Some("review"))
         .await
         .unwrap();
-    let task = crate::test_support::wait_until(
-        &format!("task {task_id} to settle (closed, stuck or cancelled)"),
-        || async {
-            let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-            match task.status.as_str() {
-                "closed" | "stuck" | "cancelled" => Ok(task),
-                other => Err(format!("status {other:?}")),
-            }
-        },
-    )
-    .await;
-    // The session's final write is what the watcher acted on, but wait for it
-    // anyway so the assertions read the settled row.
-    let session = crate::test_support::wait_until("the review session to be final", || async {
-        let runs = runs_for_stage(&pool, &task_id, "review").await;
-        match runs.as_slice() {
-            [only] if only.status != SessionStatus::Active => Ok(only.clone()),
-            other => Err(format!("{} session(s): {other:?}", other.len())),
-        }
-    })
-    .await;
-    let job_pid: u32 = std::fs::read_to_string(&job_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    LingeringReview {
+    LingeringStart {
+        jobs,
         pool,
+        engine,
         task_id,
-        task,
-        session,
-        job_pid,
         reads_after_failure,
-        _job_guard: job_guard,
     }
+}
+
+impl LingeringStart {
+    /// Waits for the task to settle anywhere (closed, stuck or cancelled) and
+    /// for the session's final write, so a wrong outcome fails an assertion of
+    /// the caller's instead of timing out on an expected state.
+    async fn settle(self) -> LingeringReview {
+        let task = wait_until_task_settled(&self.pool, &self.task_id).await;
+        let session = crate::test_support::wait_until("the review session to be final", || async {
+            let runs = runs_for_stage(&self.pool, &self.task_id, "review").await;
+            match runs.as_slice() {
+                [only] if only.status != SessionStatus::Active => Ok(only.clone()),
+                other => Err(format!("{} session(s): {other:?}", other.len())),
+            }
+        })
+        .await;
+        let job_pid = self.jobs.job_pid();
+        LingeringReview {
+            _jobs: self.jobs,
+            pool: self.pool,
+            _engine: self.engine,
+            task_id: self.task_id,
+            task,
+            session,
+            job_pid,
+            reads_after_failure: self.reads_after_failure,
+        }
+    }
+}
+
+async fn lingering_review(cleanup: Cleanup) -> LingeringReview {
+    lingering_review_with(cleanup, lingering_review_tail()).await
+}
+
+async fn lingering_review_with(cleanup: Cleanup, tail: Vec<Value>) -> LingeringReview {
+    start_lingering(cleanup, tail, fast_turn_timers())
+        .await
+        .settle()
+        .await
 }
 
 async fn wait_until_pid_gone(pid: u32) {
@@ -12637,7 +12845,7 @@ async fn wait_until_pid_gone(pid: u32) {
 /// capture, and without another review.
 #[tokio::test]
 async fn verified_grace_cleanup_applies_the_completed_verdict_once() {
-    let r = lingering_review(Cleanup::Clean, None).await;
+    let r = lingering_review(Cleanup::Clean).await;
     assert_eq!(
         r.task.status, "closed",
         "stuck_reason: {:?}; session: {:?}",
@@ -12664,14 +12872,13 @@ async fn verified_grace_cleanup_applies_the_completed_verdict_once() {
         payload["stages"]["review"]["summary"], "distinctive-summary-7f3a",
         "{payload}"
     );
-    let outcomes = events::list_for_task(&r.pool, &r.task_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|e| e.event_type == EventType::TurnOutcome)
-        .collect::<Vec<_>>();
+    // The outcome event is appended after the task has moved on, so wait for
+    // it before counting: the count is of what the engine applied, not of
+    // how far its write had got when the task closed.
+    let first = wait_until_turn_outcome_event(&r.pool, &r.task_id).await;
+    assert_eq!(first["applied"], true, "{first}");
+    let outcomes = turn_outcomes(&r.pool, &r.task_id).await;
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
-    assert_eq!(outcomes[0].payload["applied"], true);
     // No retry, nudge or second review.
     assert_eq!(runs_for_stage(&r.pool, &r.task_id, "review").await.len(), 1);
     let notes = events::list_for_session(&r.pool, &r.session.id)
@@ -12694,7 +12901,7 @@ async fn unverified_grace_cleanup_does_not_apply_the_completed_verdict() {
         ("a survivor", Cleanup::SurvivorAlive),
         ("a failed read", Cleanup::OneFailedRead),
     ] {
-        let r = lingering_review(cleanup, None).await;
+        let r = lingering_review(cleanup).await;
         assert_eq!(r.task.status, "stuck", "{name}: {:?}", r.task);
         assert_eq!(
             (r.session.status, r.session.end_reason, r.session.cleanup),
@@ -12733,13 +12940,10 @@ async fn unverified_grace_cleanup_does_not_apply_the_completed_verdict() {
                 && !line.contains("was killed"),
             "{name}: {line}"
         );
-        let applied = events::list_for_task(&r.pool, &r.task_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.event_type == EventType::TurnOutcome)
-            .count();
-        assert_eq!(applied, 0, "{name}");
+        assert!(
+            turn_outcomes(&r.pool, &r.task_id).await.is_empty(),
+            "{name}: nothing may be applied"
+        );
         // The accepted report is still readable on the session's events.
         let reported = events::list_for_session(&r.pool, &r.session.id)
             .await
@@ -12756,6 +12960,126 @@ async fn unverified_grace_cleanup_does_not_apply_the_completed_verdict() {
             );
         }
     }
+}
+
+/// An accepted report is not a completed turn without the clean end after
+/// it. A generic error end stays `Lingered` whatever the cleanup achieved, an
+/// exit with no end at all is the plain `NoReport` or crash it was, and none
+/// of them applies the report or moves the task.
+#[tokio::test]
+async fn a_report_without_a_clean_end_cannot_gain_cleanup_success() {
+    let report = json!({"op": "report", "outcome": "changes_requested", "summary": "distinctive-summary-7f3a"});
+    let cases: [(&str, Vec<Value>, Option<SessionEndReason>); 3] = [
+        (
+            "a generic error end, then grace",
+            vec![
+                report.clone(),
+                json!({"op": "result", "is_error": true}),
+                json!({"op": "sleep", "seconds": 60}),
+            ],
+            Some(SessionEndReason::Lingered),
+        ),
+        (
+            "exit 0 with no end",
+            vec![report.clone(), json!({"op": "exit", "code": 0})],
+            Some(SessionEndReason::NoReport),
+        ),
+        (
+            "exit 17 with no end",
+            vec![report, json!({"op": "exit", "code": 17})],
+            None,
+        ),
+    ];
+    for (name, tail, expected) in cases {
+        let r = lingering_review_with(Cleanup::Clean, tail).await;
+        assert_eq!(
+            (r.session.status, r.session.end_reason, r.session.cleanup),
+            (
+                SessionStatus::Exited,
+                expected,
+                Some(SessionCleanup::Verified)
+            ),
+            "{name}: task {:?}",
+            r.task
+        );
+        assert_eq!(r.task.status, "stuck", "{name}: {:?}", r.task);
+        wait_until_pid_gone(r.job_pid).await;
+        assert_eq!(
+            stage_trail(&r.pool, &r.task_id).await,
+            vec![("review".to_string(), Value::Null)],
+            "{name}: nothing may advance"
+        );
+        assert!(
+            turn_outcomes(&r.pool, &r.task_id).await.is_empty(),
+            "{name}: nothing may be applied"
+        );
+    }
+}
+
+/// The task is cancelled after the turn's report and clean end but before
+/// grace is over: cancellation keeps its precedence over the promotion. The
+/// accepted report stays on record, nothing is applied, and the CLI and the
+/// job it left are reaped.
+#[tokio::test]
+async fn cancelling_a_completed_turn_during_grace_applies_nothing() {
+    let timers = crate::session::TurnTimers {
+        grace: StdDuration::from_secs(30),
+        ..fast_turn_timers()
+    };
+    let start = start_lingering(Cleanup::Clean, lingering_review_tail(), timers).await;
+    let session = crate::test_support::wait_until(
+        "the turn's clean end to be recorded while the CLI is alive",
+        || async {
+            let runs = runs_for_stage(&start.pool, &start.task_id, "review").await;
+            let Some(session) = runs.into_iter().next() else {
+                return Err("no session yet".to_string());
+            };
+            let ended = events::list_for_session(&start.pool, &session.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.event_type == EventType::TurnCompleted);
+            if ended && session.status == SessionStatus::Active {
+                Ok(session)
+            } else {
+                Err(format!("clean end seen: {ended}; {:?}", session.status))
+            }
+        },
+    )
+    .await;
+    assert!(
+        turn_outcomes(&start.pool, &start.task_id).await.is_empty(),
+        "nothing is applied while grace is pending"
+    );
+    let job_pid = start.jobs.job_pid();
+    assert!(process_alive(job_pid), "the job is still running");
+
+    start
+        .engine
+        .cancel_task(&start.task_id, false)
+        .await
+        .unwrap();
+    let r = start.settle().await;
+    assert_eq!(r.task.status, "cancelled", "{:?}", r.task);
+    assert_eq!(r.session.id, session.id);
+    assert_eq!(
+        r.session.end_reason,
+        Some(SessionEndReason::Cancelled),
+        "{:?}",
+        r.session
+    );
+    wait_until_pid_gone(job_pid).await;
+    assert_eq!(
+        stage_trail(&r.pool, &r.task_id).await,
+        vec![("review".to_string(), Value::Null)]
+    );
+    assert!(turn_outcomes(&r.pool, &r.task_id).await.is_empty());
+    let reported = events::list_for_session(&r.pool, &r.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| e.payload.to_string().contains("distinctive-summary-7f3a"));
+    assert!(reported, "the accepted report was lost");
 }
 
 /// The owner's round, item 1, end to end: the first table the grace cleanup's

@@ -92,9 +92,13 @@ and `choco task list --status stuck` finds every stuck task.
   grace period no longer parks when choco's cleanup is verified (the group
   and what it can prove the turn started were signalled, the last check saw
   nothing alive with no failed read of the process table, and the process was
-  reaped): the session ends `idle`, the `lingered` and `leftovers_killed`
-  notes are only a record of the kill, and the task advances on the report
-  once. Do not retry such a task to apply the verdict again. A usage-limit
+  reaped): the session ends `idle` and the `lingered` and `leftovers_killed`
+  notes are only a record of the kill. The task then goes through the checks
+  any completed turn does (a read-only role's worktree check, the capture, the
+  stage's routing), and if they pass the report is applied once; do not retry
+  a task that advanced to apply the verdict again. If one of those checks
+  parked it instead (or it was cancelled), the stuck reason says which, and a
+  retry re-runs the stage; it does not replay the report. A usage-limit
   cutoff with verified cleanup ends `interrupted`, not `lingered`: it parks
   with "interrupted by a usage limit before completing" even if a report had
   been accepted, and `choco task retry <id>` attempts to resume the same
