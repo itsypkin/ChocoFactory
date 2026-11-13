@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::proc_table::{self, Identity, OwnershipInput, ProcEntry, ProcReader};
 use crate::shell::GroupKill;
 
-use chocofactory_core::models::{EventType, SessionEndReason, SessionStatus};
+use chocofactory_core::models::{EventType, SessionCleanup, SessionEndReason, SessionStatus};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -424,8 +424,16 @@ impl SessionManager {
                 return Err(SessionError::Adapter(err));
             }
         };
-        if let Err(err) =
-            sessions::update_status(&self.pool, session_id, SessionStatus::Active, None, None).await
+        // Standing: a chat resume tracks no cleanup, so this clears it too.
+        if let Err(err) = sessions::update_status(
+            &self.pool,
+            session_id,
+            SessionStatus::Active,
+            None,
+            None,
+            None,
+        )
+        .await
         {
             self.sessions.lock().await.remove(session_id);
             return Err(SessionError::Db(err));
@@ -773,6 +781,12 @@ impl SessionManager {
 /// flagged `after_completion`, rather than silently appended to a run the
 /// engine may already be acting on.
 ///
+/// The final status write also records `cleanup` for a single-shot turn:
+/// verified only when the end-of-turn sweep ran, the output stream ended on
+/// its own, the last check saw nothing alive with no failed process-table read
+/// in the turn, and the child was reaped. Nothing reads it to decide how the
+/// turn ended.
+///
 /// A [`SessionKind::Standing`] session (chat) ignores `result` entirely — it
 /// sees one per turn, and closing stdin after the first would end the
 /// conversation.
@@ -807,6 +821,10 @@ async fn drain_session(
     // genuinely finished on its own, which look identical from `status`
     // alone (§ review on PR #35).
     let mut reaped = false;
+    // Set only when the output stream ended on its own. Stays false when the
+    // kill-settle timer below gives up on a stream something outside the
+    // group still holds open: that process is alive and was not reached.
+    let mut stream_ended = false;
     let mut turn = SingleShotTurn::default();
     // Deadlines that are not armed sit here, far enough out never to fire.
     // `select!` evaluates a disabled branch's future expression anyway, so
@@ -840,7 +858,10 @@ async fn drain_session(
             // over reintroducing the mislabeling race above.
             biased;
             event = handle.recv() => {
-                let Some(event) = event else { break };
+                let Some(event) = event else {
+                    stream_ended = true;
+                    break;
+                };
                 turn.last_event_at = tokio::time::Instant::now();
                 if let AgentEvent::SessionMeta { adapter_session_id, .. } = &event
                     && let Err(err) = sessions::set_adapter_session_id(pool, session_id, adapter_session_id).await
@@ -1177,6 +1198,7 @@ async fn drain_session(
     // nothing has reaped the leader yet: at worst it's a zombie, which keeps
     // its pid and so its group number. A standing session keeps the old
     // behaviour; its process ends when the conversation does.
+    let mut swept = false;
     {
         let mut pgid = pgid.lock().await;
         if kind == SessionKind::SingleShot
@@ -1189,18 +1211,34 @@ async fn drain_session(
             // signalled would bring back the false note (and the flake) that
             // the sweep's same-group exemption exists to prevent.
             kill_and_sweep(&tracker, group, "end of turn").await;
+            swept = true;
         }
         *pgid = None;
     }
-    if kind == SessionKind::SingleShot {
-        write_leftover_notes(pool, session_id, &tracker, events_notify).await;
-    }
+    let observed_clean = if kind == SessionKind::SingleShot {
+        write_leftover_notes(pool, session_id, &tracker, events_notify).await
+    } else {
+        false
+    };
 
     let exit_status = handle.wait().await;
     let clean_exit = matches!(&exit_status, Ok(status) if status.success());
     if let Err(err) = &exit_status {
         tracing::error!(session_id, %err, "failed to reap subprocess");
     }
+    // Verified only when every part holds; anything else is unverified. An
+    // `Ok` from `wait` proves the reap even for a non-zero exit code. A
+    // standing session tracks no cleanup.
+    let cleanup = match kind {
+        SessionKind::Standing => None,
+        SessionKind::SingleShot => Some(
+            if swept && stream_ended && observed_clean && exit_status.is_ok() {
+                SessionCleanup::Verified
+            } else {
+                SessionCleanup::Unverified
+            },
+        ),
+    };
 
     let (final_status, end_reason) = final_run_state_ranked(
         kind,
@@ -1220,14 +1258,23 @@ async fn drain_session(
         );
     }
     let ended_at = (final_status == SessionStatus::Exited).then(Utc::now);
-    // `status` and `end_reason` are set in the one statement below rather
-    // than two: a watcher elsewhere (engine.rs's turn-completion watcher)
-    // polls this row from a separate task and must never be able to
+    // `status`, `end_reason` and `cleanup` are set in the one statement below
+    // rather than several: a watcher elsewhere (engine.rs's turn-completion
+    // watcher) polls this row from a separate task and must never be able to
     // observe `status == Idle` while `end_reason` still holds a stale (or
     // absent) value from before this exit — that's exactly the gap that
-    // would resurrect the ambiguity `end_reason` exists to close.
-    if let Err(err) =
-        sessions::update_status(pool, session_id, final_status, ended_at, end_reason).await
+    // would resurrect the ambiguity `end_reason` exists to close. The same
+    // statement carries `cleanup`, so a refused write leaves the row
+    // `Active` and `Pending` together instead of one without the other.
+    if let Err(err) = sessions::update_status(
+        pool,
+        session_id,
+        final_status,
+        ended_at,
+        end_reason,
+        cleanup,
+    )
+    .await
     {
         tracing::error!(session_id, %err, "failed to update status after drain");
     } else {
@@ -2392,12 +2439,18 @@ fn leftover_note_texts(
 
 /// Writes the `leftovers_killed` and `leftovers_unchecked` notes, once, at the
 /// end of the turn.
+///
+/// Returns whether the observation was clean: no survivor in the last check
+/// and no failed process-table read anywhere in the turn. Computed from the
+/// same vectors the notes are built from, taken under the one lock below, so
+/// it needs no further read. A failed note append does not change it, and
+/// group-signal errors alone do not either.
 async fn write_leftover_notes(
     pool: &SqlitePool,
     session_id: &str,
     tracker: &LeftoverTracker,
     events_notify: &Notify,
-) {
+) -> bool {
     // One lock for everything consumed, so the survivors and their identities
     // leave together.
     let (killed, survivors, failures, group_errors) = {
@@ -2413,7 +2466,8 @@ async fn write_leftover_notes(
             std::mem::take(&mut state.group_kill_errors),
         )
     };
-    if !survivors.is_empty() || !failures.is_empty() {
+    let observed_clean = survivors.is_empty() && failures.is_empty();
+    if !observed_clean {
         tracing::warn!(
             session_id,
             still_running = survivors.len(),
@@ -2443,6 +2497,7 @@ async fn write_leftover_notes(
         )
         .await;
     }
+    observed_clean
 }
 
 /// Records one of the daemon's own interventions on a run's timeline (#90).
@@ -2488,7 +2543,14 @@ mod tests {
             .into_owned()
     }
 
+    /// A standing (chat-shaped) session row: tracks no cleanup.
     async fn seed_session(pool: &SqlitePool) -> String {
+        seed_session_for(pool, SessionKind::Standing).await
+    }
+
+    /// A row as `launch_turn` creates it: a single-shot session starts out
+    /// with cleanup pending, a standing one with none.
+    async fn seed_session_for(pool: &SqlitePool, kind: SessionKind) -> String {
         let project_id = projects::create(pool, "demo", None).await.unwrap().id;
         let task_id = tasks::create(
             pool,
@@ -2515,6 +2577,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: (kind == SessionKind::SingleShot).then_some(SessionCleanup::Pending),
             },
         )
         .await
@@ -2748,7 +2811,7 @@ mod tests {
         sessions::set_adapter_session_id(&pool, &session_id, "fixed-session-id")
             .await
             .unwrap();
-        sessions::update_status(&pool, &session_id, SessionStatus::Idle, None, None)
+        sessions::update_status(&pool, &session_id, SessionStatus::Idle, None, None, None)
             .await
             .unwrap();
 
@@ -2835,6 +2898,7 @@ mod tests {
             SessionStatus::Exited,
             Some(Utc::now()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2865,7 +2929,7 @@ mod tests {
         sessions::set_adapter_session_id(&pool, &session_id, "fixed-session-id")
             .await
             .unwrap();
-        sessions::update_status(&pool, &session_id, SessionStatus::Idle, None, None)
+        sessions::update_status(&pool, &session_id, SessionStatus::Idle, None, None, None)
             .await
             .unwrap();
 
@@ -3025,7 +3089,7 @@ mod tests {
     #[tokio::test]
     async fn a_single_shot_session_completes_and_closes_stdin_against_a_stay_open_fixture() {
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> =
             Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
         let manager = SessionManager::new(
@@ -3282,7 +3346,7 @@ mod tests {
         let (binary, heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
 
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
@@ -3328,7 +3392,7 @@ mod tests {
         let dir = TempDir::new();
         let (binary, _heartbeat, child_pid_path) = spawns_child_binary(&dir.0);
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::new(
             pool.clone(),
@@ -3640,7 +3704,7 @@ mod tests {
         timers: TurnTimers,
     ) -> (SqlitePool, String, Arc<SessionManager>) {
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::with_turn_timers(
             pool.clone(),
@@ -4160,7 +4224,7 @@ mod tests {
         idle: chrono::Duration,
     ) -> (SqlitePool, String, Arc<SessionManager>) {
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(crate::adapter::OmpAdapter::with_binary(
             &script.binary,
             state_dir,
@@ -4511,7 +4575,7 @@ mod tests {
         timers: TurnTimers,
     ) -> (SqlitePool, String, Arc<SessionManager>) {
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let manager = SessionManager::with_turn_timers(
             pool.clone(),
@@ -5295,6 +5359,7 @@ mod tests {
         let run = wait_until_final(&pool, &session_id).await;
         assert_eq!(run.status, SessionStatus::Idle);
         assert_eq!(run.end_reason, None);
+        assert_eq!(run.cleanup, Some(SessionCleanup::Verified));
         assert!(session_notes(&pool, &session_id).await.is_empty());
     }
 
@@ -5867,7 +5932,7 @@ mod tests {
             ]),
         );
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         // Zero idle timeout: the first reaper pass closes the turn.
         let manager = SessionManager::with_turn_timers(
@@ -6127,7 +6192,7 @@ mod tests {
         sessions::set_adapter_session_id(pool, &session_id, "S9")
             .await
             .unwrap();
-        sessions::update_status(pool, &session_id, SessionStatus::Idle, None, None)
+        sessions::update_status(pool, &session_id, SessionStatus::Idle, None, None, None)
             .await
             .unwrap();
         session_id
@@ -6443,7 +6508,7 @@ mod tests {
         reader: Option<crate::proc_table::ProcReader>,
     ) -> (SqlitePool, String, Arc<SessionManager>) {
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
         let registry = Registry::single(adapter);
         let notify = Arc::new(Notify::new());
@@ -6513,6 +6578,17 @@ mod tests {
         timers: TurnTimers,
         action: EndAction,
     ) -> (SqlitePool, String) {
+        let (pool, session_id, _job) =
+            assert_escaped_job_is_killed_with_pid(extra_steps, timers, action).await;
+        (pool, session_id)
+    }
+
+    /// [`assert_escaped_job_is_killed`], also returning the job's pid.
+    async fn assert_escaped_job_is_killed_with_pid(
+        extra_steps: Vec<serde_json::Value>,
+        timers: TurnTimers,
+        action: EndAction,
+    ) -> (SqlitePool, String, u32) {
         let dir = TempDir::new();
         let job_pid_file = dir.0.join("job.pid");
         let mut steps = vec![json!({"op": "read_turn"}), escaped_job(&job_pid_file)];
@@ -6533,18 +6609,21 @@ mod tests {
             EndAction::Cancel => manager.cancel(&session_id).await.unwrap(),
             EndAction::Shutdown => manager.shutdown(StdDuration::from_secs(20)).await,
         }
-        wait_until_final(&pool, &session_id).await;
+        let run = wait_until_final(&pool, &session_id).await;
         wait_until_gone(job).await;
         let note = note_message(&pool, &session_id, "leftovers_killed")
             .await
             .expect("a leftovers_killed note");
         assert!(note.contains(&format!("{job} (")), "{note}");
-        (pool, session_id)
+        // The job was signalled and the last check no longer saw it, so the
+        // cleanup is verified whichever way the turn ended.
+        assert_eq!(run.cleanup, Some(SessionCleanup::Verified));
+        (pool, session_id, job)
     }
 
     #[tokio::test]
     async fn an_escaped_job_is_killed_when_the_cli_exits_on_its_own_after_reporting() {
-        let (pool, id) = assert_escaped_job_is_killed(
+        let (pool, id, job) = assert_escaped_job_is_killed_with_pid(
             vec![
                 json!({"op": "report", "outcome": "done"}),
                 json!({"op": "result"}),
@@ -6558,6 +6637,23 @@ mod tests {
         // The sweep does not change how the turn ended.
         assert_eq!(run.status, SessionStatus::Idle);
         assert_eq!(run.end_reason, None);
+        assert_eq!(run.cleanup, Some(SessionCleanup::Verified));
+        // An independent look at the same fact: the process list, not the
+        // `kill(pid, 0)` probe the helper used, shows the job gone (or only a
+        // zombie awaiting its reaper, which is not alive).
+        let listed = std::process::Command::new("ps")
+            .args(["-p", &job.to_string(), "-o", "stat="])
+            .output()
+            .expect("ps runs");
+        let stat = String::from_utf8_lossy(&listed.stdout).trim().to_string();
+        eprintln!(
+            "ps -p {job} -o stat= -> status {:?}, stdout {stat:?}",
+            listed.status.code()
+        );
+        assert!(
+            stat.is_empty() || stat.starts_with('Z'),
+            "ps still lists the job as alive: {stat:?}"
+        );
     }
 
     #[tokio::test]
@@ -6871,7 +6967,12 @@ mod tests {
     async fn an_unreadable_process_table_is_reported_and_changes_nothing_else() {
         async fn run(
             reader: Option<crate::proc_table::ProcReader>,
-        ) -> (SessionStatus, Option<SessionEndReason>, Vec<String>) {
+        ) -> (
+            SessionStatus,
+            Option<SessionEndReason>,
+            Option<SessionCleanup>,
+            Vec<String>,
+        ) {
             let dir = TempDir::new();
             let agent_pid_file = dir.0.join("agent.pid");
             let binary = script_binary(
@@ -6892,15 +6993,19 @@ mod tests {
             (
                 run.status,
                 run.end_reason,
+                run.cleanup,
                 session_notes(&pool, &session_id).await,
             )
         }
         let broken: crate::proc_table::ProcReader =
             Arc::new(|_| Err(std::io::Error::other("injected failure")));
-        let (status, reason, notes) = run(Some(broken)).await;
-        let (good_status, good_reason, good_notes) = run(None).await;
+        let (status, reason, cleanup, notes) = run(Some(broken)).await;
+        let (good_status, good_reason, good_cleanup, good_notes) = run(None).await;
         assert_eq!((status, reason), (good_status, good_reason));
         assert_eq!(reason, Some(SessionEndReason::Lingered));
+        // Only the cleanup differs: nothing could confirm the unreadable run.
+        assert_eq!(cleanup, Some(SessionCleanup::Unverified));
+        assert_eq!(good_cleanup, Some(SessionCleanup::Verified));
         assert!(
             notes.contains(&"leftovers_unchecked".to_string()),
             "{notes:?}"
@@ -7059,6 +7164,7 @@ mod tests {
         // The survivor changes neither how the turn ended nor its status.
         assert_eq!(run.end_reason, None);
         assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(run.cleanup, Some(SessionCleanup::Unverified));
         let message = note_message(&pool, &session_id, "leftovers_killed")
             .await
             .expect("a leftovers_killed note");
@@ -7069,6 +7175,236 @@ mod tests {
         assert!(message.contains(&format!("{GHOST} (ghost)")), "{message}");
         // Listed once, though several sites swept.
         assert_eq!(message.matches("(ghost)").count(), 1, "{message}");
+    }
+
+    /// A last check that sees a real job killed and gone, but also one
+    /// process still alive, is not verified: the survivor alone decides.
+    #[tokio::test]
+    async fn a_mixed_last_check_keeps_cleanup_unverified() {
+        const GHOST: i32 = 99_999_999;
+        let dir = TempDir::new();
+        let job_file = dir.0.join("job.pid");
+        let _job_guard = crate::test_support::KillPidFileOnDrop(job_file.clone());
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                escaped_job(&job_file),
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "exit"},
+            ]),
+        );
+        // SAFETY: only reads the process's own uid.
+        let uid = unsafe { libc::geteuid() };
+        // Every read is the real table plus one entry nothing can kill.
+        let reader: crate::proc_table::ProcReader = Arc::new(move |marker| {
+            let mut table = crate::proc_table::read(marker)?;
+            table.push(crate::proc_table::ProcEntry {
+                pid: GHOST,
+                ppid: 1,
+                pgid: GHOST,
+                sid: GHOST,
+                uid,
+                start: 1,
+                zombie: false,
+                comm: "ghost".into(),
+                marker: crate::proc_table::MarkerStatus::Present,
+            });
+            Ok(table)
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        let job = read_pid_when_written(&job_file).await;
+        let run = wait_until_final(&pool, &session_id).await;
+        wait_until_gone(job).await;
+        let message = note_message(&pool, &session_id, "leftovers_killed")
+            .await
+            .expect("a leftovers_killed note");
+        assert!(
+            message.contains(&format!(
+                "killed 1 process(es) the turn left running: {job} ("
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "1 still running at the last check: {GHOST} (ghost)"
+            )),
+            "{message}"
+        );
+        assert!(!process_alive(job));
+        assert_eq!(run.cleanup, Some(SessionCleanup::Unverified));
+    }
+
+    /// One failed process-table read early in the turn keeps the cleanup
+    /// unverified even though every later read, the end-of-turn sweep and the
+    /// reap all succeed and nothing is seen running.
+    #[tokio::test]
+    async fn one_failed_process_table_read_keeps_cleanup_unverified() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let dir = TempDir::new();
+        let job_file = dir.0.join("job.pid");
+        let _job_guard = crate::test_support::KillPidFileOnDrop(job_file.clone());
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                escaped_job(&job_file),
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "exit"},
+            ]),
+        );
+        let reads = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let (seen_reads, seen_failures) = (Arc::clone(&reads), Arc::clone(&failures));
+        // The first scan of any kind (the descendant record at the turn's
+        // end) fails; every later one is the real table.
+        let reader: crate::proc_table::ProcReader = Arc::new(move |marker| {
+            if seen_reads.fetch_add(1, SeqCst) == 0 {
+                seen_failures.fetch_add(1, SeqCst);
+                return Err(std::io::Error::other("injected one-off failure"));
+            }
+            crate::proc_table::read(marker)
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        let job = read_pid_when_written(&job_file).await;
+        let run = wait_until_final(&pool, &session_id).await;
+        wait_until_gone(job).await;
+        assert_eq!(failures.load(SeqCst), 1, "the injected failure never ran");
+        assert!(reads.load(SeqCst) > 1, "no read followed the failure");
+        let notes = session_notes(&pool, &session_id).await;
+        assert!(
+            notes.contains(&"leftovers_unchecked".to_string()),
+            "{notes:?}"
+        );
+        if let Some(message) = note_message(&pool, &session_id, "leftovers_killed").await {
+            assert!(!message.contains("still running"), "{message}");
+        }
+        assert_eq!(run.cleanup, Some(SessionCleanup::Unverified));
+    }
+
+    /// A refused final status write leaves the status and the cleanup as they
+    /// were, together: cleanup is part of that one statement, never written
+    /// ahead of it.
+    #[tokio::test]
+    async fn a_failed_final_status_write_leaves_cleanup_pending() {
+        let dir = TempDir::new();
+        let job_file = dir.0.join("job.pid");
+        let _job_guard = crate::test_support::KillPidFileOnDrop(job_file.clone());
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                escaped_job(&job_file),
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "exit"},
+            ]),
+        );
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_final BEFORE UPDATE OF status ON sessions \
+             WHEN NEW.status <> 'active' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let manager = SessionManager::with_turn_timers(
+            pool.clone(),
+            Registry::single(adapter),
+            chrono::Duration::hours(1),
+            Arc::new(Notify::new()),
+            fast_timers(3),
+        );
+        manager
+            .start(
+                &session_id,
+                "claude",
+                "go",
+                &single_shot_role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+        let job = read_pid_when_written(&job_file).await;
+        // The drain task removes its map slot after the final write attempt,
+        // refused or not; the status never changes, so wait on the slot.
+        crate::test_support::wait_until("the drain task to finish", || async {
+            if manager.sessions.lock().await.contains_key(&session_id) {
+                Err("session still in the map".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        wait_until_gone(job).await;
+        let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
+        assert_eq!(run.status, SessionStatus::Active);
+        assert_eq!(run.cleanup, Some(SessionCleanup::Pending));
+    }
+
+    /// A job that keeps the agent's output open outlives the kill: the drain
+    /// gives up on the stream after the settle time, and a stream it had to
+    /// abandon is never verified, even with the process table looking empty.
+    #[tokio::test]
+    async fn a_stream_held_open_after_the_kill_keeps_cleanup_unverified() {
+        let dir = TempDir::new();
+        let holder_file = dir.0.join("holder.pid");
+        let _holder_guard = crate::test_support::KillPidFileOnDrop(holder_file.clone());
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {
+                    "op": "spawn_escaped", "setsid": true, "double_fork": true,
+                    "keep_output": true, "pid_file": holder_file,
+                },
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "sleep", "seconds": 60},
+            ]),
+        );
+        // The real table, without the holder: the sweep can never reach it,
+        // and no read fails.
+        let hidden = holder_file.clone();
+        let reader: crate::proc_table::ProcReader = Arc::new(move |marker| {
+            let mut table = crate::proc_table::read(marker)?;
+            if let Some(pid) = std::fs::read_to_string(&hidden)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                table.retain(|entry| entry.pid != pid);
+            }
+            Ok(table)
+        });
+        let (pool, session_id, _manager) = start_leftovers(
+            binary,
+            fast_timers(3),
+            chrono::Duration::hours(1),
+            Some(reader),
+        )
+        .await;
+        let holder = read_pid_when_written(&holder_file).await;
+        let run = wait_until_final(&pool, &session_id).await;
+        // The leak itself: the holder is still running after the turn ended.
+        assert!(process_alive(holder), "the holder should have survived");
+        assert_eq!(run.end_reason, Some(SessionEndReason::Lingered));
+        assert_eq!(run.cleanup, Some(SessionCleanup::Unverified));
     }
 
     /// A leftover the daemon is not permitted to kill (EPERM) is listed as a
@@ -9494,7 +9830,7 @@ mod tests {
             "CHOCOFACTORY_CLAUDE_BINARY is set; this probe must drive the real claude"
         );
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::new());
         let manager = SessionManager::with_turn_timers(
             pool.clone(),
@@ -9759,7 +10095,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_then_grace_preserves_completed_run_status() {
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let mut escapee = Sleeper::spawn(None, true);
         let e = escapee.pid();
         let mut bystander = Sleeper::spawn(None, true);
@@ -10039,7 +10375,7 @@ mod tests {
     #[tokio::test]
     async fn an_earlier_kill_that_really_died_still_keeps_the_run_lingered() {
         let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
+        let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let mut worker = Sleeper::spawn(None, true);
         let w = worker.pid();
         let mut bystander = Sleeper::spawn(None, true);

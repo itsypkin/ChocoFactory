@@ -272,6 +272,7 @@ mod tests {
                 role: "coder",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -288,6 +289,7 @@ mod tests {
                 role: "coder",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
             sessions::ResumedFrom {
                 session_id: from,

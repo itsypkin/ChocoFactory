@@ -1,4 +1,4 @@
-use chocofactory_core::models::{Session, SessionEndReason, SessionStatus};
+use chocofactory_core::models::{Session, SessionCleanup, SessionEndReason, SessionStatus};
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
@@ -8,7 +8,7 @@ use uuid::Uuid;
 macro_rules! columns {
     () => {
         "id, task_id, stage, role, cli_adapter, model, adapter_session_id, status, \
-     end_reason, resumed_from, started_at, ended_at"
+     end_reason, cleanup, resumed_from, started_at, ended_at"
     };
 }
 
@@ -23,6 +23,7 @@ struct SessionRow {
     adapter_session_id: Option<String>,
     status: String,
     end_reason: Option<String>,
+    cleanup: Option<String>,
     resumed_from: Option<String>,
     started_at: DateTime<Utc>,
     ended_at: Option<DateTime<Utc>>,
@@ -64,6 +65,20 @@ impl From<SessionRow> for Session {
                     None
                 }
             }),
+            // Fails closed, unlike `end_reason` above: text this daemon
+            // cannot parse (a newer daemon's value, or a corrupt row) must
+            // never read as verified, and must not vanish into `None`
+            // ("not tracked") either, so it reads as unverified.
+            cleanup: row.cleanup.map(|text| match text.parse() {
+                Ok(cleanup) => cleanup,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "treating an unrecognized sessions.cleanup as unverified — written by a newer daemon?"
+                    );
+                    SessionCleanup::Unverified
+                }
+            }),
             resumed_from: row.resumed_from,
             started_at: row.started_at,
             ended_at: row.ended_at,
@@ -77,6 +92,8 @@ pub struct NewSession<'a> {
     pub role: &'a str,
     pub cli_adapter: &'a str,
     pub model: &'a str,
+    /// `Some(Pending)` for a single-shot launch, `None` for a standing one.
+    pub cleanup: Option<SessionCleanup>,
 }
 
 pub async fn create(pool: &SqlitePool, new: NewSession<'_>) -> Result<Session, sqlx::Error> {
@@ -119,8 +136,8 @@ async fn create_inner<'e>(
     let now = Utc::now();
     let row = sqlx::query_as::<_, SessionRow>(concat!(
         "INSERT INTO sessions (id, task_id, stage, role, cli_adapter, model, adapter_session_id, \
-         status, resumed_from, started_at, lap)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+         status, resumed_from, started_at, cleanup, lap)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
              CASE WHEN ?9 IS NOT NULL
                  THEN (SELECT lap FROM sessions WHERE id = ?9)
                  ELSE MAX(1, (SELECT COUNT(*) FROM events
@@ -145,6 +162,7 @@ async fn create_inner<'e>(
     .bind(SessionStatus::Active.to_string())
     .bind(from.map(|from| from.session_id))
     .bind(now)
+    .bind(new.cleanup.map(|cleanup| cleanup.to_string()))
     .fetch_one(pool)
     .await?;
     Ok(row.into())
@@ -323,32 +341,38 @@ pub async fn set_adapter_session_id(
     Ok(row.map(Into::into))
 }
 
-/// Updates `status` and `end_reason` together in a single statement.
+/// Updates `status`, `ended_at`, `end_reason` and `cleanup` together in a
+/// single statement.
 /// `end_reason` records why `status` reached its current value, for cases
 /// where `status` alone can't tell two paths apart (e.g. the idle reaper's
 /// clean exit vs. a turn actually finishing — both land on `Idle`). Setting
 /// both fields in one `UPDATE` matters, not just for tidiness: a watcher
 /// polling this row from another task must never be able to observe the
 /// new `status` with the *previous* `end_reason` still attached, which a
-/// pair of separate statements would allow in the gap between them.
+/// pair of separate statements would allow in the gap between them. The same
+/// goes for `cleanup`: a refused status write must not leave a cleanup fact
+/// behind, so it is never written on its own.
 /// Callers not setting a specific reason should pass `None`, clearing any
 /// stale value left over from an earlier transition (e.g. a resumed
 /// session going back to `Active` sheds whatever `end_reason` its last
-/// `Idle` had).
+/// `Idle` had). `None` clears `cleanup` the same way: it writes NULL, it
+/// does not keep the previous value.
 pub async fn update_status(
     pool: &SqlitePool,
     id: &str,
     status: SessionStatus,
     ended_at: Option<DateTime<Utc>>,
     end_reason: Option<SessionEndReason>,
+    cleanup: Option<SessionCleanup>,
 ) -> Result<Option<Session>, sqlx::Error> {
     let row = sqlx::query_as::<_, SessionRow>(concat!(
-        "UPDATE sessions SET status = ?, ended_at = ?, end_reason = ? WHERE id = ? RETURNING ",
+        "UPDATE sessions SET status = ?, ended_at = ?, end_reason = ?, cleanup = ? WHERE id = ? RETURNING ",
         columns!()
     ))
     .bind(status.to_string())
     .bind(ended_at)
     .bind(end_reason.map(|reason| reason.to_string()))
+    .bind(cleanup.map(|cleanup| cleanup.to_string()))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -449,6 +473,7 @@ mod tests {
                 role: "coder",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -482,6 +507,7 @@ mod tests {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         };
 
         let first = create(&pool, new_session()).await.unwrap();
@@ -534,6 +560,7 @@ mod tests {
                     role: "coder",
                     cli_adapter: "claude",
                     model: "sonnet",
+                    cleanup: None,
                 },
             )
             .await
@@ -542,7 +569,7 @@ mod tests {
         };
 
         let idle = make().await;
-        update_status(&pool, &idle, SessionStatus::Idle, None, None)
+        update_status(&pool, &idle, SessionStatus::Idle, None, None, None)
             .await
             .unwrap();
         assert!(mark_daemon_stopped(&pool, &idle).await.unwrap());
@@ -560,6 +587,7 @@ mod tests {
             SessionStatus::Idle,
             None,
             Some(SessionEndReason::Reaped),
+            None,
         )
         .await
         .unwrap();
@@ -590,6 +618,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -604,17 +633,24 @@ mod tests {
             .unwrap();
         assert_eq!(with_session.adapter_session_id.as_deref(), Some("sess-123"));
 
-        let idle = update_status(&pool, &created.id, SessionStatus::Idle, None, None)
+        let idle = update_status(&pool, &created.id, SessionStatus::Idle, None, None, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(idle.status, SessionStatus::Idle);
 
         let now = Utc::now();
-        let exited = update_status(&pool, &created.id, SessionStatus::Exited, Some(now), None)
-            .await
-            .unwrap()
-            .unwrap();
+        let exited = update_status(
+            &pool,
+            &created.id,
+            SessionStatus::Exited,
+            Some(now),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(exited.status, SessionStatus::Exited);
         assert_eq!(exited.ended_at, Some(now));
 
@@ -635,6 +671,7 @@ mod tests {
             role: "chat",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         };
 
         let active = create(&pool, new_session()).await.unwrap();
@@ -642,15 +679,23 @@ mod tests {
             .await
             .unwrap();
         let already_idle = create(&pool, new_session()).await.unwrap();
-        update_status(&pool, &already_idle.id, SessionStatus::Idle, None, None)
-            .await
-            .unwrap();
+        update_status(
+            &pool,
+            &already_idle.id,
+            SessionStatus::Idle,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let exited = create(&pool, new_session()).await.unwrap();
         update_status(
             &pool,
             &exited.id,
             SessionStatus::Exited,
             Some(Utc::now()),
+            None,
             None,
         )
         .await
@@ -689,6 +734,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -731,6 +777,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -744,6 +791,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -758,6 +806,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -770,5 +819,191 @@ mod tests {
         assert_eq!(current.id, second.id);
         assert_ne!(current.id, first.id);
         assert_ne!(current.id, other_stage.id);
+    }
+
+    /// A directory under the real temp dir, removed when it drops.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn new_session(task_id: &str, cleanup: Option<SessionCleanup>) -> NewSession<'_> {
+        NewSession {
+            task_id,
+            stage: "coding",
+            role: "coder",
+            cli_adapter: "claude",
+            model: "sonnet",
+            cleanup,
+        }
+    }
+
+    /// A daemon that dies mid-turn leaves the row `pending`; reopening the
+    /// database, the startup recovery of stale active rows (both of its
+    /// branches) and the daemon-stopped marking all keep it, and a finalized
+    /// row is untouched.
+    #[tokio::test]
+    async fn cleanup_survives_reopen_recovery_and_daemon_stop() {
+        let dir =
+            TempDir(std::env::temp_dir().join(format!("chocofactoryd-db-{}", Uuid::new_v4())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("choco.db");
+        let pool = crate::db::connect(&path).await.unwrap();
+        let task_id = seed_task(&pool).await;
+
+        let resumable = create(&pool, new_session(&task_id, Some(SessionCleanup::Pending)))
+            .await
+            .unwrap();
+        set_adapter_session_id(&pool, &resumable.id, "sess-1")
+            .await
+            .unwrap();
+        // Crashed before its first `init` line: no adapter session id.
+        let never_started = create(&pool, new_session(&task_id, Some(SessionCleanup::Pending)))
+            .await
+            .unwrap();
+        let finalized = create(&pool, new_session(&task_id, Some(SessionCleanup::Pending)))
+            .await
+            .unwrap();
+        update_status(
+            &pool,
+            &finalized.id,
+            SessionStatus::Idle,
+            None,
+            None,
+            Some(SessionCleanup::Unverified),
+        )
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let pool = crate::db::connect(&path).await.unwrap();
+        let cleanup_of = |id: String| {
+            let pool = pool.clone();
+            async move { get(&pool, &id).await.unwrap().unwrap() }
+        };
+        assert_eq!(
+            cleanup_of(resumable.id.clone()).await.cleanup,
+            Some(SessionCleanup::Pending)
+        );
+        assert_eq!(recover_stale_active_sessions(&pool).await.unwrap(), 2);
+
+        let recovered = cleanup_of(resumable.id.clone()).await;
+        assert_eq!(recovered.status, SessionStatus::Idle);
+        assert_eq!(recovered.cleanup, Some(SessionCleanup::Pending));
+        let exited = cleanup_of(never_started.id.clone()).await;
+        assert_eq!(exited.status, SessionStatus::Exited);
+        assert_eq!(exited.cleanup, Some(SessionCleanup::Pending));
+
+        assert!(mark_daemon_stopped(&pool, &resumable.id).await.unwrap());
+        let stopped = cleanup_of(resumable.id.clone()).await;
+        assert_eq!(stopped.status, SessionStatus::Exited);
+        assert_eq!(stopped.end_reason, Some(SessionEndReason::DaemonStopped));
+        assert_eq!(stopped.cleanup, Some(SessionCleanup::Pending));
+
+        assert_eq!(
+            cleanup_of(finalized.id.clone()).await.cleanup,
+            Some(SessionCleanup::Unverified)
+        );
+        pool.close().await;
+    }
+
+    /// Each value written by the INSERT and by `update_status` reads back
+    /// through the common conversion; SQL NULL is `None`; text this daemon
+    /// cannot parse reads `unverified` (never verified, never `None`) with a
+    /// warning; and `None` clears a pending value rather than keeping it.
+    #[tokio::test]
+    async fn cleanup_values_read_fail_closed_and_none_clears_pending() {
+        let logs = crate::test_support::LogBuf::default();
+        let _capture = logs.capture();
+        let pool = connect_in_memory().await.unwrap();
+        let task_id = seed_task(&pool).await;
+
+        // INSERT mapping, each value (and none).
+        for value in [
+            None,
+            Some(SessionCleanup::Pending),
+            Some(SessionCleanup::Verified),
+            Some(SessionCleanup::Unverified),
+        ] {
+            let created = create(&pool, new_session(&task_id, value)).await.unwrap();
+            assert_eq!(created.cleanup, value);
+            assert_eq!(
+                get(&pool, &created.id).await.unwrap().unwrap().cleanup,
+                value
+            );
+            let raw: Option<String> =
+                sqlx::query_scalar("SELECT cleanup FROM sessions WHERE id = ?")
+                    .bind(&created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(raw, value.map(|value| value.to_string()));
+        }
+
+        // UPDATE mapping, each value, from a pending row.
+        for value in [
+            SessionCleanup::Pending,
+            SessionCleanup::Verified,
+            SessionCleanup::Unverified,
+        ] {
+            let row = create(&pool, new_session(&task_id, Some(SessionCleanup::Pending)))
+                .await
+                .unwrap();
+            let updated =
+                update_status(&pool, &row.id, SessionStatus::Idle, None, None, Some(value))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(updated.cleanup, Some(value));
+            assert_eq!(
+                get(&pool, &row.id).await.unwrap().unwrap().cleanup,
+                Some(value)
+            );
+        }
+        assert!(
+            !logs.text().contains("sessions.cleanup"),
+            "a recognized value warned: {}",
+            logs.text()
+        );
+
+        // None clears a pending value to SQL NULL.
+        let pending = create(&pool, new_session(&task_id, Some(SessionCleanup::Pending)))
+            .await
+            .unwrap();
+        let cleared = update_status(&pool, &pending.id, SessionStatus::Idle, None, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.cleanup, None);
+        let raw: Option<String> = sqlx::query_scalar("SELECT cleanup FROM sessions WHERE id = ?")
+            .bind(&pending.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(raw, None);
+
+        // Unparseable text fails closed, whatever it looks like.
+        for bogus in ["bogus", "", "VERIFIED", " verified", "verified "] {
+            let row = create(&pool, new_session(&task_id, None)).await.unwrap();
+            sqlx::query("UPDATE sessions SET cleanup = ? WHERE id = ?")
+                .bind(bogus)
+                .bind(&row.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                get(&pool, &row.id).await.unwrap().unwrap().cleanup,
+                Some(SessionCleanup::Unverified),
+                "{bogus:?}"
+            );
+        }
+        assert!(
+            logs.text().contains("sessions.cleanup"),
+            "no warning for unrecognized text: {}",
+            logs.text()
+        );
     }
 }

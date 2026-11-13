@@ -724,6 +724,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -1041,6 +1042,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await

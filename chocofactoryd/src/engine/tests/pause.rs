@@ -407,6 +407,7 @@ async fn the_sweep_ignores_a_session_from_an_earlier_entry_of_a_pausing_stage() 
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await
@@ -1332,6 +1333,7 @@ async fn a_pausing_task_whose_turn_failed_before_a_crash_is_stuck_after_the_swee
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await
@@ -1406,6 +1408,7 @@ async fn resume_marks_a_task_stuck_rather_than_reopening_a_stage_whose_run_faile
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await
@@ -1479,6 +1482,7 @@ async fn a_resume_that_cannot_mark_the_task_stuck_says_so_and_keeps_the_status()
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await
@@ -1738,6 +1742,7 @@ async fn new_session(q: &Q, task: &Task, stage: &str) -> Session {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: Some(SessionCleanup::Pending),
         },
     )
     .await

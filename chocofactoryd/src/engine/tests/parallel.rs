@@ -1294,7 +1294,7 @@ async fn an_unreadable_reply_fails_the_branch() {
     .await
     .unwrap();
     // The turn ends idle with no report, so the watcher goes to read it back.
-    sessions::update_status(&g.pool, &one.id, SessionStatus::Idle, None, None)
+    sessions::update_status(&g.pool, &one.id, SessionStatus::Idle, None, None, None)
         .await
         .unwrap();
     g.wait_status("stuck").await;
@@ -1984,7 +1984,7 @@ async fn branch_session(
         return sessions::get(&g.pool, &s.id).await.unwrap().unwrap();
     }
     let ended = (status != SessionStatus::Active).then(Utc::now);
-    sessions::update_status(&g.pool, &s.id, status, ended, reason)
+    sessions::update_status(&g.pool, &s.id, status, ended, reason, None)
         .await
         .unwrap()
         .unwrap()

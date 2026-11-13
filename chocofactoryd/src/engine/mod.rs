@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chocofactory_core::models::{
-    EventType, InFlight, Project, RetryMode, RetryOutcome, Session, SessionEndReason,
-    SessionStatus, Task,
+    EventType, InFlight, Project, RetryMode, RetryOutcome, Session, SessionCleanup,
+    SessionEndReason, SessionStatus, Task,
 };
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;

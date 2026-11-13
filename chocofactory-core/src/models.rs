@@ -308,6 +308,63 @@ impl FromStr for SessionEndReason {
     }
 }
 
+/// Whether the last check after a single-shot turn saw nothing alive, as far
+/// as the ownership selector can tell (stored in `sessions.cleanup`).
+/// "Verified" is bounded by that selector: a process that dropped its
+/// environment and left the agent's tree and session before choco saw it is
+/// invisible, and does not stop a turn from reading `Verified`.
+///
+/// A row with no value (`None` on [`Session`]) tracks no cleanup: a chat or
+/// standing session, a session whose start failed before anything was
+/// spawned, or a row written before this was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCleanup {
+    /// A single-shot launch has not finalized its cleanup. Written before the
+    /// process is spawned; a daemon crash or a failed final write leaves it.
+    Pending,
+    /// The end-of-turn sweep ran, the output stream ended on its own, the last
+    /// check saw nothing alive, no process-table read failed during the turn,
+    /// and the child was reaped.
+    Verified,
+    /// Anything else at finalization.
+    Unverified,
+}
+
+impl fmt::Display for SessionCleanup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SessionCleanup::Pending => "pending",
+            SessionCleanup::Verified => "verified",
+            SessionCleanup::Unverified => "unverified",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseSessionCleanupError(pub String);
+
+impl fmt::Display for ParseSessionCleanupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid session cleanup: {}", self.0)
+    }
+}
+
+impl std::error::Error for ParseSessionCleanupError {}
+
+impl FromStr for SessionCleanup {
+    type Err = ParseSessionCleanupError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(SessionCleanup::Pending),
+            "verified" => Ok(SessionCleanup::Verified),
+            "unverified" => Ok(SessionCleanup::Unverified),
+            other => Err(ParseSessionCleanupError(other.to_string())),
+        }
+    }
+}
+
 /// What `POST /tasks/{id}/pause` did (#295).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PauseOutcome {
@@ -514,6 +571,11 @@ pub struct Session {
     pub adapter_session_id: Option<String>,
     pub status: SessionStatus,
     pub end_reason: Option<SessionEndReason>,
+    /// Whether the last check after the turn saw nothing alive — `None` when
+    /// this row tracks no cleanup (see [`SessionCleanup`]). Verified is bounded
+    /// by the ownership selector: a process it cannot see does not count
+    /// against it.
+    pub cleanup: Option<SessionCleanup>,
     /// The session this one continued (#92), set when `retry` resumed an
     /// interrupted turn instead of starting a fresh session. `None` for a
     /// session that opened its own, which is every session that isn't a
@@ -995,6 +1057,32 @@ mod tests {
         let err = "bogus".parse::<SessionEndReason>().unwrap_err();
         assert_eq!(err.0, "bogus");
         assert_eq!(err.to_string(), "invalid session end reason: bogus");
+    }
+
+    #[test]
+    fn session_cleanup_round_trips() {
+        for (cleanup, text) in [
+            (SessionCleanup::Pending, "pending"),
+            (SessionCleanup::Verified, "verified"),
+            (SessionCleanup::Unverified, "unverified"),
+        ] {
+            assert_eq!(cleanup.to_string(), text);
+            assert_eq!(text.parse::<SessionCleanup>().unwrap(), cleanup);
+            assert_eq!(
+                serde_json::to_string(&cleanup).unwrap(),
+                format!("\"{text}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<SessionCleanup>(&format!("\"{text}\"")).unwrap(),
+                cleanup
+            );
+        }
+        for bogus in ["bogus", "", "VERIFIED", " verified", "verified ", "Pending"] {
+            let err = bogus.parse::<SessionCleanup>().unwrap_err();
+            assert_eq!(err.0, bogus);
+            assert_eq!(err.to_string(), format!("invalid session cleanup: {bogus}"));
+            assert!(serde_json::from_str::<SessionCleanup>(&format!("\"{bogus}\"")).is_err());
+        }
     }
 
     #[test]
