@@ -257,9 +257,26 @@ applicable outcome:
   before then, completes normally. Neither outcome is guaranteed.
 - Once a turn has reported and ended, its process has 30 seconds to exit. If
   it's still running, choco sends SIGKILL to the process and what the turn
-  started and the task is marked `stuck`, rather than advancing past work that
-  may still be landing (sending the signal does not prove anything died). A process that exited on its own, with nothing of the turn's left
-  alive, does not park the task.
+  started. Sending the signal does not prove anything died, so the task
+  advances only if the cleanup is then verified: the end-of-turn sweep ran,
+  the output stream ended on its own, the last check of the process table saw
+  nothing of the turn's alive with no read of it having failed during the
+  turn, and the process was reaped. Then the turn counts as complete and
+  its report is applied once, as if the process had exited on time. Otherwise
+  (a process still seen at the last check, or a process table that could not
+  be read) the run ends `lingered` and the task is marked `stuck`, rather than
+  advancing past work that may still be landing; the accepted report stays on
+  the timeline, and retry starts a fresh session. Verified covers what choco
+  can see (see the blind spots below). A process that exited on its own, with
+  nothing of the turn's left alive, does not park the task either.
+- A turn cut off by a usage limit stays incomplete even if it had already
+  reported: the cutoff ends it with an error, never a clean end. If its
+  process outlives the grace period and the cleanup is verified as above, the
+  run still ends `interrupted` (as it would with nothing left running), so
+  `choco task retry` can resume the same conversation when the usual rules
+  allow it. This holds only when the usage limit was the last thing the main
+  agent met: a limit it carried on past, or a sub-agent working after the
+  limit, doesn't count, and an unverified cleanup ends `lingered`.
 - Output that arrives after a turn completed stays on the timeline, flagged
   `after_completion`. Nudges and kills appear as `session_note` events, as do
   the `execution_started` notes ("main-agent activity observed") that omp
@@ -288,11 +305,13 @@ applicable outcome:
   note means choco could not read the process table at least once, so nothing
   confirms the turn's processes are gone, whatever the other notes say, and
   the "killed" wording is replaced by "sent SIGKILL ... could not confirm".
-  None of this changes how the turn ended or whether the task advances, with
-  one exception below: the extra waiting for a leader or group member that is
-  still exiting does not count towards whether the turn lingered, which is
-  decided by what the check before the kill saw and what the first rounds of
-  the sweep had to signal. That also holds across the turn's cleanup sites (a
+  The notes are diagnostics: they do not change how the turn ended. Only the
+  verified result of this cleanup does, in the two cases above (a completed
+  turn stays complete; a usage-limit cutoff ends `interrupted`), and only for
+  a turn whose process had to be killed at the grace period. Whether the turn
+  lingered is decided by what the check before the kill saw and what the first
+  rounds of the sweep had to signal; the extra waiting for a leader or group
+  member that is still exiting does not count towards it. That also holds across the turn's cleanup sites (a
   cancel, pause or shutdown kill, then the grace kill, then the end-of-turn
   kill): a process an earlier site signalled before its stop point is counted
   once and not again. The exception: a process an earlier site signalled only
@@ -303,7 +322,8 @@ applicable outcome:
   the turn sent SIGKILL to a process, not that it died or what grace found or
   signalled (grace may have signalled that process again; the earlier count
   covers it). A process signalled early might have exited on its own before
-  the grace check; the run is still `lingered`. The extra-round finds of the
+  the grace check, and that counts as lingering (the run is `lingered` unless
+  the cleanup is verified as above). The extra-round finds of the
   grace site itself and the end-of-turn site's are not carried. The survivor
   list and the "still running" clause of the note report the final observation
   of a site's sweep: the processes that check
@@ -365,7 +385,7 @@ write succeeds, and a failed write is not retried:
   independent of the diagnostic's), and it does not change the completion.
   The run's final status still follows the usual cleanup rules; for
   example, a process still alive after the grace period ends it as
-  `lingered`. A sub-agent's stays scoped to that sub-agent.
+  `lingered`, unless the turn had completed and the cleanup is verified. A sub-agent's stays scoped to that sub-agent.
 
 ## What an agent inherits from your Claude setup
 
@@ -774,8 +794,9 @@ again (after a revise lap, say) runs every branch again.
 
 A branch fails when its turn can't complete: it ends without reporting (reason
 such as `stage 'security_review': the agent's turn ended without calling
-report_outcome`), crashes, leaves a process running, changes the worktree, or
-hits a usage limit. It also fails if it reports a result outside its
+report_outcome`), crashes, leaves a process running that the cleanup cannot verifiably remove
+(one that the turn's cleanup removes and verifies after an accepted report does
+not fail the branch), changes the worktree, or hits a usage limit. It also fails if it reports a result outside its
 `results:`, and its capture is then dropped (the tool normally refuses such a
 value, so this is a guard). The other branches keep running. When none is left
 running, the task is marked `stuck` with a reason naming each failed branch,

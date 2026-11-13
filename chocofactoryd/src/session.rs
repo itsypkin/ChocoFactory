@@ -1764,6 +1764,7 @@ fn final_run_state(
 /// DaemonStopped. A single-shot turn that had not completed ends
 /// `(Exited, Paused)`; a completed one keeps its ordinary result. A
 /// standing session is never stopped by a pause.
+#[allow(clippy::too_many_arguments)]
 fn final_run_state_ranked(
     kind: SessionKind,
     turn: &SingleShotTurn,
@@ -4092,7 +4093,10 @@ mod tests {
 
     fn main_activity() -> Vec<(&'static str, AgentEvent)> {
         vec![
-            ("assistant text", AgentEvent::AssistantMessage { text: "x".into() }),
+            (
+                "assistant text",
+                AgentEvent::AssistantMessage { text: "x".into() },
+            ),
             ("thinking", AgentEvent::Thinking { text: "x".into() }),
             (
                 "tool call",
@@ -4130,7 +4134,9 @@ mod tests {
         };
         // The production order: the limit message, the interruption, the end.
         let cut_off = observe(vec![
-            AgentEvent::AssistantMessage { text: "limit".into() },
+            AgentEvent::AssistantMessage {
+                text: "limit".into(),
+            },
             limit(),
             error_end(),
         ]);
@@ -4156,8 +4162,12 @@ mod tests {
                 details: json!({}),
             },
             omp_level(true),
-            AgentEvent::ProtocolError { message: "x".into() },
-            AgentEvent::Error { message: "x".into() },
+            AgentEvent::ProtocolError {
+                message: "x".into(),
+            },
+            AgentEvent::Error {
+                message: "x".into(),
+            },
             helper(AgentEvent::AssistantMessage { text: "x".into() }),
             helper(AgentEvent::ExecutionStarted),
             helper(error_end()),
@@ -4215,8 +4225,7 @@ mod tests {
         assert!(!completed_then_limit.cutoff_confirmed && !completed_then_limit.cutoff_pending);
         let twice = observe(vec![limit(), error_end(), limit(), error_end()]);
         assert!(twice.cutoff_confirmed);
-        let mut gave_up = SingleShotTurn::default();
-        gave_up.gave_up = true;
+        let mut gave_up = turn_with(|t| t.gave_up = true);
         gave_up.observe(&limit());
         gave_up.observe(&error_end());
         assert!(!gave_up.cutoff_confirmed);
@@ -4251,15 +4260,31 @@ mod tests {
             t.lingered = true;
         });
         let rank = |turn: &SingleShotTurn, cleanup| {
-            final_run_state(SessionKind::SingleShot, turn, false, false, false, false, cleanup)
+            final_run_state(
+                SessionKind::SingleShot,
+                turn,
+                false,
+                false,
+                false,
+                false,
+                cleanup,
+            )
         };
         for cleanup in [
             None,
             Some(SessionCleanup::Pending),
             Some(SessionCleanup::Unverified),
         ] {
-            assert_eq!(rank(&completed, cleanup), (Exited, Some(Lingered)), "{cleanup:?}");
-            assert_eq!(rank(&cutoff, cleanup), (Exited, Some(Lingered)), "{cleanup:?}");
+            assert_eq!(
+                rank(&completed, cleanup),
+                (Exited, Some(Lingered)),
+                "{cleanup:?}"
+            );
+            assert_eq!(
+                rank(&cutoff, cleanup),
+                (Exited, Some(Lingered)),
+                "{cleanup:?}"
+            );
         }
         let verified = Some(SessionCleanup::Verified);
         assert_eq!(rank(&completed, verified), (Idle, None));
@@ -5708,9 +5733,7 @@ mod tests {
         let silent = SingleShotTurn::default();
         let completed = turn_with(|t| t.completed = true);
         let ranked = |kind, turn: &SingleShotTurn, cancelled, paused, stopping| {
-            final_run_state_ranked(
-                kind, turn, false, false, cancelled, paused, stopping, None,
-            )
+            final_run_state_ranked(kind, turn, false, false, cancelled, paused, stopping, None)
         };
         assert_eq!(
             ranked(SingleShot, &silent, false, true, false),
@@ -5761,9 +5784,7 @@ mod tests {
             t.gave_up = true;
         });
         let ranked = |kind, turn: &SingleShotTurn, clean, reaped, cancelled, paused, stopping| {
-            final_run_state_ranked(
-                kind, turn, clean, reaped, cancelled, paused, stopping, None,
-            )
+            final_run_state_ranked(kind, turn, clean, reaped, cancelled, paused, stopping, None)
         };
         for kind in [SingleShot, Standing] {
             assert_eq!(
@@ -7027,13 +7048,12 @@ mod tests {
 
     /// Runs a fixture with an owned escaped job to the end of its turn and
     /// returns the session's final row.
-    async fn run_with_escaped_job(extra_steps: Vec<serde_json::Value>) -> chocofactory_core::models::Session {
-        let (pool, id, _job) = assert_escaped_job_is_killed_with_pid(
-            extra_steps,
-            fast_timers(3),
-            EndAction::Nothing,
-        )
-        .await;
+    async fn run_with_escaped_job(
+        extra_steps: Vec<serde_json::Value>,
+    ) -> chocofactory_core::models::Session {
+        let (pool, id, _job) =
+            assert_escaped_job_is_killed_with_pid(extra_steps, fast_timers(3), EndAction::Nothing)
+                .await;
         sessions::get(&pool, &id).await.unwrap().unwrap()
     }
 
@@ -7084,7 +7104,11 @@ mod tests {
             ),
             (
                 "a clean report-less end after the limit",
-                vec![raw_limit_message(), json!({"op": "result"}), generic_error.clone()],
+                vec![
+                    raw_limit_message(),
+                    json!({"op": "result"}),
+                    generic_error.clone(),
+                ],
             ),
         ];
         for (name, mut steps) in cases {
@@ -10977,7 +11001,8 @@ mod tests {
     /// recorded in a `lingered` note, and the verified cleanup then keeps the
     /// completed turn complete.
     #[tokio::test]
-    async fn an_earlier_kill_that_really_died_still_counts_as_lingering_but_a_verified_cleanup_completes() {
+    async fn an_earlier_kill_that_really_died_still_counts_as_lingering_but_a_verified_cleanup_completes()
+     {
         let pool = connect_in_memory().await.unwrap();
         let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let mut worker = Sleeper::spawn(None, true);
@@ -11082,11 +11107,7 @@ mod tests {
         let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(
             (run.status, run.end_reason, run.cleanup),
-            (
-                SessionStatus::Idle,
-                None,
-                Some(SessionCleanup::Verified)
-            ),
+            (SessionStatus::Idle, None, Some(SessionCleanup::Verified)),
             "the completed turn stays complete after a verified cleanup"
         );
         // The note exists only if grace counted the earlier kill as lingering.

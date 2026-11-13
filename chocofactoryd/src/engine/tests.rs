@@ -10926,11 +10926,7 @@ async fn a_lingering_read_only_turn_with_verified_cleanup_is_still_checked() {
         .remove(0);
     assert_eq!(
         (session.status, session.end_reason, session.cleanup),
-        (
-            SessionStatus::Idle,
-            None,
-            Some(SessionCleanup::Verified)
-        ),
+        (SessionStatus::Idle, None, Some(SessionCleanup::Verified)),
         "the lingering turn completed after verified cleanup"
     );
     assert!(
@@ -11454,7 +11450,11 @@ async fn terminating_cutoff_with_verified_cleanup_resumes_the_same_conversation(
         let c = cutoff_with_leftover(Cleanup::Clean).await;
         let interrupted = c.session.clone();
         assert_eq!(
-            (interrupted.status, interrupted.end_reason, interrupted.cleanup),
+            (
+                interrupted.status,
+                interrupted.end_reason,
+                interrupted.cleanup
+            ),
             (
                 SessionStatus::Exited,
                 Some(SessionEndReason::Interrupted),
@@ -12498,7 +12498,7 @@ fn cleanup_reader(
     // SAFETY: only reads the process's own uid.
     let uid = unsafe { libc::geteuid() };
     match cleanup {
-        Cleanup::Clean => Arc::new(|marker| crate::proc_table::read(marker)),
+        Cleanup::Clean => Arc::new(crate::proc_table::read),
         Cleanup::SurvivorAlive => tampered_reader(move |_, table| {
             table.push(crate::proc_table::ProcEntry {
                 pid: GHOST_PID,
@@ -12657,13 +12657,11 @@ async fn verified_grace_cleanup_applies_the_completed_verdict_once() {
     );
     let payload = payload_of(&r.pool, &r.task_id).await;
     assert_eq!(
-        payload["stages"]["review"]["outcome"],
-        "changes_requested",
+        payload["stages"]["review"]["outcome"], "changes_requested",
         "{payload}"
     );
     assert_eq!(
-        payload["stages"]["review"]["summary"],
-        "distinctive-summary-7f3a",
+        payload["stages"]["review"]["summary"], "distinctive-summary-7f3a",
         "{payload}"
     );
     let outcomes = events::list_for_task(&r.pool, &r.task_id)
