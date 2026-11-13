@@ -87,7 +87,11 @@ wrapper script, never through the test process's own environment):
   `awaiting` take a JSON value or "ABSENT"; `messages` is last (default),
   empty, absent, string, unknown_reason or raw: the step's own `raw` list is
   sent as the closing messages) / prompt_result {status, settled,
-  error_message, error_status} / add_totals {input, cost}.
+  error_message, error_status} / add_totals {input, cost} /
+  spawn_job {pid_file, seconds} (a job the session started and left running
+  in its own session, the way a backgrounded service is; it writes its pid to
+  `pid_file` and exits on its own after `seconds`, default 180, so a failed
+  test cannot leave it behind for long).
 - FAKE_OMP_STATS_SEQ: comma list of `ok|error|garbled|silent`, one per
   `get_session_stats` call (the last repeats). Default `ok`.
 - FAKE_OMP_START_TOKENS: input tokens the session already has at start (a
@@ -124,6 +128,7 @@ import json
 import os
 import re
 import select
+import subprocess
 import sys
 import time
 
@@ -707,6 +712,30 @@ def script_report(args):
         "content": [{"type": "text", "text": "reported"}], "isError": rejected}})
 
 
+JOB_CODE = (
+    "import os, sys, time\n"
+    "tmp = sys.argv[1] + '.tmp'\n"
+    "open(tmp, 'w').write(str(os.getpid()))\n"
+    "os.rename(tmp, sys.argv[1])\n"
+    "time.sleep(float(sys.argv[2]))\n"
+)
+
+
+def spawn_job(pid_file, seconds):
+    subprocess.Popen(
+        [sys.executable, "-c", JOB_CODE, pid_file, str(seconds)],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 30
+    while not os.path.exists(pid_file):
+        if time.time() > deadline:
+            raise SystemExit("the job never wrote " + pid_file)
+        time.sleep(0.01)
+
+
 def run_script():
     with open(os.environ["FAKE_OMP_SCRIPT"]) as handle:
         steps = json.load(handle)
@@ -725,6 +754,8 @@ def run_script():
             log("pid:%d" % os.getpid())
         elif op == "sleep":
             time.sleep(step["seconds"])
+        elif op == "spawn_job":
+            spawn_job(step["pid_file"], step.get("seconds", 180))
         elif op == "exit":
             sys.exit(step.get("code", 0))
         elif op == "gate":

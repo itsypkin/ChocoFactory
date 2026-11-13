@@ -88,15 +88,39 @@ and `choco task list --status stuck` finds every stuck task.
   tree and its session before choco saw it; on Linux, a process whose
   environment is unreadable (setuid, or non-dumpable). `docs/workflows.md`
   has the details.
+- A turn that reported, ended cleanly and left a process running past the
+  grace period no longer parks when choco's cleanup is verified (the group
+  and what it can prove the turn started were signalled, the last check saw
+  nothing alive with no failed read of the process table, and the process was
+  reaped): the session ends `idle` and the `lingered` and `leftovers_killed`
+  notes are only a record of the kill. The task then goes through the checks
+  any completed turn does (a read-only role's worktree check, the capture, the
+  stage's routing), and if they pass the report is applied once; do not retry
+  a task that advanced to apply the verdict again. If one of those checks
+  parked it instead, the stuck reason says which, and a retry re-runs the
+  stage; it does not replay the report. A task cancelled while the turn
+  waited out the grace period is `cancelled`: it is terminal, has no stuck
+  reason, cannot be retried, and its report is not applied. A usage-limit
+  cutoff with verified cleanup ends `interrupted`, not `lingered`: it parks
+  with "interrupted by a usage limit before completing" even if a report had
+  been accepted, and `choco task retry <id>` attempts to resume the same
+  conversation when the usual rules allow it (same CLI, a known adapter
+  session, and not too many resumes in a row); otherwise `--resume` is refused
+  and the default retry starts fresh. Verified only covers what choco can
+  see. Cleaning up by hand later does not certify a row that was not
+  verified, and does not replay its report.
 - `lingered`: once the grace period after the turn ended (it reported,
   errored, was closed for never reporting, or was closed by the idle reaper)
   ran out, choco found cause to clean up what the turn may have left behind,
-  and tried to SIGKILL it. The cause is the agent's process group seen alive,
-  a process outside it that choco signalled, or a process table that could not
+  and tried to SIGKILL it, and the run was neither a verified-clean completed
+  turn nor a verified usage-limit cutoff (see above). The cause is the agent's
+  process group seen alive, a process outside it that choco signalled, or a process table that could not
   be read, so a `lingered` run does not prove anything was running. The
   `lingered` note says which: what the check before the kill saw, or that it
   could not check, and whether the group signal was sent or refused. It does
-  not say anything died. The `leftovers_killed`
+  not say anything died, and it records the grace-period kill whatever the
+  run's final reason turned out to be: it can sit on an `idle` or `interrupted`
+  run whose cleanup was verified. The `leftovers_killed`
   `session_note`, when there is one, names what choco signalled outside the
   agent's own process group and what the last check still saw running. A
   `lingered` run with a successful last check and no `leftovers_*` note means
@@ -109,7 +133,8 @@ and `choco task list --status stuck` finds every stuck task.
   observation, but only when the sweep used all its rounds; a sweep that ends
   sooner logs no such warning, and the note is the record. An extra check
   that finds a leftover after the first rounds does not by itself change
-  whether the run is `lingered`, with one exception: a process an earlier
+  whether the run is `lingered`, with one exception (one that makes the run
+  lingering, not one that makes it verified): a process an earlier
   cleanup signalled in such a check still counts as left running at the grace
   check, even if it has exited by then (it may have exited on its own), and
   the `lingered` note then says an earlier cleanup of the turn sent SIGKILL
@@ -160,7 +185,8 @@ and `choco task list --status stuck` finds every stuck task.
   write succeeded, while a turn that had already completed is not reopened
   or reclassified by it (the late end is marked `after_completion`, and the
   run's final status still follows the usual cleanup rules, for example
-  `lingered` if the process outlives the grace period); for a sub-agent line
+  `lingered` if the process outlives the grace period and the cleanup is not
+  verified); for a sub-agent line
   (the events carry a `parent_tool_use_id`) only that helper's end is an
   error and the main turn can still finish cleanly. Read it together with
   the turn's last events before retrying. It is not a reason to restart the

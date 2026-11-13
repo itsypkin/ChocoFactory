@@ -699,3 +699,532 @@ async fn omp_a_wake_in_a_chat_stage_leaves_the_conversation_open() {
     })
     .await;
 }
+
+// ---- the wake's cleanup: verified cleanup lets the accepted outcome apply ----
+
+/// A job pid file outside any test directory; dropping it kills the job and
+/// removes the file.
+struct JobFile(PathBuf);
+
+impl JobFile {
+    fn new() -> Self {
+        JobFile(std::env::temp_dir().join(format!("choco-wake-job-{}.pid", uuid::Uuid::new_v4())))
+    }
+
+    fn pid(&self) -> u32 {
+        fs::read_to_string(&self.0).unwrap().trim().parse().unwrap()
+    }
+}
+
+/// The pid in a job's pid file, for a test whose fixture owns the file's
+/// cleanup elsewhere.
+fn job_pid(file: &Path) -> u32 {
+    fs::read_to_string(file).unwrap().trim().parse().unwrap()
+}
+
+impl Drop for JobFile {
+    fn drop(&mut self) {
+        drop(crate::test_support::KillPidFileOnDrop(self.0.clone()));
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// `wake_steps` that first start an owned background job of the session.
+fn wake_steps_with_job(job_file: &Path, tail: Vec<Value>) -> Value {
+    let mut steps = clean_finish();
+    steps.extend(tail);
+    let mut steps = wake_steps(json!("ABSENT"), changes_requested(), steps);
+    steps
+        .as_array_mut()
+        .unwrap()
+        .insert(1, json!({"op": "spawn_job", "pid_file": job_file}));
+    steps
+}
+
+/// The wake as a named service reaches the engine: a report-less yield, an
+/// autonomous wake that reports and ends cleanly, and the CLI exiting on its
+/// own afterwards with the job the session started still running. The tail
+/// sweep kills that job, the cleanup is verified, and the report applies once
+/// without a nudge or a second prompt.
+#[tokio::test]
+async fn the_named_service_tail_cleanup_still_advances() {
+    let job = JobFile::new();
+    let run = start_wake(wake_steps_with_job(&job.0, vec![]), timers()).await;
+    run.script.wait_log("op:gate").await;
+    assert!(run.outcomes().await.is_empty());
+    run.script.release("wake");
+
+    let task = wait_until_task_settled(&run.pool, &run.task_id).await;
+    assert_eq!(task.status, "closed", "{}", run.describe().await);
+    let outcome = wait_until_turn_outcome_event(&run.pool, &run.task_id).await;
+    assert_eq!(outcome["applied"], true, "{outcome}");
+    assert_eq!(run.outcomes().await.len(), 1, "{}", run.describe().await);
+    assert_eq!(
+        stage_trail(&run.pool, &run.task_id).await,
+        vec![
+            ("review".to_string(), Value::Null),
+            ("bounced".to_string(), json!("changes_requested")),
+        ]
+    );
+    let session = run.session().await;
+    crate::test_support::wait_until("the session's final write", || async {
+        let s = sessions::get(&run.pool, &session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        if s.status == SessionStatus::Active {
+            Err("still active".to_string())
+        } else {
+            Ok(s)
+        }
+    })
+    .await;
+    let session = sessions::get(&run.pool, &session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (session.status, session.end_reason, session.cleanup),
+        (
+            SessionStatus::Idle,
+            None,
+            Some(chocofactory_core::models::SessionCleanup::Verified)
+        ),
+        "{}",
+        run.describe().await
+    );
+    wait_until_pid_gone(job.pid()).await;
+    assert_eq!(
+        run.script.prompts_received(),
+        1,
+        "no nudge or second prompt"
+    );
+    let kinds = run.notes().await;
+    for unwanted in ["nudge", "no_report"] {
+        assert!(!kinds.iter().any(|k| k == unwanted), "{kinds:?}");
+    }
+}
+
+const MIXED_YAML: &str = "name: mixed-review\nworktree: true\nroles:\n  claude_reviewer:\n    cli: claude\n    model: sonnet\n    read_only: true\n    disallowed_tools: [edit, write, notebook_edit]\n  omp_reviewer:\n    cli: omp\n    model: openai-codex/gpt-5.6-terra\n    read_only: true\n    disallowed_tools: [edit, write, notebook_edit]\nstages:\n  panel:\n    kind: parallel\n    branches:\n      claude_branch: { kind: agent_turn, role: claude_reviewer, capture: json, results: [approved, changes_requested] }\n      omp_branch: { kind: agent_turn, role: omp_reviewer, capture: json, results: [approved, changes_requested] }\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
+
+const CLAUDE_SUMMARY: &str = "claude-summary-1b2c: the parser is fine";
+
+/// A two-adapter review group: an ordinary Claude branch that reports and
+/// finishes at once, and an omp branch that is the named-service wake held
+/// through grace with a job it started still running.
+struct MixedRun {
+    pool: SqlitePool,
+    _engine: Arc<WorkflowEngine>,
+    task_id: String,
+    script: OmpScript,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    later_reads: Arc<std::sync::atomic::AtomicUsize>,
+    omp_job: PathBuf,
+    _dir: TempDir,
+    _repo: TempDir,
+}
+
+impl Drop for MixedRun {
+    fn drop(&mut self) {
+        // Before the directories go, so the pid file is still readable.
+        drop(crate::test_support::KillPidFileOnDrop(self.omp_job.clone()));
+    }
+}
+
+/// Starts the group. The injected cleanup fault is aimed at the omp session
+/// only: it is armed by the test after the Claude branch has finished.
+async fn start_mixed(cleanup: Cleanup) -> MixedRun {
+    let dir = tempdir();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let pool = connect(&dir.join("choco.db")).await.unwrap();
+    let omp_job = dir.join("omp-job.pid");
+    let script = OmpScript::new(
+        &dir,
+        wake_steps_with_job(&omp_job, vec![json!({"op": "sleep", "seconds": 60})]),
+        &[],
+    );
+    let claude_binary = named_script_binary(
+        &dir,
+        "fake-claude-mixed",
+        json!([
+            {"op": "read_turn"},
+            {"op": "report", "outcome": "approved", "summary": CLAUDE_SUMMARY},
+            {"op": "result"},
+        ]),
+    );
+    let def = Arc::new(WorkflowDefinition::parse(MIXED_YAML, &dir).unwrap());
+    let project_id = projects::create(&pool, "demo", None).await.unwrap().id;
+    let task_id = tasks::create(
+        &pool,
+        tasks::NewTask {
+            project_id: &project_id,
+            workflow_def: &def.name,
+            title: "T",
+            config: json!({ "cwd": repo.to_string_lossy() }),
+            workflow_path: None,
+            workflow_sha256: None,
+            base_ref: None,
+            base_commit: None,
+            closes: &[],
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    let registry = Registry::new(vec![
+        Arc::new(ClaudeAdapter::with_binary(&claude_binary)),
+        Arc::new(OmpAdapter::with_binary(
+            &script.binary,
+            dir.join("omp-state"),
+        )),
+    ]);
+    let events_notify = Arc::new(Notify::new());
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let later_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let manager = SessionManager::with_proc_reader(
+        pool.clone(),
+        registry,
+        chrono::Duration::hours(1),
+        Arc::clone(&events_notify),
+        TurnTimers {
+            grace: StdDuration::from_secs(3),
+            ..timers()
+        },
+        gated_cleanup_reader(cleanup, Arc::clone(&later_reads), Arc::clone(&armed)),
+    );
+    let engine = WorkflowEngine::new(
+        pool.clone(),
+        manager,
+        PathBuf::from("."),
+        None,
+        events_notify,
+    );
+    engine.start_task(&task_id, &def, Some("go")).await.unwrap();
+    MixedRun {
+        pool,
+        _engine: engine,
+        task_id,
+        script,
+        armed,
+        later_reads,
+        omp_job,
+        _dir: dir,
+        _repo: repo,
+    }
+}
+
+impl MixedRun {
+    async fn outcomes(&self) -> Vec<Value> {
+        turn_outcomes(&self.pool, &self.task_id)
+            .await
+            .into_iter()
+            .map(|e| e.payload)
+            .collect()
+    }
+
+    async fn payload(&self) -> Value {
+        workflow_state::get(&self.pool, &self.task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload
+    }
+
+    async fn branch_session(&self, branch: &str) -> Session {
+        crate::test_support::wait_until(&format!("the {branch} session"), || async {
+            runs_for_stage(&self.pool, &self.task_id, branch)
+                .await
+                .into_iter()
+                .next()
+                .ok_or_else(|| "no session yet".to_string())
+        })
+        .await
+    }
+
+    /// Runs the group up to the point the scenario is about: the omp branch
+    /// has yielded without a report and is waiting on its background work,
+    /// while the Claude branch has finished with its own result. Returns the
+    /// Claude branch's session as the group's join must leave it.
+    async fn until_claude_is_done_and_omp_waits(&self) -> Session {
+        self.script.wait_log("op:gate").await;
+        crate::test_support::wait_until("the claude branch to be done", || async {
+            let payload = self.payload().await;
+            if payload["parallel"]["branches"]["claude_branch"]["state"] == "done" {
+                Ok(())
+            } else {
+                Err(payload.to_string())
+            }
+        })
+        .await;
+        let claude =
+            crate::test_support::wait_until("the claude session's final write", || async {
+                let s = self.branch_session("claude_branch").await;
+                if s.status == SessionStatus::Active {
+                    Err(format!("{s:?}"))
+                } else {
+                    Ok(s)
+                }
+            })
+            .await;
+        // The omp branch is still running with no result and the group has not
+        // joined: the wake has not happened yet.
+        let payload = self.payload().await;
+        assert_eq!(
+            payload["parallel"]["branches"]["omp_branch"]["state"], "running",
+            "{payload}"
+        );
+        assert_eq!(
+            payload["stages"]["claude_branch"]["summary"],
+            CLAUDE_SUMMARY
+        );
+        assert!(payload["stages"].get("omp_branch").is_none(), "{payload}");
+        assert_eq!(
+            tasks::get(&self.pool, &self.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "open"
+        );
+        assert_eq!(self.script.prompts_received(), 1);
+        claude
+    }
+}
+
+/// Both branches of a review group, one of them an omp wake that needs the
+/// grace kill and has a job left running: with verified cleanup the wake's
+/// accepted verdict is the branch's result, the ordinary Claude sibling's
+/// result and session are untouched, the group joins once after both, and
+/// each branch is applied once without a second prompt.
+#[tokio::test]
+async fn a_mixed_review_group_applies_the_cleaned_wake_once() {
+    use chocofactory_core::models::SessionCleanup;
+    let run = start_mixed(Cleanup::Clean).await;
+    let claude_before = run.until_claude_is_done_and_omp_waits().await;
+    run.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    run.script.release("wake");
+
+    let task = wait_until_task_settled(&run.pool, &run.task_id).await;
+    assert_eq!(
+        task.status,
+        "closed",
+        "{:?}; payload {}",
+        task.stuck_reason,
+        run.payload().await
+    );
+    let payload = run.payload().await;
+    assert_eq!(
+        payload["stages"]["omp_branch"]["outcome"],
+        "changes_requested"
+    );
+    assert_eq!(payload["stages"]["omp_branch"]["summary"], SUMMARY);
+    assert_eq!(
+        payload["stages"]["claude_branch"]["summary"],
+        CLAUDE_SUMMARY
+    );
+    // Each branch finished once, as done; the join then left the group.
+    let finished: Vec<_> = events::list_for_task(&run.pool, &run.task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == EventType::BranchFinished)
+        .map(|e| (e.payload["branch"].clone(), e.payload["state"].clone()))
+        .collect();
+    assert_eq!(finished.len(), 2, "{finished:?}");
+    for branch in ["claude_branch", "omp_branch"] {
+        assert!(
+            finished.contains(&(json!(branch), json!("done"))),
+            "{branch}: {finished:?}"
+        );
+    }
+    // One group join, after both branch results.
+    assert_eq!(
+        stage_trail(&run.pool, &run.task_id)
+            .await
+            .iter()
+            .filter(|(stage, _)| stage == "finished")
+            .count(),
+        1
+    );
+    let omp = run.branch_session("omp_branch").await;
+    let omp = crate::test_support::wait_until("the omp session's final write", || async {
+        let s = sessions::get(&run.pool, &omp.id).await.unwrap().unwrap();
+        if s.status == SessionStatus::Active {
+            Err("still active".to_string())
+        } else {
+            Ok(s)
+        }
+    })
+    .await;
+    assert_eq!(
+        (omp.status, omp.end_reason, omp.cleanup),
+        (SessionStatus::Idle, None, Some(SessionCleanup::Verified))
+    );
+    wait_until_pid_gone(job_pid(&run.omp_job)).await;
+    // The Claude sibling's session is exactly what it was before the wake.
+    let claude_after = sessions::get(&run.pool, &claude_before.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            claude_after.status,
+            claude_after.end_reason,
+            claude_after.cleanup
+        ),
+        (
+            claude_before.status,
+            claude_before.end_reason,
+            claude_before.cleanup
+        )
+    );
+    // One application per branch, the wake's after its cleanup.
+    let outcomes = crate::test_support::wait_until("both turn_outcome events", || async {
+        let all = run.outcomes().await;
+        if all.len() >= 2 {
+            Ok(all)
+        } else {
+            Err(format!("{all:?}"))
+        }
+    })
+    .await;
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    for branch in ["claude_branch", "omp_branch"] {
+        let of: Vec<_> = outcomes.iter().filter(|o| o["stage"] == branch).collect();
+        assert_eq!(of.len(), 1, "{branch}: {outcomes:?}");
+        assert_eq!(of[0]["applied"], true, "{branch}: {outcomes:?}");
+    }
+    assert_eq!(
+        run.script.prompts_received(),
+        1,
+        "no nudge or second prompt"
+    );
+    assert_eq!(
+        runs_for_stage(&run.pool, &run.task_id, "omp_branch")
+            .await
+            .len(),
+        1
+    );
+}
+
+/// The same group when the omp branch's cleanup cannot be verified (a
+/// survivor the last check still sees, or one failed process-table read): its
+/// report stays on record but the branch fails as lingered, the Claude
+/// sibling's result and session survive, and the group parks once nothing is
+/// running.
+async fn assert_unverified_wake_fails_only_its_branch(name: &str, cleanup: Cleanup) {
+    use chocofactory_core::models::SessionCleanup;
+    let run = start_mixed(cleanup).await;
+    let claude_before = run.until_claude_is_done_and_omp_waits().await;
+    run.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    run.script.release("wake");
+
+    let task = wait_until_task_settled(&run.pool, &run.task_id).await;
+    assert_eq!(task.status, "stuck", "{name}: {:?}", task.stuck_reason);
+    let omp = crate::test_support::wait_until("the omp session's final write", || async {
+        let s = run.branch_session("omp_branch").await;
+        if s.status == SessionStatus::Active {
+            Err("still active".to_string())
+        } else {
+            Ok(s)
+        }
+    })
+    .await;
+    assert_eq!(
+        (omp.status, omp.end_reason, omp.cleanup),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::Lingered),
+            Some(SessionCleanup::Unverified)
+        ),
+        "{name}"
+    );
+    wait_until_pid_gone(job_pid(&run.omp_job)).await;
+    if name == "a failed read" {
+        assert!(
+            run.later_reads.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "later reads must have worked"
+        );
+    }
+    let payload = run.payload().await;
+    assert_eq!(
+        payload["parallel"]["branches"]["omp_branch"]["state"], "failed",
+        "{name}: {payload}"
+    );
+    assert!(
+        payload["stages"].get("omp_branch").is_none(),
+        "{name}: {payload}"
+    );
+    // The sibling's result and session are exactly as they were, and the
+    // group did not advance.
+    assert_eq!(
+        payload["stages"]["claude_branch"]["summary"], CLAUDE_SUMMARY,
+        "{name}"
+    );
+    assert_eq!(
+        payload["parallel"]["branches"]["claude_branch"]["state"], "done",
+        "{name}"
+    );
+    let claude_after = sessions::get(&run.pool, &claude_before.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claude_after.end_reason, claude_before.end_reason, "{name}");
+    assert_eq!(claude_after.status, claude_before.status, "{name}");
+    let state = workflow_state::get(&run.pool, &run.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.current_stage, "panel", "{name}");
+    assert!(
+        stage_trail(&run.pool, &run.task_id)
+            .await
+            .iter()
+            .all(|(stage, _)| stage != "finished"),
+        "{name}: the group must not join"
+    );
+    // The wake's report is still readable on its session's events.
+    let reported = events::list_for_session(&run.pool, &omp.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| e.payload.to_string().contains(SUMMARY));
+    assert!(reported, "{name}: the accepted report was lost");
+    // Only the sibling's verdict was ever applied: the wake's is recorded
+    // as not applied, or not recorded at all.
+    // The sibling's own outcome event is appended after its branch is
+    // settled, so wait for it rather than read whatever exists at the moment
+    // the group parked.
+    let outcomes = crate::test_support::wait_until("the Claude sibling's turn_outcome", || async {
+        let all = run.outcomes().await;
+        if all.iter().any(|o| o["stage"] == "claude_branch") {
+            Ok(all)
+        } else {
+            Err(format!("{all:?}"))
+        }
+    })
+    .await;
+    let applied_of = |branch: &str| {
+        outcomes
+            .iter()
+            .filter(|o| o["stage"] == branch)
+            .map(|o| o["applied"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(applied_of("claude_branch"), vec![json!(true)], "{name}");
+    assert!(
+        !applied_of("omp_branch").contains(&json!(true)),
+        "{name}: {outcomes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_mixed_review_group_fails_only_the_wake_branch_after_a_survivor() {
+    assert_unverified_wake_fails_only_its_branch("a survivor", Cleanup::SurvivorAlive).await;
+}
+
+#[tokio::test]
+async fn a_mixed_review_group_fails_only_the_wake_branch_after_a_failed_read() {
+    assert_unverified_wake_fails_only_its_branch("a failed read", Cleanup::OneFailedRead).await;
+}

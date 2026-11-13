@@ -222,9 +222,12 @@ pub enum SessionEndReason {
     /// process outside the group was signalled, or the process table could
     /// not be read. It tried to SIGKILL what the turn may have left behind.
     /// This records that attempt, not that anything was seen running or died;
-    /// the `lingered` and `leftovers_*` session notes say what the checks saw
-    /// or that they could not check. The task parks rather than advancing past
-    /// work that may still be landing.
+    /// any `lingered` and `leftovers_*` session notes that were recorded say
+    /// what the checks saw or that they could not check. The task parks
+    /// rather than advancing past work that may still be landing. Not used
+    /// when the cleanup was verified and the turn had either completed
+    /// (`Idle`, no reason) or been cut off by a usage limit with nothing
+    /// after it (`Interrupted`): then the kill was only housekeeping.
     Lingered,
     /// A single-shot turn ended without ever calling `report_outcome`
     /// (#90), even after the daemon's nudges, so it was closed rather than
