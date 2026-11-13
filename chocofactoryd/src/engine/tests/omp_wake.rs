@@ -1115,99 +1115,97 @@ async fn a_mixed_review_group_applies_the_cleaned_wake_once() {
 /// running.
 async fn assert_unverified_wake_fails_only_its_branch(name: &str, cleanup: Cleanup) {
     use chocofactory_core::models::SessionCleanup;
-    {
-        let run = start_mixed(cleanup).await;
-        let claude_before = run.until_claude_is_done_and_omp_waits().await;
-        run.armed.store(true, std::sync::atomic::Ordering::SeqCst);
-        run.script.release("wake");
+    let run = start_mixed(cleanup).await;
+    let claude_before = run.until_claude_is_done_and_omp_waits().await;
+    run.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    run.script.release("wake");
 
-        let task = wait_until_task_settled(&run.pool, &run.task_id).await;
-        assert_eq!(task.status, "stuck", "{name}: {:?}", task.stuck_reason);
-        let omp = crate::test_support::wait_until("the omp session's final write", || async {
-            let s = run.branch_session("omp_branch").await;
-            if s.status == SessionStatus::Active {
-                Err("still active".to_string())
-            } else {
-                Ok(s)
-            }
-        })
-        .await;
-        assert_eq!(
-            (omp.status, omp.end_reason, omp.cleanup),
-            (
-                SessionStatus::Exited,
-                Some(SessionEndReason::Lingered),
-                Some(SessionCleanup::Unverified)
-            ),
-            "{name}"
-        );
-        wait_until_pid_gone(job_pid(&run.omp_job)).await;
-        if name == "a failed read" {
-            assert!(
-                run.later_reads.load(std::sync::atomic::Ordering::SeqCst) > 0,
-                "later reads must have worked"
-            );
+    let task = wait_until_task_settled(&run.pool, &run.task_id).await;
+    assert_eq!(task.status, "stuck", "{name}: {:?}", task.stuck_reason);
+    let omp = crate::test_support::wait_until("the omp session's final write", || async {
+        let s = run.branch_session("omp_branch").await;
+        if s.status == SessionStatus::Active {
+            Err("still active".to_string())
+        } else {
+            Ok(s)
         }
-        let payload = run.payload().await;
-        assert_eq!(
-            payload["parallel"]["branches"]["omp_branch"]["state"], "failed",
-            "{name}: {payload}"
-        );
+    })
+    .await;
+    assert_eq!(
+        (omp.status, omp.end_reason, omp.cleanup),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::Lingered),
+            Some(SessionCleanup::Unverified)
+        ),
+        "{name}"
+    );
+    wait_until_pid_gone(job_pid(&run.omp_job)).await;
+    if name == "a failed read" {
         assert!(
-            payload["stages"].get("omp_branch").is_none(),
-            "{name}: {payload}"
-        );
-        // The sibling's result and session are exactly as they were, and the
-        // group did not advance.
-        assert_eq!(
-            payload["stages"]["claude_branch"]["summary"], CLAUDE_SUMMARY,
-            "{name}"
-        );
-        assert_eq!(
-            payload["parallel"]["branches"]["claude_branch"]["state"], "done",
-            "{name}"
-        );
-        let claude_after = sessions::get(&run.pool, &claude_before.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(claude_after.end_reason, claude_before.end_reason, "{name}");
-        assert_eq!(claude_after.status, claude_before.status, "{name}");
-        let state = workflow_state::get(&run.pool, &run.task_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(state.current_stage, "panel", "{name}");
-        assert!(
-            stage_trail(&run.pool, &run.task_id)
-                .await
-                .iter()
-                .all(|(stage, _)| stage != "finished"),
-            "{name}: the group must not join"
-        );
-        // The wake's report is still readable on its session's events.
-        let reported = events::list_for_session(&run.pool, &omp.id)
-            .await
-            .unwrap()
-            .into_iter()
-            .any(|e| e.payload.to_string().contains(SUMMARY));
-        assert!(reported, "{name}: the accepted report was lost");
-        // Only the sibling's verdict was ever applied: the wake's is recorded
-        // as not applied, or not recorded at all.
-        let outcomes = run.outcomes().await;
-        let applied_of = |branch: &str| {
-            outcomes
-                .iter()
-                .filter(|o| o["stage"] == branch)
-                .map(|o| o["applied"].clone())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(applied_of("claude_branch"), vec![json!(true)], "{name}");
-        assert!(
-            !applied_of("omp_branch").contains(&json!(true)),
-            "{name}: {outcomes:?}"
+            run.later_reads.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "later reads must have worked"
         );
     }
+    let payload = run.payload().await;
+    assert_eq!(
+        payload["parallel"]["branches"]["omp_branch"]["state"], "failed",
+        "{name}: {payload}"
+    );
+    assert!(
+        payload["stages"].get("omp_branch").is_none(),
+        "{name}: {payload}"
+    );
+    // The sibling's result and session are exactly as they were, and the
+    // group did not advance.
+    assert_eq!(
+        payload["stages"]["claude_branch"]["summary"], CLAUDE_SUMMARY,
+        "{name}"
+    );
+    assert_eq!(
+        payload["parallel"]["branches"]["claude_branch"]["state"], "done",
+        "{name}"
+    );
+    let claude_after = sessions::get(&run.pool, &claude_before.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claude_after.end_reason, claude_before.end_reason, "{name}");
+    assert_eq!(claude_after.status, claude_before.status, "{name}");
+    let state = workflow_state::get(&run.pool, &run.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.current_stage, "panel", "{name}");
+    assert!(
+        stage_trail(&run.pool, &run.task_id)
+            .await
+            .iter()
+            .all(|(stage, _)| stage != "finished"),
+        "{name}: the group must not join"
+    );
+    // The wake's report is still readable on its session's events.
+    let reported = events::list_for_session(&run.pool, &omp.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| e.payload.to_string().contains(SUMMARY));
+    assert!(reported, "{name}: the accepted report was lost");
+    // Only the sibling's verdict was ever applied: the wake's is recorded
+    // as not applied, or not recorded at all.
+    let outcomes = run.outcomes().await;
+    let applied_of = |branch: &str| {
+        outcomes
+            .iter()
+            .filter(|o| o["stage"] == branch)
+            .map(|o| o["applied"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(applied_of("claude_branch"), vec![json!(true)], "{name}");
+    assert!(
+        !applied_of("omp_branch").contains(&json!(true)),
+        "{name}: {outcomes:?}"
+    );
 }
 
 #[tokio::test]

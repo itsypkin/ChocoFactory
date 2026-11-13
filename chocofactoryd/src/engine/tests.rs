@@ -11693,55 +11693,53 @@ async fn work_by_a_helper_after_the_limit_still_resumes_the_same_conversation() 
 /// resumable: it stays `Lingered`, a demanded resume is refused and starts
 /// nothing, and the work and the accepted report are left as they were.
 async fn assert_unverified_cutoff_is_not_resumable(name: &str, cleanup: Cleanup) {
-    {
-        let c = cutoff_with_leftover(cleanup).await;
-        assert_eq!(
-            (c.session.status, c.session.end_reason, c.session.cleanup),
-            (
-                SessionStatus::Exited,
-                Some(SessionEndReason::Lingered),
-                Some(SessionCleanup::Unverified)
-            ),
-            "{name}: {:?}",
-            c.task
-        );
-        assert_eq!(c.task.status, "stuck", "{name}: {:?}", c.task);
-        wait_until_pid_gone(c.job_pid).await;
-        if name == "a failed read" {
-            assert!(
-                c.reads_after_failure
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    > 0,
-                "later reads must have worked"
-            );
-        }
-        let (binary, _argv) = logging_script_binary(
-            &c.jobs,
-            "fake-claude-not-started",
-            json!([{"op": "echo_turn"}, {"op": "report", "outcome": "done"}, {"op": "result"}]),
-        );
-        let engine = engine_with_adapter_and_workflows_dir(c.pool.clone(), &binary, &c.jobs);
-        let err = engine
-            .retry_task(&c.task_id, RetryMode::Resume)
-            .await
-            .unwrap_err();
+    let c = cutoff_with_leftover(cleanup).await;
+    assert_eq!(
+        (c.session.status, c.session.end_reason, c.session.cleanup),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::Lingered),
+            Some(SessionCleanup::Unverified)
+        ),
+        "{name}: {:?}",
+        c.task
+    );
+    assert_eq!(c.task.status, "stuck", "{name}: {:?}", c.task);
+    wait_until_pid_gone(c.job_pid).await;
+    if name == "a failed read" {
         assert!(
-            matches!(&err, RetryTaskError::NotResumable(why) if why.contains("lingered")),
-            "{name}: expected the existing refusal: {err}"
+            c.reads_after_failure
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0,
+            "later reads must have worked"
         );
-        assert_eq!(
-            runs_for_stage(&c.pool, &c.task_id, "coding").await.len(),
-            1,
-            "{name}: the refused retry created no session"
-        );
-        assert!(c.jobs.join("edit.txt").exists());
-        let reported = events::list_for_session(&c.pool, &c.session.id)
-            .await
-            .unwrap()
-            .into_iter()
-            .any(|e| e.payload.to_string().contains("report_outcome"));
-        assert!(reported, "{name}: the accepted report was lost");
     }
+    let (binary, _argv) = logging_script_binary(
+        &c.jobs,
+        "fake-claude-not-started",
+        json!([{"op": "echo_turn"}, {"op": "report", "outcome": "done"}, {"op": "result"}]),
+    );
+    let engine = engine_with_adapter_and_workflows_dir(c.pool.clone(), &binary, &c.jobs);
+    let err = engine
+        .retry_task(&c.task_id, RetryMode::Resume)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, RetryTaskError::NotResumable(why) if why.contains("lingered")),
+        "{name}: expected the existing refusal: {err}"
+    );
+    assert_eq!(
+        runs_for_stage(&c.pool, &c.task_id, "coding").await.len(),
+        1,
+        "{name}: the refused retry created no session"
+    );
+    assert!(c.jobs.join("edit.txt").exists());
+    let reported = events::list_for_session(&c.pool, &c.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| e.payload.to_string().contains("report_outcome"));
+    assert!(reported, "{name}: the accepted report was lost");
 }
 
 #[tokio::test]
@@ -12902,65 +12900,63 @@ async fn verified_grace_cleanup_applies_the_completed_verdict_once() {
 /// that failed to read once. The task parks as before and keeps the report.
 async fn assert_unverified_grace_does_not_apply(name: &str, cleanup: Cleanup) {
     let (log, _guard) = capture_logs();
-    {
-        let r = lingering_review(cleanup).await;
-        assert_eq!(r.task.status, "stuck", "{name}: {:?}", r.task);
-        assert_eq!(
-            (r.session.status, r.session.end_reason, r.session.cleanup),
-            (
-                SessionStatus::Exited,
-                Some(SessionEndReason::Lingered),
-                Some(SessionCleanup::Unverified)
-            ),
-            "{name}"
-        );
-        wait_until_pid_gone(r.job_pid).await;
-        let trail = stage_trail(&r.pool, &r.task_id).await;
-        assert!(
-            trail.iter().all(|(stage, _)| stage == "review"),
-            "{name}: must never advance: {trail:?}"
-        );
-        assert_eq!(
-            r.task.stuck_reason.as_deref(),
-            Some(
-                "stage 'review': after the turn ended, choco tried to kill what it may have \
+    let r = lingering_review(cleanup).await;
+    assert_eq!(r.task.status, "stuck", "{name}: {:?}", r.task);
+    assert_eq!(
+        (r.session.status, r.session.end_reason, r.session.cleanup),
+        (
+            SessionStatus::Exited,
+            Some(SessionEndReason::Lingered),
+            Some(SessionCleanup::Unverified)
+        ),
+        "{name}"
+    );
+    wait_until_pid_gone(r.job_pid).await;
+    let trail = stage_trail(&r.pool, &r.task_id).await;
+    assert!(
+        trail.iter().all(|(stage, _)| stage == "review"),
+        "{name}: must never advance: {trail:?}"
+    );
+    assert_eq!(
+        r.task.stuck_reason.as_deref(),
+        Some(
+            "stage 'review': after the turn ended, choco tried to kill what it may have \
                  left running (the agent's process group or something it started); any \
                  session notes say what the last check saw, or that it could not check; \
                  work the turn started may be incomplete"
-            ),
-            "{name}"
-        );
-        // The log line makes the same claim: an attempt, not a death.
-        let line = log
-            .text()
-            .lines()
-            .find(|l| l.contains("not auto-advancing") && l.contains(&r.task_id))
-            .map(str::to_owned)
-            .unwrap_or_else(|| panic!("{name}: no lingered warning in: {}", log.text()));
+        ),
+        "{name}"
+    );
+    // The log line makes the same claim: an attempt, not a death.
+    let line = log
+        .text()
+        .lines()
+        .find(|l| l.contains("not auto-advancing") && l.contains(&r.task_id))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("{name}: no lingered warning in: {}", log.text()));
+    assert!(
+        line.contains("choco tried to kill what the session's turn may have left running")
+            && !line.contains("was killed"),
+        "{name}: {line}"
+    );
+    assert!(
+        turn_outcomes(&r.pool, &r.task_id).await.is_empty(),
+        "{name}: nothing may be applied"
+    );
+    // The accepted report is still readable on the session's events.
+    let reported = events::list_for_session(&r.pool, &r.session.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|e| e.payload.to_string().contains("distinctive-summary-7f3a"));
+    assert!(reported, "{name}: the accepted report was lost");
+    if name == "a failed read" {
         assert!(
-            line.contains("choco tried to kill what the session's turn may have left running")
-                && !line.contains("was killed"),
-            "{name}: {line}"
+            r.reads_after_failure
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0,
+            "later reads must have worked"
         );
-        assert!(
-            turn_outcomes(&r.pool, &r.task_id).await.is_empty(),
-            "{name}: nothing may be applied"
-        );
-        // The accepted report is still readable on the session's events.
-        let reported = events::list_for_session(&r.pool, &r.session.id)
-            .await
-            .unwrap()
-            .into_iter()
-            .any(|e| e.payload.to_string().contains("distinctive-summary-7f3a"));
-        assert!(reported, "{name}: the accepted report was lost");
-        if name == "a failed read" {
-            assert!(
-                r.reads_after_failure
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    > 0,
-                "later reads must have worked"
-            );
-        }
     }
 }
 
