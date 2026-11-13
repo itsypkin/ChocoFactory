@@ -458,6 +458,10 @@ impl WorkflowEngine {
             role,
             cli_adapter: adapter_name,
             model: &resolved.model,
+            // Every single-shot launch starts pending, whether fresh, resumed
+            // or from the queue, and independently of any earlier attempt's
+            // cleanup. The drain's final write settles it.
+            cleanup: (session_kind == SessionKind::SingleShot).then_some(SessionCleanup::Pending),
         };
         // A resume still opens its own session (#92): the attempt history
         // stays one row per attempt, and `resumed_from` is what records
@@ -498,6 +502,7 @@ impl WorkflowEngine {
                 SessionStatus::Exited,
                 Some(Utc::now()),
                 Some(SessionEndReason::StartFailed),
+                None,
             )
             .await
             {
@@ -613,6 +618,7 @@ impl WorkflowEngine {
                 SessionStatus::Exited,
                 Some(Utc::now()),
                 Some(SessionEndReason::StartFailed),
+                None,
             )
             .await
             {

@@ -54,8 +54,11 @@ Steps, run in order:
   while the intermediate is still alive), `release_file` (after announcing,
   wait for this file to exist), `wait_orphaned` (don't continue until the
   intermediate has exited), `defer_release` (return at once and keep the
-  intermediate alive until a later `release_escaped` step). The intermediate
-  stays alive until the announce and release are done.
+  intermediate alive until a later `release_escaped` step), `keep_output` (the
+  job keeps this process's stdout open instead of redirecting it to /dev/null,
+  so it holds the daemon's output pipe for as long as it lives; its stderr is
+  still redirected to /dev/null; off by default). The intermediate stays alive until the announce and release
+  are done.
 - `{"op": "release_escaped", "release_file": path?}` — wait for `release_file`
   (when given), then let every deferred intermediate go and reap it, so its job
   is orphaned.
@@ -134,7 +137,7 @@ JOB_CODE = (
 )
 
 
-def start_job(pid_file, scrub, ignore_sigterm):
+def start_job(pid_file, scrub, ignore_sigterm, keep_output=False):
     env = dict(os.environ)
     if scrub:
         env = {k: v for k, v in env.items() if not k.startswith("CHOCOFACTORY_TURN_")}
@@ -145,7 +148,10 @@ def start_job(pid_file, scrub, ignore_sigterm):
         [sys.executable, "-c", code, pid_file],
         env=env,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
+        # None inherits this process's fd 1, which with `keep_output` is still
+        # the daemon's output pipe; the default drops it so the job holds
+        # nothing open.
+        stdout=None if keep_output else subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
@@ -168,13 +174,21 @@ def spawn_escaped(step, session_id):
         os.close(write_fd)
         try:
             # Don't hold the daemon's output pipes open.
-            null = os.open(os.devnull, os.O_RDWR)
-            os.dup2(null, 1)
-            os.dup2(null, 2)
+            # `keep_output` leaves them open here on purpose, for a job that
+            # holds the pipe after the agent is gone; `start_job` still sends
+            # the job's stderr to /dev/null.
+            keep_output = step.get("keep_output", False)
+            if not keep_output:
+                null = os.open(os.devnull, os.O_RDWR)
+                os.dup2(null, 1)
+                os.dup2(null, 2)
             if step.get("setsid"):
                 os.setsid()
             start_job(
-                step["pid_file"], step.get("scrub_env", False), step.get("ignore_sigterm", False)
+                step["pid_file"],
+                step.get("scrub_env", False),
+                step.get("ignore_sigterm", False),
+                keep_output,
             )
             if step.get("child_pid_file"):
                 start_job(step["child_pid_file"], True, False)

@@ -85,6 +85,7 @@ mod tests {
                 role: "chat",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -178,6 +179,7 @@ mod tests {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         };
         let first = sessions::create(&pool, new("implement")).await.unwrap().id;
         // An ended session with no usage row.

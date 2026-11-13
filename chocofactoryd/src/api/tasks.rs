@@ -1142,6 +1142,7 @@ stages:
                     role: "coder",
                     cli_adapter: "claude",
                     model: "sonnet",
+                    cleanup: None,
                 },
             )
             .await

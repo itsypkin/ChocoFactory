@@ -772,12 +772,139 @@ async fn a_turn_that_fails_to_spawn_frees_its_slot() {
     );
     q.wait_running(0).await;
     assert!(q.rows().await.is_empty());
+    let sessions = q.sessions(&b.id).await;
+    assert!(!sessions.is_empty(), "the queued turn left no session row");
     assert!(
-        q.sessions(&b.id)
-            .await
+        sessions
             .iter()
             .all(|s| s.end_reason == Some(SessionEndReason::StartFailed))
     );
+    // Nothing was spawned, so no cleanup is tracked: the pending value the
+    // insert wrote is cleared with the failure.
+    assert!(sessions.iter().all(|s| s.cleanup.is_none()));
+}
+
+// ---- the cleanup fact of a launched turn -------------------------------------
+
+impl Q {
+    /// The task's only session, once it has left `active`.
+    async fn wait_session_final(&self, task_id: &str) -> Session {
+        crate::test_support::wait_until("the session's final write", || async {
+            let sessions = self.sessions(task_id).await;
+            match sessions.as_slice() {
+                [only] if only.status != SessionStatus::Active => Ok(only.clone()),
+                other => Err(format!("{} session(s), not final", other.len())),
+            }
+        })
+        .await
+    }
+
+    /// The task's only session, which must be live.
+    async fn live_session(&self, task_id: &str) -> Session {
+        let sessions = self.sessions(task_id).await;
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(sessions[0].status, SessionStatus::Active);
+        sessions[0].clone()
+    }
+}
+
+#[tokio::test]
+async fn single_shot_cleanup_is_pending_until_finalized() {
+    let q = Q::new(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let a = q.create("job-a").await;
+    q.wait_started("job-a").await;
+    // The fixture holds the turn open: the row is live and cleanup unsettled.
+    assert_eq!(
+        q.live_session(&a.id).await.cleanup,
+        Some(SessionCleanup::Pending)
+    );
+    q.release("job-a");
+    let done = q.wait_session_final(&a.id).await;
+    assert_eq!(done.cleanup, Some(SessionCleanup::Verified));
+}
+
+#[tokio::test]
+async fn chat_cleanup_is_not_tracked() {
+    let q = Q::new(None).await;
+    let chat = q.dir.join("chatflow.yaml");
+    fs::write(
+        &chat,
+        "name: qchat\nworktree: false\nroles:\n  chat:\n    cli: claude\n    model: sonnet\nstages:\n  chatting:\n    kind: agent_turn\n    role: chat\n    on: {}\n",
+    )
+    .unwrap();
+    let steps = vec![
+        json!({"op": "read_turn"}),
+        json!({"op": "run", "command": format!("touch '{}'", q.dir.join("started-chat-1").display())}),
+        json!({"op": "wait_file", "path": q.dir.join("release-chat-1").display().to_string()}),
+        json!({"op": "text", "text": "chat-reply"}),
+        json!({"op": "result"}),
+        json!({"op": "sleep", "seconds": 60}),
+    ];
+    fs::write(
+        q.dir.join("fake-claude-queue.json"),
+        json!({ "by_prompt": { "chat-1": steps } }).to_string(),
+    )
+    .unwrap();
+    q.names.lock().unwrap().push("chat-1".to_string());
+    let task = q
+        .engine
+        .create_task_from(
+            &q.project.id,
+            WorkflowRef::File(chat),
+            "chat-1",
+            "chat-1",
+            json!({}),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+    q.wait_started("chat-1").await;
+    assert_eq!(q.live_session(&task.id).await.cleanup, None);
+    q.release("chat-1");
+    // The ordinary reply and end-of-turn evidence is on the timeline before
+    // the chat is cancelled.
+    crate::test_support::wait_until("the chat's turn_completed event", || async {
+        let events = q.events(&task.id).await;
+        if events
+            .iter()
+            .any(|e| e.event_type == EventType::TurnCompleted)
+        {
+            Ok(())
+        } else {
+            Err("no turn_completed yet".to_string())
+        }
+    })
+    .await;
+    q.engine.cancel_task(&task.id, false).await.unwrap();
+    let done = q.wait_session_final(&task.id).await;
+    assert_eq!(done.cleanup, None);
+}
+
+#[tokio::test]
+async fn queued_cleanup_is_pending_while_live() {
+    let q = Q::new(Some(1)).await;
+    q.script(&[("job-a", Ending::Report), ("job-b", Ending::Report)]);
+    let a = q.create("job-a").await;
+    q.wait_started("job-a").await;
+    let b = q.create("job-b").await;
+    q.wait_rows(1).await;
+    assert!(
+        q.sessions(&b.id).await.is_empty(),
+        "the queued turn has no row yet"
+    );
+    q.release("job-a");
+    // The queued turn's session is created from its queue row.
+    q.wait_started("job-b").await;
+    assert!(q.rows().await.is_empty());
+    assert_eq!(
+        q.live_session(&b.id).await.cleanup,
+        Some(SessionCleanup::Pending)
+    );
+    q.release("job-b");
+    q.wait_session_final(&b.id).await;
+    q.wait_session_final(&a.id).await;
 }
 
 // ---- abandoned operations --------------------------------------------------
@@ -833,6 +960,7 @@ async fn aborting_the_turn_watcher_frees_its_slot_and_the_next_turn_starts() {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: Some(SessionCleanup::Pending),
         },
     )
     .await
@@ -1499,6 +1627,7 @@ async fn a_dequeue_whose_row_vanished_rolls_back_and_creates_no_session() {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
         None,
     )
@@ -1528,6 +1657,7 @@ async fn a_dequeue_whose_session_insert_fails_keeps_the_row() {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
         None,
     )
@@ -1556,6 +1686,7 @@ async fn a_dequeue_deletes_the_row_and_creates_the_session_together() {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
         None,
     )
@@ -2213,6 +2344,7 @@ async fn a_queued_branch_that_somehow_has_a_live_session_is_withdrawn() {
                     role: "coder",
                     cli_adapter: "claude",
                     model: "sonnet",
+                    cleanup: Some(SessionCleanup::Pending),
                 },
             )
             .await
@@ -2308,6 +2440,7 @@ async fn a_queued_retry_whose_session_cannot_be_resumed_parks_the_task() {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await
@@ -2344,6 +2477,7 @@ async fn a_queued_retry_whose_session_cannot_be_resumed_parks_the_task() {
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await

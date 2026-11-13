@@ -1761,6 +1761,7 @@ async fn a_turn_reaped_by_the_idle_timeout_does_not_auto_advance() {
             role: "chat",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await
@@ -1771,6 +1772,7 @@ async fn a_turn_reaped_by_the_idle_timeout_does_not_auto_advance() {
         SessionStatus::Idle,
         None,
         Some(SessionEndReason::Reaped),
+        None,
     )
     .await
     .unwrap();
@@ -4847,6 +4849,7 @@ async fn finish_review_turn_from_reply(
             role: "reviewer",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await
@@ -4885,7 +4888,7 @@ async fn finish_review_turn_from_reply(
             .await
             .unwrap();
     }
-    sessions::update_status(pool, &run_id, SessionStatus::Idle, None, None)
+    sessions::update_status(pool, &run_id, SessionStatus::Idle, None, None, None)
         .await
         .unwrap();
 
@@ -10782,7 +10785,7 @@ async fn read_only_turn_cut_off_with(
     let session = runs_for_stage(&run.pool, &run.task_id, "review")
         .await
         .remove(0);
-    sessions::update_status(&run.pool, &session.id, status, None, Some(end_reason))
+    sessions::update_status(&run.pool, &session.id, status, None, Some(end_reason), None)
         .await
         .unwrap();
     let reason = stuck_reason(&run.pool, &run.task_id).await;
@@ -10861,6 +10864,7 @@ async fn an_abnormal_end_that_cannot_be_verified_does_not_claim_an_outcome_was_d
         SessionStatus::Idle,
         None,
         Some(SessionEndReason::Reaped),
+        None,
     )
     .await
     .unwrap();
@@ -11070,6 +11074,8 @@ async fn a_baseline_that_cannot_be_written_marks_the_session_start_failed() {
         .remove(0);
     assert_eq!(session.status, SessionStatus::Exited);
     assert_eq!(session.end_reason, Some(SessionEndReason::StartFailed));
+    // Nothing was spawned: the pending cleanup the insert wrote is cleared.
+    assert_eq!(session.cleanup, None);
 }
 
 #[tokio::test]
@@ -11456,6 +11462,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
                 role: "coder",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -11471,6 +11478,7 @@ async fn only_an_outside_interruption_with_a_session_is_resumable() {
             SessionStatus::Exited,
             Some(Utc::now()),
             reason,
+            None,
         )
         .await
         .unwrap()
@@ -11583,6 +11591,7 @@ async fn a_session_resumed_too_many_times_in_a_row_has_to_start_over() {
         role: "coder",
         cli_adapter: "claude",
         model: "sonnet",
+        cleanup: None,
     };
     let interrupt = async |run: &Session| {
         sessions::update_status(
@@ -11591,6 +11600,7 @@ async fn a_session_resumed_too_many_times_in_a_row_has_to_start_over() {
             SessionStatus::Exited,
             Some(Utc::now()),
             Some(SessionEndReason::Interrupted),
+            None,
         )
         .await
         .unwrap()
@@ -12504,6 +12514,7 @@ async fn cancel_kills_every_live_session_of_the_task_not_just_the_current_one() 
                 role: "coder",
                 cli_adapter: "claude",
                 model: "sonnet",
+                cleanup: None,
             },
         )
         .await
@@ -12517,7 +12528,7 @@ async fn cancel_kills_every_live_session_of_the_task_not_just_the_current_one() 
         // The earlier stage's run is recorded as finished, exactly as
         // #88's coding run was, while its process is still alive.
         if stage == "coding" {
-            sessions::update_status(&pool, &run_id, SessionStatus::Idle, None, None)
+            sessions::update_status(&pool, &run_id, SessionStatus::Idle, None, None, None)
                 .await
                 .unwrap();
         }
@@ -13592,6 +13603,7 @@ stages:
                     role,
                     cli_adapter: "claude",
                     model,
+                    cleanup: None,
                 },
             )
             .await
@@ -13892,6 +13904,7 @@ async fn crashed_session(pool: &SqlitePool, task_id: &str, stage: &str) -> Sessi
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: Some(SessionCleanup::Pending),
         },
     )
     .await
@@ -13899,7 +13912,7 @@ async fn crashed_session(pool: &SqlitePool, task_id: &str, stage: &str) -> Sessi
     sessions::set_adapter_session_id(pool, &run.id, "adapter-sess-1")
         .await
         .unwrap();
-    sessions::update_status(pool, &run.id, SessionStatus::Idle, None, None)
+    sessions::update_status(pool, &run.id, SessionStatus::Idle, None, None, None)
         .await
         .unwrap()
         .unwrap()
@@ -15759,6 +15772,7 @@ async fn stuck_after_session_on(
             role: "coder",
             cli_adapter: "claude",
             model: "sonnet",
+            cleanup: None,
         },
     )
     .await
@@ -15778,6 +15792,7 @@ async fn stuck_after_session_on(
         SessionStatus::Exited,
         Some(Utc::now()),
         Some(SessionEndReason::Interrupted),
+        None,
     )
     .await
     .unwrap()
