@@ -11692,12 +11692,8 @@ async fn work_by_a_helper_after_the_limit_still_resumes_the_same_conversation() 
 /// The same cutoff with a cleanup that cannot be verified is not made
 /// resumable: it stays `Lingered`, a demanded resume is refused and starts
 /// nothing, and the work and the accepted report are left as they were.
-#[tokio::test]
-async fn unverified_cutoff_is_not_newly_made_resumable() {
-    for (name, cleanup) in [
-        ("a survivor", Cleanup::SurvivorAlive),
-        ("a failed read", Cleanup::OneFailedRead),
-    ] {
+async fn assert_unverified_cutoff_is_not_resumable(name: &str, cleanup: Cleanup) {
+    {
         let c = cutoff_with_leftover(cleanup).await;
         assert_eq!(
             (c.session.status, c.session.end_reason, c.session.cleanup),
@@ -11746,6 +11742,16 @@ async fn unverified_cutoff_is_not_newly_made_resumable() {
             .any(|e| e.payload.to_string().contains("report_outcome"));
         assert!(reported, "{name}: the accepted report was lost");
     }
+}
+
+#[tokio::test]
+async fn unverified_cutoff_is_not_newly_made_resumable_with_a_survivor() {
+    assert_unverified_cutoff_is_not_resumable("a survivor", Cleanup::SurvivorAlive).await;
+}
+
+#[tokio::test]
+async fn unverified_cutoff_is_not_newly_made_resumable_with_a_failed_read() {
+    assert_unverified_cutoff_is_not_resumable("a failed read", Cleanup::OneFailedRead).await;
 }
 
 #[tokio::test]
@@ -12894,13 +12900,9 @@ async fn verified_grace_cleanup_applies_the_completed_verdict_once() {
 /// The same completed report is not applied when the cleanup cannot be
 /// verified: an owned process the last check still sees, or a process table
 /// that failed to read once. The task parks as before and keeps the report.
-#[tokio::test]
-async fn unverified_grace_cleanup_does_not_apply_the_completed_verdict() {
+async fn assert_unverified_grace_does_not_apply(name: &str, cleanup: Cleanup) {
     let (log, _guard) = capture_logs();
-    for (name, cleanup) in [
-        ("a survivor", Cleanup::SurvivorAlive),
-        ("a failed read", Cleanup::OneFailedRead),
-    ] {
+    {
         let r = lingering_review(cleanup).await;
         assert_eq!(r.task.status, "stuck", "{name}: {:?}", r.task);
         assert_eq!(
@@ -12960,6 +12962,16 @@ async fn unverified_grace_cleanup_does_not_apply_the_completed_verdict() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn unverified_grace_cleanup_does_not_apply_the_completed_verdict_with_a_survivor() {
+    assert_unverified_grace_does_not_apply("a survivor", Cleanup::SurvivorAlive).await;
+}
+
+#[tokio::test]
+async fn unverified_grace_cleanup_does_not_apply_the_completed_verdict_with_a_failed_read() {
+    assert_unverified_grace_does_not_apply("a failed read", Cleanup::OneFailedRead).await;
 }
 
 /// An accepted report is not a completed turn without the clean end after

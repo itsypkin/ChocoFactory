@@ -1113,13 +1113,9 @@ async fn a_mixed_review_group_applies_the_cleaned_wake_once() {
 /// report stays on record but the branch fails as lingered, the Claude
 /// sibling's result and session survive, and the group parks once nothing is
 /// running.
-#[tokio::test]
-async fn a_mixed_review_group_with_unverifiable_wake_cleanup_fails_only_that_branch() {
+async fn assert_unverified_wake_fails_only_its_branch(name: &str, cleanup: Cleanup) {
     use chocofactory_core::models::SessionCleanup;
-    for (name, cleanup) in [
-        ("a survivor", Cleanup::SurvivorAlive),
-        ("a failed read", Cleanup::OneFailedRead),
-    ] {
+    {
         let run = start_mixed(cleanup).await;
         let claude_before = run.until_claude_is_done_and_omp_waits().await;
         run.armed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1212,4 +1208,14 @@ async fn a_mixed_review_group_with_unverifiable_wake_cleanup_fails_only_that_bra
             "{name}: {outcomes:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_mixed_review_group_fails_only_the_wake_branch_after_a_survivor() {
+    assert_unverified_wake_fails_only_its_branch("a survivor", Cleanup::SurvivorAlive).await;
+}
+
+#[tokio::test]
+async fn a_mixed_review_group_fails_only_the_wake_branch_after_a_failed_read() {
+    assert_unverified_wake_fails_only_its_branch("a failed read", Cleanup::OneFailedRead).await;
 }
