@@ -1193,7 +1193,18 @@ async fn assert_unverified_wake_fails_only_its_branch(name: &str, cleanup: Clean
     assert!(reported, "{name}: the accepted report was lost");
     // Only the sibling's verdict was ever applied: the wake's is recorded
     // as not applied, or not recorded at all.
-    let outcomes = run.outcomes().await;
+    // The sibling's own outcome event is appended after its branch is
+    // settled, so wait for it rather than read whatever exists at the moment
+    // the group parked.
+    let outcomes = crate::test_support::wait_until("the Claude sibling's turn_outcome", || async {
+        let all = run.outcomes().await;
+        if all.iter().any(|o| o["stage"] == "claude_branch") {
+            Ok(all)
+        } else {
+            Err(format!("{all:?}"))
+        }
+    })
+    .await;
     let applied_of = |branch: &str| {
         outcomes
             .iter()

@@ -97,8 +97,10 @@ and `choco task list --status stuck` finds every stuck task.
   any completed turn does (a read-only role's worktree check, the capture, the
   stage's routing), and if they pass the report is applied once; do not retry
   a task that advanced to apply the verdict again. If one of those checks
-  parked it instead (or it was cancelled), the stuck reason says which, and a
-  retry re-runs the stage; it does not replay the report. A usage-limit
+  parked it instead, the stuck reason says which, and a retry re-runs the
+  stage; it does not replay the report. A task cancelled while the turn
+  waited out the grace period is `cancelled`: it is terminal, has no stuck
+  reason, cannot be retried, and its report is not applied. A usage-limit
   cutoff with verified cleanup ends `interrupted`, not `lingered`: it parks
   with "interrupted by a usage limit before completing" even if a report had
   been accepted, and `choco task retry <id>` attempts to resume the same

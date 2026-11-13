@@ -802,11 +802,14 @@ again (after a revise lap, say) runs every branch again.
 
 A branch fails when its turn can't complete: it ends without reporting (reason
 such as `stage 'security_review': the agent's turn ended without calling
-report_outcome`), crashes, leaves a process running whose cleanup cannot be
-verified, changes the worktree, or hits a usage limit. (A process left running
-after an accepted report and a clean end of the branch's main turn does not
-fail the branch when the cleanup of it is verified; without that clean end, or
-with an unverified cleanup, it does.) It also fails if it reports a result outside its
+report_outcome`), crashes, is killed after the grace period with a process still
+running, changes the worktree, or hits a usage limit. (Only a branch whose
+process outlived the grace period and had to be killed is judged by its
+cleanup: after an accepted report and a clean end of the branch's main turn,
+verified cleanup does not fail the branch, while without that clean end, or
+with an unverified cleanup, it does. A branch whose process exited on its own
+before the grace period keeps its ordinary outcome, whatever its end-of-turn
+cleanup found.) It also fails if it reports a result outside its
 `results:`, and its capture is then dropped (the tool normally refuses such a
 value, so this is a guard). The other branches keep running. When none is left
 running, the task is marked `stuck` with a reason naming each failed branch,

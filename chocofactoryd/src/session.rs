@@ -1736,7 +1736,13 @@ async fn close_after_job_wait(
 /// reported is `NoReport`, even if its process then had to be killed; one the
 /// idle reaper closed mid-turn is `Reaped`, whether it exited cleanly
 /// (`idle`, as before #90) or had to be killed (`exited`); one that
-/// completed or errored but whose process had to be killed is `Lingered`.
+/// completed or errored but whose process had to be killed is `Lingered`,
+/// with two exceptions that apply only when the finalized cleanup is exactly
+/// `Verified`, and only after every earlier arm above has declined: a
+/// completed turn (accepted report and a clean main end) is `idle` with no
+/// reason, and a turn whose main agent ended with an error right after an
+/// unrecovered usage-limit interruption is `Interrupted`. Every other cleanup
+/// value (`Unverified`, `Pending`, none) keeps `Lingered`.
 /// Anything else that exits without having completed is `exited`: cleanly
 /// means it never reported (`NoReport`), otherwise it crashed (no reason).
 ///
