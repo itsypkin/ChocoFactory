@@ -759,8 +759,11 @@ impl SessionManager {
 ///
 /// 1. Report, then `result`: the turn is complete. Stdin is closed so the CLI
 ///    exits, and a grace timer starts. If the process is still alive when it
-///    runs out, its whole group is killed and the run ends `Lingered`: the
-///    turn said it was done while something it started kept going.
+///    runs out, its whole group is killed. The run then ends `Lingered`, the
+///    turn having said it was done while something it started kept going,
+///    unless the cleanup was verified: with the group gone, the last check
+///    empty and the child reaped, the turn is complete (`Idle`) as if it had
+///    left nothing running.
 /// 2. `result` with no report: the turn is waiting (or forgot). Stdin stays
 ///    open, so a background job's notification can wake it. After
 ///    `nudge_after` with no events at all it is nudged on stdin, up to
@@ -784,8 +787,11 @@ impl SessionManager {
 /// The final status write also records `cleanup` for a single-shot turn:
 /// verified only when the end-of-turn sweep ran, the output stream ended on
 /// its own, the last check saw nothing alive with no failed process-table read
-/// in the turn, and the child was reaped. Nothing reads it to decide how the
-/// turn ended.
+/// in the turn, and the child was reaped. Only verified cleanup changes how a
+/// turn ended, and only in two cases where a grace kill would otherwise have
+/// ended it `Lingered`: a completed turn stays complete, and a turn whose main
+/// agent was cut off by a usage limit with nothing after it ends
+/// `Interrupted`. Everything else about the end is decided without it.
 ///
 /// A [`SessionKind::Standing`] session (chat) ignores `result` entirely — it
 /// sees one per turn, and closing stdin after the first would end the
@@ -1248,6 +1254,7 @@ async fn drain_session(
         cancelled.load(Ordering::SeqCst),
         paused.load(Ordering::SeqCst),
         stopping.load(Ordering::SeqCst),
+        cleanup,
     );
     if turn.completed && !clean_exit && !turn.lingered {
         // Surprising but not actionable: the turn reported and ended, and the
@@ -1351,6 +1358,15 @@ struct SingleShotTurn {
     /// from outside, so the run is resumable rather than a failure of the
     /// agent's own.
     interrupted: bool,
+    /// A usage limit was the last thing the main agent's open turn saw: set by
+    /// `Interrupted`, cleared by any main activity or a clean end. Only
+    /// meaningful until the turn's error end consumes it.
+    cutoff_pending: bool,
+    /// The turn's terminating error end arrived while `cutoff_pending` held:
+    /// the main agent was working, hit the limit and was cut off with nothing
+    /// after it. Unlike `interrupted`, a limit the agent recovered from, or one
+    /// that arrived after the turn had closed, never sets it.
+    cutoff_confirmed: bool,
     /// The claude adapter found the role's `claude_settings` not applied (or
     /// unconfirmed) (#346); holds the end reason to record.
     /// Set for a standing session too.
@@ -1389,6 +1405,8 @@ impl Default for SingleShotTurn {
             lingered: false,
             errored: false,
             interrupted: false,
+            cutoff_pending: false,
+            cutoff_confirmed: false,
             settings_end: None,
             background_jobs: Vec::new(),
             background_pending: false,
@@ -1453,6 +1471,19 @@ impl SingleShotTurn {
         if self.completed || self.errored || self.gave_up {
             return TurnStep::Continue;
         }
+        // Main events only: a sub-agent's arrive wrapped in
+        // `AgentEvent::Subagent` and match nothing here. A session's metadata,
+        // background-job levels, protocol errors and errors show no work, so
+        // they leave the cutoff as it was.
+        match event {
+            AgentEvent::Interrupted { .. } => self.cutoff_pending = true,
+            AgentEvent::AssistantMessage { .. }
+            | AgentEvent::Thinking { .. }
+            | AgentEvent::ToolCall { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::ExecutionStarted => self.cutoff_pending = false,
+            _ => {}
+        }
         // The agent is working again after a report-less `result`: woken by a
         // background job's notification, or answering a nudge. Until its next
         // `result` it isn't waiting, so it mustn't be nudged mid-turn by a
@@ -1499,6 +1530,8 @@ impl SingleShotTurn {
             // evidence of anything, so it changes no turn state.
             AgentEvent::ProtocolError { .. } => TurnStep::Continue,
             AgentEvent::TurnCompleted { is_error: true, .. } => {
+                self.cutoff_confirmed = self.cutoff_pending;
+                self.cutoff_pending = false;
                 self.errored = true;
                 self.waiting_for_report = false;
                 TurnStep::EndedWithError
@@ -1506,6 +1539,7 @@ impl SingleShotTurn {
             AgentEvent::TurnCompleted {
                 is_error: false, ..
             } if self.reported => {
+                self.cutoff_pending = false;
                 self.completed = true;
                 self.waiting_for_report = false;
                 TurnStep::Completed
@@ -1513,6 +1547,7 @@ impl SingleShotTurn {
             AgentEvent::TurnCompleted {
                 is_error: false, ..
             } => {
+                self.cutoff_pending = false;
                 self.waiting_for_report = true;
                 TurnStep::WaitingForReport
             }
@@ -1718,8 +1753,11 @@ fn final_run_state(
     reaped: bool,
     cancelled: bool,
     stopping: bool,
+    cleanup: Option<SessionCleanup>,
 ) -> (SessionStatus, Option<SessionEndReason>) {
-    final_run_state_ranked(kind, turn, clean_exit, reaped, cancelled, false, stopping)
+    final_run_state_ranked(
+        kind, turn, clean_exit, reaped, cancelled, false, stopping, cleanup,
+    )
 }
 
 /// [`final_run_state`] with the pause request: Cancelled > Paused >
@@ -1734,6 +1772,7 @@ fn final_run_state_ranked(
     cancelled: bool,
     paused: bool,
     stopping: bool,
+    cleanup: Option<SessionCleanup>,
 ) -> (SessionStatus, Option<SessionEndReason>) {
     use SessionEndReason::{
         Cancelled, DaemonStopped, Interrupted, Lingered, NoReport, Paused, Reaped,
@@ -1791,7 +1830,20 @@ fn final_run_state_ranked(
                 let status = if clean_exit { Idle } else { Exited };
                 (status, Some(Reaped))
             } else if turn.lingered {
-                (Exited, Some(Lingered))
+                // Killing what the agent left behind is bad news only when
+                // the cleanup could not be verified. With it verified, a turn
+                // that had reported and ended cleanly is complete, and one
+                // whose main agent was cut off by a usage limit with nothing
+                // after it is the interruption it would have been had it left
+                // nothing running. Nothing else is promoted: not a report
+                // without a clean end, not a limit the agent recovered from.
+                if cleanup == Some(SessionCleanup::Verified) && turn.completed {
+                    (Idle, None)
+                } else if cleanup == Some(SessionCleanup::Verified) && turn.cutoff_confirmed {
+                    (Exited, Some(Interrupted))
+                } else {
+                    (Exited, Some(Lingered))
+                }
             } else if turn.completed {
                 (Idle, None)
             } else if clean_exit && !turn.errored {
@@ -1928,8 +1980,7 @@ fn lingered_after(report: &KillReport) -> bool {
 fn lingered_carried_message(grace_s: f32, after: &str) -> String {
     format!(
         "the agent's process group had exited {grace_s:.1}s after {after}; an earlier \
-         cleanup of this turn sent SIGKILL to a process it started, so the run is recorded \
-         as lingered"
+         cleanup of this turn sent SIGKILL to a process it started"
     )
 }
 
@@ -2472,7 +2523,7 @@ async fn write_leftover_notes(
             session_id,
             still_running = survivors.len(),
             failed_scans = failures.len(),
-            "the turn's cleanup is not verified; how the turn ended is unchanged"
+            "the turn's cleanup is not verified: a process was still running at the last check, or the process table could not be read"
         );
     }
     let (killed_note, unchecked_note) =
@@ -4015,6 +4066,208 @@ mod tests {
         }
     }
 
+    fn error_end() -> AgentEvent {
+        match clean_end() {
+            AgentEvent::TurnCompleted { usage, .. } => AgentEvent::TurnCompleted {
+                is_error: true,
+                usage,
+            },
+            other => other,
+        }
+    }
+
+    fn limit() -> AgentEvent {
+        AgentEvent::Interrupted {
+            message: "limit".into(),
+            detected_by: crate::adapter::InterruptionEvidence::Structured,
+        }
+    }
+
+    fn helper(event: AgentEvent) -> AgentEvent {
+        AgentEvent::Subagent {
+            parent_tool_use_id: "toolu_helper".into(),
+            event: Box::new(event),
+        }
+    }
+
+    fn main_activity() -> Vec<(&'static str, AgentEvent)> {
+        vec![
+            ("assistant text", AgentEvent::AssistantMessage { text: "x".into() }),
+            ("thinking", AgentEvent::Thinking { text: "x".into() }),
+            (
+                "tool call",
+                AgentEvent::ToolCall {
+                    tool_use_id: "t1".into(),
+                    tool: "Bash".into(),
+                    input: json!({}),
+                },
+            ),
+            (
+                "tool result",
+                AgentEvent::ToolResult {
+                    tool_use_id: "t1".into(),
+                    tool: "Bash".into(),
+                    output: "ok".into(),
+                    is_error: false,
+                },
+            ),
+            ("execution started", AgentEvent::ExecutionStarted),
+        ]
+    }
+
+    /// A limit confirms a cutoff only when nothing the main agent did comes
+    /// after it before the turn's error end. Every category of event is
+    /// either activity (clears it), a limit (sets it), an end (consumes it)
+    /// or neutral (leaves it), over a mix of the ones that matter.
+    #[test]
+    fn a_cutoff_is_confirmed_only_by_a_limit_with_no_main_work_after_it() {
+        let observe = |events: Vec<AgentEvent>| {
+            let mut turn = SingleShotTurn::default();
+            for event in &events {
+                turn.observe(event);
+            }
+            turn
+        };
+        // The production order: the limit message, the interruption, the end.
+        let cut_off = observe(vec![
+            AgentEvent::AssistantMessage { text: "limit".into() },
+            limit(),
+            error_end(),
+        ]);
+        assert!(cut_off.cutoff_confirmed && !cut_off.cutoff_pending);
+
+        // Main activity after the limit clears it, each kind alone.
+        for (name, activity) in main_activity() {
+            let turn = observe(vec![limit(), activity, error_end()]);
+            assert!(!turn.cutoff_confirmed, "{name} after the limit");
+            // And activity before the limit does not.
+            let (_, activity) = main_activity()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .unwrap();
+            let turn = observe(vec![activity, limit(), error_end()]);
+            assert!(turn.cutoff_confirmed, "{name} before the limit");
+        }
+
+        // Neutral main events and anything a helper does leave it alone.
+        let neutral = vec![
+            AgentEvent::SessionMeta {
+                adapter_session_id: "s".into(),
+                details: json!({}),
+            },
+            omp_level(true),
+            AgentEvent::ProtocolError { message: "x".into() },
+            AgentEvent::Error { message: "x".into() },
+            helper(AgentEvent::AssistantMessage { text: "x".into() }),
+            helper(AgentEvent::ExecutionStarted),
+            helper(error_end()),
+            helper(limit()),
+        ];
+        for event in neutral {
+            let turn = observe(vec![limit(), event.clone(), error_end()]);
+            assert!(turn.cutoff_confirmed, "{event:?} must not clear the limit");
+            let turn = observe(vec![event.clone(), error_end()]);
+            assert!(!turn.cutoff_confirmed, "{event:?} must not set a limit");
+        }
+
+        // A clean end consumes it, with and without a report before it, and a
+        // later error end then confirms nothing.
+        for reported in [false, true] {
+            let mut events = Vec::new();
+            if reported {
+                events.push(AgentEvent::ToolCall {
+                    tool_use_id: "r1".into(),
+                    tool: chocofactory_core::mcp::qualified_report_outcome_tool_name(),
+                    input: json!({}),
+                });
+                events.push(AgentEvent::ToolResult {
+                    tool_use_id: "r1".into(),
+                    tool: "report_outcome".into(),
+                    output: "ok".into(),
+                    is_error: false,
+                });
+            }
+            events.extend([limit(), clean_end(), error_end()]);
+            let turn = observe(events);
+            assert!(!turn.cutoff_confirmed, "reported: {reported}");
+        }
+
+        // A closed turn never acquires a cutoff, and one it had keeps it.
+        let errored_then_limit = observe(vec![error_end(), limit(), error_end()]);
+        assert!(!errored_then_limit.cutoff_confirmed && !errored_then_limit.cutoff_pending);
+        let completed_then_limit = observe(vec![
+            AgentEvent::ToolCall {
+                tool_use_id: "r1".into(),
+                tool: chocofactory_core::mcp::qualified_report_outcome_tool_name(),
+                input: json!({}),
+            },
+            AgentEvent::ToolResult {
+                tool_use_id: "r1".into(),
+                tool: "report_outcome".into(),
+                output: "ok".into(),
+                is_error: false,
+            },
+            clean_end(),
+            limit(),
+            error_end(),
+        ]);
+        assert!(completed_then_limit.completed);
+        assert!(!completed_then_limit.cutoff_confirmed && !completed_then_limit.cutoff_pending);
+        let twice = observe(vec![limit(), error_end(), limit(), error_end()]);
+        assert!(twice.cutoff_confirmed);
+        let mut gave_up = SingleShotTurn::default();
+        gave_up.gave_up = true;
+        gave_up.observe(&limit());
+        gave_up.observe(&error_end());
+        assert!(!gave_up.cutoff_confirmed);
+    }
+
+    /// A verified cleanup promotes only the two shapes the grace kill would
+    /// otherwise have ended `Lingered`, and only when it is exactly verified.
+    #[test]
+    fn only_a_verified_cleanup_promotes_a_lingering_turn() {
+        use SessionEndReason::{Interrupted, Lingered};
+        use SessionStatus::{Exited, Idle};
+        let completed = turn_with(|t| {
+            t.completed = true;
+            t.lingered = true;
+        });
+        let cutoff = turn_with(|t| {
+            t.errored = true;
+            t.interrupted = true;
+            t.cutoff_confirmed = true;
+            t.lingered = true;
+        });
+        // Interrupted earlier, recovered, then a generic error end.
+        let recovered = turn_with(|t| {
+            t.errored = true;
+            t.interrupted = true;
+            t.lingered = true;
+        });
+        // Reported but never cleanly ended.
+        let reported_only = turn_with(|t| {
+            t.reported = true;
+            t.errored = true;
+            t.lingered = true;
+        });
+        let rank = |turn: &SingleShotTurn, cleanup| {
+            final_run_state(SessionKind::SingleShot, turn, false, false, false, false, cleanup)
+        };
+        for cleanup in [
+            None,
+            Some(SessionCleanup::Pending),
+            Some(SessionCleanup::Unverified),
+        ] {
+            assert_eq!(rank(&completed, cleanup), (Exited, Some(Lingered)), "{cleanup:?}");
+            assert_eq!(rank(&cutoff, cleanup), (Exited, Some(Lingered)), "{cleanup:?}");
+        }
+        let verified = Some(SessionCleanup::Verified);
+        assert_eq!(rank(&completed, verified), (Idle, None));
+        assert_eq!(rank(&cutoff, verified), (Exited, Some(Interrupted)));
+        assert_eq!(rank(&recovered, verified), (Exited, Some(Lingered)));
+        assert_eq!(rank(&reported_only, verified), (Exited, Some(Lingered)));
+    }
+
     /// The signal, not the list, decides whether the turn is waiting: pending
     /// work with no identities waits (named Claude jobs too), the list alone
     /// does not.
@@ -5283,10 +5536,12 @@ mod tests {
 
     /// The other half of #88: a turn that reported and ended, but whose
     /// process (and what it started) kept running. It's killed once the
-    /// grace period runs out, the run says so, and what it emitted after
-    /// completing is flagged on the timeline instead of blending in.
+    /// grace period runs out and the cleanup is verified, so the completed
+    /// turn stays complete; the `lingered` note records the kill, and what the
+    /// turn emitted after completing is flagged on the timeline instead of
+    /// blending in.
     #[tokio::test]
-    async fn a_process_that_outlives_its_completed_turn_is_killed_and_recorded_as_lingered() {
+    async fn a_process_that_outlives_its_completed_turn_is_killed_and_the_turn_stays_complete() {
         let dir = TempDir::new();
         let heartbeat = dir.0.join("heartbeat");
         let child_pid_path = dir.0.join("child.pid");
@@ -5314,8 +5569,9 @@ mod tests {
 
         let child_pid = read_pid_when_written(&child_pid_path).await;
         let run = wait_until_final(&pool, &session_id).await;
-        assert_eq!(run.status, SessionStatus::Exited);
-        assert_eq!(run.end_reason, Some(SessionEndReason::Lingered));
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(run.end_reason, None);
+        assert_eq!(run.cleanup, Some(SessionCleanup::Verified));
         wait_until_gone(child_pid).await;
 
         let stored = events::list_for_session(&pool, &session_id).await.unwrap();
@@ -5431,6 +5687,7 @@ mod tests {
         reaped: bool,
         cancelled: bool,
         stopping: bool,
+        cleanup: Option<SessionCleanup>,
         expected: (SessionStatus, Option<SessionEndReason>),
     }
 
@@ -5451,7 +5708,9 @@ mod tests {
         let silent = SingleShotTurn::default();
         let completed = turn_with(|t| t.completed = true);
         let ranked = |kind, turn: &SingleShotTurn, cancelled, paused, stopping| {
-            final_run_state_ranked(kind, turn, false, false, cancelled, paused, stopping)
+            final_run_state_ranked(
+                kind, turn, false, false, cancelled, paused, stopping, None,
+            )
         };
         assert_eq!(
             ranked(SingleShot, &silent, false, true, false),
@@ -5502,7 +5761,9 @@ mod tests {
             t.gave_up = true;
         });
         let ranked = |kind, turn: &SingleShotTurn, clean, reaped, cancelled, paused, stopping| {
-            final_run_state_ranked(kind, turn, clean, reaped, cancelled, paused, stopping)
+            final_run_state_ranked(
+                kind, turn, clean, reaped, cancelled, paused, stopping, None,
+            )
         };
         for kind in [SingleShot, Standing] {
             assert_eq!(
@@ -5602,6 +5863,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Idle, None),
             },
             Case {
@@ -5612,6 +5874,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Idle, None),
             },
             Case {
@@ -5622,6 +5885,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Lingered)),
             },
             Case {
@@ -5632,6 +5896,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(NoReport)),
             },
             Case {
@@ -5642,6 +5907,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(NoReport)),
             },
             Case {
@@ -5652,6 +5918,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, None),
             },
             Case {
@@ -5662,6 +5929,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, None),
             },
             Case {
@@ -5672,6 +5940,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Lingered)),
             },
             Case {
@@ -5682,6 +5951,7 @@ mod tests {
                 reaped: true,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Idle, Some(Reaped)),
             },
             Case {
@@ -5692,6 +5962,7 @@ mod tests {
                 reaped: true,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Reaped)),
             },
             Case {
@@ -5702,6 +5973,7 @@ mod tests {
                 reaped: true,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(NoReport)),
             },
             Case {
@@ -5712,6 +5984,7 @@ mod tests {
                 reaped: false,
                 cancelled: true,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -5722,6 +5995,7 @@ mod tests {
                 reaped: false,
                 cancelled: true,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -5732,6 +6006,7 @@ mod tests {
                 reaped: false,
                 cancelled: true,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -5742,6 +6017,7 @@ mod tests {
                 reaped: true,
                 cancelled: true,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -5752,6 +6028,7 @@ mod tests {
                 reaped: false,
                 cancelled: true,
                 stopping: false,
+                cleanup: None,
                 expected: (Idle, Some(Cancelled)),
             },
             Case {
@@ -5762,6 +6039,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Interrupted)),
             },
             Case {
@@ -5775,6 +6053,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Lingered)),
             },
             Case {
@@ -5787,6 +6066,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(NoReport)),
             },
             Case {
@@ -5797,6 +6077,7 @@ mod tests {
                 reaped: false,
                 cancelled: true,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -5807,6 +6088,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Idle, None),
             },
             Case {
@@ -5817,6 +6099,7 @@ mod tests {
                 reaped: true,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Idle, Some(Reaped)),
             },
             Case {
@@ -5827,6 +6110,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, None),
             },
             Case {
@@ -5837,6 +6121,7 @@ mod tests {
                 reaped: true,
                 cancelled: true,
                 stopping: false,
+                cleanup: None,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -5847,6 +6132,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: true,
+                cleanup: None,
                 expected: (Exited, Some(DaemonStopped)),
             },
             Case {
@@ -5857,6 +6143,7 @@ mod tests {
                 reaped: false,
                 cancelled: true,
                 stopping: true,
+                cleanup: None,
                 expected: (Exited, Some(Cancelled)),
             },
             Case {
@@ -5867,6 +6154,7 @@ mod tests {
                 reaped: true,
                 cancelled: false,
                 stopping: true,
+                cleanup: None,
                 expected: (Exited, Some(DaemonStopped)),
             },
             Case {
@@ -5877,6 +6165,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: true,
+                cleanup: None,
                 expected: (Idle, None),
             },
             Case {
@@ -5887,6 +6176,7 @@ mod tests {
                 reaped: false,
                 cancelled: false,
                 stopping: true,
+                cleanup: None,
                 expected: (Idle, Some(DaemonStopped)),
             },
             Case {
@@ -5897,6 +6187,7 @@ mod tests {
                 reaped: false,
                 cancelled: true,
                 stopping: true,
+                cleanup: None,
                 expected: (Exited, Some(Cancelled)),
             },
         ];
@@ -5908,7 +6199,8 @@ mod tests {
                     case.clean_exit,
                     case.reaped,
                     case.cancelled,
-                    case.stopping
+                    case.stopping,
+                    case.cleanup
                 ),
                 case.expected,
                 "{}",
@@ -6689,7 +6981,189 @@ mod tests {
         )
         .await;
         let run = sessions::get(&pool, &id).await.unwrap().unwrap();
-        assert_eq!(run.end_reason, Some(SessionEndReason::Lingered));
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(run.end_reason, None);
+        assert_eq!(run.cleanup, Some(SessionCleanup::Verified));
+    }
+
+    /// The CLI's own limit message, with the machine-readable markers.
+    fn raw_limit_message() -> serde_json::Value {
+        json!({"op": "raw", "line": {
+            "type": "assistant",
+            "message": {
+                "model": "<synthetic>",
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": "You've hit your session limit \u{b7} resets 3:40pm (Europe/Berlin)"
+                }],
+            },
+            "error": "rate_limit",
+            "isApiErrorMessage": true,
+            "apiErrorStatus": 429,
+            "session_id": "limit-session",
+        }})
+    }
+
+    fn raw_tool_call() -> serde_json::Value {
+        json!({"op": "raw", "line": {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": "toolu_ls", "name": "Bash", "input": {"command": "ls"}
+            }]},
+            "session_id": "limit-session",
+        }})
+    }
+
+    fn raw_tool_result() -> serde_json::Value {
+        json!({"op": "raw", "line": {
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "toolu_ls", "content": "ok", "is_error": false
+            }]},
+            "session_id": "limit-session",
+        }})
+    }
+
+    /// Runs a fixture with an owned escaped job to the end of its turn and
+    /// returns the session's final row.
+    async fn run_with_escaped_job(extra_steps: Vec<serde_json::Value>) -> chocofactory_core::models::Session {
+        let (pool, id, _job) = assert_escaped_job_is_killed_with_pid(
+            extra_steps,
+            fast_timers(3),
+            EndAction::Nothing,
+        )
+        .await;
+        sessions::get(&pool, &id).await.unwrap().unwrap()
+    }
+
+    /// The main agent hit the limit and was cut off with nothing after it:
+    /// with its leftover verified gone the run is the interruption it would
+    /// have been without one, not a success.
+    #[tokio::test]
+    async fn a_terminating_cutoff_with_verified_cleanup_is_interrupted_not_lingered() {
+        let run = run_with_escaped_job(vec![
+            json!({"op": "report", "outcome": "done"}),
+            json!({"op": "usage_limit"}),
+            json!({"op": "sleep", "seconds": 60}),
+        ])
+        .await;
+        assert_eq!(
+            (run.status, run.end_reason, run.cleanup),
+            (
+                SessionStatus::Exited,
+                Some(SessionEndReason::Interrupted),
+                Some(SessionCleanup::Verified)
+            )
+        );
+    }
+
+    /// A limit the agent carried on past does not make a later, ordinary
+    /// failure resumable, whatever kind of work it carried on with and
+    /// whether or not it ended a turn cleanly in between.
+    #[tokio::test]
+    async fn a_recovered_limit_does_not_gain_linger_resume() {
+        let generic_error = json!({"op": "result", "is_error": true});
+        let cases: Vec<(&str, Vec<serde_json::Value>)> = vec![
+            (
+                "text after the limit",
+                vec![
+                    raw_limit_message(),
+                    json!({"op": "text", "text": "carrying on"}),
+                    generic_error.clone(),
+                ],
+            ),
+            (
+                "tool call and result after the limit",
+                vec![
+                    raw_limit_message(),
+                    raw_tool_call(),
+                    raw_tool_result(),
+                    generic_error.clone(),
+                ],
+            ),
+            (
+                "a clean report-less end after the limit",
+                vec![raw_limit_message(), json!({"op": "result"}), generic_error.clone()],
+            ),
+        ];
+        for (name, mut steps) in cases {
+            steps.push(json!({"op": "sleep", "seconds": 60}));
+            let run = run_with_escaped_job(steps).await;
+            assert_eq!(
+                (run.status, run.end_reason, run.cleanup),
+                (
+                    SessionStatus::Exited,
+                    Some(SessionEndReason::Lingered),
+                    Some(SessionCleanup::Verified)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// Control for the case above: what a sub-agent does after the limit is
+    /// not the main agent working, so the cutoff stands. The ending is a
+    /// generic error, not a second limit, which would hide a mistake.
+    #[tokio::test]
+    async fn work_by_a_helper_after_the_limit_does_not_undo_the_cutoff() {
+        let run = run_with_escaped_job(vec![
+            raw_limit_message(),
+            json!({"op": "text", "text": "helper busy", "parent": "toolu_01W3VQxTmyXy3B7b1bmz9YaX"}),
+            json!({"op": "result", "is_error": true}),
+            json!({"op": "sleep", "seconds": 60}),
+        ])
+        .await;
+        assert_eq!(
+            (run.status, run.end_reason, run.cleanup),
+            (
+                SessionStatus::Exited,
+                Some(SessionEndReason::Interrupted),
+                Some(SessionCleanup::Verified)
+            )
+        );
+    }
+
+    /// An accepted report that never got a clean end is not a completed
+    /// turn, however well the cleanup went: an error end stays `Lingered`, and
+    /// an exit with no end at all is the plain `NoReport` / crash it was.
+    #[tokio::test]
+    async fn a_report_without_a_clean_end_cannot_gain_cleanup_success() {
+        let run = run_with_escaped_job(vec![
+            json!({"op": "report", "outcome": "done"}),
+            json!({"op": "result", "is_error": true}),
+            json!({"op": "sleep", "seconds": 60}),
+        ])
+        .await;
+        assert_eq!(
+            (run.status, run.end_reason, run.cleanup),
+            (
+                SessionStatus::Exited,
+                Some(SessionEndReason::Lingered),
+                Some(SessionCleanup::Verified)
+            )
+        );
+        // Without an end the process simply exits: exit 0 never reported a
+        // completed turn, exit 17 is a crash.
+        for (code, expected) in [(0, Some(SessionEndReason::NoReport)), (17, None)] {
+            let dir = TempDir::new();
+            let binary = script_binary(
+                &dir.0,
+                json!([
+                    {"op": "read_turn"},
+                    {"op": "report", "outcome": "done"},
+                    {"op": "exit", "code": code},
+                ]),
+            );
+            let (pool, session_id, _manager) =
+                start_leftovers(binary, fast_timers(3), chrono::Duration::hours(1), None).await;
+            let run = wait_until_final(&pool, &session_id).await;
+            assert_eq!(
+                (run.status, run.end_reason),
+                (SessionStatus::Exited, expected),
+                "exit {code}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6981,10 +7455,11 @@ mod tests {
         }
     }
 
-    /// With the table unreadable, the group kill is still sent, the turn ends
-    /// the way it does with a working reader, and the operator is told.
+    /// With the table unreadable, the group kill is still sent, the turn stays
+    /// `Lingered` instead of completing the way it does with a working reader,
+    /// and the operator is told.
     #[tokio::test]
-    async fn an_unreadable_process_table_is_reported_and_changes_nothing_else() {
+    async fn an_unreadable_process_table_is_reported_and_leaves_the_turn_lingering() {
         async fn run(
             reader: Option<crate::proc_table::ProcReader>,
         ) -> (
@@ -7021,10 +7496,15 @@ mod tests {
             Arc::new(|_| Err(std::io::Error::other("injected failure")));
         let (status, reason, cleanup, notes) = run(Some(broken)).await;
         let (good_status, good_reason, good_cleanup, good_notes) = run(None).await;
-        assert_eq!((status, reason), (good_status, good_reason));
-        assert_eq!(reason, Some(SessionEndReason::Lingered));
-        // Only the cleanup differs: nothing could confirm the unreadable run.
+        // Nothing could confirm the unreadable run, so the grace kill still
+        // leaves it lingering; the same turn with a working reader is verified
+        // and stays complete.
+        assert_eq!(
+            (status, reason),
+            (SessionStatus::Exited, Some(SessionEndReason::Lingered))
+        );
         assert_eq!(cleanup, Some(SessionCleanup::Unverified));
+        assert_eq!((good_status, good_reason), (SessionStatus::Idle, None));
         assert_eq!(good_cleanup, Some(SessionCleanup::Verified));
         assert!(
             notes.contains(&"leftovers_unchecked".to_string()),
@@ -8333,8 +8813,8 @@ mod tests {
         (buf, guard)
     }
 
-    const NOT_VERIFIED: &str =
-        "the turn's cleanup is not verified; how the turn ended is unchanged";
+    const NOT_VERIFIED: &str = "the turn's cleanup is not verified: a process was still running \
+         at the last check, or the process table could not be read";
 
     /// Writes the notes of a tracker holding these findings, with the log
     /// captured; returns the log.
@@ -10493,9 +10973,11 @@ mod tests {
     /// The whole drain, as `shutdown_then_grace_preserves_completed_run_status`
     /// runs it, with a worker the earlier site kills in its extra rounds and
     /// that has really exited by grace, which finds nothing. The earlier kill
-    /// cannot erase the lingering result by succeeding.
+    /// cannot erase the lingering result by succeeding: the grace kill is still
+    /// recorded in a `lingered` note, and the verified cleanup then keeps the
+    /// completed turn complete.
     #[tokio::test]
-    async fn an_earlier_kill_that_really_died_still_keeps_the_run_lingered() {
+    async fn an_earlier_kill_that_really_died_still_counts_as_lingering_but_a_verified_cleanup_completes() {
         let pool = connect_in_memory().await.unwrap();
         let session_id = seed_session_for(&pool, SessionKind::SingleShot).await;
         let mut worker = Sleeper::spawn(None, true);
@@ -10599,10 +11081,15 @@ mod tests {
 
         let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(
-            (run.status, run.end_reason),
-            (SessionStatus::Exited, Some(SessionEndReason::Lingered)),
-            "an earlier cleanup kill that succeeded must not erase the lingering result"
+            (run.status, run.end_reason, run.cleanup),
+            (
+                SessionStatus::Idle,
+                None,
+                Some(SessionCleanup::Verified)
+            ),
+            "the completed turn stays complete after a verified cleanup"
         );
+        // The note exists only if grace counted the earlier kill as lingering.
         let lingered = note_message(&pool, &session_id, "lingered").await.unwrap();
         assert!(
             lingered.contains("an earlier cleanup of this turn sent SIGKILL to a process")

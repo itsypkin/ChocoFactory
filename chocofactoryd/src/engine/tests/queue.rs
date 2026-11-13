@@ -735,7 +735,7 @@ async fn a_turn_that_hits_a_usage_limit_frees_its_slot() {
 
 #[tokio::test]
 async fn a_turn_whose_process_lingers_frees_its_slot() {
-    ending_frees_the_slot(Ending::Lingers, "stuck").await;
+    ending_frees_the_slot(Ending::Lingers, "closed").await;
 }
 
 #[tokio::test]
