@@ -6664,7 +6664,10 @@ mod tests {
         );
         // A pid ps does not list is "no match": exit 1 with nothing printed.
         // Any other failure, or a diagnostic, is not an observation.
-        assert!(diagnostics.is_empty(), "ps reported a problem: {diagnostics:?}");
+        assert!(
+            diagnostics.is_empty(),
+            "ps reported a problem: {diagnostics:?}"
+        );
         assert!(
             (listed.status.code() == Some(1) && stat.is_empty())
                 || (listed.status.success() && stat.starts_with('Z')),
