@@ -52,8 +52,11 @@ broke it. That covers only tests already on main: a test your change adds that f
 change's defect, so find the race before approving it.
 
 Run one cargo command at a time in a worktree. A second build only waits on the first's lock on the
-target dir, and on this repo's 8 GB development machine it starves everything else. To loop a test
-under load, build once with `--no-run` and run the test binary directly.
+target dir, and on this repo's 8 GB development machine it starves everything else. Run every cargo
+build, test and clippy as `/usr/bin/lockf -k $HOME/.cargo-shared.lock cargo …`, so builds from every
+project on the machine queue one at a time. Wrap only the outer cargo command, never a script that
+itself calls a wrapped cargo. To loop a test under load, build once with `--no-run` under the lock and
+run the test binary directly, outside it.
 
 ## Self-check before opening a PR
 
