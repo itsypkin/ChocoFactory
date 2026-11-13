@@ -6641,18 +6641,35 @@ mod tests {
         // An independent look at the same fact: the process list, not the
         // `kill(pid, 0)` probe the helper used, shows the job gone (or only a
         // zombie awaiting its reaper, which is not alive).
-        let listed = std::process::Command::new("ps")
-            .args(["-p", &job.to_string(), "-o", "stat="])
-            .output()
-            .expect("ps runs");
+        let ps_stat = |pid: u32| {
+            std::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .expect("ps runs")
+        };
+        // The invocation itself is sound: it finds this very process.
+        let own = ps_stat(std::process::id());
+        assert!(
+            own.status.success() && !own.stdout.is_empty(),
+            "ps cannot look up a live pid: status {:?}, stderr {:?}",
+            own.status.code(),
+            String::from_utf8_lossy(&own.stderr)
+        );
+        let listed = ps_stat(job);
         let stat = String::from_utf8_lossy(&listed.stdout).trim().to_string();
+        let diagnostics = String::from_utf8_lossy(&listed.stderr).trim().to_string();
         eprintln!(
-            "ps -p {job} -o stat= -> status {:?}, stdout {stat:?}",
+            "ps -p {job} -o stat= -> status {:?}, stdout {stat:?}, stderr {diagnostics:?}",
             listed.status.code()
         );
+        // A pid ps does not list is "no match": exit 1 with nothing printed.
+        // Any other failure, or a diagnostic, is not an observation.
+        assert!(diagnostics.is_empty(), "ps reported a problem: {diagnostics:?}");
         assert!(
-            stat.is_empty() || stat.starts_with('Z'),
-            "ps still lists the job as alive: {stat:?}"
+            (listed.status.code() == Some(1) && stat.is_empty())
+                || (listed.status.success() && stat.starts_with('Z')),
+            "ps still lists the job as alive, or failed: status {:?}, stdout {stat:?}",
+            listed.status.code()
         );
     }
 
@@ -7356,6 +7373,108 @@ mod tests {
         let run = sessions::get(&pool, &session_id).await.unwrap().unwrap();
         assert_eq!(run.status, SessionStatus::Active);
         assert_eq!(run.cleanup, Some(SessionCleanup::Pending));
+    }
+
+    /// The live handles of a session, once its map slot is `Live`.
+    async fn live_signals(manager: &SessionManager, session_id: &str) -> SessionSignals {
+        crate::test_support::wait_until("the session to be live", || async {
+            match manager.sessions.lock().await.get(session_id) {
+                Some(SessionSlot::Live(session)) => Ok(session.signals.clone()),
+                _ => Err("not live yet".to_string()),
+            }
+        })
+        .await
+    }
+
+    /// A turn held on a release file, then reporting, ending its turn and
+    /// exiting by itself. Nothing is left behind and the output ends on its
+    /// own, so only what a test changes can affect the cleanup.
+    fn held_clean_turn(dir: &TempDir) -> (String, PathBuf) {
+        let release = dir.0.join("release");
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "wait_file", "path": release},
+                {"op": "report", "outcome": "done"},
+                {"op": "result"},
+                {"op": "exit"},
+            ]),
+        );
+        (binary, release)
+    }
+
+    /// No pid at the tail means the end-of-turn sweep could not run, so
+    /// nothing was checked: the cleanup is not verified even though the
+    /// process exits and its output ends on their own.
+    #[tokio::test]
+    async fn a_missing_pid_at_the_tail_keeps_cleanup_unverified() {
+        let dir = TempDir::new();
+        let (binary, release) = held_clean_turn(&dir);
+        let (pool, session_id, manager) = start_single_shot(
+            binary,
+            TurnTimers {
+                grace: crate::test_support::LOAD_ALLOWANCE,
+                ..fast_timers(3)
+            },
+        )
+        .await;
+        let signals = live_signals(&manager, &session_id).await;
+        assert!(signals.pgid.lock().await.take().is_some(), "had a pid");
+        std::fs::write(&release, "go").unwrap();
+        let run = wait_until_final(&pool, &session_id).await;
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(run.end_reason, None);
+        assert_eq!(
+            run.cleanup,
+            Some(SessionCleanup::Unverified),
+            "no sweep ran, so nothing was verified"
+        );
+    }
+
+    /// A failed reap is never verified. The child is reaped behind the
+    /// drain's back after the pid is retired and before it waits, so `wait`
+    /// fails while the sweep, the output and the last check are all clean.
+    #[tokio::test]
+    async fn a_failed_reap_keeps_cleanup_unverified() {
+        let dir = TempDir::new();
+        let (binary, release) = held_clean_turn(&dir);
+        let (pool, session_id, manager) = start_single_shot(
+            binary,
+            TurnTimers {
+                grace: crate::test_support::LOAD_ALLOWANCE,
+                ..fast_timers(3)
+            },
+        )
+        .await;
+        let signals = live_signals(&manager, &session_id).await;
+        let child = signals.pgid.lock().await.expect("a live session has a pid");
+        let reaped_by_test = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (seen, pgid) = (Arc::clone(&reaped_by_test), Arc::clone(&signals.pgid));
+        let hook: LockHook = Box::new(move |_| {
+            // Only once the tail has retired the pid (it holds this lock
+            // during its own sweep, so a held lock means "not yet").
+            let retired = matches!(pgid.try_lock(), Ok(guard) if guard.is_none());
+            if retired && seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut status = 0;
+                // SAFETY: waits for our own child; blocks until it exits.
+                let rc = unsafe { libc::waitpid(child as i32, &mut status, 0) };
+                assert_eq!(rc, child as i32, "the test could not reap the child");
+            }
+        });
+        assert!(signals.tracker.before_lock.set(hook).is_ok());
+        std::fs::write(&release, "go").unwrap();
+        let run = wait_until_final(&pool, &session_id).await;
+        assert!(
+            reaped_by_test.load(Ordering::SeqCst) >= 1,
+            "the hook never reaped the child"
+        );
+        assert_eq!(run.status, SessionStatus::Idle);
+        assert_eq!(
+            run.cleanup,
+            Some(SessionCleanup::Unverified),
+            "a failed reap was not verified"
+        );
     }
 
     /// A job that keeps the agent's output open outlives the kill: the drain
