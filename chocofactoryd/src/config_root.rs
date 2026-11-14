@@ -96,6 +96,10 @@ const BUILTIN_WORKFLOW_SCRIPTS: &[(&str, &str)] = &[
         "ci-checks.sh",
         include_str!("../../workflows/scripts/ci-checks.sh"),
     ),
+    (
+        "await-merge.sh",
+        include_str!("../../workflows/scripts/await-merge.sh"),
+    ),
 ];
 
 /// What [`seed_builtin_workflows`] actually did — which files it wrote for
@@ -946,9 +950,160 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         };
         assert_eq!(*capture, Some(Capture::Text));
         assert!(markers.is_empty(), "{markers:?}");
-        assert!(watch.is_none());
-        assert_eq!(on_map(gate), [("resumed", "revising")]);
+        // The gate watches only for a merge (#379); a plain reply still goes
+        // to `revising`.
+        assert!(watch.is_some());
+        assert_eq!(on_map(gate), [("resumed", "revising"), ("merged", "done")]);
         assert!(gate.loop_guard.is_none(), "blocker must have no loop guard");
+    }
+
+    /// The contract of one parked gate's merge watcher, pinned field by field.
+    fn assert_parked_merge_watch(
+        def: &crate::workflow_def::WorkflowDefinition,
+        gate_name: &str,
+        scripts: &Path,
+        what: &str,
+    ) {
+        use crate::workflow_def::{BackoffStep, Capture, ShellCommand, StageKind};
+        use std::time::Duration;
+        let gate = &def.stages[gate_name];
+        let StageKind::HumanGate {
+            capture,
+            markers,
+            watch,
+        } = &gate.kind
+        else {
+            panic!("{what}: {gate_name} must be a human_gate");
+        };
+        assert_eq!(*capture, Some(Capture::Text), "{what} {gate_name}");
+        assert!(markers.is_empty(), "{what} {gate_name}: {markers:?}");
+        let watch = watch
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what} {gate_name} must watch"));
+        assert_eq!(
+            watch.command,
+            ShellCommand::ScriptFile(scripts.join("await-merge.sh")),
+            "{what} {gate_name}"
+        );
+        let env: Vec<(&str, &str)> = watch
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            env,
+            [("PR_NUMBER", "{{ stages.open_pr.number }}")],
+            "{what} {gate_name}"
+        );
+        assert_eq!(
+            watch.interval,
+            Duration::from_secs(60),
+            "{what} {gate_name}"
+        );
+        assert_eq!(
+            watch.backoff,
+            [
+                BackoffStep {
+                    after: Duration::from_secs(6 * 3600),
+                    interval: Duration::from_secs(5 * 60)
+                },
+                BackoffStep {
+                    after: Duration::from_secs(30 * 3600),
+                    interval: Duration::from_secs(30 * 60)
+                },
+            ],
+            "{what} {gate_name} backoff"
+        );
+        assert_eq!(watch.timeout, None, "{what} {gate_name} has no deadline");
+        assert!(
+            !gate.on.contains_key("timeout"),
+            "{what} {gate_name} has no timeout edge"
+        );
+        assert_eq!(watch.outcomes.len(), 1, "{what} {gate_name}");
+        assert_eq!(
+            watch.outcomes[0].pattern, r"\AMERGED(\n|$)",
+            "{what} {gate_name}"
+        );
+        assert_eq!(watch.outcomes[0].then, "merged", "{what} {gate_name}");
+        assert_eq!(
+            on_map(gate),
+            [("resumed", "revising"), ("merged", "done")],
+            "{what} {gate_name}"
+        );
+        // The same schedule as the review gate's, checked on the same
+        // definition, so the two cannot drift apart unseen.
+        let review = def.stages["awaiting_human_review"]
+            .watch()
+            .expect("the review gate watches");
+        assert_eq!(watch.interval, review.interval, "{what} {gate_name}");
+        assert_eq!(watch.backoff, review.backoff, "{what} {gate_name}");
+        assert_eq!(review.timeout, Some(Duration::from_secs(102 * 3600)));
+    }
+
+    /// The two parked gates of both built-ins watch for a merge with the
+    /// review gate's schedule and no deadline (#379), as seeded and as
+    /// materialized for the daemon, with the script resolvable and
+    /// executable there. Nothing else gained a merge watcher.
+    #[test]
+    fn parked_merge_watch_uses_review_backoff_without_deadline() {
+        use crate::workflow_def::StageKind;
+        for how in ["seeded", "materialized"] {
+            let dir = TempDir::new();
+            if how == "seeded" {
+                seed_builtin_workflows(&dir.path).unwrap();
+            } else {
+                materialize_builtins(&dir.path).unwrap();
+            }
+            let script = dir.path.join("scripts/await-merge.sh");
+            let embedded = BUILTIN_WORKFLOW_SCRIPTS
+                .iter()
+                .find(|(name, _)| *name == "await-merge.sh")
+                .expect("await-merge.sh is embedded")
+                .1;
+            assert_eq!(std::fs::read_to_string(&script).unwrap(), embedded, "{how}");
+            assert_eq!(mode_of(&script) & 0o111, 0o111, "{how}");
+            for file in ["coding-task.yaml", "coding-task-planned.yaml"] {
+                let def = load_seeded(&dir, file);
+                let what = format!("{how} {file}");
+                for gate in ["escalate_to_human", "blocker"] {
+                    assert_parked_merge_watch(&def, gate, &dir.path.join("scripts"), &what);
+                }
+                // Only the two parked gates and the review gate watch a merge.
+                let watchers: Vec<&str> = def
+                    .stages
+                    .iter()
+                    .filter(|(_, stage)| {
+                        matches!(stage.kind, StageKind::HumanGate { .. }) && stage.watch().is_some()
+                    })
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                assert_eq!(watchers.len(), 3, "{what}: {watchers:?}");
+                for name in ["escalate_to_human", "blocker", "awaiting_human_review"] {
+                    assert!(watchers.contains(&name), "{what}: {name} in {watchers:?}");
+                }
+                // The review gate keeps its own 102h timeout and routes.
+                let review = &def.stages["awaiting_human_review"];
+                assert_eq!(
+                    on_map(review),
+                    [
+                        ("approved", "done"),
+                        ("changes_requested", "revising"),
+                        ("conflicting", "base_conflict"),
+                        ("timeout", "escalate_to_human"),
+                    ],
+                    "{what}"
+                );
+                if let StageKind::HumanGate { markers, .. } = &review.kind {
+                    assert_eq!(markers.len(), 2, "{what}");
+                }
+            }
+            // The planned workflow's shared stages are the base's.
+            let base = load_seeded(&dir, "coding-task.yaml");
+            let planned = load_seeded(&dir, "coding-task-planned.yaml");
+            for stage in ["escalate_to_human", "blocker", "awaiting_human_review"] {
+                assert_eq!(base.stages[stage], planned.stages[stage], "{how} {stage}");
+            }
+        }
     }
 
     /// The workflow's `markers:` and the shared case table agree: a marker

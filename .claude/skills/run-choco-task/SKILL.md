@@ -407,7 +407,10 @@ is in [reference/recover.md](reference/recover.md).
 Merging the PR also moves the task to `done` at the gate's next check
 (every minute for its first 6 hours, then every 5 minutes, then every 30
 minutes after 30 hours), without a vote, so don't post `/approve` after
-merging; a PR closed without merging doesn't move the task. `done` deletes the task's local branch only if it was
+merging; a PR closed without merging doesn't move the task. A task parked at
+`escalate_to_human` or `blocker` notices a merge the same way, on the same
+schedule counted from when it parked, with no time limit: don't cancel it or
+send a note. `done` deletes the task's local branch only if it was
 pushed or merged; the remote `task/<id>` branch stays unless the repo
 deletes merged head branches.
 
@@ -461,7 +464,9 @@ cancelling. In short:
   branch can't resume; `--fresh` starts every failed branch fresh); it is
   refused while a branch session is still live (wait for it to end, then
   retry, or cancel).
-- `escalate_to_human` → after a review timeout, `choco task retry <id>`
+- `escalate_to_human` → if you merged the PR, wait: the task moves to `done`
+  by itself at its next check (don't cancel it or send a note); after a review
+  timeout of an unmerged PR, `choco task retry <id>`
   watches again at no cost; after a CI timeout, re-run CI on GitHub, then
   `choco task retry <id>` (if `choco task events <id> --json` shows a
   `CI_RERUN_FAILED is '...'` note instead, fix that value in the workflow file,
@@ -470,7 +475,8 @@ cancelling. In short:
   moves on through a coder lap. `/approve` alone is refused there.
 - `blocker` → the coder stopped on a rule the spec sets. Read its report,
   then `choco task send <id> --text "<answer>"` (a reply that is only
-  `/approve` is refused) or `choco task cancel <id>`; see
+  `/approve` is refused) or `choco task cancel <id>`; a merged PR closes the
+  task by itself; see
   [reference/recover.md](reference/recover.md#blocker-answer-or-cancel).
 - `choco task cancel <id>` is final and deletes the task's worktree and
   local branch; `--keep` keeps both for you to take over.

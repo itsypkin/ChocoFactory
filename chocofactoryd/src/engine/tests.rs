@@ -7,9 +7,11 @@ use super::watch::{catch_up_len, final_attempt_limit, missed};
 use super::*;
 
 mod claude_settings;
+mod gate_retry;
 mod model_level;
 mod omp_wake;
 mod parallel;
+mod parked_gates;
 mod pause;
 mod queue;
 
@@ -7793,8 +7795,19 @@ async fn conflict_rig(pr_mergeable: &str, verdict: &str, seq: &str) -> ConflictR
     config_root::seed_builtin_workflows(&workflows_dir).unwrap();
     let yaml_path = workflows_dir.join("coding-task.yaml");
     let yaml = fs::read_to_string(&yaml_path).unwrap();
-    assert_eq!(yaml.matches("interval: 60s").count(), 1);
-    fs::write(&yaml_path, yaml.replace("interval: 60s", "interval: 1s")).unwrap();
+    // Only the review gate's interval: the two parked gates' merge watchers
+    // keep their shipped 60s.
+    assert_eq!(yaml.matches("interval: 60s").count(), 3);
+    let review_gate = yaml.find("\n  awaiting_human_review:").unwrap();
+    let (before, from_gate) = yaml.split_at(review_gate);
+    fs::write(
+        &yaml_path,
+        format!(
+            "{before}{}",
+            from_gate.replacen("interval: 60s", "interval: 1s", 1)
+        ),
+    )
+    .unwrap();
     let def = Arc::new(WorkflowDefinition::load(&yaml_path).unwrap());
     let engine = engine_with_adapter_and_workflows_dir(
         pool.clone(),
@@ -8267,63 +8280,6 @@ async fn a_task_waiting_for_review_survives_the_upgrade() {
         wait_until_stage(&pool, &task_id, "done").await;
         wait_until_task_status(&pool, &task_id, "closed").await;
     }
-}
-
-/// #175, the upgrade for a task the previous daemon left at
-/// `escalate_to_human`, a gate with no watcher: the sweep fills in its kind
-/// (which is what keeps it in "Needs you") and starts nothing.
-#[tokio::test]
-async fn an_escalated_task_keeps_waiting_on_a_human_after_the_upgrade() {
-    let pool = connect_in_memory().await.unwrap();
-    let repo = tempdir();
-    init_git_repo(&repo).await;
-    let scripts_dir = tempdir();
-    let (task_id, _def, claude_wrapper) = seed_coding_task(
-        &pool,
-        &repo,
-        &scripts_dir,
-        r#"{"outcome": "approved", "feedback": ""}"#,
-    )
-    .await;
-    // Resuming reloads the workflow by name, so seed the shipped ones.
-    let workflows_dir = tempdir();
-    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
-    let engine = engine_with_adapter_and_workflows_dir(
-        pool.clone(),
-        &claude_wrapper.to_string_lossy(),
-        &workflows_dir,
-    );
-
-    workflow_state::create(
-        &pool,
-        &task_id,
-        "escalate_to_human",
-        "human_gate",
-        json!({ "task": { "title": "Add a small feature", "input": "x" } }),
-    )
-    .await
-    .unwrap();
-    sqlx::query("UPDATE workflow_state SET stage_kind = NULL WHERE task_id = ?")
-        .bind(&task_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    engine.park_interrupted_turns().await.unwrap();
-    let report = engine.resume_interrupted_polls().await.unwrap();
-    assert_eq!(report.resumed, 0, "{report:?}");
-    assert!(!engine.has_detached_runner(&task_id));
-
-    let task = tasks::get(&pool, &task_id).await.unwrap().unwrap();
-    assert_eq!(task.status, "open");
-    let state = state_of(&pool, &task_id).await;
-    assert_eq!(state.current_stage, "escalate_to_human");
-    assert_eq!(state.stage_kind.as_deref(), Some("human_gate"));
-    let summaries = tasks::list_summaries(&pool, None, &[], tasks::SummaryOrder::Id, None)
-        .await
-        .unwrap();
-    let summary = summaries.iter().find(|t| t.task.id == task_id).unwrap();
-    assert!(summary.waiting_on_human);
 }
 
 /// A planner report carrying the four sections `spec_check` enforces.
@@ -17387,9 +17343,14 @@ async fn rewatch_setup(
 
 #[tokio::test]
 async fn retry_at_a_gate_after_a_watcher_timeout_watches_again() {
-    for (from, timeout) in [("review", 3600), ("ci", 1800)] {
+    // `esc_w` is a gate with a watcher of its own: retry still goes back.
+    for (from, timeout, gate) in [
+        ("review", 3600, "esc"),
+        ("ci", 1800, "esc"),
+        ("ci2", 1800, "esc_w"),
+    ] {
         let (pool, _dir, task_id, engine, now) =
-            rewatch_setup("esc", json!({ "from": from, "outcome": "timeout" })).await;
+            rewatch_setup(gate, json!({ "from": from, "outcome": "timeout" })).await;
         let before = state_of(&pool, &task_id).await;
         let outcome = engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
         assert_eq!(
@@ -17410,7 +17371,7 @@ async fn retry_at_a_gate_after_a_watcher_timeout_watches_again() {
         assert_eq!(state.loop_counters, before.loop_counters);
         assert_eq!(
             state.payload["arrival"],
-            json!({ "from": "esc", "outcome": "retry" })
+            json!({ "from": gate, "outcome": "retry" })
         );
         let window = poll_window_for(&state.payload, from).unwrap().unwrap();
         assert_eq!(window.entered_at, now);
@@ -17455,11 +17416,6 @@ async fn retry_refuses_an_open_task_that_did_not_time_out_at_a_gate() {
             "a watcher timing out elsewhere",
             "esc2",
             json!({ "from": "review", "outcome": "timeout" }),
-        ),
-        (
-            "a gate that watches itself",
-            "esc_w",
-            json!({ "from": "ci2", "outcome": "timeout" }),
         ),
         (
             "a non-gate stage",

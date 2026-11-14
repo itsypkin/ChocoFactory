@@ -96,13 +96,39 @@ stages:
   escalate_to_human:
     kind: human_gate
     capture: text
-    on: { resumed: revising }
+    watch:
+      script_file: scripts/await-merge.sh
+      env:
+        PR_NUMBER: "{{ stages.open_pr.number }}"
+      interval: 60s
+      # The cadence of `awaiting_human_review`, counted from entering this
+      # gate. No `timeout`: a parked gate waits for its human indefinitely.
+      backoff:
+        - { after: 6h, interval: 5m }
+        - { after: 30h, interval: 30m }
+      outcomes:
+        - match: '\AMERGED(\n|$)'
+          then: merged
+    on: { resumed: revising, merged: done }
 
   # Same as `coding-task.yaml`'s `blocker`.
   blocker:
     kind: human_gate
     capture: text
-    on: { resumed: revising }
+    watch:
+      script_file: scripts/await-merge.sh
+      env:
+        PR_NUMBER: "{{ stages.open_pr.number }}"
+      interval: 60s
+      # The cadence of `awaiting_human_review`, counted from entering this
+      # gate. No `timeout`: a parked gate waits for its human indefinitely.
+      backoff:
+        - { after: 6h, interval: 5m }
+        - { after: 30h, interval: 30m }
+      outcomes:
+        - match: '\AMERGED(\n|$)'
+          then: merged
+    on: { resumed: revising, merged: done }
 
   # Same as `coding-task.yaml`'s `open_pr`.
   open_pr:

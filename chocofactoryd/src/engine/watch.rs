@@ -120,17 +120,18 @@ pub(crate) struct TimedOutWatch {
 
 /// Whether a task at `current_stage` is waiting there because a watcher
 /// timed out, so that `retry` can watch again. Callers check the task is
-/// `open`. All of these must hold: the stage is a `human_gate` with no
-/// watcher of its own (a gate that already watches never gets a second
-/// one); the task arrived with outcome `timeout`; it came from a stage that
-/// has a watcher; and that stage's `timeout` edge leads to this gate.
+/// `open`. All of these must hold: the stage is a `human_gate`; the task
+/// arrived with outcome `timeout`; it came from a stage that has a watcher;
+/// and that stage's `timeout` edge leads to this gate. The gate may watch
+/// for something of its own (a merge, say): retry then stops that watcher
+/// and goes back to the one that timed out.
 pub(crate) fn timed_out_watch(
     definition: &WorkflowDefinition,
     current_stage: &str,
     payload: &Value,
 ) -> Option<TimedOutWatch> {
     let gate = definition.stages.get(current_stage)?;
-    if !matches!(gate.kind, StageKind::HumanGate { .. }) || gate.watch().is_some() {
+    if !matches!(gate.kind, StageKind::HumanGate { .. }) {
         return None;
     }
     let arrival = payload.get("arrival")?;
