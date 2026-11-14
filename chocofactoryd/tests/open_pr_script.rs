@@ -1830,7 +1830,8 @@ fn later_hand_moves_append_after_all_existing_outside_text() {
 /// real one. `fail-awk-hand` fails the hand-line comparison (the only awk
 /// whose last argument is the live body); `fail-awk-moved` (holding a text)
 /// fails any filter run whose input contains that text, after writing
-/// partial output.
+/// partial output; `fail-awk-count` fails the count of the moved lines (the
+/// only awk whose last argument is the moved-lines file).
 fn install_fake_awk(fx: &Fixture) {
     let real = std::env::var("PATH")
         .unwrap()
@@ -1848,6 +1849,15 @@ if [ -e "$CFG/fail-awk-hand" ]; then
     */current)
         echo "INJECTED awk failure: hand-line comparison" >&2
         echo hit >> "$GH_FAKE_DIR/awk-hand-hits"
+        exit 3
+        ;;
+    esac
+fi
+if [ -e "$CFG/fail-awk-count" ]; then
+    for a in "$@"; do last=$a; done
+    case "$last" in
+    */hand)
+        echo "INJECTED awk failure: moved-line count" >&2
         exit 3
         ;;
     esac
@@ -1925,6 +1935,67 @@ fn a_failed_moved_line_filter_aborts_before_edit() {
         "{body}"
     );
     assert!(!body.contains("PARTIAL OUTPUT") && !body.contains("Fixes #9"));
+}
+
+#[test]
+fn a_failed_moved_line_count_aborts_before_edit() {
+    let fx = Fixture::new();
+    install_fake_awk(&fx);
+    let (live, before) = hand_line_setup(&fx, "hand line kept");
+    fx.cfg("fail-awk-count", "");
+    let out = later_lap(&fx, &live, "second text\n");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("INJECTED awk failure: moved-line count"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(fx.calls_to("pr edit").is_empty());
+    assert_eq!(fs::read(copy_path(&fx)).unwrap(), before);
+
+    fs::remove_file(fx.root.join("gh/cfg/fail-awk-count")).unwrap();
+    let out = later_lap(&fx, &live, "second text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(last_edit_body(&fx).ends_with("\nhand line kept\n"));
+    assert!(stderr(&out).contains(&moved_note(1, 7)), "{}", stderr(&out));
+}
+
+#[test]
+fn trailing_blanks_in_the_saved_copy_do_not_make_a_line_a_hand_edit() {
+    let fx = Fixture::new();
+    // The published copy keeps the description's trailing blanks; the live
+    // body (as GitHub or an editor may hand it back) has them stripped.
+    let body1 = first_lap(&fx, "copy line  \t\ncopy tab\t \n");
+    assert!(fs::read_to_string(copy_path(&fx))
+        .unwrap()
+        .contains("\ncopy line  \t\n"));
+    let live = wrap(
+        &body1
+            .replace("copy line  \t\n", "copy line\n")
+            .replace("copy tab\t \n", "copy tab\n"),
+    );
+    let out = later_lap(&fx, &live, "something else\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert_no_heading(&body2);
+    assert!(!stderr(&out).contains("moved "), "{}", stderr(&out));
+    assert_eq!(count_line(&body2, "something else"), 1);
+}
+
+#[test]
+fn trailing_blanks_in_the_new_block_do_not_make_a_line_a_hand_edit() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "first text\n");
+    // The person's live line has no trailing blanks; the new description's
+    // equal line does.
+    let live = wrap(&body1.replace("first text\n", "first text\nnew line\nnew tab\n"));
+    let out = later_lap(&fx, &live, "new line \t\nnew tab\t \n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert_no_heading(&body2);
+    assert!(!stderr(&out).contains("moved "), "{}", stderr(&out));
+    assert_eq!(count_line(&body2, "new line \t"), 1);
+    assert_eq!(count_line(&body2, "new line"), 0);
 }
 
 #[test]

@@ -566,7 +566,10 @@ else
             hand_lines "$COPY" "$TMP/block" "$TMP/current" > "$TMP/hand"
             if [ -s "$TMP/hand" ]; then
                 neutralize_closing_refs < "$TMP/hand" > "$TMP/hand-safe"
-                K=$(wc -l < "$TMP/hand" | tr -d ' ')
+                # A plain awk count, not `wc | tr`: in a pipeline only the
+                # last command's status counts, so a failed `wc` would be
+                # missed and a blank count published.
+                K=$(awk 'END { print NR }' "$TMP/hand")
                 {
                     printf '\n%s\n\n%s\n\n' "$MOVED_HEADING" "$MOVED_EXPLAIN"
                     cat "$TMP/hand-safe"
