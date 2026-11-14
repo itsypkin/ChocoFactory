@@ -255,7 +255,8 @@ description that says the PR closes or fixes any other issue as a false claim.
 `open_pr` writes its text between `<!-- choco:pr-description:begin -->` and
 `<!-- choco:pr-description:end -->`. When the body has exactly one such block
 (the begin line, then the end line), each lap replaces only that block and
-keeps every line outside it byte for byte. After each successful publish it
+keeps every line outside it unchanged (apart from adding a final newline
+when the body lacks one). After each successful publish it
 saves a copy of the block it published in the worktree's private git
 directory (`choco-open-pr-published.md`).
 

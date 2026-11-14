@@ -15,7 +15,8 @@
 # the 2 KB `stderr_tail` on the timeline keeps them.
 #
 # On a later lap only choco's own marker-delimited block is replaced (splice);
-# every line outside it is kept byte for byte. After each successful publish
+# every line outside it is kept unchanged (a missing final newline is added).
+# After each successful publish
 # the block is saved as the copy ($GITDIR/choco-open-pr-published.md). On the
 # next lap a line inside the live block that is in neither the copy nor the new
 # block is moved below the block under its own heading (neutralised like any
