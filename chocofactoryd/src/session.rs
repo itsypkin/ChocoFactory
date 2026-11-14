@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::proc_table::{self, Identity, OwnershipInput, ProcEntry, ProcReader};
 use crate::shell::GroupKill;
 
 use chocofactory_core::models::{EventType, SessionCleanup, SessionEndReason, SessionStatus};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -18,6 +18,191 @@ use crate::adapter::{
     UnknownCliError, describe_background_work,
 };
 use crate::db::{events, sessions, usage};
+
+/// A moment on the clock the idle reaper measures silence with.
+///
+/// Silence is *awake* time: `std::time::Instant` is `CLOCK_UPTIME_RAW` on
+/// macOS and `CLOCK_MONOTONIC` on Linux, and neither counts the hours a laptop
+/// spends asleep (#359). A turn can't make progress while the host sleeps, so
+/// that time must not eat the allowance. UTC stays for persisted event and
+/// status timestamps; it is never compared here.
+///
+/// Tests also carry a paired wall-clock reading, so a mutation that measures
+/// idle time on the wall clock has something to measure.
+#[derive(Clone, Copy, Debug)]
+struct ActivityStamp {
+    awake: Instant,
+    #[cfg(test)]
+    wall: chrono::DateTime<Utc>,
+}
+
+/// The one place the idle reaper reads the time. Production reads
+/// `Instant::now()`; tests substitute a timeline they advance by hand.
+#[derive(Clone, Default)]
+struct IdleClock {
+    #[cfg(test)]
+    timeline: Option<Arc<std::sync::Mutex<test_clock::Timeline>>>,
+}
+
+impl IdleClock {
+    fn now(&self) -> ActivityStamp {
+        #[cfg(test)]
+        if let Some(timeline) = &self.timeline {
+            return timeline.lock().unwrap().stamp();
+        }
+        ActivityStamp {
+            awake: Instant::now(),
+            #[cfg(test)]
+            wall: Utc::now(),
+        }
+    }
+}
+
+/// A hand-advanced timeline for the idle clock. Awake time and wall time
+/// move separately: [`TestClock::advance`] moves both, [`TestClock::sleep`]
+/// only the wall (the host asleep). A script of readings fixes what the next
+/// stamps are whatever the scheduler does between them.
+#[cfg(test)]
+mod test_clock {
+    use super::{ActivityStamp, IdleClock};
+    use chrono::{DateTime, Utc};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    pub(super) struct Timeline {
+        base_awake: Instant,
+        base_wall: DateTime<Utc>,
+        awake: Duration,
+        wall: Duration,
+        script: VecDeque<(Duration, Duration)>,
+        calls: usize,
+    }
+
+    impl Timeline {
+        pub(super) fn stamp(&mut self) -> ActivityStamp {
+            self.calls += 1;
+            if let Some((awake, wall)) = self.script.pop_front() {
+                self.awake = awake;
+                self.wall = wall;
+            }
+            self.peek()
+        }
+
+        fn peek(&self) -> ActivityStamp {
+            ActivityStamp {
+                awake: self.base_awake + self.awake,
+                wall: self.base_wall + chrono::Duration::from_std(self.wall).unwrap(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct TestClock(Arc<Mutex<Timeline>>);
+
+    impl TestClock {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(Mutex::new(Timeline {
+                base_awake: Instant::now(),
+                base_wall: Utc::now(),
+                awake: Duration::ZERO,
+                wall: Duration::ZERO,
+                script: VecDeque::new(),
+                calls: 0,
+            })))
+        }
+
+        pub(super) fn clock(&self) -> IdleClock {
+            IdleClock {
+                timeline: Some(Arc::clone(&self.0)),
+            }
+        }
+
+        /// The host is awake for `by`: both clocks move.
+        pub(super) fn advance(&self, by: Duration) {
+            let mut timeline = self.0.lock().unwrap();
+            timeline.awake += by;
+            timeline.wall += by;
+        }
+
+        /// The host sleeps for `by`: only the wall clock moves.
+        pub(super) fn sleep(&self, by: Duration) {
+            self.0.lock().unwrap().wall += by;
+        }
+
+        /// The next readings, one `(awake, wall)` offset pair per `now()`
+        /// call, then the last pair holds.
+        pub(super) fn script(&self, readings: &[(Duration, Duration)]) {
+            self.0.lock().unwrap().script = readings.iter().copied().collect();
+        }
+
+        /// The current reading, without counting as a stamp or consuming
+        /// the script.
+        pub(super) fn peek(&self) -> ActivityStamp {
+            self.0.lock().unwrap().peek()
+        }
+
+        /// How many stamps have been taken (initializers, refreshes and
+        /// decisions alike).
+        pub(super) fn calls(&self) -> usize {
+            self.0.lock().unwrap().calls
+        }
+    }
+}
+
+/// What the drain decided about a queued idle-reaper `Close`, recorded so a
+/// test can wait for the decision it asserts on instead of sleeping.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseDecision {
+    /// Past the allowance: stdin was closed and the run marked reaped.
+    Closed,
+    /// Activity since the reaper looked made the session fresh.
+    KeptFresh,
+    /// The turn is waiting on its background jobs.
+    IgnoredPendingJobs,
+    /// The turn had already completed.
+    IgnoredCompleted,
+}
+
+/// Test-only: how many `Close` requests the reaper queued for a session, and
+/// what the drain decided about each one it dequeued.
+#[cfg(test)]
+#[derive(Default)]
+struct CloseLog {
+    requested: std::sync::atomic::AtomicUsize,
+    decisions: std::sync::Mutex<Vec<CloseDecision>>,
+}
+
+#[cfg(test)]
+impl CloseLog {
+    fn requested(&self) -> usize {
+        self.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn decisions(&self) -> Vec<CloseDecision> {
+        self.decisions.lock().unwrap().clone()
+    }
+    fn decided(&self, decision: CloseDecision) {
+        self.decisions.lock().unwrap().push(decision);
+    }
+}
+
+/// Whether `last` is `timeout` or more of awake time before `now`.
+///
+/// Shared by the reaper's pass and by the drain's re-check of a queued
+/// `Close`, so the two can't disagree. A non-positive timeout is always
+/// expired (the zero-timeout tests and operators rely on it), and a stamp
+/// newer than `now` (a refresh that landed after the reaper sampled `now`)
+/// is zero silence rather than a panic.
+fn idle_expired(timeout: chrono::Duration, now: ActivityStamp, last: ActivityStamp) -> bool {
+    if timeout <= chrono::Duration::zero() {
+        return true;
+    }
+    let timeout = timeout
+        .to_std()
+        .expect("a positive chrono::Duration always fits std::time::Duration");
+    now.awake.saturating_duration_since(last.awake) >= timeout
+}
 
 /// Why [`SessionManager::stop`] kills a session. The reason is recorded
 /// before the kill, so the run ends with the matching end reason.
@@ -36,6 +221,7 @@ pub struct SessionManager {
     pool: SqlitePool,
     registry: Registry,
     idle_timeout: chrono::Duration,
+    idle_clock: IdleClock,
     turn_timers: TurnTimers,
     sessions: Mutex<HashMap<String, SessionSlot>>,
     /// Triggered after every successfully-appended event (P1-9), so the
@@ -89,7 +275,11 @@ struct ActiveSession {
 /// can't drift out of step about what they share.
 #[derive(Clone)]
 struct SessionSignals {
-    last_activity: Arc<Mutex<DateTime<Utc>>>,
+    last_activity: Arc<Mutex<ActivityStamp>>,
+    /// What `last_activity` is stamped and compared with.
+    clock: IdleClock,
+    #[cfg(test)]
+    close_log: Arc<CloseLog>,
     /// The subprocess's process group id, for `cancel` to signal (#69), or
     /// `None` once it must not be signalled any more.
     ///
@@ -227,6 +417,28 @@ impl SessionManager {
             events_notify,
             turn_timers,
             Arc::new(proc_table::read),
+            IdleClock::default(),
+        )
+    }
+
+    /// [`Self::with_turn_timers`] on a clock the test advances by hand.
+    #[cfg(test)]
+    fn with_idle_clock(
+        pool: SqlitePool,
+        registry: Registry,
+        idle_timeout: chrono::Duration,
+        events_notify: Arc<Notify>,
+        turn_timers: TurnTimers,
+        idle_clock: IdleClock,
+    ) -> Arc<Self> {
+        Self::build(
+            pool,
+            registry,
+            idle_timeout,
+            events_notify,
+            turn_timers,
+            Arc::new(proc_table::read),
+            idle_clock,
         )
     }
 
@@ -247,6 +459,7 @@ impl SessionManager {
             events_notify,
             turn_timers,
             proc_reader,
+            IdleClock::default(),
         )
     }
 
@@ -257,11 +470,13 @@ impl SessionManager {
         events_notify: Arc<Notify>,
         turn_timers: TurnTimers,
         proc_reader: ProcReader,
+        idle_clock: IdleClock,
     ) -> Arc<Self> {
         Arc::new(Self {
             pool,
             registry,
             idle_timeout,
+            idle_clock,
             turn_timers,
             sessions: Mutex::new(HashMap::new()),
             events_notify,
@@ -369,7 +584,7 @@ impl SessionManager {
             let sessions = self.sessions.lock().await;
             match sessions.get(session_id) {
                 Some(SessionSlot::Live(session)) => {
-                    *session.signals.last_activity.lock().await = Utc::now();
+                    *session.signals.last_activity.lock().await = session.signals.clock.now();
                     session
                         .cmd_tx
                         .send(Command::Send(text.to_string()))
@@ -564,7 +779,10 @@ impl SessionManager {
     ) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let signals = SessionSignals {
-            last_activity: Arc::new(Mutex::new(Utc::now())),
+            last_activity: Arc::new(Mutex::new(self.idle_clock.now())),
+            clock: self.idle_clock.clone(),
+            #[cfg(test)]
+            close_log: Arc::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
             stopping: Arc::clone(&self.shutting_down),
@@ -715,22 +933,38 @@ impl SessionManager {
                     SessionSlot::Live(session) => Some((
                         session_id.clone(),
                         session.cmd_tx.clone(),
-                        Arc::clone(&session.signals.last_activity),
+                        session.signals.clone(),
                     )),
                     SessionSlot::Establishing => None,
                 })
                 .collect()
         };
 
-        let now = Utc::now();
-        for (session_id, cmd_tx, last_activity) in snapshot {
-            let last_activity = *last_activity.lock().await;
-            if now - last_activity >= self.idle_timeout {
-                tracing::info!(
-                    session_id,
-                    "idle reaper: closing session past its idle timeout"
-                );
-                let _ = cmd_tx.send(Command::Close);
+        let now = self.idle_clock.now();
+        for (session_id, cmd_tx, signals) in snapshot {
+            let last_activity = *signals.last_activity.lock().await;
+            if idle_expired(self.idle_timeout, now, last_activity) {
+                // A request, not a closure: the drain re-checks freshness
+                // when it dequeues this, and ignores it for a completed
+                // turn or one waiting on its jobs. A receiver that is gone
+                // means the session is already ending, which is fine.
+                match cmd_tx.send(Command::Close) {
+                    Ok(()) => {
+                        #[cfg(test)]
+                        signals
+                            .close_log
+                            .requested
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tracing::info!(
+                            session_id,
+                            "idle reaper: asked a session past its idle timeout to close"
+                        )
+                    }
+                    Err(_) => tracing::debug!(
+                        session_id,
+                        "idle reaper: session already ended, nothing to close"
+                    ),
+                }
             }
         }
     }
@@ -810,6 +1044,9 @@ async fn drain_session(
 ) {
     let SessionSignals {
         last_activity,
+        clock,
+        #[cfg(test)]
+        close_log,
         cancelled,
         paused,
         stopping,
@@ -995,7 +1232,7 @@ async fn drain_session(
                 // runaway agent that only ever emits and never
                 // finishes its turn is §5.3's loop-guard's job to
                 // catch, not the idle reaper's.
-                *last_activity.lock().await = Utc::now();
+                *last_activity.lock().await = clock.now();
             }
             cmd = cmd_rx.recv(), if cmd_open => {
                 match cmd {
@@ -1003,7 +1240,7 @@ async fn drain_session(
                         if let Err(err) = handle.send(&text) {
                             tracing::error!(session_id, %err, "failed to deliver message, process already gone");
                         }
-                        *last_activity.lock().await = Utc::now();
+                        *last_activity.lock().await = clock.now();
                     }
                     // The idle reaper's `Close` is ignored while the turn waits
                     // on its background jobs: nothing nudges it any more, so
@@ -1013,6 +1250,8 @@ async fn drain_session(
                         if kind == SessionKind::SingleShot && turn.waiting_on_jobs() =>
                     {
                         tracing::debug!(session_id, "ignoring the idle reaper: the turn is waiting on background jobs");
+                        #[cfg(test)]
+                        close_log.decided(CloseDecision::IgnoredPendingJobs);
                     }
                     // A `Close` that lands after the turn already completed
                     // is a no-op: stdin is already closed, and `reaped` must
@@ -1024,7 +1263,7 @@ async fn drain_session(
                         // land in the queue behind this Close before it's
                         // dequeued, and closing anyway would silently
                         // drop that message once stdin is gone.
-                        let stale = Utc::now() - *last_activity.lock().await >= idle_timeout;
+                        let stale = idle_expired(idle_timeout, clock.now(), *last_activity.lock().await);
                         if stale {
                             handle.close_stdin();
                             reaped = true;
@@ -1032,8 +1271,17 @@ async fn drain_session(
                                 turn.arm_grace(turn_timers.grace, GraceCause::Reaped);
                             }
                         }
+                        #[cfg(test)]
+                        close_log.decided(if stale {
+                            CloseDecision::Closed
+                        } else {
+                            CloseDecision::KeptFresh
+                        });
                     }
-                    Some(Command::Close) => {}
+                    Some(Command::Close) => {
+                        #[cfg(test)]
+                        close_log.decided(CloseDecision::IgnoredCompleted);
+                    }
                     None => {
                         cmd_open = false;
                     }
@@ -1074,7 +1322,7 @@ async fn drain_session(
                     if let Err(err) = handle.send(NUDGE_TEXT) {
                         tracing::error!(session_id, %err, "failed to nudge the turn, process already gone");
                     }
-                    *last_activity.lock().await = Utc::now();
+                    *last_activity.lock().await = clock.now();
                 } else {
                     turn.gave_up = true;
                     tracing::warn!(session_id, "single-shot turn never reported; closing it");
@@ -2893,57 +3141,6 @@ mod tests {
 
         let stored = wait_until_events_len(&pool, &session_id, 2).await;
         assert_eq!(stored[1].payload["text"], "echo:hello again");
-    }
-
-    #[tokio::test]
-    async fn a_send_queued_behind_a_stale_reaper_close_is_not_dropped() {
-        let pool = connect_in_memory().await.unwrap();
-        let session_id = seed_session(&pool).await;
-        let adapter: Arc<dyn AgentAdapter> =
-            Arc::new(ClaudeAdapter::with_binary(fixture_binary("fake_claude.py")));
-        // A real timeout, so last_activity looks fresh once the queued
-        // Close below is actually dequeued and re-checked.
-        let manager = SessionManager::new(
-            pool.clone(),
-            Registry::single(adapter),
-            chrono::Duration::hours(1),
-            Arc::new(Notify::new()),
-        );
-
-        manager
-            .start(
-                &session_id,
-                "claude",
-                "hello",
-                &role_config(),
-                SessionKind::Standing,
-            )
-            .await
-            .unwrap();
-        wait_until_events_len(&pool, &session_id, 2).await;
-
-        // Simulate the reaper enqueueing a Close based on a stale read of
-        // last_activity, taken before the send_message below bumps it -
-        // reproduces the ordering from the review finding without
-        // depending on real scheduler timing.
-        {
-            let sessions = manager.sessions.lock().await;
-            let Some(SessionSlot::Live(session)) = sessions.get(&session_id) else {
-                panic!("session should be live");
-            };
-            session.cmd_tx.send(Command::Close).unwrap();
-        }
-
-        manager
-            .send_message(&session_id, "again", &role_config())
-            .await
-            .unwrap();
-
-        // SessionMeta, AssistantMessage("echo:hello"), TurnCompleted (#70:
-        // fake_claude.py's `result` line, no longer discarded),
-        // AssistantMessage("echo:again").
-        let stored = wait_until_events_len(&pool, &session_id, 4).await;
-        assert_eq!(stored[3].payload["text"], "echo:again");
     }
 
     #[tokio::test]
@@ -10766,7 +10963,9 @@ mod tests {
             reader,
         ));
         let signals = SessionSignals {
-            last_activity: Arc::new(Mutex::new(Utc::now())),
+            last_activity: Arc::new(Mutex::new(IdleClock::default().now())),
+            clock: IdleClock::default(),
+            close_log: Arc::default(),
             pgid: Arc::new(Mutex::new(handle.pid())),
             cancelled: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -11053,7 +11252,9 @@ mod tests {
             reader,
         ));
         let signals = SessionSignals {
-            last_activity: Arc::new(Mutex::new(Utc::now())),
+            last_activity: Arc::new(Mutex::new(IdleClock::default().now())),
+            clock: IdleClock::default(),
+            close_log: Arc::default(),
             pgid: Arc::new(Mutex::new(handle.pid())),
             cancelled: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -11215,5 +11416,1064 @@ mod tests {
         assert_eq!(sorted(pids_of(&tracker.state().survivors)), vec![o, a]);
         assert_eq!(both.reap_signal(), Some(libc::SIGKILL));
         assert!(bystander.is_running());
+    }
+
+    // ---- idle time is awake time (#359) ----
+
+    use super::test_clock::TestClock;
+
+    const IDLE_LIMIT_MINUTES: i64 = 30;
+
+    fn minutes(n: u64) -> StdDuration {
+        StdDuration::from_secs(n * 60)
+    }
+
+    fn hours(n: u64) -> StdDuration {
+        minutes(n * 60)
+    }
+
+    /// A manager on a hand-advanced clock with the production default idle
+    /// timeout.
+    fn manager_on(
+        pool: &SqlitePool,
+        clock: &TestClock,
+        idle_timeout: chrono::Duration,
+        binary: String,
+    ) -> Arc<SessionManager> {
+        // A grace period too long to fire inside a test that expects the
+        // agent to exit by itself.
+        let timers = TurnTimers {
+            grace: StdDuration::from_secs(60),
+            ..fast_timers(0)
+        };
+        manager_with_timers(pool, clock, idle_timeout, binary, timers)
+    }
+
+    fn manager_with_timers(
+        pool: &SqlitePool,
+        clock: &TestClock,
+        idle_timeout: chrono::Duration,
+        binary: String,
+        timers: TurnTimers,
+    ) -> Arc<SessionManager> {
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        SessionManager::with_idle_clock(
+            pool.clone(),
+            Registry::single(adapter),
+            idle_timeout,
+            Arc::new(Notify::new()),
+            timers,
+            clock.clock(),
+        )
+    }
+
+    /// A session row in its own project, so a test can have several.
+    async fn seed_another(pool: &SqlitePool, kind: SessionKind) -> String {
+        let project_id = projects::create(pool, &format!("demo-{}", uuid::Uuid::new_v4()), None)
+            .await
+            .unwrap()
+            .id;
+        let task_id = tasks::create(
+            pool,
+            tasks::NewTask {
+                project_id: &project_id,
+                workflow_def: "chat",
+                title: "T",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
+                closes: &[],
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        sessions::create(
+            pool,
+            sessions::NewSession {
+                task_id: &task_id,
+                stage: "chatting",
+                role: "chat",
+                cli_adapter: "claude",
+                model: "sonnet",
+                cleanup: (kind == SessionKind::SingleShot).then_some(SessionCleanup::Pending),
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// A live session built by hand: a real child process (it exits cleanly
+    /// once `gate` is dropped), events the test feeds, and the agent's stdin
+    /// as a channel the test reads. It is registered in the manager's map
+    /// exactly as `spawn_drain` registers one, so the real reaper and the
+    /// real `send_message` see it. Its drain is started separately, so a test
+    /// can queue commands before the drain looks at any of them.
+    struct Hand {
+        session_id: String,
+        kind: SessionKind,
+        cmd_tx: mpsc::UnboundedSender<Command>,
+        cmd_rx: Option<mpsc::UnboundedReceiver<Command>>,
+        events_tx: mpsc::UnboundedSender<AgentEvent>,
+        stdin_rx: mpsc::UnboundedReceiver<String>,
+        close_log: Arc<CloseLog>,
+        gate: Option<tokio::process::ChildStdin>,
+        parts: Option<(AgentHandle, SessionSignals)>,
+        drain: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Hand {
+        async fn new(manager: &Arc<SessionManager>, session_id: String, kind: SessionKind) -> Hand {
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .args(["-c", "read line; exit 0"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .kill_on_drop(true);
+            let mut child = command.spawn().unwrap();
+            let gate = child.stdin.take().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let (events_tx, events_rx) = mpsc::unbounded_channel();
+            // The agent's output ends when the process has really exited, as
+            // a real agent's does, so the drain never sweeps a process that
+            // is still on its way out of a clean exit.
+            let output_open = events_tx.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 64];
+                while matches!(stdout.read(&mut buf).await, Ok(n) if n > 0) {}
+                drop(output_open);
+            });
+            let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
+            let marker = crate::adapter::new_turn_marker().unwrap();
+            let handle = AgentHandle::new(child, events_rx, stdin_tx, marker);
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let close_log = Arc::new(CloseLog::default());
+            let signals = SessionSignals {
+                last_activity: Arc::new(Mutex::new(manager.idle_clock.now())),
+                clock: manager.idle_clock.clone(),
+                close_log: Arc::clone(&close_log),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                paused: Arc::new(AtomicBool::new(false)),
+                stopping: Arc::clone(&manager.shutting_down),
+                pgid: Arc::new(Mutex::new(handle.pid())),
+                tracker: Arc::new(LeftoverTracker::new(
+                    handle.marker().to_string(),
+                    kind,
+                    Arc::clone(&manager.proc_reader),
+                )),
+            };
+            manager.sessions.lock().await.insert(
+                session_id.clone(),
+                SessionSlot::Live(ActiveSession {
+                    cmd_tx: cmd_tx.clone(),
+                    signals: signals.clone(),
+                }),
+            );
+            Hand {
+                session_id,
+                kind,
+                cmd_tx,
+                cmd_rx: Some(cmd_rx),
+                events_tx,
+                stdin_rx,
+                close_log,
+                gate: Some(gate),
+                parts: Some((handle, signals)),
+                drain: None,
+            }
+        }
+
+        /// Starts the real `drain_session` on this session.
+        fn start_drain(&mut self, manager: &Arc<SessionManager>, pool: &SqlitePool) {
+            let (handle, signals) = self.parts.take().unwrap();
+            let cmd_rx = self.cmd_rx.take().unwrap();
+            let (pool, session_id, kind) = (pool.clone(), self.session_id.clone(), self.kind);
+            let (idle_timeout, timers) = (manager.idle_timeout, manager.turn_timers.clone());
+            self.drain = Some(tokio::spawn(async move {
+                drain_session(
+                    &pool,
+                    &session_id,
+                    handle,
+                    kind,
+                    cmd_rx,
+                    signals,
+                    idle_timeout,
+                    &timers,
+                    &Notify::new(),
+                )
+                .await;
+            }));
+        }
+
+        /// What the real reaper has queued, without a drain: `Some(true)`
+        /// for a `Close`, `Some(false)` for a `Send`, `None` for nothing.
+        fn queued(&mut self) -> Option<bool> {
+            match self.cmd_rx.as_mut().unwrap().try_recv() {
+                Ok(Command::Close) => Some(true),
+                Ok(Command::Send(_)) => Some(false),
+                Err(_) => None,
+            }
+        }
+
+        /// Lets the agent exit, ends its output and waits for the drain to
+        /// write the final row.
+        async fn finish(mut self, pool: &SqlitePool) -> chocofactory_core::models::Session {
+            drop(self.gate.take());
+            drop(self.events_tx);
+            self.drain.take().expect("start_drain first").await.unwrap();
+            sessions::get(pool, &self.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        /// How many `Close` requests the real reaper has queued for this
+        /// session. Counted when the reaper sends, so an absence is certain
+        /// the moment its pass returns.
+        fn close_requests(&self) -> usize {
+            self.close_log.requested()
+        }
+
+        /// Waits until the drain has made `n` decisions about a queued
+        /// `Close`, and returns them. Nothing is asserted on a sleep: the
+        /// decision itself is what is waited on.
+        async fn close_decisions(&self, n: usize) -> Vec<CloseDecision> {
+            let log = Arc::clone(&self.close_log);
+            crate::test_support::wait_until("the drain to decide on the queued Close", || async {
+                let decisions = log.decisions();
+                if decisions.len() >= n {
+                    Ok(decisions)
+                } else {
+                    Err(format!("{decisions:?}"))
+                }
+            })
+            .await
+        }
+
+        /// The agent's stdin is still open and nothing but a nudge is waiting
+        /// in it. First waits for the drain to decide on every `Close` the
+        /// reaper queued, so a Close a broken check would act on has been
+        /// dealt with before this looks.
+        async fn assert_open(&mut self, pool: &SqlitePool, why: &str) {
+            self.close_decisions(self.close_requests()).await;
+            loop {
+                match self.stdin_rx.try_recv() {
+                    Ok(text) if text == NUDGE_TEXT => continue,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    other => panic!("stdin closed or written to ({other:?}): {why}"),
+                }
+            }
+            let run = sessions::get(pool, &self.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(run.status, SessionStatus::Active, "{why}");
+            assert_eq!(run.end_reason, None, "{why}");
+        }
+
+        async fn assert_delivered(&mut self, text: &str, why: &str) {
+            let got =
+                tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, self.stdin_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("nothing reached the agent: {why}"));
+            assert_eq!(got.as_deref(), Some(text), "{why}");
+        }
+
+        /// The drain closed the agent's stdin.
+        async fn assert_closed(&mut self, why: &str) {
+            let got =
+                tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, self.stdin_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("stdin was never closed: {why}"));
+            assert_eq!(got, None, "stdin should be closed: {why}");
+        }
+    }
+
+    fn assert_reaped(run: &chocofactory_core::models::Session) {
+        assert_eq!(
+            (run.status, run.end_reason),
+            (SessionStatus::Idle, Some(SessionEndReason::Reaped)),
+            "a clean exit after the reaper closed stdin"
+        );
+    }
+
+    /// The hand's agent exited cleanly by itself after the test released it.
+    fn assert_ended_cleanly(run: &chocofactory_core::models::Session) {
+        assert_eq!(
+            (run.status, run.end_reason),
+            (SessionStatus::Idle, None),
+            "a clean exit nothing reaped"
+        );
+    }
+
+    /// The fixture's own contract: `sleep` moves only the wall reading, so a
+    /// mutation that measures idle time on the wall clock sees what these
+    /// tests simulate.
+    #[test]
+    fn the_test_clock_moves_wall_time_without_awake_time_while_asleep() {
+        let clock = TestClock::new();
+        let idle = clock.clock();
+        let before = idle.now();
+        clock.sleep(hours(3));
+        clock.advance(StdDuration::from_secs(30));
+        let after = idle.now();
+        assert_eq!(
+            after.awake.duration_since(before.awake),
+            StdDuration::from_secs(30)
+        );
+        assert_eq!(
+            (after.wall - before.wall).to_std().unwrap(),
+            hours(3) + StdDuration::from_secs(30)
+        );
+        assert!(!idle_expired(chrono::Duration::minutes(30), after, before));
+        // A stamp refreshed after the reaper sampled `now` is zero silence.
+        assert!(!idle_expired(chrono::Duration::minutes(30), before, after));
+    }
+
+    /// Host sleep must not count as silence: hours of sleep and a string of
+    /// short DarkWakes add nothing, the awake minutes add up across wakes, and
+    /// the turn is reaped at exactly the allowance and not before. The
+    /// reaper's decision is checked at the command boundary (no `Close` is
+    /// ever queued for a session that is awake-fresh; the dequeue re-check
+    /// would hide one), and a session started in the middle of the sleep is
+    /// followed through the real drain.
+    #[tokio::test]
+    async fn idle_reaper_excludes_sleep_and_accumulates_darkwake_silence() {
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let manager = manager_on(
+            &pool,
+            &clock,
+            chrono::Duration::minutes(IDLE_LIMIT_MINUTES),
+            "unused".to_string(),
+        );
+
+        let mut watched = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::SingleShot).await,
+            SessionKind::SingleShot,
+        )
+        .await;
+        // The same session again, with its drain running throughout: the
+        // sleeps must not close it either, and what the drain does with a
+        // Close can be waited on rather than slept for.
+        let mut drained = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::SingleShot).await,
+            SessionKind::SingleShot,
+        )
+        .await;
+        drained.start_drain(&manager, &pool);
+        // Six DarkWakes of 30 seconds, each after two hours asleep.
+        for wake in 1..=6 {
+            clock.sleep(hours(2));
+            clock.advance(StdDuration::from_secs(30));
+            manager.reap_idle_sessions().await;
+            assert_eq!(
+                watched.queued(),
+                None,
+                "wake {wake}: {wake} x 30s awake after {wake} x 2h asleep is not 30 minutes of silence"
+            );
+            assert_eq!(
+                drained.close_requests(),
+                0,
+                "wake {wake}: the reaper asked a session that is awake-fresh to close"
+            );
+            drained
+                .assert_open(&pool, "the sleeps added no silence")
+                .await;
+        }
+        // 3 awake minutes so far; 26m59s more makes 29m59s, one second short.
+        clock.advance(minutes(26) + StdDuration::from_secs(59));
+        manager.reap_idle_sessions().await;
+        assert_eq!(
+            watched.queued(),
+            None,
+            "29m59s awake is below the allowance, however long the host slept"
+        );
+        assert_eq!(drained.close_requests(), 0, "29m59s awake");
+        drained.assert_open(&pool, "29m59s awake").await;
+        clock.advance(StdDuration::from_secs(1));
+        manager.reap_idle_sessions().await;
+        assert_eq!(
+            watched.queued(),
+            Some(true),
+            "exactly 30 awake minutes, accumulated across wakes, must be reaped"
+        );
+        assert_eq!(drained.close_requests(), 1, "exactly 30 awake minutes");
+        assert_eq!(
+            drained.close_decisions(1).await,
+            [CloseDecision::Closed],
+            "the drain closes a session that really is 30 awake minutes silent"
+        );
+        drained
+            .assert_closed("30 awake minutes of silence close the turn through the drain")
+            .await;
+        assert_reaped(&drained.finish(&pool).await);
+
+        // A run that starts while the host sleeps gets its own allowance
+        // from the moment it starts.
+        clock.sleep(hours(3));
+        let mut fresh = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::SingleShot).await,
+            SessionKind::SingleShot,
+        )
+        .await;
+        fresh.start_drain(&manager, &pool);
+        manager.reap_idle_sessions().await;
+        fresh
+            .assert_open(&pool, "a session that has been awake for no time")
+            .await;
+        clock.advance(minutes(29) + StdDuration::from_secs(59));
+        manager.reap_idle_sessions().await;
+        fresh
+            .assert_open(&pool, "29m59s awake since this run started")
+            .await;
+        clock.advance(StdDuration::from_secs(1));
+        manager.reap_idle_sessions().await;
+        fresh
+            .assert_closed("30 awake minutes of silence close the turn through the drain")
+            .await;
+        assert_eq!(fresh.close_decisions(1).await, [CloseDecision::Closed]);
+        assert_reaped(&fresh.finish(&pool).await);
+        drop(watched);
+    }
+
+    /// The reaper acts on each session's own awake silence. One pass over a
+    /// mixed set closes the overdue session only, at the exact allowance;
+    /// a negative allowance means "already overdue", not "never".
+    #[tokio::test]
+    async fn idle_reaper_only_closes_awake_overdue_sessions() {
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let manager = manager_on(
+            &pool,
+            &clock,
+            chrono::Duration::minutes(IDLE_LIMIT_MINUTES),
+            "unused".to_string(),
+        );
+
+        let mut overdue_seen = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        let mut overdue = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        overdue.start_drain(&manager, &pool);
+
+        clock.advance(minutes(10));
+        clock.sleep(hours(5));
+        let mut fresh_seen = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        let mut fresh = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        fresh.start_drain(&manager, &pool);
+
+        clock.advance(minutes(20) - StdDuration::from_nanos(1));
+        manager.reap_idle_sessions().await;
+        assert_eq!(
+            overdue_seen.queued(),
+            None,
+            "a nanosecond short of the allowance"
+        );
+        clock.advance(StdDuration::from_nanos(1));
+        manager.reap_idle_sessions().await;
+        assert_eq!(
+            overdue_seen.queued(),
+            Some(true),
+            "exactly the allowance is overdue"
+        );
+        assert_eq!(
+            fresh_seen.queued(),
+            None,
+            "a session 20 awake minutes in must not be closed with its neighbour"
+        );
+
+        assert_eq!(overdue.close_requests(), 1);
+        assert_eq!(
+            fresh.close_requests(),
+            0,
+            "the reaper asked the session below the allowance to close"
+        );
+        assert_eq!(overdue.close_decisions(1).await, [CloseDecision::Closed]);
+        overdue
+            .assert_closed("the overdue session is closed through the drain")
+            .await;
+        fresh
+            .assert_open(&pool, "the session below the allowance")
+            .await;
+        assert_reaped(&overdue.finish(&pool).await);
+        assert_ended_cleanly(&fresh.finish(&pool).await);
+
+        // A negative allowance: every session is overdue at once, and the
+        // drain really closes it.
+        let negative = manager_on(
+            &pool,
+            &clock,
+            chrono::Duration::minutes(-5),
+            "unused".to_string(),
+        );
+        let mut seen = Hand::new(
+            &negative,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        let mut drained = Hand::new(
+            &negative,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        drained.start_drain(&negative, &pool);
+        negative.reap_idle_sessions().await;
+        assert_eq!(seen.queued(), Some(true), "a negative allowance is overdue");
+        assert_eq!(drained.close_decisions(1).await, [CloseDecision::Closed]);
+        drained
+            .assert_closed("a negative allowance closes through the drain")
+            .await;
+        assert_reaped(&drained.finish(&pool).await);
+        drop((overdue_seen, fresh_seen, seen));
+    }
+
+    /// A message accepted after the reaper queued its `Close` must not be
+    /// dropped (review on PR #35). Both sessions' `Close` was queued while
+    /// they were 31 awake minutes silent; only the first then got a message
+    /// through `send_message`. The host then slept for hours before the drain
+    /// dequeued either `Close`: that time adds nothing, so the refreshed
+    /// session lives and its next message arrives, while the one nothing
+    /// refreshed is closed and recorded as reaped.
+    #[tokio::test]
+    async fn a_send_queued_behind_a_stale_reaper_close_is_not_dropped() {
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let manager = manager_on(
+            &pool,
+            &clock,
+            chrono::Duration::minutes(IDLE_LIMIT_MINUTES),
+            "unused".to_string(),
+        );
+        let mut refreshed = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        let mut untouched = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+
+        clock.advance(minutes(31));
+        manager.reap_idle_sessions().await;
+        // The live path refreshes before it queues the message behind the
+        // Close; nothing else has touched this session's activity.
+        manager
+            .send_message(&refreshed.session_id, "again", &role_config())
+            .await
+            .unwrap();
+        clock.sleep(hours(6));
+
+        refreshed.start_drain(&manager, &pool);
+        untouched.start_drain(&manager, &pool);
+        assert_eq!(
+            refreshed.close_decisions(1).await,
+            [CloseDecision::KeptFresh],
+            "the Close was dequeued first, on a session the send refreshed"
+        );
+        refreshed
+            .assert_delivered("again", "the message queued behind the Close")
+            .await;
+        refreshed
+            .assert_open(&pool, "the Close was dequeued first, on a fresh session")
+            .await;
+        assert_eq!(untouched.close_decisions(1).await, [CloseDecision::Closed]);
+        untouched
+            .assert_closed("31 awake minutes with no activity is genuinely stale")
+            .await;
+        assert_reaped(&untouched.finish(&pool).await);
+        assert_ended_cleanly(&refreshed.finish(&pool).await);
+    }
+
+    /// Output counts as activity: a `Close` queued while the session was
+    /// 31 awake minutes silent is ignored when the drain, which reads output
+    /// before commands, has since drained a line. The clock readings are
+    /// scripted (the output refresh, then the `Close` check three hours of
+    /// sleep later), so nothing but that refresh can save the session.
+    #[tokio::test]
+    async fn queued_reaper_close_observes_drained_output_activity() {
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let manager = manager_on(
+            &pool,
+            &clock,
+            chrono::Duration::minutes(IDLE_LIMIT_MINUTES),
+            "unused".to_string(),
+        );
+        let mut hand = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        clock.advance(minutes(31));
+        manager.reap_idle_sessions().await;
+        clock.script(&[
+            (minutes(31), minutes(31)),
+            (minutes(31), minutes(31) + hours(3)),
+        ]);
+        hand.events_tx
+            .send(AgentEvent::AssistantMessage {
+                text: "still working".into(),
+            })
+            .unwrap();
+        hand.cmd_tx.send(Command::Send("next".into())).unwrap();
+        hand.start_drain(&manager, &pool);
+
+        assert_eq!(
+            hand.close_decisions(1).await,
+            [CloseDecision::KeptFresh],
+            "the output that preceded the Close refreshed activity"
+        );
+        hand.assert_delivered("next", "queued behind the Close")
+            .await;
+        hand.assert_open(
+            &pool,
+            "the output that preceded the Close refreshed activity",
+        )
+        .await;
+        assert_ended_cleanly(&hand.finish(&pool).await);
+    }
+
+    /// The same, for a message the drain itself consumes: a `Send` queued
+    /// ahead of the `Close` refreshes activity when it is delivered, and
+    /// nothing else (no output, no live `send_message`) does.
+    #[tokio::test]
+    async fn queued_reaper_close_observes_a_consumed_send() {
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let manager = manager_on(
+            &pool,
+            &clock,
+            chrono::Duration::minutes(IDLE_LIMIT_MINUTES),
+            "unused".to_string(),
+        );
+        let mut hand = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        clock.advance(minutes(31));
+        hand.cmd_tx.send(Command::Send("first".into())).unwrap();
+        manager.reap_idle_sessions().await;
+        hand.cmd_tx.send(Command::Send("second".into())).unwrap();
+        clock.script(&[
+            (minutes(31), minutes(31)),
+            (minutes(31), minutes(31) + hours(3)),
+        ]);
+        hand.start_drain(&manager, &pool);
+
+        hand.assert_delivered("first", "ahead of the Close").await;
+        assert_eq!(
+            hand.close_decisions(1).await,
+            [CloseDecision::KeptFresh],
+            "the delivered Send refreshed activity"
+        );
+        hand.assert_delivered("second", "behind the Close").await;
+        hand.assert_open(&pool, "the delivered Send refreshed activity")
+            .await;
+        assert_ended_cleanly(&hand.finish(&pool).await);
+    }
+
+    /// A nudge counts as activity: a turn that ended without reporting is
+    /// asked to, and a `Close` that reaches the drain afterwards (queued from
+    /// an older look at the session) leaves it open. The clock readings are
+    /// scripted (the turn's output at awake 0, the nudge 31 minutes on, the
+    /// `Close` check three hours of sleep later), so only the nudge's own
+    /// refresh can save the session: no output, send or other activity
+    /// follows the nudge.
+    #[tokio::test]
+    async fn queued_reaper_close_observes_a_nudge() {
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let timers = TurnTimers {
+            nudge_after: StdDuration::from_secs(1),
+            max_nudges: 3,
+            ..fast_timers(3)
+        };
+        let manager = manager_with_timers(
+            &pool,
+            &clock,
+            chrono::Duration::minutes(IDLE_LIMIT_MINUTES),
+            "unused".to_string(),
+            timers,
+        );
+        let mut hand = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::SingleShot).await,
+            SessionKind::SingleShot,
+        )
+        .await;
+        clock.script(&[
+            (StdDuration::ZERO, StdDuration::ZERO),
+            (minutes(31), minutes(31)),
+            (minutes(31), minutes(31) + hours(3)),
+        ]);
+        hand.events_tx
+            .send(AgentEvent::TurnCompleted {
+                is_error: false,
+                usage: crate::adapter::TurnUsage {
+                    cost_usd: None,
+                    tokens: crate::adapter::TokenCounts {
+                        input: None,
+                        output: None,
+                        cache_read: None,
+                        cache_write: None,
+                    },
+                    models: None,
+                    wall_time_ms: None,
+                    model_turns: None,
+                    billing: crate::adapter::BillingMode::Subscription,
+                    counting: crate::adapter::UsageCounting::PerTurn,
+                },
+            })
+            .unwrap();
+        hand.start_drain(&manager, &pool);
+
+        hand.assert_delivered(NUDGE_TEXT, "the turn ended without a report")
+            .await;
+        // The baseline stamp, the output's and the nudge's: three readings.
+        for _ in 0..200 {
+            if clock.calls() >= 3 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(
+            clock.calls() >= 3,
+            "the nudge did not stamp activity ({} readings)",
+            clock.calls()
+        );
+        hand.cmd_tx.send(Command::Close).unwrap();
+        assert_eq!(
+            hand.close_decisions(1).await,
+            [CloseDecision::KeptFresh],
+            "the nudge, 31 awake minutes in, refreshed activity"
+        );
+        hand.assert_open(&pool, "the nudge refreshed activity")
+            .await;
+        let run = hand.finish(&pool).await;
+        assert_eq!(
+            (run.status, run.end_reason),
+            (SessionStatus::Exited, Some(SessionEndReason::NoReport)),
+            "never reported, never reaped: {run:?}"
+        );
+    }
+
+    /// The reaper's log line says what it did: a request that was sent, or
+    /// nothing to ask because the session's drain has already gone. Only the
+    /// first claims a request.
+    #[tokio::test]
+    async fn the_reaper_logs_a_close_request_only_when_it_was_sent() {
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let manager = manager_on(
+            &pool,
+            &clock,
+            chrono::Duration::zero(),
+            "unused".to_string(),
+        );
+        let asked = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        let mut gone = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::Standing).await,
+            SessionKind::Standing,
+        )
+        .await;
+        // The drain is gone but its map slot is still there.
+        drop(gone.cmd_rx.take());
+
+        let log = LogBuf::default();
+        let guard = log.capture_at(tracing::Level::DEBUG);
+        manager.reap_idle_sessions().await;
+        drop(guard);
+
+        let text = log.text();
+        let line_for = |id: &str| {
+            let mut lines = text.lines().filter(|line| line.contains(id));
+            let line = lines
+                .next()
+                .unwrap_or_else(|| panic!("no log line for {id}: {text}"));
+            assert!(lines.next().is_none(), "one line per session: {text}");
+            line.to_string()
+        };
+        let asked_line = line_for(&asked.session_id);
+        assert!(
+            asked_line.contains("asked a session past its idle timeout to close"),
+            "{asked_line}"
+        );
+        let gone_line = line_for(&gone.session_id);
+        assert!(
+            gone_line.contains("session already ended, nothing to close")
+                && !gone_line.contains("asked"),
+            "a close nobody received must not be logged as a request: {gone_line}"
+        );
+        assert_eq!(asked.close_requests(), 1);
+        assert_eq!(
+            gone.close_requests(),
+            0,
+            "a request nobody received was not made"
+        );
+    }
+
+    /// A `Close` behind a turn that already completed is not a reap: the drain
+    /// ignores it, the turn keeps its ordinary result and its grace period
+    /// keeps its own cause. Zero timeout, so the `Close` would be stale if
+    /// anything acted on it. The drain's decision is what is asserted, since
+    /// the final-state rules would hide a wrongly reaped completed turn.
+    #[tokio::test]
+    async fn a_queued_close_behind_a_completed_turn_is_not_a_reap() {
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let manager = manager_with_timers(
+            &pool,
+            &clock,
+            chrono::Duration::zero(),
+            "unused".to_string(),
+            fast_timers(0),
+        );
+        let mut hand = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::SingleShot).await,
+            SessionKind::SingleShot,
+        )
+        .await;
+        queue_completed_report(&hand.events_tx);
+        manager.reap_idle_sessions().await;
+        assert_eq!(hand.close_requests(), 1, "the zero timeout queues a Close");
+        hand.start_drain(&manager, &pool);
+        assert_eq!(
+            hand.close_decisions(1).await,
+            [CloseDecision::IgnoredCompleted],
+            "a Close behind a completed turn must be ignored, not acted on"
+        );
+        // The turn's own completion closes stdin, and the agent that is
+        // still running is dealt with once grace is over.
+        hand.assert_closed("the completed turn closes stdin itself")
+            .await;
+        let session_id = hand.session_id.clone();
+        wait_for_note(&pool, &session_id, "lingered").await;
+        let run = hand.finish(&pool).await;
+        let lingered = note_message(&pool, &session_id, "lingered").await.unwrap();
+        assert!(
+            lingered.contains("its turn ended") && !lingered.contains("idle reaper"),
+            "grace belongs to the completion, not the reaper: {lingered}"
+        );
+        assert_ended_cleanly(&run);
+
+        // The same turn whose agent exits by itself: an ordinary completed
+        // run, idle with no reason.
+        let timers = TurnTimers {
+            grace: StdDuration::from_secs(30),
+            ..fast_timers(0)
+        };
+        let manager = manager_with_timers(
+            &pool,
+            &clock,
+            chrono::Duration::zero(),
+            "unused".to_string(),
+            timers,
+        );
+        let mut clean_hand = Hand::new(
+            &manager,
+            seed_another(&pool, SessionKind::SingleShot).await,
+            SessionKind::SingleShot,
+        )
+        .await;
+        queue_completed_report(&clean_hand.events_tx);
+        manager.reap_idle_sessions().await;
+        clean_hand.start_drain(&manager, &pool);
+        assert_eq!(
+            clean_hand.close_decisions(1).await,
+            [CloseDecision::IgnoredCompleted]
+        );
+        clean_hand
+            .assert_closed("the completed turn closes stdin itself")
+            .await;
+        assert_ended_cleanly(&clean_hand.finish(&pool).await);
+    }
+
+    /// Runs started or resumed while the host sleeps (single-shot start, a
+    /// retry's resume into a new run, and a chat resumed by a message) begin
+    /// their allowance when they start, not from an older run's silence or
+    /// the stored wall timestamps.
+    #[tokio::test]
+    async fn started_and_resumed_runs_get_a_current_awake_baseline() {
+        let dir = TempDir::new();
+        let binary = script_binary(
+            &dir.0,
+            json!([
+                {"op": "read_turn"},
+                {"op": "answer_every_turn", "text": "ok"},
+            ]),
+        );
+        let pool = connect_in_memory().await.unwrap();
+        let clock = TestClock::new();
+        let manager = manager_on(
+            &pool,
+            &clock,
+            chrono::Duration::minutes(IDLE_LIMIT_MINUTES),
+            binary,
+        );
+        let calls_after = |n: usize| {
+            let clock = clock.clone();
+            async move {
+                crate::test_support::wait_until("the starts' activity stamps", || async {
+                    let calls = clock.calls();
+                    if calls >= n {
+                        Ok(())
+                    } else {
+                        Err(format!("{calls} stamps"))
+                    }
+                })
+                .await
+            }
+        };
+
+        // The old run, silent since the very start: baseline, then the
+        // output refresh of its first event.
+        let old = seed_another(&pool, SessionKind::SingleShot).await;
+        manager
+            .start(
+                &old,
+                "claude",
+                "go",
+                &single_shot_role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+        calls_after(2).await;
+        clock.advance(minutes(29));
+        clock.sleep(hours(5));
+        // What a run's activity is stamped with the moment it is live, read
+        // before the process has had time to emit anything: the clock's
+        // current awake reading, not an older run's or a stored timestamp.
+        let assert_baseline = |id: String| {
+            let (manager, clock) = (Arc::clone(&manager), clock.clone());
+            async move {
+                let signals = live_signals(&manager, &id).await;
+                let stamp = *signals.last_activity.lock().await;
+                let now = clock.peek();
+                assert_eq!(stamp.awake, now.awake, "{id}: awake baseline");
+                assert_eq!(stamp.wall, now.wall, "{id}: wall baseline");
+            }
+        };
+
+        let started = seed_another(&pool, SessionKind::SingleShot).await;
+        manager
+            .start(
+                &started,
+                "claude",
+                "go",
+                &single_shot_role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+        assert_baseline(started.clone()).await;
+        let started_signals = live_signals(&manager, &started).await;
+        let resumed = seed_another(&pool, SessionKind::SingleShot).await;
+        manager
+            .resume(
+                &resumed,
+                "claude",
+                "earlier-adapter-session",
+                "go",
+                &single_shot_role_config(),
+                SessionKind::SingleShot,
+            )
+            .await
+            .unwrap();
+        assert_baseline(resumed.clone()).await;
+        let resumed_signals = live_signals(&manager, &resumed).await;
+        let chat = seed_another(&pool, SessionKind::Standing).await;
+        sessions::set_adapter_session_id(&pool, &chat, "earlier-chat-session")
+            .await
+            .unwrap();
+        sessions::update_status(&pool, &chat, SessionStatus::Idle, None, None, None)
+            .await
+            .unwrap();
+        manager
+            .send_message(&chat, "hello again", &role_config())
+            .await
+            .unwrap();
+        assert_baseline(chat.clone()).await;
+        let chat_signals = live_signals(&manager, &chat).await;
+        let new_runs = [started_signals, resumed_signals, chat_signals];
+        calls_after(8).await;
+
+        clock.advance(minutes(2));
+        manager.reap_idle_sessions().await;
+        let old_run = wait_until_final(&pool, &old).await;
+        assert_eq!(old_run.end_reason, Some(SessionEndReason::Reaped));
+        // The reaper asks about a session at the pass itself, so for the new
+        // runs there is nothing to wait for: none was asked to close.
+        for (run, signals) in [&started, &resumed, &chat].into_iter().zip(&new_runs) {
+            assert_eq!(
+                signals.close_log.requested(),
+                0,
+                "{run}: the reaper asked a run 2 awake minutes in to close"
+            );
+        }
+        for id in [&started, &resumed, &chat] {
+            let run = sessions::get(&pool, id).await.unwrap().unwrap();
+            assert_eq!(
+                (run.status, run.end_reason),
+                (SessionStatus::Active, None),
+                "a run 2 awake minutes in is not overdue, whatever the old run's age or the wall clock says"
+            );
+        }
+
+        clock.advance(minutes(28));
+        manager.reap_idle_sessions().await;
+        for (id, signals) in [&started, &resumed, &chat].into_iter().zip(&new_runs) {
+            assert_eq!(signals.close_log.requested(), 1, "{id}");
+            let run = wait_until_final(&pool, id).await;
+            assert_eq!(run.end_reason, Some(SessionEndReason::Reaped), "{id}");
+            assert_eq!(
+                signals.close_log.decisions(),
+                [CloseDecision::Closed],
+                "{id}"
+            );
+        }
     }
 }
