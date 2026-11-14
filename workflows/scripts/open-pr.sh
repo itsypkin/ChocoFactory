@@ -14,6 +14,17 @@
 # Notes are collected and written to stderr just before the read-back, so
 # the 2 KB `stderr_tail` on the timeline keeps them.
 #
+# On a later lap only choco's own marker-delimited block is replaced (splice);
+# every line outside it is kept unchanged (a missing final newline is added).
+# After each successful publish
+# the block is saved as the copy ($GITDIR/choco-open-pr-published.md). On the
+# next lap a line inside the live block that is in neither the copy nor the new
+# block is moved below the block under its own heading (neutralised like any
+# agent text) instead of being silently dropped. It is only a line absent from
+# the saved copy and the new text: usually a hand edit, but the script cannot
+# tell, and a stale or partial copy makes it move lines choco wrote itself. Without a copy, or when the body has no single valid block, nothing
+# can be told apart and nothing is moved (see the notes below).
+#
 # Inputs: PR_TASK_TITLE, PR_REVIEW_VERDICT, PR_REVIEW_REPORT (stage `env:`);
 # CHOCO_TASK_ID, CHOCO_WORKFLOW, CHOCO_ROLE_MODELS, CHOCO_TASK_CLOSES (the
 # engine; the last is the issue numbers the task closes, space separated).
@@ -247,6 +258,9 @@ bound_input() {
 # new block), keeping every other line byte for byte. Exits nonzero, with
 # no output, unless $1 has exactly one BEGIN line followed by exactly one
 # END line. No content travels through `-v`: both files are read by awk.
+# Markers are recognised by the same trimmed() rule as hand_lines() below.
+# Hand edits inside the replaced block are not kept by this function; the
+# caller finds them first with hand_lines() and appends them after the result.
 splice() {
     awk '
         function trimmed(l) { sub(/[ \t\r]+$/, "", l); return l }
@@ -265,6 +279,54 @@ splice() {
             for (i = ei + 1; i <= n; i++) print cur[i]
         }' "$1" "$2"
 }
+
+# Prints, in order and with duplicates, the lines strictly between the BEGIN
+# and END lines of the body $3 whose trimmed value (trailing spaces, tabs and
+# CRs removed, nothing else) is in neither the previously published block $1
+# nor the new block $2 (the test is membership, not authorship). A terminal CR
+# is dropped from each printed line; every other byte is kept. The caller has
+# checked that $3 has exactly one block. Plain awk, no `-v`, no pipe: a
+# failure must stop the script (set -e), not publish a partial answer.
+hand_lines() {
+    awk '
+        function trimmed(l) { sub(/[ \t\r]+$/, "", l); return l }
+        # The one comparison key, for every insertion and lookup below.
+        function key(l) { return trimmed(l) }
+        FILENAME == ARGV[1] || FILENAME == ARGV[2] { known[key($0)] = 1; next }
+        {
+            t = trimmed($0)
+            if (t == ENVIRON["MARK_BEGIN"]) { inside = 1; next }
+            if (t == ENVIRON["MARK_END"]) { inside = 0; next }
+            if (inside && !(key($0) in known)) {
+                line = $0
+                sub(/\r$/, "", line)
+                print line
+            }
+        }' "$1" "$2" "$3"
+}
+
+# Saves $TMP/block, the block just published, as the copy the next lap
+# compares against. Called once per successful publication, right after the
+# gh call. $1 names the PR in the failure message. Notes queued so far are
+# flushed first: dying here skips the normal flush, and the moved/no-copy note
+# describes what the publication just did.
+# Written in place on purpose (no temp file and rename, no fsync). After a
+# failed or interrupted write the baseline can be absent (the next lap
+# replaces the section with a note), stale (a write refused before it began,
+# e.g. a read-only copy, leaves the old complete copy) or partial (a kill or
+# a full disk partway). The next lap compares against a stale or partial
+# regular file and may move lines choco itself wrote. Accepted cost; the
+# message below says only what the saved copy may be and what the next lap
+# may do. A moved line is only a line found in neither saved block.
+save_copy() {
+    cat "$TMP/block" > "$COPY" || {
+        if [ -s "$TMP/notes" ]; then cat "$TMP/notes" >&2; fi
+        die "$1 was published, but choco could not save a copy of it; the saved copy choco compares against on the next lap may be missing, out of date or incomplete, so the next lap may replace its section, or may move lines choco wrote itself"
+    }
+}
+
+MOVED_HEADING="## Kept from choco's section: lines not in choco's last published copy"
+MOVED_EXPLAIN="choco moved these lines here from its own section of this description: they were not in choco's last published copy (the saved copy it compares against) and are not in the new text, and that section is rewritten on every lap. choco never changes text outside its section, so edit or delete these freely."
 
 # Title: newlines, CRs and tabs become spaces, runs of spaces collapse to
 # one, and the ends are trimmed.
@@ -323,6 +385,8 @@ fi
 
 GITDIR=$(git rev-parse --absolute-git-dir) || die "cannot find the git dir"
 PUSHED_FILE="$GITDIR/choco-open-pr-pushed"
+# The block as last published; see save_copy().
+COPY="$GITDIR/choco-open-pr-published.md"
 LAST_PUSHED=""
 if [ -f "$PUSHED_FILE" ]; then
     LAST_PUSHED=$(awk -v b="$BRANCH" '$1 == b { v = $2 } END { print v }' "$PUSHED_FILE") || die "cannot read the pushed-commit record"
@@ -491,13 +555,38 @@ N=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number // em
 # `awaiting_human_review` as the owner's own `/approve`/`/request-changes`.
 if [ -z "$N" ]; then
     gh pr create --title="$T" --body-file "$TMP/block" >/dev/null
+    save_copy "the new PR's description"
 else
     # A Go template, not `-q .body`: jq output ends with a newline that
     # GitHub never stored, and the splice would keep it after the end marker,
     # growing the human's text by one newline per lap.
     gh pr view "$N" --json body -t '{{.body}}' > "$TMP/current"
     if splice "$TMP/current" "$TMP/block" > "$TMP/new"; then
+        # The body has exactly one block. With a saved copy, lines inside the
+        # live block that are in neither the copy nor the new block are kept:
+        # move them (neutralised) to the end of the body, after all
+        # outside text, so the replaced block does not drop them. Each step
+        # is a plain command so a failure stops the script before any
+        # publication and leaves the copy as it was.
+        if [ -f "$COPY" ]; then
+            hand_lines "$COPY" "$TMP/block" "$TMP/current" > "$TMP/hand"
+            if [ -s "$TMP/hand" ]; then
+                neutralize_closing_refs < "$TMP/hand" > "$TMP/hand-safe"
+                # A plain awk count, not `wc | tr`: in a pipeline only the
+                # last command's status counts, so a failed `wc` would be
+                # missed and a blank count published.
+                K=$(awk 'END { print NR }' "$TMP/hand")
+                {
+                    printf '\n%s\n\n%s\n\n' "$MOVED_HEADING" "$MOVED_EXPLAIN"
+                    cat "$TMP/hand-safe"
+                } >> "$TMP/new"
+                note "moved $K line(s) that were not in choco's last published copy or its new text, from inside choco's section of PR #$N to below it, under \"$MOVED_HEADING\""
+            fi
+        else
+            note "no saved copy of what choco last published in PR #$N's description (it may have been opened by an older choco, or the copy may be missing or incomplete): lines inside choco's section can't be compared, so the section was replaced and none were moved out"
+        fi
         gh pr edit "$N" --body-file "$TMP/new" >/dev/null
+        save_copy "PR #$N's description"
     else
         note "PR #$N's description doesn't have exactly one choco block (begin, then end), e.g. a hand-written or pre-#101 body; left unchanged"
     fi

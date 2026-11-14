@@ -350,6 +350,16 @@ an independent reviewer do it, and look for what agents systematically miss:
   reported the run as "not made: <reason>" within the spec's budget and way
   out, and finished. Every
   required run has a budget in the spec.
+- **Where to put facts you add to the PR body.** Put CI versions, probe results
+  or required sections below `<!-- choco:pr-description:end -->`: laps keep
+  text outside choco's block. A line you add or change inside the block moves
+  below the end marker on the next refresh only when choco has a saved copy of
+  its last block and the line is in neither that copy nor the new block (a PR
+  from an older choco gets its copy on its first refresh, so protection starts
+  the lap after). A line that the new text also contains stays inside and is
+  gone once the coder drops it; a line you delete inside the block is not kept,
+  and is back only if the coder's new text has it. A later lap can still drop a
+  section the coder wrote there.
 - **Numbered artifacts** (migrations above all) against what has landed on
   the default branch since the task started.
 - **New messages and states**: read each one with the values its own path

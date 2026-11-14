@@ -63,6 +63,15 @@ Read this while watching a task, when its behaviour surprises you.
   verified. Commit messages are not rewritten at all: the coder is told not
   to write `Closes #N` in one, and that is all. The pre-merge checks in the
   skill catch both.
+  Each lap replaces only its own marker-delimited block of the body; text
+  outside it is kept. With the copy of the last published block that `open_pr`
+  saves, a line inside the block that is in neither the copy nor the new block
+  (usually a hand edit) moves below its end marker on the next lap, under
+  "Kept from choco's section: lines not in choco's last published copy". Without a copy (an older PR) the block is replaced and no inside
+  line is moved out (a live line the new text also has is simply still in the
+  new block), and a line deleted by hand is not kept either; a body with
+  no single block is left entirely unchanged and nothing is moved (details in
+  [docs/coding-task.md](../../../../docs/coding-task.md#editing-the-pr-body-by-hand)).
 - **checks_polling.** Polls every 30 seconds for up to 30 minutes.
   It goes green when every check passed or was skipped. It goes red on a
   failed, errored or timed-out check, as soon as one has finished. Only if the
