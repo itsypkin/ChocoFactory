@@ -34,7 +34,7 @@ impl Drop for TempDir {
     }
 }
 
-const COPIES: [&str; 9] = [
+const COPIES: [&str; 10] = [
     "prompts/planner-system.md",
     "prompts/planner-turn.md",
     "prompts/coder-system.md",
@@ -44,6 +44,7 @@ const COPIES: [&str; 9] = [
     "scripts/open-pr.sh",
     "scripts/ci-checks.sh",
     "scripts/await-review.sh",
+    "scripts/await-merge.sh",
 ];
 
 const NEW_FILES: [&str; 3] = [
@@ -144,20 +145,10 @@ fn review_panel_has_the_decided_shape() {
             "{name}"
         );
     }
-    let blocker = &def.stages["blocker"];
-    let StageKind::HumanGate {
-        capture,
-        markers,
-        watch,
-    } = &blocker.kind
-    else {
-        panic!("blocker must be a human_gate");
-    };
-    assert_eq!(*capture, Some(Capture::Text));
-    assert!(markers.is_empty() && watch.is_none());
-    let on: Vec<_> = blocker.on.iter().collect();
-    assert_eq!(on, [(&"resumed".to_string(), &"revising".to_string())]);
-    assert!(blocker.loop_guard.is_none());
+    // (#379) Both parked gates watch only for a merge, with the review
+    // gate's schedule and no deadline; a plain reply still resumes.
+    assert_parked_merge_watch(&def, &exp().join("scripts"), "source");
+    assert!(def.stages["blocker"].loop_guard.is_none());
 
     let StageKind::Poll { watch, .. } = &def.stages["checks_polling"].kind else {
         panic!("checks_polling must be a poll");
@@ -214,6 +205,108 @@ fn review_panel_has_the_decided_shape() {
     let shipped = load(&root().join("workflows/coding-task-planned.yaml"));
     let (_, _, shipped_sections) = agent_turn_parts(&shipped.stages["internal_review"].kind);
     assert_eq!(sections, shipped_sections);
+}
+
+/// The parked gates' merge watchers of a loaded review panel.
+fn assert_parked_merge_watch(def: &WorkflowDefinition, scripts: &Path, what: &str) {
+    use std::time::Duration;
+    for name in ["escalate_to_human", "blocker"] {
+        let gate = &def.stages[name];
+        let StageKind::HumanGate {
+            capture,
+            markers,
+            watch,
+        } = &gate.kind
+        else {
+            panic!("{what}: {name} must be a human_gate");
+        };
+        assert_eq!(*capture, Some(Capture::Text), "{what} {name}");
+        assert!(markers.is_empty(), "{what} {name}");
+        let watch = watch
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what} {name} must watch"));
+        assert_eq!(
+            watch.command,
+            chocofactoryd::workflow_def::ShellCommand::ScriptFile(scripts.join("await-merge.sh")),
+            "{what} {name}"
+        );
+        let env: Vec<(&str, &str)> = watch
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env, [("PR_NUMBER", "{{ stages.open_pr.number }}")]);
+        assert_eq!(watch.interval, Duration::from_secs(60), "{what} {name}");
+        let steps: Vec<(u64, u64)> = watch
+            .backoff
+            .iter()
+            .map(|s| (s.after.as_secs(), s.interval.as_secs()))
+            .collect();
+        assert_eq!(steps, [(6 * 3600, 300), (30 * 3600, 1800)], "{what} {name}");
+        assert_eq!(watch.timeout, None, "{what} {name}");
+        assert!(!gate.on.contains_key("timeout"), "{what} {name}");
+        let outcomes: Vec<(&str, &str)> = watch
+            .outcomes
+            .iter()
+            .map(|o| (o.pattern.as_str(), o.then.as_str()))
+            .collect();
+        assert_eq!(outcomes, [(r"\AMERGED(\n|$)", "merged")], "{what} {name}");
+        let on: Vec<_> = gate.on.iter().collect();
+        assert_eq!(
+            on,
+            [
+                (&"resumed".to_string(), &"revising".to_string()),
+                (&"merged".to_string(), &"done".to_string())
+            ],
+            "{what} {name}"
+        );
+        let review = def.stages["awaiting_human_review"].watch().unwrap();
+        assert_eq!(watch.interval, review.interval, "{what} {name}");
+        assert_eq!(watch.backoff, review.backoff, "{what} {name}");
+        assert_eq!(review.timeout, Some(Duration::from_secs(102 * 3600)));
+    }
+}
+
+/// Copies `from` into `to`, following symlinks, as a user copying the
+/// directory out of the checkout gets a self-contained one.
+fn copy_dereferenced(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if fs::metadata(entry.path()).unwrap().is_dir() {
+            copy_dereferenced(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn review_panel_merge_watch_works_from_a_copy_outside_the_checkout() {
+    use std::os::unix::fs::PermissionsExt;
+    let out = TempDir::new();
+    let copy = out.0.join("review-panel");
+    copy_dereferenced(&exp(), &copy);
+    let script = copy.join("scripts/await-merge.sh");
+    assert!(
+        !fs::symlink_metadata(&script)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the copy holds the file itself"
+    );
+    assert_ne!(
+        fs::metadata(&script).unwrap().permissions().mode() & 0o111,
+        0,
+        "the copied script is executable"
+    );
+    assert_eq!(
+        fs::read(&script).unwrap(),
+        fs::read(root().join("workflows/scripts/await-merge.sh")).unwrap()
+    );
+    let def = load(&copy.join("review-panel.yaml"));
+    assert_parked_merge_watch(&def, &copy.join("scripts"), "copy");
 }
 
 #[test]

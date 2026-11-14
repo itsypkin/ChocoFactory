@@ -14,8 +14,8 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 | `awaiting_human_review` | Waits for your verdict on the PR (see below). |
 | `base_conflict` | Reached when the PR stops merging cleanly into its base branch while it waits. It does nothing but count these rounds, then sends the task to `revising` to rebase. |
 | `done` | The task is finished. |
-| `escalate_to_human` | A parking stage: the task waits here for a human when a limit is hit (see [Escalation limits](#escalation-limits-and-ci-polling)). |
-| `blocker` | A parking stage: the coder reported a blocker it must not work around, from `coding` or `revising`. The task waits, with no time limit, for your answer (`choco task send <id> --text "..."`). The answer goes to `revising`, and the internal reviewer sees it too and treats it as your decision. It resets no loop count. |
+| `escalate_to_human` | A parking stage: the task waits here for a human when a limit is hit (see [Escalation limits](#escalation-limits-and-ci-polling)). It has no time limit, and if the PR is merged while the task waits here, the task moves to `done` by itself (see [A PR merged while the task is parked](#a-pr-merged-while-the-task-is-parked)). |
+| `blocker` | A parking stage: the coder reported a blocker it must not work around, from `coding` or `revising`. The task waits, with no time limit, for your answer (`choco task send <id> --text "..."`). The answer goes to `revising`, and the internal reviewer sees it too and treats it as your decision. It resets no loop count. If the PR is merged while the task waits here, the task moves to `done` by itself, as at `escalate_to_human`. |
 
 Every way back (a rejected internal review, red CI, a `/request-changes` from
 you, a resumed escalation, an answered blocker, a PR that started conflicting with its base) goes through `revising`. The `coder` runs on
@@ -210,9 +210,9 @@ there: the gate doesn't read markers, so it would be a note that starts a coder
 lap. To watch again, run `choco task retry <id>`; the schedule starts over and
 no coder lap is spent. Comments and reviews posted before the timeout are not
 counted after that, except what the gate's last look at the deadline reads
-(it runs the check once more before it gives up); post them again. If the PR was merged meanwhile, `retry` is also the
-way on: the watcher sees the merge and the task moves to `done`. `retry` after
-a `checks_polling` timeout re-watches CI the same way. A fourth `/request-changes`, after three revise rounds, parks
+(it runs the check once more before it gives up); post them again. `retry`
+after a `checks_polling` timeout re-watches CI the same way. A merge needs no
+`retry`: see below. A fourth `/request-changes`, after three revise rounds, parks
 it the same way instead of looping; so does the 4th conflict round
 (`base_conflict`) since the last escalation, which is counted separately from
 your `/request-changes` rounds and in total, not in a row, and resuming from there starts the
@@ -232,6 +232,38 @@ a cancelled, startup-failure or action-required check (`ci_cancelled`,
 `ci_startup_failure`, `ci_action_required`), park the task at
 `escalate_to_human`. Green (every check passed or was skipped) and
 `no_checks` (no check reported for 3 minutes) go to `awaiting_human_review`.
+
+### A PR merged while the task is parked
+
+`escalate_to_human` and `blocker` each watch for one thing: that the task's PR
+was merged. They read only the PR's state (`gh pr view <number> --json state`),
+never its comments, reviews or conflicts, so a `/approve`, a `/request-changes`
+or a conflict cannot move a parked task. When the state is exactly `MERGED` the
+task moves to `done` (and is closed, not cancelled), with no coder or reviewer
+lap, so merging the PR by hand is all it takes: do not cancel the task and do
+not send a note.
+
+The check runs every minute for the first 6 hours after the task parks, every
+5 minutes for the next 24 hours, and every 30 minutes after that, with no time
+limit. A PR that is open or closed without merging leaves the task waiting
+(a closed-unmerged PR is not a merge). A read that fails (GitHub unreachable,
+`gh` logged out) is shown in the task's events and leaves the task waiting; it
+reads again at the next interval, and a hung `gh` call can hold the check
+until the task is cancelled or paused. While a task is paused or cancelled
+nothing is read, so a merge made then is seen after `choco task resume`, never
+for a cancelled task. If the task has no PR yet (it parked before `open_pr`,
+for example at `blocker`), there is nothing to read and it keeps waiting for
+your answer. A note sent with `choco task send` still goes to `revising` as
+before, and stops this check.
+
+After a review or CI timeout, `choco task retry <id>` is only for watching an
+unmerged PR again; it is not needed to notice a merge. It works at either
+parked gate when the task got there by a timeout, even when the gate also
+watches for the merge, and the check for the merge stops while the original
+watcher runs.
+
+Workflow files already copied into a project are never rewritten, so they
+do not have this check until you add it to them from the built-in files.
 
 ## The PR body and the issue it closes
 

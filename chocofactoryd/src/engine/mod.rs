@@ -2765,7 +2765,8 @@ impl WorkflowEngine {
 
     /// Watches again after a watcher's timeout (#179): moves the task back
     /// to the watcher stage `timed_out.from` with a fresh window, in one
-    /// state write, and re-enters it. Runs under the per-task lock
+    /// state write, stops the gate's own watcher if it has one, and re-enters
+    /// the original stage. Runs under the per-task lock
     /// `retry_task` holds, on the state it read under that lock. The task
     /// stays `open`.
     async fn rewatch_locked(
@@ -2800,6 +2801,11 @@ impl WorkflowEngine {
         )
         .await?
         .ok_or(RetryTaskError::NoWorkflowState)?;
+        // The state is committed, so the gate is behind us: stop and await
+        // its watcher (when it has one) before the original watcher starts,
+        // still under the task lock. Stopping it any earlier would leave an
+        // unwatched gate behind a failed update. Aborting is not fallible.
+        self.abort_detached_runners(task_id).await;
         if let Err(err) = self
             .enter_stage(
                 task_id,
