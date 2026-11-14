@@ -1331,22 +1331,22 @@ fn a_ref_in_the_part_of_the_title_that_is_cut_still_gets_its_refs_line() {
 
 // ---- hand edits inside choco's section are kept across laps (#344) ----
 
-const HEADING: &str = "## Kept from a hand edit inside choco's section";
-const EXPLAIN: &str = "choco moved these lines here from its own section of this description, where they were in neither the text choco last published nor the text it is publishing now, which usually means someone added or changed them by hand; that section is rewritten on every lap, and the new text doesn't have them. choco never changes text outside its section, so edit or delete these freely.";
+const HEADING: &str = "## Kept from choco's section: lines not in choco's last published copy";
+const EXPLAIN: &str = "choco moved these lines here from its own section of this description: they were not in choco's last published copy (the saved copy it compares against) and are not in the new text, and that section is rewritten on every lap. choco never changes text outside its section, so edit or delete these freely.";
 const TITLE: &str = "T (#1)";
 const PREFIX: [&str; 2] = ["HUMAN PREFIX one", "HUMAN PREFIX two"];
 const SUFFIX: [&str; 2] = ["HUMAN SUFFIX one", "HUMAN SUFFIX two"];
-const DIE_TAIL: &str = " was published, but choco could not save a copy of it; the copy choco compares against on the next lap may now be missing, out of date or incomplete: if it is missing, choco replaces its section with a note saying so; otherwise choco compares against what is there and may move lines it wrote itself, as if someone had added them by hand";
+const DIE_TAIL: &str = " was published, but choco could not save a copy of it; the saved copy choco compares against on the next lap may be missing, out of date or incomplete, so the next lap may replace its section, or may move lines choco wrote itself";
 
 fn moved_note(k: usize, n: u32) -> String {
     format!(
-        "choco open-pr: note: moved {k} line(s) that were in neither choco's last published text nor its new text, so were probably added or changed by hand, inside choco's section of PR #{n} below it, under \"{HEADING}\""
+        "choco open-pr: note: moved {k} line(s) that were not in choco's last published copy or its new text, from inside choco's section of PR #{n} to below it, under \"{HEADING}\""
     )
 }
 
 fn no_copy_note(n: u32) -> String {
     format!(
-        "choco open-pr: note: no copy of what choco last published in PR #{n}'s description (it may have been opened by an older choco): a hand edit inside choco's section can't be told apart from choco's own text, and the section was replaced"
+        "choco open-pr: note: no saved copy of what choco last published in PR #{n}'s description (it may have been opened by an older choco, or the copy may be missing or incomplete): lines inside choco's section can't be compared, so the section was replaced and none were moved out"
     )
 }
 
@@ -1422,7 +1422,7 @@ fn assert_no_heading(body: &str) {
 }
 
 fn count_moved_notes(out: &Output) -> usize {
-    stderr(out).matches("line(s) that someone added").count()
+    stderr(out).matches("choco open-pr: note: moved ").count()
 }
 
 const CI_LINE: &str =
@@ -1461,6 +1461,8 @@ fn a_hand_edit_inside_the_block_is_moved_below_it_and_kept_on_later_laps() {
     }
     // (e)
     assert!(stderr(&out).contains(&moved_note(2, 7)), "{}", stderr(&out));
+    // The negative-note helper must see a real note: exactly one here.
+    assert_eq!(count_moved_notes(&out), 1, "{}", stderr(&out));
     // The moved lines are the last thing in the body, right under the text.
     assert!(
         body2.ends_with(&format!(

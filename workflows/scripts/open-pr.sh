@@ -18,10 +18,10 @@
 # every line outside it is kept byte for byte. After each successful publish
 # the block is saved as the copy ($GITDIR/choco-open-pr-published.md). On the
 # next lap a line inside the live block that is in neither the copy nor the new
-# block is taken to have been added or changed by hand (an inference from
-# those two saved texts, not proof of who wrote it): it is moved below the block under its own
-# heading (neutralised like any agent text) instead of being silently
-# dropped. Without a copy, or when the body has no single valid block, nothing
+# block is moved below the block under its own heading (neutralised like any
+# agent text) instead of being silently dropped. It is only a line absent from
+# the saved copy and the new text: usually a hand edit, but the script cannot
+# tell, and a stale or partial copy makes it move lines choco wrote itself. Without a copy, or when the body has no single valid block, nothing
 # can be told apart and nothing is moved (see the notes below).
 #
 # Inputs: PR_TASK_TITLE, PR_REVIEW_VERDICT, PR_REVIEW_REPORT (stage `env:`);
@@ -282,8 +282,7 @@ splice() {
 # Prints, in order and with duplicates, the lines strictly between the BEGIN
 # and END lines of the body $3 whose trimmed value (trailing spaces, tabs and
 # CRs removed, nothing else) is in neither the previously published block $1
-# nor the new block $2: candidates for hand edits (the test is membership, not
-# authorship). A terminal CR
+# nor the new block $2 (the test is membership, not authorship). A terminal CR
 # is dropped from each printed line; every other byte is kept. The caller has
 # checked that $3 has exactly one block. Plain awk, no `-v`, no pipe: a
 # failure must stop the script (set -e), not publish a partial answer.
@@ -316,18 +315,17 @@ hand_lines() {
 # e.g. a read-only copy, leaves the old complete copy) or partial (a kill or
 # a full disk partway). The next lap compares against a stale or partial
 # regular file and may move lines choco itself wrote. Accepted cost; the
-# message below names all three states and promises no single route. A moved
-# line is only a line found in neither saved block, not proof that a person
-# wrote it.
+# message below says only what the saved copy may be and what the next lap
+# may do. A moved line is only a line found in neither saved block.
 save_copy() {
     cat "$TMP/block" > "$COPY" || {
         if [ -s "$TMP/notes" ]; then cat "$TMP/notes" >&2; fi
-        die "$1 was published, but choco could not save a copy of it; the copy choco compares against on the next lap may now be missing, out of date or incomplete: if it is missing, choco replaces its section with a note saying so; otherwise choco compares against what is there and may move lines it wrote itself, as if someone had added them by hand"
+        die "$1 was published, but choco could not save a copy of it; the saved copy choco compares against on the next lap may be missing, out of date or incomplete, so the next lap may replace its section, or may move lines choco wrote itself"
     }
 }
 
-MOVED_HEADING="## Kept from a hand edit inside choco's section"
-MOVED_EXPLAIN="choco moved these lines here from its own section of this description, where they were in neither the text choco last published nor the text it is publishing now, which usually means someone added or changed them by hand; that section is rewritten on every lap, and the new text doesn't have them. choco never changes text outside its section, so edit or delete these freely."
+MOVED_HEADING="## Kept from choco's section: lines not in choco's last published copy"
+MOVED_EXPLAIN="choco moved these lines here from its own section of this description: they were not in choco's last published copy (the saved copy it compares against) and are not in the new text, and that section is rewritten on every lap. choco never changes text outside its section, so edit or delete these freely."
 
 # Title: newlines, CRs and tabs become spaces, runs of spaces collapse to
 # one, and the ends are trimmed.
@@ -564,8 +562,8 @@ else
     gh pr view "$N" --json body -t '{{.body}}' > "$TMP/current"
     if splice "$TMP/current" "$TMP/block" > "$TMP/new"; then
         # The body has exactly one block. With a saved copy, lines inside the
-        # live block that are in neither the copy nor the new block are hand
-        # edits: move them (neutralised) to the end of the body, after all
+        # live block that are in neither the copy nor the new block are kept:
+        # move them (neutralised) to the end of the body, after all
         # outside text, so the replaced block does not drop them. Each step
         # is a plain command so a failure stops the script before any
         # publication and leaves the copy as it was.
@@ -581,10 +579,10 @@ else
                     printf '\n%s\n\n%s\n\n' "$MOVED_HEADING" "$MOVED_EXPLAIN"
                     cat "$TMP/hand-safe"
                 } >> "$TMP/new"
-                note "moved $K line(s) that were in neither choco's last published text nor its new text, so were probably added or changed by hand, inside choco's section of PR #$N below it, under \"$MOVED_HEADING\""
+                note "moved $K line(s) that were not in choco's last published copy or its new text, from inside choco's section of PR #$N to below it, under \"$MOVED_HEADING\""
             fi
         else
-            note "no copy of what choco last published in PR #$N's description (it may have been opened by an older choco): a hand edit inside choco's section can't be told apart from choco's own text, and the section was replaced"
+            note "no saved copy of what choco last published in PR #$N's description (it may have been opened by an older choco, or the copy may be missing or incomplete): lines inside choco's section can't be compared, so the section was replaced and none were moved out"
         fi
         gh pr edit "$N" --body-file "$TMP/new" >/dev/null
         save_copy "PR #$N's description"
