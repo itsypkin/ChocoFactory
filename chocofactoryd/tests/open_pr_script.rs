@@ -1966,9 +1966,11 @@ fn trailing_blanks_in_the_saved_copy_do_not_make_a_line_a_hand_edit() {
     // The published copy keeps the description's trailing blanks; the live
     // body (as GitHub or an editor may hand it back) has them stripped.
     let body1 = first_lap(&fx, "copy line  \t\ncopy tab\t \n");
-    assert!(fs::read_to_string(copy_path(&fx))
-        .unwrap()
-        .contains("\ncopy line  \t\n"));
+    assert!(
+        fs::read_to_string(copy_path(&fx))
+            .unwrap()
+            .contains("\ncopy line  \t\n")
+    );
     let live = wrap(
         &body1
             .replace("copy line  \t\n", "copy line\n")
