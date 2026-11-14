@@ -67,8 +67,9 @@ Read this while watching a task, when its behaviour surprises you.
   outside it is kept. With the copy of the last published block that `open_pr`
   saves, a line someone added or changed by hand inside the block moves below
   its end marker on the next lap, unless the copy or the new block already has
-  that line; without a copy (an older PR), for a line deleted by hand, or with
-  a body that has no single block, nothing is kept (details in
+  that line. Without a copy (an older PR) the block is replaced and nothing
+  inside it is kept, and a line deleted by hand is not kept either; a body with
+  no single block is left entirely unchanged and nothing is moved (details in
   [docs/coding-task.md](../../../../docs/coding-task.md#editing-the-pr-body-by-hand)).
 - **checks_polling.** Polls every 30 seconds for up to 30 minutes.
   It goes green when every check passed or was skipped. It goes red on a

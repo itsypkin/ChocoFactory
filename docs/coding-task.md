@@ -279,11 +279,11 @@ What this does and doesn't keep:
   as before and says so in a timeline note; it saves its first copy then, so
   hand edits are kept from the update after that.
 - If the copy can't be saved after publishing, the stage fails with a message
-  saying so, and the next lap can't tell a hand edit from choco's own text.
-  If a lap is killed while the copy is being written, or the write fails
-  partway, an old, empty or partial copy can remain, and then that message can
-  be wrong about the next lap: it may move some coder text as if you had
-  written it.
+  saying so, and normally no copy remains, so the next lap replaces the block
+  with a note. If a lap is killed while the copy is being written, or the
+  write fails partway, an old, empty or partial copy can remain instead; the
+  message says so, and the next lap then compares against it and may move
+  some coder text as if you had written it.
 - A body without exactly one block is left unchanged, with a note, and nothing
   is moved.
 - Only the body as read at the start of the lap is protected: an edit saved

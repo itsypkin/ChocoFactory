@@ -1336,7 +1336,7 @@ const EXPLAIN: &str = "choco moved these lines here from its own section of this
 const TITLE: &str = "T (#1)";
 const PREFIX: [&str; 2] = ["HUMAN PREFIX one", "HUMAN PREFIX two"];
 const SUFFIX: [&str; 2] = ["HUMAN SUFFIX one", "HUMAN SUFFIX two"];
-const DIE_TAIL: &str = " was published, but choco could not save a copy of it; on the next lap choco can't tell a hand edit inside its section from its own text and will replace the section, with a note saying so";
+const DIE_TAIL: &str = " was published, but choco could not save a copy of it; on the next lap choco can't tell a hand edit inside its section from its own text and will replace the section, with a note saying so; if the copy was left incomplete instead, the next lap compares against what is there and may move lines choco wrote itself";
 
 fn moved_note(k: usize, n: u32) -> String {
     format!(

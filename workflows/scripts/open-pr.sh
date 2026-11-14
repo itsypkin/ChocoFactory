@@ -18,7 +18,8 @@
 # every line outside it is kept byte for byte. After each successful publish
 # the block is saved as the copy ($GITDIR/choco-open-pr-published.md). On the
 # next lap a line inside the live block that is in neither the copy nor the new
-# block was added or changed by hand: it is moved below the block under its own
+# block is taken to have been added or changed by hand (an inference from
+# those two saved texts, not proof of who wrote it): it is moved below the block under its own
 # heading (neutralised like any agent text) instead of being silently
 # dropped. Without a copy, or when the body has no single valid block, nothing
 # can be told apart and nothing is moved (see the notes below).
@@ -312,13 +313,15 @@ hand_lines() {
 # full disk partway through can leave an old, empty or partial copy, and the
 # next lap may then move coder-written lines as if they were hand edits, or
 # find a partial regular file and compare against it. Accepted cost. The
-# message below then predicts the next lap wrongly (a partial regular copy is
-# compared against, not treated as missing), and a moved line is only a line
-# found in neither saved block, not proof that a person wrote it.
+# first part of the message below is the usual outcome (no copy, so the
+# section is replaced with a note); its last clause says what a partial
+# regular copy does instead (it is compared against, not treated as missing).
+# A moved line is only a line found in neither saved block, not proof that a
+# person wrote it.
 save_copy() {
     cat "$TMP/block" > "$COPY" || {
         if [ -s "$TMP/notes" ]; then cat "$TMP/notes" >&2; fi
-        die "$1 was published, but choco could not save a copy of it; on the next lap choco can't tell a hand edit inside its section from its own text and will replace the section, with a note saying so"
+        die "$1 was published, but choco could not save a copy of it; on the next lap choco can't tell a hand edit inside its section from its own text and will replace the section, with a note saying so; if the copy was left incomplete instead, the next lap compares against what is there and may move lines choco wrote itself"
     }
 }
 
