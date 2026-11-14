@@ -172,8 +172,11 @@ command in step 3 and the pre-merge check in step 4.
   deadline, but that does not give the lost time back, and a restart drops it.
   To keep work moving, on macOS run `caffeinate -dims` in a spare terminal.
   Don't tie it to the daemon with `-w <pid>`: the pid changes on restart.
-  A turn still goes `stuck` if it stays silent for 30 minutes of awake time;
-  look at its events before retrying.
+  An unfinished turn that stays silent for 30 minutes of awake time is
+  closed and the task goes `stuck`; look at its events before retrying. That
+  does not apply to a turn waiting on background jobs it has signalled: the
+  idle timeout leaves it alone, and the job-wait limit (one hour by default)
+  bounds it instead.
 
 ## 2. Write the spec
 
