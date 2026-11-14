@@ -288,12 +288,14 @@ splice() {
 hand_lines() {
     awk '
         function trimmed(l) { sub(/[ \t\r]+$/, "", l); return l }
-        FILENAME == ARGV[1] || FILENAME == ARGV[2] { known[trimmed($0)] = 1; next }
+        # The one comparison key, for every insertion and lookup below.
+        function key(l) { return trimmed(l) }
+        FILENAME == ARGV[1] || FILENAME == ARGV[2] { known[key($0)] = 1; next }
         {
             t = trimmed($0)
             if (t == ENVIRON["MARK_BEGIN"]) { inside = 1; next }
             if (t == ENVIRON["MARK_END"]) { inside = 0; next }
-            if (inside && !(t in known)) {
+            if (inside && !(key($0) in known)) {
                 line = $0
                 sub(/\r$/, "", line)
                 print line
