@@ -161,12 +161,19 @@ command in step 3 and the pre-merge check in step 4.
   where it can and starts the rest fresh.
   The daemon logs to `~/.config/chocofactory/logs/chocofactoryd.log`; kills,
   `stuck` marks and nudges show up there first.
-- **Keep the machine awake for the whole run.** On a sleeping laptop agent
-  turns stall, and the review window (about 4 days) keeps running and can park the
-  task overnight. A stage that wakes after its deadline takes a last look, and
-  watches up to 30 more minutes if it slept through the deadline, but that does
-  not give the lost time back, and a restart drops it. On macOS, run `caffeinate -dims` in a spare terminal. Don't
-  tie it to the daemon with `-w <pid>`: the pid changes on restart.
+- **Keeping the machine awake is optional for the idle reaper, and still
+  worth it for progress.** Time the host spends asleep (macOS and Linux) does
+  not count towards the 30-minute idle timeout, so sleeping alone no longer
+  gets a turn reaped. A sleeping laptop still makes no
+  progress, and wall-clock windows keep running: the review window (about 4
+  days) can park the task overnight, and a poll or review deadline that passes
+  during sleep is not extended. A stage that wakes after its deadline takes a
+  last look, and watches up to 30 more minutes if it slept through the
+  deadline, but that does not give the lost time back, and a restart drops it.
+  To keep work moving, on macOS run `caffeinate -dims` in a spare terminal.
+  Don't tie it to the daemon with `-w <pid>`: the pid changes on restart.
+  A turn still goes `stuck` if it stays silent for 30 minutes of awake time;
+  look at its events before retrying.
 
 ## 2. Write the spec
 
