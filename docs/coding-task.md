@@ -260,7 +260,8 @@ saves a copy of the block it published in the worktree's private git
 directory (`choco-open-pr-published.md`).
 
 With that copy, a line inside the block that is in neither the copy nor the
-new block is taken as a hand edit and moved below the end marker, under the
+new block is taken as probably a hand edit (the test is membership, not
+authorship) and moved below the end marker, under the
 heading `## Kept from a hand edit inside choco's section`, with a timeline
 note saying how many lines moved. Later moves add a new heading and group
 after everything already outside the block. Moved lines are rewritten like any
@@ -279,11 +280,12 @@ What this does and doesn't keep:
   as before and says so in a timeline note; it saves its first copy then, so
   hand edits are kept from the update after that.
 - If the copy can't be saved after publishing, the stage fails with a message
-  saying so, and normally no copy remains, so the next lap replaces the block
-  with a note. If a lap is killed while the copy is being written, or the
-  write fails partway, an old, empty or partial copy can remain instead; the
-  message says so, and the next lap then compares against it and may move
-  some coder text as if you had written it.
+  saying so. The copy can then be missing (the next lap replaces the block
+  with a note), stale (the write was refused before it began, for example a
+  read-only copy, so the old complete copy stays) or partial (a kill or a full
+  disk partway). The same holds if a lap is killed while the copy is being
+  written. From a stale or partial copy the next lap compares as usual and may
+  move some coder text as if you had written it.
 - A body without exactly one block is left unchanged, with a note, and nothing
   is moved.
 - Only the body as read at the start of the lap is protected: an edit saved

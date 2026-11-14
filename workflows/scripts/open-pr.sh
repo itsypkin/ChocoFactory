@@ -282,7 +282,8 @@ splice() {
 # Prints, in order and with duplicates, the lines strictly between the BEGIN
 # and END lines of the body $3 whose trimmed value (trailing spaces, tabs and
 # CRs removed, nothing else) is in neither the previously published block $1
-# nor the new block $2: what someone added or changed by hand. A terminal CR
+# nor the new block $2: candidates for hand edits (the test is membership, not
+# authorship). A terminal CR
 # is dropped from each printed line; every other byte is kept. The caller has
 # checked that $3 has exactly one block. Plain awk, no `-v`, no pipe: a
 # failure must stop the script (set -e), not publish a partial answer.
@@ -309,24 +310,24 @@ hand_lines() {
 # gh call. $1 names the PR in the failure message. Notes queued so far are
 # flushed first: dying here skips the normal flush, and the moved/no-copy note
 # describes what the publication just did.
-# Written in place on purpose (no temp file and rename, no fsync): a kill or a
-# full disk partway through can leave an old, empty or partial copy, and the
-# next lap may then move coder-written lines as if they were hand edits, or
-# find a partial regular file and compare against it. Accepted cost. The
-# first part of the message below is the usual outcome (no copy, so the
-# section is replaced with a note); its last clause says what a partial
-# regular copy does instead (it is compared against, not treated as missing).
-# A moved line is only a line found in neither saved block, not proof that a
-# person wrote it.
+# Written in place on purpose (no temp file and rename, no fsync). After a
+# failed or interrupted write the baseline can be absent (the next lap
+# replaces the section with a note), stale (a write refused before it began,
+# e.g. a read-only copy, leaves the old complete copy) or partial (a kill or
+# a full disk partway). The next lap compares against a stale or partial
+# regular file and may move lines choco itself wrote. Accepted cost; the
+# message below names all three states and promises no single route. A moved
+# line is only a line found in neither saved block, not proof that a person
+# wrote it.
 save_copy() {
     cat "$TMP/block" > "$COPY" || {
         if [ -s "$TMP/notes" ]; then cat "$TMP/notes" >&2; fi
-        die "$1 was published, but choco could not save a copy of it; on the next lap choco can't tell a hand edit inside its section from its own text and will replace the section, with a note saying so; if the copy was left incomplete instead, the next lap compares against what is there and may move lines choco wrote itself"
+        die "$1 was published, but choco could not save a copy of it; the copy choco compares against on the next lap may now be missing, out of date or incomplete: if it is missing, choco replaces its section with a note saying so; otherwise choco compares against what is there and may move lines it wrote itself, as if someone had added them by hand"
     }
 }
 
 MOVED_HEADING="## Kept from a hand edit inside choco's section"
-MOVED_EXPLAIN="choco moved these lines here from its own section of this description, where someone had added or changed them by hand; that section is rewritten on every lap, and the new text doesn't have them. choco never changes text outside its section, so edit or delete these freely."
+MOVED_EXPLAIN="choco moved these lines here from its own section of this description, where they were in neither the text choco last published nor the text it is publishing now, which usually means someone added or changed them by hand; that section is rewritten on every lap, and the new text doesn't have them. choco never changes text outside its section, so edit or delete these freely."
 
 # Title: newlines, CRs and tabs become spaces, runs of spaces collapse to
 # one, and the ends are trimmed.
@@ -580,7 +581,7 @@ else
                     printf '\n%s\n\n%s\n\n' "$MOVED_HEADING" "$MOVED_EXPLAIN"
                     cat "$TMP/hand-safe"
                 } >> "$TMP/new"
-                note "moved $K line(s) that someone added or changed by hand inside choco's section of PR #$N below it, under \"$MOVED_HEADING\""
+                note "moved $K line(s) that were in neither choco's last published text nor its new text, so were probably added or changed by hand, inside choco's section of PR #$N below it, under \"$MOVED_HEADING\""
             fi
         else
             note "no copy of what choco last published in PR #$N's description (it may have been opened by an older choco): a hand edit inside choco's section can't be told apart from choco's own text, and the section was replaced"

@@ -1332,15 +1332,15 @@ fn a_ref_in_the_part_of_the_title_that_is_cut_still_gets_its_refs_line() {
 // ---- hand edits inside choco's section are kept across laps (#344) ----
 
 const HEADING: &str = "## Kept from a hand edit inside choco's section";
-const EXPLAIN: &str = "choco moved these lines here from its own section of this description, where someone had added or changed them by hand; that section is rewritten on every lap, and the new text doesn't have them. choco never changes text outside its section, so edit or delete these freely.";
+const EXPLAIN: &str = "choco moved these lines here from its own section of this description, where they were in neither the text choco last published nor the text it is publishing now, which usually means someone added or changed them by hand; that section is rewritten on every lap, and the new text doesn't have them. choco never changes text outside its section, so edit or delete these freely.";
 const TITLE: &str = "T (#1)";
 const PREFIX: [&str; 2] = ["HUMAN PREFIX one", "HUMAN PREFIX two"];
 const SUFFIX: [&str; 2] = ["HUMAN SUFFIX one", "HUMAN SUFFIX two"];
-const DIE_TAIL: &str = " was published, but choco could not save a copy of it; on the next lap choco can't tell a hand edit inside its section from its own text and will replace the section, with a note saying so; if the copy was left incomplete instead, the next lap compares against what is there and may move lines choco wrote itself";
+const DIE_TAIL: &str = " was published, but choco could not save a copy of it; the copy choco compares against on the next lap may now be missing, out of date or incomplete: if it is missing, choco replaces its section with a note saying so; otherwise choco compares against what is there and may move lines it wrote itself, as if someone had added them by hand";
 
 fn moved_note(k: usize, n: u32) -> String {
     format!(
-        "choco open-pr: note: moved {k} line(s) that someone added or changed by hand inside choco's section of PR #{n} below it, under \"{HEADING}\""
+        "choco open-pr: note: moved {k} line(s) that were in neither choco's last published text nor its new text, so were probably added or changed by hand, inside choco's section of PR #{n} below it, under \"{HEADING}\""
     )
 }
 
@@ -2021,4 +2021,113 @@ fn a_failed_copy_write_flushes_the_moved_note() {
     );
     assert!(stderr(&out).contains(&moved_note(1, 7)), "{}", stderr(&out));
     assert!(!stderr(&out).contains("no copy of what choco"));
+}
+
+/// A fake `cat` first on PATH that, while the control `partial-copy-write`
+/// exists, writes only the first eight bytes of the block and fails: a copy
+/// write that died partway. Otherwise it runs the real `cat`.
+fn install_partial_cat(fx: &Fixture) {
+    let real = std::env::var("PATH")
+        .unwrap()
+        .split(':')
+        .map(|d| Path::new(d).join("cat"))
+        .find(|p| p.exists())
+        .expect("a real cat");
+    let script = format!(
+        r#"#!/bin/sh
+if [ -e "$GH_FAKE_DIR/cfg/partial-copy-write" ] && [ "$#" -eq 1 ]; then
+    case "$1" in
+    */block)
+        head -c 8 "$1"
+        exit 1
+        ;;
+    esac
+fi
+exec '{}' "$@"
+"#,
+        real.display()
+    );
+    let path = fx.root.join("bin/cat");
+    fs::write(&path, script).unwrap();
+    make_executable(&path);
+}
+
+#[test]
+fn a_partial_copy_after_a_failed_save_is_named_by_the_message_and_compared_against() {
+    let fx = Fixture::new();
+    install_partial_cat(&fx);
+    let body1 = first_lap(&fx, "first text\n");
+    fx.cfg("partial-copy-write", "");
+    let out = later_lap(&fx, &wrap(&body1), "second text\n");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains(&format!("choco open-pr: PR #7's description{DIE_TAIL}\n")),
+        "{}",
+        stderr(&out)
+    );
+    let published = last_edit_body(&fx);
+    let partial = fs::read(copy_path(&fx)).unwrap();
+    assert_eq!(partial.len(), 8, "a regular but incomplete copy remains");
+
+    // The message's warning is true: the retry compares against what is there
+    // and moves a line that only the coder wrote.
+    fs::remove_file(fx.root.join("gh/cfg/partial-copy-write")).unwrap();
+    let out = later_lap(&fx, &published, "third text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body3 = last_edit_body(&fx);
+    assert!(body3.ends_with("\nsecond text\n"), "{body3}");
+    assert!(stderr(&out).contains(&moved_note(1, 7)), "{}", stderr(&out));
+}
+
+#[test]
+fn a_refused_copy_write_keeps_the_old_complete_copy_and_a_retry_compares_against_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "first text\n");
+    let old = fs::read(copy_path(&fx)).unwrap();
+    fs::set_permissions(copy_path(&fx), fs::Permissions::from_mode(0o444)).unwrap();
+    let out = later_lap(&fx, &wrap(&body1), "second text\n");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains(&format!("choco open-pr: PR #7's description{DIE_TAIL}\n")),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fx.calls_to("pr edit").len(),
+        1,
+        "published before the failure"
+    );
+    assert_eq!(
+        fs::read(copy_path(&fx)).unwrap(),
+        old,
+        "the old copy is intact"
+    );
+    let published = last_edit_body(&fx);
+
+    // The old copy is not missing, so no "no copy" note: the retry compares
+    // against it and moves the coder's own line, as the message warns.
+    fs::set_permissions(copy_path(&fx), fs::Permissions::from_mode(0o644)).unwrap();
+    let out = later_lap(&fx, &published, "third text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("no copy of what choco"));
+    assert!(last_edit_body(&fx).ends_with("\nsecond text\n"));
+}
+
+#[test]
+fn without_a_copy_a_live_line_the_new_text_has_stays_and_an_omitted_one_is_gone() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "first text\n");
+    fs::remove_file(copy_path(&fx)).unwrap();
+    let live = wrap(&body1.replace(
+        "first text\n",
+        "first text\nretained hand fact\ndropped hand fact\n",
+    ));
+    let out = later_lap(&fx, &live, "first text\nretained hand fact\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert_no_heading(&body2);
+    assert_eq!(count_line(&body2, "retained hand fact"), 1, "{body2}");
+    assert_eq!(count_line(&body2, "dropped hand fact"), 0, "{body2}");
+    assert!(stderr(&out).contains(&no_copy_note(7)));
 }

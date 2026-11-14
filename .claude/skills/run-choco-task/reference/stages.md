@@ -65,10 +65,11 @@ Read this while watching a task, when its behaviour surprises you.
   skill catch both.
   Each lap replaces only its own marker-delimited block of the body; text
   outside it is kept. With the copy of the last published block that `open_pr`
-  saves, a line someone added or changed by hand inside the block moves below
+  saves, a line that looks added or changed by hand inside the block moves below
   its end marker on the next lap, unless the copy or the new block already has
-  that line. Without a copy (an older PR) the block is replaced and nothing
-  inside it is kept, and a line deleted by hand is not kept either; a body with
+  that line. Without a copy (an older PR) the block is replaced and no inside
+  line is moved out (a live line the new text also has is simply still in the
+  new block), and a line deleted by hand is not kept either; a body with
   no single block is left entirely unchanged and nothing is moved (details in
   [docs/coding-task.md](../../../../docs/coding-task.md#editing-the-pr-body-by-hand)).
 - **checks_polling.** Polls every 30 seconds for up to 30 minutes.
