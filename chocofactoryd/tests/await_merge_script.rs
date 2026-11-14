@@ -145,6 +145,16 @@ fn merge_probe_only_accepts_successful_merged_state() {
 }
 
 #[test]
+fn a_closed_unmerged_pr_is_not_merged() {
+    let fixture = Fixture::new("closed");
+    fixture.record(r#"{"state":"CLOSED","mergedAt":null}"#);
+    let out = fixture.run(Some("380"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(out.status.success(), "{:?}", out.status);
+    assert_eq!(fixture.calls(), expected_call("380"));
+}
+
+#[test]
 fn an_empty_successful_read_is_not_merged() {
     let fixture = Fixture::new("empty-output");
     fs::write(fixture.dir.join("raw-output"), "").unwrap();
@@ -159,8 +169,9 @@ fn a_failed_read_keeps_its_status_and_diagnostic_and_prints_no_merge() {
     let fixture = Fixture::new("failed");
     fs::write(fixture.dir.join("fail"), "").unwrap();
     let out = fixture.run(Some("389"));
-    assert_eq!(out.status.code(), Some(17));
+    // No merge is reported, whatever gh printed before it failed.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(out.status.code(), Some(17));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         "fake gh: HTTP 502 while reading the pull request\n"
@@ -174,10 +185,10 @@ fn no_pr_number_means_no_gh_call_and_no_output_even_if_gh_would_say_merged() {
     fixture.record(r#"{"state":"MERGED"}"#);
     for pr_number in [None, Some("")] {
         let out = fixture.run(pr_number);
+        assert_eq!(fixture.calls(), "", "{pr_number:?} must not call gh");
         assert!(out.status.success(), "{pr_number:?}: {:?}", out.status);
         assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{pr_number:?}");
         assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{pr_number:?}");
-        assert_eq!(fixture.calls(), "", "{pr_number:?} must not call gh");
     }
     // The same fixture does answer MERGED once there is a number.
     let out = fixture.run(Some("390"));

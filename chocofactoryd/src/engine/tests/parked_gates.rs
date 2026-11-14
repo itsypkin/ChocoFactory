@@ -190,9 +190,14 @@ fn workflows_dir_with_fast_gates(workflow: &str) -> TempDir {
     let path = dir.join(format!("{workflow}.yaml"));
     let mut yaml = fs::read_to_string(&path).unwrap();
     for gate in ["escalate_to_human", "blocker"] {
-        let start = yaml.find(&format!("\n  {gate}:\n")).unwrap();
-        let at = start + yaml[start..].find("interval: 60s").unwrap();
-        yaml.replace_range(at..at + "interval: 60s".len(), "interval: 1s");
+        // Only inside the gate's own block: a gate without a watcher (a
+        // mutated copy) has no interval to cut.
+        let start = yaml.find(&format!("\n  {gate}:\n")).unwrap() + 1;
+        let end = start + yaml[start..].find("\n\n").unwrap();
+        if let Some(at) = yaml[start..end].find("interval: 60s") {
+            let at = start + at;
+            yaml.replace_range(at..at + "interval: 60s".len(), "interval: 1s");
+        }
     }
     fs::write(&path, yaml).unwrap();
     dir
