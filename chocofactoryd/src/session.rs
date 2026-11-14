@@ -11608,6 +11608,8 @@ mod tests {
             hours(3) + StdDuration::from_secs(30)
         );
         assert!(!idle_expired(chrono::Duration::minutes(30), after, before));
+        // A stamp refreshed after the reaper sampled `now` is zero silence.
+        assert!(!idle_expired(chrono::Duration::minutes(30), before, after));
     }
 
     /// Host sleep must not count as silence: hours of sleep and a string of
