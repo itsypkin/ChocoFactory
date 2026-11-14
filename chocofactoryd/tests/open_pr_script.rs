@@ -1421,6 +1421,12 @@ fn assert_no_heading(body: &str) {
     assert_eq!(count_line(body, HEADING), 0, "{body}");
 }
 
+fn count_no_copy_notes(out: &Output) -> usize {
+    stderr(out)
+        .matches("choco open-pr: note: no saved copy of what choco ")
+        .count()
+}
+
 fn count_moved_notes(out: &Output) -> usize {
     stderr(out).matches("choco open-pr: note: moved ").count()
 }
@@ -1551,6 +1557,7 @@ fn without_a_copy_the_block_is_replaced_and_the_note_says_so() {
     let out = later_lap(&fx, &live, "second lap line\n");
     assert_no_heading(&last_edit_body(&fx));
     assert!(stderr(&out).contains(&no_copy_note(7)), "{}", stderr(&out));
+    assert_eq!(count_no_copy_notes(&out), 1, "{}", stderr(&out));
     assert_eq!(count_line(&last_edit_body(&fx), "hand fact one"), 0);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let body2 = last_edit_body(&fx);
@@ -1568,7 +1575,7 @@ fn without_a_copy_the_block_is_replaced_and_the_note_says_so() {
     assert_eq!(count_line(&body3, HEADING), 1, "{body3}");
     assert!(body3.ends_with("hand fact two\n"), "{body3}");
     assert!(stderr(&out).contains(&moved_note(1, 7)));
-    assert!(!stderr(&out).contains("no copy of what choco"));
+    assert_eq!(count_no_copy_notes(&out), 0, "{}", stderr(&out));
 }
 
 #[test]
@@ -1712,7 +1719,7 @@ fn an_invalid_live_block_keeps_an_existing_copy_untouched() {
         assert!(fx.calls_to("pr edit").is_empty());
         assert!(stderr(&out).contains("doesn't have exactly one choco block"));
         assert_eq!(count_moved_notes(&out), 0);
-        assert!(!stderr(&out).contains("no copy of what choco"));
+        assert_eq!(count_no_copy_notes(&out), 0, "{}", stderr(&out));
         assert_eq!(fs::read(copy_path(&fx)).unwrap(), before);
     }
 }
@@ -2022,7 +2029,7 @@ fn a_failed_copy_write_flushes_the_moved_note() {
         stderr(&out)
     );
     assert!(stderr(&out).contains(&moved_note(1, 7)), "{}", stderr(&out));
-    assert!(!stderr(&out).contains("no copy of what choco"));
+    assert_eq!(count_no_copy_notes(&out), 0, "{}", stderr(&out));
 }
 
 /// A fake `cat` first on PATH that, while the control `partial-copy-write`
@@ -2112,7 +2119,7 @@ fn a_refused_copy_write_keeps_the_old_complete_copy_and_a_retry_compares_against
     fs::set_permissions(copy_path(&fx), fs::Permissions::from_mode(0o644)).unwrap();
     let out = later_lap(&fx, &published, "third text\n");
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(!stderr(&out).contains("no copy of what choco"));
+    assert_eq!(count_no_copy_notes(&out), 0, "{}", stderr(&out));
     assert!(last_edit_body(&fx).ends_with("\nsecond text\n"));
 }
 
