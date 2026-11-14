@@ -250,6 +250,47 @@ a trailing `(#N)`, only gets a `Refs #N` line, which links but doesn't close
 PR body says so. The internal reviewer is told the closes list, and treats a
 description that says the PR closes or fixes any other issue as a false claim.
 
+### Editing the PR body by hand
+
+`open_pr` writes its text between `<!-- choco:pr-description:begin -->` and
+`<!-- choco:pr-description:end -->`. When the body has exactly one such block
+(the begin line, then the end line), each lap replaces only that block and
+keeps every line outside it byte for byte. After each successful publish it
+saves a copy of the block it published in the worktree's private git
+directory (`choco-open-pr-published.md`).
+
+With that copy, a line inside the block that is in neither the copy nor the
+new block is taken as a hand edit and moved below the end marker, under the
+heading `## Kept from a hand edit inside choco's section`, with a timeline
+note saying how many lines moved. Later moves add a new heading and group
+after everything already outside the block. Moved lines are rewritten like any
+other text so they can't close an issue, and after that they are outside text:
+edit or delete them freely.
+
+What this does and doesn't keep:
+
+- Lines are compared whole, ignoring only trailing spaces, tabs and CRs. A
+  line already in the copy or in the new block needs no move.
+- A line you delete inside the block comes back, because the block is rebuilt
+  from the coder's new text. A line you add that equals another line of the
+  copy, such as a second `- none`, can't be told apart and isn't moved.
+- A PR opened by an older choco has no copy. Its next update replaces the block
+  as before and says so in a timeline note; it saves its first copy then, so
+  hand edits are kept from the update after that.
+- If the copy can't be saved after publishing, the stage fails with a message
+  saying so, and the next lap can't tell a hand edit from choco's own text.
+  If a lap is killed while the copy is being written, an old, empty or partial
+  copy can remain, and the next lap may move some coder text as if you had
+  written it.
+- A body without exactly one block is left unchanged, with a note, and nothing
+  is moved.
+- Only the body as read at the start of the lap is protected: an edit saved
+  to GitHub after that read can still be overwritten.
+
+Put your own text and any ruling the PR must keep (CI versions, probe results,
+required sections) below the end marker, where laps keep it. A later lap can
+still drop a section the coder itself wrote inside the block.
+
 ## CI re-run of failed jobs (opt-in)
 
 By default the first finished red CI result is final: `checks_polling` goes to

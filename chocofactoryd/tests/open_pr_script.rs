@@ -58,6 +58,15 @@ case "${1:-} ${2:-}" in
     esac
     ;;
 "pr create") touch "$LOG/created" ;;
+"pr edit")
+    # Additive control for one test: replace the saved copy by a directory
+    # after the edit body is recorded, as a disk problem would.
+    if [ -e "$CFG/copy-to-dir" ]; then
+        p=$(cat "$CFG/copy-to-dir")
+        rm -rf "$p"
+        mkdir "$p"
+    fi
+    ;;
 esac
 exit 0
 "#;
@@ -623,6 +632,7 @@ fn a_body_without_exactly_one_block_is_left_alone() {
             stderr(&out)
         );
         assert_eq!(stdout(&out), READ_BACK);
+        assert!(!fx.git_dir().join("choco-open-pr-published.md").exists());
     }
 }
 
@@ -1317,4 +1327,625 @@ fn a_ref_in_the_part_of_the_title_that_is_cut_still_gets_its_refs_line() {
         .unwrap();
     let t = std::str::from_utf8(arg).unwrap();
     assert!(!t.contains("#77"), "{t}");
+}
+
+// ---- hand edits inside choco's section are kept across laps (#344) ----
+
+const HEADING: &str = "## Kept from a hand edit inside choco's section";
+const EXPLAIN: &str = "choco moved these lines here from its own section of this description, where someone had added or changed them by hand; that section is rewritten on every lap, and the new text doesn't have them. choco never changes text outside its section, so edit or delete these freely.";
+const TITLE: &str = "T (#1)";
+const PREFIX: [&str; 2] = ["HUMAN PREFIX one", "HUMAN PREFIX two"];
+const SUFFIX: [&str; 2] = ["HUMAN SUFFIX one", "HUMAN SUFFIX two"];
+const DIE_TAIL: &str = " was published, but choco could not save a copy of it; on the next lap choco can't tell a hand edit inside its section from its own text and will replace the section, with a note saying so";
+
+fn moved_note(k: usize, n: u32) -> String {
+    format!(
+        "choco open-pr: note: moved {k} line(s) that someone added or changed by hand inside choco's section of PR #{n} below it, under \"{HEADING}\""
+    )
+}
+
+fn no_copy_note(n: u32) -> String {
+    format!(
+        "choco open-pr: note: no copy of what choco last published in PR #{n}'s description (it may have been opened by an older choco): a hand edit inside choco's section can't be told apart from choco's own text, and the section was replaced"
+    )
+}
+
+fn copy_path(fx: &Fixture) -> PathBuf {
+    fx.git_dir().join("choco-open-pr-published.md")
+}
+
+fn lap(fx: &Fixture, desc: &str) -> Output {
+    fx.write_description(desc.as_bytes());
+    fx.run(TITLE, "approved", "r")
+}
+
+/// A real first lap: creates the PR (and so the real copy); returns the
+/// recorded create body.
+fn first_lap(fx: &Fixture, desc: &str) -> String {
+    let out = lap(fx, desc);
+    assert!(out.status.success(), "{}", stderr(&out));
+    pr_body(fx)
+}
+
+/// A later lap over the live body `live`.
+fn later_lap(fx: &Fixture, live: &str, desc: &str) -> Output {
+    fx.cfg("open-number", "7\n");
+    fx.cfg("body", live);
+    lap(fx, desc)
+}
+
+fn last_edit_body(fx: &Fixture) -> String {
+    let edits = fx.calls_to("pr edit");
+    String::from_utf8(edits.last().expect("a pr edit").body.clone().unwrap()).unwrap()
+}
+
+/// The marker block (both marker lines included) of a body.
+fn block_of(body: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for l in body.split_inclusive('\n') {
+        let t = l.trim_end_matches(['\n', '\r', ' ', '\t']);
+        if t == BEGIN {
+            inside = true;
+        }
+        if inside {
+            out.push_str(l);
+        }
+        if t == END {
+            break;
+        }
+    }
+    out
+}
+
+fn wrap(body: &str) -> String {
+    format!(
+        "{}\n{}\n{body}{}\n{}\n",
+        PREFIX[0], PREFIX[1], SUFFIX[0], SUFFIX[1]
+    )
+}
+
+fn lines_of(body: &str) -> Vec<&str> {
+    body.split('\n').collect()
+}
+
+fn count_line(body: &str, line: &str) -> usize {
+    body.split('\n').filter(|l| *l == line).count()
+}
+
+fn line_pos(body: &str, line: &str) -> Option<usize> {
+    lines_of(body).iter().position(|l| *l == line)
+}
+
+fn assert_no_heading(body: &str) {
+    assert_eq!(count_line(body, HEADING), 0, "{body}");
+}
+
+fn count_moved_notes(out: &Output) -> usize {
+    stderr(out).matches("line(s) that someone added").count()
+}
+
+const CI_LINE: &str =
+    "- CI versions recorded by the operator: ubuntu-24.04 `git version 2.55.0` (`/usr/bin/git`)";
+
+#[test]
+fn a_hand_edit_inside_the_block_is_moved_below_it_and_kept_on_later_laps() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "keep me\nold line A\nold line D\n");
+    let live = wrap(
+        &body1
+            .replace("old line A\n", "old line A, edited by hand\n")
+            .replace("old line D\n", &format!("old line D\n{CI_LINE}\n")),
+    );
+    let out = later_lap(&fx, &live, "keep me\nnew line B\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+
+    // (a)
+    assert_eq!(count_line(&body2, HEADING), 1, "{body2}");
+    // (b) after END, in order: heading, explanation, the two hand lines.
+    let end = line_pos(&body2, END).unwrap();
+    let h = line_pos(&body2, HEADING).unwrap();
+    let e = line_pos(&body2, EXPLAIN).unwrap();
+    let a = line_pos(&body2, "old line A, edited by hand").unwrap();
+    let c = line_pos(&body2, CI_LINE).unwrap();
+    assert!(end < h && h < e && e < a && a < c, "{body2}");
+    // (c)
+    assert!(
+        !lines_of(&body2)[h..].contains(&"old line D"),
+        "an unchanged line was moved: {body2}"
+    );
+    // (d)
+    for l in PREFIX.iter().chain(SUFFIX.iter()) {
+        assert_eq!(count_line(&body2, l), 1, "{l}: {body2}");
+    }
+    // (e)
+    assert!(stderr(&out).contains(&moved_note(2, 7)), "{}", stderr(&out));
+    // The moved lines are the last thing in the body, right under the text.
+    assert!(
+        body2.ends_with(&format!(
+            "\n{HEADING}\n\n{EXPLAIN}\n\nold line A, edited by hand\n{CI_LINE}\n"
+        )),
+        "{body2}"
+    );
+    let section = &body2[body2.find(&format!("\n{HEADING}\n")).unwrap()..];
+
+    // Lap 3 starts from lap 2's recorded body unchanged.
+    let out = later_lap(&fx, &body2, "keep me\nnew line C\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body3 = last_edit_body(&fx);
+    // (f)
+    let h3 = line_pos(&body3, HEADING).expect("the moved section is kept");
+    assert!(!lines_of(&body3)[h3..].contains(&"new line B"), "{body3}");
+    // (g)
+    assert!(body3.ends_with(section), "{body3}");
+    assert_eq!(count_line(&body3, HEADING), 1);
+    // (h)
+    assert_eq!(count_moved_notes(&out), 0, "{}", stderr(&out));
+    assert!(body3.contains("new line C") && !body3.contains("new line B"));
+}
+
+#[test]
+fn a_hand_line_the_new_description_keeps_is_not_moved() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "alpha\n");
+    let live = wrap(&body1.replace("alpha\n", "alpha\nX\n"));
+    let out = later_lap(&fx, &live, "alpha\nX\nbeta\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert_eq!(count_line(&body2, "X"), 1, "{body2}");
+    assert_no_heading(&body2);
+    assert_eq!(count_moved_notes(&out), 0, "{}", stderr(&out));
+    assert!(body2.contains("\nbeta\n"));
+    for l in PREFIX.iter().chain(SUFFIX.iter()) {
+        assert_eq!(count_line(&body2, l), 1, "{body2}");
+    }
+}
+
+#[test]
+fn an_untouched_block_moves_nothing() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "old description only\nsecond old line\n");
+    let live = wrap(&body1);
+    let out = later_lap(&fx, &live, "brand new description\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert_no_heading(&body2);
+    assert_eq!(count_moved_notes(&out), 0, "{}", stderr(&out));
+    assert!(!body2.contains("old description only") && !body2.contains("second old line"));
+    assert!(body2.contains("\nbrand new description\n"));
+    assert!(body2.starts_with(&format!("{}\n{}\n{BEGIN}\n", PREFIX[0], PREFIX[1])));
+    assert!(body2.ends_with(&format!("{END}\n{}\n{}\n", SUFFIX[0], SUFFIX[1])));
+}
+
+#[test]
+fn a_crlf_body_with_an_edit_outside_the_block_moves_nothing() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "old crlf line\n");
+    let live = wrap(&body1)
+        .replace(SUFFIX[0], "HUMAN SUFFIX one, edited outside")
+        .replace('\n', "\r\n");
+    assert!(live.contains("old crlf line\r\n") && live.contains(&format!("{END}\r\n")));
+    let out = later_lap(&fx, &live, "new crlf line\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert_no_heading(&body2);
+    assert_eq!(count_moved_notes(&out), 0, "{}", stderr(&out));
+    // The replacement happened, and the outside lines kept their CRLF bytes.
+    assert!(body2.contains("\nnew crlf line\n") && !body2.contains("old crlf line"));
+    assert!(body2.starts_with(&format!("{}\r\n{}\r\n{BEGIN}\n", PREFIX[0], PREFIX[1])));
+    assert!(body2.ends_with(&format!(
+        "{END}\nHUMAN SUFFIX one, edited outside\r\n{}\r\n",
+        SUFFIX[1]
+    )));
+}
+
+#[test]
+fn without_a_copy_the_block_is_replaced_and_the_note_says_so() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "old line\n");
+    fs::remove_file(copy_path(&fx)).unwrap();
+    let live = wrap(&body1.replace("old line\n", "old line\nhand fact one\n"));
+    let out = later_lap(&fx, &live, "second lap line\n");
+    assert_no_heading(&last_edit_body(&fx));
+    assert!(stderr(&out).contains(&no_copy_note(7)), "{}", stderr(&out));
+    assert_eq!(count_line(&last_edit_body(&fx), "hand fact one"), 0);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert!(body2.contains("\nsecond lap line\n"));
+    assert_eq!(
+        fs::read_to_string(copy_path(&fx)).unwrap(),
+        block_of(&body2)
+    );
+
+    // The baseline is saved now, so the next hand line is detected.
+    let live3 = body2.replace("second lap line\n", "second lap line\nhand fact two\n");
+    let out = later_lap(&fx, &live3, "third lap line\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body3 = last_edit_body(&fx);
+    assert_eq!(count_line(&body3, HEADING), 1, "{body3}");
+    assert!(body3.ends_with("hand fact two\n"), "{body3}");
+    assert!(stderr(&out).contains(&moved_note(1, 7)));
+    assert!(!stderr(&out).contains("no copy of what choco"));
+}
+
+#[test]
+fn a_copy_that_cannot_be_saved_fails_the_stage() {
+    // Create path: the copy path is a directory.
+    let fx = Fixture::new();
+    fs::create_dir(copy_path(&fx)).unwrap();
+    let out = lap(&fx, "created text\n");
+    assert!(!out.status.success());
+    let creates = fx.calls_to("pr create");
+    assert_eq!(creates.len(), 1, "the PR was published before the failure");
+    let published = String::from_utf8(creates[0].body.clone().unwrap()).unwrap();
+    assert!(published.contains("\ncreated text\n"));
+    assert!(
+        stderr(&out).contains(&format!(
+            "choco open-pr: the new PR's description{DIE_TAIL}\n"
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("PR #7"));
+    assert_ne!(stdout(&out), READ_BACK);
+
+    // Edit path: a real first lap, then the copy becomes a directory.
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "created text\n");
+    fs::remove_file(copy_path(&fx)).unwrap();
+    fs::create_dir(copy_path(&fx)).unwrap();
+    let live = wrap(&body1);
+    let out = later_lap(&fx, &live, "refreshed text\n");
+    assert!(!out.status.success());
+    assert_eq!(fx.calls_to("pr edit").len(), 1);
+    assert!(last_edit_body(&fx).contains("\nrefreshed text\n"));
+    assert!(
+        stderr(&out).contains(&format!("choco open-pr: PR #7's description{DIE_TAIL}\n")),
+        "{}",
+        stderr(&out)
+    );
+    // The queued note survived the failure.
+    assert!(stderr(&out).contains(&no_copy_note(7)), "{}", stderr(&out));
+    assert_ne!(stdout(&out), READ_BACK);
+}
+
+#[test]
+fn a_moved_line_cannot_close_an_issue() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "plain text\n");
+    let live = wrap(&body1.replace("plain text\n", "plain text\nFixes #9\n"));
+    let out = later_lap(&fx, &live, "other text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    let end = line_pos(&body2, END).unwrap();
+    let moved = line_pos(&body2, "Fixes issue 9").expect("the moved line is rewritten");
+    assert!(moved > end, "{body2}");
+    assert!(!body2.contains("Fixes #9"), "{body2}");
+    assert!(body2.starts_with(&format!("{}\n{}\n{BEGIN}\n", PREFIX[0], PREFIX[1])));
+    for l in SUFFIX {
+        assert_eq!(count_line(&body2, l), 1);
+    }
+}
+
+#[test]
+fn published_copies_track_only_successfully_published_generated_blocks() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "lap one text\n");
+    let copy = copy_path(&fx);
+    // The shell's idea of the private git dir agrees with the worktree's
+    // `.git` pointer and with the filesystem.
+    let pointer = fs::read_to_string(fx.wt.join(".git")).unwrap();
+    let pointed = PathBuf::from(pointer.trim().strip_prefix("gitdir: ").unwrap());
+    assert_eq!(pointed.canonicalize().unwrap(), fx.git_dir());
+    assert!(fs::metadata(&copy).unwrap().is_file());
+    assert_eq!(fs::read(&copy).unwrap(), block_of(&body1).into_bytes());
+
+    let live2 = wrap(&body1);
+    let out = later_lap(&fx, &live2, "lap two text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert_eq!(fs::read(&copy).unwrap(), block_of(&body2).into_bytes());
+
+    // A lap that moves a hand line: moved and outside text stay out of the copy.
+    let live3 = body2.replace("lap two text\n", "lap two text\nhand only line\n");
+    let out = later_lap(&fx, &live3, "lap three text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body3 = last_edit_body(&fx);
+    assert!(body3.ends_with("hand only line\n"));
+    let saved = fs::read_to_string(&copy).unwrap();
+    assert_eq!(saved, block_of(&body3));
+    assert!(!saved.contains("hand only line") && !saved.contains(HEADING));
+    assert!(!saved.contains(PREFIX[0]) && !saved.contains(SUFFIX[1]));
+
+    let out = later_lap(&fx, &body3, "lap four text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body4 = last_edit_body(&fx);
+    assert_eq!(fs::read(&copy).unwrap(), block_of(&body4).into_bytes());
+    assert_ne!(block_of(&body3), block_of(&body4));
+}
+
+#[test]
+fn a_failed_edit_keeps_the_copy_and_a_retry_keeps_the_hand_line() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "first text\n");
+    let before = fs::read(copy_path(&fx)).unwrap();
+    let live = wrap(&body1.replace("first text\n", "first text\nhand line to keep\n"));
+    fx.cfg("fail-pr-edit", "");
+    let out = later_lap(&fx, &live, "second text\n");
+    assert!(!out.status.success());
+    assert_ne!(stdout(&out), READ_BACK);
+    assert_eq!(fx.calls_to("pr edit").len(), 1, "the attempt was recorded");
+    assert_eq!(fs::read(copy_path(&fx)).unwrap(), before);
+
+    fs::remove_file(fx.root.join("gh/cfg/fail-pr-edit")).unwrap();
+    let out = later_lap(&fx, &live, "second text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert!(
+        body2.ends_with(&format!("\n{HEADING}\n\n{EXPLAIN}\n\nhand line to keep\n")),
+        "{body2}"
+    );
+    assert!(stderr(&out).contains(&moved_note(1, 7)));
+    assert_eq!(
+        fs::read(copy_path(&fx)).unwrap(),
+        block_of(&body2).into_bytes()
+    );
+    assert_ne!(fs::read(copy_path(&fx)).unwrap(), before);
+}
+
+#[test]
+fn an_invalid_live_block_keeps_an_existing_copy_untouched() {
+    let fx = Fixture::new();
+    first_lap(&fx, "some text\n");
+    let before = fs::read(copy_path(&fx)).unwrap();
+    for live in [
+        format!("outside\n{BEGIN}\nx\n{BEGIN}\ny\n{END}\nmore outside\n"),
+        format!("outside\n{END}\nx\n{BEGIN}\nmore outside\n"),
+        "outside text only\n".to_string(),
+        format!("outside\n{BEGIN}\nhand line without an end\n"),
+    ] {
+        let out = later_lap(&fx, &live, "other text\n");
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert!(fx.calls_to("pr edit").is_empty());
+        assert!(stderr(&out).contains("doesn't have exactly one choco block"));
+        assert_eq!(count_moved_notes(&out), 0);
+        assert!(!stderr(&out).contains("no copy of what choco"));
+        assert_eq!(fs::read(copy_path(&fx)).unwrap(), before);
+    }
+}
+
+#[test]
+fn hand_line_membership_uses_whole_trimmed_lines_and_keeps_raw_output() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "kept old\nkept old two\nprefix of a line\n");
+    let desc2 = "kept new\n";
+    // The live block: old and new lines with trailing whitespace and CRs
+    // (not true additions), marker lines with trailing whitespace, then the
+    // true additions.
+    let additions = [
+        "  kept old",                    // leading indentation
+        "kept  old two",                 // internal whitespace
+        "KEPT OLD",                      // case
+        "prefix of a line plus more \t", // shares only a prefix; trailing blanks kept
+        "dup add",                       // two identical additions
+        "between\r",                     // CR is dropped from the output
+        "dup add  \r",
+    ];
+    let mut live_block = String::new();
+    for l in block_of(&body1).split_inclusive('\n') {
+        let t = l.trim_end_matches('\n');
+        let out = match t {
+            BEGIN => format!("{BEGIN}  \n"),
+            END => format!("{END}\t\r\n"),
+            "kept old" => "kept old  \t\n".to_string(),
+            "kept old two" => "kept old two\r\n".to_string(),
+            "" => "  \t\n".to_string(),
+            "prefix of a line" => {
+                let mut s = String::from("prefix of a line \r\n");
+                for a in additions {
+                    s.push_str(a);
+                    s.push('\n');
+                }
+                s.push_str("kept new \t\n"); // equals a line of the new block
+                s
+            }
+            _ => l.to_string(),
+        };
+        live_block.push_str(&out);
+    }
+    let live = wrap(&live_block);
+    let out = later_lap(&fx, &live, desc2);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    let expected: String = [
+        "  kept old",
+        "kept  old two",
+        "KEPT OLD",
+        "prefix of a line plus more \t",
+        "dup add",
+        "between",
+        "dup add  ",
+    ]
+    .iter()
+    .map(|l| format!("{l}\n"))
+    .collect();
+    assert!(
+        body2.ends_with(&format!("\n{HEADING}\n\n{EXPLAIN}\n\n{expected}")),
+        "{body2:?}"
+    );
+    assert_eq!(count_line(&body2, HEADING), 1);
+    assert!(stderr(&out).contains(&moved_note(7, 7)), "{}", stderr(&out));
+    assert_eq!(body2.matches(BEGIN).count(), 1);
+    assert_eq!(body2.matches(END).count(), 1);
+    assert_eq!(body2.matches("kept new").count(), 1, "{body2}");
+}
+
+#[test]
+fn later_hand_moves_append_after_all_existing_outside_text() {
+    let fx = Fixture::new();
+    let body1 = first_lap(&fx, "base text\n");
+    let live2 = wrap(&body1.replace("base text\n", "base text\nhand one\nhand two\n"));
+    let out = later_lap(&fx, &live2, "base text two\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body2 = last_edit_body(&fx);
+    assert!(body2.ends_with("\nhand one\nhand two\n"));
+
+    // The person edits one moved line (keeping text a filter would rewrite)
+    // and deletes the other; a new hand line goes inside the block.
+    let dir = fx.root.join("marks");
+    fs::create_dir_all(&dir).unwrap();
+    let d = dir.display();
+    let nasty = format!("q\"uote 's' $(touch {d}/a) `touch {d}/b` ; touch {d}/c \\ %s \\n done");
+    let live3 = body2
+        .replace("hand one\n", "hand one, edited; Fixes #5 by the person\n")
+        .replace("hand two\n", "")
+        .replace("base text two\n", &format!("base text two\n{nasty}\n"));
+    let out = later_lap(&fx, &live3, "base text three\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body3 = last_edit_body(&fx);
+    // The person's outside edit stays byte for byte; the deletion is respected.
+    assert_eq!(
+        count_line(&body3, "hand one, edited; Fixes #5 by the person"),
+        1
+    );
+    assert_eq!(count_line(&body3, "hand two"), 0, "{body3}");
+    assert_eq!(count_line(&body3, HEADING), 2, "{body3}");
+    assert_eq!(count_line(&body3, EXPLAIN), 2);
+    // The new group is after all retained outside text.
+    assert!(
+        body3.ends_with(&format!("\n{HEADING}\n\n{EXPLAIN}\n\n{nasty}\n")),
+        "{body3}"
+    );
+    let second = body3.rfind(&format!("\n{HEADING}\n")).unwrap();
+    assert!(body3[..second].contains("hand one, edited; Fixes #5 by the person"));
+    assert!(body3[..second].ends_with("by the person\n"), "{body3}");
+    for marker in ["a", "b", "c"] {
+        assert!(!dir.join(marker).exists(), "{marker} was created");
+        assert!(!fx.wt.join(marker).exists());
+    }
+}
+
+/// A fake `awk` first on PATH that fails on demand and otherwise runs the
+/// real one. `fail-awk-hand` fails the hand-line comparison (the only awk
+/// whose last argument is the live body); `fail-awk-moved` (holding a text)
+/// fails any filter run whose input contains that text, after writing
+/// partial output.
+fn install_fake_awk(fx: &Fixture) {
+    let real = std::env::var("PATH")
+        .unwrap()
+        .split(':')
+        .map(|d| Path::new(d).join("awk"))
+        .find(|p| p.exists())
+        .expect("a real awk");
+    let script = format!(
+        r#"#!/bin/sh
+REAL='{}'
+CFG="$GH_FAKE_DIR/cfg"
+if [ -e "$CFG/fail-awk-hand" ]; then
+    for a in "$@"; do last=$a; done
+    case "$last" in
+    */current)
+        echo "INJECTED awk failure: hand-line comparison" >&2
+        echo hit >> "$GH_FAKE_DIR/awk-hand-hits"
+        exit 3
+        ;;
+    esac
+fi
+if [ -e "$CFG/fail-awk-moved" ] && [ "$#" -eq 1 ]; then
+    cat > "$GH_FAKE_DIR/awk-stdin"
+    if grep -qF -- "$(cat "$CFG/fail-awk-moved")" "$GH_FAKE_DIR/awk-stdin"; then
+        echo "PARTIAL OUTPUT MUST NOT BE PUBLISHED"
+        echo "INJECTED awk failure: moved-line filter" >&2
+        exit 3
+    fi
+    exec "$REAL" "$@" < "$GH_FAKE_DIR/awk-stdin"
+fi
+exec "$REAL" "$@"
+"#,
+        real.display()
+    );
+    let path = fx.root.join("bin/awk");
+    fs::write(&path, script).unwrap();
+    make_executable(&path);
+}
+
+/// Real first lap, then a live body with one hand line inside the block.
+fn hand_line_setup(fx: &Fixture, hand: &str) -> (String, Vec<u8>) {
+    let body1 = first_lap(fx, "first text\n");
+    let live = wrap(&body1.replace("first text\n", &format!("first text\n{hand}\n")));
+    (live, fs::read(copy_path(fx)).unwrap())
+}
+
+#[test]
+fn a_failed_hand_line_comparison_aborts_before_edit() {
+    let fx = Fixture::new();
+    install_fake_awk(&fx);
+    let (live, before) = hand_line_setup(&fx, "hand line kept");
+    fx.cfg("fail-awk-hand", "");
+    let out = later_lap(&fx, &live, "second text\n");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("INJECTED awk failure: hand-line comparison"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(fx.root.join("gh/awk-hand-hits").exists());
+    assert!(fx.calls_to("pr edit").is_empty());
+    assert_eq!(fs::read(copy_path(&fx)).unwrap(), before);
+
+    fs::remove_file(fx.root.join("gh/cfg/fail-awk-hand")).unwrap();
+    let out = later_lap(&fx, &live, "second text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(last_edit_body(&fx).ends_with("\nhand line kept\n"));
+}
+
+#[test]
+fn a_failed_moved_line_filter_aborts_before_edit() {
+    let fx = Fixture::new();
+    install_fake_awk(&fx);
+    let (live, before) = hand_line_setup(&fx, "hand line kept, Fixes #9");
+    fx.cfg("fail-awk-moved", "hand line kept");
+    let out = later_lap(&fx, &live, "second text\n");
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("INJECTED awk failure: moved-line filter"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(fx.calls_to("pr edit").is_empty());
+    assert_eq!(fs::read(copy_path(&fx)).unwrap(), before);
+
+    fs::remove_file(fx.root.join("gh/cfg/fail-awk-moved")).unwrap();
+    let out = later_lap(&fx, &live, "second text\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = last_edit_body(&fx);
+    assert!(
+        body.ends_with("\nhand line kept, Fixes issue 9\n"),
+        "{body}"
+    );
+    assert!(!body.contains("PARTIAL OUTPUT") && !body.contains("Fixes #9"));
+}
+
+#[test]
+fn a_failed_copy_write_flushes_the_moved_note() {
+    let fx = Fixture::new();
+    let (live, _) = hand_line_setup(&fx, "hand line kept");
+    assert!(fs::metadata(copy_path(&fx)).unwrap().is_file());
+    fx.cfg("copy-to-dir", copy_path(&fx).to_str().unwrap());
+    let out = later_lap(&fx, &live, "second text\n");
+    assert_eq!(
+        fx.calls_to("pr edit").len(),
+        1,
+        "published before the failure"
+    );
+    assert!(last_edit_body(&fx).ends_with("\nhand line kept\n"));
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains(&format!("choco open-pr: PR #7's description{DIE_TAIL}\n")),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains(&moved_note(1, 7)), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("no copy of what choco"));
 }
