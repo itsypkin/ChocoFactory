@@ -86,6 +86,10 @@ mod test_clock {
                 self.awake = awake;
                 self.wall = wall;
             }
+            self.peek()
+        }
+
+        fn peek(&self) -> ActivityStamp {
             ActivityStamp {
                 awake: self.base_awake + self.awake,
                 wall: self.base_wall + chrono::Duration::from_std(self.wall).unwrap(),
@@ -130,6 +134,12 @@ mod test_clock {
         /// call, then the last pair holds.
         pub(super) fn script(&self, readings: &[(Duration, Duration)]) {
             self.0.lock().unwrap().script = readings.iter().copied().collect();
+        }
+
+        /// The current reading, without counting as a stamp or consuming
+        /// the script.
+        pub(super) fn peek(&self) -> ActivityStamp {
+            self.0.lock().unwrap().peek()
         }
 
         /// How many stamps have been taken (initializers, refreshes and
@@ -12026,6 +12036,19 @@ mod tests {
         calls_after(2).await;
         clock.advance(minutes(29));
         clock.sleep(hours(5));
+        // What a run's activity is stamped with the moment it is live, read
+        // before the process has had time to emit anything: the clock's
+        // current awake reading, not an older run's or a stored timestamp.
+        let assert_baseline = |id: String| {
+            let (manager, clock) = (Arc::clone(&manager), clock.clone());
+            async move {
+                let signals = live_signals(&manager, &id).await;
+                let stamp = *signals.last_activity.lock().await;
+                let now = clock.peek();
+                assert_eq!(stamp.awake, now.awake, "{id}: awake baseline");
+                assert_eq!(stamp.wall, now.wall, "{id}: wall baseline");
+            }
+        };
 
         let started = seed_another(&pool, SessionKind::SingleShot).await;
         manager
@@ -12038,6 +12061,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_baseline(started.clone()).await;
         let resumed = seed_another(&pool, SessionKind::SingleShot).await;
         manager
             .resume(
@@ -12050,6 +12074,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_baseline(resumed.clone()).await;
         let chat = seed_another(&pool, SessionKind::Standing).await;
         sessions::set_adapter_session_id(&pool, &chat, "earlier-chat-session")
             .await
@@ -12061,6 +12086,7 @@ mod tests {
             .send_message(&chat, "hello again", &role_config())
             .await
             .unwrap();
+        assert_baseline(chat.clone()).await;
         calls_after(8).await;
 
         clock.advance(minutes(2));
