@@ -271,16 +271,18 @@ What this does and doesn't keep:
 
 - Lines are compared whole, ignoring only trailing spaces, tabs and CRs. A
   line already in the copy or in the new block needs no move.
-- A line you delete inside the block comes back, because the block is rebuilt
-  from the coder's new text. A line you add that equals another line of the
-  copy, such as a second `- none`, can't be told apart and isn't moved.
+- A line you delete inside the block is not kept: the block is rebuilt from the
+  coder's new text, so the line is back only if that text has it. A line you add
+  that equals another line of the copy or of the new block, such as a second
+  `- none`, isn't moved: if the coder's text later drops it, it is gone.
 - A PR opened by an older choco has no copy. Its next update replaces the block
   as before and says so in a timeline note; it saves its first copy then, so
   hand edits are kept from the update after that.
 - If the copy can't be saved after publishing, the stage fails with a message
   saying so, and the next lap can't tell a hand edit from choco's own text.
-  If a lap is killed while the copy is being written, an old, empty or partial
-  copy can remain, and the next lap may move some coder text as if you had
+  If a lap is killed while the copy is being written, or the write fails
+  partway, an old, empty or partial copy can remain, and then that message can
+  be wrong about the next lap: it may move some coder text as if you had
   written it.
 - A body without exactly one block is left unchanged, with a note, and nothing
   is moved.

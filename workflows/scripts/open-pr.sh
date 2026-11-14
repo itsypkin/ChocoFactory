@@ -311,7 +311,10 @@ hand_lines() {
 # Written in place on purpose (no temp file and rename, no fsync): a kill or a
 # full disk partway through can leave an old, empty or partial copy, and the
 # next lap may then move coder-written lines as if they were hand edits, or
-# find a partial regular file and compare against it. Accepted cost.
+# find a partial regular file and compare against it. Accepted cost. The
+# message below then predicts the next lap wrongly (a partial regular copy is
+# compared against, not treated as missing), and a moved line is only a line
+# found in neither saved block, not proof that a person wrote it.
 save_copy() {
     cat "$TMP/block" > "$COPY" || {
         if [ -s "$TMP/notes" ]; then cat "$TMP/notes" >&2; fi
