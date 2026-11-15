@@ -12,6 +12,43 @@ pub(crate) use chocofactory_test_support::{LOAD_ALLOWANCE, wait_until, write_exe
 #[allow(unused_imports)]
 pub(crate) use chocofactory_test_support::POLL_INTERVAL;
 
+/// Every row of every durable task table as JSON text, in a stable order, so
+/// a test can show that a read left nothing behind.
+pub(crate) async fn dump_tables(pool: &sqlx::SqlitePool) -> Vec<(String, String)> {
+    let mut dump = Vec::new();
+    for table in [
+        "projects",
+        "tasks",
+        "workflow_state",
+        "sessions",
+        "events",
+        "turn_usage",
+        "turn_queue",
+    ] {
+        let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT name FROM pragma_table_info('{table}')"
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(!columns.is_empty(), "no table {table}");
+        let object = columns
+            .iter()
+            .map(|c| format!("'{c}', \"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COALESCE(json_group_array(json(row)), '[]') FROM \
+             (SELECT json_object({object}) AS row FROM {table} ORDER BY rowid)"
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        dump.push((table.to_string(), rows));
+    }
+    dump
+}
+
 /// For the few tests where a production timer must fire once and then must
 /// *not* fire again before the fixture responds. Unlike `LOAD_ALLOWANCE`
 /// this is a real upper bound on how slow the fixture may be, so it can't

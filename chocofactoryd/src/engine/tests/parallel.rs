@@ -483,6 +483,61 @@ async fn a_group_records_its_departure_only_when_every_branch_is_done() {
     assert_eq!(state.payload["stages"]["two"]["summary"], "sum-two");
 }
 
+/// Reading the task's context is not a report: with two real fixture turns
+/// waiting for their agents, no lookup completes either turn or writes any
+/// durable row.
+#[tokio::test]
+async fn a_context_read_leaves_waiting_turns_waiting_and_writes_nothing() {
+    use crate::context::{ContextRequest, Lookup, lookup};
+    let g = group(Shape::new(), holding()).await;
+    g.start(None).await.unwrap();
+    let one = g.wait_sessions("one", 1).await.remove(0);
+    let two = g.wait_sessions("two", 1).await.remove(0);
+    let task_level = |events: Vec<chocofactory_core::models::Event>| -> Vec<String> {
+        events
+            .into_iter()
+            .filter(|e| e.session_id.is_none())
+            .map(|e| e.id)
+            .collect()
+    };
+    let stable_tables = |dump: Vec<(String, String)>| -> Vec<(String, String)> {
+        // A live session's own output may still arrive in `events`.
+        dump.into_iter().filter(|(table, _)| table != "events").collect()
+    };
+    let before = stable_tables(crate::test_support::dump_tables(&g.pool).await);
+    let before_events = task_level(events::list_for_task(&g.pool, &g.task_id).await.unwrap());
+    for request in [
+        ContextRequest::Task,
+        ContextRequest::StageByName {
+            stage: "prep".into(),
+            outcome: None,
+            anchor_id: None,
+        },
+        ContextRequest::StageById {
+            result_id: "nothing".into(),
+            anchor_id: None,
+        },
+    ] {
+        assert!(matches!(
+            lookup(&g.pool, &g.task_id, &request).await.unwrap(),
+            Lookup::Found(_) | Lookup::UnknownId(_)
+        ));
+    }
+    assert_eq!(
+        stable_tables(crate::test_support::dump_tables(&g.pool).await),
+        before
+    );
+    assert_eq!(
+        task_level(events::list_for_task(&g.pool, &g.task_id).await.unwrap()),
+        before_events
+    );
+    // Both turns are still waiting: sessions active, nothing completed.
+    for session in [&one, &two] {
+        assert_eq!(session_now(&g, session).await.status, SessionStatus::Active);
+    }
+    assert!(g.events_of(EventType::TurnCompleted).await.is_empty());
+}
+
 // 2
 #[tokio::test]
 async fn a_result_outside_results_fails_the_branch() {

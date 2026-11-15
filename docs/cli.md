@@ -444,6 +444,16 @@ Long output is paginated — pass `--limit N`, and follow the `--after
 available" hint. There is also a live
 WebSocket stream at `/tasks/{id}/events/live` that the CLI doesn't wrap.
 
+Every time a task actually leaves a stage, the timeline also gets a
+`stage_result` event naming the stage it left, the outcome applied and where it
+went. It is committed together with the move itself, so unlike the diagnostic
+entries around it (`stage_entered`, `turn_outcome`, `shell_output`) it cannot
+exist without the move or the move without it. The captured value itself is
+read back through the daemon's `GET /tasks/{id}/context` endpoint, described in
+[context.md](context.md). An older `choco` that does not know the
+`stage_result` event type cannot decode a timeline that contains one; update
+`choco` together with the daemon.
+
 List things:
 
 ```

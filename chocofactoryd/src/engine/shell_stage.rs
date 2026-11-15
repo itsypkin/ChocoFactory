@@ -3,8 +3,9 @@ use super::stage_capture::derive_capture;
 use super::*;
 
 /// How much of a command's stdout/stderr goes onto the timeline. Small on
-/// purpose: this is a human-facing breadcrumb, and the full output isn't
-/// retained anywhere.
+/// purpose: this is a human-facing breadcrumb. Arbitrary command output is
+/// not kept; only a capture the stage's `capture:` accepted is, and only on
+/// the stage result of a departure that committed.
 pub(super) const EVENT_OUTPUT_TAIL_BYTES: usize = 2048;
 
 /// Logs a poll attempt whose process group outlived its kill.

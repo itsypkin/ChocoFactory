@@ -3670,6 +3670,11 @@ impl WorkflowEngine {
         // through this function; deliberately not done here (X-3), since
         // `current_stage` — the value the engine actually reads back — is
         // the one that must be durable, and the failure is logged loudly.
+        //
+        // This entry is a diagnostic, not the record of what was applied.
+        // That is the `stage_result` event a departure commits *with* its
+        // state write (`commit_stage_departure`), linked by
+        // `previous_result_id`; the trail here is ordered by time only.
         match events::append_stage_transition(
             &self.pool,
             task_id,
