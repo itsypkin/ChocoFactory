@@ -1074,11 +1074,14 @@ async fn a_departure_cancelled_inside_its_transaction_leaves_nothing_and_can_be_
 }
 
 /// A task that reaches a terminal stage keeps its one result even when
-/// closing the task afterwards fails, and neither a retry nor a restart-style
-/// re-entry adds the departure again.
+/// closing the task afterwards fails, and a retry that really re-enters the
+/// terminal stage does not add the departure again.
 #[tokio::test]
 async fn a_committed_departure_into_a_terminal_stage_is_not_replayed_by_recovery() {
-    let f = gate_flow().await;
+    let dir = tempdir();
+    let db_path = dir.join("terminal.db");
+    let pool = crate::db::connect(&db_path).await.unwrap();
+    let f = gate_flow_from(GATE_FLOW, pool, dir).await;
     sqlx::query(sqlx::AssertSqlSafe(
         "CREATE TRIGGER no_closing BEFORE UPDATE ON tasks
          WHEN NEW.status = 'closed'
@@ -1088,23 +1091,53 @@ async fn a_committed_departure_into_a_terminal_stage_is_not_replayed_by_recovery
     .await
     .unwrap();
     f.reply("fine\n/approve").await.unwrap();
+    // The departure committed; only the close failed, so the task is still
+    // open at the terminal stage.
     assert_eq!(f.state().await.current_stage, "finished");
+    assert_eq!(
+        tasks::get(&f.pool, &f.task_id).await.unwrap().unwrap().status,
+        TASK_STATUS_OPEN
+    );
     let results = f.results().await;
     assert_eq!(results.len(), 1);
     let pointer = f.state().await.payload["current_result_id"].clone();
     assert_eq!(pointer, json!(results[0].id));
 
-    // Recovery in whatever way it is allowed: retry, with and without the
-    // fault.
-    let _ = f.engine.retry_task(&f.task_id, RetryMode::Auto).await;
+    // Recovery: the interrupted task is marked stuck, the fault is gone, and
+    // the retry must succeed and re-enter the persisted terminal stage.
+    assert!(
+        matches!(
+            f.engine
+                .mark_stuck(&f.task_id, "interrupted after the departure", false)
+                .await,
+            StuckMark::Marked
+        ),
+        "the interrupted task must be retryable"
+    );
     sqlx::query("DROP TRIGGER no_closing")
         .execute(&f.pool)
         .await
         .unwrap();
-    let _ = f.engine.retry_task(&f.task_id, RetryMode::Auto).await;
-    assert_eq!(f.results().await, results, "the same single result");
-    assert_eq!(f.state().await.payload["current_result_id"], pointer);
-    assert_eq!(f.state().await.current_stage, "finished");
+    let outcome = f
+        .engine
+        .retry_task(&f.task_id, RetryMode::Auto)
+        .await
+        .expect("retrying the persisted terminal stage succeeds");
+    assert_eq!(outcome.stage, "finished");
+    assert_eq!(
+        tasks::get(&f.pool, &f.task_id).await.unwrap().unwrap().status,
+        TASK_STATUS_CLOSED,
+        "the retry re-entered the terminal stage and closed the task"
+    );
+
+    // A fresh connection to the reopened file sees the same single result.
+    f.pool.close().await;
+    let observer = crate::db::connect(&db_path).await.unwrap();
+    assert_eq!(stage_results(&observer, &f.task_id).await, results);
+    assert_eq!(
+        state_of(&observer, &f.task_id).await.payload["current_result_id"],
+        pointer
+    );
 }
 
 /// A workflow may key an outcome with an empty string. The engine applies it

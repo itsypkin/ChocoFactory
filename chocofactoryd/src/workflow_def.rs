@@ -3521,12 +3521,14 @@ stages:
             matches!(err, WorkflowDefError::EmptyStageName { group: None }),
             "{err:?}"
         );
+        assert_eq!(err.to_string(), "a stage has an empty name");
         let branch = "name: w\nroles:\n  r: { cli: claude }\nstages:\n  g:\n    kind: parallel\n    branches:\n      \"\": { kind: agent_turn, role: r }\n      b: { kind: agent_turn, role: r }\n    on: { done: end }\n  end:\n    kind: terminal\n";
         let err = WorkflowDefinition::parse(branch, &dir.path).unwrap_err();
         assert!(
             matches!(&err, WorkflowDefError::EmptyStageName { group: Some(g) } if g == "g"),
             "{err:?}"
         );
+        assert_eq!(err.to_string(), "a branch of group 'g' has an empty name");
     }
 
     #[test]

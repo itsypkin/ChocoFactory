@@ -3724,7 +3724,9 @@ stages:
 
         // Wait for the fixture to be initialized and holding: its session
         // exists, its init line was handled (which sets the adapter session
-        // id) and the prompt it reads was delivered.
+        // id, and only afterwards appends the session_meta event: the last
+        // write initialization makes) and the prompt it reads was delivered.
+        // The baseline below must include that last write.
         crate::test_support::wait_until("the held turn to be initialized", || async {
             let sessions = crate::db::sessions::list_for_task(server.pool(), &id)
                 .await
@@ -3736,11 +3738,21 @@ stages:
                 .iter()
                 .any(|e| e.event_type == EventType::HumanMessage);
             match sessions.first() {
-                Some(s) if s.adapter_session_id.is_some() && delivered => Ok(()),
-                _ => Err(format!(
-                    "{} session(s), delivered={delivered}",
-                    sessions.len()
-                )),
+                Some(s) => {
+                    let described = events.iter().any(|e| {
+                        e.event_type == EventType::SessionMeta
+                            && e.session_id.as_deref() == Some(s.id.as_str())
+                    });
+                    if s.adapter_session_id.is_some() && delivered && described {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "adapter id set={}, delivered={delivered}, session_meta={described}",
+                            s.adapter_session_id.is_some()
+                        ))
+                    }
+                }
+                None => Err("no session yet".to_string()),
             }
         })
         .await;
