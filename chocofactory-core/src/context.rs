@@ -342,7 +342,10 @@ mod tests {
         assert_eq!(current_result_id(&json!({})), Ok(None));
         assert_eq!(current_result_id(&json!(null)), Ok(None));
         assert_eq!(current_result_id(&json!([1])), Ok(None));
-        assert_eq!(current_result_id(&json!({"current_result_id": null})), Ok(None));
+        assert_eq!(
+            current_result_id(&json!({"current_result_id": null})),
+            Ok(None)
+        );
         assert_eq!(
             current_result_id(&json!({"current_result_id": "r1"})),
             Ok(Some("r1".to_string()))

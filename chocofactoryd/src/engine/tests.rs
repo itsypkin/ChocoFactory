@@ -1899,7 +1899,11 @@ async fn stage_results(pool: &SqlitePool, task_id: &str) -> Vec<chocofactory_cor
 
 /// `payload` without its engine-owned `current_result_id`, after checking
 /// that the task has exactly one stage result and the pointer names it.
-async fn without_only_result_pointer(pool: &SqlitePool, task_id: &str, mut payload: Value) -> Value {
+async fn without_only_result_pointer(
+    pool: &SqlitePool,
+    task_id: &str,
+    mut payload: Value,
+) -> Value {
     let results = stage_results(pool, task_id).await;
     assert_eq!(results.len(), 1, "expected one stage result: {results:?}");
     let pointer = payload

@@ -444,7 +444,13 @@ async fn a_group_records_its_departure_only_when_every_branch_is_done() {
     let entry_results = g.events_of(EventType::StageResult).await;
     assert_eq!(entry_results.len(), 1, "{entry_results:?}");
     let entry = AppliedStageResult::from_event(&entry_results[0]).unwrap();
-    assert_eq!((entry.source_stage.as_str(), entry.destination_stage.as_str()), ("prep", "panel"));
+    assert_eq!(
+        (
+            entry.source_stage.as_str(),
+            entry.destination_stage.as_str()
+        ),
+        ("prep", "panel")
+    );
     let state = g.state().await;
     assert_eq!(state.payload["current_result_id"], json!(entry.result_id));
     assert_eq!(branch_slot(&state.payload, "one")["state"], "done");
@@ -477,7 +483,10 @@ async fn a_group_records_its_departure_only_when_every_branch_is_done() {
         Some(entry.result_id.as_str())
     );
     let state = g.state().await;
-    assert_eq!(state.payload["current_result_id"], json!(group_result.result_id));
+    assert_eq!(
+        state.payload["current_result_id"],
+        json!(group_result.result_id)
+    );
     // The branch captures stay where they always were.
     assert_eq!(state.payload["stages"]["one"]["summary"], "sum-one");
     assert_eq!(state.payload["stages"]["two"]["summary"], "sum-two");
@@ -502,7 +511,9 @@ async fn a_context_read_leaves_waiting_turns_waiting_and_writes_nothing() {
     };
     let stable_tables = |dump: Vec<(String, String)>| -> Vec<(String, String)> {
         // A live session's own output may still arrive in `events`.
-        dump.into_iter().filter(|(table, _)| table != "events").collect()
+        dump.into_iter()
+            .filter(|(table, _)| table != "events")
+            .collect()
     };
     let before = stable_tables(crate::test_support::dump_tables(&g.pool).await);
     let before_events = task_level(events::list_for_task(&g.pool, &g.task_id).await.unwrap());

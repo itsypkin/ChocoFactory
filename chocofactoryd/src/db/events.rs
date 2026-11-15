@@ -1578,13 +1578,20 @@ mod tests {
     async fn a_stage_result_is_on_the_timeline_but_never_a_reply_report_or_trail_entry() {
         let pool = connect_in_memory().await.unwrap();
         let session_id = seed_session(&pool).await;
-        let task_id = sessions::get(&pool, &session_id).await.unwrap().unwrap().task_id;
+        let task_id = sessions::get(&pool, &session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id;
         append_all(
             &pool,
             &session_id,
             &[
                 report_outcome_call("approved"),
-                (EventType::AssistantMessage, json!({ "text": "the real reply" })),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "the real reply" }),
+                ),
             ],
         )
         .await;

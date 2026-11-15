@@ -3245,10 +3245,7 @@ mod tests {
             }),
         );
         let summary = event_summary(&ev);
-        assert_eq!(
-            summary,
-            "human_review → coding  (applied request_changes)"
-        );
+        assert_eq!(summary, "human_review → coding  (applied request_changes)");
         assert!(!summary.contains("SECRET-CORRECTION-TEXT"));
         assert!(!summary.contains('\n'));
     }

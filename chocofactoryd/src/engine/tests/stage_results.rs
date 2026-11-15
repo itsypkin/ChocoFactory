@@ -142,7 +142,10 @@ async fn a_self_loop_a_guard_redirect_and_a_terminal_arrival_each_record_the_act
     assert_eq!(second.outcome, "again");
     assert_eq!(second.destination_stage, "escalated");
     assert_eq!(second.capture, json!("Second note."));
-    assert_eq!(second.previous_result_id.as_deref(), Some(first.result_id.as_str()));
+    assert_eq!(
+        second.previous_result_id.as_deref(),
+        Some(first.result_id.as_str())
+    );
 
     // Terminal arrival: the destination of a departure, with no capture
     // because the stage declares none.
@@ -151,7 +154,10 @@ async fn a_self_loop_a_guard_redirect_and_a_terminal_arrival_each_record_the_act
     assert_eq!(third.destination_stage, "finished");
     assert!(!third.capture_present);
     assert_eq!(third.capture, Value::Null);
-    assert_eq!(third.previous_result_id.as_deref(), Some(second.result_id.as_str()));
+    assert_eq!(
+        third.previous_result_id.as_deref(),
+        Some(second.result_id.as_str())
+    );
 
     let payload = f.state().await.payload;
     assert_eq!(payload["current_result_id"], json!(third.result_id));
@@ -173,14 +179,28 @@ async fn a_refused_or_discarded_outcome_records_nothing() {
 
     // A reply without a marker is refused before anything is written.
     let err = f.reply("no marker line here").await.unwrap_err();
-    assert!(matches!(err, SendMessageOrResumeError::ReplyNeedsMarker { .. }), "{err:?}");
+    assert!(
+        matches!(err, SendMessageOrResumeError::ReplyNeedsMarker { .. }),
+        "{err:?}"
+    );
     // An outcome the stage has no edge for.
-    let err = f.engine.advance(&f.task_id, &f.def, "bogus").await.unwrap_err();
+    let err = f
+        .engine
+        .advance(&f.task_id, &f.def, "bogus")
+        .await
+        .unwrap_err();
     assert!(matches!(err, EngineError::UnknownOutcome { .. }), "{err:?}");
     // A runner for a stage the task is no longer in.
     let err = f
         .engine
-        .advance_from_stage(&f.task_id, &f.def, "again", Some("escalated"), Some(json!("late")), false)
+        .advance_from_stage(
+            &f.task_id,
+            &f.def,
+            "again",
+            Some("escalated"),
+            Some(json!("late")),
+            false,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::StageMovedOn { .. }), "{err:?}");
@@ -220,14 +240,17 @@ async fn a_malformed_result_pointer_refuses_the_departure_but_null_is_a_fresh_st
         .unwrap();
         let before = f.results().await;
 
-        let err = f.engine.advance(&f.task_id, &f.def, "again").await.unwrap_err();
-        assert!(matches!(err, EngineError::MalformedResultPointer(_)), "{bad}: {err:?}");
+        let outcome = f.engine.advance(&f.task_id, &f.def, "again").await;
 
         // Nothing moved and no result was invented as a new chain start.
-        assert_eq!(f.results().await, before, "{bad}");
+        assert_eq!(f.results().await, before, "{bad}: no new result");
         let after = f.state().await;
         assert_eq!(after.current_stage, "gate", "{bad}");
         assert_eq!(after.payload, payload, "{bad}");
+        assert!(
+            matches!(outcome, Err(EngineError::MalformedResultPointer(_))),
+            "{bad}: {outcome:?}"
+        );
     }
 
     // JSON null is the pre-change boundary, exactly like an absent key.
@@ -252,7 +275,10 @@ async fn a_malformed_result_pointer_refuses_the_departure_but_null_is_a_fresh_st
     let results = f.results().await;
     assert_eq!(results.len(), 1);
     assert_eq!(result_of(&results[0]).previous_result_id, None);
-    assert_eq!(f.state().await.payload["current_result_id"], json!(results[0].id));
+    assert_eq!(
+        f.state().await.payload["current_result_id"],
+        json!(results[0].id)
+    );
 }
 
 #[tokio::test]
@@ -277,7 +303,10 @@ async fn pausing_resuming_and_an_in_place_retry_of_a_committed_self_loop_add_no_
         .await
         .unwrap();
     let after = f.results().await;
-    assert_eq!(after, before, "a retry must not append the source departure again");
+    assert_eq!(
+        after, before,
+        "a retry must not append the source departure again"
+    );
     assert_eq!(after[0].id, before[0].id);
     assert_eq!(f.state().await.payload["current_result_id"], pointer);
 
@@ -328,15 +357,22 @@ async fn every_capture_shape_is_recorded_as_the_transition_received_it() {
 
     // Invalid JSON is kept as text, as the capture always did.
     let (_, _, invalid) = shell_result("printf 'not json'", "    capture: json").await;
-    assert_eq!((invalid.capture_present, invalid.capture), (true, json!("not json")));
+    assert_eq!(
+        (invalid.capture_present, invalid.capture),
+        (true, json!("not json"))
+    );
 
     // No `capture:` at all: absent, which is not null.
     let (_, _, absent) = shell_result("printf 'ignored output'", "").await;
-    assert_eq!((absent.capture_present, absent.capture), (false, Value::Null));
+    assert_eq!(
+        (absent.capture_present, absent.capture),
+        (false, Value::Null)
+    );
 
     // Over the 1 MiB limit the output is not captured, yet the transition
     // is legal and still recorded, explicitly without a capture.
-    let (pool, task_id, oversized) = shell_result("yes x | head -c 1100000", "    capture: text").await;
+    let (pool, task_id, oversized) =
+        shell_result("yes x | head -c 1100000", "    capture: text").await;
     assert_eq!(
         (oversized.capture_present, oversized.capture),
         (false, Value::Null)
@@ -414,7 +450,9 @@ stages:
     assert_eq!(before.len(), 1);
     assert_eq!(result_of(&before[0]).outcome, "error");
 
-    let _ = engine.mark_stuck(&task_id, "operator wants a retry", false).await;
+    let _ = engine
+        .mark_stuck(&task_id, "operator wants a retry", false)
+        .await;
     engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
     assert_eq!(stage_results(&pool, &task_id).await, before);
 
@@ -445,14 +483,21 @@ async fn a_failed_result_insert_leaves_the_old_state_and_pointer() {
     .execute(&f.pool)
     .await
     .unwrap();
-    let err = f.engine.advance(&f.task_id, &f.def, "again").await.unwrap_err();
-    assert!(matches!(err, EngineError::Db(_)), "{err:?}");
+    let outcome = f.engine.advance(&f.task_id, &f.def, "again").await;
 
     let after = f.state().await;
-    assert_eq!(after.current_stage, before.current_stage, "stage stayed old after failed insert");
-    assert_eq!(after.payload, before.payload, "pointer and captures stayed old");
+    assert_eq!(
+        after.current_stage, before.current_stage,
+        "stage stayed old after failed insert"
+    );
+    assert_eq!(
+        after.payload, before.payload,
+        "pointer and captures stayed old"
+    );
     assert_eq!(after.loop_counters, before.loop_counters);
     assert_eq!(f.results().await, before_results);
+    // The failure itself is reported, not swallowed.
+    assert!(matches!(outcome, Err(EngineError::Db(_))), "{outcome:?}");
 }
 
 #[tokio::test]
@@ -466,8 +511,7 @@ async fn a_failed_state_update_leaves_no_orphan_result() {
     .execute(&f.pool)
     .await
     .unwrap();
-    let err = f.engine.advance(&f.task_id, &f.def, "again").await.unwrap_err();
-    assert!(matches!(err, EngineError::Db(_)), "{err:?}");
+    let outcome = f.engine.advance(&f.task_id, &f.def, "again").await;
 
     // The insert ran first and succeeded inside the transaction; it must not
     // have outlived the failed update.
@@ -478,6 +522,7 @@ async fn a_failed_state_update_leaves_no_orphan_result() {
         "{ask_answer:?}"
     );
     assert_eq!(f.state().await, before);
+    assert!(matches!(outcome, Err(EngineError::Db(_))), "{outcome:?}");
 }
 
 #[tokio::test]
@@ -494,10 +539,18 @@ async fn an_update_that_finds_no_row_rolls_the_result_back_too() {
     .await
     .unwrap();
     let before = f.state().await;
-    let err = f.engine.advance(&f.task_id, &f.def, "again").await.unwrap_err();
+    let err = f
+        .engine
+        .advance(&f.task_id, &f.def, "again")
+        .await
+        .unwrap_err();
     assert!(matches!(err, EngineError::NoWorkflowState), "{err:?}");
     assert!(f.results().await.is_empty());
-    assert_eq!(f.state().await, before, "the deleted row came back with the rollback");
+    assert_eq!(
+        f.state().await,
+        before,
+        "the deleted row came back with the rollback"
+    );
 }
 
 #[tokio::test]
@@ -540,7 +593,10 @@ async fn a_departure_dropped_before_commit_leaves_nothing_and_after_commit_leave
     drop(tx);
     pool.close().await;
     let pool = crate::db::connect(&path).await.unwrap();
-    assert!(stage_results(&pool, &task_id).await.is_empty(), "no orphan event");
+    assert!(
+        stage_results(&pool, &task_id).await.is_empty(),
+        "no orphan event"
+    );
     let after = state_of(&pool, &task_id).await;
     assert_eq!(after.current_stage, "run");
     assert_eq!(after.payload, state.payload);
@@ -607,7 +663,10 @@ fn planner_report(len: usize) -> String {
 fn private_correction() -> String {
     let paragraph = "Please make exactly these three changes in the parser: first rename the \
         helper, second add the missing guard, third update its one test.";
-    let text = format!("{}Change nothing else.", format!("{paragraph}\n\n").repeat(20));
+    let text = format!(
+        "{}Change nothing else.",
+        format!("{paragraph}\n\n").repeat(20)
+    );
     assert!(text.len() > 2048, "{}", text.len());
     text
 }
@@ -652,7 +711,13 @@ async fn repeated_stage_history_is_kept_in_full_and_survives_a_reopen() {
     let ids: std::collections::HashSet<_> = r.iter().map(|x| x.result_id.clone()).collect();
     assert_eq!(ids.len(), 4);
     assert_eq!(
-        r.iter().map(|x| (x.source_stage.as_str(), x.outcome.as_str(), x.destination_stage.as_str())).collect::<Vec<_>>(),
+        r.iter()
+            .map(|x| (
+                x.source_stage.as_str(),
+                x.outcome.as_str(),
+                x.destination_stage.as_str()
+            ))
+            .collect::<Vec<_>>(),
         [
             ("draft", "done", "review"),
             ("review", "changes_requested", "draft"),
@@ -664,16 +729,31 @@ async fn repeated_stage_history_is_kept_in_full_and_survives_a_reopen() {
         r.iter().map(|x| x.source_kind.as_str()).collect::<Vec<_>>(),
         ["agent_turn", "human_gate", "agent_turn", "human_gate"]
     );
-    assert_eq!(r[0].capture, json!(first_report), "the 63,266-byte report in full");
-    assert_eq!(r[1].capture, json!(correction), "the whole private correction");
+    assert_eq!(
+        r[0].capture,
+        json!(first_report),
+        "the 63,266-byte report in full"
+    );
+    assert_eq!(
+        r[1].capture,
+        json!(correction),
+        "the whole private correction"
+    );
     assert_eq!(r[2].capture, json!(second_report));
     assert_eq!(r[3].capture, json!("Looks good now."));
     assert_eq!(r[0].previous_result_id, None);
     for i in 1..4 {
-        assert_eq!(r[i].previous_result_id.as_deref(), Some(r[i - 1].result_id.as_str()));
+        assert_eq!(
+            r[i].previous_result_id.as_deref(),
+            Some(r[i - 1].result_id.as_str())
+        );
     }
     assert_eq!(
-        workflow_state::get(&pool, &task_id).await.unwrap().unwrap().payload["current_result_id"],
+        workflow_state::get(&pool, &task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload["current_result_id"],
         json!(r[3].result_id)
     );
 
@@ -701,12 +781,24 @@ async fn repeated_stage_history_is_kept_in_full_and_survives_a_reopen() {
         let latest = found(ask(&pool, &task_id, by_name("draft", None, None)).await);
         assert_eq!(latest.result_id, r[2].result_id, "round {round}");
         assert_eq!(latest.capture, json!(second_report));
-        let old = found(ask(&pool, &task_id, by_name("draft", None, Some(&r[1].result_id))).await);
+        let old = found(
+            ask(
+                &pool,
+                &task_id,
+                by_name("draft", None, Some(&r[1].result_id)),
+            )
+            .await,
+        );
         assert_eq!(old.result_id, r[0].result_id, "round {round}");
         assert_eq!(old.capture, json!(first_report));
         // A mix of stages and outcomes.
         let changes = found(
-            ask(&pool, &task_id, by_name("review", Some("changes_requested"), None)).await,
+            ask(
+                &pool,
+                &task_id,
+                by_name("review", Some("changes_requested"), None),
+            )
+            .await,
         );
         assert_eq!(changes.result_id, r[1].result_id);
         assert_eq!(changes.capture, json!(correction));
@@ -714,10 +806,24 @@ async fn repeated_stage_history_is_kept_in_full_and_survives_a_reopen() {
         assert_eq!(approved.result_id, r[3].result_id);
         // That approval is not at or before the old anchor.
         let anchored = found(
-            ask(&pool, &task_id, by_name("review", None, Some(&r[2].result_id))).await,
+            ask(
+                &pool,
+                &task_id,
+                by_name("review", None, Some(&r[2].result_id)),
+            )
+            .await,
         );
-        assert_eq!(anchored.result_id, r[1].result_id, "the old review, not the newer approval");
-        match ask(&pool, &task_id, by_id(&r[3].result_id, Some(&r[2].result_id))).await {
+        assert_eq!(
+            anchored.result_id, r[1].result_id,
+            "the old review, not the newer approval"
+        );
+        match ask(
+            &pool,
+            &task_id,
+            by_id(&r[3].result_id, Some(&r[2].result_id)),
+        )
+        .await
+        {
             ContextResponse::Unavailable { reason, .. } => {
                 assert_eq!(reason, UnavailableReason::NotAtOrBeforeAnchor)
             }
@@ -727,7 +833,10 @@ async fn repeated_stage_history_is_kept_in_full_and_survives_a_reopen() {
         let exact = found(ask(&pool, &task_id, by_id(&r[0].result_id, None)).await);
         // Everything but the timestamp, which the test rewrote above.
         assert_eq!(
-            AppliedStageResult { created_at: r[0].created_at, ..exact },
+            AppliedStageResult {
+                created_at: r[0].created_at,
+                ..exact
+            },
             r[0].clone()
         );
         let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
@@ -738,7 +847,11 @@ async fn repeated_stage_history_is_kept_in_full_and_survives_a_reopen() {
 async fn wait_for_results(pool: &SqlitePool, task_id: &str, n: usize) {
     crate::test_support::wait_until(&format!("{n} stage result(s)"), || async {
         let found = stage_results(pool, task_id).await.len();
-        if found >= n { Ok(()) } else { Err(format!("{found} result(s)")) }
+        if found >= n {
+            Ok(())
+        } else {
+            Err(format!("{found} result(s)"))
+        }
     })
     .await;
 }
@@ -816,7 +929,10 @@ async fn a_destination_that_fails_to_start_keeps_the_one_committed_result_throug
         .send_message_or_resume(&task_id, "please redo\n/changes")
         .await
         .unwrap_err();
-    assert!(matches!(err, SendMessageOrResumeError::Advance(_)), "{err:?}");
+    assert!(
+        matches!(err, SendMessageOrResumeError::Advance(_)),
+        "{err:?}"
+    );
 
     let committed = stage_results(&pool, &task_id).await;
     assert_eq!(committed.len(), 2, "{committed:?}");
@@ -825,11 +941,17 @@ async fn a_destination_that_fails_to_start_keeps_the_one_committed_result_throug
     assert_eq!(departure.destination_stage, "draft");
     let state = state_of(&pool, &task_id).await;
     assert_eq!(state.current_stage, "draft");
-    assert_eq!(state.payload["current_result_id"], json!(departure.result_id));
+    assert_eq!(
+        state.payload["current_result_id"],
+        json!(departure.result_id)
+    );
 
     // Recovery re-enters the persisted destination; the review departure is
     // not appended again and keeps its identity.
-    sqlx::query("DROP TRIGGER no_sessions").execute(&pool).await.unwrap();
+    sqlx::query("DROP TRIGGER no_sessions")
+        .execute(&pool)
+        .await
+        .unwrap();
     engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
     wait_for_results(&pool, &task_id, 3).await;
     wait_until_stage(&pool, &task_id, "review").await;

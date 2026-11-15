@@ -3436,7 +3436,10 @@ stages:
             .json();
         let id = task["id"].as_str().unwrap().to_string();
         let correction = "Make exactly these changes.\n\nChange nothing else.";
-        for reply in [format!("{correction}\n/again"), "/approve\nShip it.".to_string()] {
+        for reply in [
+            format!("{correction}\n/again"),
+            "/approve\nShip it.".to_string(),
+        ] {
             let response = server
                 .post(&format!("/tasks/{id}/messages"), json!({ "text": reply }))
                 .await;
@@ -3488,7 +3491,10 @@ stages:
         // An exact ID, and the same ID bounded by an older anchor.
         let (status, body) =
             context_get(&server, &id, &format!("source=stage&result_id={second}")).await;
-        assert_eq!((status, body["result"]["capture"].clone()), (200, json!("Ship it.")));
+        assert_eq!(
+            (status, body["result"]["capture"].clone()),
+            (200, json!("Ship it."))
+        );
         assert_eq!(body["anchor_id"], Value::Null);
         let (status, body) = context_get(
             &server,
@@ -3516,8 +3522,14 @@ stages:
         let legacy = crate::db::tasks::create(
             server.pool(),
             crate::db::tasks::NewTask {
-                project_id: &project, workflow_def: "ctxflow", title: "Old", config: json!({}),
-                workflow_path: None, workflow_sha256: None, base_ref: None, base_commit: None,
+                project_id: &project,
+                workflow_def: "ctxflow",
+                title: "Old",
+                config: json!({}),
+                workflow_path: None,
+                workflow_sha256: None,
+                base_ref: None,
+                base_commit: None,
                 closes: &[],
             },
         )
@@ -3558,8 +3570,11 @@ stages:
             assert_eq!((foreign_status, nowhere_status), (404, 404), "{query}");
             assert_eq!(foreign_body["reason"], reason, "{query}");
             assert_eq!(foreign_body["provenance"], "unavailable");
-            assert_eq!(foreign_body.to_string().replace(&first, "ID"),
-                       nowhere_body.to_string().replace("no-such-id", "ID"), "{query}");
+            assert_eq!(
+                foreign_body.to_string().replace(&first, "ID"),
+                nowhere_body.to_string().replace("no-such-id", "ID"),
+                "{query}"
+            );
             assert!(!foreign_body.to_string().contains("Make exactly"));
         }
 
@@ -3570,14 +3585,28 @@ stages:
 
         // Every shape of bad query is a 400 with the usual error body.
         for query in [
-            "", "source=bogus", "source=null", "source=", "source=task&stage=a",
-            "source=task&outcome=a", "source=task&result_id=r", "source=task&anchor_id=r",
-            "source=stage", "source=stage&stage=a&result_id=r", "source=stage&result_id=r&outcome=x",
-            "source=stage&outcome=x", "source=stage&anchor_id=r", "source=stage&stage=",
-            "source=stage&stage=%20", "source=stage&stage=a&outcome=%20%09",
-            "source=stage&stage=a&anchor_id=", "source=stage&result_id=%20",
-            "source=stage&stage=a&stage=b", "source=task&source=task",
-            "source=stage&stage[]=a", "source=stage&stage=a&bogus=1",
+            "",
+            "source=bogus",
+            "source=null",
+            "source=",
+            "source=task&stage=a",
+            "source=task&outcome=a",
+            "source=task&result_id=r",
+            "source=task&anchor_id=r",
+            "source=stage",
+            "source=stage&stage=a&result_id=r",
+            "source=stage&result_id=r&outcome=x",
+            "source=stage&outcome=x",
+            "source=stage&anchor_id=r",
+            "source=stage&stage=",
+            "source=stage&stage=%20",
+            "source=stage&stage=a&outcome=%20%09",
+            "source=stage&stage=a&anchor_id=",
+            "source=stage&result_id=%20",
+            "source=stage&stage=a&stage=b",
+            "source=task&source=task",
+            "source=stage&stage[]=a",
+            "source=stage&stage=a&bogus=1",
             "source=stage&stage=a&outcome=x&outcome=y",
             "source=stage&result_id=r&anchor_id=a&anchor_id=b",
         ] {
@@ -3589,10 +3618,27 @@ stages:
 
         // None of the requests above wrote anything.
         let after = crate::test_support::dump_tables(server.pool()).await;
-        let changed: Vec<_> = before.iter().zip(&after).filter(|(a, b)| a != b).map(|(a, _)| &a.0).collect();
-        assert_eq!(changed, ["tasks", "workflow_state"], "only the legacy task was seeded");
-        sqlx::query("DELETE FROM workflow_state WHERE task_id = ?").bind(&legacy).execute(server.pool()).await.unwrap();
-        sqlx::query("DELETE FROM tasks WHERE id = ?").bind(&legacy).execute(server.pool()).await.unwrap();
+        let changed: Vec<_> = before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| &a.0)
+            .collect();
+        assert_eq!(
+            changed,
+            ["tasks", "workflow_state"],
+            "only the legacy task was seeded"
+        );
+        sqlx::query("DELETE FROM workflow_state WHERE task_id = ?")
+            .bind(&legacy)
+            .execute(server.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM tasks WHERE id = ?")
+            .bind(&legacy)
+            .execute(server.pool())
+            .await
+            .unwrap();
         assert_eq!(context_get(&server, &legacy, "source=task").await.0, 404);
     }
 
@@ -3614,25 +3660,50 @@ stages:
         let id = task["id"].as_str().unwrap().to_string();
         // The standing fixture session is up and has taken its first turn.
         crate::test_support::wait_until("the chat turn to start", || async {
-            let sessions = crate::db::sessions::list_for_task(server.pool(), &id).await.unwrap();
-            if sessions.is_empty() { Err("no session".to_string()) } else { Ok(()) }
+            let sessions = crate::db::sessions::list_for_task(server.pool(), &id)
+                .await
+                .unwrap();
+            if sessions.is_empty() {
+                Err("no session".to_string())
+            } else {
+                Ok(())
+            }
         })
         .await;
-        let before = crate::db::sessions::list_for_task(server.pool(), &id).await.unwrap();
-        let events_before = crate::db::events::list_for_task(server.pool(), &id).await.unwrap();
-        for query in ["source=task", "source=stage&stage=chatting", "source=stage&result_id=x"] {
+        let before = crate::db::sessions::list_for_task(server.pool(), &id)
+            .await
+            .unwrap();
+        let events_before = crate::db::events::list_for_task(server.pool(), &id)
+            .await
+            .unwrap();
+        for query in [
+            "source=task",
+            "source=stage&stage=chatting",
+            "source=stage&result_id=x",
+        ] {
             context_get(&server, &id, query).await;
         }
-        let after = crate::db::sessions::list_for_task(server.pool(), &id).await.unwrap();
+        let after = crate::db::sessions::list_for_task(server.pool(), &id)
+            .await
+            .unwrap();
         assert_eq!(
-            before.iter().map(|s| (&s.id, &s.status)).collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|s| (&s.id, &s.status))
+                .collect::<Vec<_>>(),
             after.iter().map(|s| (&s.id, &s.status)).collect::<Vec<_>>()
         );
-        let events_after = crate::db::events::list_for_task(server.pool(), &id).await.unwrap();
+        let events_after = crate::db::events::list_for_task(server.pool(), &id)
+            .await
+            .unwrap();
         // Only the standing session's own output may have appeared; nothing
         // the lookup could have written (no completion, no stage result).
         assert!(events_after.len() >= events_before.len());
-        assert!(events_after.iter().all(|e| e.event_type != chocofactory_core::models::EventType::StageResult));
+        assert!(
+            events_after
+                .iter()
+                .all(|e| e.event_type != chocofactory_core::models::EventType::StageResult)
+        );
         assert!(
             events_after
                 .iter()
@@ -3640,7 +3711,10 @@ stages:
                 .all(|e| e.session_id.is_some()),
             "the lookup wrote a task-level event"
         );
-        let task = crate::db::tasks::get(server.pool(), &id).await.unwrap().unwrap();
+        let task = crate::db::tasks::get(server.pool(), &id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(task.status, "open");
     }
 }

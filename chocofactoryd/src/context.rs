@@ -94,7 +94,7 @@ enum Read {
     /// session event or another event type).
     Missing,
     Malformed,
-    Found(AppliedStageResult),
+    Found(Box<AppliedStageResult>),
 }
 
 async fn read_result(
@@ -102,13 +102,15 @@ async fn read_result(
     task_id: &str,
     id: &str,
 ) -> Result<Read, sqlx::Error> {
-    Ok(match events::get_stage_result_in(conn, task_id, id).await? {
-        None => Read::Missing,
-        Some(event) => match AppliedStageResult::from_event(&event) {
-            Ok(result) => Read::Found(result),
-            Err(_) => Read::Malformed,
+    Ok(
+        match events::get_stage_result_in(conn, task_id, id).await? {
+            None => Read::Missing,
+            Some(event) => match AppliedStageResult::from_event(&event) {
+                Ok(result) => Read::Found(Box::new(result)),
+                Err(_) => Read::Malformed,
+            },
         },
-    })
+    )
 }
 
 async fn lookup_in<F, Fut>(
@@ -134,12 +136,11 @@ where
             outcome,
             anchor_id,
         } => {
-            let anchor = match resolve_anchor(conn, task_id, anchor_id.as_deref(), stage, outcome)
-                .await?
-            {
-                Anchor::Start(anchor) => anchor,
-                Anchor::Answer(answer) => return Ok(answer),
-            };
+            let anchor =
+                match resolve_anchor(conn, task_id, anchor_id.as_deref(), stage, outcome).await? {
+                    Anchor::Start(anchor) => anchor,
+                    Anchor::Answer(answer) => return Ok(answer),
+                };
             pause().await;
             let walked = walk(conn, task_id, anchor.clone(), |r| {
                 r.source_stage == *stage && outcome.as_ref().is_none_or(|o| r.outcome == *o)
@@ -149,7 +150,7 @@ where
                 Walk::Found(result) => ContextResponse::StageResult {
                     task_id: task_id.to_string(),
                     anchor_id: Some(anchor.result_id),
-                    result,
+                    result: *result,
                 },
                 Walk::EndOfChain => unavailable(
                     task_id,
@@ -190,7 +191,7 @@ where
                             UnavailableReason::MalformedHistory,
                         )));
                     }
-                    Read::Found(anchor) => Some(anchor),
+                    Read::Found(anchor) => Some(*anchor),
                 },
             };
             let exact = match read_result(conn, task_id, result_id).await? {
@@ -208,7 +209,7 @@ where
                         UnavailableReason::MalformedHistory,
                     )));
                 }
-                Read::Found(result) => result,
+                Read::Found(result) => *result,
             };
             let Some(anchor) = anchor else {
                 return Ok(Lookup::Found(ContextResponse::StageResult {
@@ -224,7 +225,7 @@ where
                 Walk::Found(result) => ContextResponse::StageResult {
                     task_id: task_id.to_string(),
                     anchor_id,
-                    result,
+                    result: *result,
                 },
                 Walk::EndOfChain => {
                     unavailable(task_id, anchor_id, UnavailableReason::NotAtOrBeforeAnchor)
@@ -238,7 +239,11 @@ where
     }
 }
 
-fn unavailable(task_id: &str, anchor_id: Option<String>, reason: UnavailableReason) -> ContextResponse {
+fn unavailable(
+    task_id: &str,
+    anchor_id: Option<String>,
+    reason: UnavailableReason,
+) -> ContextResponse {
     ContextResponse::unavailable(task_id, anchor_id, reason)
 }
 
@@ -262,7 +267,7 @@ async fn resolve_anchor(
 ) -> Result<Anchor, sqlx::Error> {
     if let Some(id) = supplied {
         return Ok(match read_result(conn, task_id, id).await? {
-            Read::Found(anchor) => Anchor::Start(anchor),
+            Read::Found(anchor) => Anchor::Start(*anchor),
             Read::Missing => Anchor::Answer(Lookup::UnknownId(unavailable(
                 task_id,
                 Some(id.to_string()),
@@ -298,7 +303,7 @@ async fn resolve_anchor(
         ))));
     };
     Ok(match read_result(conn, task_id, &id).await? {
-        Read::Found(anchor) => Anchor::Start(anchor),
+        Read::Found(anchor) => Anchor::Start(*anchor),
         Read::Missing => Anchor::Answer(Lookup::Found(unavailable(
             task_id,
             Some(id),
@@ -345,7 +350,7 @@ fn legacy_snapshot(
 }
 
 enum Walk {
-    Found(AppliedStageResult),
+    Found(Box<AppliedStageResult>),
     /// The oldest recorded result was reached without a match.
     EndOfChain,
     /// A link needed to go further cannot be read.
@@ -369,7 +374,7 @@ async fn walk(
     let mut current = start;
     loop {
         if is_match(&current) {
-            return Ok(Walk::Found(current));
+            return Ok(Walk::Found(Box::new(current)));
         }
         let Some(previous) = current.previous_result_id.clone() else {
             return Ok(Walk::EndOfChain);
@@ -378,7 +383,7 @@ async fn walk(
             return Ok(Walk::Malformed);
         }
         current = match read_result(conn, task_id, &previous).await? {
-            Read::Found(result) => result,
+            Read::Found(result) => *result,
             Read::Missing => return Ok(Walk::Gap),
             Read::Malformed => return Ok(Walk::Malformed),
         };
@@ -542,13 +547,10 @@ mod tests {
     }
 
     async fn ask(pool: &SqlitePool, task: &str, req: &ContextRequest) -> Lookup {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            lookup(pool, task, req),
-        )
-        .await
-        .expect("the lookup must finish")
-        .unwrap()
+        tokio::time::timeout(std::time::Duration::from_secs(10), lookup(pool, task, req))
+            .await
+            .expect("the lookup must finish")
+            .unwrap()
     }
 
     fn unavailable_with(answer: &Lookup, expected_reason: UnavailableReason) -> Option<String> {
@@ -587,7 +589,17 @@ mod tests {
         )
         .await;
         put_result(pool, &task, "r1", None, "s", "x", Some(json!("first")), 1).await;
-        put_result(pool, &task, "r2", Some("r1"), "t", "x", Some(json!({"k": 1})), 2).await;
+        put_result(
+            pool,
+            &task,
+            "r2",
+            Some("r1"),
+            "t",
+            "x",
+            Some(json!({"k": 1})),
+            2,
+        )
+        .await;
         put_result(pool, &task, "r3", Some("r2"), "s", "y", None, 3).await;
         point_at(pool, &task, json!("r3")).await;
         task
@@ -620,7 +632,10 @@ mod tests {
         let (r, anchor) = result_of(&ask(&pool, &task, &by_id("r1", None)).await);
         assert_eq!((r.result_id.as_str(), anchor), ("r1", None));
         let (r, anchor) = result_of(&ask(&pool, &task, &by_id("r2", Some("r3"))).await);
-        assert_eq!((r.result_id.as_str(), anchor.as_deref()), ("r2", Some("r3")));
+        assert_eq!(
+            (r.result_id.as_str(), anchor.as_deref()),
+            ("r2", Some("r3"))
+        );
         // A result newer than the anchor is refused, with no content.
         let answer = ask(&pool, &task, &by_id("r3", Some("r2"))).await;
         assert_eq!(
@@ -641,9 +656,27 @@ mod tests {
         let mine = seeded_chain(&pool).await;
         let other = new_task_in(&pool, "Other", &[]).await;
         put_state(&pool, &other, json!({})).await;
-        put_result(&pool, &other, "foreign", None, "s", "x", Some(json!("SECRET OF B")), 1).await;
-        put_raw_event(&pool, &mine, "chatter", "assistant_message", None, json!({"text": "hi"}), 1)
-            .await;
+        put_result(
+            &pool,
+            &other,
+            "foreign",
+            None,
+            "s",
+            "x",
+            Some(json!("SECRET OF B")),
+            1,
+        )
+        .await;
+        put_raw_event(
+            &pool,
+            &mine,
+            "chatter",
+            "assistant_message",
+            None,
+            json!({"text": "hi"}),
+            1,
+        )
+        .await;
         let session = sessions::create(
             &pool,
             sessions::NewSession {
@@ -658,9 +691,18 @@ mod tests {
         .await
         .unwrap()
         .id;
-        let attributed = StageResultPayload::new("s", "agent_turn", "x", "t", None, None).to_value();
-        put_raw_event(&pool, &mine, "attributed", "stage_result", Some(&session), attributed, 1)
-            .await;
+        let attributed =
+            StageResultPayload::new("s", "agent_turn", "x", "t", None, None).to_value();
+        put_raw_event(
+            &pool,
+            &mine,
+            "attributed",
+            "stage_result",
+            Some(&session),
+            attributed,
+            1,
+        )
+        .await;
 
         for id in ["foreign", "chatter", "attributed", "does-not-exist"] {
             // An ID, as the result or as the anchor, is refused identically.
@@ -693,7 +735,17 @@ mod tests {
         put_state(&pool, &mine, json!({})).await;
         let other = new_task_in(&pool, "Other", &[]).await;
         // The only `s`/`x` result in the system belongs to the other task.
-        put_result(&pool, &other, "foreign", None, "s", "x", Some(json!("SECRET OF B")), 1).await;
+        put_result(
+            &pool,
+            &other,
+            "foreign",
+            None,
+            "s",
+            "x",
+            Some(json!("SECRET OF B")),
+            1,
+        )
+        .await;
         // A valid same-task anchor whose predecessor is that foreign row.
         put_result(&pool, &mine, "mine", Some("foreign"), "t", "y", None, 1).await;
         point_at(&pool, &mine, json!("mine")).await;
@@ -710,7 +762,10 @@ mod tests {
                 _ => UnavailableReason::HistoryGap,
             };
             unavailable_with(&answer, reason);
-            assert!(!format!("{answer:?}").contains("SECRET OF B"), "{request:?}");
+            assert!(
+                !format!("{answer:?}").contains("SECRET OF B"),
+                "{request:?}"
+            );
         }
         // A match found before the gap is still a valid answer.
         let (r, _) = result_of(&ask(&pool, &mine, &by_name("t", None, None)).await);
@@ -742,7 +797,12 @@ mod tests {
         assert!(!format!("{answer:?}").contains("STALE"));
         // An exact result needs no pointer at all.
         put_result(&pool, &task, "r1", None, "s", "x", Some(json!(1)), 1).await;
-        assert_eq!(result_of(&ask(&pool, &task, &by_id("r1", None)).await).0.result_id, "r1");
+        assert_eq!(
+            result_of(&ask(&pool, &task, &by_id("r1", None)).await)
+                .0
+                .result_id,
+            "r1"
+        );
 
         // A cycle terminates as malformed.
         put_result(&pool, &task, "c1", Some("c2"), "a", "x", None, 1).await;
@@ -792,9 +852,21 @@ mod tests {
         let pool = connect_in_memory().await.unwrap();
         // Every reachable shape of payload, task and stages.
         let cases: Vec<(&str, Value, Option<Value>)> = vec![
-            ("object", json!({"stages": {"s": {"outcome": "approved", "n": 1}}}), Some(json!({"outcome": "approved", "n": 1}))),
-            ("null pointer", json!({"current_result_id": null, "stages": {"s": "text"}}), Some(json!("text"))),
-            ("json null capture", json!({"stages": {"s": null}}), Some(Value::Null)),
+            (
+                "object",
+                json!({"stages": {"s": {"outcome": "approved", "n": 1}}}),
+                Some(json!({"outcome": "approved", "n": 1})),
+            ),
+            (
+                "null pointer",
+                json!({"current_result_id": null, "stages": {"s": "text"}}),
+                Some(json!("text")),
+            ),
+            (
+                "json null capture",
+                json!({"stages": {"s": null}}),
+                Some(Value::Null),
+            ),
             ("empty object", json!({}), None),
             ("null payload", json!(null), None),
             ("string payload", json!("x"), None),
@@ -870,17 +942,31 @@ mod tests {
         };
         // Seeded title and input, the numeric closes list.
         let task = new_task(&pool).await;
-        put_state(&pool, &task, json!({"task": {"input": "do it\nplease", "title": "Seeded"}})).await;
+        put_state(
+            &pool,
+            &task,
+            json!({"task": {"input": "do it\nplease", "title": "Seeded"}}),
+        )
+        .await;
         let got = ask_task(task).await;
         assert_eq!(got.title, "Seeded");
-        assert_eq!((got.input_available, got.input.as_deref()), (true, Some("do it\nplease")));
+        assert_eq!(
+            (got.input_available, got.input.as_deref()),
+            (true, Some("do it\nplease"))
+        );
         assert_eq!(got.closes, vec![7, 12]);
         // A valid empty input is available.
         let task = new_task(&pool).await;
         put_state(&pool, &task, json!({"task": {"input": "", "title": ""}})).await;
         let got = ask_task(task).await;
-        assert_eq!((got.input_available, got.input.as_deref()), (true, Some("")));
-        assert_eq!(got.title, "Fix the thing", "an empty seeded title falls back");
+        assert_eq!(
+            (got.input_available, got.input.as_deref()),
+            (true, Some(""))
+        );
+        assert_eq!(
+            got.title, "Fix the thing",
+            "an empty seeded title falls back"
+        );
         // Missing, null and wrong-type input are unavailable, whatever else
         // the task has recorded.
         for payload in [
@@ -896,10 +982,22 @@ mod tests {
         ] {
             let task = new_task_in(&pool, "Plain", &[]).await;
             put_state(&pool, &task, payload.clone()).await;
-            put_raw_event(&pool, &task, &format!("m-{task}"), "human_message", None,
-                json!({"text": "TYPED INPUT"}), 1).await;
+            put_raw_event(
+                &pool,
+                &task,
+                &format!("m-{task}"),
+                "human_message",
+                None,
+                json!({"text": "TYPED INPUT"}),
+                1,
+            )
+            .await;
             let got = ask_task(task).await;
-            assert_eq!((got.input_available, got.input.clone()), (false, None), "{payload}");
+            assert_eq!(
+                (got.input_available, got.input.clone()),
+                (false, None),
+                "{payload}"
+            );
             assert_eq!(got.title, "Plain", "{payload}");
             assert_eq!(got.closes, Vec::<u64>::new());
         }
@@ -914,21 +1012,49 @@ mod tests {
     #[tokio::test]
     async fn unknown_tasks_and_missing_workflow_state_are_told_apart() {
         let pool = connect_in_memory().await.unwrap();
-        assert_eq!(ask(&pool, "ghost", &ContextRequest::Task).await, Lookup::NoSuchTask);
-        assert_eq!(ask(&pool, "ghost", &by_name("s", None, None)).await, Lookup::NoSuchTask);
-        assert_eq!(ask(&pool, "ghost", &by_id("r", None)).await, Lookup::NoSuchTask);
+        assert_eq!(
+            ask(&pool, "ghost", &ContextRequest::Task).await,
+            Lookup::NoSuchTask
+        );
+        assert_eq!(
+            ask(&pool, "ghost", &by_name("s", None, None)).await,
+            Lookup::NoSuchTask
+        );
+        assert_eq!(
+            ask(&pool, "ghost", &by_id("r", None)).await,
+            Lookup::NoSuchTask
+        );
         let task = new_task(&pool).await;
         // No workflow row: unavailable for a stage lookup...
         let answer = ask(&pool, &task, &by_name("s", None, None)).await;
-        assert_eq!(unavailable_with(&answer, UnavailableReason::MissingWorkflowState), None);
+        assert_eq!(
+            unavailable_with(&answer, UnavailableReason::MissingWorkflowState),
+            None
+        );
         // ...but a valid exact result needs no workflow row.
         put_result(&pool, &task, "r1", None, "s", "x", Some(json!(1)), 1).await;
-        assert_eq!(result_of(&ask(&pool, &task, &by_id("r1", None)).await).0.result_id, "r1");
+        assert_eq!(
+            result_of(&ask(&pool, &task, &by_id("r1", None)).await)
+                .0
+                .result_id,
+            "r1"
+        );
         // A deleted task is unknown again (its events go with it or stay
         // unreachable).
-        sqlx::query("DELETE FROM events WHERE task_id = ?").bind(&task).execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM tasks WHERE id = ?").bind(&task).execute(&pool).await.unwrap();
-        assert_eq!(ask(&pool, &task, &ContextRequest::Task).await, Lookup::NoSuchTask);
+        sqlx::query("DELETE FROM events WHERE task_id = ?")
+            .bind(&task)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM tasks WHERE id = ?")
+            .bind(&task)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            ask(&pool, &task, &ContextRequest::Task).await,
+            Lookup::NoSuchTask
+        );
     }
 
     #[tokio::test]
@@ -955,7 +1081,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("choco-context-{}.db", uuid::Uuid::new_v4()));
         // Create and migrate once, then reopen with the wanted pool size.
         connect(&path).await.unwrap().close().await;
-        let options = SqliteConnectOptions::new().filename(&path).foreign_keys(true);
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(options)
@@ -989,8 +1117,17 @@ mod tests {
             let writer = {
                 let (pool, task) = (pool.clone(), task.clone());
                 tokio::spawn(async move {
-                    put_result(&pool, &task, "r4", Some("r3"), "s", "x", Some(json!("new")), 0)
-                        .await;
+                    put_result(
+                        &pool,
+                        &task,
+                        "r4",
+                        Some("r3"),
+                        "s",
+                        "x",
+                        Some(json!("new")),
+                        0,
+                    )
+                    .await;
                     point_at(&pool, &task, json!("r4")).await;
                     sqlx::query("DELETE FROM events WHERE id = 'r1'")
                         .execute(&pool)
@@ -1010,16 +1147,18 @@ mod tests {
             release_tx.send(()).unwrap();
             writer.await.unwrap();
         };
-        let (answer, ()) = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            async { tokio::join!(reading, controller) },
-        )
+        let (answer, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(reading, controller)
+        })
         .await
         .expect("the held read and the writer both finish");
         // The whole answer comes from the generation the anchor was read in:
         // r3 current, r1 still present.
         let (r, anchor) = result_of(&answer.unwrap());
-        assert_eq!((r.result_id.as_str(), anchor.as_deref()), ("r1", Some("r3")));
+        assert_eq!(
+            (r.result_id.as_str(), anchor.as_deref()),
+            ("r1", Some("r3"))
+        );
         // A fresh request sees the new generation: r4 is the latest match.
         let (r, _) = result_of(&ask(&pool, &task, &request).await);
         assert_eq!(r.result_id, "r4");

@@ -266,7 +266,10 @@ async fn retry_from_a_watched_timeout_gate_replaces_the_gate_watcher() {
         let timeout_result = AppliedStageResult::from_event(&before_results[0]).unwrap();
         assert_eq!(timeout_result.source_stage, "src", "{source:?}");
         assert_eq!(timeout_result.outcome, "timeout", "{source:?}");
-        assert_eq!(timeout_result.destination_stage, "parking_lot", "{source:?}");
+        assert_eq!(
+            timeout_result.destination_stage, "parking_lot",
+            "{source:?}"
+        );
         assert_eq!(
             state.payload["current_result_id"],
             json!(timeout_result.result_id),
@@ -400,7 +403,11 @@ async fn a_rewind_whose_result_cannot_be_written_leaves_the_gate_and_its_watcher
         let p = Parked::reach(source, false).await;
         let before = state_of(&p.pool, &p.task_id).await;
         let before_results = stage_results(&p.pool, &p.task_id).await;
-        assert_eq!(live_process_group(p.gate_pid), Some(p.gate_pid), "{source:?}");
+        assert_eq!(
+            live_process_group(p.gate_pid),
+            Some(p.gate_pid),
+            "{source:?}"
+        );
 
         sqlx::query(sqlx::AssertSqlSafe(
             "CREATE TRIGGER no_rewind_result BEFORE INSERT ON events
@@ -423,8 +430,16 @@ async fn a_rewind_whose_result_cannot_be_written_leaves_the_gate_and_its_watcher
         assert_eq!(after.current_stage, "parking_lot", "{source:?}");
         assert_eq!(after.payload, before.payload, "{source:?}");
         assert_eq!(after.loop_counters, before.loop_counters, "{source:?}");
-        assert_eq!(stage_results(&p.pool, &p.task_id).await, before_results, "{source:?}");
-        assert_eq!(live_process_group(p.gate_pid), Some(p.gate_pid), "{source:?}");
+        assert_eq!(
+            stage_results(&p.pool, &p.task_id).await,
+            before_results,
+            "{source:?}"
+        );
+        assert_eq!(
+            live_process_group(p.gate_pid),
+            Some(p.gate_pid),
+            "{source:?}"
+        );
         assert_eq!(runner_slots(&p.engine, &p.task_id), 1, "{source:?}");
         assert_eq!(pids(&p.dir.join("gate_pids")), [p.gate_pid], "{source:?}");
         let task = tasks::get(&p.pool, &p.task_id).await.unwrap().unwrap();
@@ -441,7 +456,11 @@ async fn a_rewind_whose_result_cannot_be_written_leaves_the_gate_and_its_watcher
             .retry_task(&p.task_id, RetryMode::Auto)
             .await
             .unwrap();
-        assert_eq!(stage_results(&p.pool, &p.task_id).await.len(), 2, "{source:?}");
+        assert_eq!(
+            stage_results(&p.pool, &p.task_id).await.len(),
+            2,
+            "{source:?}"
+        );
         wait_process_gone(p.gate_pid, "the old gate command").await;
         p.engine.abort_detached_runners(&p.task_id).await;
     }
