@@ -612,8 +612,15 @@ fn an_unset_empty_or_blank_description_gets_the_placeholder_and_a_note() {
         assert!(body.contains(PLACEHOLDER), "{what}: placeholder in {body}");
         assert!(body.contains("the report"), "{what}");
         assert!(body.contains("Opened by choco task `task-123`"), "{what}");
-        assert!(stderr(&out).contains(EMPTY_NOTE), "{what}: {}", stderr(&out));
-        assert!(!body.contains("DECOY"), "{what}: a coder file was read: {body}");
+        assert!(
+            stderr(&out).contains(EMPTY_NOTE),
+            "{what}: {}",
+            stderr(&out)
+        );
+        assert!(
+            !body.contains("DECOY"),
+            "{what}: a coder file was read: {body}"
+        );
     }
 }
 
@@ -648,16 +655,30 @@ fn a_refresh_replaces_an_earlier_description_whatever_the_new_shape() {
         let out = fx.run(TITLE, "approved", "r");
         assert!(out.status.success(), "{what}: {}", stderr(&out));
         let body = last_edit_body(&fx);
-        assert!(!body.contains("OLD-GENERATED-TEXT"), "{what}: stale text kept: {body}");
+        assert!(
+            !body.contains("OLD-GENERATED-TEXT"),
+            "{what}: stale text kept: {body}"
+        );
         assert!(!body.contains("DECOY"), "{what}: {body}");
         assert_eq!(count_moved_notes(&out), 0, "{what}: {}", stderr(&out));
         if value == Some(b"NEW-WRITER-TEXT\nsecond line\n".as_slice()) {
-            assert!(body.contains("NEW-WRITER-TEXT\nsecond line\n"), "{what}: {body}");
+            assert!(
+                body.contains("NEW-WRITER-TEXT\nsecond line\n"),
+                "{what}: {body}"
+            );
             assert!(!body.contains(PLACEHOLDER), "{what}: {body}");
-            assert!(!stderr(&out).contains(EMPTY_NOTE), "{what}: {}", stderr(&out));
+            assert!(
+                !stderr(&out).contains(EMPTY_NOTE),
+                "{what}: {}",
+                stderr(&out)
+            );
         } else {
             assert!(body.contains(PLACEHOLDER), "{what}: {body}");
-            assert!(stderr(&out).contains(EMPTY_NOTE), "{what}: {}", stderr(&out));
+            assert!(
+                stderr(&out).contains(EMPTY_NOTE),
+                "{what}: {}",
+                stderr(&out)
+            );
         }
     }
 }
@@ -734,7 +755,11 @@ fn marker_lines_in_the_description_are_stripped() {
     let out = fx.run("T (#1)", "approved", "plain report");
     assert!(out.status.success(), "{}", stderr(&out));
     let body = created_body(&fx);
-    assert_eq!(body.matches(BEGIN).count(), 2, "one generated pair plus the inline mention: {body}");
+    assert_eq!(
+        body.matches(BEGIN).count(),
+        2,
+        "one generated pair plus the inline mention: {body}"
+    );
     assert_eq!(body.matches(END).count(), 1, "{body}");
     assert_eq!(count_line(&body, BEGIN), 1, "{body}");
     assert_eq!(count_line(&body, END), 1, "{body}");
@@ -785,7 +810,11 @@ fn the_description_cap_keeps_a_prefix_and_says_so() {
     let multibyte = "é".repeat(20_000); // 40,000 bytes; 16,384 is even, so a whole character ends the prefix
     let straddle = format!("x{}", "é".repeat(20_000)); // the cut falls inside a character
     for (what, text, cut) in [
-        ("uncut realistic text", realistic_description("UNCUT-MARK"), false),
+        (
+            "uncut realistic text",
+            realistic_description("UNCUT-MARK"),
+            false,
+        ),
         ("exactly at the cap", exact, false),
         ("one byte over", over, true),
         ("multibyte", multibyte, true),
@@ -800,8 +829,15 @@ fn the_description_cap_keeps_a_prefix_and_says_so() {
         let part = description_part(&body);
         if cut {
             let (prefix, notice) = part.split_once("\n[truncated: ").expect(what);
-            assert!(prefix.len() <= 16_384, "{what}: prefix is {} bytes", prefix.len());
-            assert!(text.starts_with(prefix), "{what}: the prefix is the text's start");
+            assert!(
+                prefix.len() <= 16_384,
+                "{what}: prefix is {} bytes",
+                prefix.len()
+            );
+            assert!(
+                text.starts_with(prefix),
+                "{what}: the prefix is the text's start"
+            );
             let notice = format!("[truncated: {notice}");
             let kept = prefix.len();
             // The filter ends every line with a newline, so a text without
@@ -811,7 +847,11 @@ fn the_description_cap_keeps_a_prefix_and_says_so() {
                 notice.starts_with(&format!("[truncated: {kept} of {total} bytes shown]")),
                 "{what}: {notice}"
             );
-            assert_eq!(body.matches("[truncated: ").count(), 1, "{what}: one notice only");
+            assert_eq!(
+                body.matches("[truncated: ").count(),
+                1,
+                "{what}: one notice only"
+            );
         } else {
             assert!(!body.contains("[truncated: "), "{what}: {body}");
             assert!(part.starts_with(text.trim_end()), "{what}");
@@ -825,7 +865,10 @@ fn the_description_cap_keeps_a_prefix_and_says_so() {
 #[test]
 fn an_engine_shaped_description_is_cut_once_more_by_the_script_cap() {
     let suffix = "\n[truncated by chocofactory: 65480 of 140000 bytes]";
-    let value = format!("{}TAIL-PAST-THE-CUT{suffix}", "b".repeat(65_536 - suffix.len() - 17));
+    let value = format!(
+        "{}TAIL-PAST-THE-CUT{suffix}",
+        "b".repeat(65_536 - suffix.len() - 17)
+    );
     assert_eq!(value.len(), 65_536);
     let fx = Fixture::new();
     fx.set_description(value.as_bytes());
@@ -833,10 +876,18 @@ fn an_engine_shaped_description_is_cut_once_more_by_the_script_cap() {
     assert!(out.status.success(), "{}", stderr(&out));
     let body = created_body(&fx);
     let part = description_part(&body);
-    let (prefix, notice) = part.split_once("\n[truncated: ").expect("the script's notice");
+    let (prefix, notice) = part
+        .split_once("\n[truncated: ")
+        .expect("the script's notice");
     assert_eq!(prefix.len(), 16_384, "{}", prefix.len());
-    assert!(notice.starts_with("16384 of 65537 bytes shown]"), "{notice}");
-    assert!(!body.contains("TAIL-PAST-THE-CUT"), "text past the cut was published");
+    assert!(
+        notice.starts_with("16384 of 65537 bytes shown]"),
+        "{notice}"
+    );
+    assert!(
+        !body.contains("TAIL-PAST-THE-CUT"),
+        "text past the cut was published"
+    );
 }
 #[test]
 fn failures_exit_nonzero() {
@@ -902,7 +953,10 @@ fn the_description_comes_from_the_environment_not_from_any_coder_file() {
     assert!(out.status.success(), "{}", stderr(&out));
     let body = created_body(&fx);
     assert!(body.contains("WRITER-MARK-91c2"), "{body}");
-    assert!(!body.contains("DECOY"), "a coder file was published: {body}");
+    assert!(
+        !body.contains("DECOY"),
+        "a coder file was published: {body}"
+    );
 
     // A refresh of the block that lap just published takes the writer's new
     // text, again with the decoys in place.
@@ -1017,7 +1071,10 @@ fn a_closing_phrase_in_the_description_alone_is_rewritten() {
         closing_regex().find_iter(&body).next().is_none(),
         "a closing reference survived: {body}"
     );
-    assert!(body.contains("See also #34 for background.\n"), "bare reference kept: {body}");
+    assert!(
+        body.contains("See also #34 for background.\n"),
+        "bare reference kept: {body}"
+    );
     assert!(body.contains("The importer is faster.\n"), "{body}");
 }
 #[test]
@@ -1185,7 +1242,10 @@ fn an_uncut_description_whose_fragment_collapses_keeps_its_tail() {
     );
     assert!(desc.len() < 65_536);
     let body = body_for("T (#131)", Some(desc.as_bytes()), "r");
-    assert!(body.contains("closes o/r issue 5\nIMPORTANT TAIL\n"), "{body}");
+    assert!(
+        body.contains("closes o/r issue 5\nIMPORTANT TAIL\n"),
+        "{body}"
+    );
     assert!(!body.contains("[truncated: "), "{body}");
 }
 
@@ -1228,7 +1288,9 @@ const EMPTY_NOTE: &str =
 /// A few KB of realistic markdown that carries `marker` once, as a writer's
 /// summary does: headings, a list, a fence and several paragraphs.
 fn realistic_description(marker: &str) -> String {
-    let mut out = format!("## What this changes\n\n{marker}: the importer now reads the config from the project root instead of the home directory.\n\n");
+    let mut out = format!(
+        "## What this changes\n\n{marker}: the importer now reads the config from the project root instead of the home directory.\n\n"
+    );
     for i in 1..=12 {
         out.push_str(&format!(
             "- Step {i}: the loader checks the project root first, then falls back to the home directory, and says which one it used in its log line number {i}.\n"
@@ -1303,7 +1365,10 @@ fn a_temporary_description_file_that_cannot_be_written_publishes_no_body() {
     fx.set_description(b"a description that cannot be written\n");
     let out = fx.run("T (#1)", "approved", "r");
     assert!(!out.status.success(), "{}", stdout(&out));
-    assert!(fx.root.join("gh/mktemp-wrapped").exists(), "the wrapper did not run");
+    assert!(
+        fx.root.join("gh/mktemp-wrapped").exists(),
+        "the wrapper did not run"
+    );
     assert!(
         stderr(&out).to_lowercase().contains("directory"),
         "not the injected write failure: {}",

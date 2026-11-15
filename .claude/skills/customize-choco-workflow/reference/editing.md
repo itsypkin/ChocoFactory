@@ -147,8 +147,8 @@ More: [how a role is configured](https://github.com/itsypkin/ChocoFactory/blob/m
 
 ## Adding a check: an example
 
-A shell stage between the review and the PR. In `coding-task`, change
-`internal_review`'s `approved: open_pr` to `approved: lint`, and add:
+A shell stage between the writer and the PR. In `coding-task`, change
+`describe_pr`'s `done: open_pr` to `done: lint`, and add:
 
 ```yaml
   lint:
@@ -157,6 +157,11 @@ A shell stage between the review and the PR. In `coding-task`, change
     timeout: 5m
     on: { done: open_pr, error: escalate_to_human }
 ```
+
+The other stages below go between the review and the writer instead: change
+`internal_review`'s `approved: describe_pr` to point at the new stage, and have
+the new stage's success edge go to `describe_pr`, so the description is still
+written before the PR opens. Never route `describe_pr` into itself.
 
 A failed check goes to a human. Routing `error` back to the coder would not
 work unless you also edit the coder's revise prompt (and so eject `prompts/`)
@@ -171,7 +176,7 @@ A shell stage passing agent text on:
     command: printf '%s\n' "$REVIEW_SUMMARY" > /dev/null
     env:
       REVIEW_SUMMARY: "{{ stages.internal_review.summary }}"
-    on: { done: open_pr }
+    on: { done: describe_pr }
 ```
 
 A poll stage with backoff:
@@ -187,7 +192,7 @@ A poll stage with backoff:
     outcomes:
       - match: '\Aready'
         then: ready
-    on: { ready: open_pr, timeout: escalate_to_human }
+    on: { ready: describe_pr, timeout: escalate_to_human }
 ```
 
 A gate that waits for `/ship`:
@@ -199,7 +204,7 @@ A gate that waits for `/ship`:
     markers:
       - line: /ship
         then: shipped
-    on: { shipped: open_pr }
+    on: { shipped: describe_pr }
 ```
 
 A reply without the `/ship` line is refused and nothing is sent, so the
@@ -226,7 +231,7 @@ roles:
     prompt_file: prompts/reviewer-turn.md
     capture: json
     report_sections: [Reviewed, Findings]
-    on: { approved: open_pr, changes_requested: escalate_to_human }
+    on: { approved: describe_pr, changes_requested: escalate_to_human }
 ```
 
 `changes_requested` goes to a human, not to `revising`. The built-in revise

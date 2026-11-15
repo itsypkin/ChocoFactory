@@ -8405,7 +8405,10 @@ fn recorded_bodies(scripts_dir: &Path) -> Vec<String> {
 /// The part of a published body that is the writer's text: between the issue
 /// lines and the `## Internal review` heading.
 fn description_region(body: &str) -> &str {
-    let from = body.find("\n\n").expect("the issue lines end at a blank line") + 2;
+    let from = body
+        .find("\n\n")
+        .expect("the issue lines end at a blank line")
+        + 2;
     let to = body.find("## Internal review").expect("the review section");
     &body[from..to]
 }
@@ -8536,7 +8539,10 @@ async fn a_failed_writer_turn_publishes_nothing_and_the_retry_publishes_its_own_
         "the second writer turn died"
     );
     assert_eq!(
-        fs::read_to_string(scripts_dir.join("pr-writes")).unwrap().lines().collect::<Vec<_>>(),
+        fs::read_to_string(scripts_dir.join("pr-writes"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
         ["create"],
         "no create or edit after the writer failed"
     );

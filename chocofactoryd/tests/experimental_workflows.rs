@@ -632,7 +632,11 @@ fn review_panel_routes_the_lead_approval_through_describe_pr() {
         .filter(|(_, st)| st.on.values().any(|to| to == "open_pr"))
         .map(|(name, _)| name.as_str())
         .collect();
-    assert_eq!(into_open_pr, ["describe_pr"], "only the writer enters open_pr");
+    assert_eq!(
+        into_open_pr,
+        ["describe_pr"],
+        "only the writer enters open_pr"
+    );
 
     let StageKind::Shell { env, .. } = &def.stages["open_pr"].kind else {
         panic!("open_pr must be a shell stage");
@@ -656,7 +660,12 @@ fn review_panel_routes_the_lead_approval_through_describe_pr() {
     assert_eq!(writer.cli.as_deref(), Some("claude"));
     assert_eq!(writer.model.as_deref(), Some("claude-sonnet-5-5"));
     assert_eq!(
-        writer.system_prompt_file.as_ref().unwrap().file_name().unwrap(),
+        writer
+            .system_prompt_file
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap(),
         "writer-system.md"
     );
     assert!(writer.read_only, "the writer is read-only");
@@ -676,7 +685,10 @@ fn the_writer_prompts_resolve_and_load_from_a_dereferenced_copy() {
         assert!(COPIES.contains(&rel), "{rel} is listed in COPIES");
         let path = exp().join(rel);
         assert!(
-            fs::symlink_metadata(&path).unwrap().file_type().is_symlink(),
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "{rel} must be a link, not a second copy"
         );
         assert_eq!(
@@ -735,6 +747,9 @@ fn the_experimental_revise_prompt_is_the_shipped_one_with_the_lead_wording() {
             format!("{lead}{}reviewer", &caps[1])
         })
         .replace("`internal_review`", "`lead_review`")
-        .replace("stages.internal_review.summary", "stages.lead_review.summary");
+        .replace(
+            "stages.internal_review.summary",
+            "stages.lead_review.summary",
+        );
     assert_eq!(fork, expected, "the fork drifted from the shipped prompt");
 }

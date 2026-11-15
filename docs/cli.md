@@ -295,7 +295,7 @@ standing agent stage such as `chat`'s takes a message into the live session
 (the agent's reply is recorded as an event), and a `human_gate` (or
 `escalate_to_human`) takes a message that resumes it.
 A `coding-task` accepts a message only at its human gates; at its other agent
-stages (`coding`, `internal_review`, `revising`) the daemon answers `409`.
+stages (`coding`, `internal_review`, `describe_pr`, `revising`) the daemon answers `409`.
 At a gate that has markers, such as `awaiting_human_review`, the text must
 carry exactly one of them on a line of its own.
 

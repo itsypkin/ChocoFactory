@@ -2174,7 +2174,6 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         }
     }
 
-
     #[test]
     fn reviewer_turn_reads_the_work_report() {
         for name in ["reviewer-turn.md", "reviewer-turn-planned.md"] {
@@ -2991,8 +2990,6 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         }
     }
 
-
-
     #[test]
     fn planner_system_check_six_bullets_stay_inside_the_list_item() {
         let raw = embedded_prompt("planner-system.md");
@@ -3306,7 +3303,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         let blocking = "A false claim that hides something missing from the implementation blocks, and you request changes, because the work isn't done:";
         let minor = "Any other inaccuracy is a minor finding and by itself never a reason for `changes_requested`:";
         let absent = "A missing or empty report is not a form rejection: judge the implementation without it, and note its absence as a minor finding when it hides no missing required work.";
-        assert_says(&text, &[rule, blocking, minor, absent], "reviewer-system.md step 5");
+        assert_says(
+            &text,
+            &[rule, blocking, minor, absent],
+            "reviewer-system.md step 5",
+        );
         for c in [rule, blocking, minor, absent] {
             let at = index_of(&text, c);
             assert!(
@@ -3339,7 +3340,10 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             let wf = def.name.as_str();
             assert_eq!(
                 on_map(&def.stages["internal_review"]),
-                [("approved", "describe_pr"), ("changes_requested", "revising")],
+                [
+                    ("approved", "describe_pr"),
+                    ("changes_requested", "revising")
+                ],
                 "{wf}: the approval edge goes to describe_pr"
             );
             let stage = &def.stages["describe_pr"];
@@ -3455,7 +3459,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         };
         for (name, spec_mark, other_mark) in [
             ("writer-turn.md", "ORIGINAL-TASK-MARK", "HARDENED-SPEC-MARK"),
-            ("writer-turn-planned.md", "HARDENED-SPEC-MARK", "ORIGINAL-TASK-MARK"),
+            (
+                "writer-turn-planned.md",
+                "HARDENED-SPEC-MARK",
+                "ORIGINAL-TASK-MARK",
+            ),
         ] {
             let (out, unresolved) =
                 crate::template::render(embedded_prompt(name), &payload("#152 #126")).unwrap();
@@ -3489,8 +3497,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 ],
                 name,
             );
-            let (none, _) =
-                crate::template::render(embedded_prompt(name), &payload("")).unwrap();
+            let (none, _) = crate::template::render(embedded_prompt(name), &payload("")).unwrap();
             assert!(
                 none.starts_with("Task: TITLE-MARK\nCloses: \n"),
                 "{name}: an empty closes list renders empty: {none}"
@@ -3562,17 +3569,27 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             ),
         ];
         for (what, sentence) in rules {
-            assert!(system.contains(sentence), "writer-system.md ({what}): {sentence}");
+            assert!(
+                system.contains(sentence),
+                "writer-system.md ({what}): {sentence}"
+            );
         }
         for name in ["writer-turn.md", "writer-turn-planned.md"] {
             let text = squash(embedded_prompt(name));
             assert!(
-                text.contains("Report the description as the `report_outcome` summary, with outcome `done`."),
+                text.contains(
+                    "Report the description as the `report_outcome` summary, with outcome `done`."
+                ),
                 "{name}: the turn ends with the report"
             );
         }
         // The old form rules are not carried over into the new author.
-        for gone in ["6,000", "## Problem", "Changes, in reading order", "choco-pr-description"] {
+        for gone in [
+            "6,000",
+            "## Problem",
+            "Changes, in reading order",
+            "choco-pr-description",
+        ] {
             assert!(!system.contains(gone), "writer-system.md carries {gone}");
         }
     }

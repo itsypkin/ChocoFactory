@@ -28,8 +28,8 @@ already exists:
 - `--config '<json>'`, for anything the typed flags don't cover
 
 Each role flag is `ROLE=VALUE` and can repeat. `ROLE` is a key of the
-workflow's `roles:`: `coder` and `reviewer` in `coding-task`, plus `planner`
-in `coding-task-planned`. A name that isn't in `roles:` applies to nothing.
+workflow's `roles:`: `coder`, `reviewer` and `writer` in `coding-task`, plus
+`planner` in `coding-task-planned`. A name that isn't in `roles:` applies to nothing.
 A model is set per role, not per stage: `--role-model coder=…` changes both
 the `coding` and `revising` stages. To give one stage its own model, give it
 a new role in a workflow file.

@@ -228,8 +228,8 @@ moves the task on, into `revising`.
   lap and a review lap, because resuming always goes through `revising`.
 - The note is templated into the coder's prompt verbatim. Make it
   self-contained: list every item in full. List them under MUST DO and
-  ACCEPTED COSTS, and ask the coder to copy the accepted costs into the PR
-  description.
+  ACCEPTED COSTS, and ask the coder to copy the accepted costs into its work
+  report, the text the PR description is written from.
 - On every lap where the branch has an open PR, `open_pr` force-pushes with
   a lease on the commit the task itself last pushed (recorded in the
   worktree's git dir), so a rebase goes through. If the PR's head is not
@@ -268,6 +268,24 @@ with the spec the answer wins.
   kept. Make it self-contained: say what to do and what to leave alone.
 - If the answer doesn't settle it, the coder reports `blocked` again and the
   task waits here again. No loop count is used up by a block or an answer.
+
+## A failed or parked `describe_pr`
+
+The writer turn is read-only and takes no message, so `choco task send` is
+refused there. If it ended without a report or failed, the task is `stuck` at
+`describe_pr` and nothing was published: `choco task retry <id>` runs it again.
+If choco detected that the writer changed the worktree, the task is `stuck`
+with a reason naming the change, and choco did not undo it. Before retrying,
+inspect the worktree (`git -C <worktree> status`, `git -C <worktree> diff`,
+`git -C <worktree> log`) and reset any change you don't want: a plain retry
+starts a fresh session that takes whatever is in the worktree as its starting
+point, so a retained change can be accepted and published without a new
+review. Only a resumed session keeps its original baseline. A write to an
+ignored path, to `.git`, or outside the worktree is not detected.
+
+Wrong or incomplete description prose is corrected by hand on the PR, not with
+`/request-changes`, which costs a coder lap and a review lap and never reaches
+the writer.
 
 ## Getting your review items done when the coder ignores them
 
