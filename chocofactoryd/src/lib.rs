@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod api;
 pub mod claude_settings;
 pub mod config_root;
+pub mod context;
 pub mod daemon_lock;
 pub mod db;
 pub mod engine;

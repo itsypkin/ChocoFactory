@@ -789,6 +789,17 @@ pub enum EventType {
     /// A stage was entered while the task was pausing or paused and not
     /// started. Task-scoped. Payload is `{"stage"}`.
     StageHeld,
+    /// A stage departure that actually committed: which stage the task left,
+    /// the outcome the engine applied, where the task actually went (after
+    /// any loop-guard redirect) and the full capture handed to the transition.
+    /// Task-scoped (`session_id` is `None`). Payload is the transition facts
+    /// of `context::StageResultPayload`; the event's own ID is the result's
+    /// stable ID, and `previous_result_id` links it to the departure before it.
+    /// Written in the same transaction as the workflow state it describes, so
+    /// unlike the diagnostic entries around it (`stage_entered`,
+    /// `turn_outcome`, `shell_output`) it exists exactly when the move did.
+    /// Never evidence of a report, a completed turn or usage.
+    StageResult,
 }
 
 impl fmt::Display for EventType {
@@ -820,6 +831,7 @@ impl fmt::Display for EventType {
             EventType::TaskPaused => "task_paused",
             EventType::TaskResumed => "task_resumed",
             EventType::StageHeld => "stage_held",
+            EventType::StageResult => "stage_result",
         })
     }
 }
@@ -866,6 +878,7 @@ impl FromStr for EventType {
             "task_paused" => Ok(EventType::TaskPaused),
             "task_resumed" => Ok(EventType::TaskResumed),
             "stage_held" => Ok(EventType::StageHeld),
+            "stage_result" => Ok(EventType::StageResult),
             other => Err(ParseEventTypeError(other.to_string())),
         }
     }
@@ -876,7 +889,9 @@ impl FromStr for EventType {
 /// Most entries are normalized from an agent session's output and name the
 /// session they came from; `StageEntered`/`ShellOutput` entries belong to the
 /// task itself and leave `session_id` `None`. Ordering across a task is always
-/// `(created_at, id)` — there is no per-session sequence counter.
+/// `(created_at, id)` — there is no per-session sequence counter. That is the
+/// order of the diagnostic timeline, not of applied stage results: those are
+/// ordered only by their `previous_result_id` links (see `context`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,
@@ -1117,6 +1132,7 @@ mod tests {
             EventType::TaskPaused,
             EventType::TaskResumed,
             EventType::StageHeld,
+            EventType::StageResult,
         ] {
             assert_eq!(
                 event_type.to_string().parse::<EventType>().unwrap(),
@@ -1145,6 +1161,23 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&EventType::ToolResult).unwrap(),
             "\"tool_result\""
+        );
+    }
+
+    #[test]
+    fn stage_result_event_type_serializes_displays_and_parses() {
+        assert_eq!(
+            serde_json::to_string(&EventType::StageResult).unwrap(),
+            "\"stage_result\""
+        );
+        assert_eq!(EventType::StageResult.to_string(), "stage_result");
+        assert_eq!(
+            "stage_result".parse::<EventType>().unwrap(),
+            EventType::StageResult
+        );
+        assert_eq!(
+            serde_json::from_str::<EventType>("\"stage_result\"").unwrap(),
+            EventType::StageResult
         );
     }
 

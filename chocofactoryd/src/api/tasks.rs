@@ -4,8 +4,10 @@
 use std::path::PathBuf;
 
 use axum::Json;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use chocofactory_core::context::ContextResponse;
 use chocofactory_core::models::{
     Event, PauseOutcome, ResumeOutcome, RetryMode, RetryOutcome, Task, TaskSummary, WorkflowState,
 };
@@ -14,6 +16,7 @@ use serde_json::{Value, json};
 
 use super::{ApiError, AppState};
 use crate::adapter;
+use crate::context::{self, ContextRequest, Lookup};
 use crate::db::usage as usage_db;
 use crate::db::{events, tasks, workflow_state};
 use crate::engine::{ConfigPatchError, WorkflowEngine, WorkflowRef};
@@ -289,6 +292,77 @@ async fn read_usage(
         stage_trail,
         chrono::Utc::now(),
     ))
+}
+
+/// `GET /tasks/{id}/context`: one value about a task, read-only. See
+/// `docs/context.md` for the query and response shapes.
+pub async fn context(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+) -> Result<(StatusCode, Json<ContextResponse>), ApiError> {
+    let Query(pairs) = query.map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let request = parse_context_query(&pairs)?;
+    match context::lookup(&state.pool, &id, &request).await? {
+        Lookup::NoSuchTask => Err(ApiError::NotFound(format!("no such task '{id}'"))),
+        Lookup::Found(answer) => Ok((StatusCode::OK, Json(answer))),
+        Lookup::UnknownId(answer) => Ok((StatusCode::NOT_FOUND, Json(answer))),
+    }
+}
+
+/// Turns a context query string into a request, refusing anything that is
+/// not one of the three documented shapes rather than choosing a default.
+/// Values are opaque strings: `null` and `7` are just names.
+fn parse_context_query(pairs: &[(String, String)]) -> Result<ContextRequest, ApiError> {
+    const KEYS: [&str; 5] = ["source", "stage", "outcome", "result_id", "anchor_id"];
+    let bad = |message: String| Err(ApiError::BadRequest(message));
+    let mut values: [Option<&str>; 5] = [None; 5];
+    for (key, value) in pairs {
+        let Some(slot) = KEYS.iter().position(|known| known == key) else {
+            return bad(format!(
+                "unknown query key '{key}'; use source, stage, outcome, result_id, anchor_id"
+            ));
+        };
+        if values[slot].is_some() {
+            return bad(format!("query key '{key}' given more than once"));
+        }
+        if value.trim().is_empty() {
+            return bad(format!("query key '{key}' must not be empty"));
+        }
+        values[slot] = Some(value);
+    }
+    let [source, stage, outcome, result_id, anchor_id] = values;
+    let own = |value: Option<&str>| value.map(str::to_string);
+    match source {
+        None => bad("missing 'source': use source=task or source=stage".to_string()),
+        Some("task") => {
+            if stage.is_some() || outcome.is_some() || result_id.is_some() || anchor_id.is_some() {
+                return bad("source=task takes no other query keys".to_string());
+            }
+            Ok(ContextRequest::Task)
+        }
+        Some("stage") => match (stage, result_id) {
+            (Some(_), Some(_)) => bad("pass either 'stage' or 'result_id', not both".to_string()),
+            (None, None) => bad("source=stage needs 'stage' or 'result_id'".to_string()),
+            (Some(stage), None) => Ok(ContextRequest::StageByName {
+                stage: stage.to_string(),
+                outcome: own(outcome),
+                anchor_id: own(anchor_id),
+            }),
+            (None, Some(result_id)) => {
+                if outcome.is_some() {
+                    return bad("'outcome' only narrows a 'stage' lookup".to_string());
+                }
+                Ok(ContextRequest::StageById {
+                    result_id: result_id.to_string(),
+                    anchor_id: own(anchor_id),
+                })
+            }
+        },
+        Some(other) => bad(format!(
+            "unknown source '{other}': use source=task or source=stage"
+        )),
+    }
 }
 
 pub async fn get(

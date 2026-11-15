@@ -8,6 +8,7 @@
 //! and the command released, so the source's last look ends in `timeout`.
 
 use super::*;
+use chocofactory_core::context::AppliedStageResult;
 
 #[derive(Clone, Copy, Debug)]
 enum Source {
@@ -259,6 +260,19 @@ async fn retry_from_a_watched_timeout_gate_replaces_the_gate_watcher() {
         );
         assert!(!group_members(p.gate_pid).is_empty(), "{source:?}");
 
+        // The timeout that parked the task was a departure of its own.
+        let before_results = stage_results(&p.pool, &p.task_id).await;
+        assert_eq!(before_results.len(), 1, "{source:?}");
+        let timeout_result = AppliedStageResult::from_event(&before_results[0]).unwrap();
+        assert_eq!(timeout_result.source_stage, "src", "{source:?}");
+        assert_eq!(timeout_result.outcome, "timeout", "{source:?}");
+        assert_eq!(timeout_result.destination_stage, "parking_lot", "{source:?}");
+        assert_eq!(
+            state.payload["current_result_id"],
+            json!(timeout_result.result_id),
+            "{source:?}"
+        );
+
         // Hold the replacement source attempt, then retry.
         fs::remove_file(p.dir.join("src_go")).unwrap();
         let outcome = p
@@ -296,6 +310,29 @@ async fn retry_from_a_watched_timeout_gate_replaces_the_gate_watcher() {
 
         let after = state_of(&p.pool, &p.task_id).await;
         assert_eq!(after.current_stage, "src", "{source:?}");
+        // Leaving the parking gate is a recorded departure: the gate, its
+        // kind, the `retry` outcome, the watcher it went back to, no capture
+        // and a link to the timeout that parked the task there.
+        let after_results = stage_results(&p.pool, &p.task_id).await;
+        assert_eq!(after_results.len(), 2, "{source:?}");
+        assert_eq!(after_results[0], before_results[0], "{source:?}");
+        let rewind = AppliedStageResult::from_event(&after_results[1]).unwrap();
+        assert_eq!(rewind.source_stage, "parking_lot", "{source:?}");
+        assert_eq!(rewind.source_kind, "human_gate", "{source:?}");
+        assert_eq!(rewind.outcome, "retry", "{source:?}");
+        assert_eq!(rewind.destination_stage, "src", "{source:?}");
+        assert!(!rewind.capture_present, "{source:?}");
+        assert_eq!(rewind.capture, Value::Null, "{source:?}");
+        assert_eq!(
+            rewind.previous_result_id.as_deref(),
+            Some(timeout_result.result_id.as_str()),
+            "{source:?}"
+        );
+        assert_eq!(
+            after.payload["current_result_id"],
+            json!(rewind.result_id),
+            "{source:?}"
+        );
         assert_eq!(
             after.stage_kind.as_deref(),
             Some(if matches!(source, Source::Poll) {
@@ -350,6 +387,62 @@ async fn retry_from_a_watched_timeout_gate_replaces_the_gate_watcher() {
         );
         assert_eq!(runner_slots(&p.engine, &p.task_id), 1, "{source:?}");
         let _ = &p.offset;
+        p.engine.abort_detached_runners(&p.task_id).await;
+    }
+}
+
+/// The rewind's departure and the move commit together: when the result
+/// cannot be written, the task stays at the gate with its watcher running,
+/// and the next retry can try again.
+#[tokio::test]
+async fn a_rewind_whose_result_cannot_be_written_leaves_the_gate_and_its_watcher_running() {
+    for source in [Source::Poll, Source::ReviewGate] {
+        let p = Parked::reach(source, false).await;
+        let before = state_of(&p.pool, &p.task_id).await;
+        let before_results = stage_results(&p.pool, &p.task_id).await;
+        assert_eq!(live_process_group(p.gate_pid), Some(p.gate_pid), "{source:?}");
+
+        sqlx::query(sqlx::AssertSqlSafe(
+            "CREATE TRIGGER no_rewind_result BEFORE INSERT ON events
+             WHEN NEW.event_type = 'stage_result'
+             BEGIN SELECT RAISE(ABORT, 'insert refused'); END",
+        ))
+        .execute(&p.pool)
+        .await
+        .unwrap();
+        let err = p
+            .engine
+            .retry_task(&p.task_id, RetryMode::Auto)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RetryTaskError::Db(_)), "{source:?}: {err:?}");
+
+        // Nothing moved, no result was written, and the gate's own command
+        // is still alive, as the OS reports it, with its slot.
+        let after = state_of(&p.pool, &p.task_id).await;
+        assert_eq!(after.current_stage, "parking_lot", "{source:?}");
+        assert_eq!(after.payload, before.payload, "{source:?}");
+        assert_eq!(after.loop_counters, before.loop_counters, "{source:?}");
+        assert_eq!(stage_results(&p.pool, &p.task_id).await, before_results, "{source:?}");
+        assert_eq!(live_process_group(p.gate_pid), Some(p.gate_pid), "{source:?}");
+        assert_eq!(runner_slots(&p.engine, &p.task_id), 1, "{source:?}");
+        assert_eq!(pids(&p.dir.join("gate_pids")), [p.gate_pid], "{source:?}");
+        let task = tasks::get(&p.pool, &p.task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "open", "{source:?}");
+
+        // The failure was not a stuck mark of the gate: the retry can try
+        // again, and now records the departure.
+        sqlx::query("DROP TRIGGER no_rewind_result")
+            .execute(&p.pool)
+            .await
+            .unwrap();
+        fs::remove_file(p.dir.join("src_go")).unwrap();
+        p.engine
+            .retry_task(&p.task_id, RetryMode::Auto)
+            .await
+            .unwrap();
+        assert_eq!(stage_results(&p.pool, &p.task_id).await.len(), 2, "{source:?}");
+        wait_process_gone(p.gate_pid, "the old gate command").await;
         p.engine.abort_detached_runners(&p.task_id).await;
     }
 }

@@ -311,11 +311,12 @@ async fn wait_settle_errors(g: &Group, n: usize) {
     .await;
 }
 
-/// How many transition and branch entries the timeline holds.
+/// How many transition, stage-result and branch entries the timeline holds.
 async fn timeline_len(g: &Group) -> usize {
     let mut n = 0;
     for kind in [
         EventType::StageEntered,
+        EventType::StageResult,
         EventType::BranchStarted,
         EventType::BranchFinished,
         EventType::Error,
@@ -422,6 +423,64 @@ async fn all_branches_done_moves_the_task_to_the_done_target() {
     let finished_events = g.events_of(EventType::BranchFinished).await;
     assert_eq!(finished_events.len(), 2);
     assert!(finished_events.iter().all(|e| e.payload["state"] == "done"));
+}
+
+/// A group records a result only when it departs: not when a branch
+/// finishes, fails, settles or is retried.
+#[tokio::test]
+async fn a_group_records_its_departure_only_when_every_branch_is_done() {
+    use chocofactory_core::context::AppliedStageResult;
+    let script = by_prompt(&[
+        ("BRANCH-ONE", report_steps("clean", "sum-one")),
+        ("BRANCH-TWO", report_steps("bogus", "x")),
+        ("SUMMARIZE", summarize_steps()),
+    ]);
+    let g = group(Shape::new(), script).await;
+    g.start(None).await.unwrap();
+    g.wait_status("stuck").await;
+
+    // One branch done, one failed: the shell stage `prep` departed into the
+    // group, and nothing about the branches is a result.
+    let entry_results = g.events_of(EventType::StageResult).await;
+    assert_eq!(entry_results.len(), 1, "{entry_results:?}");
+    let entry = AppliedStageResult::from_event(&entry_results[0]).unwrap();
+    assert_eq!((entry.source_stage.as_str(), entry.destination_stage.as_str()), ("prep", "panel"));
+    let state = g.state().await;
+    assert_eq!(state.payload["current_result_id"], json!(entry.result_id));
+    assert_eq!(branch_slot(&state.payload, "one")["state"], "done");
+    assert_eq!(branch_slot(&state.payload, "two")["state"], "failed");
+
+    // Retrying only the failed branch, then both branches finishing.
+    set_script(
+        &g,
+        by_prompt(&[
+            ("BRANCH-ONE", report_steps("clean", "sum-one")),
+            ("BRANCH-TWO", report_steps("clean", "sum-two")),
+            ("SUMMARIZE", summarize_steps()),
+        ]),
+    );
+    retry(&g, RetryMode::Auto).await.unwrap();
+    g.wait_sessions("summarize", 1).await;
+
+    let results = g.events_of(EventType::StageResult).await;
+    assert_eq!(results.len(), 2, "exactly one group result: {results:?}");
+    let group_result = AppliedStageResult::from_event(&results[1]).unwrap();
+    assert_eq!(group_result.source_stage, "panel");
+    assert_eq!(group_result.source_kind, "parallel");
+    assert_eq!(group_result.outcome, "done");
+    assert_eq!(group_result.destination_stage, "summarize");
+    // No aggregate is invented from the branches' captures.
+    assert!(!group_result.capture_present);
+    assert_eq!(group_result.capture, Value::Null);
+    assert_eq!(
+        group_result.previous_result_id.as_deref(),
+        Some(entry.result_id.as_str())
+    );
+    let state = g.state().await;
+    assert_eq!(state.payload["current_result_id"], json!(group_result.result_id));
+    // The branch captures stay where they always were.
+    assert_eq!(state.payload["stages"]["one"]["summary"], "sum-one");
+    assert_eq!(state.payload["stages"]["two"]["summary"], "sum-two");
 }
 
 // 2

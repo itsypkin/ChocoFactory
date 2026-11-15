@@ -669,6 +669,18 @@ stages:
     assert_eq!(human_message["task_id"], task_id.as_str());
     assert_eq!(human_message["session_id"], Value::Null);
 
+    // The gate's departure is committed, and pushed, before the stage it
+    // led to is entered.
+    let result = next_event(&mut ws)
+        .await
+        .expect("stage result was not pushed over the already-open socket");
+    assert_eq!(result["event_type"], "stage_result");
+    assert_eq!(result["payload"]["source_stage"], "gate");
+    assert_eq!(result["payload"]["outcome"], "resumed");
+    assert_eq!(result["payload"]["destination_stage"], "review");
+    assert_eq!(result["task_id"], task_id.as_str());
+    assert_eq!(result["session_id"], Value::Null);
+
     let live = next_event(&mut ws)
         .await
         .expect("stage transition was not pushed over the already-open socket");

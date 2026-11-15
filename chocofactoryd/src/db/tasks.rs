@@ -120,10 +120,20 @@ pub async fn create(pool: &SqlitePool, new: NewTask<'_>) -> Result<Task, sqlx::E
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Task>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    get_in(&mut conn, id).await
+}
+
+/// [`get`] on a caller-supplied connection, so a read can share a
+/// transaction with other reads (pass `&mut *tx`).
+pub async fn get_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<Option<Task>, sqlx::Error> {
     let row =
         sqlx::query_as::<_, TaskRow>(concat!("SELECT ", columns!(), " FROM tasks WHERE id = ?"))
             .bind(id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     Ok(row.map(Into::into))
 }
