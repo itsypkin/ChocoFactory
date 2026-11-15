@@ -2259,14 +2259,18 @@ if [ -e "$CFG/fail-awk-count" ]; then
     esac
 fi
 if [ -e "$CFG/fail-awk-desc" ] && [ "$#" -eq 1 ]; then
-    cat > "$GH_FAKE_DIR/awk-stdin"
-    if grep -qF -- "$(cat "$CFG/fail-awk-desc")" "$GH_FAKE_DIR/awk-stdin"; then
-        echo "PARTIAL DESCRIPTION OUTPUT MUST NOT BE PUBLISHED"
-        echo "INJECTED awk failure: description filter" >&2
-        echo hit >> "$GH_FAKE_DIR/awk-desc-hits"
-        exit 3
-    fi
-    exec "$REAL" "$@" < "$GH_FAKE_DIR/awk-stdin"
+    case "$1" in
+    *MARK_BEGIN*)
+        cat > "$GH_FAKE_DIR/awk-stdin"
+        if grep -qF -- "$(cat "$CFG/fail-awk-desc")" "$GH_FAKE_DIR/awk-stdin"; then
+            echo "PARTIAL DESCRIPTION OUTPUT MUST NOT BE PUBLISHED"
+            echo "INJECTED awk failure: description filter" >&2
+            echo hit >> "$GH_FAKE_DIR/awk-desc-hits"
+            exit 3
+        fi
+        exec "$REAL" "$@" < "$GH_FAKE_DIR/awk-stdin"
+        ;;
+    esac
 fi
 if [ -e "$CFG/fail-awk-desc-neutralize" ] && [ "$#" -eq 1 ]; then
     case "$1" in
