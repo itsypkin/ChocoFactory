@@ -1320,24 +1320,41 @@ fn description_part(body: &str) -> &str {
 }
 
 /// A filter that fails after writing partial output, for the description
-/// only: the stage must exit nonzero and publish no body at all. (The branch
-/// push comes first in the script, so a pushed branch proves nothing here.)
+/// only: the stage must exit nonzero and publish no body at all. Each filter
+/// step is failed on its own (the marker stripper, then the closing-reference
+/// filter), because a hidden failure in either would publish. The branch push
+/// comes first in the script, so a pushed branch proves nothing here.
 #[test]
 fn a_description_filter_that_fails_after_partial_output_publishes_no_body() {
-    let fx = Fixture::new();
-    install_fake_awk(&fx);
-    fx.cfg("fail-awk-desc", "FAIL-ON-THIS-DESCRIPTION");
-    fx.set_description(b"FAIL-ON-THIS-DESCRIPTION\nbody text\n");
-    let out = fx.run("T (#1)", "approved", "plain report");
-    assert!(!out.status.success(), "{}", stdout(&out));
-    assert!(
-        stderr(&out).contains("INJECTED awk failure: description filter"),
-        "the failure was not the injected one: {}",
-        stderr(&out)
-    );
-    assert!(fx.root.join("gh/awk-desc-hits").exists());
-    assert!(fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty());
-    assert!(!stdout(&out).contains("PARTIAL"), "{}", stdout(&out));
+    for (config, evidence) in [
+        ("fail-awk-desc", "INJECTED awk failure: description filter"),
+        (
+            "fail-awk-desc-neutralize",
+            "INJECTED awk failure: description closing-reference filter",
+        ),
+    ] {
+        let fx = Fixture::new();
+        install_fake_awk(&fx);
+        fx.cfg(config, "FAIL-ON-THIS-DESCRIPTION");
+        fx.set_description(b"FAIL-ON-THIS-DESCRIPTION\nbody text\n");
+        let out = fx.run("T (#1)", "approved", "plain report");
+        assert!(!out.status.success(), "{config}: {}", stdout(&out));
+        assert!(
+            stderr(&out).contains(evidence),
+            "{config}: the failure was not the injected one: {}",
+            stderr(&out)
+        );
+        assert!(fx.root.join("gh/awk-desc-hits").exists(), "{config}");
+        assert!(
+            fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty(),
+            "{config}"
+        );
+        assert!(
+            !stdout(&out).contains("PARTIAL"),
+            "{config}: {}",
+            stdout(&out)
+        );
+    }
 }
 
 /// The description is written to a temporary file first; if that write
@@ -2250,6 +2267,20 @@ if [ -e "$CFG/fail-awk-desc" ] && [ "$#" -eq 1 ]; then
         exit 3
     fi
     exec "$REAL" "$@" < "$GH_FAKE_DIR/awk-stdin"
+fi
+if [ -e "$CFG/fail-awk-desc-neutralize" ] && [ "$#" -eq 1 ]; then
+    case "$1" in
+    *refat*)
+        cat > "$GH_FAKE_DIR/awk-stdin"
+        if grep -qF -- "$(cat "$CFG/fail-awk-desc-neutralize")" "$GH_FAKE_DIR/awk-stdin"; then
+            echo "PARTIAL DESCRIPTION OUTPUT MUST NOT BE PUBLISHED"
+            echo "INJECTED awk failure: description closing-reference filter" >&2
+            echo hit >> "$GH_FAKE_DIR/awk-desc-hits"
+            exit 3
+        fi
+        exec "$REAL" "$@" < "$GH_FAKE_DIR/awk-stdin"
+        ;;
+    esac
 fi
 if [ -e "$CFG/fail-awk-moved" ] && [ "$#" -eq 1 ]; then
     cat > "$GH_FAKE_DIR/awk-stdin"
