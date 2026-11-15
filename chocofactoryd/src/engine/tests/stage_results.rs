@@ -1095,7 +1095,11 @@ async fn a_committed_departure_into_a_terminal_stage_is_not_replayed_by_recovery
     // open at the terminal stage.
     assert_eq!(f.state().await.current_stage, "finished");
     assert_eq!(
-        tasks::get(&f.pool, &f.task_id).await.unwrap().unwrap().status,
+        tasks::get(&f.pool, &f.task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         TASK_STATUS_OPEN
     );
     let results = f.results().await;
@@ -1125,7 +1129,11 @@ async fn a_committed_departure_into_a_terminal_stage_is_not_replayed_by_recovery
         .expect("retrying the persisted terminal stage succeeds");
     assert_eq!(outcome.stage, "finished");
     assert_eq!(
-        tasks::get(&f.pool, &f.task_id).await.unwrap().unwrap().status,
+        tasks::get(&f.pool, &f.task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         TASK_STATUS_CLOSED,
         "the retry re-entered the terminal stage and closed the task"
     );
