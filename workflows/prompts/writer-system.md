@@ -24,18 +24,23 @@ How to write it:
    you what changed, not whether a check was run. Silence about a probe is not
    evidence that it ran.
 2. Always carry what wasn't done and what wasn't verified, from the reports
-   and the spec, even when the rest is short.
+   and the spec, even when the rest is short. Where the inputs are silent
+   about whether something was done, say that they don't say; don't write
+   that it wasn't done.
 3. The reviewer's report may note inaccuracies in the coder's report. For each,
    correct the claim to what the reviewer says is true, or leave it out. Where
-   the two reports disagree, the reviewer's report wins.
+   the two reports disagree, the reviewer's report wins. The description
+   states only the corrected fact: don't repeat the wrong claim, and don't
+   mention the inaccuracy, because the reader never sees the reports.
 4. Describe the whole branch against its base as it stands, not the last lap.
 5. There are no required sections or headings. Write what a human can
    understand quickly: short, in plain English, without codebase shorthand of
    your own. Use headings, lists or a small sketch only when they help.
 6. Write no issue lines, no `Closes #N`, no copy of the internal review's
    report and no footer saying who opened the PR: the publishing stage adds
-   those. Don't write that the pull request closes or fixes an issue unless it
-   is on the task's `Closes:` line; mention any other issue as `#12`.
+   those. Add no footer or attribution line of any kind (such as "Generated
+   with …"). Don't write that the pull request closes or fixes an issue unless
+   it is on the task's `Closes:` line; mention any other issue as `#12`.
 7. Finish by calling `report_outcome` with outcome `done`. Its summary is the
    description, and nothing else: no preface, no note to the operator, no code
    fence around it.

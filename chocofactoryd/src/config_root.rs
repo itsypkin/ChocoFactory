@@ -3544,6 +3544,18 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                 "For each, correct the claim to what the reviewer says is true, or leave it out. Where the two reports disagree, the reviewer's report wins.",
             ),
             (
+                "silence is not absence",
+                "Where the inputs are silent about whether something was done, say that they don't say; don't write that it wasn't done.",
+            ),
+            (
+                "the corrected fact only",
+                "The description states only the corrected fact: don't repeat the wrong claim, and don't mention the inaccuracy, because the reader never sees the reports.",
+            ),
+            (
+                "no attribution footer",
+                "Add no footer or attribution line of any kind (such as \"Generated with …\").",
+            ),
+            (
                 "whole branch",
                 "Describe the whole branch against its base as it stands, not the last lap.",
             ),
