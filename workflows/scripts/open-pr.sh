@@ -2,10 +2,9 @@
 # Opens (or refreshes) the pull request for a `coding-task` branch (#101).
 #
 # SAFETY: no agent- or human-written text may ever be parsed by a shell. The
-# task title and the internal review's report arrive as environment
-# variables (the stage's `env:` map), and the coder's description arrives as
-# a file in git's private directory for this worktree. Every such value is
-# expanded only inside double quotes, printed only as a `printf` argument,
+# task title, the writer's description and the internal review's report
+# arrive as environment variables (the stage's `env:` map). Every such value
+# is expanded only inside double quotes, printed only as a `printf` argument,
 # and handed to `gh` as `--title="$T"` / `--body-file` — never through
 # `eval`, `echo`, a format string, or a string that gets re-parsed.
 #
@@ -25,7 +24,9 @@
 # tell, and a stale or partial copy makes it move lines choco wrote itself. Without a copy, or when the body has no single valid block, nothing
 # can be told apart and nothing is moved (see the notes below).
 #
-# Inputs: PR_TASK_TITLE, PR_REVIEW_VERDICT, PR_REVIEW_REPORT (stage `env:`);
+# Inputs: PR_TASK_TITLE, PR_DESCRIPTION, PR_REVIEW_VERDICT, PR_REVIEW_REPORT
+# (stage `env:`; PR_DESCRIPTION is the `describe_pr` stage's text, and the engine
+# cuts any env value at 64 KiB);
 # CHOCO_TASK_ID, CHOCO_WORKFLOW, CHOCO_ROLE_MODELS, CHOCO_TASK_CLOSES (the
 # engine; the last is the issue numbers the task closes, space separated).
 set -eu
@@ -51,7 +52,7 @@ note() {
 }
 
 # Deletes every line that matches a marker (equal to it after trailing
-# spaces, tabs and CRs are removed), so text from the coder or the reviewer
+# spaces, tabs and CRs are removed), so text from the writer or the reviewer
 # can never break the next lap's splice.
 strip_markers() {
     awk '
@@ -487,29 +488,31 @@ if [ "$TLEN" -gt 100 ]; then
     T="$HEAD$ELLIPSIS$SUFFIX"
 fi
 
-# The description lives in git's private directory for this worktree
-# (`.git/worktrees/<name>` in a linked worktree, `.git` in the main one), so
-# it is never inside the work tree and never committed. Deliberately not
-# `rev-parse` with a path-format flag: Apple Git 2.30 doesn't know it and
-# prints the flag back as an extra output line while still exiting 0.
-DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
+# The writer's description arrives in PR_DESCRIPTION. It is written to a file
+# first (so a failed write stops the script before anything is published) and
+# then filtered one plain command at a time, never through a pipe: a pipe's
+# status is its last command's, so a failing filter would publish an empty
+# section. No coder file is read: an unset, empty or whitespace-only
+# PR_DESCRIPTION gets the placeholder below, never an earlier description.
+printf '%s' "${PR_DESCRIPTION:-}" > "$TMP/desc-env"
+# grep's status 1 means no non-blank text; any other failure stops the script.
+HAS_DESC=0
+grep -q '[^[:space:]]' "$TMP/desc-env" && HAS_DESC=1 || [ $? -eq 1 ] || die "cannot inspect the PR description text"
 
 {
     printf '%s\n' "$BEGIN"
     printf '%s' "$ISSUE_LINES"
     printf '\n'
-    if [ -f "$DESC" ] && grep -q '[^[:space:]]' "$DESC"; then
-        # Stepwise through files, not one pipe: a pipe's status is its last
-        # command's, so a failing filter would publish an empty section.
+    if [ "$HAS_DESC" = 1 ]; then
         # The filter's cost grows with line length, so bound its input first
         # (4x the cap; the cap still decides what is published).
-        strip_markers < "$DESC" > "$TMP/desc-0"
+        strip_markers < "$TMP/desc-env" > "$TMP/desc-0"
         bound_input 65536 "$TMP/desc-0" "$TMP/desc-1"
         neutralize_closing_refs < "$TMP/desc-1" > "$TMP/desc-2"
         cap 16384 "$(cat "$TMP/desc-1.cut")" < "$TMP/desc-2"
     else
-        printf '%s\n' '> **The coder wrote no description for this PR.** The internal review below and the commits are the record of what changed.'
-        note "no PR description at $DESC"
+        printf '%s\n' '> **The writer wrote no description for this PR.** The internal review below and the commits are the record of what changed.'
+        note "no PR description from describe_pr (PR_DESCRIPTION is empty)"
     fi
     printf '\n'
     printf '%s\n' '## Internal review'

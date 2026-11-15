@@ -39,6 +39,15 @@ roles:
     model: claude-opus-5-5
     read_only: true
     disallowed_tools: [edit, write, notebook_edit]
+  # Reads the all-round review's report (`stages.internal_review.summary`), not the
+  # lead's: that branch already has this name on purpose. The lead's report still
+  # reaches the publisher.
+  writer:
+    cli: claude
+    model: claude-sonnet-5-5
+    system_prompt_file: prompts/writer-system.md
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
 
 stages:
   # As in `coding-task-planned.yaml`.
@@ -121,9 +130,29 @@ stages:
     capture: json
     report_sections: [Prior findings, Reviewers, Findings, Dismissed]
     on:
-      approved: open_pr
+      approved: describe_pr
       changes_requested: revising
     loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Writes the pull request's description from the spec, the coder's work
+  # report, the internal reviewer's report and the branch's commits and diff
+  # (`writer-system.md`), and reports it as its summary, which `open_pr`
+  # publishes. It runs after every approval, so each round's description is
+  # new text. It is read-only: if choco detects a change to the worktree when
+  # the turn ends, the task parks, and choco does not undo that change. The
+  # operator inspects the worktree and resets any change before retrying; a
+  # plain retry can take the retained change as its new starting point. The
+  # check covers the checked-out files, their git state and the branch, not
+  # ignored files, other git metadata, files outside the worktree or what a
+  # shell command sends elsewhere. Human PR comments and hand edits don't
+  # reach it: wrong or incomplete prose is corrected by hand on the PR, not
+  # with `/request-changes`, which costs a coder lap and a review lap.
+  describe_pr:
+    kind: agent_turn
+    role: writer
+    prompt_file: prompts/writer-turn-planned.md
+    capture: json
+    on: { done: open_pr }
 
   # Same as `coding-task-planned.yaml`'s `escalate_to_human`.
   escalate_to_human:
@@ -169,6 +198,7 @@ stages:
     script_file: scripts/open-pr.sh
     env:
       PR_TASK_TITLE: "{{ task.title }}"
+      PR_DESCRIPTION: "{{ stages.describe_pr.summary }}"
       PR_REVIEW_VERDICT: "{{ stages.lead_review.outcome }}"
       PR_REVIEW_REPORT: "{{ stages.lead_review.summary }}"
     capture: json

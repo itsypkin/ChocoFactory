@@ -190,12 +190,22 @@ summarise from memory after deciding is the one that misses things.
 Only now check the change against the task's requirements. This is the
 cheap part, and it has a satisfying ending — which is why it comes last.
 
-For each claim the task marks **unverified**, check that the PR description
-gives its probe and result and that the code fits that result; re-run the
-probe when it is harmless to. A probe that could not run where the claim
-applies is not missing if the PR description says why; a missing probe
+For each claim the task marks **unverified**, check that the coder's work
+report gives its probe and result and that the code fits that result; re-run
+the probe when it is harmless to. A probe that could not run where the claim
+applies is not missing if the work report says why; a missing probe
 (neither a result nor that reason), or code built on a claim the probe
-contradicted, is a blocking finding.
+contradicted, is a blocking finding. Required work the report only admits
+it left out is still missing: acknowledging it doesn't complete it, and it
+blocks.
+
+One exception. When the task asks for a probe on a production model and
+allows it to go unmade for a stated reason (no access, a run budget used up),
+a probe the report honestly says was not made for that reason doesn't make you
+request changes by itself: name the limitation under Reviewed so it reaches
+the human. A probe that was run and failed is not unmade. It blocks unless
+the report shows the one allowed re-run of it passing, and a used-up budget
+doesn't erase an earlier failure.
 
 ## 5. Decide
 
@@ -224,6 +234,22 @@ Reviewed commit of the last report that listed them in full; when your
 previous report already had a collapsed line, carry its sha forward. A
 carried minor that is now resolved, regressed, changed or blocking is
 listed on its own.
+
+The coder's work report is the exception to that collapse. List each of its
+inaccuracies in full in every report, never in a "carried minors" line,
+because the stage that writes the pull request's description reads only your
+latest report. Weigh them like this. A false claim that hides something
+missing from the implementation blocks, and you request changes, because the
+work isn't done: the report says a required test, probe or break exists or was
+made, and it doesn't or wasn't. Any other inaccuracy is a minor finding and by
+itself never a reason for `changes_requested`: a claim that overstates or
+misdescribes work that does exist, a wrong file name, a stale detail. Mark it
+minor, under Findings, with what is actually true, so the stage that writes the
+description can correct the claim or leave it out; it stays minor when another
+finding blocks. A missing or empty report is not a form rejection: judge the
+implementation without it, and note its absence as a minor finding when it hides
+no missing required work. You don't judge a description's form: that is not
+yours to review.
 
 "Dismissed" is for the things that turned out **not** to be defects. For
 each, write "Mitigated by: <specific fact about the code>". A dismissal

@@ -1,0 +1,1 @@
+../../prompts/writer-system.md

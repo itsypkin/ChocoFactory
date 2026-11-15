@@ -1,7 +1,7 @@
 # `coding-task` with a spec check in front. It is a separate workflow so the
 # two can be compared on real runs. Every stage from `coding` on is
 # `coding-task.yaml`'s; read the rationale in that file's comments. Only
-# three prompt files differ, and each is its `coding-task` counterpart with
+# four prompt files differ, and each is its `coding-task` counterpart with
 # `{{ task.input }}` replaced by the planner's report. Tests in
 # `chocofactoryd/src/config_root.rs` pin both facts, so an edit to
 # `coding-task.yaml` or to one of those prompts must be copied here too.
@@ -22,6 +22,12 @@ roles:
     cli: claude
     model: claude-opus-5-5
     system_prompt_file: prompts/reviewer-system.md
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
+  writer:
+    cli: claude
+    model: claude-sonnet-5-5
+    system_prompt_file: prompts/writer-system.md
     read_only: true
     disallowed_tools: [edit, write, notebook_edit]
 
@@ -88,9 +94,18 @@ stages:
       - Findings
       - Dismissed
     on:
-      approved: open_pr
+      approved: describe_pr
       changes_requested: revising
     loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Same as `coding-task.yaml`'s `describe_pr`, with the planner's report as
+  # the spec the writer reads.
+  describe_pr:
+    kind: agent_turn
+    role: writer
+    prompt_file: prompts/writer-turn-planned.md
+    capture: json
+    on: { done: open_pr }
 
   # Same as `coding-task.yaml`'s `escalate_to_human`.
   escalate_to_human:
@@ -136,6 +151,7 @@ stages:
     script_file: scripts/open-pr.sh
     env:
       PR_TASK_TITLE: "{{ task.title }}"
+      PR_DESCRIPTION: "{{ stages.describe_pr.summary }}"
       PR_REVIEW_VERDICT: "{{ stages.internal_review.outcome }}"
       PR_REVIEW_REPORT: "{{ stages.internal_review.summary }}"
     capture: json

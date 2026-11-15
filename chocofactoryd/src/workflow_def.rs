@@ -4510,6 +4510,7 @@ stages:
             pairs,
             [
                 ("PR_TASK_TITLE", "{{ task.title }}"),
+                ("PR_DESCRIPTION", "{{ stages.describe_pr.summary }}"),
                 ("PR_REVIEW_VERDICT", "{{ stages.internal_review.outcome }}"),
                 ("PR_REVIEW_REPORT", "{{ stages.internal_review.summary }}"),
             ]

@@ -1,4 +1,5 @@
 Task: {{ task.title }}
+Closes: {{ task.closes }}
 
 {{ stages.spec_check.summary }}
 
@@ -22,7 +23,7 @@ follow that entry:
   human's review", and that section is current. Address every item in it,
   not just the first.
   Make only the changes the human asks for, and what those changes need
-  (their tests, the description). A finding from an earlier review that
+  (their tests). A finding from an earlier review that
   the human doesn't repeat is not a request, whoever raised it and however
   it was rated: leave that code as it is. If you notice a defect nobody
   asked about, name it in your summary instead of changing it.
@@ -166,18 +167,10 @@ rebase as the `base_conflict` entry says before you finish, whatever path
 brought you here. If it prints `UNKNOWN`, read it again up to 3 times,
 about 10 seconds apart, and act only on `CONFLICTING`.
 
-Commit your revisions, and rewrite the PR description file whole (step 4 of your
-instructions) so it describes the branch as it now stands.
-Start your draft from the file's current text, change what this lap changes, and write
-the whole result in one write; never append to it, find-and-replace in it, or splice
-around a heading. If the result is over 6,000 bytes, cut it as step 4 says, even in
-sections this lap didn't change and even when the task allows more.
-Keep every section the spec requires. If the branch has an open PR, first
-read its published description: set `N` as the `awaiting_human_review`
-entry does, then `[ -n "$N" ] && gh pr view "$N" --json body -q .body`.
-Only the part between the issue line and `## Internal review` is your
-description; carry into the file every edit a person made there that is
-still true.
+Commit your revisions, and rewrite your work report whole (step 4 of your
+instructions) so it describes the branch as it now stands, not only this lap.
+Start your draft from the report's current text, change what this lap changes,
+and write the whole result in one write.
 The self-check in step 2 of your instructions applies to every branch this
 lap added or changed, including new message text and new tests. Commit the
 lap's work before you run it, restore each break with
@@ -193,8 +186,11 @@ a lap. Then call `report_outcome` with the outcome `done`, or `blocked` only as 
 give one short line per item you were sent back for: what you changed, or
 that you didn't act on it and why. On the `awaiting_human_review` path,
 map each item in the human's review to the short SHA of the commit that
-addresses it, or say it wasn't done and why. A requested change to the PR's
-description is done by rewriting that file; the workflow republishes it. The
+addresses it, or say it wasn't done and why. The PR's description is written
+by a later stage from your work report, not by you: record each requested
+change to the description in the work report, so that stage can act on it,
+and say in your summary that the description is written again when the task
+next reaches that stage. The
 PR's title comes from the task and can't be changed from here. List a title
 change, and anything else you can't do from here, as not done rather than
 leaving it out.

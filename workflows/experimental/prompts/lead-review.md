@@ -54,7 +54,7 @@ the security and architecture reviews are `clean`.
 
 Decide which findings are blocking. Reject a finding that is wrong, already
 handled or out of scope, and say why. A finding that something the agreed spec
-requires is missing or untested blocks, even when the pull request lists it as
+requires is missing or untested blocks, even when the coder's work report lists it as
 not done.
 
 ## Report
