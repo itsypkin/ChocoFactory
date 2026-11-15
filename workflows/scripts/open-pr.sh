@@ -538,10 +538,10 @@ DESC="$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"
 # `gh pr list --state open` rather than `gh pr view`: branch resolution in
 # `gh pr view` matches a *closed or merged* PR too. That would make the
 # probe succeed on a branch whose PR a human already merged, skip the
-# create, and hand every later stage a dead PR number to poll. Reachable by
-# the ordinary route: escalate, merge by hand, `choco task send`,
-# `revising`. Both list calls need the scope, the read-back as much as the
-# probe.
+# create, and hand every later stage a dead PR number to poll. Still
+# reachable when a human merges by hand and sends a note (`choco task send`,
+# `revising`) before the parked gate has seen the merge. Both list calls need
+# the scope, the read-back as much as the probe.
 N=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number // empty')
 
 # The create is conditional (#78): `gh pr create` fails outright when a PR

@@ -196,16 +196,23 @@ and `choco task list --status stuck` finds every stuck task.
 
 `/approve` does nothing here; a reply that is only `/approve` or
 `/request-changes` is refused. After a review or CI timeout,
-`choco task retry <id>` watches again from the start and costs no lap. After a
-review timeout, comments and reviews posted before the timeout no longer count,
-so post them again. If the
-PR was merged meanwhile, after a review timeout `retry` lets the watcher see
-the merge and move the task to `done`. `choco task send <id> --text "<note>"` moves the task on, into
-`revising`.
+`choco task retry <id>` watches the unmerged PR again from the start and costs
+no lap. After a review timeout, comments and reviews posted before the timeout
+no longer count, so post them again. `choco task send <id> --text "<note>"`
+moves the task on, into `revising`.
 
-- If the PR is already good, merge it and then `choco task cancel <id>`.
-  Don't send a note after merging by hand: the next `open_pr` would open a
-  fresh PR.
+- If the PR is already good, merge it and leave the task alone: while it waits
+  here it reads the PR's state (every minute for 6 hours after arriving, then
+  every 5 minutes, then every 30 minutes after 30 hours) and moves to `done`
+  and `closed` when it sees `MERGED`. Don't cancel it, send a note or `retry`:
+  a note starts a coder and reviewer lap and the next `open_pr` would open a
+  fresh PR, and cancelling records merged work as cancelled. A PR that is open
+  or closed without merging leaves the task waiting, and so does a failed read
+  of GitHub (the task's events show the failure); it reads again at the next
+  interval, and no time is promised while GitHub or `gh` is failing or the
+  machine sleeps. Nothing is read while the task is paused, so after merging a
+  paused task's PR run `choco task resume <id>`. A cancelled task stays
+  cancelled.
 - After 4 red CI results in a row, name the failing check and what it says
   in the note, or fix CI by hand first.
 - After a CI timeout, or a cancelled, startup-failure or action-required
@@ -216,9 +223,9 @@ the merge and move the task to `done`. `choco task send <id> --text "<note>"` mo
   reloads it), then retry. Re-running CI on GitHub does not help there. Once it is green, after a CI timeout run
   `choco task retry <id>`: it polls CI again and costs no lap. After a
   cancelled, startup-failure or action-required check, either merge the PR
-  and cancel the task, or send a note saying CI is green and no code change
-  is needed. The note costs a coder lap and a review lap, because
-  resuming always goes through `revising`.
+  and let the task notice (it moves to `done` by itself), or send a note
+  saying CI is green and no code change is needed. The note costs a coder
+  lap and a review lap, because resuming always goes through `revising`.
 - The note is templated into the coder's prompt verbatim. Make it
   self-contained: list every item in full. List them under MUST DO and
   ACCEPTED COSTS, and ask the coder to copy the accepted costs into the PR
@@ -240,7 +247,10 @@ the merge and move the task to `done`. `choco task send <id> --text "<note>"` mo
 ## `blocker`: answer or cancel
 
 The coder reported `blocked`: the spec's rules left it no way forward, and it
-stopped instead of breaking one. Read its report:
+stopped instead of breaking one. If its PR gets merged anyway, the task moves
+to `done` by itself on the same schedule and merge-only check as
+`escalate_to_human` (a task with no PR yet has nothing to read); don't cancel
+it. Read the report:
 
 ```bash
 choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'

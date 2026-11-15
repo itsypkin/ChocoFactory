@@ -37,6 +37,9 @@ Read this while watching a task, when its behaviour surprises you.
   to `revising`, and the internal reviewer is shown it as your decision: where
   it conflicts with the spec, the answer wins. Only your latest answer is kept.
   It resets no loop count, and a reply that is only `/approve` is refused.
+  If the task's PR is merged meanwhile, the task moves to `done` by itself
+  (the same merge-only check as `escalate_to_human`; with no PR yet, nothing
+  to check).
 - **internal_review.** The reviewer is told the task's closes list and treats
   a description that claims the PR closes any other issue as a false claim.
   The reviewer can't use the file-editing tools, and a
@@ -104,6 +107,12 @@ Read this while watching a task, when its behaviour surprises you.
   `mergeable` holds an approval for one more poll.
 - **escalate_to_human.** Arriving here starts all four loop counts over (internal rejections, red CI
   results, your votes, conflict rounds).
-  It waits for you. After a review or CI timeout, `choco task retry <id>`
-  watches again at no cost. Otherwise `choco task send <id> --text "<note>"`
-  moves the task into `revising`.
+  It waits for you, with no time limit. If the PR is merged while the task
+  waits here, the task moves to `done` by itself, with no `/approve`, note or
+  coder lap: the gate reads only the PR's state (never comments, reviews or
+  conflicts), every minute for 6 hours after arriving, every 5 minutes up to
+  30 hours, then every 30 minutes. An open or closed-unmerged PR, a failed
+  read, or a task with no PR keeps it waiting for a later read, with no
+  promise of how soon. After a review or CI timeout, `choco task retry <id>`
+  watches the unmerged PR again at no cost. Otherwise
+  `choco task send <id> --text "<note>"` moves the task into `revising`.

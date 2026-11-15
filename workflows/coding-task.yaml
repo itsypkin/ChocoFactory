@@ -112,11 +112,26 @@ stages:
   # loop guards' counts (§5.3), whichever of those brought the task here,
   # so a human resuming from this stage always hands the loop a fresh
   # budget. `capture: text` keeps the human's reply so `revising` can see
-  # what they said.
+  # what they said. If the PR is merged by hand while the task waits here, the
+  # `watch` below sees it (`scripts/await-merge.sh`: only the merged state
+  # counts, never reviews or conflicts) and the task is `done`, not cancelled.
   escalate_to_human:
     kind: human_gate
     capture: text
-    on: { resumed: revising }
+    watch:
+      script_file: scripts/await-merge.sh
+      env:
+        PR_NUMBER: "{{ stages.open_pr.number }}"
+      interval: 60s
+      # The cadence of `awaiting_human_review`, counted from entering this
+      # gate. No `timeout`: a parked gate waits for its human indefinitely.
+      backoff:
+        - { after: 6h, interval: 5m }
+        - { after: 30h, interval: 30m }
+      outcomes:
+        - match: '\AMERGED(\n|$)'
+          then: merged
+    on: { resumed: revising, merged: done }
 
   # Reached when the coder reports `blocked` from `coding` or `revising`: it
   # hit a rule the task sets that leaves no way forward, and stopped instead of
@@ -127,10 +142,25 @@ stages:
   # also shown to the internal reviewer (`reviewer-turn.md`), where it wins over
   # the task text. `capture: text` keeps it. There is no loop guard, because
   # every round here waits on a human, and arriving here resets no loop count.
+  # A PR merged by hand in the meantime ends the task as `done`, as at
+  # `escalate_to_human`.
   blocker:
     kind: human_gate
     capture: text
-    on: { resumed: revising }
+    watch:
+      script_file: scripts/await-merge.sh
+      env:
+        PR_NUMBER: "{{ stages.open_pr.number }}"
+      interval: 60s
+      # The cadence of `awaiting_human_review`, counted from entering this
+      # gate. No `timeout`: a parked gate waits for its human indefinitely.
+      backoff:
+        - { after: 6h, interval: 5m }
+        - { after: 30h, interval: 30m }
+      outcomes:
+        - match: '\AMERGED(\n|$)'
+          then: merged
+    on: { resumed: revising, merged: done }
 
   # The probe (`gh pr list --state open`, never `gh pr view`), the
   # conditional create (#78), the refresh of an existing PR's description
