@@ -1144,6 +1144,13 @@ case "$1" in
     pr)
         case "$2" in
             create)
+                # Keep the body file's bytes: the temp file is gone once the
+                # script exits, and the test asserts on what was published.
+                prev=""
+                for a in "$@"; do
+                    if [ "$prev" = "--body-file" ]; then cp "$a" "{dir}/pr-body"; fi
+                    prev=$a
+                done
                 echo created >> "$created"
                 echo "https://example.test/pr/42"
                 ;;
@@ -1234,6 +1241,14 @@ esac
         r#"{"outcome": "approved", "summary": ""}"#,
     )
     .unwrap();
+    // The writer's report: a multi-line description with its own marker, so
+    // the body assertion cannot be met by any other text in the PR.
+    const WRITER_SUMMARY: &str = "Adds the small feature the task asked for.\n\n- WRITER-MARK-7f3a: one change, one test.\n- Not done: nothing.";
+    std::fs::write(
+        scripts_dir.join("writer-reply.json"),
+        json!({ "outcome": "done", "summary": WRITER_SUMMARY }).to_string(),
+    )
+    .unwrap();
     // The PR comments `awaiting_human_review`'s script reads (the stub
     // applies the script's `-q` filter to this page): an owner's approval.
     std::fs::write(
@@ -1251,11 +1266,15 @@ role="coder"
 for arg in "$@"; do
     case "$arg" in
         *"reviewing agent"*) role="reviewer" ;;
+        *"writing agent"*) role="writer" ;;
     esac
 done
 if [ "$role" = "reviewer" ]; then
     export MOCK_CLAUDE_REPLY="$(cat "{scripts_dir}/reviewer-reply.json")"
     export MOCK_CLAUDE_REPORT="$(cat "{scripts_dir}/reviewer-reply.json")"
+elif [ "$role" = "writer" ]; then
+    export MOCK_CLAUDE_REPLY="wrote the description"
+    export MOCK_CLAUDE_REPORT="$(cat "{scripts_dir}/writer-reply.json")"
 else
     export MOCK_CLAUDE_REPLY="did the thing"
 fi
@@ -1326,11 +1345,23 @@ exec "{mock_claude}" "$@"
         vec![
             "coding",
             "internal_review",
+            "describe_pr",
             "open_pr",
             "checks_polling",
             "awaiting_human_review",
             "done",
         ]
+    );
+
+    // What was published: the writer's text sits in the description region,
+    // between the issue lines and the review fold, not only somewhere in the
+    // body.
+    let body = std::fs::read_to_string(scripts_dir.join("pr-body")).unwrap();
+    let from = body.find("\n\n").unwrap() + 2;
+    let to = body.find("## Internal review").unwrap();
+    assert!(
+        body[from..to].contains(WRITER_SUMMARY),
+        "the PR description is not the writer's summary: {body}"
     );
 }
 
