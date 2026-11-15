@@ -3549,7 +3549,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             ),
             (
                 "the corrected fact only",
-                "The description states only the corrected fact: don't repeat the wrong claim, and don't mention the inaccuracy, because the reader never sees the reports.",
+                "The description states only the corrected fact: don't repeat the wrong claim, and don't narrate the correction. The publishing stage adds the internal review's report below your description, and it already records the inaccuracy.",
             ),
             (
                 "no attribution footer",

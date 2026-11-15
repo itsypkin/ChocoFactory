@@ -176,7 +176,9 @@ fn every_place_that_calls_the_writer_read_only_says_detection_not_undo() {
             &[
                 "choco did not undo it",
                 "inspect the worktree",
-                "reset any change you don't want",
+                "reset every change the writer made",
+                "resumes its session against its original baseline",
+                "starts a fresh session that takes whatever is in the worktree",
             ],
         ),
         (

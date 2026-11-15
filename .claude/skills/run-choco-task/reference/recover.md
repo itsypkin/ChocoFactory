@@ -277,10 +277,13 @@ refused there. If it ended without a report or failed, the task is `stuck` at
 If choco detected that the writer changed the worktree, the task is `stuck`
 with a reason naming the change, and choco did not undo it. Before retrying,
 inspect the worktree (`git -C <worktree> status`, `git -C <worktree> diff`,
-`git -C <worktree> log`) and reset any change you don't want: a plain retry
-starts a fresh session that takes whatever is in the worktree as its starting
-point, so a retained change can be accepted and published without a new
-review. Only a resumed session keeps its original baseline. A write to an
+`git -C <worktree> log`) and reset every change the writer made, even one you
+would like to keep: it was never reviewed. What a plain retry does depends on
+how the turn ended. A turn cut off from outside (a usage limit, a daemon stop)
+resumes its session against its original baseline, and the change is checked
+again. A turn that failed on its own, or `--fresh`, starts a fresh session
+that takes whatever is in the worktree as its starting point, so a retained
+change is accepted and published without implementation review. A write to an
 ignored path, to `.git`, or outside the worktree is not detected.
 
 Wrong or incomplete description prose is corrected by hand on the PR, not with

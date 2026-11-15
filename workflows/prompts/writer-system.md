@@ -31,7 +31,8 @@ How to write it:
    correct the claim to what the reviewer says is true, or leave it out. Where
    the two reports disagree, the reviewer's report wins. The description
    states only the corrected fact: don't repeat the wrong claim, and don't
-   mention the inaccuracy, because the reader never sees the reports.
+   narrate the correction. The publishing stage adds the internal review's
+   report below your description, and it already records the inaccuracy.
 4. Describe the whole branch against its base as it stands, not the last lap.
 5. There are no required sections or headings. Write what a human can
    understand quickly: short, in plain English, without codebase shorthand of

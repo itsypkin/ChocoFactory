@@ -1394,6 +1394,100 @@ fn a_temporary_description_file_that_cannot_be_written_publishes_no_body() {
     assert!(fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty());
 }
 
+/// The write check on its own. The temporary description file is made
+/// read-only and already holds readable, non-blank text, so the `printf` that
+/// should replace it fails while the later "does it have text" inspection
+/// would still succeed on the leftover. Ignoring the failed write would then
+/// publish that leftover; only the write check stops it. (A user who can
+/// write a read-only file, such as root, cannot make the write fail this way,
+/// so the test says so and returns.)
+#[test]
+fn a_failed_description_write_leaving_readable_text_publishes_no_body() {
+    let fx = Fixture::new();
+    let probe = fx.root.join("readonly-probe");
+    fs::write(&probe, "x").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    if fs::OpenOptions::new().write(true).open(&probe).is_ok() {
+        eprintln!("skipped: this user can write a read-only file");
+        return;
+    }
+    let real = Command::new("sh")
+        .args(["-c", "command -v mktemp"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    assert!(!real.is_empty(), "no mktemp on this host");
+    let fake = fx.root.join("bin/mktemp");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nd=$({real} \"$@\") || exit 1\nprintf '%s\\n' 'LEFTOVER-READABLE-TEXT nonblank' > \"$d/desc-env\" || exit 1\nchmod 444 \"$d/desc-env\" || exit 1\necho INJECTED >> \"$GH_FAKE_DIR/mktemp-wrapped\"\nprintf '%s\\n' \"$d\"\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&fake);
+    fx.set_description(b"the real description that cannot be written\n");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(
+        fx.root.join("gh/mktemp-wrapped").exists(),
+        "the wrapper did not run"
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).to_lowercase().contains("permission denied"),
+        "not the injected write failure: {}",
+        stderr(&out)
+    );
+    assert!(
+        fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty(),
+        "a body was published after the write failed"
+    );
+}
+
+/// The inspection check on its own: `grep` fails (exit 2, not "no match")
+/// only when it is asked about the description's temporary file. The write
+/// before it succeeded, so ignoring the failure would treat the description
+/// as empty and publish the placeholder instead of stopping.
+#[test]
+fn a_description_inspection_that_fails_publishes_no_body() {
+    let fx = Fixture::new();
+    let real = std::env::var("PATH")
+        .unwrap()
+        .split(':')
+        .map(|d| Path::new(d).join("grep"))
+        .find(|p| p.exists())
+        .expect("a real grep");
+    let fake = fx.root.join("bin/grep");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\ncase \"$last\" in\n*/desc-env)\n    echo 'INJECTED grep failure: description inspection' >&2\n    echo hit >> \"$GH_FAKE_DIR/grep-desc-hits\"\n    exit 2\n    ;;\nesac\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&fake);
+    fx.set_description(b"a description whose inspection fails\n");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(
+        fx.root.join("gh/grep-desc-hits").exists(),
+        "the grep wrapper did not see the description file"
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("cannot inspect the PR description text"),
+        "the script did not stop on the inspection failure: {}",
+        stderr(&out)
+    );
+    assert!(
+        fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty(),
+        "the placeholder body was published after the inspection failed"
+    );
+}
+
 const TASK_REF: &str = "refs/heads/task/branch-name-xyz";
 
 fn origin_tip(fx: &Fixture) -> String {
