@@ -82,6 +82,9 @@ struct Group {
     task_id: String,
     def: Arc<WorkflowDefinition>,
     _dirs: Vec<TempDir>,
+    /// Set when the group's database is a file whose connections can be
+    /// held inside a departure.
+    barrier: Option<crate::test_support::DepartureBarrier>,
 }
 
 /// A task on `shape`'s workflow, not yet started. `script` is the fake
@@ -108,6 +111,38 @@ async fn group_with(
     build: impl FnOnce(&str, SqlitePool, &Path) -> Arc<WorkflowEngine>,
 ) -> Group {
     let pool = connect_in_memory().await.unwrap();
+    group_on(pool, None, shape, script, build).await
+}
+
+/// [`group`] on a file-backed database whose connections can be held inside
+/// a departure.
+async fn held_group(shape: Shape, script: Value) -> Group {
+    let db_dir = tempdir();
+    let (pool, barrier) = crate::test_support::DepartureBarrier::open(&db_dir.join("g.db")).await;
+    let mut g = group_on(pool, Some(barrier), shape, script, |binary, pool, dir| {
+        let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(binary));
+        let events_notify = Arc::new(Notify::new());
+        let manager = SessionManager::with_turn_timers(
+            pool.clone(),
+            Registry::single(adapter),
+            chrono::Duration::hours(1),
+            Arc::clone(&events_notify),
+            fast_turn_timers(),
+        );
+        WorkflowEngine::new(pool, manager, dir.to_path_buf(), None, events_notify)
+    })
+    .await;
+    g._dirs.push(db_dir);
+    g
+}
+
+async fn group_on(
+    pool: SqlitePool,
+    barrier: Option<crate::test_support::DepartureBarrier>,
+    shape: Shape,
+    script: Value,
+    build: impl FnOnce(&str, SqlitePool, &Path) -> Arc<WorkflowEngine>,
+) -> Group {
     let dir = tempdir();
     let repo = tempdir();
     init_git_repo(&repo).await;
@@ -147,6 +182,7 @@ async fn group_with(
         task_id,
         def,
         _dirs: vec![dir, repo],
+        barrier,
     }
 }
 
@@ -435,7 +471,7 @@ async fn a_group_records_its_departure_only_when_every_branch_is_done() {
         ("BRANCH-TWO", report_steps("bogus", "x")),
         ("SUMMARIZE", summarize_steps()),
     ]);
-    let g = group(Shape::new(), script).await;
+    let g = held_group(Shape::new(), script).await;
     g.start(None).await.unwrap();
     g.wait_status("stuck").await;
 
@@ -490,6 +526,152 @@ async fn a_group_records_its_departure_only_when_every_branch_is_done() {
     // The branch captures stay where they always were.
     assert_eq!(state.payload["stages"]["one"]["summary"], "sum-one");
     assert_eq!(state.payload["stages"]["two"]["summary"], "sum-two");
+
+    // Reopened from the file, the group's result is still there, retrievable
+    // by ID and by name, with the pointer on it and no capture invented.
+    let observer = g.barrier.as_ref().unwrap().observer().await;
+    let pointer = workflow_state::get(&observer, &g.task_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .payload["current_result_id"]
+        .clone();
+    assert_eq!(pointer, json!(group_result.result_id));
+    for request in [
+        crate::context::ContextRequest::StageById {
+            result_id: group_result.result_id.clone(),
+            anchor_id: None,
+        },
+        crate::context::ContextRequest::StageByName {
+            stage: "panel".into(),
+            outcome: Some("done".into()),
+            anchor_id: None,
+        },
+    ] {
+        match crate::context::lookup(&observer, &g.task_id, &request)
+            .await
+            .unwrap()
+        {
+            crate::context::Lookup::Found(
+                chocofactory_core::context::ContextResponse::StageResult { result, .. },
+            ) => {
+                assert_eq!(result.result_id, group_result.result_id);
+                assert_eq!(result.source_kind, "parallel");
+                assert!(!result.capture_present);
+                assert_eq!(
+                    result.previous_result_id.as_deref(),
+                    Some(entry.result_id.as_str())
+                );
+            }
+            other => panic!("{request:?}: {other:?}"),
+        }
+    }
+    observer.close().await;
+}
+
+/// What a second process sees of the group task: its place, its pointer, its
+/// results and how many `summarize` sessions exist.
+async fn group_seen_elsewhere(g: &Group) -> (String, Value, Vec<String>, usize) {
+    let observer = g.barrier.as_ref().unwrap().observer().await;
+    let state = workflow_state::get(&observer, &g.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let results = events::list_for_task(&observer, &g.task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == EventType::StageResult)
+        .map(|e| e.id)
+        .collect();
+    let summarize = runs_for_stage(&observer, &g.task_id, "summarize")
+        .await
+        .len();
+    observer.close().await;
+    (
+        state.current_stage,
+        state.payload["current_result_id"].clone(),
+        results,
+        summarize,
+    )
+}
+
+/// A held group with its first branch reported done, so the next branch end
+/// is the group's departure. Returns what the second branch needs to end.
+async fn group_one_branch_from_departing() -> (Group, i64, String) {
+    let g = held_group(Shape::new(), holding()).await;
+    g.start(None).await.unwrap();
+    let one = g.wait_sessions("one", 1).await.remove(0);
+    let two = g.wait_sessions("two", 1).await.remove(0);
+    let entry = g.state().await.payload["parallel"]["entry"]
+        .as_i64()
+        .unwrap();
+    let first = g
+        .finish(entry, "one", &one.id, reported("clean", "sum-one"))
+        .await;
+    assert_eq!(first, BranchApplied::Recorded { done: true });
+    (g, entry, two.id)
+}
+
+#[tokio::test]
+async fn a_group_departure_whose_commit_fails_leaves_the_group_and_starts_nothing() {
+    let (g, entry, two) = group_one_branch_from_departing().await;
+    let before = group_seen_elsewhere(&g).await;
+    assert_eq!(before.0, "panel");
+    assert_eq!(before.2.len(), 1, "only the entry into the group");
+
+    // The last branch to finish makes the group depart; its COMMIT fails.
+    crate::test_support::fail_commit_of_stage_results(&g.pool).await;
+    let applied = g
+        .finish(entry, "two", &two, reported("clean", "sum-two"))
+        .await;
+    assert!(matches!(applied, BranchApplied::Parked(_)), "{applied:?}");
+
+    assert_eq!(
+        group_seen_elsewhere(&g).await,
+        before,
+        "the group is still at its panel with its old pointer, no group result, nothing started after it"
+    );
+    assert_eq!(g.status().await, "stuck");
+}
+
+#[tokio::test]
+async fn a_group_departure_cancelled_inside_its_transaction_leaves_nothing() {
+    let (g, entry, two) = group_one_branch_from_departing().await;
+    let before = group_seen_elsewhere(&g).await;
+
+    let barrier = g.barrier.as_ref().unwrap();
+    barrier.arm(&g.pool).await;
+    let ending = {
+        let (engine, task_id, def) = (g.engine.clone(), g.task_id.clone(), g.def.clone());
+        tokio::spawn(async move {
+            engine
+                .finish_branch(
+                    &task_id,
+                    &def,
+                    &BranchWatch {
+                        group: "panel".to_string(),
+                        entry,
+                    },
+                    "two",
+                    &two,
+                    reported("clean", "sum-two"),
+                )
+                .await
+        })
+    };
+    // The group's departure is inside its transaction: its result row is
+    // written there, the move and the COMMIT are not.
+    barrier.reached().await;
+    ending.abort();
+    assert!(ending.await.unwrap_err().is_cancelled());
+    barrier.release(&g.pool).await;
+
+    assert_eq!(
+        group_seen_elsewhere(&g).await,
+        before,
+        "a dropped group departure leaves no result, no move, no next stage"
+    );
 }
 
 /// Reading the task's context is not a report: with two real fixture turns
@@ -502,6 +684,18 @@ async fn a_context_read_leaves_waiting_turns_waiting_and_writes_nothing() {
     g.start(None).await.unwrap();
     let one = g.wait_sessions("one", 1).await.remove(0);
     let two = g.wait_sessions("two", 1).await.remove(0);
+    // A session row exists before its CLI has announced itself. Only once the
+    // announcement has been handled (it sets `adapter_session_id`) is the
+    // row stable enough to take a baseline of.
+    for session in [&one, &two] {
+        crate::test_support::wait_until("the session's announcement handled", || async {
+            match session_now(&g, session).await.adapter_session_id {
+                Some(_) => Ok(()),
+                None => Err("no adapter session id yet".to_string()),
+            }
+        })
+        .await;
+    }
     let task_level = |events: Vec<chocofactory_core::models::Event>| -> Vec<String> {
         events
             .into_iter()

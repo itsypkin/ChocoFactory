@@ -327,6 +327,15 @@ fn legacy_snapshot(
     stage: &str,
     outcome: &Option<String>,
 ) -> ContextResponse {
+    // The outcome filter is decided first: a stored capture, present or
+    // not, can never say which outcome was applied.
+    if outcome.is_some() {
+        return unavailable(
+            task_id,
+            None,
+            UnavailableReason::UnverifiableSnapshotOutcome,
+        );
+    }
     let capture = state
         .payload
         .get("stages")
@@ -334,11 +343,6 @@ fn legacy_snapshot(
         .and_then(|stages| stages.get(stage));
     match capture {
         None => unavailable(task_id, None, UnavailableReason::MissingSnapshot),
-        Some(_) if outcome.is_some() => unavailable(
-            task_id,
-            None,
-            UnavailableReason::UnverifiableSnapshotOutcome,
-        ),
         Some(capture) => ContextResponse::Snapshot {
             task_id: task_id.to_string(),
             anchor_id: None,
@@ -847,6 +851,87 @@ mod tests {
         }
     }
 
+    /// `terminal` never departs and `not_a_kind` is no kind at all: a row
+    /// claiming either was not written by this engine, whichever way the
+    /// lookup reaches it.
+    #[tokio::test]
+    async fn a_result_with_a_source_kind_that_cannot_depart_is_malformed_history() {
+        let pool = connect_in_memory().await.unwrap();
+        for (n, bad_kind) in ["terminal", "not_a_kind", ""].into_iter().enumerate() {
+            let task = new_task_in(&pool, &format!("kinds-{n}"), &[]).await;
+            put_state(&pool, &task, json!({})).await;
+            let (bad, good) = (format!("bad-{n}"), format!("good-{n}"));
+            let payload = json!({"source_stage": "s", "source_kind": bad_kind, "outcome": "x",
+                                 "destination_stage": "next", "capture_present": true,
+                                 "capture": "PRIVATE-CAPTURE", "previous_result_id": null});
+            put_raw_event(&pool, &task, &bad, "stage_result", None, payload, 1).await;
+            // A good result whose predecessor is the bad row.
+            put_result(&pool, &task, &good, Some(&bad), "g", "x", None, 0).await;
+            for request in [
+                // As an exact result.
+                by_id(&bad, None),
+                // As an explicit anchor.
+                by_name("s", None, Some(&bad)),
+                // As an encountered predecessor, for requests that must read it.
+                by_name("s", None, Some(&good)),
+                by_id(&bad, Some(&good)),
+            ] {
+                let answer = ask(&pool, &task, &request).await;
+                unavailable_with(&answer, UnavailableReason::MalformedHistory);
+                assert!(
+                    !format!("{answer:?}").contains("PRIVATE-CAPTURE"),
+                    "{bad_kind:?}: {request:?}"
+                );
+            }
+            // As the implicit anchor, through the current pointer.
+            point_at(&pool, &task, json!(bad)).await;
+            let answer = ask(&pool, &task, &by_name("s", None, None)).await;
+            unavailable_with(&answer, UnavailableReason::MalformedHistory);
+            assert!(!format!("{answer:?}").contains("PRIVATE-CAPTURE"));
+        }
+
+        // The five kinds a task can leave are each readable, in the same
+        // positions.
+        let task = new_task_in(&pool, "kinds-ok", &[]).await;
+        put_state(&pool, &task, json!({})).await;
+        let mut previous: Option<String> = None;
+        for kind in chocofactory_core::context::DEPARTING_KINDS {
+            let id = format!("ok-{kind}");
+            let payload = StageResultPayload::new(
+                kind,
+                kind,
+                "x",
+                "next",
+                Some(json!(kind)),
+                previous.clone(),
+            )
+            .to_value();
+            put_raw_event(&pool, &task, &id, "stage_result", None, payload, 0).await;
+            previous = Some(id);
+        }
+        point_at(&pool, &task, json!(previous.unwrap())).await;
+        for kind in chocofactory_core::context::DEPARTING_KINDS {
+            let (r, _) = result_of(&ask(&pool, &task, &by_name(kind, None, None)).await);
+            assert_eq!(r.source_kind, kind);
+            assert_eq!(r.capture, json!(kind));
+        }
+    }
+
+    /// A workflow may key an outcome with an empty string; the engine applies
+    /// it as written, so the result it wrote must read back.
+    #[tokio::test]
+    async fn a_result_with_an_empty_outcome_is_returned_not_malformed() {
+        let pool = connect_in_memory().await.unwrap();
+        let task = new_task(&pool).await;
+        put_state(&pool, &task, json!({})).await;
+        put_result(&pool, &task, "e1", None, "s", "", Some(json!("kept")), 0).await;
+        point_at(&pool, &task, json!("e1")).await;
+        let (r, _) = result_of(&ask(&pool, &task, &by_id("e1", None)).await);
+        assert_eq!((r.outcome.as_str(), r.capture), ("", json!("kept")));
+        let (r, _) = result_of(&ask(&pool, &task, &by_name("s", None, None)).await);
+        assert_eq!(r.result_id, "e1");
+    }
+
     #[tokio::test]
     async fn only_a_pointerless_task_falls_back_to_a_snapshot() {
         let pool = connect_in_memory().await.unwrap();
@@ -905,22 +990,15 @@ mod tests {
             // A snapshot can never confirm an applied outcome — not even by
             // an `outcome` key inside the captured value.
             let answer = ask(&pool, &task, &by_name("s", Some("approved"), None)).await;
-            let reason = if expected_present(label) {
-                UnavailableReason::UnverifiableSnapshotOutcome
-            } else {
-                UnavailableReason::MissingSnapshot
-            };
-            unavailable_with(&answer, reason);
+            // The filter decides before any snapshot is looked for: the
+            // answer is the same whether or not a capture exists.
+            unavailable_with(&answer, UnavailableReason::UnverifiableSnapshotOutcome);
             // And never for an exact ID or an anchored request.
             let answer = ask(&pool, &task, &by_id("s", None)).await;
             unavailable_with(&answer, UnavailableReason::MissingResult);
             let answer = ask(&pool, &task, &by_name("s", None, Some("s"))).await;
             unavailable_with(&answer, UnavailableReason::MissingAnchor);
         }
-    }
-
-    fn expected_present(label: &str) -> bool {
-        matches!(label, "object" | "null pointer" | "json null capture")
     }
 
     #[tokio::test]
@@ -1094,14 +1172,27 @@ mod tests {
 
     /// The database runs in SQLite's default rollback-journal mode, where a
     /// transaction that has read holds a shared lock and a writer cannot
-    /// commit until it ends. So a writer that tries a transition while the
-    /// lookup is held either waits for it (old generation, complete) or — if
-    /// the lookup held nothing between its statements — commits in the gap
-    /// and the lookup would mix generations. Only the first is allowed.
+    /// commit until it ends. The writer here has no busy timeout, so its one
+    /// attempt, made while the lookup is held between its statements,
+    /// returns at once either way: refused (the lookup holds a lock across
+    /// its statements, so every statement reads one generation) or
+    /// committed (the lookup held nothing between statements and would mix
+    /// generations). Only the refusal is allowed. After the lookup is
+    /// released the same write goes through.
     #[tokio::test]
     async fn a_read_sees_one_database_snapshot_while_a_writer_moves_on() {
         let (pool, path) = file_pool(4).await;
         let task = seeded_chain(&pool).await;
+        let writer_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .foreign_keys(true)
+                    .busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let request = by_name("s", Some("x"), None);
@@ -1109,49 +1200,38 @@ mod tests {
             reached_tx.send(()).unwrap();
             release_rx.await.unwrap();
         });
+        // One transition: a new result becomes current and the oldest link
+        // is pruned, in one transaction.
+        let transition = |pool: SqlitePool, task: String| async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query(
+                "UPDATE workflow_state
+                 SET payload = json_set(payload, '$.current_result_id', 'r4')
+                 WHERE task_id = ?",
+            )
+            .bind(&task)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM events WHERE id = 'r1'")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        };
         let controller = async {
             reached_rx.await.unwrap();
-            // The anchor has been read. A separate connection now tries a
-            // transition: a new result becomes current and the oldest link
-            // is pruned.
-            let writer = {
-                let (pool, task) = (pool.clone(), task.clone());
-                tokio::spawn(async move {
-                    put_result(
-                        &pool,
-                        &task,
-                        "r4",
-                        Some("r3"),
-                        "s",
-                        "x",
-                        Some(json!("new")),
-                        0,
-                    )
-                    .await;
-                    point_at(&pool, &task, json!("r4")).await;
-                    sqlx::query("DELETE FROM events WHERE id = 'r1'")
-                        .execute(&pool)
-                        .await
-                        .unwrap();
-                })
-            };
-            // Give a writer that is *not* blocked time to get in. Nothing is
-            // asserted on this wait: it only lets a lookup that held no lock
-            // be overtaken, which the assertions below then catch.
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-                while !writer.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
+            let attempt = transition(writer_pool.clone(), task.clone()).await;
             release_tx.send(()).unwrap();
-            writer.await.unwrap();
+            attempt
         };
-        let (answer, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (answer, attempt) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             tokio::join!(reading, controller)
         })
         .await
-        .expect("the held read and the writer both finish");
+        .expect("the held read and the writer attempt both finish");
+        assert!(
+            attempt.is_err(),
+            "the writer committed while the lookup was between its statements"
+        );
         // The whole answer comes from the generation the anchor was read in:
         // r3 current, r1 still present.
         let (r, anchor) = result_of(&answer.unwrap());
@@ -1159,7 +1239,20 @@ mod tests {
             (r.result_id.as_str(), anchor.as_deref()),
             ("r1", Some("r3"))
         );
-        // A fresh request sees the new generation: r4 is the latest match.
+        // Released, the same transition now commits and a fresh request sees
+        // the new generation: r4 is the latest match.
+        transition(writer_pool.clone(), task.clone()).await.unwrap();
+        put_result(
+            &pool,
+            &task,
+            "r4",
+            Some("r3"),
+            "s",
+            "x",
+            Some(json!("new")),
+            0,
+        )
+        .await;
         let (r, _) = result_of(&ask(&pool, &task, &request).await);
         assert_eq!(r.result_id, "r4");
         let _ = std::fs::remove_file(path);

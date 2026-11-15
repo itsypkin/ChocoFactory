@@ -3552,6 +3552,17 @@ stages:
         let (_, body) =
             context_get(&server, &legacy, "source=stage&stage=gate&outcome=approved").await;
         assert_eq!(body["reason"], "unverifiable_snapshot_outcome");
+        // Even with no capture for the stage at all, an outcome filter
+        // cannot be answered from a legacy task.
+        let (status, body) = context_get(
+            &server,
+            &legacy,
+            "source=stage&stage=never_captured&outcome=approved",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["provenance"], "unavailable");
+        assert_eq!(body["reason"], "unverifiable_snapshot_outcome");
         let (_, body) = context_get(&server, &legacy, "source=task").await;
         assert_eq!(body["task"]["input"], json!(""));
         assert_eq!(body["task"]["input_available"], json!(true));
@@ -3642,79 +3653,149 @@ stages:
         assert_eq!(context_get(&server, &legacy, "source=task").await.0, 404);
     }
 
-    /// A lookup is not a report: while a real turn is waiting for its agent,
-    /// reading the task's context writes nothing and completes nothing.
+    /// A lookup is not a report: while a single-shot turn that must report
+    /// is held before it reports, reading the task's context writes nothing
+    /// and completes nothing — and releasing the turn afterwards still
+    /// completes it, so the hold was real.
     #[tokio::test]
-    async fn a_context_read_does_not_complete_a_waiting_agent_turn() {
-        let server = TestServer::start().await;
-        server.seed_chat_workflow();
+    async fn a_context_read_leaves_a_held_report_turn_waiting_and_writes_nothing() {
+        use chocofactory_core::models::{EventType, SessionStatus};
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("choco-held-turn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = Dir(dir.clone());
+        let release = dir.join("release");
+        let script = dir.join("hold.json");
+        std::fs::write(
+            &script,
+            json!([
+                {"op": "read_turn"},
+                {"op": "wait_file", "path": release.display().to_string()},
+                {"op": "report", "outcome": "done", "summary": "all done"},
+                {"op": "result"},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let wrapper = dir.join("hold-claude");
+        crate::test_support::write_executable(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nFAKE_CLAUDE_SCRIPT='{}' exec '{}' \"$@\"\n",
+                script.display(),
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/fake_claude_script.py")
+                    .display(),
+            ),
+        );
+        let server = TestServer::start_with_adapter_binary(&wrapper.display().to_string()).await;
+        server.write_workflow(
+            "held",
+            r#"
+name: held
+roles:
+  coder:
+    cli: claude
+    model: sonnet
+stages:
+  coding:
+    kind: agent_turn
+    role: coder
+    on: { done: finished }
+  finished:
+    kind: terminal
+"#,
+        );
         let project = create_project(&server).await;
         let task: Value = server
             .post(
                 "/tasks",
-                json!({ "project_id": project, "workflow_def": "chat", "title": "t",
-                        "prompt": "hello", "config": { "cwd": "." } }),
+                json!({ "project_id": project, "workflow_def": "held", "title": "t",
+                        "prompt": "hello" }),
             )
             .await
             .json();
         let id = task["id"].as_str().unwrap().to_string();
-        // The standing fixture session is up and has taken its first turn.
-        crate::test_support::wait_until("the chat turn to start", || async {
+
+        // Wait for the fixture to be initialized and holding: its session
+        // exists, its init line was handled (which sets the adapter session
+        // id) and the prompt it reads was delivered.
+        crate::test_support::wait_until("the held turn to be initialized", || async {
             let sessions = crate::db::sessions::list_for_task(server.pool(), &id)
                 .await
                 .unwrap();
-            if sessions.is_empty() {
-                Err("no session".to_string())
-            } else {
-                Ok(())
+            let events = crate::db::events::list_for_task(server.pool(), &id)
+                .await
+                .unwrap();
+            let delivered = events
+                .iter()
+                .any(|e| e.event_type == EventType::HumanMessage);
+            match sessions.first() {
+                Some(s) if s.adapter_session_id.is_some() && delivered => Ok(()),
+                _ => Err(format!(
+                    "{} session(s), delivered={delivered}",
+                    sessions.len()
+                )),
             }
         })
         .await;
-        let before = crate::db::sessions::list_for_task(server.pool(), &id)
-            .await
-            .unwrap();
-        let events_before = crate::db::events::list_for_task(server.pool(), &id)
-            .await
-            .unwrap();
+        let before = crate::test_support::dump_tables(server.pool()).await;
+
         for query in [
             "source=task",
-            "source=stage&stage=chatting",
+            "source=stage&stage=coding",
+            "source=stage&stage=coding&outcome=done",
             "source=stage&result_id=x",
         ] {
-            context_get(&server, &id, query).await;
+            let (status, _) = context_get(&server, &id, query).await;
+            assert!(status == 200 || status == 404, "{query}: {status}");
         }
-        let after = crate::db::sessions::list_for_task(server.pool(), &id)
-            .await
-            .unwrap();
+
+        // Every table, events included, is exactly as it was: no completion,
+        // report or usage evidence, no session or task change.
         assert_eq!(
+            crate::test_support::dump_tables(server.pool()).await,
             before
-                .iter()
-                .map(|s| (&s.id, &s.status))
-                .collect::<Vec<_>>(),
-            after.iter().map(|s| (&s.id, &s.status)).collect::<Vec<_>>()
         );
-        let events_after = crate::db::events::list_for_task(server.pool(), &id)
+        let events = crate::db::events::list_for_task(server.pool(), &id)
             .await
             .unwrap();
-        // Only the standing session's own output may have appeared; nothing
-        // the lookup could have written (no completion, no stage result).
-        assert!(events_after.len() >= events_before.len());
         assert!(
-            events_after
+            events
                 .iter()
-                .all(|e| e.event_type != chocofactory_core::models::EventType::StageResult)
+                .all(|e| e.event_type != EventType::TurnCompleted
+                    && e.event_type != EventType::StageResult),
+            "{events:?}"
         );
-        assert!(
-            events_after
-                .iter()
-                .skip(events_before.len())
-                .all(|e| e.session_id.is_some()),
-            "the lookup wrote a task-level event"
-        );
-        let task = crate::db::tasks::get(server.pool(), &id)
+        let sessions = crate::db::sessions::list_for_task(server.pool(), &id)
+            .await
+            .unwrap();
+        assert!(sessions.iter().all(|s| s.status == SessionStatus::Active));
+        let state = crate::db::workflow_state::get(server.pool(), &id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(task.status, "open");
+        assert_eq!(state.current_stage, "coding");
+
+        // Released, the turn reports and the stage departs: the hold above
+        // was a real wait, and the report is what moved the task.
+        std::fs::write(&release, "go").unwrap();
+        crate::test_support::wait_until("the released turn to finish", || async {
+            let state = crate::db::workflow_state::get(server.pool(), &id)
+                .await
+                .unwrap()
+                .unwrap();
+            if state.current_stage == "finished" {
+                Ok(())
+            } else {
+                Err(state.current_stage)
+            }
+        })
+        .await;
     }
 }

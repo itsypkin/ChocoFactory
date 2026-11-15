@@ -4,8 +4,10 @@ use super::*;
 
 /// How much of a command's stdout/stderr goes onto the timeline. Small on
 /// purpose: this is a human-facing breadcrumb. Arbitrary command output is
-/// not kept; only a capture the stage's `capture:` accepted is, and only on
-/// the stage result of a departure that committed.
+/// not kept beyond it; only a capture the stage's `capture:` accepted is, and
+/// that lives in two places: the stage-result event of a departure that
+/// committed, and `workflow_state.payload.stages` (the latest value per
+/// stage).
 pub(super) const EVENT_OUTPUT_TAIL_BYTES: usize = 2048;
 
 /// Logs a poll attempt whose process group outlived its kill.

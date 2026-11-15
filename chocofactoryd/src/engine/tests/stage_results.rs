@@ -7,7 +7,7 @@
 use super::*;
 use crate::context::{self, ContextRequest, Lookup};
 use chocofactory_core::context::{AppliedStageResult, ContextResponse, UnavailableReason};
-use chocofactory_core::models::Event;
+use chocofactory_core::models::{Event, WorkflowState};
 
 /// A gate that can loop on itself, be redirected by its loop guard, and
 /// finish. Its replies carry marker lines.
@@ -39,10 +39,12 @@ struct GateFlow {
 }
 
 async fn gate_flow() -> GateFlow {
-    let dir = tempdir();
-    fs::write(dir.join("sr-gate.yaml"), GATE_FLOW).unwrap();
-    let def = Arc::new(WorkflowDefinition::parse(GATE_FLOW, &dir).unwrap());
-    let pool = connect_in_memory().await.unwrap();
+    gate_flow_from(GATE_FLOW, connect_in_memory().await.unwrap(), tempdir()).await
+}
+
+async fn gate_flow_from(yaml: &str, pool: SqlitePool, dir: TempDir) -> GateFlow {
+    fs::write(dir.join("sr-gate.yaml"), yaml).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
     let task_id = seed_task(&pool, &def.name).await;
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
     engine.start_task(&task_id, &def, None).await.unwrap();
@@ -553,71 +555,6 @@ async fn an_update_that_finds_no_row_rolls_the_result_back_too() {
     );
 }
 
-#[tokio::test]
-async fn a_departure_dropped_before_commit_leaves_nothing_and_after_commit_leaves_both() {
-    // File-backed, read back through a second connection after a reopen.
-    let dir = tempdir();
-    let path = dir.join("tasks.db");
-    let pool = crate::db::connect(&path).await.unwrap();
-    let def = shell_def("true", "");
-    let task_id = seed_task(&pool, &def.name).await;
-    let state = workflow_state::create(
-        &pool,
-        &task_id,
-        "run",
-        "shell",
-        json!({"stages": {"run": "old capture"}}),
-    )
-    .await
-    .unwrap();
-    let update = || workflow_state::WorkflowStateUpdate {
-        current_stage: "finished".to_string(),
-        stage_kind: "terminal".to_string(),
-        loop_counters: state.loop_counters.clone(),
-        payload: json!({"stages": {"run": "new capture"}}),
-        enters_stage: true,
-    };
-    let departure = || departure::Departure {
-        source_stage: "run",
-        source_kind: "shell",
-        outcome: "done",
-        capture: Some(json!("new capture")),
-        previous_result_id: None,
-    };
-
-    // Dropped after both writes, before the commit.
-    let mut tx = pool.begin().await.unwrap();
-    departure::write_departure(&mut tx, &task_id, departure(), update())
-        .await
-        .unwrap();
-    drop(tx);
-    pool.close().await;
-    let pool = crate::db::connect(&path).await.unwrap();
-    assert!(
-        stage_results(&pool, &task_id).await.is_empty(),
-        "no orphan event"
-    );
-    let after = state_of(&pool, &task_id).await;
-    assert_eq!(after.current_stage, "run");
-    assert_eq!(after.payload, state.payload);
-
-    // Committed: both halves are there after a reopen.
-    let mut tx = pool.begin().await.unwrap();
-    departure::write_departure(&mut tx, &task_id, departure(), update())
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    pool.close().await;
-    let pool = crate::db::connect(&path).await.unwrap();
-    let results = stage_results(&pool, &task_id).await;
-    assert_eq!(results.len(), 1);
-    let after = state_of(&pool, &task_id).await;
-    assert_eq!(after.current_stage, "finished");
-    assert_eq!(after.payload["current_result_id"], json!(results[0].id));
-    let answer = found(ask(&pool, &task_id, by_id(&results[0].id, None)).await);
-    assert_eq!(answer.capture, json!("new capture"));
-}
-
 /// An agent that drafts, a gate that sends changes back, and a final approval.
 const LOOP_FLOW: &str = r#"name: sr-loop
 roles:
@@ -856,50 +793,77 @@ async fn wait_for_results(pool: &SqlitePool, task_id: &str, n: usize) {
     .await;
 }
 
-/// A watched gate whose request-changes reply is far longer than the
-/// diagnostic tail the watcher keeps.
+/// A watched gate whose watcher itself prints a request-changes verdict far
+/// longer than the diagnostic tail. Nobody types a reply: the watcher's own
+/// matched output is what departs the gate.
 #[tokio::test]
-async fn a_watched_gate_records_the_whole_reply_not_the_diagnostic_tail() {
+async fn a_watched_gate_records_the_whole_watcher_output_not_the_diagnostic_tail() {
     let dir = tempdir();
-    let yaml = r#"name: sr-watched
+    let correction = private_correction();
+    fs::write(
+        dir.join("verdict.txt"),
+        format!("{correction}\nVERDICT: CHANGES_REQUESTED\n"),
+    )
+    .unwrap();
+    let yaml = format!(
+        r#"name: sr-watched
 stages:
   review:
     kind: human_gate
     capture: text
-    markers:
-      - line: /changes
-        then: changes_requested
     watch:
-      command: 'echo PENDING'
+      command: 'cat {}'
       interval: 1h
       timeout: 30m
       outcomes:
-        - match: 'NEVER_XYZ'
-          then: approved
-    on: { changes_requested: finished, approved: finished, timeout: finished }
+        - match: 'VERDICT: CHANGES_REQUESTED'
+          then: changes_requested
+    on: {{ changes_requested: finished, timeout: finished }}
   finished:
     kind: terminal
-"#;
-    fs::write(dir.join("sr-watched.yaml"), yaml).unwrap();
-    let def = Arc::new(WorkflowDefinition::parse(yaml, &dir).unwrap());
+"#,
+        dir.join("verdict.txt").display()
+    );
+    fs::write(dir.join("sr-watched.yaml"), &yaml).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
     let pool = connect_in_memory().await.unwrap();
     let task_id = seed_task(&pool, &def.name).await;
     let engine = engine_with_adapter_and_workflows_dir(pool.clone(), "unused", &dir);
     engine.start_task(&task_id, &def, None).await.unwrap();
-
-    let correction = private_correction();
-    engine
-        .send_message_or_resume(&task_id, &format!("{correction}\n/changes"))
-        .await
-        .unwrap();
     wait_until_stage(&pool, &task_id, "finished").await;
+
     let results = stage_results(&pool, &task_id).await;
-    assert_eq!(results.len(), 1);
+    assert_eq!(results.len(), 1, "{results:?}");
     let result = result_of(&results[0]);
+    assert_eq!(result.source_kind, "human_gate");
     assert_eq!(result.outcome, "changes_requested");
-    assert_eq!(result.capture, json!(correction));
-    assert!(correction.len() > 2048);
     assert_eq!(result.previous_result_id, None);
+    let full = format!("{correction}\nVERDICT: CHANGES_REQUESTED");
+    assert!(full.len() > 2048);
+    assert!(result.capture_present);
+    assert_eq!(result.capture, json!(full), "the whole watcher output");
+
+    // The diagnostic the watcher also wrote keeps only its 2,048-byte tail,
+    // so the result cannot have been built from it.
+    let tail = events::list_for_task(&pool, &task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.event_type == EventType::ShellOutput && e.payload["matched"].is_string())
+        .expect("the matched attempt is recorded as a diagnostic");
+    let tail = tail.payload["stdout_tail"].as_str().unwrap().to_string();
+    let kept = tail
+        .strip_prefix('…')
+        .expect("a cut-off tail starts with an ellipsis");
+    assert!(
+        kept.len() <= 2048 && kept.len() < full.len(),
+        "{}",
+        kept.len()
+    );
+    assert!(full.ends_with(kept), "the tail is the end of the output");
+    assert_ne!(json!(tail), result.capture);
+    let answer = found(ask(&pool, &task_id, by_id(&result.result_id, None)).await);
+    assert_eq!(answer.capture, json!(full));
 }
 
 #[tokio::test]
@@ -967,4 +931,206 @@ async fn a_destination_that_fails_to_start_keeps_the_one_committed_result_throug
         result_of(&after[2]).previous_result_id.as_deref(),
         Some(committed[1].id.as_str())
     );
+}
+
+/// The loop flow on a file-backed database whose connections can be held in
+/// the middle of a departure, parked at its review gate after one result.
+struct HeldLoop {
+    pool: SqlitePool,
+    barrier: crate::test_support::DepartureBarrier,
+    engine: Arc<WorkflowEngine>,
+    task_id: String,
+    _dir: TempDir,
+}
+
+async fn held_loop() -> HeldLoop {
+    let dir = tempdir();
+    fs::write(dir.join("turn.md"), "do the thing").unwrap();
+    fs::write(dir.join("sr-loop.yaml"), LOOP_FLOW).unwrap();
+    let def = Arc::new(WorkflowDefinition::parse(LOOP_FLOW, &dir).unwrap());
+    let (pool, barrier) = crate::test_support::DepartureBarrier::open(&dir.join("loop.db")).await;
+    let task_id = seed_task(&pool, &def.name).await;
+    let binary = reply_binary(&dir, "first draft");
+    let engine = engine_with_adapter_and_workflows_dir(pool.clone(), &binary, &dir);
+    engine.start_task(&task_id, &def, None).await.unwrap();
+    wait_for_results(&pool, &task_id, 1).await;
+    wait_until_stage(&pool, &task_id, "review").await;
+    HeldLoop {
+        pool,
+        barrier,
+        engine,
+        task_id,
+        _dir: dir,
+    }
+}
+
+impl HeldLoop {
+    /// Everything a departure could have changed, as another process sees it.
+    async fn seen_by_another_process(&self) -> (WorkflowState, Vec<Event>, usize) {
+        let observer = self.barrier.observer().await;
+        let seen = (
+            state_of(&observer, &self.task_id).await,
+            stage_results(&observer, &self.task_id).await,
+            runs_for_stage(&observer, &self.task_id, "draft")
+                .await
+                .len(),
+        );
+        observer.close().await;
+        seen
+    }
+}
+
+#[tokio::test]
+async fn a_departure_whose_commit_fails_leaves_the_old_state_and_starts_nothing() {
+    let f = held_loop().await;
+    let before = f.seen_by_another_process().await;
+    assert_eq!(before.1.len(), 1);
+    assert_eq!(before.0.current_stage, "review");
+
+    crate::test_support::fail_commit_of_stage_results(&f.pool).await;
+    let err = f
+        .engine
+        .send_message_or_resume(&f.task_id, "please redo\n/changes")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SendMessageOrResumeError::Advance(EngineError::Db(_))),
+        "{err:?}"
+    );
+
+    // Both writes succeeded inside the transaction; the failed COMMIT took
+    // both back, and the draft stage was never started.
+    assert_eq!(
+        f.seen_by_another_process().await,
+        before,
+        "old state and pointer, no orphan result, no destination session"
+    );
+
+    // The failure marked the task stuck, as any non-benign failure of a
+    // reply does. Once the fault is gone a retry re-enters the persisted
+    // gate without recording anything, and the same reply then departs
+    // exactly once, linked to the earlier result.
+    crate::test_support::stop_failing_commits(&f.pool).await;
+    f.engine
+        .retry_task(&f.task_id, RetryMode::Auto)
+        .await
+        .unwrap();
+    assert_eq!(f.seen_by_another_process().await, before);
+    f.engine
+        .send_message_or_resume(&f.task_id, "please redo\n/changes")
+        .await
+        .unwrap();
+    wait_for_results(&f.pool, &f.task_id, 3).await;
+    let results = stage_results(&f.pool, &f.task_id).await;
+    assert_eq!(results[1].payload["source_stage"], "review");
+    assert_eq!(
+        results[1].payload["previous_result_id"],
+        json!(before.1[0].id)
+    );
+}
+
+#[tokio::test]
+async fn a_departure_cancelled_inside_its_transaction_leaves_nothing_and_can_be_redone() {
+    let f = held_loop().await;
+    let before = f.seen_by_another_process().await;
+
+    // Hold the departure's INSERT inside its transaction: the result row
+    // exists there, the state update and the COMMIT have not happened.
+    f.barrier.arm(&f.pool).await;
+    let reply = {
+        let (engine, task_id) = (f.engine.clone(), f.task_id.clone());
+        tokio::spawn(async move {
+            engine
+                .send_message_or_resume(&task_id, "please redo\n/changes")
+                .await
+        })
+    };
+    f.barrier.reached().await;
+    reply.abort();
+    assert!(reply.await.unwrap_err().is_cancelled());
+    f.barrier.release(&f.pool).await;
+
+    assert_eq!(
+        f.seen_by_another_process().await,
+        before,
+        "a dropped departure leaves no orphan result and no move"
+    );
+
+    // The task lock and the connection are free again: the reply goes
+    // through and records exactly one result.
+    f.engine
+        .send_message_or_resume(&f.task_id, "please redo\n/changes")
+        .await
+        .unwrap();
+    wait_for_results(&f.pool, &f.task_id, 3).await;
+    let results = stage_results(&f.pool, &f.task_id).await;
+    assert_eq!(
+        results
+            .iter()
+            .filter(|e| e.payload["source_stage"] == "review")
+            .count(),
+        1
+    );
+}
+
+/// A task that reaches a terminal stage keeps its one result even when
+/// closing the task afterwards fails, and neither a retry nor a restart-style
+/// re-entry adds the departure again.
+#[tokio::test]
+async fn a_committed_departure_into_a_terminal_stage_is_not_replayed_by_recovery() {
+    let f = gate_flow().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE TRIGGER no_closing BEFORE UPDATE ON tasks
+         WHEN NEW.status = 'closed'
+         BEGIN SELECT RAISE(ABORT, 'cannot close'); END",
+    ))
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.reply("fine\n/approve").await.unwrap();
+    assert_eq!(f.state().await.current_stage, "finished");
+    let results = f.results().await;
+    assert_eq!(results.len(), 1);
+    let pointer = f.state().await.payload["current_result_id"].clone();
+    assert_eq!(pointer, json!(results[0].id));
+
+    // Recovery in whatever way it is allowed: retry, with and without the
+    // fault.
+    let _ = f.engine.retry_task(&f.task_id, RetryMode::Auto).await;
+    sqlx::query("DROP TRIGGER no_closing")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let _ = f.engine.retry_task(&f.task_id, RetryMode::Auto).await;
+    assert_eq!(f.results().await, results, "the same single result");
+    assert_eq!(f.state().await.payload["current_result_id"], pointer);
+    assert_eq!(f.state().await.current_stage, "finished");
+}
+
+/// A workflow may key an outcome with an empty string. The engine applies it
+/// as written, so the result it records must be readable straight away.
+#[tokio::test]
+async fn an_outcome_keyed_by_an_empty_string_is_recorded_and_read_back() {
+    let yaml = r#"name: sr-gate
+stages:
+  gate:
+    kind: human_gate
+    capture: text
+    markers:
+      - line: /go
+        then: ""
+    on: { "": finished }
+  finished:
+    kind: terminal
+"#;
+    let f = gate_flow_from(yaml, connect_in_memory().await.unwrap(), tempdir()).await;
+    f.reply("proceed with A\n/go").await.unwrap();
+    assert_eq!(f.state().await.current_stage, "finished");
+    let results = f.results().await;
+    assert_eq!(results.len(), 1);
+    let answer = found(ask(&f.pool, &f.task_id, by_id(&results[0].id, None)).await);
+    assert_eq!(answer.outcome, "");
+    assert_eq!(answer.capture, json!("proceed with A"));
+    let by_stage = found(ask(&f.pool, &f.task_id, by_name("gate", None, None)).await);
+    assert_eq!(by_stage.result_id, results[0].id);
 }

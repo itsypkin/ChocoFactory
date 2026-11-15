@@ -25,6 +25,10 @@ use crate::models::{Event, EventType};
 /// `workflow_state.payload`. Engine-owned: never a workflow capture key.
 pub const CURRENT_RESULT_ID_KEY: &str = "current_result_id";
 
+/// The stage kinds a task can leave, spelled as workflow YAML spells them.
+/// `terminal` is a destination only and never departs.
+pub const DEPARTING_KINDS: [&str; 5] = ["agent_turn", "shell", "poll", "human_gate", "parallel"];
+
 /// A stored stage result, or the pointer to one, has a shape this version
 /// does not write.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,12 +144,17 @@ impl AppliedStageResult {
         }
         let stored: StageResultPayload = serde_json::from_value(event.payload.clone())
             .map_err(|err| bad(&format!("unreadable payload: {err}")))?;
-        if stored.source_stage.is_empty()
-            || stored.source_kind.is_empty()
-            || stored.outcome.is_empty()
-            || stored.destination_stage.is_empty()
-        {
-            return Err(bad("a stage, kind or outcome is empty"));
+        // The workflow's own outcome keys are applied as written, so even an
+        // empty one is a legitimate outcome; stage names are validated
+        // nonempty when the workflow is loaded.
+        if stored.source_stage.is_empty() || stored.destination_stage.is_empty() {
+            return Err(bad("a stage name is empty"));
+        }
+        if !DEPARTING_KINDS.contains(&stored.source_kind.as_str()) {
+            return Err(bad(&format!(
+                "source_kind {:?} is not a stage kind that departs",
+                stored.source_kind
+            )));
         }
         if stored.previous_result_id.as_deref() == Some("") {
             return Err(bad("previous_result_id is empty"));
@@ -321,6 +330,26 @@ mod tests {
             },
             {
                 let mut v = good.clone();
+                v["destination_stage"] = json!("");
+                v
+            },
+            {
+                let mut v = good.clone();
+                v["source_kind"] = json!("terminal");
+                v
+            },
+            {
+                let mut v = good.clone();
+                v["source_kind"] = json!("not_a_kind");
+                v
+            },
+            {
+                let mut v = good.clone();
+                v["source_kind"] = json!("");
+                v
+            },
+            {
+                let mut v = good.clone();
                 v["capture_present"] = json!("yes");
                 v
             },
@@ -335,6 +364,21 @@ mod tests {
                 "{broken} should be malformed"
             );
         }
+    }
+
+    #[test]
+    fn every_departing_kind_and_an_empty_outcome_are_readable() {
+        for kind in DEPARTING_KINDS {
+            let stored = StageResultPayload::new("a", kind, "ok", "b", None, None);
+            let result = AppliedStageResult::from_event(&event(stored.to_value()))
+                .unwrap_or_else(|err| panic!("{kind}: {err}"));
+            assert_eq!(result.source_kind, kind);
+        }
+        // A workflow may key an outcome with an empty string; the engine
+        // applies it as written, so the reader must return it.
+        let stored = StageResultPayload::new("a", "human_gate", "", "b", None, None);
+        let result = AppliedStageResult::from_event(&event(stored.to_value())).unwrap();
+        assert_eq!(result.outcome, "");
     }
 
     #[test]

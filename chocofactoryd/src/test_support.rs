@@ -49,6 +49,139 @@ pub(crate) async fn dump_tables(pool: &sqlx::SqlitePool) -> Vec<(String, String)
     dump
 }
 
+/// A file-backed database whose connections can be held in the middle of a
+/// stage departure, for tests that cancel or fail the production transaction
+/// at a known point.
+///
+/// Every connection of the pool has a Rust collation, `choco_barrier`, that
+/// blocks its SQLite worker thread. While armed, a trigger on the stage
+/// result's INSERT compares two values with that collation, so the
+/// departure's INSERT stops *inside the transaction*, after the result row
+/// exists and before the state update and the COMMIT, until the test lets it
+/// go. This is test-only: nothing in production code knows about it.
+pub(crate) struct DepartureBarrier {
+    path: std::path::PathBuf,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reached: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl DepartureBarrier {
+    /// Creates and migrates the database file at `path`, then opens a pool
+    /// with the barrier collation on every connection.
+    pub(crate) async fn open(path: &std::path::Path) -> (sqlx::SqlitePool, Self) {
+        crate::db::connect(path).await.unwrap().close().await;
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reached_tx = std::sync::Mutex::new(Some(reached_tx));
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let armed_in_collation = armed.clone();
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .foreign_keys(true)
+            .collation("choco_barrier", move |_, _| {
+                // Only the first comparison after arming holds.
+                if armed_in_collation.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    if let Some(tx) = reached_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    // Returns when the test releases, or drops its sender.
+                    let _ = release_rx.lock().unwrap().recv();
+                }
+                std::cmp::Ordering::Equal
+            });
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let barrier = Self {
+            path: path.to_path_buf(),
+            armed,
+            reached: tokio::sync::Mutex::new(Some(reached_rx)),
+            release: release_tx,
+        };
+        (pool, barrier)
+    }
+
+    /// The next stage-result INSERT stops until [`Self::release`].
+    pub(crate) async fn arm(&self, pool: &sqlx::SqlitePool) {
+        sqlx::query(sqlx::AssertSqlSafe(
+            "CREATE TRIGGER hold_after_result AFTER INSERT ON events
+             WHEN NEW.event_type = 'stage_result'
+             BEGIN SELECT 1 WHERE NEW.id = NEW.task_id COLLATE choco_barrier; END",
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Resolves once an INSERT is held inside its transaction.
+    pub(crate) async fn reached(&self) {
+        let rx = self
+            .reached
+            .lock()
+            .await
+            .take()
+            .expect("the barrier was already reached once");
+        tokio::time::timeout(Duration::from_secs(60), rx)
+            .await
+            .expect("no departure reached the barrier")
+            .expect("the barrier's sender was dropped");
+    }
+
+    /// Lets the held INSERT go on, and removes the trigger.
+    pub(crate) async fn release(&self, pool: &sqlx::SqlitePool) {
+        self.release.send(()).unwrap();
+        sqlx::query("DROP TRIGGER hold_after_result")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A fresh pool on the same file with plain options, as a second
+    /// process (or a restarted daemon) would open it. It sees only what was
+    /// committed.
+    pub(crate) async fn observer(&self) -> sqlx::SqlitePool {
+        crate::db::connect(&self.path).await.unwrap()
+    }
+}
+
+/// Makes the next `COMMIT` that includes a stage result fail, while every
+/// statement before it succeeds: the result's INSERT leaves a row that
+/// breaks a deferred foreign key, which SQLite only checks at COMMIT.
+pub(crate) async fn fail_commit_of_stage_results(pool: &sqlx::SqlitePool) {
+    for statement in [
+        "CREATE TABLE commit_probe_parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE commit_probe_child (
+             parent INTEGER REFERENCES commit_probe_parent(id) DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE TRIGGER fail_at_commit AFTER INSERT ON events
+         WHEN NEW.event_type = 'stage_result'
+         BEGIN INSERT INTO commit_probe_child (parent) VALUES (1); END",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+/// Undoes [`fail_commit_of_stage_results`].
+pub(crate) async fn stop_failing_commits(pool: &sqlx::SqlitePool) {
+    for statement in [
+        "DROP TRIGGER fail_at_commit",
+        "DROP TABLE commit_probe_child",
+        "DROP TABLE commit_probe_parent",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
 /// For the few tests where a production timer must fire once and then must
 /// *not* fire again before the fixture responds. Unlike `LOAD_ALLOWANCE`
 /// this is a real upper bound on how slow the fixture may be, so it can't

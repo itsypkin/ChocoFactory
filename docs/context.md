@@ -62,8 +62,11 @@ A query string has no JSON types: `stage=null` and `stage=7` are just the names
 
 ## Responses
 
-Every `200`/`404` body has `provenance` (`task`, `stage_result`, `snapshot` or
-`unavailable`), `task_id` and `anchor_id` (the anchor used, or `null`).
+Every answer about a task that exists — each `200`, and the `404` for an ID
+that cannot be read — has `provenance` (`task`, `stage_result`, `snapshot` or
+`unavailable`), `task_id` and `anchor_id` (the anchor used, or `null`). The one
+exception is a task that does not exist: that `404` is the API's usual
+`{"error": "…"}` body, with none of these fields.
 
 ```
 $ curl -s "$DAEMON/tasks/$ID/context?source=task"
@@ -108,8 +111,8 @@ Anything else that cannot be answered is
 | `history_gap` | a link needed to answer cannot be read (pruned, or not this task's) |
 | `not_found_in_recorded_history` | the chain ends without a match. This does not say nothing happened earlier |
 | `not_at_or_before_anchor` | the whole chain from the anchor was read and does not contain that result |
-| `missing_snapshot` | pre-results task with no capture for the stage |
-| `unverifiable_snapshot_outcome` | pre-results task asked for an `outcome`: a stored capture cannot say which outcome was applied |
+| `missing_snapshot` | pre-results task with no capture for the stage (and no `outcome` asked for) |
+| `unverifiable_snapshot_outcome` | pre-results task asked for an `outcome`: a stored capture cannot say which outcome was applied, so this is answered whether or not a capture exists |
 | `malformed_history` | a pointer, result or link has an unexpected shape, or the chain loops |
 
 An ID that is missing, pruned, another task's, a session's, or of another event

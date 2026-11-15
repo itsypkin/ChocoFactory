@@ -3251,6 +3251,37 @@ mod tests {
     }
 
     #[test]
+    fn a_stage_result_with_a_missing_or_non_string_field_shows_a_placeholder_not_the_capture() {
+        let private = "SECRET-CORRECTION-TEXT. Change nothing else.";
+        let full = json!({
+            "source_stage": "review", "source_kind": "human_gate",
+            "outcome": "approved", "destination_stage": "finished",
+            "capture_present": true, "capture": private,
+            "previous_result_id": null,
+        });
+        // Each of the three shown fields, missing, null and of the wrong
+        // type, in turn; the other two stay as stored.
+        for (key, shown) in [
+            ("source_stage", "? → finished  (applied approved)"),
+            ("destination_stage", "review → ?  (applied approved)"),
+            ("outcome", "review → finished  (applied ?)"),
+        ] {
+            for broken in [None, Some(json!(null)), Some(json!(7)), Some(json!(["x"]))] {
+                let mut payload = full.clone();
+                match &broken {
+                    None => {
+                        payload.as_object_mut().unwrap().remove(key);
+                    }
+                    Some(value) => payload[key] = value.clone(),
+                }
+                let summary = event_summary(&event(EventType::StageResult, payload));
+                assert_eq!(summary, shown, "{key} = {broken:?}");
+                assert!(!summary.contains("SECRET-CORRECTION-TEXT"));
+            }
+        }
+    }
+
+    #[test]
     fn the_pause_events_read_as_one_line_each() {
         let ev = |t, p| event(t, p);
         assert_eq!(

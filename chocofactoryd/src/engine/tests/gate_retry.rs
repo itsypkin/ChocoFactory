@@ -160,8 +160,18 @@ async fn wait_runner_slots(engine: &WorkflowEngine, task_id: &str, slots: usize)
 
 impl Parked {
     async fn reach(source: Source, worktree: bool) -> Parked {
-        let pool = connect_in_memory().await.unwrap();
-        let dir = tempdir();
+        Self::reach_on(
+            connect_in_memory().await.unwrap(),
+            tempdir(),
+            source,
+            worktree,
+        )
+        .await
+    }
+
+    /// [`Self::reach`] on a database the caller opened (which must live in,
+    /// or at least outlast, `dir`).
+    async fn reach_on(pool: SqlitePool, dir: TempDir, source: Source, worktree: bool) -> Parked {
         let yaml = flow_yaml(&dir, source, worktree);
         fs::write(dir.join("gr.yaml"), &yaml).unwrap();
         let def = Arc::new(WorkflowDefinition::parse(&yaml, &dir).unwrap());
@@ -756,4 +766,118 @@ async fn status_and_marker_refusal_describe_the_original_watcher_at_a_watched_ga
     );
     assert!(!err.to_string().contains("choco task retry"));
     p.engine.abort_detached_runners(&p.task_id).await;
+}
+
+/// The same parked gate on a file-backed database whose connections can be
+/// held inside the rewind's transaction.
+async fn reach_held(source: Source) -> (Parked, crate::test_support::DepartureBarrier) {
+    let dir = tempdir();
+    let (pool, barrier) = crate::test_support::DepartureBarrier::open(&dir.join("gr.db")).await;
+    (Parked::reach_on(pool, dir, source, false).await, barrier)
+}
+
+/// What a second process sees of the parked task: its place, its results
+/// and, as the OS reports it, whether the gate's own command still runs.
+async fn seen_by_another_process(
+    p: &Parked,
+    barrier: &crate::test_support::DepartureBarrier,
+) -> (
+    chocofactory_core::models::WorkflowState,
+    Vec<chocofactory_core::models::Event>,
+) {
+    let observer = barrier.observer().await;
+    let seen = (
+        state_of(&observer, &p.task_id).await,
+        stage_results(&observer, &p.task_id).await,
+    );
+    observer.close().await;
+    seen
+}
+
+/// A COMMIT that fails after the result and the move were both written
+/// leaves neither, and the gate's watcher keeps running (it is only stopped
+/// after a commit that succeeded).
+#[tokio::test]
+async fn a_rewind_whose_commit_fails_leaves_the_gate_and_its_watcher_running() {
+    for source in [Source::Poll, Source::ReviewGate] {
+        let (p, barrier) = reach_held(source).await;
+        let before = seen_by_another_process(&p, &barrier).await;
+        crate::test_support::fail_commit_of_stage_results(&p.pool).await;
+
+        let err = p
+            .engine
+            .retry_task(&p.task_id, RetryMode::Auto)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RetryTaskError::Db(_)), "{source:?}: {err:?}");
+
+        assert_eq!(
+            seen_by_another_process(&p, &barrier).await,
+            before,
+            "{source:?}: old gate state and pointer, no orphan result"
+        );
+        assert_eq!(
+            live_process_group(p.gate_pid),
+            Some(p.gate_pid),
+            "{source:?}"
+        );
+        assert_eq!(runner_slots(&p.engine, &p.task_id), 1, "{source:?}");
+
+        // Without the fault the next retry commits one linked result.
+        crate::test_support::stop_failing_commits(&p.pool).await;
+        fs::remove_file(p.dir.join("src_go")).unwrap();
+        p.engine
+            .retry_task(&p.task_id, RetryMode::Auto)
+            .await
+            .unwrap();
+        let (_, results) = seen_by_another_process(&p, &barrier).await;
+        assert_eq!(results.len(), 2, "{source:?}");
+        wait_process_gone(p.gate_pid, "the old gate command").await;
+        p.engine.abort_detached_runners(&p.task_id).await;
+    }
+}
+
+/// A retry dropped while its rewind is inside its transaction (result
+/// written, move and COMMIT not yet) leaves the gate, its pointer and its
+/// watcher as they were.
+#[tokio::test]
+async fn a_rewind_cancelled_inside_its_transaction_leaves_the_gate_and_its_watcher_running() {
+    for source in [Source::Poll, Source::ReviewGate] {
+        let (p, barrier) = reach_held(source).await;
+        let before = seen_by_another_process(&p, &barrier).await;
+
+        barrier.arm(&p.pool).await;
+        let retry = {
+            let (engine, task_id) = (p.engine.clone(), p.task_id.clone());
+            tokio::spawn(async move { engine.retry_task(&task_id, RetryMode::Auto).await })
+        };
+        barrier.reached().await;
+        retry.abort();
+        assert!(retry.await.unwrap_err().is_cancelled(), "{source:?}");
+        barrier.release(&p.pool).await;
+
+        assert_eq!(
+            seen_by_another_process(&p, &barrier).await,
+            before,
+            "{source:?}: a dropped rewind leaves no result and no move"
+        );
+        assert_eq!(
+            live_process_group(p.gate_pid),
+            Some(p.gate_pid),
+            "{source:?}"
+        );
+        assert_eq!(runner_slots(&p.engine, &p.task_id), 1, "{source:?}");
+
+        // The task lock was released with the dropped retry: the next one
+        // goes through and records one result.
+        fs::remove_file(p.dir.join("src_go")).unwrap();
+        p.engine
+            .retry_task(&p.task_id, RetryMode::Auto)
+            .await
+            .unwrap();
+        let (_, results) = seen_by_another_process(&p, &barrier).await;
+        assert_eq!(results.len(), 2, "{source:?}");
+        wait_process_gone(p.gate_pid, "the old gate command").await;
+        p.engine.abort_detached_runners(&p.task_id).await;
+    }
 }
