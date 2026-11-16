@@ -56,6 +56,7 @@ use crate::workflow_def::{
 };
 use crate::worktree::{self, WorktreeError};
 
+mod departure;
 mod gate;
 mod parallel;
 mod pause;
@@ -239,6 +240,10 @@ pub enum EngineError {
         stage: String,
     },
     NoWorkflowState,
+    /// `workflow_state.payload.current_result_id` is present but is not a
+    /// result ID, so the task cannot leave its stage without cutting the
+    /// chain of recorded results. Nothing was written.
+    MalformedResultPointer(String),
     NoSuchTask,
     UnknownStage(String),
     UnknownOutcome {
@@ -331,6 +336,11 @@ impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EngineError::NoWorkflowState => write!(f, "task has no workflow_state row"),
+            EngineError::MalformedResultPointer(why) => write!(
+                f,
+                "the task's recorded stage results are damaged ({why}), so it cannot leave its \
+                 stage"
+            ),
             EngineError::NoSuchTask => write!(f, "no such task"),
             EngineError::GroupStateMissing { stage } => write!(
                 f,
@@ -2765,7 +2775,8 @@ impl WorkflowEngine {
 
     /// Watches again after a watcher's timeout (#179): moves the task back
     /// to the watcher stage `timed_out.from` with a fresh window, in one
-    /// state write, stops the gate's own watcher if it has one, and re-enters
+    /// transaction that also records the gate's departure as a stage result,
+    /// stops the gate's own watcher if it has one, and re-enters
     /// the original stage. Runs under the per-task lock
     /// `retry_task` holds, on the state it read under that lock. The task
     /// stays `open`.
@@ -2782,25 +2793,48 @@ impl WorkflowEngine {
             .stages
             .get(&from)
             .ok_or_else(|| RetryTaskError::UnknownStage(from.clone()))?;
+        let gate_kind = definition
+            .stages
+            .get(gate)
+            .ok_or_else(|| RetryTaskError::UnknownStage(gate.to_string()))?
+            .kind
+            .name();
+        let previous_result_id =
+            departure::previous_result_id(state).map_err(RetryTaskError::Enter)?;
         let mut payload = state.payload.clone();
         // The record must stay true: the task is no longer at the gate it
         // arrived at by timing out.
         set_arrival(&mut payload, gate, "retry");
         set_poll_window(&mut payload, definition, &from, self.now())
             .map_err(RetryTaskError::Enter)?;
-        let updated = workflow_state::update(
-            &self.pool,
-            task_id,
-            workflow_state::WorkflowStateUpdate {
-                current_stage: from.clone(),
-                stage_kind: from_def.kind.name().to_string(),
-                loop_counters: state.loop_counters.clone(),
-                payload,
-                enters_stage: true,
-            },
-        )
-        .await?
-        .ok_or(RetryTaskError::NoWorkflowState)?;
+        // Leaving the parking gate for the watcher is a departure like any
+        // other (outcome `retry`, no capture): its result and the state
+        // write commit together. A failure leaves the gate and its running
+        // watcher exactly as they were.
+        let updated = self
+            .commit_stage_departure(
+                task_id,
+                departure::Departure {
+                    source_stage: gate,
+                    source_kind: gate_kind,
+                    outcome: "retry",
+                    capture: None,
+                    previous_result_id,
+                },
+                workflow_state::WorkflowStateUpdate {
+                    current_stage: from.clone(),
+                    stage_kind: from_def.kind.name().to_string(),
+                    loop_counters: state.loop_counters.clone(),
+                    payload,
+                    enters_stage: true,
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                EngineError::NoWorkflowState => RetryTaskError::NoWorkflowState,
+                EngineError::Db(err) => RetryTaskError::Db(err),
+                other => RetryTaskError::Enter(other),
+            })?;
         // The state is committed, so the gate is behind us: stop and await
         // its watcher (when it has one) before the original watcher starts,
         // still under the task lock. Stopping it any earlier would leave an
@@ -3302,7 +3336,8 @@ impl WorkflowEngine {
     /// per-task lock — and a transition interleaving between that read and
     /// write would silently lose either the capture or the new
     /// `current_stage`/`loop_counters`. Merging here keeps all three fields
-    /// in the single UPDATE already made under the lock.
+    /// in the single UPDATE already made under the lock — which commits in
+    /// one transaction with the stage result recording the departure.
     ///
     /// `expected_stage` makes the detached runner's assumption explicit
     /// rather than merely true-by-construction. No path today can move a
@@ -3327,7 +3362,8 @@ impl WorkflowEngine {
         let lock = self.lock_for_task(task_id).await;
         let _guard = lock.lock().await;
 
-        // Set once `workflow_state::update` has committed the transition.
+        // Set once the departure's transaction (stage result plus state) has
+        // committed the transition.
         let committed = std::sync::atomic::AtomicBool::new(false);
 
         // The stage entered on success, so the caller below can tell
@@ -3370,31 +3406,54 @@ impl WorkflowEngine {
                 });
             }
 
+            // What the task is leaving, taken before `compute_transition`
+            // consumes the state and merges the capture: the result pointer
+            // it will chain to, and the capture exactly as supplied.
+            let previous_result_id = departure::previous_result_id(&state)?;
+            let supplied_capture = capture.clone();
             let (next_stage, transition) =
                 self.compute_transition(definition, state, outcome, capture)?;
+            let source_kind = definition
+                .stages
+                .get(&from_stage)
+                .ok_or_else(|| EngineError::UnknownStage(from_stage.clone()))?
+                .kind
+                .name();
 
             // The reply path stops the gate's watcher here: under the
             // task lock, after every check that can refuse the
             // transition, and immediately before the write. Nothing
-            // fallible may sit between this and `workflow_state::update`
-            // — a refusal after the abort would leave the task open at
-            // the gate with nothing watching it. If the update itself
-            // fails, the caller marks the task stuck at the gate and
-            // `retry` starts a new watcher.
+            // fallible may sit between this and the departure's
+            // transaction — a refusal after the abort would leave the task
+            // open at the gate with nothing watching it. If the
+            // transaction itself fails, the caller marks the task stuck at
+            // the gate and `retry` starts a new watcher.
             if stop_watcher {
                 self.abort_detached_runners(task_id).await;
             }
 
             // The returned row is the authority on what was actually
             // committed, and it's what the next stage renders its
-            // templates against (P2-3). A `None` here means the row
-            // vanished between this function's read and its write —
-            // impossible while the lock is held, but discarding the
-            // `Option` would turn that broken invariant into a task that
-            // silently transitions against state nothing persisted.
-            let updated = workflow_state::update(&self.pool, task_id, transition)
-                .await?
-                .ok_or(EngineError::NoWorkflowState)?;
+            // templates against (P2-3). It is written together with the
+            // stage result recording this departure: a `None` from the
+            // update (the row vanished between this function's read and
+            // its write — impossible while the lock is held) fails the
+            // whole transaction, so the task never transitions against
+            // state nothing persisted, nor records a result for a move
+            // that did not happen.
+            let updated = self
+                .commit_stage_departure(
+                    task_id,
+                    departure::Departure {
+                        source_stage: &from_stage,
+                        source_kind,
+                        outcome,
+                        capture: supplied_capture,
+                        previous_result_id,
+                    },
+                    transition,
+                )
+                .await?;
             committed.store(true, std::sync::atomic::Ordering::Relaxed);
 
             // `enter_stage` records the transition itself (X-3), so the
@@ -3431,7 +3490,7 @@ impl WorkflowEngine {
         }
         // Same rationale as `start_task`'s eviction above: every error
         // branch here either precedes any write (nothing to protect) or
-        // follows `workflow_state::update` already having durably
+        // follows the departure's transaction already having durably
         // committed (a fresh lock next time reads that same state
         // correctly), so it's safe to evict on failure; likewise once the
         // stage just entered is terminal, no future call for this task
@@ -3611,6 +3670,11 @@ impl WorkflowEngine {
         // through this function; deliberately not done here (X-3), since
         // `current_stage` — the value the engine actually reads back — is
         // the one that must be durable, and the failure is logged loudly.
+        //
+        // This entry is a diagnostic, not the record of what was applied.
+        // That is the `stage_result` event a departure commits *with* its
+        // state write (`commit_stage_departure`), linked by
+        // `previous_result_id`; the trail here is ordered by time only.
         match events::append_stage_transition(
             &self.pool,
             task_id,

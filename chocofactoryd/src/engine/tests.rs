@@ -14,6 +14,7 @@ mod parallel;
 mod parked_gates;
 mod pause;
 mod queue;
+mod stage_results;
 
 #[test]
 fn set_arrival_replaces_a_non_object_payload() {
@@ -1886,6 +1887,34 @@ async fn payload_of(pool: &SqlitePool, task_id: &str) -> Value {
         .payload
 }
 
+/// Every stage result of the task, in the order they were recorded.
+async fn stage_results(pool: &SqlitePool, task_id: &str) -> Vec<chocofactory_core::models::Event> {
+    events::list_for_task(pool, task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == EventType::StageResult)
+        .collect()
+}
+
+/// `payload` without its engine-owned `current_result_id`, after checking
+/// that the task has exactly one stage result and the pointer names it.
+async fn without_only_result_pointer(
+    pool: &SqlitePool,
+    task_id: &str,
+    mut payload: Value,
+) -> Value {
+    let results = stage_results(pool, task_id).await;
+    assert_eq!(results.len(), 1, "expected one stage result: {results:?}");
+    let pointer = payload
+        .as_object_mut()
+        .unwrap()
+        .remove("current_result_id")
+        .expect("a departure records current_result_id");
+    assert_eq!(pointer, json!(results[0].id));
+    payload
+}
+
 /// `payload` without its engine-owned `left_at`, after checking that
 /// `left_at` holds exactly `stage`, as a whole-second `…Z` time (#260).
 fn without_left_at(mut payload: Value, stage: &str) -> Value {
@@ -2080,8 +2109,12 @@ async fn a_stage_without_capture_writes_no_payload() {
     // `task` and `arrival` are the only payload here — the stage
     // itself writes nothing, since it declares no `capture:` (#112:
     // `arrival` now always accompanies the transition into `finished`).
+    let payload = payload_of(&pool, &task_id).await;
     assert_eq!(
-        without_left_at(payload_of(&pool, &task_id).await, "run"),
+        without_left_at(
+            without_only_result_pointer(&pool, &task_id, payload).await,
+            "run"
+        ),
         json!({
             "task": {"input": null, "title": "T", "closes": ""},
             "arrival": {"from": "run", "outcome": "done"},
@@ -2442,8 +2475,12 @@ async fn an_outcome_for_a_stage_the_task_has_left_is_discarded() {
     // from `start_task`'s advance, not the rejected late outcome.
     let state = workflow_state::get(&pool, &task_id).await.unwrap().unwrap();
     assert_eq!(state.current_stage, "finished");
+    // The refused late outcome recorded no second result.
     assert_eq!(
-        without_left_at(state.payload, "run"),
+        without_left_at(
+            without_only_result_pointer(&pool, &task_id, state.payload).await,
+            "run"
+        ),
         json!({
             "task": {"input": null, "title": "T", "closes": ""},
             "arrival": {"from": "run", "outcome": "done"},
@@ -5517,8 +5554,12 @@ stages:
     // no `capture:` neither stores it nor routes on it — `task` and the
     // engine-owned `arrival` (#112) are the only payload keys present
     // (P2-7a).
+    let payload = payload_of(&pool, &task_id).await;
     assert_eq!(
-        without_left_at(payload_of(&pool, &task_id).await, "coding"),
+        without_left_at(
+            without_only_result_pointer(&pool, &task_id, payload).await,
+            "coding"
+        ),
         json!({
             "task": {"input": null, "title": "T", "closes": ""},
             "arrival": {"from": "coding", "outcome": "done"},

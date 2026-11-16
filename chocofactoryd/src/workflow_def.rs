@@ -178,6 +178,20 @@ impl WorkflowDefinition {
     }
 
     fn validate(&self) -> Result<(), WorkflowDefError> {
+        // Stage names are recorded in every applied stage result, as its
+        // source and its destination, so each must be nonempty.
+        for (group, stage) in &self.stages {
+            if group.is_empty() {
+                return Err(WorkflowDefError::EmptyStageName { group: None });
+            }
+            if let StageKind::Parallel { branches } = &stage.kind
+                && branches.keys().any(String::is_empty)
+            {
+                return Err(WorkflowDefError::EmptyStageName {
+                    group: Some(group.clone()),
+                });
+            }
+        }
         // Top-level names are already unique (the map rejects duplicate
         // keys), so only a branch can collide: with a stage, its own group,
         // or an earlier branch.
@@ -1740,6 +1754,12 @@ pub enum WorkflowDefError {
     Io(std::io::Error),
     Yaml(serde_yaml::Error),
     NoStages,
+    /// A stage (or a group's branch, when `group` is set) is named with an
+    /// empty string. Applied stage results record stage names, and an empty
+    /// one cannot be told from a missing one.
+    EmptyStageName {
+        group: Option<String>,
+    },
     UnknownRole {
         stage: String,
         role: String,
@@ -1996,6 +2016,12 @@ impl fmt::Display for WorkflowDefError {
             WorkflowDefError::Io(err) => write!(f, "failed to read workflow definition: {err}"),
             WorkflowDefError::Yaml(err) => write!(f, "failed to parse workflow definition: {err}"),
             WorkflowDefError::NoStages => write!(f, "workflow definition has no stages"),
+            WorkflowDefError::EmptyStageName { group: None } => {
+                write!(f, "a stage has an empty name")
+            }
+            WorkflowDefError::EmptyStageName { group: Some(group) } => {
+                write!(f, "a branch of group '{group}' has an empty name")
+            }
             WorkflowDefError::UnknownRole { stage, role } => {
                 write!(f, "stage '{stage}' references unknown role '{role}'")
             }
@@ -3484,6 +3510,25 @@ stages:
         let yaml = "name: empty\nstages: {}\n";
         let err = WorkflowDefinition::parse(yaml, &dir.path).unwrap_err();
         assert!(matches!(err, WorkflowDefError::NoStages));
+    }
+
+    #[test]
+    fn rejects_an_empty_stage_or_branch_name() {
+        let dir = TempDir::new();
+        let top = "name: w\nstages:\n  \"\":\n    kind: terminal\n";
+        let err = WorkflowDefinition::parse(top, &dir.path).unwrap_err();
+        assert!(
+            matches!(err, WorkflowDefError::EmptyStageName { group: None }),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "a stage has an empty name");
+        let branch = "name: w\nroles:\n  r: { cli: claude }\nstages:\n  g:\n    kind: parallel\n    branches:\n      \"\": { kind: agent_turn, role: r }\n      b: { kind: agent_turn, role: r }\n    on: { done: end }\n  end:\n    kind: terminal\n";
+        let err = WorkflowDefinition::parse(branch, &dir.path).unwrap_err();
+        assert!(
+            matches!(&err, WorkflowDefError::EmptyStageName { group: Some(g) } if g == "g"),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "a branch of group 'g' has an empty name");
     }
 
     #[test]

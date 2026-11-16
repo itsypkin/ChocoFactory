@@ -1318,12 +1318,25 @@ impl WorkflowEngine {
 
         // Every branch is done: leave the group through the same transition
         // a stage's `done` outcome takes.
+        let previous_result_id = departure::previous_result_id(&state)?;
         let mut state = state;
         state.payload = payload;
         let (next_stage, update) = self.compute_transition(definition, state, "done", None)?;
-        let updated = workflow_state::update(&self.pool, task_id, update)
-            .await?
-            .ok_or(EngineError::NoWorkflowState)?;
+        // The group's departure carries no capture: the branches' own
+        // captures stay in the payload, and no aggregate is invented.
+        let updated = self
+            .commit_stage_departure(
+                task_id,
+                departure::Departure {
+                    source_stage: group,
+                    source_kind: "parallel",
+                    outcome: "done",
+                    capture: None,
+                    previous_result_id,
+                },
+                update,
+            )
+            .await?;
         self.record_branch_end(task_id, group, branch, watch.entry, &ended)
             .await;
         let entered = self

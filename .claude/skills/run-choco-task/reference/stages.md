@@ -35,7 +35,10 @@ Read this while watching a task, when its behaviour surprises you.
 - **blocker.** Reached when the coder reports `blocked` from `coding` or
   `revising`. Waits, with no time limit, for `choco task send`. The answer goes
   to `revising`, and the internal reviewer is shown it as your decision: where
-  it conflicts with the spec, the answer wins. Only your latest answer is kept.
+  it conflicts with the spec, the answer wins. Only your latest answer is kept in the
+  captured value the workflow's templates read; each answer the task acted on is
+  also recorded as its own stage result (see `docs/context.md`), subject to the
+  daemon's event retention.
   It resets no loop count, and a reply that is only `/approve` is refused.
   If the task's PR is merged meanwhile, the task moves to `done` by itself
   (the same merge-only check as `escalate_to_human`; with no PR yet, nothing

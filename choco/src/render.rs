@@ -1441,6 +1441,24 @@ fn event_summary_body(event: &Event) -> String {
                 None => stage.to_string(),
             }
         }
+        // `{source_stage, outcome, destination_stage, capture, ..}`: only the
+        // transition. The capture can be a whole private correction or a
+        // large report, and the timeline is not the place to print it.
+        EventType::StageResult => {
+            let field = |key: &str| {
+                payload
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(single_line)
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            format!(
+                "{} → {}  (applied {})",
+                field("source_stage"),
+                field("destination_stage"),
+                field("outcome")
+            )
+        }
         // `{group, branch, kind, entry, via}` and `{group, branch, entry,
         // state, result | reason}` (#257): one line each, never raw JSON.
         EventType::BranchStarted | EventType::BranchFinished => {
@@ -3212,6 +3230,55 @@ mod tests {
             },
         );
         assert!(none.contains("Nothing needed starting"), "{none}");
+    }
+
+    #[test]
+    fn a_stage_result_reads_as_its_transition_and_never_prints_the_capture() {
+        let private = "Please fix A, B and C.\n\nSECRET-CORRECTION-TEXT. Change nothing else.";
+        let ev = event(
+            EventType::StageResult,
+            json!({
+                "source_stage": "human_review", "source_kind": "human_gate",
+                "outcome": "request_changes", "destination_stage": "coding",
+                "capture_present": true, "capture": private,
+                "previous_result_id": "r1",
+            }),
+        );
+        let summary = event_summary(&ev);
+        assert_eq!(summary, "human_review → coding  (applied request_changes)");
+        assert!(!summary.contains("SECRET-CORRECTION-TEXT"));
+        assert!(!summary.contains('\n'));
+    }
+
+    #[test]
+    fn a_stage_result_with_a_missing_or_non_string_field_shows_a_placeholder_not_the_capture() {
+        let private = "SECRET-CORRECTION-TEXT. Change nothing else.";
+        let full = json!({
+            "source_stage": "review", "source_kind": "human_gate",
+            "outcome": "approved", "destination_stage": "finished",
+            "capture_present": true, "capture": private,
+            "previous_result_id": null,
+        });
+        // Each of the three shown fields, missing, null and of the wrong
+        // type, in turn; the other two stay as stored.
+        for (key, shown) in [
+            ("source_stage", "? → finished  (applied approved)"),
+            ("destination_stage", "review → ?  (applied approved)"),
+            ("outcome", "review → finished  (applied ?)"),
+        ] {
+            for broken in [None, Some(json!(null)), Some(json!(7)), Some(json!(["x"]))] {
+                let mut payload = full.clone();
+                match &broken {
+                    None => {
+                        payload.as_object_mut().unwrap().remove(key);
+                    }
+                    Some(value) => payload[key] = value.clone(),
+                }
+                let summary = event_summary(&event(EventType::StageResult, payload));
+                assert_eq!(summary, shown, "{key} = {broken:?}");
+                assert!(!summary.contains("SECRET-CORRECTION-TEXT"));
+            }
+        }
     }
 
     #[test]

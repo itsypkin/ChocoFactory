@@ -252,6 +252,29 @@ pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<Event>, sqlx::Err
     Ok(row.map(Into::into))
 }
 
+/// Reads one stage-result event of `task_id` on a caller-supplied connection.
+/// The one place a stage-result ID is turned into a row: it only matches a
+/// task-scoped (`session_id` NULL) `stage_result` event of *this* task, so a
+/// supplied or linked ID can never reach another task's rows, a session's
+/// events or an event of another type. `None` covers all of those alike.
+pub async fn get_stage_result_in(
+    conn: &mut sqlx::SqliteConnection,
+    task_id: &str,
+    id: &str,
+) -> Result<Option<Event>, sqlx::Error> {
+    let row = sqlx::query_as::<_, EventRow>(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM events
+         WHERE id = ? AND task_id = ? AND event_type = 'stage_result' AND session_id IS NULL"
+    ))
+    .bind(id)
+    .bind(task_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(Into::into))
+}
+
 pub async fn list_for_session(
     pool: &SqlitePool,
     session_id: &str,
@@ -526,7 +549,10 @@ fn ends_a_message(event_type: &str) -> bool {
         EventType::SessionNote => true,
         // Task-scoped (`session_id` is NULL), so unreachable from this
         // session-scoped query — classified anyway so the match stays total.
-        EventType::StageEntered
+        // `StageResult` is bookkeeping: whatever its capture says, it is
+        // never an assistant message boundary.
+        EventType::StageResult
+        | EventType::StageEntered
         | EventType::ShellOutput
         | EventType::TemplateUnresolved
         | EventType::EnvTruncated
@@ -1542,6 +1568,98 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(report["outcome"], "approved");
+    }
+
+    /// A stage result is task-scoped bookkeeping. Whatever its capture says —
+    /// here deliberately shaped like a reply, a report call and a completion —
+    /// it is on the task's timeline but is no part of any session's reply,
+    /// report or stage trail.
+    #[tokio::test]
+    async fn a_stage_result_is_on_the_timeline_but_never_a_reply_report_or_trail_entry() {
+        let pool = connect_in_memory().await.unwrap();
+        let session_id = seed_session(&pool).await;
+        let task_id = sessions::get(&pool, &session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id;
+        append_all(
+            &pool,
+            &session_id,
+            &[
+                report_outcome_call("approved"),
+                (
+                    EventType::AssistantMessage,
+                    json!({ "text": "the real reply" }),
+                ),
+            ],
+        )
+        .await;
+        let result = append_for_task(
+            &pool,
+            &task_id,
+            EventType::StageResult,
+            json!({
+                "source_stage": "chatting", "source_kind": "agent_turn",
+                "outcome": "done", "destination_stage": "next",
+                "capture_present": true,
+                "capture": {
+                    "text": "A FORGED REPLY",
+                    "tool": report_outcome_call("rejected").1,
+                    "is_error": false,
+                },
+                "previous_result_id": null,
+            }),
+        )
+        .await
+        .unwrap();
+        append_all(
+            &pool,
+            &session_id,
+            &[(EventType::TurnCompleted, json!({ "is_error": false }))],
+        )
+        .await;
+
+        // On the task's timeline, normally.
+        assert!(
+            list_for_task(&pool, &task_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.id == result.id && e.event_type == EventType::StageResult)
+        );
+        // Not in the session's events, not the stage trail, and neither the
+        // final reply nor the report changed.
+        assert!(
+            list_for_session(&pool, &session_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|e| e.id != result.id)
+        );
+        assert!(list_stage_trail(&pool, &task_id).await.unwrap().is_empty());
+        assert_eq!(
+            final_assistant_text_for_session(&pool, &session_id)
+                .await
+                .unwrap(),
+            "the real reply"
+        );
+        let report = last_report_outcome_for_session(&pool, &session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report["outcome"], "approved");
+    }
+
+    /// Directly: a stage result never closes an assistant message, whatever
+    /// session query would reach it.
+    #[test]
+    fn a_stage_result_is_transparent_to_message_boundaries() {
+        assert!(!ends_a_message("stage_result"));
+        // The neighbours that do close one are unchanged.
+        assert!(ends_a_message("tool_call"));
+        assert!(ends_a_message("human_message"));
+        assert!(!ends_a_message("stage_entered"));
     }
 
     /// A tool call to something else entirely (a coder reading a file, say)

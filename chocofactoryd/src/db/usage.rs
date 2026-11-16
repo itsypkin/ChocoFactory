@@ -646,6 +646,69 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// A stage result is task bookkeeping: a task that records them has the
+    /// same laps and usage rows as one that does not, even when a result's
+    /// capture looks like a stage, a branch or a cost line.
+    #[tokio::test]
+    async fn stage_results_change_neither_laps_nor_usage() {
+        let with = connect_in_memory().await.unwrap();
+        let without = connect_in_memory().await.unwrap();
+        let mut seen = Vec::new();
+        for (pool, noisy) in [(&with, true), (&without, false)] {
+            let task = new_task(pool).await;
+            let mut laps = Vec::new();
+            let mut ids = Vec::new();
+            for round in 0..2 {
+                enter(
+                    pool,
+                    &task,
+                    "review",
+                    if round == 0 { None } else { Some("done") },
+                )
+                .await;
+                if noisy {
+                    events::append_for_task(
+                        pool,
+                        &task,
+                        EventType::StageResult,
+                        json!({
+                            "source_stage": "review", "source_kind": "agent_turn",
+                            "outcome": "done", "destination_stage": "review",
+                            "capture_present": true,
+                            "capture": {"stage": "review", "branch": "review",
+                                        "cost_usd": 99.0, "input_tokens": 9999,
+                                        "is_error": false},
+                            "previous_result_id": null,
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let s = new_session(pool, &task, "review").await;
+                laps.push(lap(pool, &s).await);
+                turn(pool, &s, &usage(Some(1.5), 10, one_model(10, 1.5))).await;
+                ids.push(s);
+            }
+            let rows: Vec<_> = list_rows_for_task(pool, &task)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.cost_usd, r.tokens.input, r.tokens.output))
+                .collect();
+            let facts: Vec<_> = list_session_facts(pool, &task)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.stage, f.lap))
+                .collect();
+            seen.push((laps, rows, facts));
+            let _ = ids;
+        }
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(seen[0].0, vec![Some(1), Some(2)]);
+        assert_eq!(seen[0].1.len(), 2);
+    }
+
     /// The pre-change lap expression, verbatim, evaluated as a plain SELECT.
     async fn old_lap(pool: &SqlitePool, task: &str, stage: &str, from: Option<&str>) -> i64 {
         sqlx::query_scalar::<_, i64>(

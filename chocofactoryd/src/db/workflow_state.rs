@@ -71,13 +71,23 @@ pub async fn create(
 }
 
 pub async fn get(pool: &SqlitePool, task_id: &str) -> Result<Option<WorkflowState>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    get_in(&mut conn, task_id).await
+}
+
+/// [`get`] on a caller-supplied connection, so a read can share a
+/// transaction with other reads (pass `&mut *tx`).
+pub async fn get_in(
+    conn: &mut sqlx::SqliteConnection,
+    task_id: &str,
+) -> Result<Option<WorkflowState>, sqlx::Error> {
     let row = sqlx::query_as::<_, WorkflowStateRow>(concat!(
         "SELECT ",
         columns!(),
         " FROM workflow_state WHERE task_id = ?"
     ))
     .bind(task_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     Ok(row.map(Into::into))
 }

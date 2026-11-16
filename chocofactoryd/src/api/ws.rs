@@ -333,6 +333,20 @@ stages:
         assert_eq!(human_message["payload"]["text"], "go");
         assert_eq!(human_message["session_id"], Value::Null);
 
+        // The departure's result commits with the state it describes, before
+        // the destination's `stage_entered`.
+        let Ok(Some(Ok(WsMessage::Text(text)))) =
+            tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
+        else {
+            panic!("stage result was not pushed over the already-open socket");
+        };
+        let result: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(result["event_type"], "stage_result");
+        assert_eq!(result["payload"]["source_stage"], "gate");
+        assert_eq!(result["payload"]["outcome"], "resumed");
+        assert_eq!(result["payload"]["destination_stage"], "review");
+        assert_eq!(result["session_id"], Value::Null);
+
         let Ok(Some(Ok(WsMessage::Text(text)))) =
             tokio::time::timeout(crate::test_support::LOAD_ALLOWANCE, ws.next()).await
         else {
