@@ -89,6 +89,7 @@ impl Env {
 
     fn cfg(&self) -> RoleConfig {
         RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -106,6 +107,7 @@ impl Env {
     /// A `memory: true` role of project `project`.
     fn memory_cfg(&self, project: &str) -> RoleConfig {
         RoleConfig {
+            context: None,
             isolation: Isolation::Isolated {
                 skills: Vec::new(),
                 memory: true,
@@ -1271,6 +1273,7 @@ impl Drop for RemoveOnDrop {
 
 fn chat_cfg(env: &Env) -> RoleConfig {
     RoleConfig {
+        context: None,
         isolation: Isolation::InheritOperatorConfig,
         ..env.cfg()
     }
@@ -2908,6 +2911,7 @@ fn dump_probe_spawn() {
     let out = std::env::var("CHOCO_PROBE_OUT").unwrap();
     let state = PathBuf::from(&out).with_extension("state");
     let mut cfg = RoleConfig {
+        context: None,
         claude_settings: Default::default(),
         role: "coder".to_string(),
         project_id: None,
@@ -4393,5 +4397,483 @@ async fn omp_settlement_clears_pending_work_and_completes_nothing() {
         ends_in(&all),
         vec![false],
         "settlement ends nothing: {all:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `get_context` (#369): the second host tool
+// ---------------------------------------------------------------------------
+
+use crate::context_tool_tests::ToolReply;
+use chocofactory_core::context_tool::ContextBinding;
+use chocofactory_core::mcp::qualified_get_context_tool_name;
+
+fn is_context_call(event: &AgentEvent) -> bool {
+    matches!(event, AgentEvent::ToolCall { tool, .. } if *tool == qualified_get_context_tool_name())
+}
+
+fn is_context_result(event: &AgentEvent) -> bool {
+    matches!(event, AgentEvent::ToolResult { tool, .. } if *tool == qualified_get_context_tool_name())
+}
+
+/// What the omp surface did for a list of `get_context` calls.
+struct OmpContextRun {
+    replies: Vec<ToolReply>,
+    events: Vec<AgentEvent>,
+    log: Vec<String>,
+}
+
+/// Every call through the production omp driver (scripted fixture) bound to
+/// `binding` (or unbound). A call of `None` is made with no `arguments` key.
+async fn via_omp(
+    env: &Env,
+    binding: Option<&ContextBinding>,
+    calls: &[Option<Value>],
+) -> OmpContextRun {
+    let mut steps = vec![s_start()];
+    for (index, call) in calls.iter().enumerate() {
+        steps.push(match call {
+            Some(args) => json!({"op": "context", "args": args, "label": index.to_string()}),
+            None => json!({"op": "context", "no_args": true, "label": index.to_string()}),
+        });
+    }
+    steps.push(s_report("done"));
+    steps.push(s_end());
+    let (script, adapter) = Scripted::start(env, Value::Array(steps), &[]);
+    let cfg = RoleConfig {
+        context: binding.cloned(),
+        ..env.cfg()
+    };
+    let mut handle = adapter.start("go", &cfg).unwrap();
+    script.wait_log("script_done").await;
+    let events = drain(&mut handle).await;
+    let replies = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult {
+                tool,
+                output,
+                is_error,
+                ..
+            } if *tool == qualified_get_context_tool_name() => Some(ToolReply {
+                is_error: *is_error,
+                text: output.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    OmpContextRun {
+        replies,
+        events,
+        log: script.lines(),
+    }
+}
+
+#[tokio::test]
+async fn omp_registers_get_context_as_an_essential_host_tool_only_when_bound() {
+    let env = Env::new();
+    let binding = ContextBinding::new("t", "s", Some("r"), "http://127.0.0.1:1").unwrap();
+    let bound = via_omp(&env, Some(&binding), &[Some(json!({"source": "task"}))]).await;
+    assert!(
+        bound
+            .log
+            .contains(&"host_tools:report_outcome=essential,get_context=essential".to_string()),
+        "{:?}",
+        bound.log
+    );
+    // `get_state` lists both tools; each is named the way its events are.
+    let listed: Vec<String> = bound
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SessionMeta { details, .. } => Some(details["tools"].clone()),
+            _ => None,
+        })
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        listed.contains(&qualified_get_context_tool_name()),
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains(&qualified_report_outcome_tool_name()),
+        "{listed:?}"
+    );
+
+    // Unbound: not registered, and a call to it is refused as unknown.
+    let unbound = via_omp(&env, None, &[Some(json!({"source": "task"}))]).await;
+    assert!(
+        unbound
+            .log
+            .contains(&"host_tools:report_outcome=essential".to_string()),
+        "{:?}",
+        unbound.log
+    );
+    assert!(
+        !unbound.events.iter().any(is_context_call),
+        "an unregistered tool is no context call: {:?}",
+        unbound.events
+    );
+    assert!(
+        unbound.log.contains(&"context_result:0:error".to_string()),
+        "{:?}",
+        unbound.log
+    );
+}
+
+#[tokio::test]
+async fn both_surfaces_return_the_same_full_results_for_the_same_binding() {
+    use crate::context_tool_tests::*;
+    let (server, project) = server_with_flow().await;
+    let mut a = new_task(&server, &project, "A", &[369]).await;
+    let mut b = new_task(&server, &project, "B", &[]).await;
+    a.reply(&server, "again").await;
+    b.reply(&server, "again").await;
+    let binding =
+        ContextBinding::new(&a.id, "session-a", Some(&a.results[0]), server.base_url()).unwrap();
+    // The history moves on after the launch.
+    a.reply(&server, "again").await;
+    a.reply(&server, "approved").await;
+
+    let calls = full_result_calls(&a, &b.results[0]);
+    let env = Env::new();
+    let omp = via_omp(
+        &env,
+        Some(&binding),
+        &calls.iter().cloned().map(Some).collect::<Vec<_>>(),
+    )
+    .await;
+    assert_eq!(omp.replies.len(), calls.len());
+    assert_full_results_at_first_result(&a, &omp.replies, "omp");
+
+    // The same bytes as the Claude surface, call by call.
+    let choco = via_choco(&binding, &calls).await;
+    for (index, (from_omp, from_choco)) in omp.replies.iter().zip(&choco).enumerate() {
+        assert_eq!(from_omp.is_error, from_choco.is_error, "call {index}");
+        assert_eq!(from_omp.text, from_choco.text, "call {index}");
+    }
+    // One qualified pair per call, nothing under the bare name.
+    let calls_seen = omp.events.iter().filter(|e| is_context_call(e)).count();
+    let results_seen = omp.events.iter().filter(|e| is_context_result(e)).count();
+    assert_eq!((calls_seen, results_seen), (calls.len(), calls.len()));
+    assert!(!omp.events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolCall { tool, .. } | AgentEvent::ToolResult { tool, .. } if tool == "get_context"
+    )));
+}
+
+/// Every malformed argument shape, through both surfaces: a visible tool
+/// error, with the daemon never asked.
+#[tokio::test]
+async fn both_surfaces_refuse_every_malformed_get_context_argument() {
+    use crate::context_tool_tests::*;
+    let (server, project) = server_with_flow().await;
+    let mut a = new_task(&server, &project, "A", &[]).await;
+    a.reply(&server, "again").await;
+    let binding = ContextBinding::new(&a.id, "s", Some(&a.results[0]), server.base_url()).unwrap();
+    let bad: Vec<Option<Value>> = vec![
+        None,
+        Some(Value::Null),
+        Some(json!([])),
+        Some(json!("task")),
+        Some(json!(7)),
+        Some(json!(true)),
+        Some(json!({})),
+        Some(json!({"source": null})),
+        Some(json!({"source": 1})),
+        Some(json!({"source": ""})),
+        Some(json!({"source": "  "})),
+        Some(json!({"source": "elsewhere"})),
+        Some(json!({"source": "stage"})),
+        Some(json!({"source": "stage", "stage": null})),
+        Some(json!({"source": "stage", "stage": 3})),
+        Some(json!({"source": "stage", "stage": " "})),
+        Some(json!({"source": "stage", "result_id": null})),
+        Some(json!({"source": "stage", "stage": "gate", "result_id": a.results[0]})),
+        Some(json!({"source": "stage", "result_id": a.results[0], "outcome": "again"})),
+        Some(json!({"source": "stage", "stage": "gate", "outcome": null})),
+        Some(json!({"source": "stage", "stage": "gate", "outcome": 4})),
+        Some(json!({"source": "stage", "stage": "gate", "outcome": ""})),
+        Some(json!({"source": "task", "stage": "gate"})),
+        Some(json!({"source": "task", "outcome": "again"})),
+        Some(json!({"source": "task", "result_id": a.results[0]})),
+    ];
+    // Attempts to steer the call elsewhere, on every valid form: the
+    // task, anchor, session and address are not the model's to name.
+    let mut bad = bad;
+    for key in [
+        "task_id",
+        "anchor_id",
+        "session_id",
+        "daemon_url",
+        "base_url",
+        "stagee",
+    ] {
+        for form in [
+            json!({"source": "task"}),
+            json!({"source": "stage", "stage": "gate"}),
+            json!({"source": "stage", "result_id": a.results[0]}),
+        ] {
+            let mut call = form;
+            call[key] = json!(a.results[0]);
+            bad.push(Some(call));
+        }
+    }
+    // Valid control calls on the same binding must still succeed.
+    let good = [
+        json!({"source": "task"}),
+        json!({"source": "stage", "stage": "gate"}),
+    ];
+    let env = Env::new();
+    let omp_bad = via_omp(&env, Some(&binding), &bad).await;
+    let omp_good = via_omp(
+        &env,
+        Some(&binding),
+        &good.iter().cloned().map(Some).collect::<Vec<_>>(),
+    )
+    .await;
+    assert!(omp_good.replies.iter().all(|reply| !reply.is_error));
+    assert_eq!(omp_bad.replies.len(), bad.len());
+    for (call, reply) in bad.iter().zip(&omp_bad.replies) {
+        assert!(reply.is_error, "omp accepted {call:?}: {}", reply.text);
+    }
+    // The Claude surface, for every call it can express (absent arguments
+    // included).
+    let mut mcp = McpChild::spawn(&binding.to_args(), &[]);
+    mcp.initialize().await;
+    for call in &bad {
+        let reply = mcp.call("get_context", call.clone()).await;
+        assert!(reply.is_error, "choco accepted {call:?}: {}", reply.text);
+    }
+    for call in &good {
+        assert!(!mcp.call("get_context", Some(call.clone())).await.is_error);
+    }
+    assert!(mcp.finish().await.success());
+}
+
+/// A daemon that answers every request with one fixed status and body.
+async fn fixed_daemon(status: u16, body: &str) -> String {
+    let body = body.to_string();
+    let app = axum::Router::new().fallback(move || {
+        let body = body.clone();
+        async move {
+            (
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                [("content-type", "application/json")],
+                body,
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
+#[tokio::test]
+async fn both_surfaces_show_a_daemon_failure_as_a_tool_error_never_as_an_empty_answer() {
+    use crate::context_tool_tests::via_choco;
+    let result_body = json!({"provenance": "stage_result", "task_id": "t", "anchor_id": "r",
+        "result": {"task_id": "t", "result_id": "r1", "source_stage": "gate",
+                   "source_kind": "human_gate", "outcome": "again",
+                   "destination_stage": "gate", "capture_present": false, "capture": null,
+                   "previous_result_id": null, "created_at": "2026-11-15T10:00:00Z"}})
+    .to_string();
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "http 500",
+            fixed_daemon(500, r#"{"error":"database is locked"}"#).await,
+        ),
+        (
+            "an unknown task's 404",
+            fixed_daemon(404, r#"{"error":"no such task"}"#).await,
+        ),
+        ("malformed json", fixed_daemon(200, "{not json").await),
+        (
+            "json that is no answer",
+            fixed_daemon(200, r#"{"hello":"world"}"#).await,
+        ),
+        (
+            "a 404 that is no unavailable answer",
+            fixed_daemon(404, &result_body).await,
+        ),
+        // Nothing listens on port 1.
+        ("a refused connection", "http://127.0.0.1:1".to_string()),
+    ];
+    let env = Env::new();
+    for (what, url) in cases {
+        let binding = ContextBinding::new("t", "s", Some("r"), &url).unwrap();
+        let call = json!({"source": "stage", "result_id": "r1"});
+        let omp = via_omp(&env, Some(&binding), &[Some(call.clone())]).await;
+        assert!(
+            omp.replies[0].is_error,
+            "omp, {what}: {}",
+            omp.replies[0].text
+        );
+        let choco = via_choco(&binding, &[call]).await;
+        assert!(choco[0].is_error, "choco, {what}: {}", choco[0].text);
+    }
+    // And a typed `unavailable` 404 is a legitimate answer on both.
+    let typed = json!({"provenance": "unavailable", "task_id": "t", "anchor_id": "r",
+                       "reason": "missing_result"})
+    .to_string();
+    let binding =
+        ContextBinding::new("t", "s", Some("r"), &fixed_daemon(404, &typed).await).unwrap();
+    let call = json!({"source": "stage", "result_id": "r1"});
+    let omp = via_omp(&env, Some(&binding), &[Some(call.clone())]).await;
+    assert!(!omp.replies[0].is_error, "{}", omp.replies[0].text);
+    assert_eq!(omp.replies[0].json()["reason"], "missing_result");
+    assert!(!via_choco(&binding, &[call]).await[0].is_error);
+}
+
+/// Two genuinely thin reports are turned away and the third is taken: a
+/// `get_context` read or failure in between neither adds to that count nor
+/// resets it.
+#[tokio::test]
+async fn omp_a_context_read_or_failure_does_not_touch_the_thin_report_allowance() {
+    let env = Env::new();
+    let decoy = crate::context_tool_tests::decoy_daemon().await;
+    let thin = json!({"op": "report", "args": {"outcome": "done", "summary": "no sections"}});
+    for (what, base_url) in [
+        ("a successful read", decoy.as_str()),
+        ("a failed read", "http://127.0.0.1:1"),
+    ] {
+        let binding = ContextBinding::new("t", "s", Some("r"), base_url).unwrap();
+        let steps = json!([
+            s_start(),
+            thin,
+            {"op": "context", "args": {"source": "task"}, "label": "mid"},
+            thin,
+            thin,
+            s_end(),
+        ]);
+        let (script, adapter) = Scripted::start(&env, steps, &[]);
+        let cfg = RoleConfig {
+            context: Some(binding),
+            report_sections: vec!["Findings".to_string()],
+            ..env.cfg()
+        };
+        let mut handle = adapter.start("go", &cfg).unwrap();
+        script.wait_log("script_done").await;
+        drain(&mut handle).await;
+        let verdicts: Vec<String> = script
+            .lines()
+            .into_iter()
+            .filter(|line| line.starts_with("host_result:"))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [
+                "host_result:0:rejected",
+                "host_result:1:rejected",
+                "host_result:2:accepted"
+            ],
+            "{what}"
+        );
+    }
+}
+
+/// The overlay's approval list, as data. This reads the file the adapter
+/// writes; that real omp honours it is shown by the opt-in probe
+/// (`context_tool_tests::real_probe_omp`), not by this test.
+#[test]
+fn the_overlay_allows_get_context_only_for_a_bound_launch() {
+    let env = Env::new();
+    let bound = ContextBinding::new("t", "s", None, "http://127.0.0.1:1").unwrap();
+    for sandboxed in [true, false] {
+        let cfg = RoleConfig {
+            sandboxed,
+            context: Some(bound.clone()),
+            ..env.cfg()
+        };
+        let approval = &overlay(&cfg, None)["tools"]["approval"];
+        assert_eq!(approval["get_context"], "allow", "sandboxed {sandboxed}");
+        assert_eq!(approval["report_outcome"], "allow");
+        let unbound = RoleConfig {
+            context: None,
+            ..cfg
+        };
+        let approval = &overlay(&unbound, None)["tools"]["approval"];
+        assert!(
+            approval.get("get_context").is_none(),
+            "sandboxed {sandboxed}"
+        );
+        assert_eq!(approval["report_outcome"], "allow");
+    }
+}
+
+/// A call the model cancels while its read is pending is still answered when
+/// the (bounded) read ends; the driver's cancel handling is "ignored", the
+/// read writes nothing, and the turn goes on to report normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn omp_a_cancelled_read_finishes_writes_nothing_and_the_turn_still_reports() {
+    use crate::context_tool_tests::*;
+    use std::sync::atomic::Ordering;
+    let (server, project) = server_with_flow().await;
+    let mut a = new_task(&server, &project, "A", &[]).await;
+    a.reply(&server, "again").await;
+    let (proxy, arrived, gate) = gated_proxy(server.base_url().to_string()).await;
+    let binding = ContextBinding::new(&a.id, "s", Some(&a.results[0]), &proxy).unwrap();
+    let before = crate::test_support::dump_tables(server.pool()).await;
+
+    let env = Env::new();
+    let steps = json!([
+        s_start(),
+        {"op": "context", "args": {"source": "task"}, "label": "c", "cancel": true},
+        s_report("done"),
+        s_end(),
+    ]);
+    let (script, adapter) = Scripted::start(&env, steps, &[]);
+    let cfg = RoleConfig {
+        context: Some(binding),
+        ..env.cfg()
+    };
+    let mut handle = adapter.start("go", &cfg).unwrap();
+    crate::test_support::wait_until("the read to be pending", || async {
+        if arrived.load(Ordering::SeqCst) == 1 {
+            Ok(())
+        } else {
+            Err("not yet".to_string())
+        }
+    })
+    .await;
+    // Cancelled, and still waiting: nothing has been answered yet.
+    assert!(
+        !script
+            .lines()
+            .iter()
+            .any(|line| line.starts_with("context_result:")),
+        "{:?}",
+        script.lines()
+    );
+    gate.notify_one();
+    script.wait_log("script_done").await;
+    let events = drain(&mut handle).await;
+    let result = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolResult {
+                tool,
+                is_error,
+                output,
+                ..
+            } if *tool == qualified_get_context_tool_name() => Some((*is_error, output.clone())),
+            _ => None,
+        })
+        .expect("the cancelled call was still answered");
+    assert!(!result.0, "{}", result.1);
+    assert!(result.1.contains(&a.title));
+    assert!(
+        script
+            .lines()
+            .contains(&"host_result:0:accepted".to_string())
+    );
+    assert_eq!(
+        crate::test_support::dump_tables(server.pool()).await,
+        before
     );
 }

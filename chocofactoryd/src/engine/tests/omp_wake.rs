@@ -9,21 +9,21 @@ use crate::session::TurnTimers;
 use crate::test_support::OmpScript;
 use chocofactory_core::models::SessionEndReason;
 
-const WAKE_YAML: &str = "name: omp-wake\nroles:\n  reviewer:\n    cli: omp\n    model: openai-codex/gpt-5.6-terra\nstages:\n  review:\n    kind: agent_turn\n    role: reviewer\n    capture: json\n    on: { approved: finished, changes_requested: bounced }\n  finished:\n    kind: terminal\n  bounced:\n    kind: terminal\n";
+pub(super) const WAKE_YAML: &str = "name: omp-wake\nroles:\n  reviewer:\n    cli: omp\n    model: openai-codex/gpt-5.6-terra\nstages:\n  review:\n    kind: agent_turn\n    role: reviewer\n    capture: json\n    on: { approved: finished, changes_requested: bounced }\n  finished:\n    kind: terminal\n  bounced:\n    kind: terminal\n";
 
 /// The distinctive summary the wake reports.
 const SUMMARY: &str = "wake-summary-7f3a: the retry loop drops the last element";
 
-struct WakeRun {
-    pool: SqlitePool,
-    task_id: String,
-    script: OmpScript,
-    engine: Arc<WorkflowEngine>,
+pub(super) struct WakeRun {
+    pub(super) pool: SqlitePool,
+    pub(super) task_id: String,
+    pub(super) script: OmpScript,
+    pub(super) engine: Arc<WorkflowEngine>,
     _dir: TempDir,
     _repo: TempDir,
 }
 
-fn timers() -> TurnTimers {
+pub(super) fn timers() -> TurnTimers {
     TurnTimers {
         grace: StdDuration::from_secs(5),
         nudge_after: StdDuration::from_secs(60),
@@ -41,6 +41,17 @@ async fn start_wake(steps: Value, timers: TurnTimers) -> WakeRun {
 /// `start_wake` for a workflow other than `WAKE_YAML` (its stage must be
 /// `review` and its terminals `finished` / `bounced`).
 async fn start_wake_on(yaml: &str, steps: Value, timers: TurnTimers) -> WakeRun {
+    start_wake_with(yaml, steps, timers, None).await
+}
+
+/// `start_wake_on` with the engine told its daemon's address (#369), so the
+/// turn gets a `get_context` tool.
+pub(super) async fn start_wake_with(
+    yaml: &str,
+    steps: Value,
+    timers: TurnTimers,
+    base_url: Option<&str>,
+) -> WakeRun {
     let dir = tempdir();
     let repo = tempdir();
     init_git_repo(&repo).await;
@@ -77,13 +88,16 @@ async fn start_wake_on(yaml: &str, steps: Value, timers: TurnTimers) -> WakeRun 
         Arc::clone(&events_notify),
         timers,
     );
-    let engine = WorkflowEngine::new(
+    let mut engine = WorkflowEngine::new(
         pool.clone(),
         manager,
         PathBuf::from("."),
         None,
         events_notify,
     );
+    if let Some(base_url) = base_url {
+        engine = engine.with_context_base_url(base_url).unwrap();
+    }
     engine.start_task(&task_id, &def, Some("go")).await.unwrap();
     WakeRun {
         pool,
@@ -96,7 +110,7 @@ async fn start_wake_on(yaml: &str, steps: Value, timers: TurnTimers) -> WakeRun 
 }
 
 impl WakeRun {
-    async fn session(&self) -> Session {
+    pub(super) async fn session(&self) -> Session {
         crate::test_support::wait_until("the review session", || async {
             sessions::list_for_task(&self.pool, &self.task_id)
                 .await
@@ -119,7 +133,7 @@ impl WakeRun {
             .collect()
     }
 
-    async fn outcomes(&self) -> Vec<Value> {
+    pub(super) async fn outcomes(&self) -> Vec<Value> {
         events::list_for_task(&self.pool, &self.task_id)
             .await
             .unwrap()
@@ -130,7 +144,7 @@ impl WakeRun {
     }
 
     /// Everything the run left: for failure messages.
-    async fn describe(&self) -> String {
+    pub(super) async fn describe(&self) -> String {
         let task = tasks::get(&self.pool, &self.task_id)
             .await
             .unwrap()
@@ -239,7 +253,7 @@ async fn assert_applied_once(run: &WakeRun) {
 
 /// A failed or unfinished wake must advance nothing: the task parks at the
 /// review stage with no outcome written.
-async fn assert_not_applied(run: &WakeRun, what: &str) {
+pub(super) async fn assert_not_applied(run: &WakeRun, what: &str) {
     // Any settled state ends the wait, so an application that should not
     // have happened (a closed task) fails the assertions below, not a wait.
     let status = crate::test_support::wait_until("the task to settle", || async {

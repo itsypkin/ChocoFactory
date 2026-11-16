@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use chocofactory_core::context_tool::ContextBinding;
 use chocofactory_core::models::{
     EventType, InFlight, Project, RetryMode, RetryOutcome, Session, SessionCleanup,
     SessionEndReason, SessionStatus, Task,
@@ -164,6 +165,11 @@ pub struct WorkflowEngine {
     /// to load a pre-#88 task (`workflow_path` NULL) that was created
     /// against it; never consulted to resolve a new task.
     legacy_workflows_dir: Option<PathBuf>,
+    /// The address this daemon actually bound (`http://127.0.0.1:<port>`),
+    /// handed to every agent turn's `get_context` tool (#369). `None` — an
+    /// engine nobody told its address, as in a hand-built test fixture —
+    /// launches turns with no such tool rather than guessing a daemon.
+    context_base_url: Option<String>,
     /// `None` means "no global config file configured" (e.g. `$HOME`
     /// unset, or a test that doesn't care) — treated the same as a
     /// missing file: role resolution just gets no global defaults.
@@ -242,8 +248,11 @@ pub enum EngineError {
     NoWorkflowState,
     /// `workflow_state.payload.current_result_id` is present but is not a
     /// result ID, so the task cannot leave its stage without cutting the
-    /// chain of recorded results. Nothing was written.
+    /// chain of recorded results, and a turn cannot be given a point in that
+    /// chain to read from (#369). Nothing was written.
     MalformedResultPointer(String),
+    /// A launch could not be given its `get_context` binding (#369).
+    ContextBinding(String),
     NoSuchTask,
     UnknownStage(String),
     UnknownOutcome {
@@ -338,9 +347,12 @@ impl fmt::Display for EngineError {
             EngineError::NoWorkflowState => write!(f, "task has no workflow_state row"),
             EngineError::MalformedResultPointer(why) => write!(
                 f,
-                "the task's recorded stage results are damaged ({why}), so it cannot leave its \
-                 stage"
+                "the task's recorded stage results are damaged ({why}), so it can neither start \
+                 a turn nor leave its stage"
             ),
+            EngineError::ContextBinding(why) => {
+                write!(f, "could not bind the turn's task-context tool: {why}")
+            }
             EngineError::NoSuchTask => write!(f, "no such task"),
             EngineError::GroupStateMissing { stage } => write!(
                 f,
@@ -830,6 +842,10 @@ pub enum SendMessageError {
     GlobalConfig(GlobalConfigError),
     Session(SessionError),
     Db(sqlx::Error),
+    /// The message could not be relayed because the session's `get_context`
+    /// binding could not be built (#369): the task's recorded result pointer
+    /// is damaged, or the binding itself is unusable. Nothing was sent.
+    ContextBinding(String),
     /// Same as `EngineError::Worktree` — relaying a message into a
     /// worktree-enabled workflow's open stage needs the same working
     /// directory the stage itself runs in.
@@ -895,6 +911,9 @@ impl fmt::Display for SendMessageError {
             SendMessageError::GlobalConfig(err) => write!(f, "{err}"),
             SendMessageError::Session(err) => write!(f, "{err}"),
             SendMessageError::Db(err) => write!(f, "{err}"),
+            SendMessageError::ContextBinding(why) => {
+                write!(f, "could not bind the session's task-context tool: {why}")
+            }
             SendMessageError::Worktree(err) => write!(f, "{err}"),
         }
     }
@@ -1451,6 +1470,7 @@ impl WorkflowEngine {
             task_locks: Mutex::new(HashMap::new()),
             builtin_dir,
             legacy_workflows_dir: None,
+            context_base_url: None,
             global_config_path,
             events_notify,
             detached_runners: std::sync::Mutex::new(HashMap::new()),
@@ -1663,6 +1683,35 @@ impl WorkflowEngine {
             .expect("with_legacy_workflows_dir must be called before the engine is shared")
             .legacy_workflows_dir = Some(dir);
         self
+    }
+
+    /// Tells the engine the address the daemon is actually listening on, so
+    /// every agent turn's `get_context` tool reads from it (#369). Must be
+    /// called before the engine is shared, and before anything — recovery,
+    /// the poll sweep, queue admission — can launch a turn. `base_url` is
+    /// checked now, so a bad address fails startup rather than every launch.
+    pub fn with_context_base_url(mut self: Arc<Self>, base_url: &str) -> Result<Arc<Self>, String> {
+        // The same check a launch applies, with placeholder IDs.
+        ContextBinding::new("task", "session", None, base_url)?;
+        Arc::get_mut(&mut self)
+            .expect("with_context_base_url must be called before the engine is shared")
+            .context_base_url = Some(base_url.to_string());
+        Ok(self)
+    }
+
+    /// The `get_context` binding for a launch of `session_id`, which may
+    /// read stage results back from `preceding_result` (`None`: none had
+    /// been recorded). `None` when this engine was never told its address.
+    fn launch_context(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        preceding_result: Option<&str>,
+    ) -> Result<Option<ContextBinding>, String> {
+        self.context_base_url
+            .as_deref()
+            .map(|base_url| ContextBinding::new(task_id, session_id, preceding_result, base_url))
+            .transpose()
     }
 
     /// The built-in directory's file for built-in `name` (#129).
@@ -2068,6 +2117,16 @@ impl WorkflowEngine {
             &task.project_id,
         )
         .map_err(SendMessageError::RoleConfig)?;
+        // A live session keeps the binding it started with; a session being
+        // re-established (the idle reaper closed it) is given its actual
+        // existing session ID and the task's persisted point in history, the
+        // same boundary a launch of this stage had.
+        let mut resolved = resolved;
+        let preceding = chocofactory_core::context::current_result_id(&state.payload)
+            .map_err(|err| SendMessageError::ContextBinding(err.to_string()))?;
+        resolved.role_config.context = self
+            .launch_context(task_id, &session.id, preceding.as_deref())
+            .map_err(SendMessageError::ContextBinding)?;
 
         // Recorded *before* handing off to the live session, not after —
         // once handed off, the session's own drain task can react and

@@ -60,7 +60,9 @@ choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revisi
 `scripts/tail-events.sh` cuts each event to one line, so it can't show
 reasons. Every lap's text is in the events. A report is a `tool_call` event
 whose `payload.tool` ends in `report_outcome`, with `payload.input.outcome`
-and `payload.input.summary`. Events come oldest first, 100 a page by default
+and `payload.input.summary`. (A `get_context` call is a `tool_call` too, with
+`payload.tool` ending in `get_context`: a read of the task's recorded history,
+never a report, so it is not in this list.) Events come oldest first, 100 a page by default
 and at most 500 with `--limit 500`; `next_token` (pass it to `--after`) is
 null on the last page. This loop prints every report:
 

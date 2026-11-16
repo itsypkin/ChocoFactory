@@ -218,31 +218,63 @@ stages:
             global_config_path: Option<PathBuf>,
             with_omp: bool,
         ) -> Self {
+            let binary = binary.to_string();
+            Self::start_built(
+                move |dir| {
+                    let adapter: Arc<dyn AgentAdapter> =
+                        Arc::new(ClaudeAdapter::with_binary(fixture_binary(&binary)));
+                    let mut adapters = vec![adapter];
+                    if with_omp {
+                        adapters.push(Arc::new(crate::adapter::OmpAdapter::with_binary(
+                            "omp-that-is-not-installed",
+                            dir.join("omp-state"),
+                        )));
+                    }
+                    adapters
+                },
+                choco_binary,
+                global_config_path,
+            )
+            .await
+        }
+
+        /// A server whose adapters `make` builds, given the server's own
+        /// scratch directory (for an adapter's state folder). For tests that
+        /// run real CLIs.
+        pub async fn start_with_adapters(
+            make: impl FnOnce(&std::path::Path) -> Vec<Arc<dyn AgentAdapter>>,
+            choco_binary: &str,
+        ) -> Self {
+            Self::start_built(make, choco_binary, None).await
+        }
+
+        async fn start_built(
+            make: impl FnOnce(&std::path::Path) -> Vec<Arc<dyn AgentAdapter>>,
+            choco_binary: &str,
+            global_config_path: Option<PathBuf>,
+        ) -> Self {
             let pool = db::connect_in_memory().await.unwrap();
             let workflows_dir = TempDir::new();
             let events_notify = Arc::new(Notify::new());
-            let adapter: Arc<dyn AgentAdapter> =
-                Arc::new(ClaudeAdapter::with_binary(fixture_binary(binary)));
-            let mut adapters = vec![adapter];
-            if with_omp {
-                adapters.push(Arc::new(crate::adapter::OmpAdapter::with_binary(
-                    "omp-that-is-not-installed",
-                    workflows_dir.0.join("omp-state"),
-                )));
-            }
+            let adapters = make(&workflows_dir.0);
             let session_manager = SessionManager::new(
                 pool.clone(),
                 Registry::new(adapters),
                 chrono::Duration::hours(1),
                 Arc::clone(&events_notify),
             );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
             let engine = WorkflowEngine::new(
                 pool.clone(),
                 session_manager,
                 workflows_dir.0.clone(),
                 global_config_path,
                 Arc::clone(&events_notify),
-            );
+            )
+            // As the daemon does, with the address it actually bound.
+            .with_context_base_url(&format!("http://{addr}"))
+            .unwrap();
             // The queue dispatcher, as the daemon runs it, but with a tick so
             // long that only a wake can start a queued turn: a test that
             // changes a cap proves the change wakes it.
@@ -250,8 +282,6 @@ stages:
                 .turn_gate()
                 .set_tick(std::time::Duration::from_secs(3600));
             let dispatcher = engine.start_dispatcher();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
             let state = AppState {
                 pool: pool.clone(),
                 engine,
@@ -279,6 +309,11 @@ stages:
                 dispatcher,
                 state: handler_state,
             }
+        }
+
+        /// The `http://127.0.0.1:<port>` address this server is listening on.
+        pub fn base_url(&self) -> &str {
+            &self.base_url
         }
 
         /// The state the handlers get, for a test that calls one directly.

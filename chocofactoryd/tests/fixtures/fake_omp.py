@@ -83,6 +83,10 @@ wrapper script, never through the test process's own environment):
   until that gate file exists, and then reports the totals of that moment) /
   assistant {text, usage, counted, stop_reason, error_message, error_status}
   / report {args} (a real host call under fresh ids; waits for the reply) /
+  context {args | no_args, label, cancel?} (a real `get_context` host call under fresh ids,
+  waits for the reply and logs `context_result:<label>:ok|error`) /
+  native_tool {name} (an ordinary, non-host tool call and its result, as a
+  model's own `read` would produce) /
   agent_end {yielded, terminal, awaiting, messages} (`yielded` and
   `awaiting` take a JSON value or "ABSENT"; `messages` is last (default),
   empty, absent, string, unknown_reason or raw: the step's own `raw` list is
@@ -223,6 +227,10 @@ class State:
         self.script_ran = False
         self.prompt_id = None
         self.report_n = 0
+        self.context_n = 0
+        # The host tools `set_host_tools` registered, in order; `get_state`
+        # lists them (real omp lists every registered host tool).
+        self.host_tools = ["report_outcome"]
         self.last_assistant = None
         self.hold_next = None
         self.held = None
@@ -688,6 +696,47 @@ def wait_for(path, what):
         dispatch(frame)
 
 
+ABSENT = object()
+
+
+def script_context(args, label, cancel=False):
+    n = STATE.context_n
+    STATE.context_n += 1
+    call_id = "call-context-%d" % n
+    host_id = "htc-context-%d" % n
+    # `ABSENT` leaves `arguments` off the frame, as a call with no arguments
+    # at all would; a JSON null stays a null.
+    present = {} if args is ABSENT else {"arguments": args}
+    assistant([{"type": "toolCall", "id": call_id, "name": "get_context", **present}],
+              stop_reason="toolUse")
+    emit({"type": "host_tool_call", "id": host_id, "toolCallId": call_id,
+          "toolName": "get_context", **present})
+    if cancel:
+        # The model gave up on the call while it is still being answered.
+        emit({"type": "host_tool_cancel", "id": host_id})
+    while True:
+        frame = read_frame()
+        if frame is None:
+            sys.exit(0)
+        if frame.get("type") == "host_tool_result" and frame.get("id") == host_id:
+            failed = bool(frame.get("isError"))
+            break
+        dispatch(frame)
+    log("context_result:%s:%s" % (label, "error" if failed else "ok"))
+    emit_event({"type": "message_end", "message": {
+        "role": "toolResult", "toolCallId": call_id, "toolName": "get_context",
+        "content": [{"type": "text", "text": "context"}], "isError": failed}})
+
+
+def script_native_tool(name):
+    call_id = "call-native-%s" % name
+    assistant([{"type": "toolCall", "id": call_id, "name": name,
+                "arguments": {"path": "a.txt"}}], stop_reason="toolUse")
+    emit_event({"type": "message_end", "message": {
+        "role": "toolResult", "toolCallId": call_id, "toolName": name,
+        "content": [{"type": "text", "text": "native output"}], "isError": False}})
+
+
 def script_report(args):
     n = STATE.report_n
     STATE.report_n += 1
@@ -776,6 +825,10 @@ def run_script():
             )
         elif op == "report":
             script_report(step["args"])
+        elif op == "context":
+            script_context(ABSENT if step.get("no_args") else step.get("args"), step.get("label", "0"), step.get("cancel", False))
+        elif op == "native_tool":
+            script_native_tool(step["name"])
         elif op == "prompt_result":
             frame = {"type": "prompt_result", "id": STATE.prompt_id, "agentInvoked": True,
                      "status": step.get("status", "completed"),
@@ -831,6 +884,9 @@ def dispatch(request):
             respond(request, success=False, error="cannot register tools")
             return
         names = [tool["name"] for tool in request.get("tools", [])]
+        STATE.host_tools = names
+        log("host_tools:" + ",".join(
+            "%s=%s" % (tool["name"], tool.get("loadMode")) for tool in request.get("tools", [])))
         respond(request, data={"toolNames": names})
     elif kind == "get_state":
         if "state_error" in MODES:
@@ -850,7 +906,7 @@ def dispatch(request):
                 "thinkingLevel": "medium",
                 "sessionId": STATE.session_id,
                 "systemPrompt": ["fake prompt"],
-                "dumpTools": [{"name": name} for name in STATE.tools + ["report_outcome"]],
+                "dumpTools": [{"name": name} for name in STATE.tools + STATE.host_tools],
             },
         )
     elif kind == "get_session_stats":

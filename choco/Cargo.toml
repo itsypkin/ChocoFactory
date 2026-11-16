@@ -19,7 +19,7 @@ sha2 = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
 tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]

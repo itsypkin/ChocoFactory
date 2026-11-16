@@ -45,17 +45,18 @@ pub struct MessageNormalizer {
 }
 
 impl MessageNormalizer {
-    /// `skip_tool` names a tool whose call and result are not reported here
-    /// (the host `report_outcome` tool, which the adapter reports itself).
-    pub fn normalize(&mut self, message: &Value, skip_tool: &str) -> Vec<AgentEvent> {
+    /// `skip_tools` names the tools whose calls and results are not reported
+    /// here (the host tools, `report_outcome` and `get_context`, which the
+    /// adapter reports itself under their qualified names).
+    pub fn normalize(&mut self, message: &Value, skip_tools: &[&str]) -> Vec<AgentEvent> {
         match message.get("role").and_then(Value::as_str) {
-            Some("assistant") => self.assistant(message, skip_tool),
-            Some("toolResult") => self.tool_result(message, skip_tool),
+            Some("assistant") => self.assistant(message, skip_tools),
+            Some("toolResult") => self.tool_result(message, skip_tools),
             _ => Vec::new(),
         }
     }
 
-    fn assistant(&mut self, message: &Value, skip_tool: &str) -> Vec<AgentEvent> {
+    fn assistant(&mut self, message: &Value, skip_tools: &[&str]) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         let Some(blocks) = message.get("content").and_then(Value::as_array) else {
             return events;
@@ -84,7 +85,7 @@ impl MessageNormalizer {
                         continue;
                     };
                     self.tool_names.insert(id.to_string(), name.to_string());
-                    if name == skip_tool {
+                    if skip_tools.contains(&name) {
                         continue;
                     }
                     events.push(AgentEvent::ToolCall {
@@ -99,7 +100,7 @@ impl MessageNormalizer {
         events
     }
 
-    fn tool_result(&mut self, message: &Value, skip_tool: &str) -> Vec<AgentEvent> {
+    fn tool_result(&mut self, message: &Value, skip_tools: &[&str]) -> Vec<AgentEvent> {
         let Some(id) = message.get("toolCallId").and_then(Value::as_str) else {
             return Vec::new();
         };
@@ -109,7 +110,7 @@ impl MessageNormalizer {
             .map(str::to_string)
             .or_else(|| self.tool_names.get(id).cloned())
             .unwrap_or_default();
-        if tool == skip_tool {
+        if skip_tools.contains(&tool.as_str()) {
             return Vec::new();
         }
         let output: String = message
@@ -663,7 +664,7 @@ mod tests {
                 {"type": "toolCall", "id": "t1", "name": "read", "arguments": {"path": "a"}},
                 {"type": "toolCall", "id": "t2", "name": "report_outcome", "arguments": {}},
             ]}),
-            "report_outcome",
+            &["report_outcome"],
         );
         assert_eq!(
             events,
@@ -686,7 +687,7 @@ mod tests {
             m
         };
         assert_eq!(
-            n.normalize(&result("t1", Some("read")), "report_outcome"),
+            n.normalize(&result("t1", Some("read")), &["report_outcome"]),
             vec![AgentEvent::ToolResult {
                 tool_use_id: "t1".into(),
                 tool: "read".into(),
@@ -696,17 +697,62 @@ mod tests {
         );
         // The name falls back to the remembered call.
         assert!(matches!(
-            &n.normalize(&result("t1", None), "report_outcome")[..],
+            &n.normalize(&result("t1", None), &["report_outcome"])[..],
             [AgentEvent::ToolResult { tool, .. }] if tool == "read"
         ));
         assert!(
-            n.normalize(&result("t2", Some("report_outcome")), "report_outcome")
+            n.normalize(&result("t2", Some("report_outcome")), &["report_outcome"])
                 .is_empty()
         );
         assert!(
-            n.normalize(&json!({"role": "user"}), "report_outcome")
+            n.normalize(&json!({"role": "user"}), &["report_outcome"])
                 .is_empty()
         );
+    }
+
+    /// Both host tools are reported by the adapter itself, so the native
+    /// messages naming them are dropped — and only them: a model's own tool
+    /// in the same message is still reported, call and result.
+    #[test]
+    fn both_host_tools_are_suppressed_and_other_tools_are_kept() {
+        let mut n = MessageNormalizer::default();
+        let skip = chocofactory_core::mcp::HOST_TOOL_NAMES;
+        let events = n.normalize(
+            &json!({"role": "assistant", "content": [
+                {"type": "toolCall", "id": "c1", "name": "get_context", "arguments": {"source": "task"}},
+                {"type": "toolCall", "id": "t1", "name": "read", "arguments": {"path": "a"}},
+                {"type": "toolCall", "id": "r1", "name": "report_outcome", "arguments": {}},
+                {"type": "toolCall", "id": "c2", "name": "get_context_like", "arguments": {}},
+            ]}),
+            &skip,
+        );
+        let kept: Vec<&str> = events
+            .iter()
+            .map(|event| match event {
+                AgentEvent::ToolCall { tool, .. } => tool.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        // A tool whose name merely starts with a host tool's is not one.
+        assert_eq!(kept, ["read", "get_context_like"]);
+        for (id, tool, kept) in [
+            ("c1", Some("get_context"), false),
+            ("c1", None, false),
+            ("t1", Some("read"), true),
+            ("r1", None, false),
+            ("c2", None, true),
+        ] {
+            let mut message = json!({"role": "toolResult", "toolCallId": id,
+                "content": [{"type": "text", "text": "x"}]});
+            if let Some(tool) = tool {
+                message["toolName"] = json!(tool);
+            }
+            assert_eq!(
+                !n.normalize(&message, &skip).is_empty(),
+                kept,
+                "{id} {tool:?}"
+            );
+        }
     }
 
     #[test]

@@ -104,6 +104,18 @@ impl Q {
         timers: crate::session::TurnTimers,
         dispatch: bool,
     ) -> Q {
+        Q::build_with(max_agents, timers, dispatch, None).await
+    }
+
+    /// [`Self::build`] with an engine that has been told its daemon's
+    /// address (#369), and a wrapper that records every launch's argv in
+    /// `argv.log` (one JSON array per line).
+    pub(super) async fn build_with(
+        max_agents: Option<u32>,
+        timers: crate::session::TurnTimers,
+        dispatch: bool,
+        base_url: Option<&str>,
+    ) -> Q {
         let pool = connect_in_memory().await.unwrap();
         let dir = tempdir();
         let config = dir.join("config.yaml");
@@ -128,7 +140,15 @@ impl Q {
         crate::test_support::write_executable(
             &dir.join("fake-claude-queue"),
             format!(
-                "#!/bin/sh\nFAKE_CLAUDE_SCRIPT='{}' '{}' \"$@\"\ncode=$?\npython3 -c 'import time; print(time.time())' >> '{}'\nexit $code\n",
+                "#!/bin/sh\n{}FAKE_CLAUDE_SCRIPT='{}' '{}' \"$@\"\ncode=$?\npython3 -c 'import time; print(time.time())' >> '{}'\nexit $code\n",
+                if base_url.is_some() {
+                    format!(
+                        "python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \"$@\" >> '{}'\n",
+                        dir.join("argv.log").display()
+                    )
+                } else {
+                    String::new()
+                },
                 script.display(),
                 fixture_binary("fake_claude_script.py"),
                 dir.join("exits.log").display(),
@@ -143,13 +163,16 @@ impl Q {
             Arc::clone(&events_notify),
             timers,
         );
-        let engine = WorkflowEngine::new(
+        let mut engine = WorkflowEngine::new(
             pool.clone(),
             manager,
             dir.to_path_buf(),
             Some(config.clone()),
             events_notify,
         );
+        if let Some(base_url) = base_url {
+            engine = engine.with_context_base_url(base_url).unwrap();
+        }
         engine.turn_gate().set_tick(StdDuration::from_millis(50));
         let dispatcher = dispatch.then(|| engine.start_dispatcher());
         Q {
@@ -1058,6 +1081,11 @@ impl Q {
 
     /// A second daemon on the same database: what a restart builds.
     pub(super) fn restarted_engine(&self) -> Arc<WorkflowEngine> {
+        self.restarted_engine_at(None)
+    }
+
+    /// [`Self::restarted_engine`], told the address its daemon bound.
+    pub(super) fn restarted_engine_at(&self, base_url: Option<&str>) -> Arc<WorkflowEngine> {
         let adapter: Arc<dyn AgentAdapter> = Arc::new(ClaudeAdapter::with_binary(
             self.dir.join("fake-claude-queue").display().to_string(),
         ));
@@ -1069,13 +1097,16 @@ impl Q {
             Arc::clone(&events_notify),
             queue_timers(),
         );
-        let engine = WorkflowEngine::new(
+        let mut engine = WorkflowEngine::new(
             self.pool.clone(),
             manager,
             self.dir.to_path_buf(),
             Some(self.config.clone()),
             events_notify,
         );
+        if let Some(base_url) = base_url {
+            engine = engine.with_context_base_url(base_url).unwrap();
+        }
         engine.turn_gate().set_tick(StdDuration::from_millis(50));
         engine
     }

@@ -17,6 +17,8 @@ Steps, run in order:
   message, from a sub-agent when `parent` is set.
 - `{"op": "report", "outcome": "done", "summary": ""?, "parent": "toolu_x"?, "is_error": false?}`
   — a `report_outcome` tool_use/tool_result pair.
+- `{"op": "context", "input": {...}?, "is_error": false?}` — a `get_context`
+  tool_use/tool_result pair (#369); `is_error` makes the result a failed read.
 - `{"op": "result", "is_error": false?}` — the CLI's end-of-turn line.
 - `{"op": "echo_turn"}` — wait for the next user turn and repeat it back as
   an assistant message, so a test can assert what the daemon actually sent.
@@ -78,7 +80,7 @@ import sys
 import time
 import uuid
 
-from fake_common import emit, emit_report, read_turn
+from fake_common import emit, emit_context, emit_report, read_turn
 
 
 def assistant_text(session_id, text, parent=None):
@@ -268,6 +270,7 @@ def main():
         first_turn = turn
 
     reports = 0
+    contexts = 0
     for step in steps:
         op = step["op"]
         if op == "read_turn":
@@ -286,6 +289,14 @@ def main():
                 report_input,
                 tool_use_id,
                 step.get("parent"),
+                step.get("is_error", False),
+            )
+        elif op == "context":
+            contexts += 1
+            emit_context(
+                session_id,
+                step.get("input", {"source": "task"}),
+                "toolu_context_{}".format(contexts),
                 step.get("is_error", False),
             )
         elif op == "result":

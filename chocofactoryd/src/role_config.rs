@@ -179,6 +179,7 @@ pub fn resolve(
         cli,
         model: model.clone(),
         role_config: RoleConfig {
+            context: None,
             cwd,
             model: Some(model),
             system_prompt,

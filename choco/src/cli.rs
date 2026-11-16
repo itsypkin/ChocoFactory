@@ -137,10 +137,12 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Serves the `report_outcome` MCP tool over stdio (issue #73): a
-    /// stage's agent turn calls it to state its outcome explicitly instead
-    /// of leaving the engine to infer one from prose. `chocofactoryd` spawns
-    /// this itself via `--mcp-config` as part of every agent turn; it isn't
+    /// Serves the `report_outcome` MCP tool over stdio (issue #73), and
+    /// `get_context` when launched with a task binding (#369): a stage's
+    /// agent turn calls the first to state its outcome explicitly instead
+    /// of leaving the engine to infer one from prose, and the second to read
+    /// one recorded fact about its own task. `chocofactoryd` spawns this
+    /// itself via `--mcp-config` as part of every agent turn; it isn't
     /// meant to be run by hand, hence hidden from `--help`.
     #[command(hide = true)]
     McpServe(McpServeArgs),
@@ -243,6 +245,36 @@ pub struct McpServeArgs {
     /// can only pass when Claude Code applied the settings.
     #[arg(long = "claude-settings-sentinel", allow_hyphen_values = true)]
     pub claude_settings_sentinel: Option<String>,
+
+    /// The task `get_context` reads (#369). The daemon fixes the whole
+    /// `--context-*` binding at launch; there is no environment, lock-file
+    /// or default-port fallback. Giving any one binding flag requires all
+    /// of: this, `--context-session-id`, `--context-base-url` and exactly
+    /// one of `--context-anchor-id` or `--context-no-anchor`. With none of
+    /// them the server offers `report_outcome` only and needs no daemon.
+    #[arg(long = "context-task-id")]
+    pub context_task_id: Option<String>,
+
+    /// The session this launch created or resumed. Launch metadata; never
+    /// sent as a lookup selector.
+    #[arg(long = "context-session-id")]
+    pub context_session_id: Option<String>,
+
+    /// The running daemon's address, e.g. `http://127.0.0.1:4141`: an
+    /// absolute http(s) URL, as `chocofactoryd` actually bound it.
+    #[arg(long = "context-base-url")]
+    pub context_base_url: Option<String>,
+
+    /// The newest stage result recorded when the turn launched: the point
+    /// in history `get_context` may read back from.
+    #[arg(long = "context-anchor-id", conflicts_with = "context_no_anchor")]
+    pub context_anchor_id: Option<String>,
+
+    /// The turn launched before any stage result existed. `get_context`
+    /// then answers task questions only and reports stage results as
+    /// unavailable; it never reads results recorded later.
+    #[arg(long = "context-no-anchor")]
+    pub context_no_anchor: bool,
 }
 
 #[derive(Subcommand)]
@@ -891,6 +923,45 @@ mod tests {
 
     /// `#[command(hide = true)]` hides it from `--help` text; it must not
     /// also make the subcommand itself unparseable.
+    #[test]
+    fn mcp_serve_parses_a_complete_context_binding_either_way() {
+        let parse = |tail: &[&str]| {
+            let mut argv = vec!["choco", "mcp-serve"];
+            argv.extend_from_slice(tail);
+            let Command::McpServe(args) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("expected McpServe");
+            };
+            args
+        };
+        let anchored = parse(&[
+            "--context-task-id",
+            "t-1",
+            "--context-session-id",
+            "s-1",
+            "--context-base-url",
+            "http://127.0.0.1:5000",
+            "--context-anchor-id",
+            "r-1",
+        ]);
+        assert_eq!(anchored.context_task_id.as_deref(), Some("t-1"));
+        assert_eq!(anchored.context_anchor_id.as_deref(), Some("r-1"));
+        assert!(!anchored.context_no_anchor);
+        let empty = parse(&["--context-no-anchor"]);
+        assert!(empty.context_no_anchor && empty.context_anchor_id.is_none());
+        let none = parse(&[]);
+        assert!(none.context_task_id.is_none() && !none.context_no_anchor);
+        assert!(
+            Cli::try_parse_from([
+                "choco",
+                "mcp-serve",
+                "--context-anchor-id",
+                "r",
+                "--context-no-anchor"
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn mcp_serve_is_hidden_but_still_parses() {
         assert!(Cli::try_parse_from(["choco", "mcp-serve"]).is_ok());

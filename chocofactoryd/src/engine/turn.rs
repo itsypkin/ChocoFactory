@@ -174,6 +174,13 @@ pub(super) struct PreparedTurn<'a> {
     pub(super) resume: Option<&'a ResumeSession>,
     pub(super) branch: Option<BranchEntry<'a>>,
     pub(super) session_kind: SessionKind,
+    /// The newest stage result recorded before this turn started (#369): the
+    /// point in history its `get_context` tool may read back from. Read from
+    /// the stage's own payload here, before anything is written, so a
+    /// damaged pointer fails the entry instead of becoming an empty one. A
+    /// resumed turn reads the unchanged persisted pointer again: nothing
+    /// that could advance it happens between an interruption and its resume.
+    preceding_result: Option<String>,
 }
 
 impl WorkflowEngine {
@@ -286,6 +293,8 @@ impl WorkflowEngine {
                 .to_string(),
         };
 
+        let preceding_result = chocofactory_core::context::current_result_id(payload)
+            .map_err(|err| EngineError::MalformedResultPointer(err.0))?;
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(EngineError::NoSuchTask)?;
@@ -404,6 +413,7 @@ impl WorkflowEngine {
             resume,
             branch,
             session_kind,
+            preceding_result,
         })
     }
 
@@ -427,11 +437,12 @@ impl WorkflowEngine {
             capture,
             prompt_from_file,
             prompt,
-            resolved,
+            mut resolved,
             adapter_name,
             resume,
             branch,
             session_kind,
+            preceding_result,
         } = prepared;
         let adapter_name = adapter_name.as_str();
 
@@ -483,6 +494,18 @@ impl WorkflowEngine {
             (None, Some(from)) => sessions::create_resumed(&self.pool, new_session, from).await?,
             (None, None) => sessions::create(&self.pool, new_session).await?,
         };
+
+        // The binding names the session that was just created (the new one
+        // on a resume), so it can only be completed here, and it is set
+        // before the adapter sees the role. A failure ends the launch the
+        // same way a failed start does.
+        match self.launch_context(task_id, &session.id, preceding_result.as_deref()) {
+            Ok(context) => resolved.role_config.context = context,
+            Err(why) => {
+                self.fail_session_start(&session.id).await;
+                return Err(EngineError::ContextBinding(why));
+            }
+        }
 
         // Written before the agent is spawned, so it always precedes anything
         // the turn does.
@@ -652,6 +675,26 @@ impl WorkflowEngine {
             drop(watcher);
         }
         Ok(session.id)
+    }
+
+    /// Settles a session row that was created but whose agent was never
+    /// started, as the other start failures in `launch_turn` do.
+    async fn fail_session_start(&self, session_id: &str) {
+        if let Err(update_err) = sessions::update_status(
+            &self.pool,
+            session_id,
+            SessionStatus::Exited,
+            Some(Utc::now()),
+            Some(SessionEndReason::StartFailed),
+            None,
+        )
+        .await
+        {
+            tracing::error!(
+                session_id, %update_err,
+                "failed to mark session exited after a failed context binding"
+            );
+        }
     }
 
     /// The `worktree_baseline` payload for a read-only role's turn (#172):

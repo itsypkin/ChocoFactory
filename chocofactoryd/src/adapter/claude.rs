@@ -284,6 +284,11 @@ fn spawn(
         mcp_args.push("--require-section".to_string());
         mcp_args.push(section.clone());
     }
+    // #369: the launch's task binding, so the server offers `get_context`.
+    // Startup arguments only — the model's tool arguments cannot change them.
+    if let Some(context) = &cfg.context {
+        mcp_args.extend(context.to_args());
+    }
     // The expected sentinel reaches the tool server as an argument, never
     // through the MCP config's `env` or the `claude` process's environment:
     // either of those would set the variable whether or not Claude Code
@@ -1970,6 +1975,7 @@ mod tests {
     async fn start_spawns_process_and_streams_events() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2023,6 +2029,7 @@ mod tests {
     async fn resume_passes_session_id_through_to_the_cli() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2057,6 +2064,7 @@ mod tests {
     async fn a_sandboxed_spawn_bypasses_claudes_own_permission_prompts() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2093,6 +2101,7 @@ mod tests {
     async fn an_unsandboxed_spawn_leaves_claudes_permission_prompts_enabled() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2127,6 +2136,7 @@ mod tests {
     async fn a_turn_with_no_outcomes_still_gets_the_tool_but_no_routing_instruction() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2166,6 +2176,7 @@ mod tests {
     async fn a_turn_with_outcomes_gets_a_routing_instruction_naming_them() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2233,6 +2244,7 @@ mod tests {
     async fn a_turn_with_report_sections_passes_them_to_the_tool() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2316,6 +2328,7 @@ mod tests {
     ) -> HashMap<String, String> {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2448,6 +2461,7 @@ mod tests {
     fn an_omp_only_level_fails_the_spawn_naming_role_and_suffix() {
         let adapter = ClaudeAdapter::with_binary("/nonexistent/never-spawned");
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2485,6 +2499,7 @@ mod tests {
     async fn a_real_claude_turn_runs_with_an_effort_suffix() {
         let adapter = ClaudeAdapter::new();
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2712,6 +2727,7 @@ mod tests {
     async fn an_isolated_spawn_whose_init_has_no_plugins_key_produces_no_warning() {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2753,6 +2769,7 @@ mod tests {
         ] {
             let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
             let cfg = RoleConfig {
+                context: None,
                 claude_settings: Default::default(),
                 role: "coder".to_string(),
                 project_id: None,
@@ -2822,6 +2839,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"));
         let cfg = RoleConfig {
+            context: None,
             role: "coder".to_string(),
             project_id: None,
             disallowed_tools: Vec::new(),
@@ -2855,6 +2873,7 @@ mod tests {
         );
         let adapter = ClaudeAdapter::with_binary(script.to_str().unwrap().to_string());
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -3126,6 +3145,7 @@ mod tests {
 
         let adapter = ClaudeAdapter::new();
         let cfg = RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -3611,6 +3631,7 @@ mod tests {
         let adapter = ClaudeAdapter::with_binary(fixture_binary("fake_claude_echo_args.py"))
             .with_choco_binary(real_choco());
         let cfg = RoleConfig {
+            context: None,
             claude_settings,
             role: "coder".to_string(),
             project_id: None,
@@ -3833,6 +3854,7 @@ mod tests {
         async fn run(&self, choco: &str) -> Vec<AgentEvent> {
             let adapter = ClaudeAdapter::with_binary(self.wrapper.clone()).with_choco_binary(choco);
             let cfg = RoleConfig {
+                context: None,
                 claude_settings: settings_of("attribution: {commit: secret-commit-text}"),
                 role: "coder".to_string(),
                 project_id: None,
@@ -3996,6 +4018,7 @@ mod tests {
         let adapter =
             ClaudeAdapter::with_binary(gate.wrapper.clone()).with_choco_binary(real_choco());
         let cfg = RoleConfig {
+            context: None,
             claude_settings: settings_of("attribution: {commit: c1}"),
             role: "coder".to_string(),
             project_id: None,

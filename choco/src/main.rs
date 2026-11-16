@@ -120,12 +120,11 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Handled before `Client::new` and outside the `Output`/`run` path
-    // entirely: serving the MCP tool must never depend on `chocofactoryd`
-    // being reachable, and its stdio framing is its own protocol, not
-    // something the `--json`/human-readable split applies to.
+    // entirely: serving the MCP tools must never depend on `chocofactoryd`
+    // being reachable (a report needs no daemon; `get_context` contacts it
+    // only when a call is made), and its stdio framing is its own protocol,
+    // not something the `--json`/human-readable split applies to.
     if let Command::McpServe(args) = &cli.command {
-        let stdin = std::io::stdin();
-        let stdout = std::io::stdout();
         let stage = mcp::StageReport {
             outcomes: args.outcomes.clone(),
             required_sections: args.required_sections.clone(),
@@ -141,7 +140,20 @@ async fn main() -> ExitCode {
                 }
             },
         };
-        return match mcp::serve_checked(&stage, settings_applied, stdin.lock(), stdout.lock()) {
+        // A partial or unusable binding stops the server before it serves
+        // anything; there is no guessing the missing pieces.
+        let context = match mcp::context_client(args) {
+            Ok(context) => context,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let stdout = tokio::io::stdout();
+        return match mcp::serve_checked(&stage, settings_applied, context.as_ref(), stdin, stdout)
+            .await
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");
