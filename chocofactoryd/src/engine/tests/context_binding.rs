@@ -4,17 +4,21 @@
 //! really listening on.
 //!
 //! Read off the `--mcp-config` the engine really gave the spawned CLI: a
-//! wrapper script records every launch's argv. The tool's own answers are
-//! checked against real data in `adapter::context_tests`; here the question is
-//! only which binding each launch path builds. These are isolated fixtures
-//! (a scripted stand-in for `claude`), not runs of the real CLI.
+//! wrapper script records every launch's argv. Each recorded binding is then
+//! run through the same client the spawned CLI uses, against a private daemon
+//! serving the real lookup over the test database, and the full results it
+//! returns (capture and metadata of two distinct preceding results) are
+//! compared with what the database holds. The tool's own behaviour on both
+//! surfaces is tested in `context_tool_tests` and the omp tests in
+//! `adapter::omp_tests`. These are isolated fixtures (a scripted stand-in for
+//! `claude`), not runs of the real CLI.
 
 use super::queue::{Ending, Q, held, queue_timers};
 use super::*;
 
 const URL: &str = "http://127.0.0.1:41999";
 
-use crate::context_tool_tests::serve_context;
+use crate::context_tool_tests::{serve_context, serve_context_with_decoy};
 use chocofactory_core::context_tool::{ContextBinding, ContextClient};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -22,6 +26,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 struct Served {
     url: String,
     hits: Arc<AtomicUsize>,
+    /// While set, this daemon answers with valid but different content under
+    /// the same IDs: it then stands for a wrong address.
+    decoy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Served {
@@ -50,32 +57,63 @@ async fn ask(launch: &Launch, arguments: Value) -> Value {
     serde_json::from_str(&output.text).unwrap()
 }
 
-/// The `prep` departure as the launched turn must see it, and the task it
-/// belongs to.
-async fn assert_sees_prep(launch: &Launch, task: &Task, result_id: &str) {
-    let got = ask(launch, json!({"source": "stage", "stage": "prep"})).await;
-    assert_eq!(got["provenance"], "stage_result", "{got}");
-    assert_eq!(got["task_id"], json!(task.id));
-    assert_eq!(got["result"]["task_id"], json!(task.id));
-    assert_eq!(got["result"]["result_id"], json!(result_id));
-    assert_eq!(got["result"]["source_stage"], "prep");
-    assert_eq!(got["result"]["destination_stage"], "coding");
-    assert_eq!(got["anchor_id"], json!(result_id));
+/// What a launched turn must see through its own binding: both preceding
+/// results of its own task, in full (their stored captures and every
+/// metadata field, as the database holds them), at its own anchor, and its
+/// own task's title. `destination` is where the second departure went.
+async fn assert_sees_history(q: &Q, launch: &Launch, task: &Task, destination: &str) {
+    let results = stage_results(&q.pool, &task.id).await;
+    let stored = |stage: &str| {
+        let event = results
+            .iter()
+            .find(|e| e.payload["source_stage"] == stage)
+            .unwrap_or_else(|| panic!("no recorded result of {stage}: {results:?}"));
+        serde_json::to_value(
+            chocofactory_core::context::AppliedStageResult::from_event(event).unwrap(),
+        )
+        .unwrap()
+    };
+    let (first, second) = (stored("prep"), stored("mid"));
+    assert_eq!(second["previous_result_id"], first["result_id"]);
+    assert_eq!(second["destination_stage"], json!(destination));
+    assert_eq!(first["capture"], json!("FIRST-OUTPUT"), "{first}");
+    assert_eq!(second["capture"], json!("SECOND-OUTPUT"), "{second}");
+    let anchor = second["result_id"].clone();
+    for (arguments, expected) in [
+        (json!({"source": "stage", "stage": "mid"}), &second),
+        (json!({"source": "stage", "stage": "prep"}), &first),
+        (
+            json!({"source": "stage", "result_id": first["result_id"]}),
+            &first,
+        ),
+        (
+            json!({"source": "stage", "result_id": second["result_id"]}),
+            &second,
+        ),
+    ] {
+        let got = ask(launch, arguments.clone()).await;
+        assert_eq!(
+            got,
+            json!({"provenance": "stage_result", "task_id": task.id,
+                   "anchor_id": anchor, "result": expected}),
+            "{arguments}"
+        );
+    }
     let own = ask(launch, json!({"source": "task"})).await;
     assert_eq!(own["task_id"], json!(task.id));
     assert_eq!(own["task"]["title"], json!(task.title));
 }
 
-/// `prep` (a shell stage) departs first, so the agent turn after it has a
-/// preceding result; `FLOW`'s turn is the entry stage and has none.
+/// `prep` then `mid` (shell stages with distinct captures) depart first, so
+/// the agent turn after them has two preceding results; `FLOW`'s turn is the entry stage and has none.
 fn prep_flow(prompt_file: &str) -> String {
     format!(
-        "name: bindflow\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  prep:\n    kind: shell\n    command: \"echo ok\"\n    on: {{ done: coding }}\n  coding:\n    kind: agent_turn\n    role: coder\n    prompt_file: {prompt_file}\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
+        "name: bindflow\nworktree: false\nroles:\n  coder:\n    cli: claude\n    model: sonnet\nstages:\n  prep:\n    kind: shell\n    command: \"echo FIRST-OUTPUT\"\n    capture: text\n    on: {{ done: mid }}\n  mid:\n    kind: shell\n    command: \"echo SECOND-OUTPUT\"\n    capture: text\n    on: {{ done: coding }}\n  coding:\n    kind: agent_turn\n    role: coder\n    prompt_file: {prompt_file}\n    on: {{ done: finished }}\n  finished:\n    kind: terminal\n"
     )
 }
 
 /// A group entered after a shell stage.
-const PREP_GROUP_FLOW: &str = "name: bindgroup\nworktree: true\nroles:\n  coder:\n    cli: claude\n    model: sonnet\n    read_only: true\n    disallowed_tools: [edit, write, notebook_edit]\nstages:\n  prep:\n    kind: shell\n    command: \"echo ok\"\n    on: { done: panel }\n  panel:\n    kind: parallel\n    branches:\n      one: { kind: agent_turn, role: coder, prompt_file: one.md }\n      two: { kind: agent_turn, role: coder, prompt_file: two.md }\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
+const PREP_GROUP_FLOW: &str = "name: bindgroup\nworktree: true\nroles:\n  coder:\n    cli: claude\n    model: sonnet\n    read_only: true\n    disallowed_tools: [edit, write, notebook_edit]\nstages:\n  prep:\n    kind: shell\n    command: \"echo FIRST-OUTPUT\"\n    capture: text\n    on: { done: mid }\n  mid:\n    kind: shell\n    command: \"echo SECOND-OUTPUT\"\n    capture: text\n    on: { done: panel }\n  panel:\n    kind: parallel\n    branches:\n      one: { kind: agent_turn, role: coder, prompt_file: one.md }\n      two: { kind: agent_turn, role: coder, prompt_file: two.md }\n    on: { done: finished }\n  finished:\n    kind: terminal\n";
 
 /// One recorded launch of the stand-in CLI.
 #[derive(Debug, Clone)]
@@ -145,8 +183,8 @@ async fn wait_launches(q: &Q, task_id: &str, count: usize) -> Vec<Launch> {
 async fn bound_q(max_agents: Option<u32>) -> (Q, Served) {
     let (listener, url) = bind_context_listener().await;
     let q = Q::build_with(max_agents, queue_timers(), true, Some(&url)).await;
-    let hits = serve_context(listener, q.pool.clone());
-    (q, Served { url, hits })
+    let (hits, decoy) = serve_context_with_decoy(listener, q.pool.clone(), Default::default());
+    (q, Served { url, hits, decoy })
 }
 
 /// A task running `yaml`, whose turn prompts hold `name` (the key the
@@ -169,10 +207,15 @@ async fn create_from(q: &Q, yaml: &str, file: &str, name: &str, config: Value) -
         .unwrap()
 }
 
+/// The `mid` departure, the newer of the two that precede the turn (the one
+/// the launch's anchor must name).
 async fn departure_of(q: &Q, task_id: &str) -> String {
     let results = stage_results(&q.pool, task_id).await;
-    assert_eq!(results.len(), 1, "{results:?}");
-    results[0].id.clone()
+    let newest = results
+        .iter()
+        .find(|e| e.payload["source_stage"] == "mid")
+        .expect("the mid departure");
+    newest.id.clone()
 }
 
 /// The `workflow_state` pointer, as the engine keeps it.
@@ -208,7 +251,7 @@ async fn a_launch_is_bound_to_its_own_task_session_preceding_result_and_the_daem
     assert_eq!(launch.base_url, format!("{}/", daemon.url));
     let session = q.sessions(&after.id).await.remove(0);
     assert_eq!(launch.session, session.id);
-    assert_sees_prep(&launch, &after, &result).await;
+    assert_sees_history(&q, &launch, &after, "coding").await;
 
     let entry = wait_launches(&q, &first.id, 1).await.remove(0);
     assert_eq!(entry.anchor, None);
@@ -238,7 +281,7 @@ async fn a_launch_is_bound_to_its_own_task_session_preceding_result_and_the_daem
     assert_ne!(second.anchor, launch.anchor, "another task's own result");
     let other_result = departure_of(&q, &other.id).await;
     assert_eq!(second.anchor.as_deref(), Some(other_result.as_str()));
-    assert_sees_prep(&second, &other, &other_result).await;
+    assert_sees_history(&q, &second, &other, "coding").await;
     assert!(daemon.hits() > 0);
     for name in ["job-a", "job-b", "job-c"] {
         q.release(name);
@@ -287,12 +330,12 @@ async fn a_queued_turn_is_bound_when_admitted_to_its_own_session_and_result() {
     assert_ne!(launch.anchor, launch_a.anchor);
     assert_eq!(launch.session, q.sessions(&b.id).await.remove(0).id);
     // Admitted after the slot opened, it reads its own task's history.
-    assert_sees_prep(&launch, &b, &b_result).await;
-    assert_sees_prep(&launch_a, &a, launch_a.anchor.as_deref().unwrap()).await;
-    assert_eq!(
-        stage_results(&q.pool, &a.id).await[0].id,
-        launch_a.anchor.clone().unwrap(),
-        "a's turn was bound to a's own first departure"
+    assert_sees_history(&q, &launch, &b, "coding").await;
+    assert_sees_history(&q, &launch_a, &a, "coding").await;
+    assert_ne!(
+        departure_of(&q, &a.id).await,
+        b_result,
+        "each task has its own results"
     );
     assert!(daemon.hits() > 0);
     q.release("job-b");
@@ -333,16 +376,10 @@ async fn parallel_branches_get_their_own_sessions_and_keep_the_pointer_until_the
             .iter()
             .all(|l| l.anchor.as_deref() == Some(before.as_str()))
     );
-    // Each branch's own binding reads the group's own task and its `prep`.
+    // Each branch's own binding reads the group's own task and both of its
+    // preceding results, in full.
     for launch in &launches {
-        let got = ask(launch, json!({"source": "stage", "stage": "prep"})).await;
-        assert_eq!(got["result"]["task_id"], json!(g.id));
-        assert_eq!(got["result"]["result_id"], json!(before));
-        assert_eq!(got["result"]["destination_stage"], "panel");
-        assert_eq!(
-            ask(launch, json!({"source": "task"})).await["task"]["title"],
-            json!(g.title)
-        );
+        assert_sees_history(&q, launch, &g, "panel").await;
     }
     assert_ne!(launches[0].session, launches[1].session);
 
@@ -359,10 +396,7 @@ async fn parallel_branches_get_their_own_sessions_and_keep_the_pointer_until_the
     let retried = launches.last().unwrap();
     assert_eq!(retried.anchor.as_deref(), Some(before.as_str()));
     assert!(!branch_sessions.contains(&retried.session));
-    assert_eq!(
-        ask(retried, json!({"source": "stage", "stage": "prep"})).await["result"]["result_id"],
-        json!(before)
-    );
+    assert_sees_history(&q, retried, &g, "panel").await;
     assert!(daemon.hits() > 0);
     q.release("two");
 }
@@ -388,7 +422,7 @@ async fn a_fresh_retry_gets_a_new_session_with_the_same_preceding_result() {
     assert_eq!(launches[1].resumed, None, "a fresh retry resumes nothing");
     for launch in &launches {
         assert_eq!(launch.anchor.as_deref(), Some(result.as_str()));
-        assert_sees_prep(launch, &task, &result).await;
+        assert_sees_history(&q, launch, &task, "coding").await;
     }
     assert!(daemon.hits() > 0);
     q.release("job-a");
@@ -431,10 +465,11 @@ async fn a_paused_turn_resumes_with_the_same_boundary_and_the_new_session() {
         .unwrap();
     assert_eq!(new.resumed_from.as_deref(), Some(old.id.as_str()));
     assert_eq!(resumed.session, new.id, "bound to the resumed session");
+    // The resumed turn reads the same two preceding results, in full,
+    // through its own binding.
+    assert_sees_history(&q, resumed, &task, "coding").await;
     assert_eq!(resumed.anchor, launches[0].anchor);
     assert_eq!(resumed.anchor.as_deref(), Some(result.as_str()));
-    // And the resumed turn reads the same preceding result through it.
-    assert_sees_prep(resumed, &task, &result).await;
     assert!(daemon.hits() > 0);
 }
 
@@ -467,15 +502,7 @@ async fn a_restart_then_resume_keeps_the_boundary_and_binds_the_new_address() {
     next.resume_task(&task.id).await.unwrap();
 
     let launches = wait_launches(&q, &task.id, 2).await;
-    assert_eq!(
-        launches[0].base_url,
-        format!("{}/", daemon.url),
-        "history keeps its address"
-    );
-    assert_eq!(launches[1].base_url, format!("{new_url}/"));
     assert_eq!(launches[1].resumed.as_deref(), Some("adapter-1"));
-    assert_eq!(launches[1].anchor.as_deref(), Some(result.as_str()));
-    assert_eq!(launches[1].anchor, launches[0].anchor);
     let new = q
         .sessions(&task.id)
         .await
@@ -483,20 +510,31 @@ async fn a_restart_then_resume_keeps_the_boundary_and_binds_the_new_address() {
         .find(|s| s.id != old.id)
         .unwrap();
     assert_eq!(launches[1].session, new.id);
-    // Each launch reads from the daemon it was told about, not the other.
-    assert_sees_prep(&launches[0], &task, &result).await;
-    let (old_hits, new_hits_before) = (daemon.hits(), new_hits.load(Ordering::SeqCst));
-    assert_eq!(
-        new_hits_before, 0,
-        "the old launch never reached the new daemon"
-    );
-    assert_sees_prep(&launches[1], &task, &result).await;
+    // The first launch reads real content from the daemon it was told about.
+    assert_sees_history(&q, &launches[0], &task, "coding").await;
+    // The old address now stands for a wrong one: valid answers under the
+    // same IDs but other content. The resumed launch must still read the
+    // real content, so it is reaching the daemon it was newly told about.
+    daemon.decoy.store(true, Ordering::SeqCst);
+    let old_hits = daemon.hits();
+    assert_sees_history(&q, &launches[1], &task, "coding").await;
     assert_eq!(
         daemon.hits(),
         old_hits,
         "the resumed launch never used the old address"
     );
     assert!(new_hits.load(Ordering::SeqCst) > 0);
+    let still = ask(&launches[0], json!({"source": "stage", "stage": "mid"})).await;
+    assert_eq!(
+        still["result"]["capture"],
+        json!("DECOY-CAPTURE"),
+        "the decoy really serves other content under the same IDs"
+    );
+    // And the recorded addresses: history keeps its own.
+    assert_eq!(launches[0].base_url, format!("{}/", daemon.url));
+    assert_eq!(launches[1].base_url, format!("{new_url}/"));
+    assert_eq!(launches[1].anchor.as_deref(), Some(result.as_str()));
+    assert_eq!(launches[1].anchor, launches[0].anchor);
 }
 
 #[tokio::test]
@@ -587,16 +625,28 @@ async fn a_damaged_pointer_refuses_the_launch_instead_of_becoming_an_empty_bound
     assert_eq!(launched.len(), 1, "no second launch");
 }
 
-#[tokio::test]
-async fn a_blank_pointer_refuses_the_launch_before_any_session_row_exists() {
-    let (q, _daemon) = bound_q(None).await;
-    q.script(&[("job-a", Ending::Crash)]);
-    let task = q.create("job-a").await;
-    q.wait_started("job-a").await;
-    q.release("job-a");
+/// A task whose last turn crashed and whose pointer is then damaged, retried
+/// fresh while the pool has a free slot (`saturated` false) or none (true).
+/// Either way the retry is refused at once: no session row, no queue row, no
+/// queued event.
+async fn a_blank_pointer_is_refused_with_the_pool(saturated: bool) {
+    let (q, _daemon) = bound_q(Some(1)).await;
+    q.script(&[("job-b", Ending::Crash), ("job-a", Ending::Crash)]);
+    let task = q.create("job-b").await;
+    q.wait_started("job-b").await;
+    q.release("job-b");
     q.wait_status(&task.id, "stuck").await;
     q.wait_running(0).await;
+    let blocker = if saturated {
+        let blocker = q.create("job-a").await;
+        q.wait_started("job-a").await;
+        q.wait_running(1).await;
+        Some(blocker)
+    } else {
+        None
+    };
     let sessions_before = q.sessions(&task.id).await;
+    let events_before = q.events(&task.id).await;
     sqlx::query("UPDATE workflow_state SET payload = json_set(payload, '$.current_result_id', '  ') WHERE task_id = ?")
         .bind(&task.id)
         .execute(&q.pool)
@@ -621,7 +671,7 @@ async fn a_blank_pointer_refuses_the_launch_before_any_session_row_exists() {
         .unwrap_err();
     assert!(
         err.to_string().contains("must not be blank"),
-        "the blank pointer is named: {err}"
+        "the blank pointer is named (saturated pool: {saturated}): {err}"
     );
     let after = q.sessions(&task.id).await;
     assert_eq!(
@@ -633,6 +683,39 @@ async fn a_blank_pointer_refuses_the_launch_before_any_session_row_exists() {
         after.iter().all(|s| s.status != SessionStatus::Active),
         "nothing is left active: {after:?}"
     );
+    assert!(
+        q.rows().await.is_empty(),
+        "a damaged binding must be refused before queue admission (saturated pool: {saturated}): {:?}",
+        q.rows().await
+    );
+    let new_events: Vec<_> = q
+        .events(&task.id)
+        .await
+        .into_iter()
+        .filter(|e| !events_before.iter().any(|old| old.id == e.id))
+        .collect();
+    // The refused entry records only that the stage was entered and that it
+    // failed (stuck); no queue admission event and no session event.
+    assert_eq!(
+        new_events.iter().map(|e| e.event_type).collect::<Vec<_>>(),
+        [EventType::StageEntered, EventType::Error],
+        "{new_events:?}"
+    );
+    assert!(new_events.iter().all(|e| e.session_id.is_none()));
+    if let Some(blocker) = blocker {
+        q.release("job-a");
+        q.wait_status(&blocker.id, "stuck").await;
+    }
+}
+
+#[tokio::test]
+async fn a_blank_pointer_refuses_the_launch_before_any_session_row_exists() {
+    a_blank_pointer_is_refused_with_the_pool(false).await;
+}
+
+#[tokio::test]
+async fn a_blank_pointer_refuses_the_launch_before_it_can_be_queued() {
+    a_blank_pointer_is_refused_with_the_pool(true).await;
 }
 
 #[tokio::test]

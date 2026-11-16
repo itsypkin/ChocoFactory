@@ -4701,6 +4701,38 @@ async fn both_surfaces_show_a_daemon_failure_as_a_tool_error_never_as_an_empty_a
             "a 404 that is no unavailable answer",
             fixed_daemon(404, &result_body).await,
         ),
+        (
+            "a result that belongs to another task than its answer",
+            fixed_daemon(
+                200,
+                &{
+                    let mut body: Value = serde_json::from_str(&result_body).unwrap();
+                    body["result"]["task_id"] = json!("ANOTHER-TASK");
+                    body.to_string()
+                },
+            )
+            .await,
+        ),
+        (
+            "an answer about another task than the bound one",
+            fixed_daemon(
+                200,
+                &{
+                    let mut body: Value = serde_json::from_str(&result_body).unwrap();
+                    body["task_id"] = json!("ANOTHER-TASK");
+                    body.to_string()
+                },
+            )
+            .await,
+        ),
+        (
+            "a task answer carrying an anchor",
+            fixed_daemon(
+                200,
+                r#"{"provenance":"task","task_id":"t","anchor_id":"r","task":{"title":"T","input_available":true,"input":"I","closes":[]}}"#,
+            )
+            .await,
+        ),
         // Nothing listens on port 1.
         ("a refused connection", "http://127.0.0.1:1".to_string()),
     ];
@@ -4881,6 +4913,7 @@ async fn omp_a_cancelled_read_finishes_writes_nothing_and_the_turn_still_reports
     assert!(!again.is_error, "{}", again.text);
     a.reply(&server, "approved").await;
     assert_eq!(a.results.len(), 2);
+    held.shut_down().await;
 }
 
 /// A read that outlasts the driver's request timeout is a visible tool
@@ -4952,6 +4985,16 @@ async fn omp_a_stalled_read_times_out_as_an_error_and_the_turn_still_reports() {
         crate::test_support::dump_tables(server.pool()).await,
         before
     );
+    // A later read and write still go through, then the daemon shuts down.
+    let direct = ContextBinding::new(&a.id, "s", Some(&a.results[0]), server.base_url()).unwrap();
+    let again = ContextClient::new(direct)
+        .unwrap()
+        .call(&json!({"source": "stage", "stage": "gate"}))
+        .await;
+    assert!(!again.is_error, "{}", again.text);
+    a.reply(&server, "approved").await;
+    assert_eq!(a.results.len(), 2);
+    held.shut_down().await;
 }
 
 /// The model's own process stops listening while a read is pending, so the

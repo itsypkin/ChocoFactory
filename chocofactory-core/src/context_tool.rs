@@ -408,10 +408,10 @@ impl ContextClient {
             format!("the daemon's task-context answer was cut short ({status}): {err}")
         })?;
         match status {
-            StatusCode::OK => parse_answer(&body).map_err(|err| {
+            StatusCode::OK => parse_answer(&body, &self.binding.task_id).map_err(|err| {
                 format!("the daemon's task-context answer is not a valid answer: {err}")
             }),
-            StatusCode::NOT_FOUND => match parse_answer(&body) {
+            StatusCode::NOT_FOUND => match parse_answer(&body, &self.binding.task_id) {
                 Ok(answer @ ContextResponse::Unavailable { .. }) => Ok(answer),
                 _ => Err(format!(
                     "the daemon could not find this task's context (404): {}",
@@ -429,8 +429,9 @@ impl ContextClient {
 /// Decodes a daemon answer and checks the facts the daemon always writes.
 /// Plain deserialization would invent a `null` for a nullable field the
 /// body left out and accept a result that contradicts itself; neither is a
-/// recorded fact, so both are refused.
-fn parse_answer(body: &[u8]) -> Result<ContextResponse, String> {
+/// recorded fact, so both are refused. So is an answer about another task
+/// than the bound one, or whose own parts disagree about which task it is.
+fn parse_answer(body: &[u8], bound_task_id: &str) -> Result<ContextResponse, String> {
     let raw: Value = serde_json::from_slice(body).map_err(|err| err.to_string())?;
     let present = |value: &Value, key: &str| -> Result<(), String> {
         if value.get(key).is_none() {
@@ -448,8 +449,38 @@ fn parse_answer(body: &[u8]) -> Result<ContextResponse, String> {
         _ => {}
     }
     let answer: ContextResponse = serde_json::from_value(raw).map_err(|err| err.to_string())?;
+    let (outer_task_id, anchor_id) = match &answer {
+        ContextResponse::Task {
+            task_id, anchor_id, ..
+        }
+        | ContextResponse::StageResult {
+            task_id, anchor_id, ..
+        }
+        | ContextResponse::Snapshot {
+            task_id, anchor_id, ..
+        }
+        | ContextResponse::Unavailable {
+            task_id, anchor_id, ..
+        } => (task_id, anchor_id),
+    };
+    if outer_task_id != bound_task_id {
+        return Err(format!(
+            "the answer is about task {outer_task_id:?}, not the bound task"
+        ));
+    }
+    // The daemon never anchors a task or a snapshot answer.
+    if matches!(
+        answer,
+        ContextResponse::Task { .. } | ContextResponse::Snapshot { .. }
+    ) && anchor_id.is_some()
+    {
+        return Err("a task or snapshot answer carries an anchor_id".into());
+    }
     match &answer {
         ContextResponse::StageResult { result, .. } => {
+            if result.task_id != *outer_task_id {
+                return Err("the result belongs to a different task than the answer".into());
+            }
             if result.source_stage.is_empty() || result.destination_stage.is_empty() {
                 return Err("a stage name is empty".into());
             }
@@ -1158,6 +1189,53 @@ mod tests {
                 "typed 404 without anchor_id",
                 404,
                 without(unavailable.clone(), &["anchor_id"]),
+            ),
+            (
+                "empty source_stage only",
+                200,
+                with(
+                    stage_result_body("x"),
+                    &["result", "source_stage"],
+                    json!(""),
+                ),
+            ),
+            (
+                "empty destination_stage only",
+                200,
+                with(
+                    stage_result_body("x"),
+                    &["result", "destination_stage"],
+                    json!(""),
+                ),
+            ),
+            (
+                "result of another task inside this task's answer",
+                200,
+                with(
+                    stage_result_body("x"),
+                    &["result", "task_id"],
+                    json!("ANOTHER-TASK"),
+                ),
+            ),
+            (
+                "answer about another task than the bound one",
+                200,
+                with(stage_result_body("x"), &["task_id"], json!("ANOTHER-TASK")),
+            ),
+            (
+                "typed 404 about another task",
+                404,
+                with(unavailable.clone(), &["task_id"], json!("ANOTHER-TASK")),
+            ),
+            (
+                "task answer with an anchor",
+                200,
+                with(task.clone(), &["anchor_id"], json!("a1")),
+            ),
+            (
+                "snapshot answer with an anchor",
+                200,
+                with(snapshot.clone(), &["anchor_id"], json!("a1")),
             ),
         ];
         for (label, status, body) in bad {

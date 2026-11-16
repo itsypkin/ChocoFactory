@@ -180,7 +180,10 @@ pub(super) struct PreparedTurn<'a> {
     /// damaged pointer fails the entry instead of becoming an empty one. A
     /// resumed turn reads the unchanged persisted pointer again: nothing
     /// that could advance it happens between an interruption and its resume.
-    preceding_result: Option<String>,
+    /// A binding whose session ID is still a placeholder; launch fills in
+    /// the real one once the session row exists. `None` for an engine that
+    /// was never told its address.
+    context_template: Option<ContextBinding>,
 }
 
 impl WorkflowEngine {
@@ -295,6 +298,11 @@ impl WorkflowEngine {
 
         let preceding_result = chocofactory_core::context::current_result_id(payload)
             .map_err(|err| EngineError::MalformedResultPointer(err.0))?;
+        // Checked here, before the gate can queue the turn or a session row
+        // exists, so a damaged pointer or address is refused at once.
+        let context_template = self
+            .launch_context_template(task_id, preceding_result.as_deref())
+            .map_err(EngineError::ContextBinding)?;
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(EngineError::NoSuchTask)?;
@@ -413,7 +421,7 @@ impl WorkflowEngine {
             resume,
             branch,
             session_kind,
-            preceding_result,
+            context_template,
         })
     }
 
@@ -442,16 +450,9 @@ impl WorkflowEngine {
             resume,
             branch,
             session_kind,
-            preceding_result,
+            context_template,
         } = prepared;
         let adapter_name = adapter_name.as_str();
-
-        // A damaged pointer or address refuses the launch before a baseline,
-        // a queue row or a session row is touched, so nothing is left to
-        // clean up.
-        let context_template = self
-            .launch_context_template(task_id, preceding_result.as_deref())
-            .map_err(EngineError::ContextBinding)?;
 
         // #172: a read-only role's baseline is taken (or, for a resumed turn,
         // looked up) before any session row exists, so a failure here leaves

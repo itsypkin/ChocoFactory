@@ -837,9 +837,22 @@ pub(crate) struct HeldDaemon {
     pub held: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     release: std::sync::Arc<tokio::sync::Notify>,
     pool: sqlx::SqlitePool,
+    stop: std::sync::Arc<tokio::sync::Notify>,
+    server: tokio::task::JoinHandle<()>,
 }
 
 impl HeldDaemon {
+    /// Asks the private daemon to shut down gracefully and requires it to
+    /// finish: a request or worker still held by an abandoned read would
+    /// keep a graceful shutdown waiting.
+    pub(crate) async fn shut_down(self) {
+        self.stop.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), self.server)
+            .await
+            .expect("the private daemon did not shut down: something is still held")
+            .expect("the private daemon's server task failed");
+    }
+
     /// Lets the held lookup finish.
     pub(crate) fn release(&self) {
         self.release.notify_one();
@@ -925,12 +938,21 @@ pub(crate) async fn held_lookup_daemon(pool: sqlx::SqlitePool) -> HeldDaemon {
         .with_state(shared);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stopped = Arc::clone(&stop);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { stopped.notified().await })
+            .await
+            .unwrap()
+    });
     HeldDaemon {
         base,
         held,
         release,
         pool,
+        stop,
+        server,
     }
 }
 
@@ -941,13 +963,30 @@ pub(crate) fn serve_context(
     listener: tokio::net::TcpListener,
     pool: sqlx::SqlitePool,
 ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    serve_context_with_decoy(listener, pool, Default::default()).0
+}
+
+/// [`serve_context`] with a switch: while it is set, every answer keeps its
+/// task, result IDs and shape but carries other content (a different
+/// capture and title). Switched on, the listener stands for a daemon at the
+/// wrong address: a launch sent there reads valid, different content under
+/// the very IDs it asked for.
+pub(crate) fn serve_context_with_decoy(
+    listener: tokio::net::TcpListener,
+    pool: sqlx::SqlitePool,
+    decoy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     use axum::extract::{Path, Query, State};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     #[derive(Clone)]
     struct Shared {
         pool: sqlx::SqlitePool,
         hits: Arc<AtomicUsize>,
+        decoy: Arc<AtomicBool>,
     }
     async fn handler(
         State(shared): State<Shared>,
@@ -958,23 +997,32 @@ pub(crate) fn serve_context(
         shared.hits.fetch_add(1, Ordering::SeqCst);
         let request = crate::api::tasks::parse_context_query(&pairs)
             .unwrap_or_else(|_| panic!("a malformed query reached the daemon: {pairs:?}"));
-        match crate::context::lookup(&shared.pool, &id, &request)
+        let (status, mut body) = match crate::context::lookup(&shared.pool, &id, &request)
             .await
             .unwrap()
         {
             Lookup::Found(answer) => (
                 axum::http::StatusCode::OK,
-                axum::Json(serde_json::to_value(answer).unwrap()),
+                serde_json::to_value(answer).unwrap(),
             ),
             Lookup::UnknownId(answer) => (
                 axum::http::StatusCode::NOT_FOUND,
-                axum::Json(serde_json::to_value(answer).unwrap()),
+                serde_json::to_value(answer).unwrap(),
             ),
             Lookup::NoSuchTask => (
                 axum::http::StatusCode::NOT_FOUND,
-                axum::Json(json!({"error": "no such task"})),
+                json!({"error": "no such task"}),
             ),
+        };
+        if shared.decoy.load(Ordering::SeqCst) {
+            if body["result"].is_object() && !body["result"]["capture"].is_null() {
+                body["result"]["capture"] = json!("DECOY-CAPTURE");
+            }
+            if body["task"].is_object() {
+                body["task"]["title"] = json!("DECOY-TITLE");
+            }
         }
+        (status, axum::Json(body))
     }
     let hits = Arc::new(AtomicUsize::new(0));
     let app = axum::Router::new()
@@ -982,9 +1030,10 @@ pub(crate) fn serve_context(
         .with_state(Shared {
             pool,
             hits: Arc::clone(&hits),
+            decoy: Arc::clone(&decoy),
         });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    hits
+    (hits, decoy)
 }
 
 /// A read abandoned by Ctrl-C while the daemon's lookup holds its read
@@ -1037,6 +1086,8 @@ async fn an_abandoned_read_changes_nothing_and_blocks_neither_a_read_nor_a_write
     // ...and a write: the gate takes another reply and records its result.
     a.reply(&server, "approved").await;
     assert_eq!(a.results.len(), 2);
+    // Finally the private daemon is asked to shut down and must be able to.
+    held.shut_down().await;
 }
 
 // ---------------------------------------------------------------------------

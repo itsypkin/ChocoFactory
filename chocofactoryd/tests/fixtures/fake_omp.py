@@ -709,16 +709,19 @@ def script_context(args, label, cancel=False, close_stdin=False):
     present = {} if args is ABSENT else {"arguments": args}
     assistant([{"type": "toolCall", "id": call_id, "name": "get_context", **present}],
               stop_reason="toolUse")
+    if close_stdin:
+        # The child's end of the host's pipe goes away before the call is
+        # published: the fault exists before the host can possibly answer.
+        os.close(0)
     emit({"type": "host_tool_call", "id": host_id, "toolCallId": call_id,
           "toolName": "get_context", **present})
     if cancel:
         # The model gave up on the call while it is still being answered.
         emit({"type": "host_tool_cancel", "id": host_id})
     if close_stdin:
-        # The child's end of the host's pipe goes away while the call is
-        # pending, so the host's reply cannot be delivered. Stay alive until
-        # the test says the host has dealt with it, then leave.
-        os.close(0)
+        # The pipe was closed before the call was published, so the host's
+        # reply cannot be delivered however fast it answers. Stay alive
+        # until the test says the host has dealt with it, then leave.
         deadline = time.time() + 60
         while not os.path.exists(gate_path("context-undelivered-seen")):
             if time.time() > deadline:
