@@ -934,6 +934,59 @@ pub(crate) async fn held_lookup_daemon(pool: sqlx::SqlitePool) -> HeldDaemon {
     }
 }
 
+/// Serves the real `GET /tasks/{id}/context` lookup over `pool` on an
+/// already-bound listener (so an engine can be told its address first) and
+/// counts every request it answers.
+pub(crate) fn serve_context(
+    listener: tokio::net::TcpListener,
+    pool: sqlx::SqlitePool,
+) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use axum::extract::{Path, Query, State};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Clone)]
+    struct Shared {
+        pool: sqlx::SqlitePool,
+        hits: Arc<AtomicUsize>,
+    }
+    async fn handler(
+        State(shared): State<Shared>,
+        Path(id): Path<String>,
+        Query(pairs): Query<Vec<(String, String)>>,
+    ) -> (axum::http::StatusCode, axum::Json<Value>) {
+        use crate::context::Lookup;
+        shared.hits.fetch_add(1, Ordering::SeqCst);
+        let request = crate::api::tasks::parse_context_query(&pairs)
+            .unwrap_or_else(|_| panic!("a malformed query reached the daemon: {pairs:?}"));
+        match crate::context::lookup(&shared.pool, &id, &request)
+            .await
+            .unwrap()
+        {
+            Lookup::Found(answer) => (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::to_value(answer).unwrap()),
+            ),
+            Lookup::UnknownId(answer) => (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::to_value(answer).unwrap()),
+            ),
+            Lookup::NoSuchTask => (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(json!({"error": "no such task"})),
+            ),
+        }
+    }
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new()
+        .route("/tasks/{id}/context", axum::routing::get(handler))
+        .with_state(Shared {
+            pool,
+            hits: Arc::clone(&hits),
+        });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    hits
+}
+
 /// A read abandoned by Ctrl-C while the daemon's lookup holds its read
 /// transaction changes nothing on the daemon and holds nothing: the
 /// transaction is released, a later read and a later write both complete,

@@ -13,7 +13,58 @@ use super::queue::{Ending, Q, held, queue_timers};
 use super::*;
 
 const URL: &str = "http://127.0.0.1:41999";
-const OTHER_URL: &str = "http://127.0.0.1:42001";
+
+use crate::context_tool_tests::serve_context;
+use chocofactory_core::context_tool::{ContextBinding, ContextClient};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A private daemon's address and the number of context requests it served.
+struct Served {
+    url: String,
+    hits: Arc<AtomicUsize>,
+}
+
+impl Served {
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+/// Binds a listener now (so an engine can be told its address) and serves
+/// the real context lookup over `pool` on it once the pool exists.
+async fn bind_context_listener() -> (tokio::net::TcpListener, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (listener, url)
+}
+
+/// What the tool answers for `launch`'s own binding: the recorded flags of
+/// the launch, run through the same client the spawned CLI uses.
+async fn ask(launch: &Launch, arguments: Value) -> Value {
+    let anchor = launch.anchor.as_deref();
+    assert_eq!(anchor.is_none(), launch.no_anchor);
+    let binding = ContextBinding::new(&launch.task, &launch.session, anchor, &launch.base_url)
+        .unwrap();
+    let output = ContextClient::new(binding).unwrap().call(&arguments).await;
+    assert!(!output.is_error, "{}", output.text);
+    serde_json::from_str(&output.text).unwrap()
+}
+
+/// The `prep` departure as the launched turn must see it, and the task it
+/// belongs to.
+async fn assert_sees_prep(launch: &Launch, task: &Task, result_id: &str) {
+    let got = ask(launch, json!({"source": "stage", "stage": "prep"})).await;
+    assert_eq!(got["provenance"], "stage_result", "{got}");
+    assert_eq!(got["task_id"], json!(task.id));
+    assert_eq!(got["result"]["task_id"], json!(task.id));
+    assert_eq!(got["result"]["result_id"], json!(result_id));
+    assert_eq!(got["result"]["source_stage"], "prep");
+    assert_eq!(got["result"]["destination_stage"], "coding");
+    assert_eq!(got["anchor_id"], json!(result_id));
+    let own = ask(launch, json!({"source": "task"})).await;
+    assert_eq!(own["task_id"], json!(task.id));
+    assert_eq!(own["task"]["title"], json!(task.title));
+}
 
 /// `prep` (a shell stage) departs first, so the agent turn after it has a
 /// preceding result; `FLOW`'s turn is the entry stage and has none.
@@ -89,8 +140,13 @@ async fn wait_launches(q: &Q, task_id: &str, count: usize) -> Vec<Launch> {
     .await
 }
 
-async fn bound_q(max_agents: Option<u32>) -> Q {
-    Q::build_with(max_agents, queue_timers(), true, Some(URL)).await
+/// A fixture whose engine is told the address of a private daemon that
+/// really answers context lookups over its database.
+async fn bound_q(max_agents: Option<u32>) -> (Q, Served) {
+    let (listener, url) = bind_context_listener().await;
+    let q = Q::build_with(max_agents, queue_timers(), true, Some(&url)).await;
+    let hits = serve_context(listener, q.pool.clone());
+    (q, Served { url, hits })
 }
 
 /// A task running `yaml`, whose turn prompts hold `name` (the key the
@@ -130,7 +186,7 @@ async fn pointer_of(q: &Q, task_id: &str) -> Option<String> {
 
 #[tokio::test]
 async fn a_launch_is_bound_to_its_own_task_session_preceding_result_and_the_daemons_address() {
-    let q = bound_q(None).await;
+    let (q, daemon) = bound_q(None).await;
     q.script(&[
         ("job-a", Ending::Report),
         ("job-b", Ending::Report),
@@ -149,9 +205,10 @@ async fn a_launch_is_bound_to_its_own_task_session_preceding_result_and_the_daem
     let result = departure_of(&q, &after.id).await;
     assert_eq!(launch.anchor.as_deref(), Some(result.as_str()));
     assert!(!launch.no_anchor);
-    assert_eq!(launch.base_url, format!("{URL}/"));
+    assert_eq!(launch.base_url, format!("{}/", daemon.url));
     let session = q.sessions(&after.id).await.remove(0);
     assert_eq!(launch.session, session.id);
+    assert_sees_prep(&launch, &after, &result).await;
 
     let entry = wait_launches(&q, &first.id, 1).await.remove(0);
     assert_eq!(entry.anchor, None);
@@ -160,14 +217,29 @@ async fn a_launch_is_bound_to_its_own_task_session_preceding_result_and_the_daem
         "an entry turn has the explicit empty boundary"
     );
     assert_eq!(entry.session, q.sessions(&first.id).await.remove(0).id);
+    // Its turn ends with a report and the task departs, but the turn's own
+    // boundary was empty, so that later result stays invisible to it.
+    q.release("job-c");
+    q.wait_status(&first.id, "closed").await;
+    assert!(!stage_results(&q.pool, &first.id).await.is_empty());
+    for arguments in [
+        json!({"source": "stage", "stage": "coding"}),
+        json!({"source": "stage", "result_id": stage_results(&q.pool, &first.id).await[0].id}),
+    ] {
+        assert_eq!(
+            ask(&entry, arguments).await,
+            json!({"provenance": "unavailable", "task_id": first.id, "anchor_id": null,
+                   "reason": "not_found_in_recorded_history"})
+        );
+    }
 
     let second = wait_launches(&q, &other.id, 1).await.remove(0);
     assert_ne!(second.session, launch.session);
     assert_ne!(second.anchor, launch.anchor, "another task's own result");
-    assert_eq!(
-        second.anchor.as_deref(),
-        Some(departure_of(&q, &other.id).await.as_str())
-    );
+    let other_result = departure_of(&q, &other.id).await;
+    assert_eq!(second.anchor.as_deref(), Some(other_result.as_str()));
+    assert_sees_prep(&second, &other, &other_result).await;
+    assert!(daemon.hits() > 0);
     for name in ["job-a", "job-b", "job-c"] {
         q.release(name);
     }
@@ -194,7 +266,7 @@ async fn an_engine_never_told_its_address_builds_no_binding_and_a_told_one_build
 
 #[tokio::test]
 async fn a_queued_turn_is_bound_when_admitted_to_its_own_session_and_result() {
-    let q = bound_q(Some(1)).await;
+    let (q, daemon) = bound_q(Some(1)).await;
     q.script(&[("job-a", Ending::Report), ("job-b", Ending::Report)]);
     let a = create_from(&q, &prep_flow("job-a.md"), "bind.yaml", "job-a", json!({})).await;
     q.wait_started("job-a").await;
@@ -209,18 +281,26 @@ async fn a_queued_turn_is_bound_when_admitted_to_its_own_session_and_result() {
     q.release("job-a");
     q.wait_started("job-b").await;
     let launch = wait_launches(&q, &b.id, 1).await.remove(0);
-    assert_eq!(
-        launch.anchor.as_deref(),
-        Some(departure_of(&q, &b.id).await.as_str())
-    );
-    assert_ne!(launch.anchor, wait_launches(&q, &a.id, 1).await[0].anchor);
+    let b_result = departure_of(&q, &b.id).await;
+    assert_eq!(launch.anchor.as_deref(), Some(b_result.as_str()));
+    let launch_a = wait_launches(&q, &a.id, 1).await.remove(0);
+    assert_ne!(launch.anchor, launch_a.anchor);
     assert_eq!(launch.session, q.sessions(&b.id).await.remove(0).id);
+    // Admitted after the slot opened, it reads its own task's history.
+    assert_sees_prep(&launch, &b, &b_result).await;
+    assert_sees_prep(&launch_a, &a, launch_a.anchor.as_deref().unwrap()).await;
+    assert_eq!(
+        stage_results(&q.pool, &a.id).await[0].id,
+        launch_a.anchor.clone().unwrap(),
+        "a's turn was bound to a's own first departure"
+    );
+    assert!(daemon.hits() > 0);
     q.release("job-b");
 }
 
 #[tokio::test]
 async fn parallel_branches_get_their_own_sessions_and_keep_the_pointer_until_the_group_departs() {
-    let q = bound_q(None).await;
+    let (q, daemon) = bound_q(None).await;
     q.script_branches(&[
         ("BRANCH-ONE", "one", Ending::Report),
         ("BRANCH-TWO", "two", Ending::Crash),
@@ -253,6 +333,15 @@ async fn parallel_branches_get_their_own_sessions_and_keep_the_pointer_until_the
             .iter()
             .all(|l| l.anchor.as_deref() == Some(before.as_str()))
     );
+    // Each branch's own binding reads the group's own task and its `prep`.
+    for launch in &launches {
+        let got = ask(launch, json!({"source": "stage", "stage": "prep"})).await;
+        assert_eq!(got["result"]["task_id"], json!(g.id));
+        assert_eq!(got["result"]["result_id"], json!(before));
+        assert_eq!(got["result"]["destination_stage"], "panel");
+        assert_eq!(ask(launch, json!({"source": "task"})).await["task"]["title"], json!(g.title));
+    }
+    assert_ne!(launches[0].session, launches[1].session);
 
     // One branch finishes, the other fails and is retried: the pointer has
     // not moved (the group has not departed) and neither has the anchor.
@@ -267,12 +356,17 @@ async fn parallel_branches_get_their_own_sessions_and_keep_the_pointer_until_the
     let retried = launches.last().unwrap();
     assert_eq!(retried.anchor.as_deref(), Some(before.as_str()));
     assert!(!branch_sessions.contains(&retried.session));
+    assert_eq!(
+        ask(retried, json!({"source": "stage", "stage": "prep"})).await["result"]["result_id"],
+        json!(before)
+    );
+    assert!(daemon.hits() > 0);
     q.release("two");
 }
 
 #[tokio::test]
 async fn a_fresh_retry_gets_a_new_session_with_the_same_preceding_result() {
-    let q = bound_q(None).await;
+    let (q, daemon) = bound_q(None).await;
     q.script(&[("job-a", Ending::Crash)]);
     let task = create_from(&q, &prep_flow("job-a.md"), "bind.yaml", "job-a", json!({})).await;
     q.wait_started("job-a").await;
@@ -291,13 +385,15 @@ async fn a_fresh_retry_gets_a_new_session_with_the_same_preceding_result() {
     assert_eq!(launches[1].resumed, None, "a fresh retry resumes nothing");
     for launch in &launches {
         assert_eq!(launch.anchor.as_deref(), Some(result.as_str()));
+        assert_sees_prep(launch, &task, &result).await;
     }
+    assert!(daemon.hits() > 0);
     q.release("job-a");
 }
 
 #[tokio::test]
 async fn a_paused_turn_resumes_with_the_same_boundary_and_the_new_session() {
-    let q = bound_q(None).await;
+    let (q, daemon) = bound_q(None).await;
     q.script(&[("job-a", Ending::Report)]);
     let task = create_from(&q, &prep_flow("job-a.md"), "bind.yaml", "job-a", json!({})).await;
     q.wait_started("job-a").await;
@@ -334,16 +430,23 @@ async fn a_paused_turn_resumes_with_the_same_boundary_and_the_new_session() {
     assert_eq!(resumed.session, new.id, "bound to the resumed session");
     assert_eq!(resumed.anchor, launches[0].anchor);
     assert_eq!(resumed.anchor.as_deref(), Some(result.as_str()));
+    // And the resumed turn reads the same preceding result through it.
+    assert_sees_prep(resumed, &task, &result).await;
+    assert!(daemon.hits() > 0);
 }
 
 #[tokio::test]
 async fn a_restart_then_resume_keeps_the_boundary_and_binds_the_new_address() {
-    let q = bound_q(None).await;
+    let (q, daemon) = bound_q(None).await;
     q.script(&[("job-a", Ending::Report)]);
     let task = create_from(&q, &prep_flow("job-a.md"), "bind.yaml", "job-a", json!({})).await;
     q.wait_started("job-a").await;
     q.engine.pause_task(&task.id, false).await.unwrap();
-    let next = q.restarted_engine_at(Some(OTHER_URL));
+    // The restarted daemon listens somewhere else; the old address stays up
+    // (and counts) so a launch sent to it would show.
+    let (listener, new_url) = bind_context_listener().await;
+    let new_hits = serve_context(listener, q.pool.clone());
+    let next = q.restarted_engine_at(Some(&new_url));
     q.crash_and_sweep(&next).await;
     assert_eq!(q.status(&task.id).await, "paused");
     let old = q.sessions(&task.id).await.remove(0);
@@ -363,10 +466,10 @@ async fn a_restart_then_resume_keeps_the_boundary_and_binds_the_new_address() {
     let launches = wait_launches(&q, &task.id, 2).await;
     assert_eq!(
         launches[0].base_url,
-        format!("{URL}/"),
+        format!("{}/", daemon.url),
         "history keeps its address"
     );
-    assert_eq!(launches[1].base_url, format!("{OTHER_URL}/"));
+    assert_eq!(launches[1].base_url, format!("{new_url}/"));
     assert_eq!(launches[1].resumed.as_deref(), Some("adapter-1"));
     assert_eq!(launches[1].anchor.as_deref(), Some(result.as_str()));
     assert_eq!(launches[1].anchor, launches[0].anchor);
@@ -377,11 +480,63 @@ async fn a_restart_then_resume_keeps_the_boundary_and_binds_the_new_address() {
         .find(|s| s.id != old.id)
         .unwrap();
     assert_eq!(launches[1].session, new.id);
+    // Each launch reads from the daemon it was told about, not the other.
+    assert_sees_prep(&launches[0], &task, &result).await;
+    let (old_hits, new_hits_before) = (daemon.hits(), new_hits.load(Ordering::SeqCst));
+    assert_eq!(new_hits_before, 0, "the old launch never reached the new daemon");
+    assert_sees_prep(&launches[1], &task, &result).await;
+    assert_eq!(daemon.hits(), old_hits, "the resumed launch never used the old address");
+    assert!(new_hits.load(Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
+async fn a_resume_with_no_provable_pointer_gets_an_explicit_empty_boundary_not_an_invented_one() {
+    let (q, daemon) = bound_q(None).await;
+    q.script(&[("job-a", Ending::Report)]);
+    let task = create_from(&q, &prep_flow("job-a.md"), "bind.yaml", "job-a", json!({})).await;
+    q.wait_started("job-a").await;
+    let result = departure_of(&q, &task.id).await;
+    q.engine.pause_task(&task.id, true).await.unwrap();
+    q.wait_status(&task.id, "paused").await;
+    let old = q.sessions(&task.id).await.remove(0);
+    sessions::set_adapter_session_id(&q.pool, &old.id, "adapter-1")
+        .await
+        .unwrap();
+    // A task from before results were recorded has no pointer in its state.
+    sqlx::query("UPDATE workflow_state SET payload = json_remove(payload, '$.current_result_id') WHERE task_id = ?")
+        .bind(&task.id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    fs::write(
+        q.dir.join("fake-claude-queue.json"),
+        json!(held(&q.dir, "job-a", Ending::Report)).to_string(),
+    )
+    .unwrap();
+    q.release("job-a");
+    q.engine.resume_task(&task.id).await.unwrap();
+    let launches = wait_launches(&q, &task.id, 2).await;
+    let resumed = &launches[1];
+    assert_eq!(resumed.resumed.as_deref(), Some("adapter-1"));
+    assert!(resumed.no_anchor && resumed.anchor.is_none());
+    // The result that does exist is not found through it, and no ID is made up.
+    for arguments in [
+        json!({"source": "stage", "stage": "prep"}),
+        json!({"source": "stage", "result_id": result}),
+    ] {
+        assert_eq!(
+            ask(resumed, arguments).await,
+            json!({"provenance": "unavailable", "task_id": task.id, "anchor_id": null,
+                   "reason": "not_found_in_recorded_history"})
+        );
+    }
+    assert_eq!(ask(resumed, json!({"source": "task"})).await["task"]["title"], json!(task.title));
+    assert!(daemon.hits() > 0);
 }
 
 #[tokio::test]
 async fn a_damaged_pointer_refuses_the_launch_instead_of_becoming_an_empty_boundary() {
-    let q = bound_q(None).await;
+    let (q, _daemon) = bound_q(None).await;
     q.script(&[("job-a", Ending::Crash)]);
     let task = q.create("job-a").await;
     q.wait_started("job-a").await;
@@ -421,7 +576,7 @@ async fn a_damaged_pointer_refuses_the_launch_instead_of_becoming_an_empty_bound
 
 #[tokio::test]
 async fn a_blank_pointer_refuses_the_launch_before_any_session_row_exists() {
-    let q = bound_q(None).await;
+    let (q, _daemon) = bound_q(None).await;
     q.script(&[("job-a", Ending::Crash)]);
     let task = q.create("job-a").await;
     q.wait_started("job-a").await;
@@ -470,6 +625,10 @@ async fn a_blank_pointer_refuses_the_launch_before_any_session_row_exists() {
 #[tokio::test]
 async fn a_standing_session_reestablished_by_a_message_is_bound_to_its_existing_session() {
     let pool = connect_in_memory().await.unwrap();
+    let (first_listener, first_url) = bind_context_listener().await;
+    let (second_listener, second_url) = bind_context_listener().await;
+    let first_hits = serve_context(first_listener, pool.clone());
+    let second_hits = serve_context(second_listener, pool.clone());
     let workflows_dir = tempdir();
     write_chat_workflow(&workflows_dir);
     let log = workflows_dir.join("argv.log");
@@ -488,7 +647,7 @@ async fn a_standing_session_reestablished_by_a_message_is_bound_to_its_existing_
         &wrapper.display().to_string(),
         &workflows_dir,
     )
-    .with_context_base_url(URL)
+    .with_context_base_url(&first_url)
     .unwrap();
     let task = engine
         .create_task(&project_id, "chat", "t", "hello", json!({}))
@@ -526,7 +685,7 @@ async fn a_standing_session_reestablished_by_a_message_is_bound_to_its_existing_
         None,
         events_notify,
     )
-    .with_context_base_url(OTHER_URL)
+    .with_context_base_url(&second_url)
     .unwrap();
     next.send_message_or_resume(&task.id, "are you still there?")
         .await
@@ -541,7 +700,7 @@ async fn a_standing_session_reestablished_by_a_message_is_bound_to_its_existing_
         }
     })
     .await;
-    assert_eq!(launches[0].base_url, format!("{URL}/"));
+    assert_eq!(launches[0].base_url, format!("{first_url}/"));
     let resumed = &launches[1];
     assert!(resumed.resumed.is_some(), "the message resumed the session");
     assert_eq!(
@@ -549,8 +708,19 @@ async fn a_standing_session_reestablished_by_a_message_is_bound_to_its_existing_
         "the existing session, not a new row"
     );
     assert_eq!(resumed.task, task.id);
-    assert_eq!(resumed.base_url, format!("{OTHER_URL}/"));
+    assert_eq!(resumed.base_url, format!("{second_url}/"));
     assert!(resumed.no_anchor, "a chat has recorded no stage result");
+    // Read through the re-established binding: this task, this session's
+    // boundary, and only the new daemon.
+    let own = ask(resumed, json!({"source": "task"})).await;
+    assert_eq!(own["task_id"], json!(task.id));
+    assert_eq!(own["task"]["title"], json!(task.title));
+    assert_eq!(
+        ask(resumed, json!({"source": "stage", "stage": "chat"})).await["reason"],
+        "not_found_in_recorded_history"
+    );
+    assert_eq!(first_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(second_hits.load(Ordering::SeqCst), 2);
     assert_eq!(
         sessions::list_for_task(&pool, &task.id)
             .await
