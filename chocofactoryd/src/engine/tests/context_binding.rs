@@ -45,10 +45,14 @@ fn value_after(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+/// The launches the wrapper has logged. Each record is one `write(2)` of a
+/// complete line to an append-only file, so only newline-terminated lines are
+/// parsed (a line still being written is read on the next poll), and a
+/// committed line that does not parse fails the test.
 fn launches_in(log: &Path) -> Vec<Launch> {
-    fs::read_to_string(log)
-        .unwrap_or_default()
-        .lines()
+    let text = fs::read_to_string(log).unwrap_or_default();
+    text.split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
         .filter_map(|line| {
             let argv: Vec<String> = serde_json::from_str(line).unwrap();
             let config: Value = serde_json::from_str(&value_after(&argv, "--mcp-config")?).unwrap();
@@ -416,6 +420,54 @@ async fn a_damaged_pointer_refuses_the_launch_instead_of_becoming_an_empty_bound
 }
 
 #[tokio::test]
+async fn a_blank_pointer_refuses_the_launch_before_any_session_row_exists() {
+    let q = bound_q(None).await;
+    q.script(&[("job-a", Ending::Crash)]);
+    let task = q.create("job-a").await;
+    q.wait_started("job-a").await;
+    q.release("job-a");
+    q.wait_status(&task.id, "stuck").await;
+    q.wait_running(0).await;
+    let sessions_before = q.sessions(&task.id).await;
+    sqlx::query("UPDATE workflow_state SET payload = json_set(payload, '$.current_result_id', '  ') WHERE task_id = ?")
+        .bind(&task.id)
+        .execute(&q.pool)
+        .await
+        .unwrap();
+    // A launch that created a row and then failed to bind would settle it
+    // with an `end_reason` write; refuse that write, so a cleanup that
+    // cannot happen is visible instead of silently lost.
+    sqlx::query(
+        "CREATE TRIGGER refuse_cleanup BEFORE UPDATE ON sessions \
+         WHEN NEW.end_reason = 'start_failed' \
+         BEGIN SELECT RAISE(ABORT, 'cleanup refused'); END",
+    )
+    .execute(&q.pool)
+    .await
+    .unwrap();
+
+    let err = q
+        .engine
+        .retry_task(&task.id, RetryMode::Fresh)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must not be blank"),
+        "the blank pointer is named: {err}"
+    );
+    let after = q.sessions(&task.id).await;
+    assert_eq!(
+        after.iter().map(|s| &s.id).collect::<Vec<_>>(),
+        sessions_before.iter().map(|s| &s.id).collect::<Vec<_>>(),
+        "no session row was created for the refused launch"
+    );
+    assert!(
+        after.iter().all(|s| s.status != SessionStatus::Active),
+        "nothing is left active: {after:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_standing_session_reestablished_by_a_message_is_bound_to_its_existing_session() {
     let pool = connect_in_memory().await.unwrap();
     let workflows_dir = tempdir();
@@ -425,7 +477,7 @@ async fn a_standing_session_reestablished_by_a_message_is_bound_to_its_existing_
     crate::test_support::write_executable(
         &wrapper,
         format!(
-            "#!/bin/sh\npython3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\npython3 -c 'import json,os,sys; os.write(1, (json.dumps(sys.argv[1:]) + chr(10)).encode())' \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
             log.display(),
             fixture_binary("fake_claude.py"),
         ),

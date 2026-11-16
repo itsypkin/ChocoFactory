@@ -132,8 +132,9 @@ dropped request releases it.
 Every agent turn the daemon launches gets a read-only `get_context` tool, on
 both `claude` and `omp`, bound at launch to that turn's own task and to the
 point in history it started from. It returns one JSON value with the same
-shapes as above, in full, and never completes, reports or advances a turn: a
-turn still ends only by `report_outcome`.
+shapes as above, in full. A read never completes, reports or advances a turn.
+A workflow stage's turn is accepted only through its own `report_outcome`; a
+standing chat session has no report and its turns end as they always did.
 
 | call | returns |
 |---|---|
@@ -153,12 +154,16 @@ it knows about that launch, never from a model's arguments:
 
 - **task**, **session** and **address**: the task and session the daemon
   created or resumed for this turn, and the address it is actually listening
-  on (so `CHOCOFACTORY_PORT=0` works). A turn resumed after an interruption or
-  a daemon restart is bound to its new session and the new address.
+  on (so `CHOCOFACTORY_PORT=0` works). A workflow turn resumed after an
+  interruption or a daemon restart starts a new session and is bound to that
+  session and the current address. A standing chat session whose process is
+  started again by a new message keeps its existing session: it is bound to
+  that session, the stored boundary and the current address.
 - **anchor**: the newest stage result recorded before the turn started, sent
   with every stage request. Results recorded later are invisible to it, so
   the answer to "what did the reviewer say" cannot change under a running
-  turn, and a later result's ID is `not_at_or_before_anchor`. A resumed or
+  turn. A later result's ID is `not_at_or_before_anchor` when the chain from
+  the anchor is fully readable, and `history_gap` when a link has been pruned. A resumed or
   retried turn gets the same anchor again unless the task has since moved
   through a stage.
 
@@ -176,8 +181,11 @@ A typed `unavailable` answer (HTTP 200, or the 404 for a missing result or
 anchor) is a successful tool result. An unknown task's plain error body, any
 other HTTP status, an answer that is not one of the shapes above, a refused or
 dropped connection and a request that takes longer than 30 seconds are tool
-errors, never an empty result. The tool makes one request per call, no
-retries, and writes nothing.
+errors, never an empty result. The tool makes one request per call (an
+empty boundary asks only for the task), follows no redirect (a 3xx status is a
+tool error), and an answer that omits a field the daemon always writes or
+contradicts itself (for example a `capture` with `capture_present: false`) is a
+tool error too. There are no retries, and nothing is written.
 
 `choco mcp-serve` (hidden, started by the daemon) takes the binding as
 `--context-task-id`, `--context-session-id`, `--context-base-url` and exactly

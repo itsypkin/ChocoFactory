@@ -246,7 +246,7 @@ pub fn tool_definition() -> Value {
     json!({
         "name": GET_CONTEXT_TOOL_NAME,
         "description": "Read-only lookup of ONE recorded fact about THIS task; it changes nothing, \
-            does not report an outcome and never ends your turn (you still finish with \
+            does not report an outcome and never ends your turn by itself (it is not \
             report_outcome). source=\"task\" returns the task's original title, input and closing \
             issues. source=\"stage\" with `stage` returns the full recorded result of the latest \
             time the task left that stage (add `outcome` to require that exact outcome); with \

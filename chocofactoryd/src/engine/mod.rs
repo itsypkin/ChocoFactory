@@ -1699,6 +1699,18 @@ impl WorkflowEngine {
         Ok(self)
     }
 
+    /// Everything of a launch's binding that is known before its session
+    /// row exists, checked so a bad pointer or address refuses the launch
+    /// before anything durable is written. The caller puts the real session
+    /// ID in once the row exists (the placeholder is never used for a call).
+    fn launch_context_template(
+        &self,
+        task_id: &str,
+        preceding_result: Option<&str>,
+    ) -> Result<Option<ContextBinding>, String> {
+        self.launch_context(task_id, "session-not-created-yet", preceding_result)
+    }
+
     /// The `get_context` binding for a launch of `session_id`, which may
     /// read stage results back from `preceding_result` (`None`: none had
     /// been recorded). `None` when this engine was never told its address.

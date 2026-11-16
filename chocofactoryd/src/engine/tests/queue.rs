@@ -143,7 +143,7 @@ impl Q {
                 "#!/bin/sh\n{}FAKE_CLAUDE_SCRIPT='{}' '{}' \"$@\"\ncode=$?\npython3 -c 'import time; print(time.time())' >> '{}'\nexit $code\n",
                 if base_url.is_some() {
                     format!(
-                        "python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \"$@\" >> '{}'\n",
+                        "python3 -c 'import json,os,sys; os.write(1, (json.dumps(sys.argv[1:]) + chr(10)).encode())' \"$@\" >> '{}'\n",
                         dir.join("argv.log").display()
                     )
                 } else {

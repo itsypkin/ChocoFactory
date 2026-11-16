@@ -2781,7 +2781,7 @@ async fn real_binary_binds_get_context_to_its_actual_port_when_the_port_is_zero(
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\npython3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\npython3 -c 'import json,os,sys; os.write(1, (json.dumps(sys.argv[1:]) + chr(10)).encode())' \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
             argv_log.display(),
             workspace_binary("mock-claude").display()
         ),
@@ -2859,7 +2859,13 @@ async fn real_binary_binds_get_context_to_its_actual_port_when_the_port_is_zero(
     let line = wait_until("the CLI to be launched", || async {
         std::fs::read_to_string(&argv_log)
             .ok()
-            .and_then(|text| text.lines().next().map(str::to_string))
+            // A complete (newline-terminated) record only.
+            .and_then(|text| {
+                text.split_inclusive('\n')
+                    .next()
+                    .filter(|line| line.ends_with('\n'))
+                    .map(str::to_string)
+            })
             .ok_or_else(|| "no launch yet".to_string())
     })
     .await;

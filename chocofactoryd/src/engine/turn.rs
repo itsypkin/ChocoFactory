@@ -446,6 +446,13 @@ impl WorkflowEngine {
         } = prepared;
         let adapter_name = adapter_name.as_str();
 
+        // A damaged pointer or address refuses the launch before a baseline,
+        // a queue row or a session row is touched, so nothing is left to
+        // clean up.
+        let context_template = self
+            .launch_context_template(task_id, preceding_result.as_deref())
+            .map_err(EngineError::ContextBinding)?;
+
         // #172: a read-only role's baseline is taken (or, for a resumed turn,
         // looked up) before any session row exists, so a failure here leaves
         // nothing behind and the agent is never started.
@@ -496,15 +503,11 @@ impl WorkflowEngine {
         };
 
         // The binding names the session that was just created (the new one
-        // on a resume), so it can only be completed here, and it is set
-        // before the adapter sees the role. A failure ends the launch the
-        // same way a failed start does.
-        match self.launch_context(task_id, &session.id, preceding_result.as_deref()) {
-            Ok(context) => resolved.role_config.context = context,
-            Err(why) => {
-                self.fail_session_start(&session.id).await;
-                return Err(EngineError::ContextBinding(why));
-            }
+        // on a resume), so its session ID can only be filled in here. It was
+        // fully checked before the row existed, so nothing here can fail.
+        if let Some(mut binding) = context_template {
+            binding.session_id = session.id.clone();
+            resolved.role_config.context = Some(binding);
         }
 
         // Written before the agent is spawned, so it always precedes anything
@@ -675,26 +678,6 @@ impl WorkflowEngine {
             drop(watcher);
         }
         Ok(session.id)
-    }
-
-    /// Settles a session row that was created but whose agent was never
-    /// started, as the other start failures in `launch_turn` do.
-    async fn fail_session_start(&self, session_id: &str) {
-        if let Err(update_err) = sessions::update_status(
-            &self.pool,
-            session_id,
-            SessionStatus::Exited,
-            Some(Utc::now()),
-            Some(SessionEndReason::StartFailed),
-            None,
-        )
-        .await
-        {
-            tracing::error!(
-                session_id, %update_err,
-                "failed to mark session exited after a failed context binding"
-            );
-        }
     }
 
     /// The `worktree_baseline` payload for a read-only role's turn (#172):
