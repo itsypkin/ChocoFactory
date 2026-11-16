@@ -4925,13 +4925,21 @@ async fn omp_a_stalled_read_times_out_as_an_error_and_the_turn_still_reports() {
             _ => None,
         })
         .expect("the stalled call was answered");
-    assert!(result.0, "a timeout is an error, not an answer: {}", result.1);
+    assert!(
+        result.0,
+        "a timeout is an error, not an answer: {}",
+        result.1
+    );
     assert!(
         !result.1.contains("provenance"),
         "no answer was invented: {}",
         result.1
     );
-    assert!(script.lines().contains(&"context_result:c:error".to_string()));
+    assert!(
+        script
+            .lines()
+            .contains(&"context_result:c:error".to_string())
+    );
     assert!(
         script
             .lines()
@@ -4955,8 +4963,7 @@ async fn omp_an_answer_that_cannot_be_delivered_is_logged_as_an_error() {
     let (server, project) = server_with_flow().await;
     let mut a = new_task(&server, &project, "A", &[]).await;
     a.reply(&server, "again").await;
-    let binding =
-        ContextBinding::new(&a.id, "s", Some(&a.results[0]), server.base_url()).unwrap();
+    let binding = ContextBinding::new(&a.id, "s", Some(&a.results[0]), server.base_url()).unwrap();
     let before = crate::test_support::dump_tables(server.pool()).await;
 
     let env = Env::new();
@@ -4994,7 +5001,10 @@ async fn omp_an_answer_that_cannot_be_delivered_is_logged_as_an_error() {
     };
     assert!(result.0, "{}", result.1);
     assert_eq!(result.1, "omp could not be sent the reply to get_context");
-    assert!(!result.1.contains(&a.title), "the daemon's answer is not shown as delivered");
+    assert!(
+        !result.1.contains(&a.title),
+        "the daemon's answer is not shown as delivered"
+    );
     std::fs::write(script.gates.join("context-undelivered-seen"), "").unwrap();
     events.extend(drain(&mut handle).await);
     assert!(

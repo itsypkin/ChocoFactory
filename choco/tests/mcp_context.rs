@@ -433,6 +433,10 @@ async fn a_successful_read_between_thin_reports_does_not_spend_the_allowance() {
             .contains("\"title\":\"T\"")
     );
     assert_eq!(daemon.hits.load(Ordering::SeqCst), 1);
-    assert_eq!(is_error(2), json!(true), "second thin report is still rejected");
+    assert_eq!(
+        is_error(2),
+        json!(true),
+        "second thin report is still rejected"
+    );
     assert_eq!(is_error(3), json!(false), "third thin report is accepted");
 }

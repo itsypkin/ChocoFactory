@@ -1034,8 +1034,16 @@ mod tests {
             for (label, client, arguments) in [
                 ("task", &anchored, json!({"source": "task"})),
                 ("stage", &anchored, json!({"source": "stage", "stage": "s"})),
-                ("id", &anchored, json!({"source": "stage", "result_id": "r1"})),
-                ("empty boundary", &empty, json!({"source": "stage", "stage": "s"})),
+                (
+                    "id",
+                    &anchored,
+                    json!({"source": "stage", "result_id": "r1"}),
+                ),
+                (
+                    "empty boundary",
+                    &empty,
+                    json!({"source": "stage", "stage": "s"}),
+                ),
             ] {
                 let output = client.call(&arguments).await;
                 assert!(output.is_error, "{status} {label}: {}", output.text);
@@ -1089,13 +1097,21 @@ mod tests {
             (
                 "unknown source_kind",
                 200,
-                with(stage_result_body("x"), &["result", "source_kind"], json!("bogus")),
+                with(
+                    stage_result_body("x"),
+                    &["result", "source_kind"],
+                    json!("bogus"),
+                ),
             ),
             (
                 "capture without capture_present",
                 200,
                 with(
-                    with(stage_result_body("x"), &["result", "capture_present"], json!(false)),
+                    with(
+                        stage_result_body("x"),
+                        &["result", "capture_present"],
+                        json!(false),
+                    ),
                     &["result", "capture"],
                     json!("stray"),
                 ),
@@ -1103,10 +1119,22 @@ mod tests {
             (
                 "empty previous_result_id",
                 200,
-                with(stage_result_body("x"), &["result", "previous_result_id"], json!("")),
+                with(
+                    stage_result_body("x"),
+                    &["result", "previous_result_id"],
+                    json!(""),
+                ),
             ),
-            ("task without anchor_id", 200, without(task.clone(), &["anchor_id"])),
-            ("task without input", 200, without(task.clone(), &["task", "input"])),
+            (
+                "task without anchor_id",
+                200,
+                without(task.clone(), &["anchor_id"]),
+            ),
+            (
+                "task without input",
+                200,
+                without(task.clone(), &["task", "input"]),
+            ),
             (
                 "task input contradicts input_available",
                 200,
@@ -1121,7 +1149,11 @@ mod tests {
                     json!("stray"),
                 ),
             ),
-            ("snapshot without anchor_id", 200, without(snapshot.clone(), &["anchor_id"])),
+            (
+                "snapshot without anchor_id",
+                200,
+                without(snapshot.clone(), &["anchor_id"]),
+            ),
             (
                 "typed 404 without anchor_id",
                 404,
@@ -1139,15 +1171,15 @@ mod tests {
             task,
             snapshot,
             with(
-                with(stage_result_body("x"), &["result", "capture_present"], json!(false)),
+                with(
+                    stage_result_body("x"),
+                    &["result", "capture_present"],
+                    json!(false),
+                ),
                 &["result", "capture"],
                 Value::Null,
             ),
-            with(
-                stage_result_body("x"),
-                &["result", "capture"],
-                Value::Null,
-            ),
+            with(stage_result_body("x"), &["result", "capture"], Value::Null),
         ];
         for body in good {
             let daemon = FakeDaemon::start(fixed(200, body.clone()), Duration::ZERO).await;

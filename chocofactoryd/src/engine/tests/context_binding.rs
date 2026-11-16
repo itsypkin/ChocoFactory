@@ -43,8 +43,8 @@ async fn bind_context_listener() -> (tokio::net::TcpListener, String) {
 async fn ask(launch: &Launch, arguments: Value) -> Value {
     let anchor = launch.anchor.as_deref();
     assert_eq!(anchor.is_none(), launch.no_anchor);
-    let binding = ContextBinding::new(&launch.task, &launch.session, anchor, &launch.base_url)
-        .unwrap();
+    let binding =
+        ContextBinding::new(&launch.task, &launch.session, anchor, &launch.base_url).unwrap();
     let output = ContextClient::new(binding).unwrap().call(&arguments).await;
     assert!(!output.is_error, "{}", output.text);
     serde_json::from_str(&output.text).unwrap()
@@ -339,7 +339,10 @@ async fn parallel_branches_get_their_own_sessions_and_keep_the_pointer_until_the
         assert_eq!(got["result"]["task_id"], json!(g.id));
         assert_eq!(got["result"]["result_id"], json!(before));
         assert_eq!(got["result"]["destination_stage"], "panel");
-        assert_eq!(ask(launch, json!({"source": "task"})).await["task"]["title"], json!(g.title));
+        assert_eq!(
+            ask(launch, json!({"source": "task"})).await["task"]["title"],
+            json!(g.title)
+        );
     }
     assert_ne!(launches[0].session, launches[1].session);
 
@@ -483,9 +486,16 @@ async fn a_restart_then_resume_keeps_the_boundary_and_binds_the_new_address() {
     // Each launch reads from the daemon it was told about, not the other.
     assert_sees_prep(&launches[0], &task, &result).await;
     let (old_hits, new_hits_before) = (daemon.hits(), new_hits.load(Ordering::SeqCst));
-    assert_eq!(new_hits_before, 0, "the old launch never reached the new daemon");
+    assert_eq!(
+        new_hits_before, 0,
+        "the old launch never reached the new daemon"
+    );
     assert_sees_prep(&launches[1], &task, &result).await;
-    assert_eq!(daemon.hits(), old_hits, "the resumed launch never used the old address");
+    assert_eq!(
+        daemon.hits(),
+        old_hits,
+        "the resumed launch never used the old address"
+    );
     assert!(new_hits.load(Ordering::SeqCst) > 0);
 }
 
@@ -530,7 +540,10 @@ async fn a_resume_with_no_provable_pointer_gets_an_explicit_empty_boundary_not_a
                    "reason": "not_found_in_recorded_history"})
         );
     }
-    assert_eq!(ask(resumed, json!({"source": "task"})).await["task"]["title"], json!(task.title));
+    assert_eq!(
+        ask(resumed, json!({"source": "task"})).await["task"]["title"],
+        json!(task.title)
+    );
     assert!(daemon.hits() > 0);
 }
 
