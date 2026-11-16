@@ -825,6 +825,19 @@ fn the_probe_checkers_tell_right_from_wrong_reports() {
     }
     assert!(check_mixed_rereview("approved", &right, head).is_err());
 
+    assert!(invents_first_review(
+        "OK. This is a first review of the branch."
+    ));
+    assert!(invents_first_review("Treating this as a first review."));
+    for fine in [
+        "If this is a first review or inside the human's scope, it would block.",
+        "I neither treat this as a first review nor approve.",
+        "A pruned parent is not evidence of a first review.",
+        "Prior findings: unavailable (history_gap).",
+    ] {
+        assert!(!invents_first_review(fine), "{fine}");
+    }
+
     let human = format!(
         "Findings\n1. BLOCKING README.md: HTTP_RETRY_MAX is not renamed, though the report says it was.\n2. BLOCKING scripts/verify-backoff.sh: recomputes the delays instead of calling retry_delay.\n3. nonblocking: the soak run was accepted by the human, not required.\n\nDismissed\n- jitter. Reviewed: {head}"
     );
@@ -1066,6 +1079,29 @@ fn check_human_round(outcome: &str, summary: &str, head: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Whether a report affirms "this is a first review". A conditional ("if
+/// this is a first review") or a refusal ("I do not treat this as a first
+/// review") is not an affirmation.
+fn invents_first_review(summary: &str) -> bool {
+    let lower = summary.to_lowercase();
+    lower.match_indices("first review").any(|(at, _)| {
+        let mut from = at.saturating_sub(40);
+        while !lower.is_char_boundary(from) {
+            from -= 1;
+        }
+        let before = &lower[from..at];
+        let affirms = ["this is a ", "this as a ", "this was a ", "this is the "]
+            .iter()
+            .any(|p| before.ends_with(p));
+        let hedged = [
+            "if ", "whether", "not ", "n't", "neither", "nor ", "never", "unless",
+        ]
+        .iter()
+        .any(|w| before.contains(w));
+        affirms && !hedged
+    })
+}
+
 fn assert_bounded(contexts: &[Value]) {
     assert!(!contexts.is_empty(), "the agent never called get_context");
     assert!(contexts.len() <= 16, "{} get_context calls", contexts.len());
@@ -1168,17 +1204,10 @@ async fn probe_missing_history() {
             || lower.contains("handoff"),
         "the missing hand-off is not named: {summary}"
     );
-    for invented in [
-        "this is a first review",
-        "first review: yes",
-        "treating this as a first review",
-        "as a first review",
-    ] {
-        assert!(
-            !lower.contains(invented),
-            "invented a first review ({invented}): {summary}"
-        );
-    }
+    assert!(
+        !invents_first_review(&summary),
+        "invented a first review: {summary}"
+    );
     assert_eq!(out.status, "closed");
 }
 
