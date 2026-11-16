@@ -177,8 +177,10 @@ fn every_place_that_calls_the_writer_read_only_says_detection_not_undo() {
                 "choco did not undo it",
                 "inspect the worktree",
                 "reset every change the writer made",
-                "resumes its session against its original baseline",
-                "starts a fresh session that takes whatever is in the worktree",
+                "resumes its session against its original baseline, and the change is checked again, only when it is eligible",
+                "it has a recorded session ID, the same CLI is still available",
+                "Otherwise a plain retry starts a fresh session",
+                "A fresh session takes whatever is in the worktree",
             ],
         ),
         (

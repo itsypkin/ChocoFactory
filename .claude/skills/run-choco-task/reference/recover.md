@@ -279,12 +279,15 @@ with a reason naming the change, and choco did not undo it. Before retrying,
 inspect the worktree (`git -C <worktree> status`, `git -C <worktree> diff`,
 `git -C <worktree> log`) and reset every change the writer made, even one you
 would like to keep: it was never reviewed. What a plain retry does depends on
-how the turn ended. A turn cut off from outside (a usage limit, a daemon stop)
-resumes its session against its original baseline, and the change is checked
-again. A turn that failed on its own, or `--fresh`, starts a fresh session
-that takes whatever is in the worktree as its starting point, so a retained
-change is accepted and published without implementation review. A write to an
-ignored path, to `.git`, or outside the worktree is not detected.
+whether the turn can resume. A turn cut off from outside (a usage limit, a
+daemon stop) resumes its session against its original baseline, and the change
+is checked again, only when it is eligible: it has a recorded session ID, the
+same CLI is still available, and it has not already been resumed three times
+in a row. Otherwise a plain retry starts a fresh session. A turn that failed on
+its own, or `--fresh`, also starts a fresh session. A fresh session takes
+whatever is in the worktree as its starting point, so a retained change is
+accepted and published without implementation review. A write to an ignored
+path, to `.git`, or outside the worktree is not detected.
 
 Wrong or incomplete description prose is corrected by hand on the PR, not with
 `/request-changes`, which costs a coder lap and a review lap and never reaches
