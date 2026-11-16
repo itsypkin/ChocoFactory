@@ -20,7 +20,7 @@ use std::time::Duration;
 use reqwest::{StatusCode, Url};
 use serde_json::{Value, json};
 
-use crate::context::{ContextResponse, UnavailableReason};
+use crate::context::{ContextResponse, DEPARTING_KINDS, UnavailableReason};
 use crate::mcp::GET_CONTEXT_TOOL_NAME;
 
 /// How long one request may take, connection to last body byte.
@@ -319,6 +319,10 @@ impl ContextClient {
             // The daemon is local; a proxy variable in the agent's
             // environment must not reroute (or leak) a loopback request.
             .no_proxy()
+            // The binding fixes where the question goes: a redirect would
+            // answer from somewhere else, and the 3xx status itself must
+            // be what the status check sees.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| format!("could not build the context HTTP client: {err}"))?;
         Ok(Self { http, binding })
@@ -404,10 +408,10 @@ impl ContextClient {
             format!("the daemon's task-context answer was cut short ({status}): {err}")
         })?;
         match status {
-            StatusCode::OK => serde_json::from_slice::<ContextResponse>(&body).map_err(|err| {
+            StatusCode::OK => parse_answer(&body).map_err(|err| {
                 format!("the daemon's task-context answer is not a valid answer: {err}")
             }),
-            StatusCode::NOT_FOUND => match serde_json::from_slice::<ContextResponse>(&body) {
+            StatusCode::NOT_FOUND => match parse_answer(&body) {
                 Ok(answer @ ContextResponse::Unavailable { .. }) => Ok(answer),
                 _ => Err(format!(
                     "the daemon could not find this task's context (404): {}",
@@ -420,6 +424,65 @@ impl ContextClient {
             )),
         }
     }
+}
+
+/// Decodes a daemon answer and checks the facts the daemon always writes.
+/// Plain deserialization would invent a `null` for a nullable field the
+/// body left out and accept a result that contradicts itself; neither is a
+/// recorded fact, so both are refused.
+fn parse_answer(body: &[u8]) -> Result<ContextResponse, String> {
+    let raw: Value = serde_json::from_slice(body).map_err(|err| err.to_string())?;
+    let present = |value: &Value, key: &str| -> Result<(), String> {
+        if value.get(key).is_none() {
+            return Err(format!("`{key}` is missing"));
+        }
+        Ok(())
+    };
+    present(&raw, "anchor_id")?;
+    match raw.get("provenance").and_then(Value::as_str) {
+        Some("stage_result") => {
+            let result = raw.get("result").unwrap_or(&Value::Null);
+            present(result, "previous_result_id")?;
+        }
+        Some("task") => present(raw.get("task").unwrap_or(&Value::Null), "input")?,
+        _ => {}
+    }
+    let answer: ContextResponse = serde_json::from_value(raw).map_err(|err| err.to_string())?;
+    match &answer {
+        ContextResponse::StageResult { result, .. } => {
+            if result.source_stage.is_empty() || result.destination_stage.is_empty() {
+                return Err("a stage name is empty".into());
+            }
+            if !DEPARTING_KINDS.contains(&result.source_kind.as_str()) {
+                return Err(format!(
+                    "source_kind {:?} is not a stage kind that departs",
+                    result.source_kind
+                ));
+            }
+            if result.previous_result_id.as_deref() == Some("") {
+                return Err("previous_result_id is empty".into());
+            }
+            if !result.capture_present && !result.capture.is_null() {
+                return Err("capture is set but capture_present is false".into());
+            }
+        }
+        ContextResponse::Snapshot {
+            capture_present,
+            capture,
+            ..
+        } => {
+            if !capture_present && !capture.is_null() {
+                return Err("capture is set but capture_present is false".into());
+            }
+        }
+        ContextResponse::Task { task, .. } => {
+            if task.input_available != task.input.is_some() {
+                return Err("input_available does not match whether input is present".into());
+            }
+        }
+        ContextResponse::Unavailable { .. } => {}
+    }
+    Ok(answer)
 }
 
 /// The start of a failure body, enough to say what the daemon said.
@@ -931,5 +994,196 @@ mod tests {
             .await;
         accepted.await.unwrap();
         assert!(output.is_error, "{}", output.text);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_an_error_and_never_reaches_the_other_address() {
+        for status in [301u16, 302, 303, 307, 308] {
+            let decoy = FakeDaemon::start(
+                fixed(200, stage_result_body("DECOY CONTENT")),
+                Duration::ZERO,
+            )
+            .await;
+            let target = format!("{}/elsewhere", decoy.base);
+            let redirecting: Respond = Arc::new(move |_| (status, String::new()));
+            let daemon = {
+                // A daemon that answers every request with a redirect.
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let seen = Arc::clone(&requests);
+                let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                    let respond = Arc::clone(&redirecting);
+                    let seen = Arc::clone(&seen);
+                    let target = target.clone();
+                    async move {
+                        seen.lock().unwrap().push(uri.clone());
+                        let (status, _) = respond(&uri);
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [("location", target)],
+                            String::new(),
+                        )
+                    }
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                FakeDaemon { base, requests }
+            };
+            let anchored = client(&daemon, Some("a1"));
+            let empty = client(&daemon, None);
+            for (label, client, arguments) in [
+                ("task", &anchored, json!({"source": "task"})),
+                ("stage", &anchored, json!({"source": "stage", "stage": "s"})),
+                ("id", &anchored, json!({"source": "stage", "result_id": "r1"})),
+                ("empty boundary", &empty, json!({"source": "stage", "stage": "s"})),
+            ] {
+                let output = client.call(&arguments).await;
+                assert!(output.is_error, "{status} {label}: {}", output.text);
+                assert!(!output.text.contains("DECOY"), "{status} {label}");
+            }
+            assert!(decoy.seen().is_empty(), "{status}: {:?}", decoy.seen());
+            assert_eq!(daemon.seen().len(), 4, "{status}: one request per call");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_leaves_out_or_contradicts_a_recorded_fact_is_an_error() {
+        let ask = json!({"source": "stage", "result_id": "r1"});
+        let without = |mut body: Value, path: &[&str]| {
+            let (last, parents) = path.split_last().unwrap();
+            let mut at = &mut body;
+            for key in parents {
+                at = at.get_mut(*key).unwrap();
+            }
+            at.as_object_mut().unwrap().remove(*last);
+            body
+        };
+        let with = |mut body: Value, path: &[&str], value: Value| {
+            let (last, parents) = path.split_last().unwrap();
+            let mut at = &mut body;
+            for key in parents {
+                at = at.get_mut(*key).unwrap();
+            }
+            at.as_object_mut().unwrap().insert(last.to_string(), value);
+            body
+        };
+        let task = json!({"provenance": "task", "task_id": "task/1 &x", "anchor_id": null,
+                          "task": {"title": "T", "input_available": true, "input": "I",
+                                   "closes": []}});
+        let snapshot = json!({"provenance": "snapshot", "task_id": "task/1 &x",
+                              "anchor_id": null, "stage": "s", "capture_present": true,
+                              "capture": "C"});
+        let unavailable = json!({"provenance": "unavailable", "task_id": "task/1 &x",
+                                 "anchor_id": "a1", "reason": "missing_result"});
+        let bad: Vec<(&str, u16, Value)> = vec![
+            (
+                "stage result without anchor_id",
+                200,
+                without(stage_result_body("x"), &["anchor_id"]),
+            ),
+            (
+                "stage result without previous_result_id",
+                200,
+                without(stage_result_body("x"), &["result", "previous_result_id"]),
+            ),
+            (
+                "unknown source_kind",
+                200,
+                with(stage_result_body("x"), &["result", "source_kind"], json!("bogus")),
+            ),
+            (
+                "capture without capture_present",
+                200,
+                with(
+                    with(stage_result_body("x"), &["result", "capture_present"], json!(false)),
+                    &["result", "capture"],
+                    json!("stray"),
+                ),
+            ),
+            (
+                "empty previous_result_id",
+                200,
+                with(stage_result_body("x"), &["result", "previous_result_id"], json!("")),
+            ),
+            ("task without anchor_id", 200, without(task.clone(), &["anchor_id"])),
+            ("task without input", 200, without(task.clone(), &["task", "input"])),
+            (
+                "task input contradicts input_available",
+                200,
+                with(task.clone(), &["task", "input_available"], json!(false)),
+            ),
+            (
+                "snapshot capture without capture_present",
+                200,
+                with(
+                    with(snapshot.clone(), &["capture_present"], json!(false)),
+                    &["capture"],
+                    json!("stray"),
+                ),
+            ),
+            ("snapshot without anchor_id", 200, without(snapshot.clone(), &["anchor_id"])),
+            (
+                "typed 404 without anchor_id",
+                404,
+                without(unavailable.clone(), &["anchor_id"]),
+            ),
+        ];
+        for (label, status, body) in bad {
+            let daemon = FakeDaemon::start(fixed(status, body.clone()), Duration::ZERO).await;
+            let output = client(&daemon, Some("a1")).call(&ask).await;
+            assert!(output.is_error, "{label}: {}", output.text);
+        }
+        // The same shapes with every nullable field explicitly null are valid.
+        let good = [
+            stage_result_body("x"),
+            task,
+            snapshot,
+            with(
+                with(stage_result_body("x"), &["result", "capture_present"], json!(false)),
+                &["result", "capture"],
+                Value::Null,
+            ),
+            with(
+                stage_result_body("x"),
+                &["result", "capture"],
+                Value::Null,
+            ),
+        ];
+        for body in good {
+            let daemon = FakeDaemon::start(fixed(200, body.clone()), Duration::ZERO).await;
+            let output = client(&daemon, Some("a1")).call(&ask).await;
+            assert!(!output.is_error, "{body}: {}", output.text);
+            assert_eq!(serde_json::from_str::<Value>(&output.text).unwrap(), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_short_after_the_headers_is_a_cut_short_error() {
+        // Promises more bytes than it sends, then closes: the headers
+        // arrive, the body does not.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                      content-length: 5000\r\n\r\n{\"provenance\":\"task\"",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let binding = ContextBinding::new("t", "s", Some("a"), &base).unwrap();
+        let output = ContextClient::new(binding)
+            .unwrap()
+            .call(&json!({"source": "task"}))
+            .await;
+        served.await.unwrap();
+        assert!(output.is_error, "{}", output.text);
+        assert!(output.text.contains("cut short"), "{}", output.text);
     }
 }
