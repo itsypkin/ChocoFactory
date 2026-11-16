@@ -7,9 +7,10 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 | Stage | What happens |
 |---|---|
 | `coding` | The `coder` agent implements the spec in the task's own git worktree. If the spec's rules leave it no way forward (for example, a pinned dependency that doesn't build and a spec that forbids substituting another), it can instead stop at `blocker`. |
-| `internal_review` | A separate, read-only `reviewer` agent reviews the work against the spec. It approves, or sends the task to `revising`. |
+| `internal_review` | A separate, read-only `reviewer` agent reviews the work against the spec, and checks the coder's work report against the code. It approves (the task goes to `describe_pr`), or sends the task to `revising`. |
 | `revising` | The coder fixes what a review, CI or you asked for, then goes back to `internal_review`, or stops at `blocker`. |
-| `open_pr` | A script pushes the branch `task/<id>` and opens the pull request. |
+| `describe_pr` | A separate, read-only `writer` agent writes the PR's description from the spec, the coder's work report, the internal reviewer's report and the branch's commits and diff, and reports it as its summary. Every approval goes through it, so the first open and every round after a `/request-changes`, red CI or a conflict get a freshly written description. Read-only means choco checks the worktree when the turn ends: a change it detects (files, git state or branch) parks the task as stuck, and choco does not undo the change. Inspect the worktree and reset any change before `choco task retry`; a plain retry can take the retained change as its new starting point. Ignored files, other git metadata and anything outside the worktree are not checked. |
+| `open_pr` | A script pushes the branch `task/<id>` and opens the pull request, with the writer's description in the body. |
 | `checks_polling` | Polls the PR's CI checks. Green goes on; red goes to `revising` as soon as a check has failed. Optionally (off by default) the failed GitHub Actions jobs are re-run once for the PR's current head first; see [CI re-run](#ci-re-run-of-failed-jobs-opt-in). |
 | `awaiting_human_review` | Waits for your verdict on the PR (see below). |
 | `base_conflict` | Reached when the PR stops merging cleanly into its base branch while it waits. It does nothing but count these rounds, then sends the task to `revising` to rebase. |
@@ -18,7 +19,7 @@ ChocoFactory ships two coding workflows: `coding-task`, which takes a spec to a 
 | `blocker` | A parking stage: the coder reported a blocker it must not work around, from `coding` or `revising`. The task waits, with no time limit, for your answer (`choco task send <id> --text "..."`). The answer goes to `revising`, and the internal reviewer sees it too and treats it as your decision. It resets no loop count. If the PR is merged while the task waits here, the task moves to `done` by itself, as at `escalate_to_human`. |
 
 Every way back (a rejected internal review, red CI, a `/request-changes` from
-you, a resumed escalation, an answered blocker, a PR that started conflicting with its base) goes through `revising`. The `coder` runs on
+you, a resumed escalation, an answered blocker, a PR that started conflicting with its base) goes through `revising`. The `coder` and the `writer` run on
 `claude-sonnet-5-5` and the `reviewer` on `claude-opus-5-5` by default; see
 [models.md](models.md) to change that.
 
@@ -35,8 +36,8 @@ want: the spec contradicts itself, the goal is missing or unclear, or every
 way forward is irreversible, weakens security or costs far more than the
 spec suggests.
 
-From then on the coder and the internal reviewer work from the planner's
-report, not from your `--prompt`. Read it with:
+From then on the coder, the internal reviewer and the writer work from the
+planner's report, not from your `--prompt`. Read it with:
 
 ```
 choco --json task status <id> | jq -r '.workflow_state.payload.stages.spec_check.summary'
@@ -90,8 +91,8 @@ timeout.
 **A PR that conflicts.** If the open PR can no longer merge into its base
 branch (GitHub reports `mergeable: CONFLICTING`), the task does not wait for
 you: it goes to `base_conflict`, then `revising`, where the coder rebases the
-branch; it then runs through `internal_review`, `open_pr` (which pushes the
-rebased branch) and `checks_polling` and comes back here. The order of
+branch; it then runs through `internal_review`, `describe_pr`, `open_pr` (which
+pushes the rebased branch) and `checks_polling` and comes back here. The order of
 findings is: merged, then `/request-changes` (that round's coder lap rebases
 too), then a conflict, then `/approve`. Comments you posted since the last
 hand-off, marker or not, travel with the conflict note, and the coder
@@ -267,9 +268,10 @@ do not have this check until you add it to them from the built-in files.
 
 ## The PR body and the issue it closes
 
-The PR body `open_pr` publishes holds the coder's description and the
-internal reviewer's report. A closing keyword followed by an issue reference
-in either is rewritten (`Resolves #84` becomes `Resolves issue 84`, inside
+The PR body `open_pr` publishes holds the description the `describe_pr` writer
+wrote and the internal reviewer's report. If the writer's text is empty, the
+body says the writer wrote no description, in place of it. A closing keyword
+followed by an issue reference in either is rewritten (`Resolves #84` becomes `Resolves issue 84`, inside
 code blocks too, since GitHub doesn't say whether it skips code), so only the
 lines the script builds from the task's closes list can close an issue.
 
@@ -279,8 +281,17 @@ block, so merging the PR closes those issues. A task created without
 `--closes` closes nothing. The title is plain text: every `#N` in it, including
 a trailing `(#N)`, only gets a `Refs #N` line, which links but doesn't close
 (an issue that is also closed gets just its `Closes` line). With neither, the
-PR body says so. The internal reviewer is told the closes list, and treats a
-description that says the PR closes or fixes any other issue as a false claim.
+PR body says so. The internal reviewer is told the closes list. It checks the coder's work
+report against the code: a report claim that the PR closes or fixes another
+issue is a minor inaccuracy that it lists for the writer to correct, and the
+writer is told not to write that claim either.
+
+Wrong or incomplete description prose is corrected by hand on the PR (see
+below), not with `/request-changes`: a request for changes costs a coder lap
+and a review lap, and the writer never reads PR comments or hand edits. A
+`/request-changes` that asks only for description changes is still accepted:
+the coder records it in its work report and makes an empty commit, and the
+description is written again on the way back to `open_pr`.
 
 ### Editing the PR body by hand
 
@@ -307,9 +318,9 @@ What this does and doesn't keep:
 - Lines are compared whole, ignoring only trailing spaces, tabs and CRs. A
   line already in the copy or in the new block needs no move.
 - A line you delete inside the block is not kept: the block is rebuilt from the
-  coder's new text, so the line is back only if that text has it. A line you add
+  writer's new text, so the line is back only if that text has it. A line you add
   that equals another line of the copy or of the new block, such as a second
-  `- none`, isn't moved: if the coder's text later drops it, it is gone.
+  `- none`, isn't moved: if the writer's text later drops it, it is gone.
 - A PR opened by an older choco has no copy. Its next update replaces the block
   as before and says so in a timeline note; it saves its first copy then, so
   hand edits are kept from the update after that.
@@ -319,7 +330,7 @@ What this does and doesn't keep:
   read-only copy, so the old complete copy stays) or partial (a kill or a full
   disk partway). The same holds if a lap is killed while the copy is being
   written. From a stale or partial copy the next lap compares as usual and may
-  move some coder text as if you had written it.
+  move some of choco's own text as if you had written it.
 - A body without exactly one block is left unchanged, with a note, and nothing
   is moved.
 - Only the body as read at the start of the lap is protected: an edit saved
@@ -327,7 +338,7 @@ What this does and doesn't keep:
 
 Put your own text and any ruling the PR must keep (CI versions, probe results,
 required sections) below the end marker, where laps keep it. A later lap can
-still drop a section the coder itself wrote inside the block.
+still drop a section the writer itself wrote inside the block.
 
 ## CI re-run of failed jobs (opt-in)
 

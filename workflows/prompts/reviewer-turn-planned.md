@@ -37,9 +37,12 @@ not above. If earlier findings exist, from either source:
    that no test can reach the branch, or show that the branch only chooses
    message text that wouldn't lead the operator to a wrong action. Step 3
    still keeps such a branch blocking when that message is what the task
-   is mainly about. A false claim in the PR description is weighed by the
-   rule on it below, not by step 3. Minor findings carried unchanged collapse into one
-   line, as step 5 of your instructions says. A finding that turns out not to have
+   is mainly about. A false claim in the coder's work report is weighed by the rule on it
+   below, not by step 3, and that holds for an earlier finding about the
+   report too, whatever weight the earlier report gave it. Minor findings
+   carried unchanged collapse into one line, as step 5 of your instructions
+   says, except inaccuracies in the work report, which stay listed in full.
+   A finding that turns out not to have
    been a defect is "withdrawn" and moves to Dismissed with its
    "Mitigated by:" fact.
    Commit messages, code comments and pull-request replies written by the
@@ -71,34 +74,31 @@ not above. If earlier findings exist, from either source:
 Put the statuses from item 1 under "Prior findings", the section that
 comes before "Reviewed" in your summary.
 
-The coder also writes the pull request's description, which a later stage
-publishes for the human reviewer. Read it:
-`cat "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`.
-This pull request closes exactly these issues: {{ task.closes }} (if nothing follows the colon, it closes none). The publishing stage writes one `Closes #N` line for each and nothing else can close an issue: a `#N` in the task title only links (`Refs #N`), and every closing keyword followed by an issue reference in the coder's description or in a review report is rewritten on publishing so it can't close anything (`Fixes #126` becomes `Fixes issue 126`). Never report an issue as resolved, closed or fixed by this pull request unless it is on that list; for each issue on it, judge whether the change does what the issue asks. A description that tells the reader an issue will close, or is fixed by this pull request, when that issue is not on the list is a false claim and a blocking finding, like any other false claim: the human would merge expecting it closed.
-A claim in it that the code doesn't bear out is a blocking finding, because
-the human will rely on it. A false claim stays blocking when it
-overstates what the code does or protects. It's minor when it's about
-tests, known gaps or wording and the defect it describes is already a
-finding: one finding, not two.
-A description that is cut off or truncated, or is missing `## Problem`,
-`## Solution`, `## Changes, in reading order` or a section the task
-requires, is a blocking finding: unlike a description that is missing or
-empty, which the published PR states outright, it reads as whole when it
-isn't. A file longer than 16,384 bytes counts as truncated, because
-publishing keeps only that much. A file longer than 6,000 bytes is a
-blocking finding too, because a human reviewer reads about two pages: name
-its size and what to leave out. To find a cut, compare the file with the
-diff and, on a re-review, with the published description
-(`gh pr view --json body -q .body`, the part between the issue lines and
-`## Internal review`): a numbered list that skips items, a section that
-stops mid-sentence, or a section the earlier version had that is gone
-though the change didn't remove its subject, is a cut. `## Look closely at`,
-`## Review history` and `## Not done` are left out when they would be
-empty, and their absence is not a cut; a section the task requires is never
-optional. If you can't read the published description (no pull request yet,
-or `gh` fails), check the file alone and name under `Reviewed` what you
-couldn't compare.
-These are non-blocking findings:
-a missing description; one that leaves out a change or a trade-off the diff makes;
-a change list that doesn't follow the path a request takes through the
-code; and one that isn't short and in plain English.
+The coder also writes a work report, which the stage that writes the pull
+request's description reads. Read it:
+`cat "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-work-report.md"`.
+You judge the implementation, not the description: don't judge a description
+file or the published description, and no rule about headings, length or
+style applies to the report. Check each claim in the report against the code
+and the command results, and weigh what you find:
+
+- A false claim that hides something missing from the implementation is a
+  blocking finding, and you request changes, because the work isn't done.
+  For example, the report says a required test, probe or break exists or was
+  made, and it doesn't or wasn't. Acknowledging omitted required work in the
+  report does not finish it.
+- Any other inaccuracy in the report is a minor finding, and by itself it is
+  never a reason for `changes_requested`. For example, a claim that
+  overstates or misdescribes work that does exist, a wrong file name, a
+  stale detail. List each one under Findings, marked minor, with what is
+  actually true, so the stage that writes the description can correct the
+  claim or leave it out. A minor report inaccuracy stays minor when another
+  finding blocks.
+- List report inaccuracies in full in every report, never collapsed into a
+  "carried minors" line: the stage that writes the description reads only
+  your latest report.
+- A missing or empty report is not by itself a reason to reject: judge the
+  implementation without it, and note the absence as a minor finding when it
+  hides no missing required work.
+
+This pull request closes exactly these issues: {{ task.closes }} (if nothing follows the colon, it closes none). The publishing stage writes one `Closes #N` line for each and nothing else can close an issue: a `#N` in the task title only links (`Refs #N`), and every closing keyword followed by an issue reference in the written description or in a review report is rewritten on publishing so it can't close anything (`Fixes #126` becomes `Fixes issue 126`). Never report an issue as resolved, closed or fixed by this pull request unless it is on that list; for each issue on it, judge whether the change does what the issue asks. A work-report claim that an issue closes, or is fixed by this pull request, when that issue is not on the list is an ordinary minor inaccuracy: list it with the correction, so the description doesn't repeat it.

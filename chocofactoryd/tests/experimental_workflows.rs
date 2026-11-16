@@ -34,13 +34,15 @@ impl Drop for TempDir {
     }
 }
 
-const COPIES: [&str; 10] = [
+const COPIES: [&str; 12] = [
     "prompts/planner-system.md",
     "prompts/planner-turn.md",
     "prompts/coder-system.md",
     "prompts/coder-turn-planned.md",
     "prompts/reviewer-system.md",
     "prompts/reviewer-turn-planned.md",
+    "prompts/writer-system.md",
+    "prompts/writer-turn-planned.md",
     "scripts/open-pr.sh",
     "scripts/ci-checks.sh",
     "scripts/await-review.sh",
@@ -156,7 +158,7 @@ fn review_panel_has_the_decided_shape() {
     assert_eq!(watch.env["CI_RERUN_FAILED"], "off");
 
     let lead = &def.stages["lead_review"];
-    assert_eq!(lead.on["approved"], "open_pr");
+    assert_eq!(lead.on["approved"], "describe_pr");
     assert_eq!(lead.on["changes_requested"], "revising");
     assert_eq!(lead.on.len(), 2);
     let g = lead.loop_guard.as_ref().expect("lead_review loop guard");
@@ -557,7 +559,7 @@ fn the_experimental_revise_prompt_changes_only_what_the_human_asks() {
     let rest = &revise[start + 1..];
     let entry = flat(&revise[start..start + 1 + rest.find("\n- **`").expect("next entry")]);
     let rule = [
-        r#"Make only the changes the human asks for, and what those changes need (their tests, the description)."#,
+        r#"Make only the changes the human asks for, and what those changes need (their tests)."#,
         r#"A finding from an earlier review that the human doesn't repeat is not a request, whoever raised it and however it was rated: leave that code as it is."#,
         r#"If you notice a defect nobody asked about, name it in your summary instead of changing it."#,
     ];
@@ -580,4 +582,174 @@ fn the_experimental_revise_prompt_changes_only_what_the_human_asks() {
         1,
         "the human-round rule appears once in the experimental revise prompt"
     );
+}
+
+/// Every way into `open_pr` in the panel is the writer's `done`; the lead's
+/// approval goes to the writer, and the publisher still gets the lead's
+/// verdict and report next to the writer's text.
+#[test]
+fn review_panel_routes_the_lead_approval_through_describe_pr() {
+    let def = load(&exp().join("review-panel.yaml"));
+    let lead_on: Vec<_> = def.stages["lead_review"].on.iter().collect();
+    assert_eq!(
+        lead_on,
+        [
+            (&"approved".to_string(), &"describe_pr".to_string()),
+            (&"changes_requested".to_string(), &"revising".to_string()),
+        ],
+        "the lead's approval goes to describe_pr"
+    );
+
+    let stage = &def.stages["describe_pr"];
+    let StageKind::AgentTurn {
+        role,
+        prompt_file,
+        capture,
+        report_sections,
+    } = &stage.kind
+    else {
+        panic!("describe_pr must be an agent_turn");
+    };
+    assert_eq!(role, "writer", "describe_pr role");
+    assert_eq!(
+        prompt_file.as_ref().unwrap().file_name().unwrap(),
+        "writer-turn-planned.md",
+        "describe_pr prompt"
+    );
+    assert_eq!(*capture, Some(Capture::Json), "describe_pr capture");
+    assert!(report_sections.is_empty());
+    let on: Vec<_> = stage.on.iter().collect();
+    assert_eq!(
+        on,
+        [(&"done".to_string(), &"open_pr".to_string())],
+        "describe_pr's edge map"
+    );
+    assert!(stage.loop_guard.is_none());
+
+    let into_open_pr: Vec<&str> = def
+        .stages
+        .iter()
+        .filter(|(_, st)| st.on.values().any(|to| to == "open_pr"))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        into_open_pr,
+        ["describe_pr"],
+        "only the writer enters open_pr"
+    );
+
+    let StageKind::Shell { env, .. } = &def.stages["open_pr"].kind else {
+        panic!("open_pr must be a shell stage");
+    };
+    let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert!(
+        pairs.contains(&("PR_DESCRIPTION", "{{ stages.describe_pr.summary }}")),
+        "the description binding: {pairs:?}"
+    );
+    assert!(
+        pairs.contains(&("PR_REVIEW_VERDICT", "{{ stages.lead_review.outcome }}")),
+        "{pairs:?}"
+    );
+    assert!(
+        pairs.contains(&("PR_REVIEW_REPORT", "{{ stages.lead_review.summary }}")),
+        "{pairs:?}"
+    );
+    assert_eq!(pairs.len(), 4, "{pairs:?}");
+
+    let writer = &def.roles["writer"];
+    assert_eq!(writer.cli.as_deref(), Some("claude"));
+    assert_eq!(writer.model.as_deref(), Some("claude-sonnet-5-5"));
+    assert_eq!(
+        writer
+            .system_prompt_file
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap(),
+        "writer-system.md"
+    );
+    assert!(writer.read_only, "the writer is read-only");
+    assert_eq!(
+        writer.disallowed_tools.len(),
+        3,
+        "edit, write and notebook_edit are all disallowed: {:?}",
+        writer.disallowed_tools
+    );
+}
+
+/// The writer's two prompt files are links to the shipped files, and load
+/// from a copy that follows links, as a user's copy outside the checkout does.
+#[test]
+fn the_writer_prompts_resolve_and_load_from_a_dereferenced_copy() {
+    for rel in ["prompts/writer-system.md", "prompts/writer-turn-planned.md"] {
+        assert!(COPIES.contains(&rel), "{rel} is listed in COPIES");
+        let path = exp().join(rel);
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{rel} must be a link, not a second copy"
+        );
+        assert_eq!(
+            fs::canonicalize(&path).unwrap(),
+            fs::canonicalize(root().join("workflows").join(rel)).unwrap(),
+            "{rel} does not link to the shipped file"
+        );
+    }
+    let out = TempDir::new();
+    let copy = out.0.join("review-panel");
+    copy_dereferenced(&exp(), &copy);
+    let def = load(&copy.join("review-panel.yaml"));
+    let StageKind::AgentTurn { prompt_file, .. } = &def.stages["describe_pr"].kind else {
+        panic!("describe_pr must be an agent_turn");
+    };
+    let prompt = prompt_file.as_ref().unwrap();
+    assert!(prompt.starts_with(&copy), "{prompt:?}");
+    assert_eq!(
+        fs::read(prompt).unwrap(),
+        fs::read(root().join("workflows/prompts/writer-turn-planned.md")).unwrap()
+    );
+    let system = def.roles["writer"].system_prompt_file.as_ref().unwrap();
+    assert_eq!(
+        fs::read(system).unwrap(),
+        fs::read(root().join("workflows/prompts/writer-system.md")).unwrap()
+    );
+}
+
+/// The experimental revise prompt is the shipped planned one with only the
+/// lead-for-internal wording changed: no description-file rule survives in
+/// it, and it still carries the `Closes:` line.
+#[test]
+fn the_experimental_revise_prompt_is_the_shipped_one_with_the_lead_wording() {
+    let fork = fs::read_to_string(exp().join("prompts/coder-revise-planned.md")).unwrap();
+    let shipped =
+        fs::read_to_string(root().join("workflows/prompts/coder-revise-planned.md")).unwrap();
+    for gone in [
+        "choco-pr-description",
+        "PR description file",
+        "description file",
+        "6,000",
+        "splice around a heading",
+        "Keep every section the spec requires",
+    ] {
+        assert!(!fork.contains(gone), "the fork still carries: {gone}");
+    }
+    assert!(
+        fork.starts_with("Task: {{ task.title }}\nCloses: {{ task.closes }}\n"),
+        "the fork keeps its Closes line"
+    );
+    let words = regex::Regex::new(r"(?i)\binternal(\s+)reviewer").unwrap();
+    let expected = words
+        .replace_all(&shipped, |caps: &regex::Captures| {
+            let first = caps[0].chars().next().unwrap();
+            let lead = if first == 'I' { "Lead" } else { "lead" };
+            format!("{lead}{}reviewer", &caps[1])
+        })
+        .replace("`internal_review`", "`lead_review`")
+        .replace(
+            "stages.internal_review.summary",
+            "stages.lead_review.summary",
+        );
+    assert_eq!(fork, expected, "the fork drifted from the shipped prompt");
 }

@@ -35,10 +35,10 @@ is described under "When you can't go on" below. Work like this:
    report, but say in your summary which check you didn't run and why, and
    don't describe the change as verified. Before you build on anything the
    spec marks **unverified**, run its probe where the claim applies, and
-   give the command and its result in the PR description under
-   `## Look closely at`. If the result contradicts the spec, adapt as little as
-   possible and say what changed there. If the probe can't run where the
-   claim applies, say there why it couldn't, in place of its result.
+   give the command and its result in your work report (step 4). If the
+   result contradicts the spec, adapt as little as possible and say what
+   changed there. If the probe can't run where the claim applies, say there
+   why it couldn't, in place of its result.
 
    Then self-check your tests. Commit your work first, so the tree is
    clean and a break can't be mistaken for your changes. Commit a new test
@@ -62,116 +62,41 @@ is described under "When you can't go on" below. Work like this:
    the code. A reviewer's suggested fix is a hint, not a spec. Before you
    apply it, check it against the task's other rules.
 3. Commit everything. Don't push, and don't open, update or comment on a
-   pull request — a later stage of the workflow does that. What the pull
-   request says is up to you, through the description file in step 4.
+   pull request — a later stage of the workflow does that, and writes the
+   pull request's description from your work report (step 4).
    Never put a closing keyword followed by an issue reference in a
    commit message (`Closes #12`, `fixes: #12`, `Resolves owner/repo#12`):
    GitHub closes that issue when the commit reaches the main branch,
    whether or not the work finished it. The issues the pull request closes are set by whoever created the task,
    and the publishing stage writes their `Closes` lines; write `#12` on its
    own if you need to mention one.
-4. Write the pull request's description to the file this command prints:
-   `echo "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`.
+4. Write your work report to the file this command prints:
+   `echo "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-work-report.md"`.
    It sits in git's private data for this worktree, so it is never
-   committed: don't `git add` it or copy it into the tree. A later stage
-   publishes it as the PR's description and adds the issue lines, the
-   internal review's report and the task's provenance itself, so write
-   none of those, and no `Closes #…` line. Don't write that the pull request
-   closes or fixes an issue unless the task closes it (your turn prompt lists
-   them on its `Closes:` line); mention any other issue as `#12`.
+   committed: don't `git add` it or copy it into the tree. The internal
+   reviewer checks it against your code, and the stage that writes the
+   pull request's description reads it, so it must be true.
 
-   Write it as a short guide to the change for a human reviewer who
-   hasn't read the task: concise, in plain English, with no codebase
-   jargon or shorthand of your own, readable in about two minutes. Don't
-   retell the work commit by commit. The file must be 6,000 bytes or
-   less (about two pages; aim for one), even when the task allows more:
-   a reviewer sends a longer one back. When it doesn't fit, leave things out: a short description that
-   skips detail is better than a complete one nobody reads. On a revise
-   turn the earlier text is something to cut from, not to keep: an
-   earlier turn's long file is not a reason to stay long. Use these
-   sections, in this order:
-   - `## Problem`: what was wrong, in a few sentences, as a user or
-     operator would notice it.
-   - `## Solution`: the short version of the fix, in a few sentences,
-     including any reading you took of an ambiguous request. When the
-     change alters what happens in what order (which function calls which,
-     a state's transitions, or where files live), end this section with one
-     small sketch of the new order in a fenced plain-text block, not a
-     diagram language: a call tree, or a call tree with `+` lines for what
-     was added and `-` lines for what was removed, keeping only the calls
-     that matter, in about 15 lines at most. Leave it out for a change of a
-     few lines or one that changes only text.
-   - `## Changes, in reading order`: a short numbered list that walks the
-     reviewer along the path a request takes. Start where the request or
-     the change enters the system (a CLI flag, an API handler, a workflow
-     file, startup) and follow it to where it ends up. Each item names the
-     file and function, then says in one line what changed and why. Put
-     small incidental fixes last, together in one item.
-   - `## Look closely at`: deliberate trade-offs and risky spots a
-     reviewer should check by hand.
-   - `## Review history`: on a revise turn, one short line per earlier
-     review finding and how you resolved it.
-   - `## Not done`: anything asked for that you didn't do, and why.
-   Leave out the last three sections when they would be empty.
+   Report the branch as it stands against its base, not only this lap's
+   commits. It has four parts, in any form and at any length that serves
+   a reader:
+   - what the branch changes;
+   - the readings you took of anything the task left ambiguous;
+   - what you verified: the commands, probes and breaks you ran and what
+     each one printed or did, including the command and result of every
+     probe step 2 asked for;
+   - what you did not do, and why.
 
-   For example:
+   State only what you did and saw. Don't claim a test pins something
+   unless you ran that test against the broken code. Don't call something
+   untestable: if step 2 let you skip a test, give the code fact that shows
+   no test can reach the branch. If you could not write the report, say so
+   under what you didn't do instead of claiming it exists.
 
-       ## Problem
-       A task waiting on CI or on a human's review stopped for good if the
-       daemon restarted, and its time limit paused while the laptop slept.
-
-       ## Solution
-       On entering a waiting stage, the daemon now stores a clock-time
-       deadline with the task. At startup it resumes every waiting task
-       with the time it had left; one whose deadline passed while the
-       daemon was down moves on as timed out.
-
-       ```
-       main
-         bind port
-       + resume_interrupted_polls
-         serve requests
-
-       run_poll_stage
-       - wait on a timer that pauses during sleep
-       + count down to the stored deadline
-       ```
-
-       ## Changes, in reading order
-       1. `engine.rs` `set_poll_window`: stores the deadline in the same
-          write that moves the task into the stage.
-       2. `main.rs`: runs the new startup sweep after binding the port,
-          before serving requests.
-       3. `engine.rs` `resume_interrupted_polls`: resumes each waiting task
-          under its lock, and marks one it can't resume as stuck.
-       4. `engine.rs` `run_poll_stage`: counts down to the stored deadline
-          instead of a timer that pauses during sleep.
-       5. Smaller: a retry gives the stage a fresh deadline; doc comments
-          updated.
-
-   The description states only what you verified. Don't claim a test
-   pins something unless you ran that test against the broken code. Don't
-   call something untestable. If step 2 let you skip a test, the
-   description gives the code fact that shows no test can reach the branch.
-
-   Write it on every turn, for the branch as a whole rather than for this
-   turn's commits, rewriting whatever an earlier turn left there. If your
-   file-writing tool refuses the path, write it from the shell with a
-   quoted heredoc: `cat > "$path" <<'EOF'`.
-
-   Write the file whole, every turn, from a complete draft that starts from
-   the file's current text (if there is one), with your file-writing tool or
-   a quoted heredoc. Never change part of it by
-   searching for a heading or any other string (a find-and-replace edit,
-   or a script that splices around a heading): the string can match inside
-   quoted text or code and cut what follows. To keep a person's edits from
-   the published description, copy them into your draft, which you then
-   write whole. After writing it, read the file back and check that every
-   section is there and ends where you meant it to. Then check its size
-   with `wc -c`: if it is over 6,000 bytes, cut and write it whole again.
-   If the write fails, or the read-back still shows a cut after you
-   rewrite it, say so in the `report_outcome` summary, under what you
-   didn't do.
+   Write it on every turn, whole, from a complete draft, with your
+   file-writing tool or a quoted heredoc; it replaces whatever an earlier
+   turn left there. If your file-writing tool refuses the path, write it
+   from the shell with a quoted heredoc: `cat > "$path" <<'EOF'`.
 5. Call `report_outcome` with outcome `done` and a short summary of what
    you changed: one line, plus anything you didn't do.
    To stop on a blocker instead, follow "When you can't go on" below. That call is what
@@ -192,8 +117,8 @@ stage's outcomes, finish with `done` and name what you couldn't do, as the next 
 
 If you didn't do part of what was asked — you had no tool or access for
 it, a check couldn't run, or you judged it out of scope — name it and say
-why, both in the `report_outcome` summary and in your reply. Don't leave
-it out silently.
+why, in the `report_outcome` summary, in your work report and in your
+reply. Don't leave it out silently.
 
 After reporting, reply with a short, plain-text summary of what you
 changed — a sentence or two, plus anything you didn't do and why. Don't

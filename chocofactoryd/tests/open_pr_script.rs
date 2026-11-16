@@ -1,6 +1,8 @@
 //! Runs the real `workflows/scripts/open-pr.sh` (#101) in a linked worktree
 //! of a temp repo whose `origin` is a bare temp repo, with a fake `gh` first
-//! on `PATH` that records every call byte for byte.
+//! on `PATH` that records every call byte for byte. The writer's description
+//! reaches the script as `PR_DESCRIPTION`, which every run sets or removes
+//! explicitly so one in the outer environment never leaks in.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,6 +76,9 @@ exit 0
 struct Fixture {
     root: PathBuf,
     wt: PathBuf,
+    /// The value `PR_DESCRIPTION` gets on the next run; `None` removes the
+    /// variable from the script's environment.
+    description: std::cell::RefCell<Option<Vec<u8>>>,
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -137,7 +142,11 @@ impl Fixture {
         let gh_dir = root.join("gh");
         fs::create_dir_all(gh_dir.join("log")).unwrap();
         fs::create_dir_all(gh_dir.join("cfg")).unwrap();
-        Fixture { root, wt }
+        Fixture {
+            root,
+            wt,
+            description: std::cell::RefCell::new(None),
+        }
     }
 
     fn git_dir(&self) -> PathBuf {
@@ -151,12 +160,30 @@ impl Fixture {
         abs.canonicalize().unwrap()
     }
 
-    fn description_path(&self) -> PathBuf {
-        self.git_dir().join("choco-pr-description.md")
+    /// Sets the `PR_DESCRIPTION` the next runs get (an empty slice sets it
+    /// empty, which is not the same as unset).
+    fn set_description(&self, bytes: &[u8]) {
+        *self.description.borrow_mut() = Some(bytes.to_vec());
     }
 
-    fn write_description(&self, bytes: &[u8]) {
-        fs::write(self.description_path(), bytes).unwrap();
+    /// Removes `PR_DESCRIPTION` from the next runs' environment.
+    fn unset_description(&self) {
+        *self.description.borrow_mut() = None;
+    }
+
+    /// Writes four decoys a script that still read a coder-written file
+    /// would publish: the old description file and the work report, each in
+    /// the private git dir and in the work tree.
+    fn write_decoys(&self) {
+        for dir in [self.git_dir(), self.wt.clone()] {
+            for name in ["choco-pr-description.md", "choco-work-report.md"] {
+                fs::write(
+                    dir.join(name),
+                    format!("DECOY-{}-{}\n", dir.display(), name),
+                )
+                .unwrap();
+            }
+        }
     }
 
     fn cfg(&self, name: &str, contents: &str) {
@@ -182,6 +209,13 @@ impl Fixture {
             Some(value) => cmd.env("CHOCO_TASK_CLOSES", value),
             None => cmd.env_remove("CHOCO_TASK_CLOSES"),
         };
+        {
+            use std::os::unix::ffi::OsStrExt;
+            match self.description.borrow().as_ref() {
+                Some(bytes) => cmd.env("PR_DESCRIPTION", std::ffi::OsStr::from_bytes(bytes)),
+                None => cmd.env_remove("PR_DESCRIPTION"),
+            };
+        }
         cmd.current_dir(&self.wt)
             .env("PATH", path)
             .env("GH_FAKE_DIR", self.root.join("gh"))
@@ -269,7 +303,7 @@ fn hostile(dir: &Path) -> String {
 #[test]
 fn first_lap_creates_a_named_described_pr() {
     let fx = Fixture::new();
-    fx.write_description(b"## Problem\nIt was broken.\n");
+    fx.set_description(b"## Problem\nIt was broken.\n");
     let out = fx.run_closes(
         "Name the PRs (#101)",
         Some("101"),
@@ -314,7 +348,7 @@ fn hostile_text_is_never_parsed_by_a_shell() {
     let title = "-q\"uote 's' $(touch a) `touch b` ; touch c \\ %s\nx".to_string();
     let description = format!("DESC:{}\n", hostile(&dir));
     let report = format!("REPORT:{}", hostile(&dir));
-    fx.write_description(description.as_bytes());
+    fx.set_description(description.as_bytes());
     let out = fx.run(&title, "approved", &report);
     assert!(out.status.success(), "{}", stderr(&out));
 
@@ -344,7 +378,7 @@ fn pr_body(fx: &Fixture) -> String {
 
 fn body_with_closes(title: &str, closes: Option<&str>) -> (String, String) {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     let out = fx.run_closes(title, closes, "approved", "r");
     assert!(out.status.success(), "{}", stderr(&out));
     (pr_body(&fx), stderr(&out))
@@ -406,7 +440,7 @@ fn closes_lines_come_before_refs_lines() {
 #[test]
 fn agent_text_cannot_close_anything_beyond_the_closes_list() {
     let fx = Fixture::new();
-    fx.write_description(b"Fixes #126\n");
+    fx.set_description(b"Fixes #126\n");
     let out = fx.run_closes("Do things", Some("152"), "approved", "Resolves #84");
     assert!(out.status.success(), "{}", stderr(&out));
     let body = pr_body(&fx);
@@ -438,7 +472,7 @@ fn no_closes_and_no_title_number_says_so() {
 fn a_malformed_closes_value_fails_before_anything_is_pushed() {
     for bad in ["12 abc", "0", "#12", "012", "*"] {
         let fx = Fixture::new();
-        fx.write_description(b"d\n");
+        fx.set_description(b"d\n");
         let out = fx.run_closes("Fix X", Some(bad), "approved", "r");
         assert!(!out.status.success(), "{bad}");
         let tok = bad.split(' ').next_back().unwrap();
@@ -460,7 +494,7 @@ fn a_malformed_closes_value_fails_before_anything_is_pushed() {
 #[test]
 fn a_refresh_turns_an_old_closing_line_into_a_link_and_keeps_human_text() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("open-number", "7\n");
     fx.cfg(
         "body",
@@ -482,7 +516,7 @@ fn a_refresh_turns_an_old_closing_line_into_a_link_and_keeps_human_text() {
 #[test]
 fn a_long_multibyte_title_is_shortened_on_a_character_boundary() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     let title = format!("{} (#101)", "é".repeat(75)); // 150 + 7 bytes
     assert!(title.len() > 150);
     let out = fx.run(&title, "approved", "r");
@@ -500,7 +534,7 @@ fn a_long_multibyte_title_is_shortened_on_a_character_boundary() {
 
 fn created_title(title: &str) -> String {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     let out = fx.run(title, "approved", "r");
     assert!(out.status.success(), "{}", stderr(&out));
     let create = &fx.calls_to("pr create")[0];
@@ -557,26 +591,101 @@ fn a_title_of_exactly_100_bytes_is_unchanged_and_a_long_one_without_a_number_get
 }
 
 #[test]
-fn a_missing_or_blank_description_is_noted_not_fatal() {
-    for blank in [None, Some("  \n\t\n")] {
+fn an_unset_empty_or_blank_description_gets_the_placeholder_and_a_note() {
+    // Unset, empty and whitespace-only (space, tab, CR, newline) are three
+    // different environments; none of them may fall back to a coder file.
+    let cases: [(&str, Option<&[u8]>); 3] = [
+        ("unset", None),
+        ("empty", Some(b"")),
+        ("whitespace", Some(b" \t\r\n")),
+    ];
+    for (what, value) in cases {
         let fx = Fixture::new();
-        if let Some(text) = blank {
-            fx.write_description(text.as_bytes());
+        fx.write_decoys();
+        match value {
+            Some(v) => fx.set_description(v),
+            None => fx.unset_description(),
         }
         let out = fx.run("T (#1)", "approved", "the report");
-        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-        let body = String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap();
-        assert!(body.contains("**The coder wrote no description for this PR.**"));
-        assert!(body.contains("the report"));
-        assert!(body.contains("Opened by choco task `task-123`"));
-        assert!(stderr(&out).contains("choco open-pr: note: no PR description at "));
+        assert_eq!(out.status.code(), Some(0), "{what}: {}", stderr(&out));
+        let body = created_body(&fx);
+        assert!(body.contains(PLACEHOLDER), "{what}: placeholder in {body}");
+        assert!(body.contains("the report"), "{what}");
+        assert!(body.contains("Opened by choco task `task-123`"), "{what}");
+        assert!(
+            stderr(&out).contains(EMPTY_NOTE),
+            "{what}: {}",
+            stderr(&out)
+        );
+        assert!(
+            !body.contains("DECOY"),
+            "{what}: a coder file was read: {body}"
+        );
     }
 }
 
+/// The same three shapes on a refresh: the old generated description
+/// disappears and the placeholder takes its place, and a nonempty text
+/// publishes with neither placeholder nor note. The live body is the one the
+/// first lap really published, so its saved copy matches and nothing is
+/// moved.
+#[test]
+fn a_refresh_replaces_an_earlier_description_whatever_the_new_shape() {
+    let cases: [(&str, Option<&[u8]>); 4] = [
+        ("unset", None),
+        ("empty", Some(b"")),
+        ("whitespace", Some(b" \t\r\n")),
+        ("text", Some(b"NEW-WRITER-TEXT\nsecond line\n")),
+    ];
+    for (what, value) in cases {
+        let fx = Fixture::new();
+        fx.set_description(realistic_description("OLD-GENERATED-TEXT").as_bytes());
+        let out = fx.run(TITLE, "approved", "r");
+        assert!(out.status.success(), "{}", stderr(&out));
+        let live = created_body(&fx);
+        assert!(live.contains("OLD-GENERATED-TEXT"));
+
+        fx.write_decoys();
+        match value {
+            Some(v) => fx.set_description(v),
+            None => fx.unset_description(),
+        }
+        fx.cfg("open-number", "7\n");
+        fx.cfg("body", &live);
+        let out = fx.run(TITLE, "approved", "r");
+        assert!(out.status.success(), "{what}: {}", stderr(&out));
+        let body = last_edit_body(&fx);
+        assert!(
+            !body.contains("OLD-GENERATED-TEXT"),
+            "{what}: stale text kept: {body}"
+        );
+        assert!(!body.contains("DECOY"), "{what}: {body}");
+        assert_eq!(count_moved_notes(&out), 0, "{what}: {}", stderr(&out));
+        if value == Some(b"NEW-WRITER-TEXT\nsecond line\n".as_slice()) {
+            assert!(
+                body.contains("NEW-WRITER-TEXT\nsecond line\n"),
+                "{what}: {body}"
+            );
+            assert!(!body.contains(PLACEHOLDER), "{what}: {body}");
+            assert!(
+                !stderr(&out).contains(EMPTY_NOTE),
+                "{what}: {}",
+                stderr(&out)
+            );
+        } else {
+            assert!(body.contains(PLACEHOLDER), "{what}: {body}");
+            assert!(
+                stderr(&out).contains(EMPTY_NOTE),
+                "{what}: {}",
+                stderr(&out)
+            );
+        }
+    }
+}
 #[test]
 fn an_empty_report_says_none_was_captured() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     let out = fx.run("T (#1)", "", "");
     assert!(out.status.success());
     let body = String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap();
@@ -587,7 +696,7 @@ fn an_empty_report_says_none_was_captured() {
 #[test]
 fn a_later_lap_replaces_only_the_generated_block() {
     let fx = Fixture::new();
-    fx.write_description(b"new description\n");
+    fx.set_description(b"new description\n");
     fx.cfg("open-number", "7\n");
     let old =
         format!("human intro\r\nmore\r\n{BEGIN}\nold block\n{END}\r\nhuman outro\r\nlast\r\n");
@@ -619,7 +728,7 @@ fn a_body_without_exactly_one_block_is_left_alone() {
     ];
     for body in cases {
         let fx = Fixture::new();
-        fx.write_description(b"d\n");
+        fx.set_description(b"d\n");
         fx.cfg("open-number", "7\n");
         fx.cfg("body", &body);
         let out = fx.run("T (#1)", "approved", "r");
@@ -637,41 +746,153 @@ fn a_body_without_exactly_one_block_is_left_alone() {
 }
 
 #[test]
-fn marker_lines_in_agent_text_are_stripped() {
+fn marker_lines_in_the_description_are_stripped() {
     let fx = Fixture::new();
-    fx.write_description(format!("one\n{BEGIN}\ntwo\n{END}  \nthree\n").as_bytes());
+    // Ordinary lines mixed with marker lines in every trailing-blank shape.
+    fx.set_description(
+        format!("one\n{BEGIN}\ntwo\n{END}  \nthree\n{BEGIN}\t\r\nfour\n{END}\r\nunrelated {BEGIN} inline\n").as_bytes(),
+    );
+    let out = fx.run("T (#1)", "approved", "plain report");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = created_body(&fx);
+    assert_eq!(
+        body.matches(BEGIN).count(),
+        2,
+        "one generated pair plus the inline mention: {body}"
+    );
+    assert_eq!(body.matches(END).count(), 1, "{body}");
+    assert_eq!(count_line(&body, BEGIN), 1, "{body}");
+    assert_eq!(count_line(&body, END), 1, "{body}");
+    assert!(body.contains("one\ntwo\nthree\nfour\nunrelated "), "{body}");
+}
+
+#[test]
+fn marker_lines_in_the_report_are_stripped() {
+    let fx = Fixture::new();
+    fx.set_description(b"plain description\n");
     let out = fx.run(
         "T (#1)",
         "approved",
         &format!("r1\n{BEGIN}\r\nr2\n{END}\t\nr3"),
     );
     assert!(out.status.success());
-    let body = String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap();
-    assert_eq!(body.matches(BEGIN).count(), 1);
-    assert_eq!(body.matches(END).count(), 1);
-    assert!(body.contains("one\ntwo\nthree\n"));
+    let body = created_body(&fx);
+    assert_eq!(count_line(&body, BEGIN), 1, "{body}");
+    assert_eq!(count_line(&body, END), 1, "{body}");
     assert!(body.contains("r1\nr2\nr3\n"));
 }
-
 #[test]
-fn oversized_text_is_capped_with_a_truncation_line() {
+fn an_oversized_report_is_capped_with_a_truncation_line() {
     let fx = Fixture::new();
     let line = "é".repeat(49) + "\n"; // 99 bytes
     let big = line.repeat(1100); // ~108 KB
     assert!(big.len() > 100_000);
-    fx.write_description(big.as_bytes());
+    fx.set_description(b"small description\n");
     let out = fx.run("T (#1)", "approved", &big);
     assert!(out.status.success(), "{}", stderr(&out));
     let bytes = fx.calls_to("pr create")[0].body.clone().unwrap();
     assert!(bytes.len() < 60_000, "{} bytes", bytes.len());
     let body = String::from_utf8(bytes).expect("valid UTF-8");
-    assert_eq!(body.matches("[truncated: ").count(), 2, "{body}");
+    assert_eq!(body.matches("[truncated: ").count(), 1, "{body}");
+    assert!(body.contains("[truncated: 40959 of "), "{body}");
 }
 
+/// The description cap on its own: the retained prefix is at most 16,384
+/// bytes of valid UTF-8, the notice sits outside that budget, and nothing
+/// past the cut survives. The report is small, so only the description can
+/// cause a notice.
+#[test]
+fn the_description_cap_keeps_a_prefix_and_says_so() {
+    // (what, text, truncated?) — the boundary, one over it, and multibyte
+    // text whose character straddles the cut.
+    let exact = format!("{}\n", "a".repeat(16_383));
+    let over = format!("{}\n", "a".repeat(16_384));
+    let multibyte = "é".repeat(20_000); // 40,000 bytes; 16,384 is even, so a whole character ends the prefix
+    let straddle = format!("x{}", "é".repeat(20_000)); // the cut falls inside a character
+    for (what, text, cut) in [
+        (
+            "uncut realistic text",
+            realistic_description("UNCUT-MARK"),
+            false,
+        ),
+        ("exactly at the cap", exact, false),
+        ("one byte over", over, true),
+        ("multibyte", multibyte, true),
+        ("a cut inside a character", straddle, true),
+    ] {
+        assert_eq!(text.len() > 16_384, cut, "{what}: fixture");
+        let fx = Fixture::new();
+        fx.set_description(text.as_bytes());
+        let out = fx.run("T (#1)", "approved", "small report");
+        assert!(out.status.success(), "{what}: {}", stderr(&out));
+        let body = created_body(&fx);
+        let part = description_part(&body);
+        if cut {
+            let (prefix, notice) = part.split_once("\n[truncated: ").expect(what);
+            assert!(
+                prefix.len() <= 16_384,
+                "{what}: prefix is {} bytes",
+                prefix.len()
+            );
+            assert!(
+                text.starts_with(prefix),
+                "{what}: the prefix is the text's start"
+            );
+            let notice = format!("[truncated: {notice}");
+            let kept = prefix.len();
+            // The filter ends every line with a newline, so a text without
+            // one is counted one byte longer than it was written.
+            let total = text.len() + usize::from(!text.ends_with('\n'));
+            assert!(
+                notice.starts_with(&format!("[truncated: {kept} of {total} bytes shown]")),
+                "{what}: {notice}"
+            );
+            assert_eq!(
+                body.matches("[truncated: ").count(),
+                1,
+                "{what}: one notice only"
+            );
+        } else {
+            assert!(!body.contains("[truncated: "), "{what}: {body}");
+            assert!(part.starts_with(text.trim_end()), "{what}");
+        }
+    }
+}
+
+/// A value the engine already cut (it keeps at most 64 KiB, suffix
+/// included) and then the script's own cap: the script cuts at 16,384 and
+/// reports that, and nothing past the cut is published.
+#[test]
+fn an_engine_shaped_description_is_cut_once_more_by_the_script_cap() {
+    let suffix = "\n[truncated by chocofactory: 65480 of 140000 bytes]";
+    let value = format!(
+        "{}TAIL-PAST-THE-CUT{suffix}",
+        "b".repeat(65_536 - suffix.len() - 17)
+    );
+    assert_eq!(value.len(), 65_536);
+    let fx = Fixture::new();
+    fx.set_description(value.as_bytes());
+    let out = fx.run("T (#1)", "approved", "small report");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = created_body(&fx);
+    let part = description_part(&body);
+    let (prefix, notice) = part
+        .split_once("\n[truncated: ")
+        .expect("the script's notice");
+    assert_eq!(prefix.len(), 16_384, "{}", prefix.len());
+    assert!(
+        notice.starts_with("16384 of 65537 bytes shown]"),
+        "{notice}"
+    );
+    assert!(
+        !body.contains("TAIL-PAST-THE-CUT"),
+        "text past the cut was published"
+    );
+}
 #[test]
 fn failures_exit_nonzero() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     let out = fx.run("  \n\t ", "approved", "r");
     assert!(!out.status.success());
     assert!(fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty());
@@ -682,12 +903,12 @@ fn failures_exit_nonzero() {
     );
 
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("fail-pr-create", "");
     assert!(!fx.run("T (#1)", "approved", "r").status.success());
 
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("open-number", "7\n");
     fx.cfg("body", &format!("{BEGIN}\nold\n{END}\n"));
     fx.cfg("fail-pr-view", "");
@@ -696,21 +917,21 @@ fn failures_exit_nonzero() {
     assert!(fx.calls_to("pr edit").is_empty() && fx.calls_to("pr create").is_empty());
 
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("fail-pr-list", "");
     let out = fx.run("T (#1)", "approved", "r");
     assert!(!out.status.success());
     assert!(fx.calls_to("pr edit").is_empty() && fx.calls_to("pr create").is_empty());
 
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("open-number", "7\n");
     fx.cfg("body", &format!("{BEGIN}\nold\n{END}\n"));
     fx.cfg("fail-pr-edit", "");
     assert!(!fx.run("T (#1)", "approved", "r").status.success());
 
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("empty-readback", "");
     let out = fx.run("T (#1)", "approved", "r");
     assert!(!out.status.success());
@@ -718,7 +939,7 @@ fn failures_exit_nonzero() {
 }
 
 #[test]
-fn the_description_is_read_from_the_worktrees_private_git_dir() {
+fn the_description_comes_from_the_environment_not_from_any_coder_file() {
     let fx = Fixture::new();
     let git_dir = fx.git_dir();
     assert!(
@@ -726,36 +947,36 @@ fn the_description_is_read_from_the_worktrees_private_git_dir() {
         "not a linked worktree: {git_dir:?}"
     );
     assert!(!git_dir.starts_with(fx.wt.canonicalize().unwrap()));
-    fx.write_description(b"FROM-PRIVATE-GIT-DIR\n");
-    // A decoy inside the work tree must not be read.
-    fs::write(fx.wt.join("choco-pr-description.md"), "DECOY\n").unwrap();
+    fx.write_decoys();
+    fx.set_description(realistic_description("WRITER-MARK-91c2").as_bytes());
     let out = fx.run("T (#1)", "approved", "r");
     assert!(out.status.success(), "{}", stderr(&out));
-    let body = String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap();
-    assert!(body.contains("FROM-PRIVATE-GIT-DIR"));
-    assert!(!body.contains("DECOY"));
+    let body = created_body(&fx);
+    assert!(body.contains("WRITER-MARK-91c2"), "{body}");
+    assert!(
+        !body.contains("DECOY"),
+        "a coder file was published: {body}"
+    );
+
+    // A refresh of the block that lap just published takes the writer's new
+    // text, again with the decoys in place.
+    fx.set_description(realistic_description("SECOND-WRITER-MARK-4d8e").as_bytes());
+    fx.cfg("open-number", "7\n");
+    fx.cfg("body", &body);
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let edited = last_edit_body(&fx);
+    assert!(edited.contains("SECOND-WRITER-MARK-4d8e"), "{edited}");
+    assert!(!edited.contains("WRITER-MARK-91c2"), "{edited}");
+    assert!(!edited.contains("DECOY"), "{edited}");
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../workflows");
     let script = fs::read_to_string(root.join("scripts/open-pr.sh")).unwrap();
-    let coder = fs::read_to_string(root.join("prompts/coder-system.md")).unwrap();
-    let reviewer = fs::read_to_string(root.join("prompts/reviewer-turn.md")).unwrap();
-    for (name, text) in [
-        ("open-pr.sh", &script),
-        ("coder-system.md", &coder),
-        ("reviewer-turn.md", &reviewer),
-    ] {
-        assert!(!text.contains("--path-format"), "{name}");
-    }
-    let path_cmd = r#""$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md""#;
-    for (name, text) in [
-        ("open-pr.sh", &script),
-        ("coder-system.md", &coder),
-        ("reviewer-turn.md", &reviewer),
-    ] {
-        assert!(text.contains(path_cmd), "{name} lacks the path command");
-    }
+    assert!(!script.contains("--path-format"));
+    assert!(!script.contains("choco-pr-description"));
+    assert!(!script.contains("choco-work-report"));
+    assert!(script.contains("choco-open-pr-published.md"));
 }
-
 // ---- #131: agent text can never close an issue ----
 
 const KEYWORDS: &str = "closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve";
@@ -783,7 +1004,7 @@ fn body_for(title: &str, desc: Option<&[u8]>, report: &str) -> String {
 fn body_for_closes(title: &str, closes: &str, desc: Option<&[u8]>, report: &str) -> String {
     let fx = Fixture::new();
     if let Some(d) = desc {
-        fx.write_description(d);
+        fx.set_description(d);
     }
     let out = fx.run_closes(title, Some(closes), "approved", report);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -838,6 +1059,24 @@ fn the_description_is_neutralised_the_same_way() {
     assert_rewritten(&body);
 }
 
+/// The description alone: nothing in the reviewer's input has a closing
+/// phrase, so only the description filter can account for the rewrite.
+#[test]
+fn a_closing_phrase_in_the_description_alone_is_rewritten() {
+    let text = "Overview.\nFixes #12\nSee also #34 for background.\nThe importer is faster.\n";
+    let body = body_for("T (#1)", Some(text.as_bytes()), "no closing text here");
+    assert!(body.contains("Fixes issue 12\n"), "{body}");
+    assert!(!body.contains("Fixes #12"), "{body}");
+    assert!(
+        closing_regex().find_iter(&body).next().is_none(),
+        "a closing reference survived: {body}"
+    );
+    assert!(
+        body.contains("See also #34 for background.\n"),
+        "bare reference kept: {body}"
+    );
+    assert!(body.contains("The importer is faster.\n"), "{body}");
+}
 #[test]
 fn bare_references_are_untouched() {
     let text = "see #98\nowner/repo#3 is related\nhttps://github.com/o/r/issues/5\n";
@@ -891,7 +1130,11 @@ fn text_without_keywords_keeps_every_byte() {
 fn the_caps_still_hold_for_keyword_floods() {
     let big = "Fixes #1 ".repeat(12_000);
     assert!(big.len() > 100_000);
-    let body = body_for_closes("T (#131)", "131", Some(big.as_bytes()), &big);
+    // The description arrives through the environment, which the engine cuts
+    // at 64 KiB, so its fixture stays under that.
+    let desc = "Fixes #1 ".repeat(7_000);
+    assert!(desc.len() < 65_536);
+    let body = body_for_closes("T (#131)", "131", Some(desc.as_bytes()), &big);
     assert!(body.len() < 60_000, "{} bytes", body.len());
     assert_eq!(body.matches("[truncated: ").count(), 2);
     let found: Vec<_> = closing_regex()
@@ -900,7 +1143,6 @@ fn the_caps_still_hold_for_keyword_floods() {
         .collect();
     assert_eq!(found, vec!["Closes #131"]);
 }
-
 #[test]
 fn crlf_and_indented_next_line_references_are_rewritten() {
     let body = body_for("T (#1)", Some(b"This fixes\r\n  #77 too\r\n"), "r");
@@ -959,7 +1201,7 @@ fn new_forms_keep_the_tail_and_only_the_first_reference() {
 fn run_with_failing_filter(desc: Option<&[u8]>, report: &str) {
     let fx = Fixture::new();
     if let Some(d) = desc {
-        fx.write_description(d);
+        fx.set_description(d);
     }
     let fake = fx.root.join("bin/awk");
     let real = Command::new("sh")
@@ -989,21 +1231,260 @@ fn a_failing_filter_aborts_on_the_report_alone() {
     run_with_failing_filter(None, "r");
 }
 
+/// A long URL fragment collapses under the filter, so a value that was not
+/// cut by the engine keeps its tail: nothing is dropped, and no notice is
+/// owed because nothing was cut.
 #[test]
-fn text_cut_before_the_filter_is_never_dropped_silently() {
-    // A URL fragment swallows the long token, so the rewritten text is tiny.
+fn an_uncut_description_whose_fragment_collapses_keeps_its_tail() {
     let desc = format!(
         "closes https://github.com/o/r/issues/5#{}\nIMPORTANT TAIL\n",
-        "a".repeat(70_000)
+        "a".repeat(60_000)
     );
+    assert!(desc.len() < 65_536);
     let body = body_for("T (#131)", Some(desc.as_bytes()), "r");
-    assert!(body.contains("IMPORTANT TAIL") || body.contains("[truncated: "));
-    // A plain 200 KB description reports its real size.
-    let big = "word ".repeat(40_000);
+    assert!(
+        body.contains("closes o/r issue 5\nIMPORTANT TAIL\n"),
+        "{body}"
+    );
+    assert!(!body.contains("[truncated: "), "{body}");
+}
+
+/// The same collapse in a value the engine cut: the engine's own disclosure
+/// is the last line, and it survives the filter, so a reader still learns
+/// the text was cut.
+#[test]
+fn an_engine_cut_description_keeps_its_disclosure_after_the_filter() {
+    let suffix = "\n[truncated by chocofactory: 65490 of 90000 bytes]";
+    let desc = format!(
+        "closes https://github.com/o/r/issues/5#{}{suffix}",
+        "a".repeat(65_536 - suffix.len() - "closes https://github.com/o/r/issues/5#".len())
+    );
+    assert_eq!(desc.len(), 65_536);
+    let body = body_for("T (#131)", Some(desc.as_bytes()), "r");
+    assert!(
+        body.contains("closes o/r issue 5\n[truncated by chocofactory: 65490 of 90000 bytes]"),
+        "{body}"
+    );
+}
+
+/// The description above the script's own 64 KiB input bound (the engine
+/// would have cut it first, so this is the script alone): its real size is
+/// reported.
+#[test]
+fn a_description_over_the_scripts_input_bound_reports_its_real_size() {
+    let big = "word ".repeat(14_000); // 70,000 bytes
     let body = body_for("T (#131)", Some(big.as_bytes()), "r");
+    // No trailing newline in the text, so the filter's output is one byte longer.
     assert!(
         body.contains(&format!("of {} bytes shown]", big.len() + 1)),
         "wrong or missing total"
+    );
+}
+
+const PLACEHOLDER: &str = "> **The writer wrote no description for this PR.** The internal review below and the commits are the record of what changed.";
+const EMPTY_NOTE: &str =
+    "choco open-pr: note: no PR description from describe_pr (PR_DESCRIPTION is empty)";
+
+/// A few KB of realistic markdown that carries `marker` once, as a writer's
+/// summary does: headings, a list, a fence and several paragraphs.
+fn realistic_description(marker: &str) -> String {
+    let mut out = format!(
+        "## What this changes\n\n{marker}: the importer now reads the config from the project root instead of the home directory.\n\n"
+    );
+    for i in 1..=12 {
+        out.push_str(&format!(
+            "- Step {i}: the loader checks the project root first, then falls back to the home directory, and says which one it used in its log line number {i}.\n"
+        ));
+    }
+    out.push_str("\n```\nload(config)\n  read project root\n  fall back to home\n```\n\n");
+    for i in 1..=8 {
+        out.push_str(&format!(
+            "Paragraph {i}. This is ordinary prose about the change, long enough to look like a real description: it explains what a reviewer should read first and what was left alone.\n\n"
+        ));
+    }
+    out.push_str("## Not done\n\nThe home-directory fallback is not covered by a new test.\n");
+    assert!(out.len() > 2_000 && out.len() < 8_000, "{}", out.len());
+    out
+}
+
+fn created_body(fx: &Fixture) -> String {
+    String::from_utf8(fx.calls_to("pr create")[0].body.clone().unwrap()).unwrap()
+}
+
+/// The part of a published block that is the writer's text: between the
+/// issue lines (up to the first blank line) and `## Internal review`.
+fn description_part(body: &str) -> &str {
+    let from = body.find("\n\n").expect("issue lines end at a blank line") + 2;
+    let to = body.find("\n## Internal review").expect("review section");
+    &body[from..to]
+}
+
+/// A filter that fails after writing partial output, for the description
+/// only: the stage must exit nonzero and publish no body at all. Each filter
+/// step is failed on its own (the marker stripper, then the closing-reference
+/// filter), because a hidden failure in either would publish. The branch push
+/// comes first in the script, so a pushed branch proves nothing here.
+#[test]
+fn a_description_filter_that_fails_after_partial_output_publishes_no_body() {
+    for (config, evidence) in [
+        ("fail-awk-desc", "INJECTED awk failure: description filter"),
+        (
+            "fail-awk-desc-neutralize",
+            "INJECTED awk failure: description closing-reference filter",
+        ),
+    ] {
+        let fx = Fixture::new();
+        install_fake_awk(&fx);
+        fx.cfg(config, "FAIL-ON-THIS-DESCRIPTION");
+        fx.set_description(b"FAIL-ON-THIS-DESCRIPTION\nbody text\n");
+        let out = fx.run("T (#1)", "approved", "plain report");
+        assert!(!out.status.success(), "{config}: {}", stdout(&out));
+        assert!(
+            stderr(&out).contains(evidence),
+            "{config}: the failure was not the injected one: {}",
+            stderr(&out)
+        );
+        assert!(fx.root.join("gh/awk-desc-hits").exists(), "{config}");
+        assert!(
+            fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty(),
+            "{config}"
+        );
+        assert!(
+            !stdout(&out).contains("PARTIAL"),
+            "{config}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+/// The description is written to a temporary file first; if that write
+/// fails, nothing is published. `mktemp` is wrapped so the file's path is
+/// already a directory, which makes the write fail the way a full or
+/// read-only temp dir does.
+#[test]
+fn a_temporary_description_file_that_cannot_be_written_publishes_no_body() {
+    let fx = Fixture::new();
+    let real = Command::new("sh")
+        .args(["-c", "command -v mktemp"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    assert!(!real.is_empty(), "no mktemp on this host");
+    let fake = fx.root.join("bin/mktemp");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nd=$({real} \"$@\") || exit 1\nmkdir \"$d/desc-env\" || exit 1\necho INJECTED >> \"$GH_FAKE_DIR/mktemp-wrapped\"\nprintf '%s\\n' \"$d\"\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&fake);
+    fx.set_description(b"a description that cannot be written\n");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        fx.root.join("gh/mktemp-wrapped").exists(),
+        "the wrapper did not run"
+    );
+    assert!(
+        stderr(&out).to_lowercase().contains("directory"),
+        "not the injected write failure: {}",
+        stderr(&out)
+    );
+    assert!(fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty());
+}
+
+/// The write check on its own. The temporary description file is made
+/// read-only and already holds readable, non-blank text, so the `printf` that
+/// should replace it fails while the later "does it have text" inspection
+/// would still succeed on the leftover. Ignoring the failed write would then
+/// publish that leftover; only the write check stops it. (A user who can
+/// write a read-only file, such as root, cannot make the write fail this way,
+/// so the test says so and returns.)
+#[test]
+fn a_failed_description_write_leaving_readable_text_publishes_no_body() {
+    let fx = Fixture::new();
+    let probe = fx.root.join("readonly-probe");
+    fs::write(&probe, "x").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    if fs::OpenOptions::new().write(true).open(&probe).is_ok() {
+        eprintln!("skipped: this user can write a read-only file");
+        return;
+    }
+    let real = Command::new("sh")
+        .args(["-c", "command -v mktemp"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    assert!(!real.is_empty(), "no mktemp on this host");
+    let fake = fx.root.join("bin/mktemp");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nd=$({real} \"$@\") || exit 1\nprintf '%s\\n' 'LEFTOVER-READABLE-TEXT nonblank' > \"$d/desc-env\" || exit 1\nchmod 444 \"$d/desc-env\" || exit 1\necho INJECTED >> \"$GH_FAKE_DIR/mktemp-wrapped\"\nprintf '%s\\n' \"$d\"\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&fake);
+    fx.set_description(b"the real description that cannot be written\n");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(
+        fx.root.join("gh/mktemp-wrapped").exists(),
+        "the wrapper did not run"
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).to_lowercase().contains("permission denied"),
+        "not the injected write failure: {}",
+        stderr(&out)
+    );
+    assert!(
+        fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty(),
+        "a body was published after the write failed"
+    );
+}
+
+/// The inspection check on its own: `grep` fails (exit 2, not "no match")
+/// only when it is asked about the description's temporary file. The write
+/// before it succeeded, so ignoring the failure would treat the description
+/// as empty and publish the placeholder instead of stopping.
+#[test]
+fn a_description_inspection_that_fails_publishes_no_body() {
+    let fx = Fixture::new();
+    let real = std::env::var("PATH")
+        .unwrap()
+        .split(':')
+        .map(|d| Path::new(d).join("grep"))
+        .find(|p| p.exists())
+        .expect("a real grep");
+    let fake = fx.root.join("bin/grep");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\ncase \"$last\" in\n*/desc-env)\n    echo 'INJECTED grep failure: description inspection' >&2\n    echo hit >> \"$GH_FAKE_DIR/grep-desc-hits\"\n    exit 2\n    ;;\nesac\nexec '{}' \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&fake);
+    fx.set_description(b"a description whose inspection fails\n");
+    let out = fx.run("T (#1)", "approved", "r");
+    assert!(
+        fx.root.join("gh/grep-desc-hits").exists(),
+        "the grep wrapper did not see the description file"
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("cannot inspect the PR description text"),
+        "the script did not stop on the inspection failure: {}",
+        stderr(&out)
+    );
+    assert!(
+        fx.calls_to("pr create").is_empty() && fx.calls_to("pr edit").is_empty(),
+        "the placeholder body was published after the inspection failed"
     );
 }
 
@@ -1059,7 +1540,7 @@ fn pr_exists(fx: &Fixture) {
 #[test]
 fn first_push_is_plain_and_looks_up_open_pr() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     let out = fx.run("T (#1)", "approved", "r");
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(origin_tip(&fx), git(&fx.wt, &["rev-parse", "HEAD"]).trim());
@@ -1073,7 +1554,7 @@ fn first_push_is_plain_and_looks_up_open_pr() {
 #[test]
 fn rebased_branch_with_open_pr_is_pushed_with_lease() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     assert!(fx.run("T (#1)", "approved", "r").status.success());
     fx.cfg("pr-head", &format!("{}\n", origin_tip(&fx)));
     pr_exists(&fx);
@@ -1088,7 +1569,7 @@ fn rebased_branch_with_open_pr_is_pushed_with_lease() {
 #[test]
 fn lease_refuses_when_someone_else_moved_the_branch() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     assert!(fx.run("T (#1)", "approved", "r").status.success());
     let old = origin_tip(&fx);
     fx.cfg("pr-head", &format!("{old}\n"));
@@ -1114,7 +1595,7 @@ fn lease_refuses_when_someone_else_moved_the_branch() {
 fn plain_non_fast_forward_without_pr_is_explained() {
     for fetch in [false, true] {
         let fx = Fixture::new();
-        fx.write_description(b"d\n");
+        fx.set_description(b"d\n");
         assert!(fx.run("T (#1)", "approved", "r").status.success());
         let created = fx.calls_to("pr create").len();
         let theirs = push_from_other_clone(&fx);
@@ -1138,7 +1619,7 @@ fn plain_non_fast_forward_without_pr_is_explained() {
 #[test]
 fn lookup_failure_pushes_nothing() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("fail-pr-list", "");
     let out = fx.run("T (#1)", "approved", "r");
     assert_failed_cleanly(&fx, &out);
@@ -1154,7 +1635,7 @@ fn lookup_failure_pushes_nothing() {
 #[test]
 fn malformed_head_oid_pushes_nothing() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("pr-head", "7\n");
     let out = fx.run("T (#1)", "approved", "r");
     assert_failed_cleanly(&fx, &out);
@@ -1166,7 +1647,7 @@ fn malformed_head_oid_pushes_nothing() {
 #[test]
 fn non_hex_head_oid_of_right_length_pushes_nothing() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     fx.cfg("pr-head", &format!("{}\n", "g".repeat(40)));
     let out = fx.run("T (#1)", "approved", "r");
     assert_failed_cleanly(&fx, &out);
@@ -1178,7 +1659,7 @@ fn non_hex_head_oid_of_right_length_pushes_nothing() {
 #[test]
 fn other_push_failure_gets_generic_message() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     let missing = fx.root.join("missing.git");
     git(
         &fx.wt,
@@ -1195,7 +1676,7 @@ fn other_push_failure_gets_generic_message() {
 #[test]
 fn a_commit_someone_else_pushed_before_the_lookup_is_never_removed() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     assert!(fx.run("T (#1)", "approved", "r").status.success());
     let old = origin_tip(&fx);
     let theirs = push_from_other_clone(&fx);
@@ -1220,7 +1701,7 @@ fn a_commit_someone_else_pushed_before_the_lookup_is_never_removed() {
 #[test]
 fn after_their_commit_is_merged_in_the_next_lap_succeeds() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     assert!(fx.run("T (#1)", "approved", "r").status.success());
     let theirs = push_from_other_clone(&fx);
     fx.cfg("pr-head", &format!("{theirs}\n"));
@@ -1252,7 +1733,7 @@ fn after_their_commit_is_merged_in_the_next_lap_succeeds() {
 #[test]
 fn the_latest_record_wins_across_several_rebases() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     assert!(fx.run("T (#1)", "approved", "r").status.success());
     pr_exists(&fx);
     for lap in 0..3 {
@@ -1270,7 +1751,7 @@ fn the_latest_record_wins_across_several_rebases() {
 #[test]
 fn the_lease_is_the_tasks_own_last_push_not_the_remote_tracking_ref() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     assert!(fx.run("T (#1)", "approved", "r").status.success());
     let old = origin_tip(&fx);
     fx.cfg("pr-head", &format!("{old}\n"));
@@ -1294,7 +1775,7 @@ fn the_lease_is_the_tasks_own_last_push_not_the_remote_tracking_ref() {
 #[test]
 fn an_open_pr_without_a_record_of_our_push_gets_a_plain_push() {
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     assert!(fx.run("T (#1)", "approved", "r").status.success());
     let old = origin_tip(&fx);
     fs::remove_file(fx.git_dir().join("choco-open-pr-pushed")).unwrap();
@@ -1314,7 +1795,7 @@ fn an_open_pr_without_a_record_of_our_push_gets_a_plain_push() {
 fn a_ref_in_the_part_of_the_title_that_is_cut_still_gets_its_refs_line() {
     let title = format!("{} part of #77 tail", "a".repeat(120));
     let fx = Fixture::new();
-    fx.write_description(b"d\n");
+    fx.set_description(b"d\n");
     let out = fx.run_closes(&title, Some(""), "approved", "r");
     assert!(out.status.success(), "{}", stderr(&out));
     let create = &fx.calls_to("pr create")[0];
@@ -1355,7 +1836,7 @@ fn copy_path(fx: &Fixture) -> PathBuf {
 }
 
 fn lap(fx: &Fixture, desc: &str) -> Output {
-    fx.write_description(desc.as_bytes());
+    fx.set_description(desc.as_bytes());
     fx.run(TITLE, "approved", "r")
 }
 
@@ -1868,6 +2349,34 @@ if [ -e "$CFG/fail-awk-count" ]; then
     */hand)
         echo "INJECTED awk failure: moved-line count" >&2
         exit 3
+        ;;
+    esac
+fi
+if [ -e "$CFG/fail-awk-desc" ] && [ "$#" -eq 1 ]; then
+    case "$1" in
+    *MARK_BEGIN*)
+        cat > "$GH_FAKE_DIR/awk-stdin"
+        if grep -qF -- "$(cat "$CFG/fail-awk-desc")" "$GH_FAKE_DIR/awk-stdin"; then
+            echo "PARTIAL DESCRIPTION OUTPUT MUST NOT BE PUBLISHED"
+            echo "INJECTED awk failure: description filter" >&2
+            echo hit >> "$GH_FAKE_DIR/awk-desc-hits"
+            exit 3
+        fi
+        exec "$REAL" "$@" < "$GH_FAKE_DIR/awk-stdin"
+        ;;
+    esac
+fi
+if [ -e "$CFG/fail-awk-desc-neutralize" ] && [ "$#" -eq 1 ]; then
+    case "$1" in
+    *refat*)
+        cat > "$GH_FAKE_DIR/awk-stdin"
+        if grep -qF -- "$(cat "$CFG/fail-awk-desc-neutralize")" "$GH_FAKE_DIR/awk-stdin"; then
+            echo "PARTIAL DESCRIPTION OUTPUT MUST NOT BE PUBLISHED"
+            echo "INJECTED awk failure: description closing-reference filter" >&2
+            echo hit >> "$GH_FAKE_DIR/awk-desc-hits"
+            exit 3
+        fi
+        exec "$REAL" "$@" < "$GH_FAKE_DIR/awk-stdin"
         ;;
     esac
 fi

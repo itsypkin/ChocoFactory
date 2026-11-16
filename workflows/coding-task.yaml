@@ -11,6 +11,12 @@ roles:
     system_prompt_file: prompts/reviewer-system.md
     read_only: true
     disallowed_tools: [edit, write, notebook_edit]
+  writer:
+    cli: claude
+    model: claude-sonnet-5-5
+    system_prompt_file: prompts/writer-system.md
+    read_only: true
+    disallowed_tools: [edit, write, notebook_edit]
 
 stages:
   # First attempt at the task. Every later return path (a failed review, a
@@ -97,9 +103,29 @@ stages:
       - Findings
       - Dismissed
     on:
-      approved: open_pr
+      approved: describe_pr
       changes_requested: revising
     loop_guard: { on: changes_requested, max: 3, then: escalate_to_human }
+
+  # Writes the pull request's description from the spec, the coder's work
+  # report, the internal reviewer's report and the branch's commits and diff
+  # (`writer-system.md`), and reports it as its summary, which `open_pr`
+  # publishes. It runs after every approval, so each round's description is
+  # new text. It is read-only: if choco detects a change to the worktree when
+  # the turn ends, the task parks, and choco does not undo that change. The
+  # operator inspects the worktree and resets any change before retrying; a
+  # plain retry can take the retained change as its new starting point. The
+  # check covers the checked-out files, their git state and the branch, not
+  # ignored files, other git metadata, files outside the worktree or what a
+  # shell command sends elsewhere. Human PR comments and hand edits don't
+  # reach it: wrong or incomplete prose is corrected by hand on the PR, not
+  # with `/request-changes`, which costs a coder lap and a review lap.
+  describe_pr:
+    kind: agent_turn
+    role: writer
+    prompt_file: prompts/writer-turn.md
+    capture: json
+    on: { done: open_pr }
 
   # Reached because any of the four loop guards trips (`internal_review`'s,
   # `checks_polling`'s, `awaiting_human_review`'s or `base_conflict`'s), because `open_pr` itself failed (see
@@ -166,14 +192,16 @@ stages:
   # conditional create (#78), the refresh of an existing PR's description
   # and the fail-closed read-back all live in `scripts/open-pr.sh`, with
   # their rationale; read it there. Agent-written text reaches the script
-  # only through the `env:` map below and the description file the coder
-  # leaves in git's private directory — never through a shell command line
-  # (a `command:` is templated as raw text; a `script_file:` is not).
+  # only through the `env:` map below (the task title, the writer's
+  # description and the internal reviewer's verdict and report) — never
+  # through a shell command line (a `command:` is templated as raw text; a
+  # `script_file:` is not).
   open_pr:
     kind: shell
     script_file: scripts/open-pr.sh
     env:
       PR_TASK_TITLE: "{{ task.title }}"
+      PR_DESCRIPTION: "{{ stages.describe_pr.summary }}"
       PR_REVIEW_VERDICT: "{{ stages.internal_review.outcome }}"
       PR_REVIEW_REPORT: "{{ stages.internal_review.summary }}"
     capture: json

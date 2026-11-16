@@ -18,7 +18,7 @@ plain `coding-task` is for when you have already checked the spec against the
 code yourself:
 
 ```
-[spec_check ⇄ spec_questions →] coding → internal_review → open_pr → checks_polling → awaiting_human_review → done
+[spec_check ⇄ spec_questions →] coding → internal_review → describe_pr → open_pr → checks_polling → awaiting_human_review → done
 ```
 
 The bracketed part is `coding-task-planned` only.
@@ -28,6 +28,14 @@ Every way back goes through `revising`, which returns to `internal_review` (or s
 post `/request-changes`, the PR starts conflicting with its base (`base_conflict`
 sends it to `revising` to rebase), you answer a blocker, or someone resumes
 the task from `escalate_to_human`.
+
+`describe_pr` is a read-only `writer` turn that writes the PR description after
+every approval, from the spec, the coder's work report, the internal reviewer's
+report and the branch's diff. If it fails, the task is `stuck` there and
+nothing is published. Read-only is detection, not undo: when choco detects that
+the writer changed the worktree, it parks the task and does not revert the
+change. Inspect the worktree and reset any change before `choco task retry`: a
+plain retry can take the retained change as its new starting point.
 
 A coder that hits a rule the spec sets and that leaves no way forward (for
 example, a pinned dependency that doesn't build, where the spec forbids
@@ -42,7 +50,7 @@ A task parks at `escalate_to_human` after a 4th rejection in a row by
 separately), after about 4 days with no verdict from you, when CI has not
 finished in 30 minutes (after a last look, and up to 30 more minutes if the
 machine slept through the deadline), when a check is cancelled, failed to start or needs
-an action (approval) before it can run, or when `open_pr` fails.
+an action (approval) before it can run, or when `open_pr` fails. A failed `describe_pr` leaves it `stuck` instead.
 
 Copy this checklist and tick it off:
 
@@ -300,6 +308,10 @@ choco task create --project <p> --workflow coding-task-planned \
   for `spec_check` or `internal_review`. For the coder's latest report, which
   holds the reason when it stopped at `blocker`, use
   `choco --json task status <id> | jq -r '.workflow_state.payload.stages | (.revising // .coding).summary'`.
+  The description the writer wrote is `.workflow_state.payload.stages.describe_pr.summary`.
+  While the task is open, the coder's work report (what the reviewer checks
+  and the writer reads) is in the worktree's private git directory, never
+  committed: `cat "$(git -C <worktree> rev-parse --git-dir)/choco-work-report.md"`.
   Every lap's text, and watching
   commits while a revise lap is still open, are in
   [reference/watch.md](reference/watch.md#reading-a-stages-verdict-text).
@@ -344,8 +356,10 @@ an independent reviewer do it, and look for what agents systematically miss:
   the main fix in a scratch copy and confirm a test fails.
 - **Claims are not evidence.** Code comments ("deliberately untested"),
   commit messages and "addressed in <sha>" replies are claims to verify.
-  Check the readings the coder took and its `Not done` section against the
-  spec, and read the internal reviewer's report, not only the coder's summary. A coder's
+  Check the readings the coder took and what it did not do against the
+  spec. They reach you through the PR description (written by the writer from
+  the coder's work report) and the internal reviewer's report, so read both,
+  not only the coder's summary. A coder's
   "not re-run" on a run the spec requires is an unmet requirement, unless it
   reported the run as "not made: <reason>" within the spec's budget and way
   out, and finished. Every
@@ -357,9 +371,9 @@ an independent reviewer do it, and look for what agents systematically miss:
   its last block and the line is in neither that copy nor the new block (a PR
   from an older choco gets its copy on its first refresh, so protection starts
   the lap after). A line that the new text also contains stays inside and is
-  gone once the coder drops it; a line you delete inside the block is not kept,
-  and is back only if the coder's new text has it. A later lap can still drop a
-  section the coder wrote there.
+  gone once the writer drops it; a line you delete inside the block is not kept,
+  and is back only if the writer's new text has it. A later lap can still drop a
+  section the writer wrote there.
 - **Numbered artifacts** (migrations above all) against what has landed on
   the default branch since the task started.
 - **New messages and states**: read each one with the values its own path
@@ -382,6 +396,8 @@ commit fence, edits, ties, who can vote, fenced markers) is in
 
 **Batch your findings into one `/request-changes`.** Each one costs a coder
 lap and a review lap. Prefer approve-and-file-a-follow-up for minor points.
+Fix wrong or incomplete description prose by hand on the PR instead: the writer
+never reads PR comments or hand edits.
 
 The coder makes only the changes you ask for, so repeat in your comment any
 earlier review finding you want fixed.
@@ -398,7 +414,8 @@ the internal reviewer's earlier summary instead. After each lap, check that
 each of your items maps to a commit (while the task is still open, see
 [reference/watch.md](reference/watch.md#watching-commits-in-a-revise-lap)),
 then read the rest of the lap's diff for changes nobody asked for. Watch for an **empty commit**: the coder
-makes one when it decides only the PR description needs changing, and it
+makes one when every item you asked for is about the PR description, records
+the request in its work report, and the description is written again; the commit
 moves the head past your comment without changing anything. A short lap is
 not by itself an empty one: check its commits. What to do next
 is in [reference/recover.md](reference/recover.md).

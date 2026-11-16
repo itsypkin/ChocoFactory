@@ -18,7 +18,8 @@ workflow's `roles:` block, merged key by key, and no task layer (see
 
 The `--role-*` flags set the task-level layer. Each is `ROLE=VALUE` and each
 is repeatable, so several roles can be configured in one command. The built-in
-`coding-task` has two roles, `coder` and `reviewer`:
+`coding-task` has three roles, `coder`, `reviewer` and `writer` (the `writer` writes the
+PR description in `describe_pr`):
 
 ```
 $ choco task create --project acme --workflow coding-task \
@@ -49,7 +50,7 @@ role's `cli:` has changed starts fresh instead.
 | `--role-system-prompt ROLE=TEXT` | that role's system prompt, inline |
 | `--role-system-prompt-file ROLE=PATH` | the same, read from a file |
 
-There is deliberately no bare `--model`: with two roles it would be
+There is deliberately no bare `--model`: with several roles it would be
 ambiguous which one it meant.
 
 `--role-system-prompt-file` is read by `choco` itself and sent as text — the

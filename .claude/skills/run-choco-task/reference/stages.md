@@ -40,9 +40,11 @@ Read this while watching a task, when its behaviour surprises you.
   If the task's PR is merged meanwhile, the task moves to `done` by itself
   (the same merge-only check as `escalate_to_human`; with no PR yet, nothing
   to check).
-- **internal_review.** The reviewer is told the task's closes list and treats
-  a description that claims the PR closes any other issue as a false claim.
-  The reviewer can't use the file-editing tools, and a
+- **internal_review.** The reviewer is told the task's closes list. It checks
+  the coder's work report against the code: a report claim that hides
+  missing work blocks, and any other inaccuracy (such as a claim that the PR
+  closes another issue) is a minor finding listed for the writer to correct.
+  The reviewer doesn't judge a description's form. The reviewer can't use the file-editing tools, and a
   turn that changes HEAD or `git status` anyway parks the task as `stuck`,
   with the change left in place for you to inspect (same coverage and gaps
   as `spec_check`: not ignored paths, not anything inside `.git`). Before it
@@ -56,8 +58,22 @@ Read this while watching a task, when its behaviour surprises you.
   starts the count over, so your `/request-changes` always gets a fresh
   internal budget. It re-reads the PR's comments, so it can pick up review
   items the coder ignored.
+- **describe_pr.** A read-only `writer` turn, after every approval (the first
+  open and each human-review, red-CI or conflict round), that writes the PR
+  description from the spec, the coder's work report, the internal reviewer's
+  report and the branch's whole diff, and reports it as its summary. It
+  shortens and arranges what those say and adds nothing; it carries what was
+  not done or not verified, and where the reviewer corrects the coder's
+  report, the reviewer wins. It never sees PR comments or hand edits. If
+  it fails, the task is `stuck` at `describe_pr` and `open_pr` does not run.
+  The writer can't use the file-editing tools, and choco detects a change
+  to HEAD, the branch or `git status` when its turn ends and parks the task as
+  `stuck`; it does not undo the change. Inspect the worktree and reset any
+  change before `choco task retry`: a plain retry can take the retained change
+  as its new starting point. A write to an ignored path, to `.git`, or outside
+  the worktree is not seen.
 - **open_pr.** Pushes the branch `task/<task-id>` and opens or refreshes the
-  PR. The title comes from the task title; the body is the coder's own
+  PR. The title comes from the task title; the body is the writer's
   description plus the internal reviewer's report. The issue lines at the top
   come from the task's `--closes` list (`Closes #N` each); a `#N` in the title
   only gives `Refs #N`. A closing keyword followed

@@ -7111,8 +7111,8 @@ fn write_script(dir: &Path, name: &str, contents: &str) -> PathBuf {
     path
 }
 
-/// A single fake `claude` binary standing in for *both* `coder` and
-/// `reviewer` — both roles run on the one claude adapter, which has one
+/// A single fake `claude` binary standing in for the `coder`, `reviewer`,
+/// `planner` and `writer` — all roles run on the one claude adapter, which has one
 /// fixed binary, so distinguishing the two roles *within* that adapter has
 /// to happen inside the script itself. (Which adapter a role runs on is
 /// picked by its `cli:`; see the dispatch tests for that.) `adapter/claude.rs::spawn` passes
@@ -7136,6 +7136,7 @@ for arg in "$@"; do
     case "$arg" in
         *"reviewing agent"*) role="reviewer" ;;
         *"planning agent"*) role="planner" ;;
+        *"writing agent"*) role="writer" ;;
     esac
 done
 export MOCK_CLAUDE_ONESHOT=1
@@ -7156,6 +7157,23 @@ elif [ "$role" = "reviewer" ]; then
     [ -f "$f" ] || f="{reply_path}"
     export MOCK_CLAUDE_REPLY="$(cat "$f")"
     export MOCK_CLAUDE_REPORT="$(cat "$f")"
+elif [ "$role" = "writer" ]; then
+    # Call N reports `writer-reply-N.json` when present; otherwise a
+    # `done` whose summary names the call, so two descriptions differ.
+    export MOCK_CLAUDE_REPLY="wrote the description"
+    # `writer-fail-N` makes call N die before it reports, as a crash does.
+    if [ -e "{dir}/writer-fail-$n" ]; then exit 1; fi
+    # `writer-hold-N` keeps call N running until `writer-release` exists.
+    if [ -e "{dir}/writer-hold-$n" ]; then
+        touch "{dir}/writer-held-$n"
+        while [ ! -e "{dir}/writer-release" ]; do sleep 0.05; done
+    fi
+    f="{dir}/writer-reply-$n.json"
+    if [ -f "$f" ]; then
+        export MOCK_CLAUDE_REPORT="$(cat "$f")"
+    else
+        export MOCK_CLAUDE_REPORT="{{\"outcome\":\"done\",\"summary\":\"Writer description number $n.\"}}"
+    fi
 else
     # Call N reports `coder-reply-N.json` when present; otherwise the mock's
     # own default report (`done`).
@@ -7329,9 +7347,27 @@ case "$1" in
         ;;
     pr)
         case "$2" in
-            create)
-                echo created >> "$created"
-                echo "https://example.test/pr/42"
+            create|edit)
+                # Every body publication is logged (`pr-writes`) and, when a
+                # test opts in with `record-bodies`, its body file is kept
+                # (`bodies/<n>`) and becomes what `pr view` reads back.
+                echo "$2" >> "{dir}/pr-writes"
+                if [ -e "{dir}/record-bodies" ]; then
+                    prev=""
+                    for a in "$@"; do
+                        if [ "$prev" = "--body-file" ]; then
+                            mkdir -p "{dir}/bodies"
+                            n=$(wc -l < "{dir}/pr-writes" | tr -d ' ')
+                            cp "$a" "{dir}/bodies/$n"
+                            cp "$a" "{dir}/pr-body"
+                        fi
+                        prev=$a
+                    done
+                fi
+                if [ "$2" = create ]; then
+                    echo created >> "$created"
+                    echo "https://example.test/pr/42"
+                fi
                 ;;
             list)
                 # `open_pr`'s probe and its read-back, both scoped to open
@@ -7362,7 +7398,10 @@ case "$1" in
                 if [ -e "{dir}/pr-merged" ]; then
                     state=MERGED; merged='"2030-01-02T00:00:00Z"'
                 fi
-                if [ -z "$q" ]; then
+                if [ -z "$q" ] && [ -e "{dir}/record-bodies" ] && [ -e "{dir}/pr-body" ]; then
+                    # The body as the last publication left it, exactly.
+                    cat "{dir}/pr-body"
+                elif [ -z "$q" ]; then
                     # `open_pr`'s body read-back (`-t`), not the verdict poll.
                     echo "0000000000000000000000000000000000000000"
                 else
@@ -7538,11 +7577,18 @@ async fn the_real_coding_task_workflow_walks_the_happy_path_to_done() {
         vec![
             "coding",
             "internal_review",
+            "describe_pr",
             "open_pr",
             "checks_polling",
             "awaiting_human_review",
             "done",
         ]
+    );
+    // The writer's own summary is what `open_pr` is handed.
+    let payload = payload_of(&pool, &task_id).await;
+    assert_eq!(
+        payload["stages"]["describe_pr"]["summary"],
+        "Writer description number 1."
     );
 
     // Worktree cleanup (#58) still fires for the real shipped workflow.
@@ -8339,12 +8385,255 @@ async fn the_real_coding_task_planned_workflow_walks_the_happy_path_to_done() {
             "spec_check",
             "coding",
             "internal_review",
+            "describe_pr",
             "open_pr",
             "checks_polling",
             "awaiting_human_review",
             "done",
         ]
     );
+}
+
+/// Reads the bodies the recording `gh` stub kept, oldest first.
+fn recorded_bodies(scripts_dir: &Path) -> Vec<String> {
+    let writes = fs::read_to_string(scripts_dir.join("pr-writes")).unwrap_or_default();
+    (1..=writes.lines().count())
+        .map(|n| fs::read_to_string(scripts_dir.join(format!("bodies/{n}"))).unwrap())
+        .collect()
+}
+
+/// The part of a published body that is the writer's text: between the issue
+/// lines and the `## Internal review` heading.
+fn description_region(body: &str) -> &str {
+    let from = body
+        .find("\n\n")
+        .expect("the issue lines end at a blank line")
+        + 2;
+    let to = body.find("## Internal review").expect("the review section");
+    &body[from..to]
+}
+
+/// Every approval passes through `describe_pr` before `open_pr`, so each
+/// publication carries the summary of its own writer turn: with no hand edit
+/// in between, round N's description is round N's text and none of the
+/// earlier rounds'. The writer runs once per approval, and `open_pr` once per
+/// writer turn.
+#[tokio::test]
+async fn each_round_publishes_the_summary_of_its_own_writer_turn() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(scripts_dir.join("record-bodies"), "").unwrap();
+    // The human asks for changes every time, so the loop runs until its
+    // guard escalates: four approvals, four descriptions.
+    fs::write(
+        scripts_dir.join("verdict"),
+        owner_comment_page("again\\n/request-changes"),
+    )
+    .unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_stage(&pool, &task_id, "escalate_to_human").await;
+    wait_until_task_status(&pool, &task_id, "open").await;
+
+    let trail: Vec<String> = stage_trail(&pool, &task_id)
+        .await
+        .into_iter()
+        .map(|(stage, _)| stage)
+        .collect();
+    let count = |name: &str| trail.iter().filter(|s| s.as_str() == name).count();
+    assert_eq!(count("describe_pr"), 4, "{trail:?}");
+    assert_eq!(count("open_pr"), 4, "{trail:?}");
+    assert_eq!(
+        fs::read_to_string(scripts_dir.join("writer-calls"))
+            .unwrap()
+            .trim(),
+        "4"
+    );
+
+    let writes = fs::read_to_string(scripts_dir.join("pr-writes")).unwrap();
+    assert_eq!(
+        writes.lines().collect::<Vec<_>>(),
+        ["create", "edit", "edit", "edit"]
+    );
+    let bodies = recorded_bodies(&scripts_dir);
+    for (i, body) in bodies.iter().enumerate() {
+        let region = description_region(body);
+        let own = format!("Writer description number {}.", i + 1);
+        assert!(region.contains(&own), "round {}: {body}", i + 1);
+        for other in (1..=4).filter(|n| *n != i + 1) {
+            assert!(
+                !body.contains(&format!("Writer description number {other}.")),
+                "round {} carries round {other}'s text: {body}",
+                i + 1
+            );
+        }
+    }
+}
+
+/// A writer turn that dies leaves the task stuck at `describe_pr` with
+/// nothing new published: `open_pr` has not run again, so the earlier
+/// description stands. A retry that completes the writer turn publishes that
+/// turn's summary only, never the first description's or the failed turn's.
+/// The worktree is untouched in this fixture (the mock writer changes
+/// nothing), so there is nothing to inspect or reset before the retry.
+#[tokio::test]
+async fn a_failed_writer_turn_publishes_nothing_and_the_retry_publishes_its_own_summary() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(scripts_dir.join("record-bodies"), "").unwrap();
+    fs::write(scripts_dir.join("writer-fail-2"), "").unwrap();
+    fs::write(
+        scripts_dir.join("verdict"),
+        owner_comment_page("again\\n/request-changes"),
+    )
+    .unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    wait_until_task_status(&pool, &task_id, "stuck").await;
+
+    assert_eq!(
+        state_of(&pool, &task_id).await.current_stage,
+        "describe_pr",
+        "the second writer turn died"
+    );
+    assert_eq!(
+        fs::read_to_string(scripts_dir.join("pr-writes"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["create"],
+        "no create or edit after the writer failed"
+    );
+    let trail: Vec<String> = stage_trail(&pool, &task_id)
+        .await
+        .into_iter()
+        .map(|(stage, _)| stage)
+        .collect();
+    assert_eq!(
+        trail.iter().filter(|s| s.as_str() == "open_pr").count(),
+        1,
+        "open_pr must not run without a completed writer turn: {trail:?}"
+    );
+
+    // The human stops asking for changes, so the retried round ends at the
+    // review gate instead of looping.
+    fs::write(scripts_dir.join("verdict"), "[]").unwrap();
+    engine.retry_task(&task_id, RetryMode::Auto).await.unwrap();
+    wait_until_stage(&pool, &task_id, "awaiting_human_review").await;
+    let writes = fs::read_to_string(scripts_dir.join("pr-writes")).unwrap();
+    assert_eq!(writes.lines().collect::<Vec<_>>(), ["create", "edit"]);
+    let bodies = recorded_bodies(&scripts_dir);
+    let region = description_region(&bodies[1]);
+    assert!(region.contains("Writer description number 3."), "{region}");
+    for stale in ["number 1.", "number 2."] {
+        assert!(!bodies[1].contains(stale), "{stale}: {}", bodies[1]);
+    }
+}
+
+/// `choco task send` to a task whose writer is mid-turn is refused as a
+/// conflict (HTTP 409): `describe_pr` is an agent turn with outgoing edges,
+/// which takes no human message. The task is held at the stage by a writer
+/// that has started and not yet reported.
+#[tokio::test]
+async fn a_message_to_the_running_writer_stage_is_refused_as_a_conflict() {
+    let pool = connect_in_memory().await.unwrap();
+    let repo = tempdir();
+    init_git_repo(&repo).await;
+    let _origin = add_bare_origin(&repo).await;
+    let scripts_dir = tempdir();
+    let _path_guard = PathPrefixGuard::new(&gh_stub_dir(&scripts_dir));
+    fs::write(scripts_dir.join("verdict"), "[]").unwrap();
+    fs::write(scripts_dir.join("writer-hold-1"), "").unwrap();
+
+    let (task_id, def, claude_wrapper) = seed_coding_task(
+        &pool,
+        &repo,
+        &scripts_dir,
+        r#"{"outcome": "approved", "feedback": ""}"#,
+    )
+    .await;
+    let workflows_dir = tempdir();
+    config_root::seed_builtin_workflows(&workflows_dir).unwrap();
+    let engine = engine_with_adapter_and_workflows_dir(
+        pool.clone(),
+        &claude_wrapper.to_string_lossy(),
+        &workflows_dir,
+    );
+    engine
+        .start_task(&task_id, &def, Some("Add a small feature"))
+        .await
+        .unwrap();
+    crate::test_support::wait_until("the writer to be running", || async {
+        if scripts_dir.join("writer-held-1").exists() {
+            Ok(())
+        } else {
+            Err("the writer has not started".to_string())
+        }
+    })
+    .await;
+    assert_eq!(state_of(&pool, &task_id).await.current_stage, "describe_pr");
+
+    let err = engine
+        .send_message_or_resume(&task_id, "please mention the retry")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, SendMessageOrResumeError::UnsupportedStageKind(stage) if stage == "describe_pr"),
+        "{err:?}"
+    );
+    assert!(
+        matches!(
+            crate::api::ApiError::from(err),
+            crate::api::ApiError::Conflict(_)
+        ),
+        "the refusal must be a 409"
+    );
+    assert!(human_messages(&pool, &task_id).await.is_empty());
+
+    fs::write(scripts_dir.join("writer-release"), "").unwrap();
+    wait_until_stage(&pool, &task_id, "awaiting_human_review").await;
 }
 
 /// #241: an owner's `/request-changes` review with inline comments, on the
@@ -8493,6 +8782,7 @@ async fn the_planned_workflow_parks_for_answers_then_resumes_through_spec_check(
             "spec_check",
             "coding",
             "internal_review",
+            "describe_pr",
             "open_pr",
             "checks_polling",
             "awaiting_human_review",

@@ -78,6 +78,18 @@ const BUILTIN_WORKFLOW_PROMPTS: &[(&str, &str)] = &[
         "reviewer-turn-planned.md",
         include_str!("../../workflows/prompts/reviewer-turn-planned.md"),
     ),
+    (
+        "writer-system.md",
+        include_str!("../../workflows/prompts/writer-system.md"),
+    ),
+    (
+        "writer-turn.md",
+        include_str!("../../workflows/prompts/writer-turn.md"),
+    ),
+    (
+        "writer-turn-planned.md",
+        include_str!("../../workflows/prompts/writer-turn-planned.md"),
+    ),
 ];
 
 /// The scripts `coding-task.yaml`'s `script_file:` fields reference (#101),
@@ -1264,7 +1276,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     #[test]
     fn coder_revise_on_a_humans_round_changes_only_what_the_human_asks() {
         let rule = [
-            r#"Make only the changes the human asks for, and what those changes need (their tests, the description)."#,
+            r#"Make only the changes the human asks for, and what those changes need (their tests)."#,
             r#"A finding from an earlier review that the human doesn't repeat is not a request, whoever raised it and however it was rated: leave that code as it is."#,
             r#"If you notice a defect nobody asked about, name it in your summary instead of changing it."#,
         ];
@@ -1566,15 +1578,17 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_says(
             &squash(&rendered[done..]),
             &[
-                "Commit your revisions, and rewrite the PR description file whole (step 4 of \
-                 your instructions) so it describes the branch as it now stands.",
+                "Commit your revisions, and rewrite your work report whole (step 4 of your \
+                 instructions) so it describes the branch as it now stands, not only this lap.",
                 "An empty commit (`git commit --allow-empty -m \"Update the PR description: \
                  <why>\"`) is allowed only when every requested change is to the PR's \
                  description",
                 "In its summary, give one short line per item you were sent back for: what \
                  you changed, or that you didn't act on it and why.",
-                "A requested change to the PR's description is done by rewriting that file; the \
-                 workflow republishes it.",
+                "The PR's description is written by a later stage from your work report, not by \
+                 you: record each requested change to the description in the work report, so \
+                 that stage can act on it, and say in your summary that the description is \
+                 written again when the task next reaches that stage.",
                 "The PR's title comes from the task and can't be changed from here. List a \
                  title change, and anything else you can't do from here, as not done rather \
                  than leaving it out.",
@@ -2016,8 +2030,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             .1
     }
 
-    const DESCRIPTION_PATH_COMMAND: &str =
-        r#"echo "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md""#;
+    /// The one spelling of the work report's path, as every prompt that reads
+    /// or writes it must carry it (no `--path-format`: Apple Git 2.30 prints
+    /// the flag back as an extra line).
+    const WORK_REPORT_PATH: &str =
+        r#""$(cd "$(git rev-parse --git-dir)" && pwd)/choco-work-report.md""#;
 
     #[test]
     fn coder_system_step_three_forbids_closing_keywords_in_commit_messages() {
@@ -2035,15 +2052,25 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     }
 
     #[test]
-    fn coder_system_leaves_the_closing_to_the_task_and_forbids_claiming_others() {
-        let text = squash(embedded_prompt("coder-system.md"));
+    fn coder_system_leaves_the_closing_to_the_task_and_the_writer_forbids_claiming_others() {
+        let coder = squash(embedded_prompt("coder-system.md"));
         assert_says(
-            &text,
+            &coder,
             &[
                 "The issues the pull request closes are set by whoever created the task, and the publishing stage writes their `Closes` lines;",
-                "Don't write that the pull request closes or fixes an issue unless the task closes it (your turn prompt lists them on its `Closes:` line); mention any other issue as `#12`.",
             ],
             "coder-system.md",
+        );
+        assert!(
+            !coder.contains("Don't write that the pull request closes or fixes an issue"),
+            "the coder no longer writes the description, so the claim rule moved to the writer"
+        );
+        assert_says(
+            &squash(embedded_prompt("writer-system.md")),
+            &[
+                "Don't write that the pull request closes or fixes an issue unless it is on the task's `Closes:` line; mention any other issue as `#12`.",
+            ],
+            "writer-system.md",
         );
     }
 
@@ -2067,9 +2094,13 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
                     "This pull request closes exactly these issues: #152 #126 (if nothing follows the colon, it closes none).",
                     "nothing else can close an issue",
                     "Never report an issue as resolved, closed or fixed by this pull request unless it is on that list",
-                    "is a false claim and a blocking finding",
+                    "is an ordinary minor inaccuracy: list it with the correction",
                 ],
                 name,
+            );
+            assert!(
+                !squash(&some).contains("is a false claim and a blocking finding"),
+                "{name}: an unlisted closing claim in the work report is minor, not blocking"
             );
             let (none, _) =
                 crate::template::render(embedded_prompt(name), &closes_payload("")).unwrap();
@@ -2103,96 +2134,75 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     }
 
     #[test]
-    fn coder_system_step_four_asks_for_the_pr_description() {
+    fn coder_system_step_four_asks_for_the_work_report() {
         let text = squash(embedded_prompt("coder-system.md"));
         assert_says(
             &text,
             &[
-                "What the pull request says is up to you, through the description file in step 4.",
-                "4. Write the pull request's description to the file this command prints:",
-                DESCRIPTION_PATH_COMMAND,
+                "writes the pull request's description from your work report (step 4).",
+                "4. Write your work report to the file this command prints:",
+                &format!("`echo {WORK_REPORT_PATH}`"),
                 "so it is never committed: don't `git add` it or copy it into the tree.",
-                "so write none of those, and no `Closes #…` line.",
-                "Write it as a short guide to the change for a human reviewer who hasn't read \
-                 the task: concise, in plain English, with no codebase jargon or shorthand of \
-                 your own, readable in about two minutes.",
-                "Write it on every turn, for the branch as a whole rather than for this turn's \
-                 commits, rewriting whatever an earlier turn left there.",
-                "Start where the request or the change enters the system",
-                "Put small incidental fixes last, together in one item.",
+                "Report the branch as it stands against its base, not only this lap's commits.",
+                "- what the branch changes;",
+                "- the readings you took of anything the task left ambiguous;",
+                "- what you verified: the commands, probes and breaks you ran and what each one printed or did, including the command and result of every probe step 2 asked for;",
+                "- what you did not do, and why.",
+                "State only what you did and saw.",
+                "Don't claim a test pins something unless you ran that test against the broken code.",
+                "Don't call something untestable: if step 2 let you skip a test, give the code fact that shows no test can reach the branch.",
+                "If you could not write the report, say so under what you didn't do instead of claiming it exists.",
                 "5. Call `report_outcome`",
             ],
-            "coder-system.md step 4 must ask for the PR description",
+            "coder-system.md step 4 must ask for the work report",
         );
-        let mut at = 0;
-        for heading in [
+        for gone in [
+            "choco-pr-description",
+            "6,000",
             "`## Problem`",
-            "`## Solution`",
-            "`## Changes, in reading order`",
-            "`## Look closely at`",
-            "`## Review history`",
-            "`## Not done`",
+            "## Solution",
+            "Changes, in reading order",
+            "plain English",
+            "wc -c",
+            "description file",
+            "no `Closes #…` line",
         ] {
-            let found = text[at..]
-                .find(heading)
-                .unwrap_or_else(|| panic!("{heading} missing or out of order"));
-            at += found + heading.len();
+            assert!(
+                !text.contains(gone),
+                "coder-system.md still carries the old description rule: {gone}"
+            );
         }
     }
 
     #[test]
-    fn coder_system_step_four_asks_for_a_sketch_of_the_new_order() {
-        let text = squash(embedded_prompt("coder-system.md"));
-        let step = &text[index_of(&text, "4. Write the pull request's description")
-            ..index_of(&text, "5. Call `report_outcome`")];
-        let rule = "When the change alters what happens in what order (which function calls \
-                    which, a state's transitions, or where files live), end this section with \
-                    one small sketch of the new order in a fenced plain-text block, not a \
-                    diagram language: a call tree, or a call tree with `+` lines for what was \
-                    added and `-` lines for what was removed, keeping only the calls that \
-                    matter, in about 15 lines at most. Leave it out for a change of a few \
-                    lines or one that changes only text.";
-        assert_says(
-            step,
-            &[rule],
-            "coder-system.md step 4 must ask for a sketch",
-        );
-        let rule_at = index_of(step, "When the change alters what happens in what order");
-        assert!(
-            index_of(step, "- `## Solution`:") < rule_at
-                && rule_at < index_of(step, "- `## Changes, in reading order`:"),
-            "the sketch rule must sit inside the Solution bullet"
-        );
-        let example = &step[index_of(step, "For example:")..];
-        let sol = index_of(example, "## Solution");
-        let chg = index_of(example, "## Changes, in reading order");
-        let plus = index_of(example, "+ resume_interrupted_polls");
-        let minus = index_of(example, "- wait on a timer that pauses during sleep");
-        assert!(
-            sol < plus && plus < chg && sol < minus && minus < chg,
-            "the example sketch must sit inside its Solution"
-        );
-        assert!(
-            example[sol..plus].contains("```") && example[minus..chg].contains("```"),
-            "the example sketch must be fenced"
-        );
-    }
-
-    #[test]
-    fn reviewer_turn_reads_the_pr_description() {
-        let text = squash(embedded_prompt("reviewer-turn.md"));
-        assert_says(
-            &text,
-            &[
-                r#"`cat "$(cd "$(git rev-parse --git-dir)" && pwd)/choco-pr-description.md"`"#,
-                "A claim in it that the code doesn't bear out is a blocking finding",
-                "These are non-blocking findings: a missing description; one that leaves out a \
-                 change or a trade-off the diff makes; a change list that doesn't follow the \
-                 path a request takes through the code; and one that isn't short and in plain \
-                 English.",
-            ],
-            "reviewer-turn.md must have the reviewer check the PR description",
-        );
+    fn reviewer_turn_reads_the_work_report() {
+        for name in ["reviewer-turn.md", "reviewer-turn-planned.md"] {
+            let text = squash(embedded_prompt(name));
+            assert_says(
+                &text,
+                &[
+                    &format!("`cat {WORK_REPORT_PATH}`"),
+                    "You judge the implementation, not the description: don't judge a description file or the published description, and no rule about headings, length or style applies to the report.",
+                    "Check each claim in the report against the code and the command results",
+                ],
+                name,
+            );
+            for gone in [
+                "choco-pr-description",
+                "16,384",
+                "6,000",
+                "## Problem",
+                "Changes, in reading order",
+                "cut off",
+                "plain English",
+                "non-blocking findings: a missing description",
+            ] {
+                assert!(
+                    !text.contains(gone),
+                    "{name} still carries the old description rule: {gone}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2466,8 +2476,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert!(gate.loop_guard.is_none());
     }
 
-    /// Drift guard: every stage from `coding` on, and the `coder`/`reviewer`
-    /// roles, are `coding-task`'s, apart from three prompt files.
+    /// Drift guard: every stage from `coding` on, and the `coder`/`reviewer`/
+    /// `writer` roles, are `coding-task`'s, apart from four prompt files.
     #[test]
     fn coding_task_planned_stages_and_roles_match_coding_task() {
         use crate::workflow_def::StageKind;
@@ -2487,6 +2497,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             ("coding", "coder-turn-planned.md"),
             ("revising", "coder-revise-planned.md"),
             ("internal_review", "reviewer-turn-planned.md"),
+            ("describe_pr", "writer-turn-planned.md"),
         ];
         for (name, base_stage) in &base.stages {
             let mut planned_stage = planned.stages[name].clone();
@@ -2511,7 +2522,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             assert_eq!(&planned_stage, base_stage, "stage {name} drifted");
         }
 
-        for role in ["coder", "reviewer"] {
+        for role in ["coder", "reviewer", "writer"] {
             assert_eq!(planned.roles[role], base.roles[role], "role {role} drifted");
         }
     }
@@ -2529,6 +2540,8 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             (&base, "reviewer"),
             (&planned, "reviewer"),
             (&planned, "planner"),
+            (&base, "writer"),
+            (&planned, "writer"),
         ] {
             let def = &workflow.roles[role];
             assert!(def.read_only, "{} {role}", workflow.name);
@@ -2545,7 +2558,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     /// `{{ task.input }}` replaced.
     #[test]
     fn planned_prompts_are_their_originals_with_the_spec_swapped_in() {
-        for stem in ["coder-turn", "coder-revise", "reviewer-turn"] {
+        for stem in ["coder-turn", "coder-revise", "reviewer-turn", "writer-turn"] {
             let original = embedded_prompt(&format!("{stem}.md"));
             let planned = embedded_prompt(&format!("{stem}-planned.md"));
             assert_eq!(original.matches("{{ task.input }}").count(), 1, "{stem}");
@@ -2573,6 +2586,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "coder-turn-planned.md",
             "coder-revise-planned.md",
             "reviewer-turn-planned.md",
+            "writer-turn-planned.md",
         ] {
             let (out, _) = crate::template::render(embedded_prompt(name), &payload)
                 .unwrap_or_else(|e| panic!("{name} failed to render: {e}"));
@@ -2732,7 +2746,7 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             "When the self-check ends, the tree must be exactly what you meant to commit, and the tests must prove it.",
             "A branch no test can reach needs the code fact that shows it;",
             "one on the change's main path that you would list as untested, or as covered only by a unit test of a helper, isn't finished until it has its test or that code fact, and the reviewer blocks on it.",
-            "Before you build on anything the spec marks **unverified**, run its probe where the claim applies, and give the command and its result in the PR description under `## Look closely at`.",
+            "Before you build on anything the spec marks **unverified**, run its probe where the claim applies, and give the command and its result in your work report (step 4).",
             "If the result contradicts the spec, adapt as little as possible and say what changed there.",
             "If the probe can't run where the claim applies, say there why it couldn't, in place of its result.",
         ];
@@ -2751,11 +2765,11 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         assert_eq!(step2_text.matches("isn't finished").count(), 1);
         assert_eq!(step2_text.matches("the code fact that shows it").count(), 1);
         assert!(!step2_text.contains("Listing it is not finishing it"));
-        let step4 = index_of(&text, "4. Write the pull request's description");
+        let step4 = index_of(&text, "4. Write your work report");
         let step5 = index_of(&text, "5. Call `report_outcome`");
         let claims = [
             "Don't claim a test pins something unless you ran that test against the broken code.",
-            "Don't call something untestable.",
+            "Don't call something untestable",
         ];
         assert_says(&text, &claims, "coder-system.md step 4 must limit claims");
         for c in claims {
@@ -2779,22 +2793,30 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             ],
             "coder-revise.md must apply the self-check to the lap",
         );
-        for name in ["coder-revise.md", "coder-revise-planned.md"] {
-            let raw = embedded_prompt(name);
+        for name in [
+            "coder-revise.md",
+            "coder-revise-planned.md",
+            "../experimental/coder-revise-planned.md",
+        ] {
+            let raw = if name.starts_with("../experimental/") {
+                include_str!("../../workflows/experimental/prompts/coder-revise-planned.md")
+            } else {
+                embedded_prompt(name)
+            };
             let done = squash(&raw[raw.find("## When you're done").expect("section")..]);
-            assert_says(
-                &done,
-                &[
-                    "Keep every section the spec requires.",
-                    "If the branch has an open PR, first read its published description: set `N` as the `awaiting_human_review` entry does, then `[ -n \"$N\" ] && gh pr view \"$N\" --json body -q .body`.",
-                    "Only the part between the issue lines and `## Internal review` is your description; carry into the file every edit a person made there that is still true.",
-                ],
-                name,
-            );
-            assert!(
-                !done.contains("Re-read the whole description, delete what is no longer true"),
-                "{name}: the old re-read sentence is gone"
-            );
+            for gone in [
+                "Keep every section the spec requires.",
+                "gh pr view \"$N\" --json body -q .body",
+                "carry into the file every edit a person made there",
+                "6,000",
+                "splice around a heading",
+                "PR description file",
+            ] {
+                assert!(
+                    !done.contains(gone),
+                    "{name}: the closing section still carries the old description rule: {gone}"
+                );
+            }
         }
     }
 
@@ -2925,78 +2947,47 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     }
 
     #[test]
-    fn coder_system_step_four_writes_the_description_whole() {
+    fn coder_system_step_four_writes_the_work_report_whole() {
         let text = squash(embedded_prompt("coder-system.md"));
-        let step = &text[index_of(&text, "4. Write the pull request's description")
+        let step = &text[index_of(&text, "4. Write your work report")
             ..index_of(&text, "5. Call `report_outcome`")];
         assert_says(
             step,
             &[
-                "Write the file whole, every turn, from a complete draft that starts from the file's current text (if there is one), with your file-writing tool or a quoted heredoc.",
-                "Never change part of it by searching for a heading or any other string (a find-and-replace edit, or a script that splices around a heading): the string can match inside quoted text or code and cut what follows.",
-                "To keep a person's edits from the published description, copy them into your draft, which you then write whole.",
-                "After writing it, read the file back and check that every section is there and ends where you meant it to.",
-                "If the write fails, or the read-back still shows a cut after you rewrite it, say so in the `report_outcome` summary, under what you didn't do.",
+                "Write it on every turn, whole, from a complete draft, with your file-writing tool or a quoted heredoc; it replaces whatever an earlier turn left there.",
+                "If your file-writing tool refuses the path, write it from the shell with a quoted heredoc: `cat > \"$path\" <<'EOF'`.",
             ],
             "coder-system.md step 4",
         );
-    }
-
-    #[test]
-    fn coder_revise_rewrites_the_description_file_whole() {
-        let raw = embedded_prompt("coder-revise.md");
-        let done = squash(&raw[index_of(raw, "## When you're done")..]);
-        assert_says(
-            &done,
-            &[
-                "Commit your revisions, and rewrite the PR description file whole (step 4 of your instructions) so it describes the branch as it now stands.",
-                "done by rewriting that file",
-                "Start your draft from the file's current text, change what this lap changes, and write the whole result in one write; never append to it, find-and-replace in it, or splice around a heading.",
-            ],
-            "coder-revise.md closing section",
-        );
-        assert!(!done.contains("update the PR description file"));
-        assert!(!done.contains("done by editing that file"));
-    }
-
-    #[test]
-    fn reviewer_turn_blocks_on_a_cut_description() {
-        let text = squash(embedded_prompt("reviewer-turn.md"));
-        let blocking = "A description that is cut off or truncated, or is missing `## Problem`, `## Solution`, `## Changes, in reading order` or a section the task requires, is a blocking finding: unlike a description that is missing or empty, which the published PR states outright, it reads as whole when it isn't.";
-        assert_says(
-            &text,
-            &[
-                blocking,
-                "A file longer than 16,384 bytes counts as truncated, because publishing keeps only that much.",
-                "To find a cut, compare the file with the diff and, on a re-review, with the published description (`gh pr view --json body -q .body`, the part between the issue lines and `## Internal review`): a numbered list that skips items, a section that stops mid-sentence, or a section the earlier version had that is gone though the change didn't remove its subject, is a cut.",
-                "`## Look closely at`, `## Review history` and `## Not done` are left out when they would be empty, and their absence is not a cut; a section the task requires is never optional.",
-                "If you can't read the published description (no pull request yet, or `gh` fails), check the file alone and name under `Reviewed` what you couldn't compare.",
-            ],
-            "reviewer-turn.md",
-        );
-        let list_at = index_of(&text, "These are non-blocking findings:");
-        assert!(index_of(&text, blocking) < list_at);
-        let list = &text[list_at..];
-        let list = &list[..=list.find('.').unwrap()];
-        for word in ["cut", "truncated", "missing a section", "required"] {
+        for gone in [
+            "searching for a heading",
+            "read the file back",
+            "bytes",
+            "published description",
+        ] {
             assert!(
-                !list.contains(word),
-                "non-blocking list mentions {word}: {list}"
+                !step.contains(gone),
+                "coder-system.md step 4 still carries the old description rule: {gone}"
             );
         }
     }
 
     #[test]
-    fn reviewer_turn_byte_limit_matches_open_pr_cap() {
-        let (_, script) = BUILTIN_WORKFLOW_SCRIPTS
-            .iter()
-            .find(|(name, _)| *name == "open-pr.sh")
-            .expect("open-pr.sh is embedded");
-        assert!(script.contains("cap 16384 "), "open-pr.sh cap changed");
-        assert!(
-            squash(embedded_prompt("reviewer-turn.md")).contains("16,384 bytes"),
-            "reviewer-turn.md must state the same limit as open-pr.sh"
-        );
+    fn coder_revise_rewrites_the_work_report_whole() {
+        for name in ["coder-revise.md", "coder-revise-planned.md"] {
+            let raw = embedded_prompt(name);
+            let done = squash(&raw[index_of(raw, "## When you're done")..]);
+            assert_says(
+                &done,
+                &[
+                    "Commit your revisions, and rewrite your work report whole (step 4 of your instructions) so it describes the branch as it now stands, not only this lap.",
+                    "Start your draft from the report's current text, change what this lap changes, and write the whole result in one write.",
+                ],
+                name,
+            );
+            assert!(!done.contains("update the PR description file"));
+            assert!(!done.contains("done by rewriting that file"));
+        }
     }
 
     #[test]
@@ -3079,9 +3070,12 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
     fn reviewer_system_checks_unverified_claims_in_conformance() {
         let text = squash(embedded_prompt("reviewer-system.md"));
         let claims = [
-            "For each claim the task marks **unverified**, check that the PR description gives its probe and result and that the code fits that result; re-run the probe when it is harmless to.",
-            "A probe that could not run where the claim applies is not missing if the PR description says why;",
+            "For each claim the task marks **unverified**, check that the coder's work report gives its probe and result and that the code fits that result; re-run the probe when it is harmless to.",
+            "A probe that could not run where the claim applies is not missing if the work report says why;",
             "a missing probe (neither a result nor that reason), or code built on a claim the probe contradicted, is a blocking finding.",
+            "Required work the report only admits it left out is still missing: acknowledging it doesn't complete it, and it blocks.",
+            "a probe the report honestly says was not made for that reason doesn't make you request changes by itself: name the limitation under Reviewed so it reaches the human.",
+            "A probe that was run and failed is not unmade. It blocks unless the report shows the one allowed re-run of it passing, and a used-up budget doesn't erase an earlier failure.",
         ];
         assert_says(&text, &claims, "reviewer-system.md step 4");
         let (from, to) = (
@@ -3092,6 +3086,10 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
             let at = index_of(&text, c);
             assert!(from < at && at < to, "'{c}' must sit in step 4");
         }
+        assert!(
+            !text[from..to].contains("PR description"),
+            "step 4 reads the work report, not a PR description"
+        );
     }
 
     #[test]
@@ -3251,18 +3249,393 @@ Edits here are overwritten. To customise a workflow, copy the built-ins into a r
         );
     }
 
+    /// A false claim that hides missing work blocks; any other report
+    /// inaccuracy is minor and listed in full. Each sentence is asserted on
+    /// its own, in both turn prompts, so deleting one fails its own line.
     #[test]
-    fn reviewer_turn_weighs_pr_claims_both_ways() {
-        let text = squash(embedded_prompt("reviewer-turn.md"));
-        assert_says(
-            &text,
-            &[
+    fn reviewer_turn_weighs_report_claims_both_ways() {
+        for name in ["reviewer-turn.md", "reviewer-turn-planned.md"] {
+            let text = squash(embedded_prompt(name));
+            let blocking = "A false claim that hides something missing from the implementation is a blocking finding, and you request changes, because the work isn't done.";
+            let minor = "Any other inaccuracy in the report is a minor finding, and by itself it is never a reason for `changes_requested`.";
+            let full = "List report inaccuracies in full in every report, never collapsed into a \"carried minors\" line: the stage that writes the description reads only your latest report.";
+            let absent = "A missing or empty report is not by itself a reason to reject: judge the implementation without it, and note the absence as a minor finding when it hides no missing required work.";
+            assert_says(
+                &text,
+                &[
+                    blocking,
+                    minor,
+                    full,
+                    absent,
+                    "A minor report inaccuracy stays minor when another finding blocks.",
+                    "stale detail.",
+                    "or show that the branch only chooses message text that wouldn't lead the operator to a wrong action.",
+                    "Minor findings carried unchanged collapse into one line, as step 5 of your instructions says, except inaccuracies in the work report, which stay listed in full.",
+                    "A false claim in the coder's work report is weighed by the rule on it below, not by step 3, and that holds for an earlier finding about the report too, whatever weight the earlier report gave it.",
+                ],
+                name,
+            );
+            assert!(
+                index_of(&text, blocking) < index_of(&text, minor)
+                    && index_of(&text, minor) < index_of(&text, full),
+                "{name}: the blocking rule comes first, then the minor rule, then the listing rule"
+            );
+            for gone in [
                 "A false claim stays blocking when it overstates what the code does or protects.",
                 "already a finding: one finding, not two.",
-                "or show that the branch only chooses message text that wouldn't lead the operator to a wrong action.",
-                "Minor findings carried unchanged collapse into one line",
-            ],
-            "reviewer-turn.md PR claims and item 1",
+                "A false claim in the PR description",
+            ] {
+                assert!(
+                    !text.contains(gone),
+                    "{name} still carries the old description-claim rule: {gone}"
+                );
+            }
+        }
+    }
+
+    /// The same weighting, from the reviewer's system prompt (step 5), next
+    /// to the carried-minors rule it makes an exception to.
+    #[test]
+    fn reviewer_system_lists_report_inaccuracies_in_full_and_weighs_them() {
+        let text = squash(embedded_prompt("reviewer-system.md"));
+        let minors = index_of(&text, "carried minors: N, see report of <sha>");
+        let rule = "The coder's work report is the exception to that collapse. List each of its inaccuracies in full in every report, never in a \"carried minors\" line, because the stage that writes the pull request's description reads only your latest report.";
+        let blocking = "A false claim that hides something missing from the implementation blocks, and you request changes, because the work isn't done:";
+        let minor = "Any other inaccuracy is a minor finding and by itself never a reason for `changes_requested`:";
+        let absent = "A missing or empty report is not a form rejection: judge the implementation without it, and note its absence as a minor finding when it hides no missing required work.";
+        assert_says(
+            &text,
+            &[rule, blocking, minor, absent],
+            "reviewer-system.md step 5",
         );
+        for c in [rule, blocking, minor, absent] {
+            let at = index_of(&text, c);
+            assert!(
+                minors < at && at < index_of(&text, "\"Dismissed\" is for the things"),
+                "'{c}' must sit between the carried-minors rule and the Dismissed rule"
+            );
+        }
+    }
+
+    /// The seeded definition of each built-in coding workflow.
+    fn coding_workflows() -> (TempDir, Vec<crate::workflow_def::WorkflowDefinition>) {
+        let dir = TempDir::new();
+        seed_builtin_workflows(&dir.path).unwrap();
+        let defs = ["coding-task.yaml", "coding-task-planned.yaml"]
+            .into_iter()
+            .map(|file| load_seeded(&dir, file))
+            .collect();
+        (dir, defs)
+    }
+
+    /// Every way into `open_pr` and out of the approval, in both built-ins:
+    /// the writer sits between them, and nothing reaches the publisher
+    /// without passing it.
+    #[test]
+    fn describe_pr_sits_between_the_approval_and_the_publisher() {
+        use crate::workflow_def::{Capture, ShellCommand, StageKind};
+        let (dir, defs) = coding_workflows();
+        let prompts = ["writer-turn.md", "writer-turn-planned.md"];
+        for (def, prompt) in defs.iter().zip(prompts) {
+            let wf = def.name.as_str();
+            assert_eq!(
+                on_map(&def.stages["internal_review"]),
+                [
+                    ("approved", "describe_pr"),
+                    ("changes_requested", "revising")
+                ],
+                "{wf}: the approval edge goes to describe_pr"
+            );
+            let stage = &def.stages["describe_pr"];
+            let StageKind::AgentTurn {
+                role,
+                prompt_file,
+                capture,
+                report_sections,
+            } = &stage.kind
+            else {
+                panic!("{wf}: describe_pr must be an agent_turn");
+            };
+            assert_eq!(role, "writer", "{wf}: describe_pr role");
+            assert_eq!(
+                prompt_file.as_deref(),
+                Some(dir.path.join("prompts").join(prompt).as_path()),
+                "{wf}: describe_pr prompt"
+            );
+            assert_eq!(*capture, Some(Capture::Json), "{wf}: describe_pr capture");
+            assert!(report_sections.is_empty(), "{wf}: no report_sections");
+            assert_eq!(
+                on_map(stage),
+                [("done", "open_pr")],
+                "{wf}: describe_pr's whole edge map"
+            );
+            assert!(stage.loop_guard.is_none(), "{wf}: describe_pr has no guard");
+
+            let into_open_pr: Vec<&str> = def
+                .stages
+                .iter()
+                .filter(|(_, st)| st.on.values().any(|to| to == "open_pr"))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            assert_eq!(
+                into_open_pr,
+                ["describe_pr"],
+                "{wf}: only describe_pr's done edge enters open_pr"
+            );
+
+            let StageKind::Shell { command, env, .. } = &def.stages["open_pr"].kind else {
+                panic!("{wf}: open_pr must be a shell stage");
+            };
+            assert_eq!(
+                command,
+                &ShellCommand::ScriptFile(dir.path.join("scripts/open-pr.sh")),
+                "{wf}: open_pr script"
+            );
+            let pairs: Vec<(&str, &str)> =
+                env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            assert_eq!(
+                pairs.len(),
+                4,
+                "{wf}: open_pr passes the title, description, verdict and report"
+            );
+            assert!(
+                pairs.contains(&("PR_DESCRIPTION", "{{ stages.describe_pr.summary }}")),
+                "{wf}: the description comes from the writer's summary: {pairs:?}"
+            );
+            for pair in [
+                ("PR_TASK_TITLE", "{{ task.title }}"),
+                ("PR_REVIEW_VERDICT", "{{ stages.internal_review.outcome }}"),
+                ("PR_REVIEW_REPORT", "{{ stages.internal_review.summary }}"),
+            ] {
+                assert!(pairs.contains(&pair), "{wf}: {pair:?} in {pairs:?}");
+            }
+        }
+    }
+
+    /// The writer's role, each field on its own assertion, in both built-ins.
+    #[test]
+    fn the_writer_role_is_read_only_with_the_shipped_defaults() {
+        use crate::adapter::RoleTool;
+        let (dir, defs) = coding_workflows();
+        for def in &defs {
+            let wf = def.name.as_str();
+            let writer = &def.roles["writer"];
+            assert_eq!(writer.cli.as_deref(), Some("claude"), "{wf}: writer cli");
+            assert_eq!(
+                writer.model.as_deref(),
+                Some("claude-sonnet-5-5"),
+                "{wf}: writer model"
+            );
+            assert_eq!(
+                writer.system_prompt_file.as_deref(),
+                Some(dir.path.join("prompts/writer-system.md").as_path()),
+                "{wf}: writer system prompt"
+            );
+            assert!(writer.read_only, "{wf}: writer is read-only");
+            assert_eq!(
+                writer.disallowed_tools,
+                RoleTool::ALL.to_vec(),
+                "{wf}: writer's disallowed tools"
+            );
+            let coder = &def.roles["coder"];
+            assert!(!coder.read_only && coder.disallowed_tools.is_empty());
+        }
+    }
+
+    /// Both writer turns rendered with distinct inputs: the spec and the
+    /// internal review inside their own markers, the report command, the
+    /// whole-branch instruction.
+    #[test]
+    fn writer_turns_render_the_title_closes_spec_and_review() {
+        let payload = |closes: &str| {
+            serde_json::json!({
+                "task": { "title": "TITLE-MARK", "input": "ORIGINAL-TASK-MARK", "closes": closes },
+                "arrival": { "from": "", "outcome": "" },
+                "stages": {
+                    "spec_check": { "summary": "HARDENED-SPEC-MARK" },
+                    "internal_review": { "summary": "REVIEW-MARK" },
+                },
+            })
+        };
+        for (name, spec_mark, other_mark) in [
+            ("writer-turn.md", "ORIGINAL-TASK-MARK", "HARDENED-SPEC-MARK"),
+            (
+                "writer-turn-planned.md",
+                "HARDENED-SPEC-MARK",
+                "ORIGINAL-TASK-MARK",
+            ),
+        ] {
+            let (out, unresolved) =
+                crate::template::render(embedded_prompt(name), &payload("#152 #126")).unwrap();
+            assert!(unresolved.is_empty(), "{name}: {unresolved:?}");
+            assert!(
+                out.starts_with("Task: TITLE-MARK\nCloses: #152 #126\n"),
+                "{name}: {out}"
+            );
+            assert!(
+                out.contains(&format!("<spec>\n{spec_mark}\n</spec>")),
+                "{name}: the spec sits in its own markers: {out}"
+            );
+            assert!(
+                !out.contains(other_mark),
+                "{name}: must not render {other_mark}"
+            );
+            assert!(
+                out.contains("<internal_review>\nREVIEW-MARK\n</internal_review>"),
+                "{name}: the reviewer's report sits in its own markers: {out}"
+            );
+            let text = squash(&out);
+            assert_says(
+                &text,
+                &[
+                    &format!("`cat {WORK_REPORT_PATH}`"),
+                    "read `git log` and `git diff` from that merge-base to `HEAD`",
+                    "all of them, not only the last lap's",
+                    "Don't fetch, modify or publish anything just to get prose.",
+                    "If the file is missing or empty, write from the other inputs and say in the description that the coder left no report; don't stop.",
+                    "If the read fails for another reason, say that it could not be read: don't say it doesn't exist.",
+                ],
+                name,
+            );
+            let (none, _) = crate::template::render(embedded_prompt(name), &payload("")).unwrap();
+            assert!(
+                none.starts_with("Task: TITLE-MARK\nCloses: \n"),
+                "{name}: an empty closes list renders empty: {none}"
+            );
+        }
+    }
+
+    /// Each rule of the writer's prompt on its own assertion, so deleting
+    /// one sentence fails exactly that line.
+    #[test]
+    fn writer_prompts_carry_every_writer_rule() {
+        let system = squash(embedded_prompt("writer-system.md"));
+        assert!(
+            system.starts_with("You are the writing agent in an automated coding-task workflow."),
+            "mock dispatch matches on `writing agent`: {system}"
+        );
+        let rules = [
+            (
+                "read-only",
+                "You are read-only. You don't edit, create or delete files, you don't commit, and you don't push or post anywhere",
+            ),
+            (
+                "detection, no undo",
+                "Choco checks the worktree when your turn ends: a change it detects parks the task, and choco doesn't undo it.",
+            ),
+            (
+                "inputs",
+                "the spec, the coder's work report, the internal reviewer's report, and the branch's commits and diff against its base",
+            ),
+            (
+                "never adds",
+                "You shorten and arrange what they say, and you never add to it: you don't assume, you don't round a claim up (\"tested\" to \"guaranteed\"), and you don't describe a check as run or passing unless one of the reports says so.",
+            ),
+            (
+                "silence is not execution",
+                "Silence about a probe is not evidence that it ran.",
+            ),
+            (
+                "carries what was not done",
+                "Always carry what wasn't done and what wasn't verified, from the reports and the spec, even when the rest is short.",
+            ),
+            (
+                "corrections win",
+                "For each, correct the claim to what the reviewer says is true, or leave it out. Where the two reports disagree, the reviewer's report wins.",
+            ),
+            (
+                "silence is not absence",
+                "Where the inputs are silent about whether something was done, say that they don't say; don't write that it wasn't done.",
+            ),
+            (
+                "the corrected fact only",
+                "The description states only the corrected fact: don't repeat the wrong claim, and don't narrate the correction. The publishing stage adds the internal review's report below your description, and it already records the inaccuracy.",
+            ),
+            (
+                "no attribution footer",
+                "Add no footer or attribution line of any kind (such as \"Generated with …\").",
+            ),
+            (
+                "whole branch",
+                "Describe the whole branch against its base as it stands, not the last lap.",
+            ),
+            (
+                "no required headings",
+                "There are no required sections or headings.",
+            ),
+            (
+                "no issue lines",
+                "Write no issue lines, no `Closes #N`, no copy of the internal review's report and no footer saying who opened the PR: the publishing stage adds those.",
+            ),
+            (
+                "no claim about unlisted issues",
+                "Don't write that the pull request closes or fixes an issue unless it is on the task's `Closes:` line; mention any other issue as `#12`.",
+            ),
+            (
+                "summary is the description",
+                "Its summary is the description, and nothing else",
+            ),
+            (
+                "done outcome",
+                "Finish by calling `report_outcome` with outcome `done`.",
+            ),
+        ];
+        for (what, sentence) in rules {
+            assert!(
+                system.contains(sentence),
+                "writer-system.md ({what}): {sentence}"
+            );
+        }
+        for name in ["writer-turn.md", "writer-turn-planned.md"] {
+            let text = squash(embedded_prompt(name));
+            assert!(
+                text.contains(
+                    "Report the description as the `report_outcome` summary, with outcome `done`."
+                ),
+                "{name}: the turn ends with the report"
+            );
+        }
+        // The old form rules are not carried over into the new author.
+        for gone in [
+            "6,000",
+            "## Problem",
+            "Changes, in reading order",
+            "choco-pr-description",
+        ] {
+            assert!(!system.contains(gone), "writer-system.md carries {gone}");
+        }
+    }
+
+    /// The work report's path is spelled the same way, with no
+    /// `--path-format`, in every prompt that names it, and nowhere else.
+    #[test]
+    fn the_work_report_path_is_spelled_the_same_in_every_prompt() {
+        for name in [
+            "coder-system.md",
+            "reviewer-turn.md",
+            "reviewer-turn-planned.md",
+            "writer-turn.md",
+            "writer-turn-planned.md",
+        ] {
+            let text = squash(embedded_prompt(name));
+            assert!(
+                text.contains(WORK_REPORT_PATH),
+                "{name} must carry the canonical command {WORK_REPORT_PATH}"
+            );
+            assert!(!text.contains("--path-format"), "{name}");
+        }
+        for (name, source) in BUILTIN_WORKFLOW_PROMPTS {
+            assert!(
+                !source.contains("choco-pr-description"),
+                "{name} still names the old description file"
+            );
+        }
+        let (_, script) = BUILTIN_WORKFLOW_SCRIPTS
+            .iter()
+            .find(|(name, _)| *name == "open-pr.sh")
+            .unwrap();
+        assert!(!script.contains("choco-pr-description"));
+        assert!(!script.contains("choco-work-report"));
+        assert!(script.contains("choco-open-pr-published.md"));
     }
 }

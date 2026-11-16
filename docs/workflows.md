@@ -149,10 +149,16 @@ internal_review:
   kind: agent_turn
   role: reviewer
   capture: json
-  on: { approved: open_pr, changes_requested: revising }
+  on: { approved: describe_pr, changes_requested: revising }
+
+describe_pr:
+  kind: agent_turn
+  role: writer
+  capture: json
+  on: { done: open_pr }
 ```
 
-the daemon derives, from `on:`'s keys alone: the tool's allowed `outcome`
+the daemon derives, from each stage's `on:` keys alone: the tool's allowed `outcome`
 values, its description, and (via `--append-system-prompt`) the instruction
 telling the agent to call it before ending its turn. There is no second copy
 of `approved`/`changes_requested` to keep in sync — change the `on:` map and
@@ -172,7 +178,7 @@ internal_review:
   role: reviewer
   capture: json
   report_sections: [Branches → tests, States, Findings, Dismissed]
-  on: { approved: open_pr, changes_requested: revising }
+  on: { approved: describe_pr, changes_requested: revising }
 ```
 
 Each name must appear as a heading in the report's `summary`, with
@@ -564,7 +570,7 @@ it was launched under, and the key names (never the values) of its
 
 ## Read-only roles
 
-A role that must not change the code (a reviewer, a planner) can be enforced
+A role that must not change the code (a reviewer, a planner, a writer) can be enforced
 rather than just asked nicely. Two role fields do it:
 
 ```yaml
@@ -601,8 +607,9 @@ If the turn changed the worktree anyway, the task is marked `stuck` (in a
 [parallel group](#parallel-stages) the branch fails instead, and the task parks
 when the group settles) with a reason such as `read-only role 'reviewer' changed the worktree in stage
 'internal_review': HEAD 1a2b3c4 → 9f8e7d6; git status changed (3 entries)`,
-and a `worktree_changed` event lands on the timeline. Nothing is reverted:
-inspect the worktree, reset it yourself, then run `choco task retry`. A
+and a `worktree_changed` event lands on the timeline. Choco detects the
+change and parks the task; it does not undo it. Nothing is reverted:
+inspect the worktree, reset any change yourself, then run `choco task retry`. A
 resumed turn is compared against the baseline of the session it resumes. If
 the check can't run (git fails), the task is parked too, never passed
 silently. The comparison also runs when the turn crashes, ends without
@@ -612,8 +619,12 @@ that baselines whatever is in the worktree, so reset it before retrying.
 The check covers HEAD, the branch, `git status` and file contents. It
 doesn't cover ignored paths (`target/`, `.omc/`) or anything inside `.git`
 (refs, config, hooks). A read-only turn that runs `cargo fmt` or rewrites `Cargo.lock`
-trips the check as well, and that is intended. The built-in reviewer, and the
-planner in `coding-task-planned`, are read-only.
+trips the check as well, and that is intended. The built-in reviewer and
+writer, and the planner in `coding-task-planned`, are read-only. That is
+detection, not a sandbox: a writer that changes a checked file parks the task,
+but a write to an ignored path, to `.git`, or outside the worktree is not seen,
+and a plain retry of a failed read-only turn can accept an unreset change as
+its new starting point, so inspect and reset before retrying.
 
 ## A human gate that watches for its answer
 
