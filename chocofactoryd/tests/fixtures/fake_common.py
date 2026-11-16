@@ -20,6 +20,7 @@ import subprocess
 import sys
 
 REPORT_OUTCOME_TOOL = "mcp__chocofactory__report_outcome"
+GET_CONTEXT_TOOL = "mcp__chocofactory__get_context"
 
 # How long the real CLI takes to answer `initialize` when a tool server is
 # still connecting (probed on 2.1.310: it answers only after its MCP servers
@@ -336,6 +337,40 @@ def allowed_outcomes(args):
 
 def is_single_shot(args):
     return "--append-system-prompt" in args
+
+
+def emit_context(session_id, tool_input, tool_use_id, is_error=False):
+    """One `get_context` tool_use/tool_result pair, as Claude Code logs it."""
+    emit(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": GET_CONTEXT_TOOL,
+                        "input": tool_input,
+                    }
+                ]
+            },
+            "session_id": session_id,
+        }
+    )
+    block = {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": [{"type": "text", "text": "{\"provenance\":\"task\"}"}],
+    }
+    if is_error:
+        block["is_error"] = True
+    emit(
+        {
+            "type": "user",
+            "message": {"content": [block]},
+            "session_id": session_id,
+        }
+    )
 
 
 def emit_report(

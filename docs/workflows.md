@@ -136,8 +136,10 @@ trusts its workflows.
 
 Every agent turn is launched with an MCP tool, `report_outcome`, that lets
 the agent state its verdict explicitly instead of the engine trying to guess
-one from its reply's text. The whole rule a workflow author needs is one
-sentence:
+one from its reply's text. (It also gets a read-only `get_context` tool for
+reading back its task's recorded input and earlier stage results; reading
+never reports or completes a turn, see [context.md](context.md#the-agent-tool).)
+The whole rule a workflow author needs is one sentence:
 
 > A stage routes on the agent's own verdict **if and only if** it declares
 > `capture: json`. Its `on:` keys are the allowed verdicts.

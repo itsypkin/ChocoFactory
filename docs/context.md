@@ -8,9 +8,9 @@ Use the daemon address your `choco` talks to (`127.0.0.1:4141` is only the
 default; with `CHOCOFACTORY_PORT` or a lock file it differs). The examples use
 `$DAEMON` for it.
 
-This is the daemon side only. No `choco` command and no agent tool reads it
-yet, and a running agent is not handed an anchor automatically: a caller
-supplies `anchor_id` itself when it wants a fixed point in the history.
+Agents read it through the `get_context` tool (see [The agent tool](#the-agent-tool)
+below); `choco` itself has no command for it. A bare HTTP caller supplies
+`anchor_id` itself when it wants a fixed point in the history.
 
 ## What is recorded
 
@@ -126,3 +126,74 @@ All reads of one request happen in a single read-only database transaction, so
 the pointer, the captures and the chain come from the same moment. While it
 runs, a writer waits for it to finish (SQLite's default journal mode); a
 dropped request releases it.
+
+## The agent tool
+
+Every agent turn the daemon launches gets a read-only `get_context` tool, on
+both `claude` and `omp`, bound at launch to that turn's own task and to the
+point in history it started from. It returns one JSON value with the same
+shapes as above, in full. A read never completes, reports or advances a turn.
+A workflow stage's turn is accepted only through its own `report_outcome`; a
+standing chat session has no report and its turns end as they always did.
+
+| call | returns |
+|---|---|
+| `{"source":"task"}` | the task's title, input and closing issues |
+| `{"source":"stage","stage":"NAME"}` (optionally `"outcome":"VALUE"`) | the latest recorded result that left that stage |
+| `{"source":"stage","result_id":"ID"}` | exactly that result of this task |
+
+Nothing else is accepted: an unknown key (`task_id`, `anchor_id`,
+`session_id`, `daemon_url` and so on), a blank or non-string value, or keys
+from different forms mixed together is a tool error, so the model cannot steer
+the tool to another task, anchor or address. `stage` and `outcome` are matched
+exactly; `outcome` must not be blank (a result recorded with an empty outcome
+can still be fetched by `result_id`).
+
+The binding is fixed when the turn starts, and the daemon builds it from what
+it knows about that launch, never from a model's arguments:
+
+- **task**, **session** and **address**: the task and session the daemon
+  created or resumed for this turn, and the address it is actually listening
+  on (so `CHOCOFACTORY_PORT=0` works). A workflow turn resumed after an
+  interruption or a daemon restart starts a new session and is bound to that
+  session and the current address. A standing chat session whose process is
+  started again by a new message keeps its existing session: it is bound to
+  that session, the stored boundary and the current address.
+- **anchor**: the newest stage result recorded before the turn started, sent
+  with every stage request. Results recorded later are invisible to it, so
+  the answer to "what did the reviewer say" cannot change under a running
+  turn. A later result's ID is `not_at_or_before_anchor` when the chain from
+  the anchor is fully readable, and `history_gap` when a link has been pruned. A resumed or
+  retried turn gets the same anchor again unless the task has since moved
+  through a stage.
+
+A turn that started before any result existed (no earlier departure) has an
+*empty boundary*, and the tool does not read results recorded later. Both
+stage requests then answer `unavailable` with `anchor_id: null` and reason
+`not_found_in_recorded_history`, after checking that the task still exists
+(a deleted task or an unreachable daemon is a tool error). This means no
+matching result is established within that turn's recorded boundary; it does
+not mean no earlier review happened. The stored snapshot a task from before
+results were recorded may hold is never offered through the tool; the raw
+HTTP lookup above still returns it. `source=task` always works.
+
+A typed `unavailable` answer (HTTP 200, or the 404 for a missing result or
+anchor) is a successful tool result. An unknown task's plain error body, any
+other HTTP status, an answer that is not one of the shapes above, a refused or
+dropped connection and a request that takes longer than 30 seconds are tool
+errors, never an empty result. The tool makes one request per call (an
+empty boundary asks only for the task), follows no redirect (a 3xx status is a
+tool error), and an answer that omits a field the daemon always writes or
+contradicts itself (for example a `capture` with `capture_present: false`, a
+result whose `task_id` differs from its answer's, an answer about another task
+than the bound one, an `anchor_id` on a task or snapshot answer, or an empty
+stage name) is a tool error too. There are no retries, and nothing is written.
+
+`choco mcp-serve` (hidden, started by the daemon) takes the binding as
+`--context-task-id`, `--context-session-id`, `--context-base-url` and exactly
+one of `--context-anchor-id` or `--context-no-anchor`. Giving one requires all;
+none means a report-only server that offers no `get_context`. There is no
+environment or default-port fallback. Neither listing tools nor a report call
+contacts the daemon, so an unreachable daemon cannot stop a turn reporting.
+When `claude_settings` were not applied, only `claude_settings_rejected` is
+offered, for list and call alike.

@@ -2893,6 +2893,7 @@ mod tests {
 
     fn role_config() -> RoleConfig {
         RoleConfig {
+            context: None,
             claude_settings: Default::default(),
             role: "coder".to_string(),
             project_id: None,
@@ -2911,6 +2912,7 @@ mod tests {
     /// makes the adapter tell the turn to report, and the fixtures report.
     fn single_shot_role_config() -> RoleConfig {
         RoleConfig {
+            context: None,
             role: "coder".to_string(),
             project_id: None,
             report_outcomes: vec!["done".to_string()],
@@ -4718,6 +4720,7 @@ mod tests {
             timers,
         );
         let role = RoleConfig {
+            context: None,
             model: Some("openai-codex/gpt-5.6-terra".to_string()),
             sandboxed: true,
             isolation: crate::adapter::Isolation::default(),
@@ -5883,6 +5886,7 @@ mod tests {
             Arc::new(Notify::new()),
         );
         let cfg = RoleConfig {
+            context: None,
             role: "coder".to_string(),
             project_id: None,
             isolation: crate::adapter::Isolation::Isolated {
@@ -6766,6 +6770,7 @@ mod tests {
 
     fn memory_role_config() -> RoleConfig {
         RoleConfig {
+            context: None,
             role: "coder".to_string(),
             project_id: Some("P".to_string()),
             isolation: crate::adapter::Isolation::Isolated {
@@ -6789,6 +6794,7 @@ mod tests {
         );
         let session_id = idle_chat_session_on(&pool, "claude").await;
         let bad = RoleConfig {
+            context: None,
             model: Some("claude-sonnet-5-5:auto".to_string()),
             ..role_config()
         };
@@ -6804,6 +6810,7 @@ mod tests {
         assert_eq!(row.status, SessionStatus::Idle);
         // A valid level gets past the check (the missing binary fails later).
         let good = RoleConfig {
+            context: None,
             model: Some("claude-sonnet-5-5:high".to_string()),
             ..role_config()
         };
@@ -6940,6 +6947,7 @@ mod tests {
             Arc::new(Notify::new()),
         );
         let cfg = RoleConfig {
+            context: None,
             role: "coder".to_string(),
             project_id: None,
             cwd: std::env::temp_dir(),
@@ -10673,6 +10681,7 @@ mod tests {
         );
         let dir = TempDir::new();
         let cfg = RoleConfig {
+            context: None,
             role: "coder".to_string(),
             project_id: None,
             model: Some("haiku".to_string()),

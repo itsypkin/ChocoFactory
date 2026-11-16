@@ -6,6 +6,7 @@ pub mod pi_family;
 use std::fmt;
 use std::path::PathBuf;
 
+use chocofactory_core::context_tool::ContextBinding;
 use chocofactory_core::models::EventType;
 
 use crate::claude_settings::ClaudeSettings;
@@ -73,6 +74,13 @@ pub struct RoleConfig {
     /// The claude adapter passes them in `--settings`; the omp adapter
     /// refuses a non-empty one.
     pub claude_settings: ClaudeSettings,
+    /// What this launch fixes for the `get_context` tool (#369): the task,
+    /// the session, the point in history it may read back from and the
+    /// daemon's actual address. `None` means no complete binding — the tool
+    /// is not offered. Launch-derived, never layered from task or global
+    /// config: `role_config::resolve` leaves it `None` and the engine
+    /// attaches it once the session row exists.
+    pub context: Option<ContextBinding>,
 }
 
 /// The adapter-neutral tool vocabulary a workflow's `disallowed_tools` may

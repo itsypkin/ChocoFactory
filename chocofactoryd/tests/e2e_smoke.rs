@@ -2762,3 +2762,167 @@ async fn a_wait_on_the_lock_file_outlasts_a_held_but_unpublished_window() {
     );
     drop(publisher.join().unwrap());
 }
+
+// ---- #369: the get_context tool is bound to the address the daemon bound ----
+
+/// With `CHOCOFACTORY_PORT=0` the daemon is told its own port by the
+/// operating system. A real turn launched through the real binary carries
+/// exactly that address to its `get_context` tool, and the tool, run from the
+/// launch's own arguments, reads this task's facts from it. A second listener
+/// that would answer the same request with different content stands for a
+/// guessed or default address and must never be asked.
+#[tokio::test]
+async fn real_binary_binds_get_context_to_its_actual_port_when_the_port_is_zero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new();
+    let argv_log = home.0.join("argv.log");
+    let wrapper = home.0.join("claude-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\npython3 -c 'import json,os,sys; os.write(1, (json.dumps(sys.argv[1:]) + chr(10)).encode())' \"$@\" >> '{}'\nexec '{}' \"$@\"\n",
+            argv_log.display(),
+            workspace_binary("mock-claude").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The decoy answers the same task with different content.
+    let decoy_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&decoy_hits);
+    let decoy_app = axum::Router::new().fallback(move || {
+        let counted = std::sync::Arc::clone(&counted);
+        async move {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            axum::Json(
+                json!({"provenance": "task", "task_id": "decoy", "anchor_id": null,
+                "task": {"title": "DECOY TITLE", "input_available": false, "input": null,
+                         "closes": []}}),
+            )
+        }
+    });
+    let decoy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let decoy_port = decoy_listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(decoy_listener, decoy_app).await.unwrap() });
+
+    let mut child = spawn_raw(
+        &home.0,
+        &[
+            ("CHOCOFACTORY_PORT", "0"),
+            ("CHOCOFACTORY_CLAUDE_BINARY", wrapper.to_str().unwrap()),
+            (
+                "CHOCOFACTORY_CHOCO_BINARY",
+                workspace_binary("choco").to_str().unwrap(),
+            ),
+        ],
+    );
+    // The port the operating system gave it, read from the lock file the
+    // daemon publishes from its listener.
+    let port = wait_until("the daemon to publish its port", || async {
+        match lock_state_or_not_yet(&config_root_of(&home))? {
+            chocofactory_core::daemon_lock::LockState::Running(info) => Ok(info.port),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    assert_ne!(port, 0);
+    assert_ne!(port, decoy_port);
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let project: Value = wait_until("the daemon to answer", || async {
+        client
+            .post(format!("{base}/projects"))
+            .json(&json!({"name": "demo"}))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?
+            .json::<Value>()
+            .await
+            .map_err(|err| err.to_string())
+    })
+    .await;
+    let created: Value = client
+        .post(format!("{base}/tasks"))
+        .json(&json!({"project_id": project["id"], "workflow_def": "chat",
+                      "title": "Port zero task", "prompt": "hello", "closes": [369]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = created["id"].as_str().unwrap().to_string();
+
+    // The launch's own `--mcp-config`, as the spawned CLI received it.
+    let line = wait_until("the CLI to be launched", || async {
+        std::fs::read_to_string(&argv_log)
+            .ok()
+            // A complete (newline-terminated) record only.
+            .and_then(|text| {
+                text.split_inclusive('\n')
+                    .next()
+                    .filter(|line| line.ends_with('\n'))
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "no launch yet".to_string())
+    })
+    .await;
+    let argv: Vec<String> = serde_json::from_str(&line).unwrap();
+    let config: Value =
+        serde_json::from_str(&argv[argv.iter().position(|a| a == "--mcp-config").unwrap() + 1])
+            .unwrap();
+    let mcp_args: Vec<String> = config["mcpServers"]["chocofactory"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    let after = |flag: &str| mcp_args[mcp_args.iter().position(|a| a == flag).unwrap() + 1].clone();
+    assert_eq!(after("--context-base-url"), format!("{base}/"));
+    assert_eq!(after("--context-task-id"), task_id);
+    assert!(mcp_args.iter().any(|a| a == "--context-no-anchor"));
+
+    // Run the tool exactly as launched: it answers from this daemon.
+    let mut serve = Command::new(workspace_binary("choco"))
+        .args(&mcp_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = serve.stdin.take().unwrap();
+    tokio::io::AsyncWriteExt::write_all(
+        &mut stdin,
+        format!(
+            "{}\n",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "get_context", "arguments": {"source": "task"}}})
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    drop(stdin);
+    let output = serve.wait_with_output().await.unwrap();
+    let reply: Value = serde_json::from_str(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
+    let answer: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(answer["task_id"], json!(task_id));
+    assert_eq!(answer["task"]["title"], "Port zero task");
+    assert_eq!(answer["task"]["closes"], json!([369]));
+    assert_eq!(decoy_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let status = sigterm_and_wait(&mut child).await;
+    assert!(status.success(), "{status:?}");
+}

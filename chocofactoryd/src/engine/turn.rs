@@ -174,6 +174,16 @@ pub(super) struct PreparedTurn<'a> {
     pub(super) resume: Option<&'a ResumeSession>,
     pub(super) branch: Option<BranchEntry<'a>>,
     pub(super) session_kind: SessionKind,
+    /// The newest stage result recorded before this turn started (#369): the
+    /// point in history its `get_context` tool may read back from. Read from
+    /// the stage's own payload here, before anything is written, so a
+    /// damaged pointer fails the entry instead of becoming an empty one. A
+    /// resumed turn reads the unchanged persisted pointer again: nothing
+    /// that could advance it happens between an interruption and its resume.
+    /// A binding whose session ID is still a placeholder; launch fills in
+    /// the real one once the session row exists. `None` for an engine that
+    /// was never told its address.
+    context_template: Option<ContextBinding>,
 }
 
 impl WorkflowEngine {
@@ -286,6 +296,13 @@ impl WorkflowEngine {
                 .to_string(),
         };
 
+        let preceding_result = chocofactory_core::context::current_result_id(payload)
+            .map_err(|err| EngineError::MalformedResultPointer(err.0))?;
+        // Checked here, before the gate can queue the turn or a session row
+        // exists, so a damaged pointer or address is refused at once.
+        let context_template = self
+            .launch_context_template(task_id, preceding_result.as_deref())
+            .map_err(EngineError::ContextBinding)?;
         let task = tasks::get(&self.pool, task_id)
             .await?
             .ok_or(EngineError::NoSuchTask)?;
@@ -404,6 +421,7 @@ impl WorkflowEngine {
             resume,
             branch,
             session_kind,
+            context_template,
         })
     }
 
@@ -427,11 +445,12 @@ impl WorkflowEngine {
             capture,
             prompt_from_file,
             prompt,
-            resolved,
+            mut resolved,
             adapter_name,
             resume,
             branch,
             session_kind,
+            context_template,
         } = prepared;
         let adapter_name = adapter_name.as_str();
 
@@ -483,6 +502,14 @@ impl WorkflowEngine {
             (None, Some(from)) => sessions::create_resumed(&self.pool, new_session, from).await?,
             (None, None) => sessions::create(&self.pool, new_session).await?,
         };
+
+        // The binding names the session that was just created (the new one
+        // on a resume), so its session ID can only be filled in here. It was
+        // fully checked before the row existed, so nothing here can fail.
+        if let Some(mut binding) = context_template {
+            binding.session_id = session.id.clone();
+            resolved.role_config.context = Some(binding);
+        }
 
         // Written before the agent is spawned, so it always precedes anything
         // the turn does.

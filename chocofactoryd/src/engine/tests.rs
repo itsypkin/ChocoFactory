@@ -7,6 +7,8 @@ use super::watch::{catch_up_len, final_attempt_limit, missed};
 use super::*;
 
 mod claude_settings;
+mod context_binding;
+mod context_completion;
 mod gate_retry;
 mod model_level;
 mod omp_wake;
@@ -13631,6 +13633,7 @@ async fn cancel_kills_every_live_session_of_the_task_not_just_the_current_one() 
     let engine = engine_with_adapter(pool.clone(), &wrapper.display().to_string());
     let task_id = seed_task(&pool, "single").await;
     let cfg = crate::adapter::RoleConfig {
+        context: None,
         claude_settings: Default::default(),
         role: "coder".to_string(),
         project_id: None,

@@ -11,6 +11,13 @@
 //! (`chocofactory_core::mcp::check_report_call`) and reports the call to the
 //! engine as an ordinary `ToolCall` / `ToolResult` pair under the qualified
 //! tool name, so the engine has no omp-specific path.
+//!
+//! `get_context` (#369) is the second host tool, registered only when the
+//! launch carries a complete task binding. Its calls go through the same
+//! shared client `choco mcp-serve` uses and are reported the same way, under
+//! their own qualified name. A context call is never a report: it touches
+//! none of the report state, and the engine's report filters match the
+//! qualified `report_outcome` name exactly.
 
 use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -19,8 +26,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use base64::Engine as _;
+use chocofactory_core::context_tool::{self, ContextClient};
 use chocofactory_core::mcp::{
-    REPORT_OUTCOME_TOOL_NAME, StageReport, check_report_call, qualified_report_outcome_tool_name,
+    GET_CONTEXT_TOOL_NAME, HOST_TOOL_NAMES, REPORT_OUTCOME_TOOL_NAME, StageReport,
+    check_report_call, qualified_get_context_tool_name, qualified_report_outcome_tool_name,
     tool_definition,
 };
 use serde_json::{Value, json};
@@ -85,6 +94,8 @@ pub struct OmpAdapter {
     state_dir: PathBuf,
     /// How long a memory role's `/memory stats` check may take.
     memory_check_timeout: Duration,
+    /// How long one `get_context` read may take.
+    context_timeout: Duration,
     /// The `HOME` the omp child sees: omp prints a path under it as `~/…`.
     home: Option<PathBuf>,
     /// Test stand-in for the daemon's inherited environment (see
@@ -118,6 +129,13 @@ impl OmpAdapter {
         self
     }
 
+    /// Overrides how long one `get_context` read may take (tests use a short
+    /// one; a launch otherwise gets the shared 30 seconds).
+    pub fn with_context_timeout(mut self, timeout: Duration) -> Self {
+        self.context_timeout = timeout;
+        self
+    }
+
     /// Overrides the memory check's deadline (tests use a short one).
     pub fn with_memory_check_timeout(mut self, timeout: Duration) -> Self {
         self.memory_check_timeout = timeout;
@@ -134,6 +152,7 @@ impl OmpAdapter {
             binary: binary.into(),
             state_dir: state_dir.into(),
             memory_check_timeout: REQUEST_TIMEOUT,
+            context_timeout: context_tool::REQUEST_TIMEOUT,
             home: std::env::var_os("HOME").map(PathBuf::from),
             #[cfg(test)]
             parent_env: Vec::new(),
@@ -205,6 +224,15 @@ impl OmpAdapter {
             Isolation::InheritOperatorConfig => (!cfg.report_outcomes.is_empty())
                 .then(|| with_trailing_newline(&report_instruction(&cfg.report_outcomes))),
         };
+
+        // Before anything exists to clean up: an unusable client refuses the
+        // spawn outright.
+        let context = cfg
+            .context
+            .clone()
+            .map(|binding| ContextClient::with_timeout(binding, self.context_timeout))
+            .transpose()
+            .map_err(|message| AdapterError::Spawn(std::io::Error::other(message)))?;
 
         let memory_db = match &cfg.isolation {
             Isolation::Isolated { memory: true, .. } => Some(self.prepare_memory_store(cfg)?),
@@ -297,6 +325,7 @@ impl OmpAdapter {
                     outcomes: cfg.report_outcomes.clone(),
                     required_sections: cfg.report_sections.clone(),
                 },
+                context,
                 isolation: cfg.isolation.describe(),
                 role: cfg.role.clone(),
                 memory_db,
@@ -557,7 +586,12 @@ fn approval_mode(cfg: &RoleConfig) -> &'static str {
 
 /// The settings overlay (`--config`), as data.
 ///
-/// `tools.approval`: `report_outcome` is always allowed. Outside a
+/// `tools.approval`: `report_outcome` is always allowed, and `get_context`
+/// is when the launch is bound to a task (#369): without it a real omp in
+/// `always-ask` mode, which a non-sandboxed role runs in, refuses the call
+/// ("the tool required approval and no interactive UI was available") before
+/// it reaches the driver. A sandboxed role runs in `yolo` and needs no
+/// entry, but gets the same one. Outside a
 /// disposable worktree `bash`, `edit` and `write` are pinned to `deny`: in
 /// `always-ask` a user `allow` from the operator's or the repo's own
 /// settings would otherwise beat the mode, and a user `deny` can't be
@@ -567,6 +601,9 @@ fn approval_mode(cfg: &RoleConfig) -> &'static str {
 /// store (#222); the other roles ignore it.
 pub fn overlay(cfg: &RoleConfig, memory_db: Option<&Path>) -> Value {
     let mut approval = json!({ REPORT_OUTCOME_TOOL_NAME: "allow" });
+    if cfg.context.is_some() {
+        approval[GET_CONTEXT_TOOL_NAME] = json!("allow");
+    }
     // No approval pin for `recall` and `retain`: the real omp runs both under
     // `always-ask` (probed, #222).
     let memory_db = match cfg.isolation {
@@ -653,8 +690,9 @@ fn append_block(rendered_files: &str, cfg: &RoleConfig) -> String {
     with_trailing_newline(&block)
 }
 
-/// The tools omp may use: never `report_outcome` (omp exits 2 on it; it is a
-/// host tool), and minus the role's disallowed tools. `task`, `wait`,
+/// The tools omp may use: never a host tool (omp exits 2 on `report_outcome`
+/// here; `report_outcome` and `get_context` are registered over RPC instead),
+/// and minus the role's disallowed tools. `task`, `wait`,
 /// `eval`, `web_search`, `lsp` and `python` are deliberately absent.
 fn allowed_tools(disallowed: &[RoleTool], memory: bool) -> Vec<&'static str> {
     let memory_tools: &[&str] = if memory { &MEMORY_TOOLS } else { &[] };
@@ -1045,6 +1083,8 @@ struct DriverConfig {
     /// after the event stream ends, so the pid can't be reused before then.
     pid: Option<u32>,
     stage: StageReport,
+    /// The launch's `get_context` client; `None` registers no such tool.
+    context: Option<ContextClient>,
     isolation: Value,
     /// The role's name, for the errors of the memory check.
     role: String,
@@ -1437,17 +1477,25 @@ impl Driver {
         }
 
         let tool = tool_definition(&self.config.stage);
-        self.request(
-            "set_host_tools",
-            json!({ "tools": [{
-                "name": REPORT_OUTCOME_TOOL_NAME,
-                "label": "Report outcome",
+        let mut host_tools = vec![json!({
+            "name": REPORT_OUTCOME_TOOL_NAME,
+            "label": "Report outcome",
+            "description": tool["description"],
+            "parameters": tool["inputSchema"],
+            "loadMode": "essential",
+        })];
+        if self.config.context.is_some() {
+            let tool = context_tool::tool_definition();
+            host_tools.push(json!({
+                "name": GET_CONTEXT_TOOL_NAME,
+                "label": "Get task context",
                 "description": tool["description"],
                 "parameters": tool["inputSchema"],
                 "loadMode": "essential",
-            }] }),
-        )
-        .await?;
+            }));
+        }
+        self.request("set_host_tools", json!({ "tools": host_tools }))
+            .await?;
 
         let state = self.request("get_state", json!({})).await?;
         let session_id = state
@@ -1481,13 +1529,15 @@ impl Driver {
                 tools
                     .iter()
                     .filter_map(|tool| tool.get("name").cloned())
-                    // Every emitted event names the report tool the same way.
-                    .map(|name| {
-                        if name.as_str() == Some(REPORT_OUTCOME_TOOL_NAME) {
+                    // Every emitted event names a host tool the same way.
+                    .map(|name| match name.as_str() {
+                        Some(REPORT_OUTCOME_TOOL_NAME) => {
                             Value::String(qualified_report_outcome_tool_name())
-                        } else {
-                            name
                         }
+                        Some(GET_CONTEXT_TOOL_NAME) => {
+                            Value::String(qualified_get_context_tool_name())
+                        }
+                        _ => name,
                     })
                     .collect()
             })
@@ -1666,7 +1716,7 @@ impl Driver {
         {
             tracing::debug!("omp: an assistant message outside an execution isn't counted");
         }
-        for event in self.normalizer.normalize(message, REPORT_OUTCOME_TOOL_NAME) {
+        for event in self.normalizer.normalize(message, &HOST_TOOL_NAMES) {
             self.emit(event);
         }
     }
@@ -1686,13 +1736,24 @@ impl Driver {
             }
             return;
         };
-        if tool_name != REPORT_OUTCOME_TOOL_NAME {
-            tracing::warn!("omp: unknown host tool '{tool_name}'");
-            let reply = host_tool_result(id, &format!("unknown host tool '{tool_name}'"), true);
-            self.send_frame(&reply).await;
-            return;
-        }
         let arguments = frame.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        match tool_name {
+            REPORT_OUTCOME_TOOL_NAME => self.on_report_call(id, tool_call_id, arguments).await,
+            // Only a registered tool can be called: with no binding the
+            // name falls to the unknown-tool refusal below.
+            GET_CONTEXT_TOOL_NAME if self.config.context.is_some() => {
+                self.on_context_call(id, tool_call_id, frame.get("arguments"))
+                    .await
+            }
+            _ => {
+                tracing::warn!("omp: unknown host tool '{tool_name}'");
+                let reply = host_tool_result(id, &format!("unknown host tool '{tool_name}'"), true);
+                self.send_frame(&reply).await;
+            }
+        }
+    }
+
+    async fn on_report_call(&mut self, id: &str, tool_call_id: &str, arguments: Value) {
         let qualified = qualified_report_outcome_tool_name();
         self.emit(AgentEvent::ToolCall {
             tool_use_id: tool_call_id.to_string(),
@@ -1715,6 +1776,43 @@ impl Driver {
             tool_use_id: tool_call_id.to_string(),
             tool: qualified,
             output,
+            is_error,
+        });
+    }
+
+    /// One `get_context` call: a read-only request through the shared client,
+    /// logged as an ordinary tool call and result. It touches no report
+    /// state (not the rejection count, not acceptance), and the engine's
+    /// report filters never match its qualified name. The read is awaited
+    /// here, so frames queue behind it for at most the client's timeout; a
+    /// cancelled call finishes its bounded read and the reply is discarded.
+    async fn on_context_call(&mut self, id: &str, tool_call_id: &str, arguments: Option<&Value>) {
+        let Some(client) = self.config.context.clone() else {
+            return;
+        };
+        let qualified = qualified_get_context_tool_name();
+        // Missing arguments are not defaulted into a usable call.
+        let arguments = arguments.cloned().unwrap_or(Value::Null);
+        self.emit(AgentEvent::ToolCall {
+            tool_use_id: tool_call_id.to_string(),
+            tool: qualified.clone(),
+            input: arguments.clone(),
+        });
+        let output = client.call(&arguments).await;
+        let reply = host_tool_result(id, &output.text, output.is_error);
+        let delivered = self.send_frame(&reply).await;
+        let (text, is_error) = if delivered {
+            (output.text, output.is_error)
+        } else {
+            (
+                "omp could not be sent the reply to get_context".to_string(),
+                true,
+            )
+        };
+        self.emit(AgentEvent::ToolResult {
+            tool_use_id: tool_call_id.to_string(),
+            tool: qualified,
+            output: text,
             is_error,
         });
     }

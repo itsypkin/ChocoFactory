@@ -233,7 +233,11 @@ async fn main() {
         GlobalConfig::default_path(),
         Arc::clone(&events_notify),
     )
-    .with_legacy_workflows_dir(root.join("workflows"));
+    .with_legacy_workflows_dir(root.join("workflows"))
+    // The address actually bound above (`CHOCOFACTORY_PORT=0` included), told
+    // to the engine before the sweeps below can launch a turn (#369).
+    .with_context_base_url(&format!("http://127.0.0.1:{port}"))
+    .expect("chocofactoryd: the bound address is not a usable base URL");
 
     tokio::spawn(Arc::clone(&session_manager).run_idle_reaper(IdleReaperConfig::default()));
     tokio::spawn(retention::run_retention_job(

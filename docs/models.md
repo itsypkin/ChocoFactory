@@ -166,6 +166,8 @@ roles:
   is not loaded. Instruction files in subfolders (`sub/CLAUDE.md`) are not
   loaded either: a known gap. A role with `inherit_operator_config: true` (the
   chat role) keeps your omp setup and the repo's files, as it does on claude.
+  Every omp turn also gets choco's own `report_outcome` and (bound to the task)
+  `get_context` tools, in any role and outside a worktree too.
 - **No `claude_settings`.** `claude_settings` are Claude Code settings; a role
   on omp can't take them and is refused (see above).
 - **Outside a disposable worktree.** A role that doesn't run in a

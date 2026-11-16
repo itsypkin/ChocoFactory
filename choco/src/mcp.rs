@@ -1,54 +1,65 @@
-//! `choco mcp-serve` (issue #73): a one-tool MCP server the daemon wires into
-//! every agent turn so an agent can *state* its outcome instead of leaving the
-//! engine to infer one from prose.
+//! `choco mcp-serve` (issue #73): the MCP server the daemon wires into every
+//! Claude agent turn so an agent can *state* its outcome instead of leaving
+//! the engine to infer one from prose, and (since #369) read back one
+//! recorded fact about its own task.
 //!
-//! The problem it replaces: a `capture: json` stage used to recognise a
-//! verdict only when the agent's entire reply parsed as JSON, so a sentence of
-//! preamble discarded a perfectly good verdict and parked the task. A tool
-//! call is unambiguous, and — unlike a reply — a bad argument can be rejected
-//! with an error the model can act on and retry.
+//! The problem the first tool replaces: a `capture: json` stage used to
+//! recognise a verdict only when the agent's entire reply parsed as JSON, so
+//! a sentence of preamble discarded a perfectly good verdict and parked the
+//! task. A tool call is unambiguous, and — unlike a reply — a bad argument
+//! can be rejected with an error the model can act on and retry.
 //!
-//! Two deliberate limits:
+//! Deliberate limits:
 //!
-//! - **No daemon.** It never contacts `chocofactoryd`. The daemon already
-//!   records every tool call an agent makes as a `tool_call` event, so it
-//!   reads the verdict back off that timeline exactly as it already reads the
-//!   final assistant text. That leaves nothing here to authenticate and no
-//!   endpoint to add. The one thing it does keep (issue #95) is a count of
-//!   how many reports it has turned away for missing sections, which lives
-//!   in this process — one server process per CLI session, one thread
-//!   reading one stdio stream, so there is nothing for it to race with.
-//!   That count is shared with anything else calling the tool over the
-//!   same connection, a sub-agent included; the server can't tell callers
-//!   apart, and the direction it fails in is lenient (an allowance spent
-//!   early, never a turn parked), so it is left as is.
+//! - **`report_outcome` needs no daemon.** It never contacts `chocofactoryd`.
+//!   The daemon already records every tool call an agent makes as a
+//!   `tool_call` event, so it reads the verdict back off that timeline
+//!   exactly as it already reads the final assistant text. That leaves
+//!   nothing here to authenticate and no endpoint to add. The one thing it
+//!   does keep (issue #95) is a count of how many reports it has turned
+//!   away for missing sections, which lives in this process. That count is
+//!   shared with anything else calling the tool over the same connection, a
+//!   sub-agent included; the server can't tell callers apart, and the
+//!   direction it fails in is lenient (an allowance spent early, never a
+//!   turn parked), so it is left as is. A `get_context` call never touches
+//!   it.
+//! - **`get_context` is bound at launch (#369).** It is offered only when the
+//!   daemon started the server with a complete `--context-*` binding
+//!   (task, session, anchor choice, daemon address) and it answers from the
+//!   daemon's read-only `GET /tasks/{id}/context`, one request per call. Its
+//!   arguments cannot name another task, anchor or address. Starting,
+//!   listing tools and reporting never make a request, so an unreachable
+//!   daemon cannot stop a report. Without a binding (a hand-started
+//!   server) only `report_outcome` is offered and a `get_context` call is
+//!   refused.
 //! - **One startup check (#346).** Given `--claude-settings-sentinel NAME=VALUE`
 //!   the server reads its environment once, before serving, and passes only
 //!   if `NAME` holds exactly `VALUE`. The daemon put that variable into the
 //!   role's `claude_settings` `env`, and gave the server the expected pair as
 //!   an argument, never through the server's environment, so the check can
 //!   pass only when Claude Code applied the settings. On a miss the server
-//!   offers one tool, `claude_settings_rejected`, and no `report_outcome`.
+//!   offers one tool, `claude_settings_rejected`, and neither
+//!   `report_outcome` nor `get_context`, whether asked to list or to call.
 //!   It still never contacts the daemon: the daemon reads the verdict off
 //!   Claude's tool list.
 //! - **Hand-rolled.** Four JSON-RPC methods over newline-delimited stdio, no
-//!   MCP SDK. `serde_json` is already a dependency; a crate for one tool
-//!   would not be.
+//!   MCP SDK. Requests are served one at a time in arrival order.
 //!
 //! The allowed `outcome` values are passed in with repeated `--outcome`
 //! flags and come from the stage's `on:` map, and the sections a report must
 //! carry come from the stage's `report_sections:` with repeated
 //! `--require-section` flags, so this binary has no idea what a "reviewer"
-//! is — every agent turn gets the same tool, and only the lists differ.
+//! is — every agent turn gets the same tools, and only the lists differ.
 
-use std::io::{BufRead, Write};
+use chocofactory_core::context_tool::{self, ContextClient};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 pub use chocofactory_core::mcp::StageReport;
 #[cfg(test)]
 use chocofactory_core::mcp::missing_sections;
 use chocofactory_core::mcp::{
-    CLAUDE_SETTINGS_REJECTED_TOOL_NAME, MCP_SERVER_NAME, REPORT_OUTCOME_TOOL_NAME,
-    check_report_call, tool_definition,
+    CLAUDE_SETTINGS_REJECTED_TOOL_NAME, GET_CONTEXT_TOOL_NAME, MCP_SERVER_NAME,
+    REPORT_OUTCOME_TOOL_NAME, check_report_call, tool_definition,
 };
 use serde_json::{Value, json};
 
@@ -86,6 +97,20 @@ pub fn sentinel_present(
     Ok(lookup(name).is_some_and(|found| found == std::ffi::OsStr::new(value)))
 }
 
+/// The `get_context` client the server's `--context-*` flags describe:
+/// `None` when none were given, an error naming the problem when they are
+/// partial or unusable.
+pub fn context_client(args: &crate::cli::McpServeArgs) -> Result<Option<ContextClient>, String> {
+    let binding = chocofactory_core::context_tool::ContextBinding::from_flags(
+        args.context_task_id.as_deref(),
+        args.context_session_id.as_deref(),
+        args.context_base_url.as_deref(),
+        args.context_anchor_id.as_deref(),
+        args.context_no_anchor,
+    )?;
+    binding.map(ContextClient::new).transpose()
+}
+
 /// The description of the one tool offered when the settings were not applied.
 const SETTINGS_REJECTED_DESCRIPTION: &str =
     "Claude Code did not apply this turn's settings; choco is ending this turn. Do nothing.";
@@ -102,7 +127,7 @@ fn settings_rejected_tool() -> Value {
     })
 }
 
-/// Serves the tool over `input`/`output` until the client closes the stream.
+/// Serves the tools over `input`/`output` until the client closes the stream.
 ///
 /// Split from the subcommand entry point so tests can drive a whole session
 /// over byte slices, the same reason `client`'s request builders are split
@@ -110,23 +135,28 @@ fn settings_rejected_tool() -> Value {
 ///
 /// `settings_applied` is the settings check's verdict: `false` means Claude
 /// Code did not apply the role's `claude_settings`, and the only tool offered
-/// is `claude_settings_rejected`.
-pub fn serve_checked(
+/// is `claude_settings_rejected`. `context` is the launch binding's client;
+/// `None` means `get_context` is not offered.
+pub async fn serve_checked(
     stage: &StageReport,
     settings_applied: bool,
-    input: impl BufRead,
-    mut output: impl Write,
+    context: Option<&ContextClient>,
+    input: impl AsyncBufRead + Unpin,
+    mut output: impl AsyncWrite + Unpin,
 ) -> std::io::Result<()> {
     // Per session, not per call: see `MAX_SECTION_REJECTIONS`.
     let mut thin_reports = 0;
-    for line in input.lines() {
-        let line = line?;
+    let mut lines = input.lines();
+    while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(stage, settings_applied, &mut thin_reports, &line) {
-            writeln!(output, "{response}")?;
-            output.flush()?;
+        if let Some(response) =
+            handle_line(stage, settings_applied, context, &mut thin_reports, &line).await
+        {
+            output.write_all(response.as_bytes()).await?;
+            output.write_all(b"\n").await?;
+            output.flush().await?;
         }
     }
     Ok(())
@@ -135,9 +165,10 @@ pub fn serve_checked(
 /// Answers one request line. `None` means "say nothing", which is required
 /// rather than merely polite: a JSON-RPC *notification* has no `id`, and
 /// replying to one is a protocol violation.
-fn handle_line(
+async fn handle_line(
     stage: &StageReport,
     settings_applied: bool,
+    context: Option<&ContextClient>,
     thin_reports: &mut u32,
     line: &str,
 ) -> Option<String> {
@@ -163,13 +194,23 @@ fn handle_line(
 
     let result = match method {
         "initialize" => Ok(initialize_result(&request)),
+        // The settings check is decided first, for list and call alike: a
+        // turn whose settings were not applied gets no route to anything.
         "tools/list" if !settings_applied => Ok(json!({ "tools": [settings_rejected_tool()] })),
-        "tools/list" => Ok(json!({ "tools": [tool_definition(stage)] })),
+        "tools/list" => {
+            let mut tools = vec![tool_definition(stage)];
+            if context.is_some() {
+                tools.push(context_tool::tool_definition());
+            }
+            Ok(json!({ "tools": tools }))
+        }
         "tools/call" if !settings_applied => Ok(tool_error(SETTINGS_REJECTED_CALL_TEXT)),
-        "tools/call" => match call_tool(stage, thin_reports, request.get("params")) {
-            Ok(result) => Ok(result),
-            Err(CallError::Protocol(message)) => Err((-32602, message)),
-        },
+        "tools/call" => {
+            match call_tool(stage, context, thin_reports, request.get("params")).await {
+                Ok(result) => Ok(result),
+                Err(CallError::Protocol(message)) => Err((-32602, message)),
+            }
+        }
         "ping" => Ok(json!({})),
         other => Err((-32601, format!("unknown method '{other}'"))),
     };
@@ -210,22 +251,37 @@ enum CallError {
 /// only the second form gives it the chance to correct itself and call again
 /// — which is precisely what the old "reply with nothing but this object"
 /// instruction could never offer.
-fn call_tool(
+async fn call_tool(
     stage: &StageReport,
+    context: Option<&ContextClient>,
     thin_reports: &mut u32,
     params: Option<&Value>,
 ) -> Result<Value, CallError> {
     let params = params.ok_or_else(|| CallError::Protocol("missing params".to_string()))?;
 
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    // Absent arguments are not defaulted into a usable call: `get_context`
+    // sees `null` and refuses it.
+    let arguments = params.get("arguments");
+
+    if name == GET_CONTEXT_TOOL_NAME {
+        let Some(client) = context else {
+            return Ok(tool_error(
+                "get_context is not available: this server was started without a task binding",
+            ));
+        };
+        let output = client.call(arguments.unwrap_or(&Value::Null)).await;
+        return Ok(if output.is_error {
+            tool_error(&output.text)
+        } else {
+            tool_success(&output.text)
+        });
+    }
     if name != TOOL_NAME {
         return Err(CallError::Protocol(format!("unknown tool '{name}'")));
     }
 
-    let arguments = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let arguments = arguments.cloned().unwrap_or_else(|| json!({}));
 
     // The validation itself lives in core, shared with the omp adapter.
     let check = check_report_call(stage, thin_reports, &arguments);
@@ -282,6 +338,28 @@ mod tests {
         StageReport::default()
     }
 
+    /// Runs the async server over byte slices to completion.
+    fn serve(
+        stage: &StageReport,
+        settings_applied: bool,
+        context: Option<&ContextClient>,
+        input: &[u8],
+        output: &mut Vec<u8>,
+    ) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(serve_checked(
+                stage,
+                settings_applied,
+                context,
+                input,
+                output,
+            ))
+            .unwrap();
+    }
+
     /// Drives a whole session and returns one parsed response per line the
     /// server wrote — so a test can assert on what a client would actually
     /// see, including *how many* responses it got.
@@ -292,7 +370,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut output = Vec::new();
-        serve_checked(stage, true, input.as_bytes(), &mut output).unwrap();
+        serve(stage, true, None, input.as_bytes(), &mut output);
         String::from_utf8(output)
             .unwrap()
             .lines()
@@ -316,7 +394,13 @@ mod tests {
     fn list_tools(settings_applied: bool) -> Vec<Value> {
         let input = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string();
         let mut output = Vec::new();
-        serve_checked(&outcomes(), settings_applied, input.as_bytes(), &mut output).unwrap();
+        serve(
+            &outcomes(),
+            settings_applied,
+            None,
+            input.as_bytes(),
+            &mut output,
+        );
         let response: Value =
             serde_json::from_str(String::from_utf8(output).unwrap().lines().next().unwrap())
                 .unwrap();
@@ -347,7 +431,7 @@ mod tests {
         })
         .to_string();
         let mut output = Vec::new();
-        serve_checked(&outcomes(), false, input.as_bytes(), &mut output).unwrap();
+        serve(&outcomes(), false, None, input.as_bytes(), &mut output);
         let response: Value =
             serde_json::from_str(String::from_utf8(output).unwrap().lines().next().unwrap())
                 .unwrap();
@@ -1048,7 +1132,7 @@ mod tests {
     #[test]
     fn an_unparseable_line_is_a_jsonrpc_parse_error() {
         let mut output = Vec::new();
-        serve_checked(&outcomes(), true, &b"not json\n"[..], &mut output).unwrap();
+        serve(&outcomes(), true, None, &b"not json\n"[..], &mut output);
         let response: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(response["error"]["code"], -32700);
         assert!(response["id"].is_null());
@@ -1057,7 +1141,194 @@ mod tests {
     #[test]
     fn blank_lines_are_ignored() {
         let mut output = Vec::new();
-        serve_checked(&outcomes(), true, &b"\n   \n"[..], &mut output).unwrap();
+        serve(&outcomes(), true, None, &b"\n   \n"[..], &mut output);
         assert!(output.is_empty(), "got {output:?}");
+    }
+
+    // -- get_context (#369) ---------------------------------------------------
+
+    use chocofactory_core::context_tool::ContextBinding;
+
+    /// A bound client whose daemon address nothing listens on: any request
+    /// it makes fails, so a test that expects success proves none was made.
+    fn offline_client() -> ContextClient {
+        ContextClient::new(
+            ContextBinding::new("task-1", "sess-1", Some("r1"), "http://127.0.0.1:1").unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn rpc(
+        stage: &StageReport,
+        settings_applied: bool,
+        context: Option<&ContextClient>,
+        requests: &[Value],
+    ) -> Vec<Value> {
+        let input = requests
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut output = Vec::new();
+        serve(
+            stage,
+            settings_applied,
+            context,
+            input.as_bytes(),
+            &mut output,
+        );
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn tool_names(response: &Value) -> Vec<String> {
+        response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn call_request(name: &str, arguments: Option<Value>) -> Value {
+        let mut params = json!({ "name": name });
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params})
+    }
+
+    #[test]
+    fn get_context_is_listed_only_with_a_complete_binding() {
+        let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let client = offline_client();
+        let bound = rpc(
+            &outcomes(),
+            true,
+            Some(&client),
+            std::slice::from_ref(&list),
+        );
+        assert_eq!(tool_names(&bound[0]), ["report_outcome", "get_context"]);
+        let unbound = rpc(&outcomes(), true, None, &[list]);
+        assert_eq!(tool_names(&unbound[0]), ["report_outcome"]);
+    }
+
+    #[test]
+    fn a_bound_but_offline_server_still_reports_without_a_request() {
+        let client = offline_client();
+        let responses = rpc(
+            &outcomes(),
+            true,
+            Some(&client),
+            &[
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                call_request(
+                    "report_outcome",
+                    Some(json!({"outcome": "approved", "summary": "ok"})),
+                ),
+            ],
+        );
+        assert_eq!(responses[1]["result"]["isError"], json!(false));
+    }
+
+    #[test]
+    fn an_unbound_get_context_call_is_a_tool_error_not_a_guess() {
+        let responses = rpc(
+            &outcomes(),
+            true,
+            None,
+            &[call_request("get_context", Some(json!({"source": "task"})))],
+        );
+        assert_eq!(responses[0]["result"]["isError"], json!(true));
+        assert!(
+            responses[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("without a task binding")
+        );
+        // An unrelated tool name keeps its protocol error.
+        let unknown = rpc(&outcomes(), true, None, &[call_request("nope", None)]);
+        assert_eq!(unknown[0]["error"]["code"], json!(-32602));
+    }
+
+    #[test]
+    fn a_get_context_argument_error_reaches_the_model_as_a_tool_error() {
+        let client = offline_client();
+        for arguments in [
+            None,
+            Some(json!(null)),
+            Some(json!([])),
+            Some(json!({})),
+            Some(json!({"source": "task", "task_id": "other"})),
+        ] {
+            let responses = rpc(
+                &outcomes(),
+                true,
+                Some(&client),
+                &[call_request("get_context", arguments.clone())],
+            );
+            assert!(responses[0].get("error").is_none(), "{arguments:?}");
+            assert_eq!(
+                responses[0]["result"]["isError"],
+                json!(true),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_settings_offer_only_the_rejected_tool_and_refuse_get_context() {
+        let client = offline_client();
+        let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let listed = rpc(&outcomes(), false, Some(&client), &[list]);
+        assert_eq!(tool_names(&listed[0]), ["claude_settings_rejected"]);
+        let called = rpc(
+            &outcomes(),
+            false,
+            Some(&client),
+            &[call_request("get_context", Some(json!({"source": "task"})))],
+        );
+        assert_eq!(called[0]["result"]["isError"], json!(true));
+        assert_eq!(
+            called[0]["result"]["content"][0]["text"],
+            SETTINGS_REJECTED_CALL_TEXT
+        );
+    }
+
+    #[test]
+    fn a_context_call_does_not_spend_the_thin_report_allowance() {
+        let stage = with_sections(&["Findings"]);
+        let client = offline_client();
+        let thin = || {
+            call_request(
+                "report_outcome",
+                Some(json!({"outcome": "approved", "summary": "no sections"})),
+            )
+        };
+        // One thin report, a failed context read, a second thin report, a
+        // third: the second must still be rejected (the allowance is two).
+        let responses = rpc(
+            &stage,
+            true,
+            Some(&client),
+            &[
+                thin(),
+                call_request("get_context", Some(json!({"source": "task"}))),
+                thin(),
+                thin(),
+            ],
+        );
+        let is_error = |index: usize| responses[index]["result"]["isError"].clone();
+        assert_eq!(is_error(0), json!(true));
+        assert_eq!(is_error(1), json!(true), "the context read itself failed");
+        assert_eq!(
+            is_error(2),
+            json!(true),
+            "second thin report is still rejected"
+        );
+        assert_eq!(is_error(3), json!(false), "third thin report is accepted");
     }
 }

@@ -291,9 +291,12 @@ dependencies = [
 name = "chocofactory-core"
 version = "0.3.5"
 dependencies = [
+ "axum",
  "chrono",
+ "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

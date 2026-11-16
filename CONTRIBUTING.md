@@ -79,7 +79,7 @@ For what the lock file, stop and restart do, see
 |---|---|
 | `CHOCOFACTORY_CLAUDE_BINARY` | Path to the agent CLI. Unset = the real, billable `claude`. |
 | `CHOCOFACTORY_OMP_BINARY` | Path to the `omp` CLI used by roles with `cli: omp`. Unset = `omp` from `PATH`. |
-| `CHOCOFACTORY_CHOCO_BINARY` | Path to `choco`, used to serve every agent turn's `report_outcome` tool (see [Routing on an agent's verdict](docs/workflows.md#routing-on-an-agents-verdict)). Unset = the daemon's own sibling `choco` binary. |
+| `CHOCOFACTORY_CHOCO_BINARY` | Path to `choco`, used to serve every agent turn's `report_outcome` and `get_context` tools (see [Routing on an agent's verdict](docs/workflows.md#routing-on-an-agents-verdict)). Unset = the daemon's own sibling `choco` binary. |
 | `CHOCOFACTORY_PORT` | Bind port. Defaults to `4141`. Useful when a daemon is already running there. `0` picks a free port; the bound port is written to the lock file. |
 | `MOCK_CLAUDE_REPLY` | Read by `mock-claude` only — reply with this fixed text instead of echoing. |
 | `MOCK_CLAUDE_REPORT` | Read by `mock-claude` only — the JSON input of the `report_outcome` call a single-shot turn makes (default `{"outcome": "done"}`). |
