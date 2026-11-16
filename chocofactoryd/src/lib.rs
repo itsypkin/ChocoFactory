@@ -4,6 +4,8 @@ pub mod claude_settings;
 pub mod config_root;
 pub mod context;
 #[cfg(test)]
+pub(crate) mod context_probe_tests;
+#[cfg(test)]
 pub(crate) mod context_tool_tests;
 pub mod daemon_lock;
 pub mod db;
