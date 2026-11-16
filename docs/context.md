@@ -184,8 +184,10 @@ dropped connection and a request that takes longer than 30 seconds are tool
 errors, never an empty result. The tool makes one request per call (an
 empty boundary asks only for the task), follows no redirect (a 3xx status is a
 tool error), and an answer that omits a field the daemon always writes or
-contradicts itself (for example a `capture` with `capture_present: false`) is a
-tool error too. There are no retries, and nothing is written.
+contradicts itself (for example a `capture` with `capture_present: false`, a
+result whose `task_id` differs from its answer's, an answer about another task
+than the bound one, an `anchor_id` on a task or snapshot answer, or an empty
+stage name) is a tool error too. There are no retries, and nothing is written.
 
 `choco mcp-serve` (hidden, started by the daemon) takes the binding as
 `--context-task-id`, `--context-session-id`, `--context-base-url` and exactly
