@@ -313,7 +313,7 @@ pub async fn context(
 /// Turns a context query string into a request, refusing anything that is
 /// not one of the three documented shapes rather than choosing a default.
 /// Values are opaque strings: `null` and `7` are just names.
-fn parse_context_query(pairs: &[(String, String)]) -> Result<ContextRequest, ApiError> {
+pub(crate) fn parse_context_query(pairs: &[(String, String)]) -> Result<ContextRequest, ApiError> {
     const KEYS: [&str; 5] = ["source", "stage", "outcome", "result_id", "anchor_id"];
     let bad = |message: String| Err(ApiError::BadRequest(message));
     let mut values: [Option<&str>; 5] = [None; 5];

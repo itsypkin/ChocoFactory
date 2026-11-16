@@ -826,70 +826,140 @@ async fn real_probe_omp() {
     real_probe("omp", "openai-codex/gpt-6.1-sol:high", sandboxed).await;
 }
 
-/// A reverse proxy in front of `target` that tells the test when a request
-/// has arrived and holds it until released, so a test can abandon a read
-/// while it is genuinely pending.
-pub(crate) async fn gated_proxy(
-    target: String,
-) -> (
-    String,
-    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    std::sync::Arc<tokio::sync::Notify>,
-) {
+/// A daemon whose `GET /tasks/{id}/context` runs the real lookup against
+/// `pool` but holds the lookup's read transaction open after the anchor was
+/// read, until released. The pool the tests use has one connection, so while
+/// the read is held every other statement waits on it: a write that
+/// completes afterwards shows the connection was really given back.
+pub(crate) struct HeldDaemon {
+    pub base: String,
+    /// Lookups that reached the held point (their transaction is open).
+    pub held: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    pool: sqlx::SqlitePool,
+}
+
+impl HeldDaemon {
+    /// Lets the held lookup finish.
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+
+    /// Waits until the held lookup's connection is back in the pool, which is
+    /// the transaction's release.
+    pub(crate) async fn wait_until_the_read_is_released(&self) {
+        let pool = self.pool.clone();
+        crate::test_support::wait_until("the read transaction to be released", || async {
+            if pool.num_idle() == pool.size() as usize {
+                Ok(())
+            } else {
+                Err(format!("{} of {} idle", pool.num_idle(), pool.size()))
+            }
+        })
+        .await;
+    }
+
+    pub(crate) async fn wait_until_held(&self) {
+        let held = std::sync::Arc::clone(&self.held);
+        crate::test_support::wait_until("the lookup to hold its transaction", || async {
+            if held.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                Ok(())
+            } else {
+                Err("not yet".to_string())
+            }
+        })
+        .await;
+    }
+}
+
+pub(crate) async fn held_lookup_daemon(pool: sqlx::SqlitePool) -> HeldDaemon {
+    use axum::extract::{Path, Query, State};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let arrived = Arc::new(AtomicUsize::new(0));
-    let gate = Arc::new(tokio::sync::Notify::new());
-    let (seen, release) = (Arc::clone(&arrived), Arc::clone(&gate));
-    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
-        let (seen, release, target) = (Arc::clone(&seen), Arc::clone(&release), target.clone());
-        async move {
-            seen.fetch_add(1, Ordering::SeqCst);
-            release.notified().await;
-            let body = reqwest::get(format!("{target}{uri}"))
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap();
-            ([("content-type", "application/json")], body)
+    let held = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    #[derive(Clone)]
+    struct Shared {
+        pool: sqlx::SqlitePool,
+        held: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    let shared = Shared {
+        pool: pool.clone(),
+        held: Arc::clone(&held),
+        release: Arc::clone(&release),
+    };
+    async fn handler(
+        State(shared): State<Shared>,
+        Path(id): Path<String>,
+        Query(pairs): Query<Vec<(String, String)>>,
+    ) -> (axum::http::StatusCode, axum::Json<Value>) {
+        use crate::context::Lookup;
+        let request = crate::api::tasks::parse_context_query(&pairs)
+            .unwrap_or_else(|_| panic!("a malformed query reached the daemon: {pairs:?}"));
+        let (held, release) = (Arc::clone(&shared.held), Arc::clone(&shared.release));
+        let looked_up =
+            crate::context::lookup_with_pause(&shared.pool, &id, &request, || async move {
+                held.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+            })
+            .await
+            .unwrap();
+        match looked_up {
+            Lookup::Found(answer) => (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::to_value(answer).unwrap()),
+            ),
+            Lookup::UnknownId(answer) => (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::to_value(answer).unwrap()),
+            ),
+            Lookup::NoSuchTask => (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(json!({"error": "no such task"})),
+            ),
         }
-    });
+    }
+    let app = axum::Router::new()
+        .route("/tasks/{id}/context", axum::routing::get(handler))
+        .with_state(shared);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (base, arrived, gate)
+    HeldDaemon {
+        base,
+        held,
+        release,
+        pool,
+    }
 }
 
-/// A read abandoned by Ctrl-C while it is pending changes nothing on the
-/// daemon and holds nothing: a later read and a later write both complete.
+/// A read abandoned by Ctrl-C while the daemon's lookup holds its read
+/// transaction changes nothing on the daemon and holds nothing: the
+/// transaction is released, a later read and a later write both complete,
+/// and nothing is left that a shutdown would wait for.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_read_changes_nothing_and_blocks_neither_a_read_nor_a_write() {
     use std::os::unix::process::ExitStatusExt;
-    use std::sync::atomic::Ordering;
     let (server, project) = server_with_flow().await;
     let mut a = new_task(&server, &project, "A", &[]).await;
     a.reply(&server, "again").await;
-    let (proxy, arrived, gate) = gated_proxy(server.base_url().to_string()).await;
-    let through_proxy = ContextBinding::new(&a.id, "s", Some(&a.results[0]), &proxy).unwrap();
+    let held = held_lookup_daemon(server.pool().clone()).await;
+    let through_held = ContextBinding::new(&a.id, "s", Some(&a.results[0]), &held.base).unwrap();
     // Every row the daemon keeps, once the fixture's own writes are done.
     let before = crate::test_support::dump_tables(server.pool()).await;
 
-    let mut child = McpChild::spawn(&through_proxy.to_args(), &[]);
+    let mut child = McpChild::spawn(&through_held.to_args(), &[]);
     child.initialize().await;
     child
         .send(json!({"jsonrpc": "2.0", "id": 90, "method": "tools/call",
                      "params": {"name": "get_context",
                                 "arguments": {"source": "stage", "stage": "gate"}}}))
         .await;
-    crate::test_support::wait_until("the read to be pending", || async {
-        if arrived.load(Ordering::SeqCst) == 1 {
-            Ok(())
-        } else {
-            Err("not yet".to_string())
-        }
-    })
-    .await;
+    // The daemon is inside the lookup, holding its read transaction (the
+    // pool's only connection).
+    held.wait_until_held().await;
+    assert_eq!(server.pool().num_idle(), 0, "the read holds the connection");
     let pid = child.child.id().unwrap() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
     let status = tokio::time::timeout(Duration::from_secs(30), child.child.wait())
@@ -897,9 +967,10 @@ async fn an_abandoned_read_changes_nothing_and_blocks_neither_a_read_nor_a_write
         .expect("the abandoned server did not exit")
         .unwrap();
     assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
-    // Let the proxy finish the read the dead client had asked for.
-    gate.notify_one();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A lookup that outlived its client finishes when let go; either way
+    // the transaction must end, so the connection is back in the pool.
+    held.release();
+    held.wait_until_the_read_is_released().await;
 
     assert_eq!(
         crate::test_support::dump_tables(server.pool()).await,

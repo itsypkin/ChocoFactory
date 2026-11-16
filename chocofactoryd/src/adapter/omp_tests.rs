@@ -4405,7 +4405,7 @@ async fn omp_settlement_clears_pending_work_and_completes_nothing() {
 // ---------------------------------------------------------------------------
 
 use crate::context_tool_tests::ToolReply;
-use chocofactory_core::context_tool::ContextBinding;
+use chocofactory_core::context_tool::{ContextBinding, ContextClient};
 use chocofactory_core::mcp::qualified_get_context_tool_name;
 
 fn is_context_call(event: &AgentEvent) -> bool {
@@ -4806,24 +4806,25 @@ fn the_overlay_allows_get_context_only_for_a_bound_launch() {
     }
 }
 
-/// A call the model cancels while its read is pending is still answered when
-/// the (bounded) read ends; the driver's cancel handling is "ignored", the
-/// read writes nothing, and the turn goes on to report normally.
+/// A call the model cancels while the daemon's lookup holds its read
+/// transaction is still answered when the (bounded) read ends; the driver's
+/// cancel handling is "ignored". The read writes nothing, gives its
+/// connection back, and the turn goes on to report normally; afterwards a
+/// later read and a later write both go through.
 #[tokio::test(flavor = "multi_thread")]
 async fn omp_a_cancelled_read_finishes_writes_nothing_and_the_turn_still_reports() {
     use crate::context_tool_tests::*;
-    use std::sync::atomic::Ordering;
     let (server, project) = server_with_flow().await;
     let mut a = new_task(&server, &project, "A", &[]).await;
     a.reply(&server, "again").await;
-    let (proxy, arrived, gate) = gated_proxy(server.base_url().to_string()).await;
-    let binding = ContextBinding::new(&a.id, "s", Some(&a.results[0]), &proxy).unwrap();
+    let held = held_lookup_daemon(server.pool().clone()).await;
+    let binding = ContextBinding::new(&a.id, "s", Some(&a.results[0]), &held.base).unwrap();
     let before = crate::test_support::dump_tables(server.pool()).await;
 
     let env = Env::new();
     let steps = json!([
         s_start(),
-        {"op": "context", "args": {"source": "task"}, "label": "c", "cancel": true},
+        {"op": "context", "args": {"source": "stage", "stage": "gate"}, "label": "c", "cancel": true},
         s_report("done"),
         s_end(),
     ]);
@@ -4833,14 +4834,7 @@ async fn omp_a_cancelled_read_finishes_writes_nothing_and_the_turn_still_reports
         ..env.cfg()
     };
     let mut handle = adapter.start("go", &cfg).unwrap();
-    crate::test_support::wait_until("the read to be pending", || async {
-        if arrived.load(Ordering::SeqCst) == 1 {
-            Ok(())
-        } else {
-            Err("not yet".to_string())
-        }
-    })
-    .await;
+    held.wait_until_held().await;
     // Cancelled, and still waiting: nothing has been answered yet.
     assert!(
         !script
@@ -4850,7 +4844,7 @@ async fn omp_a_cancelled_read_finishes_writes_nothing_and_the_turn_still_reports
         "{:?}",
         script.lines()
     );
-    gate.notify_one();
+    held.release();
     script.wait_log("script_done").await;
     let events = drain(&mut handle).await;
     let result = events
@@ -4866,14 +4860,25 @@ async fn omp_a_cancelled_read_finishes_writes_nothing_and_the_turn_still_reports
         })
         .expect("the cancelled call was still answered");
     assert!(!result.0, "{}", result.1);
-    assert!(result.1.contains(&a.title));
+    let answered: Value = serde_json::from_str(&result.1).unwrap();
+    assert_eq!(answered["result"]["capture"], json!(a.captures[0]));
     assert!(
         script
             .lines()
             .contains(&"host_result:0:accepted".to_string())
     );
+    held.wait_until_the_read_is_released().await;
     assert_eq!(
         crate::test_support::dump_tables(server.pool()).await,
         before
     );
+    // The driver is finished (shutdown), and the daemon still reads and writes.
+    let direct = ContextBinding::new(&a.id, "s", Some(&a.results[0]), server.base_url()).unwrap();
+    let again = ContextClient::new(direct)
+        .unwrap()
+        .call(&json!({"source": "stage", "stage": "gate"}))
+        .await;
+    assert!(!again.is_error, "{}", again.text);
+    a.reply(&server, "approved").await;
+    assert_eq!(a.results.len(), 2);
 }

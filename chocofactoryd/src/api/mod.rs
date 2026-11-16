@@ -7,7 +7,7 @@ mod error;
 mod events;
 mod projects;
 mod server;
-mod tasks;
+pub(crate) mod tasks;
 mod ws;
 
 use std::sync::Arc;
